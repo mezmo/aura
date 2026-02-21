@@ -46,10 +46,15 @@ rig-qdrant = { workspace = true }
 qdrant-client = { workspace = true }
 uuid = { workspace = true }
 
+sha2 = "0.10"
 regex = "1"
 async-stream = "0.3"
 
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+
+[dev-dependencies]
+tempfile = "3.23.0"
+toml = "0.8"
 

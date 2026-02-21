@@ -6,6 +6,19 @@
 use rmcp::model::ProgressToken;
 use serde::Serialize;
 
+/// Format any serializable type as an SSE event with a named event field.
+///
+/// Returns a string in the format:
+/// ```text
+/// event: {event_name}
+/// data: {json}
+///
+/// ```
+pub fn format_named_sse(event_name: &str, data: &impl Serialize) -> String {
+    let json = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+    format!("event: {event_name}\ndata: {json}\n\n")
+}
+
 /// Context identifying which agent emitted an event.
 ///
 /// For single-agent deployments, use `AgentContext::single_agent()` which sets
@@ -250,9 +263,7 @@ impl AuraStreamEvent {
     ///
     /// ```
     pub fn format_sse(&self) -> String {
-        let event_name = self.event_name();
-        let data = serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string());
-        format!("event: {event_name}\ndata: {data}\n\n")
+        format_named_sse(self.event_name(), self)
     }
 
     /// Create a ToolRequested event (LLM decided to call a tool).

@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use crate::orchestration::OrchestratorEvent;
 use crate::streaming_request_hook::StreamingRequestHook;
 
 // Type aliases for provider-specific completion models
@@ -329,6 +330,8 @@ pub enum StreamItem {
     Final(FinalResponseInfo),
     /// Internal marker for final response (filtered out before returning to caller)
     FinalMarker,
+    /// Orchestrator status event (plan progress, task status, etc.)
+    OrchestratorEvent(OrchestratorEvent),
 }
 
 /// Final response information.

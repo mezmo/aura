@@ -1,0 +1,75 @@
+# Integration test configuration for orchestration mode
+# Used by: compose/orchestration.yml → compose/orchestration-test.yml
+# Worker definitions mirror configs/math-orchestration.toml.
+# If you update worker mcp_filter or preambles, update both files.
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+
+[agent]
+name = "Math Orchestrator Test"
+system_prompt = """
+You are a math assistant coordinator. You decompose math problems into
+specialized tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Simple single-operation arithmetic (e.g., "What is 2+2?"): answer directly
+- Multi-step calculations or mixed domains: create a plan with workers
+- Vague or ambiguous requests: ask for clarification
+"""
+turn_depth = 5
+temperature = 0.3
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.math]
+transport = "http_streamable"
+url = "http://math-mcp:8081/mcp"
+headers = {}
+description = "Math MCP server providing arithmetic, statistics, and trigonometry tools"
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+quality_threshold = 0.7
+allow_direct_answers = true
+allow_clarification = true
+tools_in_planning = "summary"
+
+[orchestration.timeouts]
+per_call_timeout_secs = 60
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-orchestration-test"
+
+[orchestration.worker.arithmetic]
+description = "Basic arithmetic: addition, subtraction, multiplication, division, modulo, rounding"
+turn_depth = 5
+mcp_filter = ["add", "subtract", "multiply", "division", "modulo", "floor", "ceiling", "round", "sum"]
+preamble = """
+You are an Arithmetic Specialist. Use your math tools for every calculation.
+Do NOT compute results in your head — always call the appropriate tool.
+Show each step and report the tool result.
+"""
+
+[orchestration.worker.statistics]
+description = "Statistical analysis: mean, median, mode, min, max"
+turn_depth = 5
+mcp_filter = ["mean", "median", "mode", "min", "max"]
+preamble = """
+You are a Statistics Specialist. Use your statistical tools for analysis.
+Always use the appropriate tool — do not compute statistics manually.
+Report results clearly with the operation performed.
+"""
+
+[orchestration.worker.trigonometry]
+description = "Trigonometric functions and angle conversions"
+turn_depth = 5
+mcp_filter = ["sin", "cos", "tan", "arcsin", "arccos", "arctan", "radiansToDegrees", "degreesToRadians"]
+preamble = """
+You are a Trigonometry Specialist. Use your trig tools for all calculations.
+Always specify whether inputs are in radians or degrees.
+"""

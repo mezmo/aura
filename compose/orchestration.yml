@@ -1,0 +1,38 @@
+# compose/orchestration.yml
+# Overlay: Reconfigures aura-web-server for orchestration mode with math-mcp
+#
+# Adds math-mcp service and overrides base config with orchestration-enabled TOML.
+# Mock-mcp from base.yml is NOT used by orchestration tests (math-mcp replaces it).
+#
+# Usage:
+#   docker compose -f compose/base.yml -f compose/orchestration.yml up -d
+#   docker compose -f compose/base.yml -f compose/orchestration.yml -f compose/dev.yml up -d
+
+services:
+  math-mcp:
+    build:
+      context: ./math-mcp
+    healthcheck:
+      test: >
+        curl -sf http://localhost:8081/mcp -X POST
+        -H "Content-Type: application/json"
+        -H "Accept: application/json, text/event-stream"
+        -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}},"id":1}'
+        > /dev/null || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - aura-test
+
+  aura-web-server:
+    environment:
+      # Override config path to orchestration-enabled config
+      - CONFIG_PATH=/app/config/test-orchestration.toml
+    volumes:
+      # Mount orchestration test config (instead of standard test config)
+      - ../configs/integration-orchestration.toml:/app/config/test-orchestration.toml:ro
+    depends_on:
+      math-mcp:
+        condition: service_healthy

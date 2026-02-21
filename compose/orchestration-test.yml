@@ -1,0 +1,53 @@
+# compose/orchestration-test.yml
+# CI test runner for orchestration integration tests
+#
+# Uses integration-orchestration feature flag (NOT in parent `integration` list).
+# Orchestration tests require a different server config (orchestration.enabled = true).
+#
+# Usage:
+#   docker compose -p aura-orch-test \
+#     -f compose/base.yml \
+#     -f compose/orchestration.yml \
+#     -f compose/orchestration-test.yml \
+#     up --build --force-recreate --exit-code-from aura-orchestration-test
+
+services:
+  # Silence infrastructure output during tests
+  mock-mcp:
+    attach: false
+    logging:
+      driver: "none"
+
+  aura-web-server:
+    attach: false
+    logging:
+      driver: "none"
+
+  # Orchestration test runner container
+  aura-orchestration-test:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      target: base
+      args:
+        - GITHUB_TOKEN
+    environment:
+      # Point to containerized services (use service names, not localhost)
+      - AURA_SERVER_URL=http://aura-web-server:8080
+      - MCP_SERVER_URL=http://mock-mcp:9998
+      - MCP_MOCK_SERVER_URL=http://mock-mcp:9999
+    env_file:
+      - ./env/test.env
+    depends_on:
+      aura-web-server:
+        condition: service_healthy
+    # Run orchestration tests only
+    # NOTE: --test-threads=1 required due to LLM API rate limits
+    command: >
+      cargo test
+      --package aura-web-server
+      --features integration-orchestration
+      --no-fail-fast
+      -- --test-threads=1
+    networks:
+      - aura-test
