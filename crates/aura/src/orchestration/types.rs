@@ -17,6 +17,16 @@ pub struct Plan {
     pub goal: String,
     /// Ordered list of tasks to accomplish the goal.
     pub tasks: Vec<Task>,
+    /// Optional phase groupings for multi-phase execution.
+    ///
+    /// When `Some`, tasks are executed phase-by-phase with coordinator
+    /// checkpoints between phases. When `None`, all tasks execute as
+    /// a single flat plan (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phases: Option<Vec<Phase>>,
+    /// Index of the currently active phase (0-indexed).
+    #[serde(default)]
+    pub current_phase_index: usize,
 }
 
 impl Plan {
@@ -25,6 +35,8 @@ impl Plan {
         Self {
             goal: goal.into(),
             tasks: Vec::new(),
+            phases: None,
+            current_phase_index: 0,
         }
     }
 
@@ -110,6 +122,84 @@ impl Plan {
                 true
             })
             .collect()
+    }
+
+    /// Whether this plan uses phased execution.
+    pub fn is_phased(&self) -> bool {
+        self.phases.is_some()
+    }
+
+    /// Get the currently active phase, if any.
+    pub fn current_phase(&self) -> Option<&Phase> {
+        self.phases
+            .as_ref()
+            .and_then(|phases| phases.get(self.current_phase_index))
+    }
+
+    /// Advance to the next phase. Returns `true` if there is a next phase.
+    pub fn advance_phase(&mut self) -> bool {
+        if let Some(phases) = &self.phases {
+            if self.current_phase_index + 1 < phases.len() {
+                self.current_phase_index += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get tasks belonging to a specific phase.
+    pub fn phase_tasks(&self, phase_id: usize) -> Vec<&Task> {
+        let Some(phases) = &self.phases else {
+            return Vec::new();
+        };
+        let Some(phase) = phases.iter().find(|p| p.id == phase_id) else {
+            return Vec::new();
+        };
+        self.tasks
+            .iter()
+            .filter(|t| phase.task_ids.contains(&t.id))
+            .collect()
+    }
+
+    /// Get tasks that are ready to execute within the current phase only.
+    ///
+    /// Like `ready_tasks()` but filtered to the current phase's task set.
+    /// Falls back to `ready_tasks()` for flat (non-phased) plans.
+    pub fn current_phase_ready_tasks(&self) -> Vec<&Task> {
+        let Some(phase) = self.current_phase() else {
+            return self.ready_tasks();
+        };
+        let phase_task_ids = &phase.task_ids;
+        self.tasks
+            .iter()
+            .filter(|task| {
+                if !phase_task_ids.contains(&task.id) {
+                    return false;
+                }
+                if task.status != TaskStatus::Pending {
+                    return false;
+                }
+                for dep_id in &task.dependencies {
+                    let dep = self.tasks.iter().find(|t| t.id == *dep_id);
+                    match dep.map(|t| &t.status) {
+                        Some(TaskStatus::Complete) => continue,
+                        _ => return false,
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
+    /// Check if all tasks in the current phase are finished.
+    pub fn is_current_phase_finished(&self) -> bool {
+        let Some(phase) = self.current_phase() else {
+            return self.is_finished();
+        };
+        self.tasks
+            .iter()
+            .filter(|t| phase.task_ids.contains(&t.id))
+            .all(|t| t.status == TaskStatus::Complete || t.status == TaskStatus::Failed)
     }
 
     /// Returns tasks that are blocked due to failed dependencies.
@@ -210,6 +300,47 @@ impl Task {
     }
 }
 
+/// What should happen after a phase completes.
+///
+/// The coordinator inspects phase results and decides whether to proceed
+/// with the next phase or replan based on what was discovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseContinuation {
+    /// Proceed to the next phase as planned.
+    #[default]
+    Continue,
+    /// Discard remaining phases and replan based on results so far.
+    Replan,
+}
+
+impl std::fmt::Display for PhaseContinuation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PhaseContinuation::Continue => write!(f, "continue"),
+            PhaseContinuation::Replan => write!(f, "replan"),
+        }
+    }
+}
+
+/// A group of tasks executed together within a phased plan.
+///
+/// Phases provide deliberate coordinator checkpoints between execution groups.
+/// Between phases, the coordinator inspects results and decides whether to
+/// continue with the next phase or replan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Phase {
+    /// Phase identifier (0-indexed).
+    pub id: usize,
+    /// Human-readable label for this phase (e.g., "Gather data").
+    pub label: String,
+    /// IDs of tasks belonging to this phase.
+    pub task_ids: Vec<usize>,
+    /// Default continuation strategy after this phase completes.
+    #[serde(default)]
+    pub continuation: PhaseContinuation,
+}
+
 /// Status of a task in the execution plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -262,6 +393,9 @@ pub enum PlanningResponse {
         /// Natural-language summary of the plan from the coordinator.
         #[serde(default)]
         planning_summary: String,
+        /// Optional phase groupings for multi-phase execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phases: Option<Vec<PhaseJson>>,
     },
     /// The query is ambiguous and needs clarification from the user.
     #[serde(rename = "clarification")]
@@ -279,7 +413,12 @@ impl PlanningResponse {
     /// Returns `None` for `Direct` and `Clarification` variants.
     pub fn into_plan(self) -> Option<Plan> {
         match self {
-            PlanningResponse::Orchestrated { goal, tasks, .. } => {
+            PlanningResponse::Orchestrated {
+                goal,
+                tasks,
+                phases,
+                ..
+            } => {
                 let mut plan = Plan::new(goal);
                 for task_json in tasks {
                     let mut task = Task::new(
@@ -293,6 +432,24 @@ impl PlanningResponse {
                     }
                     plan.add_task(task);
                 }
+                plan.phases = phases.map(|phase_jsons: Vec<PhaseJson>| {
+                    phase_jsons
+                        .into_iter()
+                        .map(|pj: PhaseJson| Phase {
+                            id: pj.id,
+                            label: pj.label,
+                            task_ids: pj.task_ids,
+                            continuation: pj
+                                .continuation
+                                .as_deref()
+                                .map(|c| match c {
+                                    "replan" => PhaseContinuation::Replan,
+                                    _ => PhaseContinuation::Continue,
+                                })
+                                .unwrap_or_default(),
+                        })
+                        .collect()
+                });
                 Some(plan)
             }
             _ => None,
@@ -348,6 +505,19 @@ pub struct TaskJson {
     pub dependencies: Option<Vec<usize>>,
     #[serde(default)]
     pub worker: Option<String>,
+}
+
+/// JSON representation of a phase in a planning response.
+///
+/// This is the shape the LLM produces when calling `create_plan` with phases.
+/// Converted to `Phase` via `PlanningResponse::into_plan()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhaseJson {
+    pub id: usize,
+    pub label: String,
+    pub task_ids: Vec<usize>,
+    #[serde(default)]
+    pub continuation: Option<String>,
 }
 
 /// Result of semantic evaluation by the coordinator LLM.
@@ -1065,6 +1235,7 @@ mod tests {
             ],
             routing_rationale: "Requires tool execution".to_string(),
             planning_summary: "Fetch and analyze logs".to_string(),
+            phases: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"response_type\":\"orchestrated\""));
@@ -1145,6 +1316,7 @@ mod tests {
             ],
             routing_rationale: "Needs orchestration".to_string(),
             planning_summary: "Execute tasks A and B".to_string(),
+            phases: None,
         };
 
         let plan = response.into_plan().unwrap();
@@ -1190,6 +1362,7 @@ mod tests {
             tasks: vec![],
             routing_rationale: "reason_o".to_string(),
             planning_summary: "summary".to_string(),
+            phases: None,
         };
         assert_eq!(orch.routing_rationale(), "reason_o");
 
@@ -1297,5 +1470,364 @@ mod tests {
         for (f, exp) in cases.iter().zip(expected.iter()) {
             assert_eq!(f.elapsed(), *exp, "elapsed mismatch for {:?}", f);
         }
+    }
+
+    // ========================================================================
+    // Phase and phased plan tests
+    // ========================================================================
+
+    #[test]
+    fn test_plan_phased_creation() {
+        let mut plan = Plan::new("Multi-phase goal");
+        plan.add_task(Task::new(0, "Discover services", "Phase 1 discovery"));
+        plan.add_task(Task::new(1, "Gather metrics", "Phase 1 data collection"));
+        plan.add_task(Task::new(2, "Analyze results", "Phase 2 analysis").with_dependency(0));
+
+        plan.phases = Some(vec![
+            Phase {
+                id: 0,
+                label: "Discovery".to_string(),
+                task_ids: vec![0, 1],
+                continuation: PhaseContinuation::Continue,
+            },
+            Phase {
+                id: 1,
+                label: "Analysis".to_string(),
+                task_ids: vec![2],
+                continuation: PhaseContinuation::Replan,
+            },
+        ]);
+
+        assert!(plan.is_phased());
+        let phase = plan.current_phase().unwrap();
+        assert_eq!(phase.id, 0);
+        assert_eq!(phase.label, "Discovery");
+    }
+
+    #[test]
+    fn test_plan_advance_phase() {
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "A", "first"));
+        plan.add_task(Task::new(1, "B", "second"));
+        plan.add_task(Task::new(2, "C", "third"));
+
+        plan.phases = Some(vec![
+            Phase {
+                id: 0,
+                label: "Phase 1".to_string(),
+                task_ids: vec![0],
+                continuation: PhaseContinuation::Continue,
+            },
+            Phase {
+                id: 1,
+                label: "Phase 2".to_string(),
+                task_ids: vec![1],
+                continuation: PhaseContinuation::Continue,
+            },
+            Phase {
+                id: 2,
+                label: "Phase 3".to_string(),
+                task_ids: vec![2],
+                continuation: PhaseContinuation::Replan,
+            },
+        ]);
+
+        assert_eq!(plan.current_phase().unwrap().id, 0);
+        assert!(plan.advance_phase());
+        assert_eq!(plan.current_phase().unwrap().id, 1);
+        assert!(plan.advance_phase());
+        assert_eq!(plan.current_phase().unwrap().id, 2);
+        // No more phases
+        assert!(!plan.advance_phase());
+        assert_eq!(plan.current_phase().unwrap().id, 2);
+    }
+
+    #[test]
+    fn test_plan_flat_is_not_phased() {
+        let mut plan = Plan::new("Flat plan");
+        plan.add_task(Task::new(0, "Task A", "reason"));
+        plan.add_task(Task::new(1, "Task B", "reason"));
+
+        assert!(!plan.is_phased());
+        assert!(plan.current_phase().is_none());
+        assert!(!plan.advance_phase());
+    }
+
+    #[test]
+    fn test_phase_tasks() {
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "A", "r"));
+        plan.add_task(Task::new(1, "B", "r"));
+        plan.add_task(Task::new(2, "C", "r"));
+
+        plan.phases = Some(vec![
+            Phase {
+                id: 0,
+                label: "Phase 1".to_string(),
+                task_ids: vec![0, 1],
+                continuation: PhaseContinuation::Continue,
+            },
+            Phase {
+                id: 1,
+                label: "Phase 2".to_string(),
+                task_ids: vec![2],
+                continuation: PhaseContinuation::Continue,
+            },
+        ]);
+
+        let p0_tasks = plan.phase_tasks(0);
+        assert_eq!(p0_tasks.len(), 2);
+        assert_eq!(p0_tasks[0].id, 0);
+        assert_eq!(p0_tasks[1].id, 1);
+
+        let p1_tasks = plan.phase_tasks(1);
+        assert_eq!(p1_tasks.len(), 1);
+        assert_eq!(p1_tasks[0].id, 2);
+
+        // Non-existent phase returns empty
+        assert!(plan.phase_tasks(99).is_empty());
+    }
+
+    #[test]
+    fn test_current_phase_ready_tasks() {
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "A", "r"));
+        plan.add_task(Task::new(1, "B", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "C", "r")); // Phase 2
+
+        plan.phases = Some(vec![
+            Phase {
+                id: 0,
+                label: "Phase 1".to_string(),
+                task_ids: vec![0, 1],
+                continuation: PhaseContinuation::Continue,
+            },
+            Phase {
+                id: 1,
+                label: "Phase 2".to_string(),
+                task_ids: vec![2],
+                continuation: PhaseContinuation::Continue,
+            },
+        ]);
+
+        // Phase 1: only task 0 is ready (task 1 depends on 0)
+        let ready = plan.current_phase_ready_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 0);
+
+        // Task 2 is NOT ready (wrong phase)
+        assert!(ready.iter().all(|t| t.id != 2));
+
+        // Complete task 0 → task 1 becomes ready
+        plan.get_task_mut(0).unwrap().complete("done");
+        let ready = plan.current_phase_ready_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+    }
+
+    #[test]
+    fn test_is_current_phase_finished() {
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "A", "r"));
+        plan.add_task(Task::new(1, "B", "r"));
+
+        plan.phases = Some(vec![Phase {
+            id: 0,
+            label: "Phase 1".to_string(),
+            task_ids: vec![0, 1],
+            continuation: PhaseContinuation::Continue,
+        }]);
+
+        assert!(!plan.is_current_phase_finished());
+        plan.get_task_mut(0).unwrap().complete("done");
+        assert!(!plan.is_current_phase_finished());
+        plan.get_task_mut(1).unwrap().complete("done");
+        assert!(plan.is_current_phase_finished());
+    }
+
+    #[test]
+    fn test_phased_plan_parsing() {
+        let response = PlanningResponse::Orchestrated {
+            goal: "Investigate system".to_string(),
+            tasks: vec![
+                TaskJson {
+                    id: 0,
+                    description: "Discover services".to_string(),
+                    rationale: Some("Need to find what's running".to_string()),
+                    dependencies: None,
+                    worker: None,
+                },
+                TaskJson {
+                    id: 1,
+                    description: "Analyze health".to_string(),
+                    rationale: Some("Check discovered services".to_string()),
+                    dependencies: Some(vec![0]),
+                    worker: None,
+                },
+            ],
+            routing_rationale: "Complex investigation".to_string(),
+            planning_summary: "Discover then analyze".to_string(),
+            phases: Some(vec![
+                PhaseJson {
+                    id: 0,
+                    label: "Discovery".to_string(),
+                    task_ids: vec![0],
+                    continuation: Some("continue".to_string()),
+                },
+                PhaseJson {
+                    id: 1,
+                    label: "Analysis".to_string(),
+                    task_ids: vec![1],
+                    continuation: Some("replan".to_string()),
+                },
+            ]),
+        };
+
+        let plan = response.into_plan().unwrap();
+        assert!(plan.is_phased());
+        let phases = plan.phases.as_ref().unwrap();
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].label, "Discovery");
+        assert_eq!(phases[0].continuation, PhaseContinuation::Continue);
+        assert_eq!(phases[1].label, "Analysis");
+        assert_eq!(phases[1].continuation, PhaseContinuation::Replan);
+        assert_eq!(phases[1].task_ids, vec![1]);
+    }
+
+    #[test]
+    fn test_flat_plan_parsing_unchanged() {
+        // Existing flat plan (no phases) should parse identically
+        let response = PlanningResponse::Orchestrated {
+            goal: "Simple query".to_string(),
+            tasks: vec![
+                TaskJson {
+                    id: 0,
+                    description: "Do thing".to_string(),
+                    rationale: Some("Reason".to_string()),
+                    dependencies: None,
+                    worker: None,
+                },
+            ],
+            routing_rationale: "Needs tool".to_string(),
+            planning_summary: "Just do it".to_string(),
+            phases: None,
+        };
+
+        let plan = response.into_plan().unwrap();
+        assert!(!plan.is_phased());
+        assert!(plan.phases.is_none());
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].description, "Do thing");
+    }
+
+    #[test]
+    fn test_phase_continuation_display() {
+        assert_eq!(PhaseContinuation::Continue.to_string(), "continue");
+        assert_eq!(PhaseContinuation::Replan.to_string(), "replan");
+    }
+
+    #[test]
+    fn test_phase_continuation_default() {
+        let default: PhaseContinuation = Default::default();
+        assert_eq!(default, PhaseContinuation::Continue);
+    }
+
+    #[test]
+    fn test_phased_plan_serde_roundtrip() {
+        let response = PlanningResponse::Orchestrated {
+            goal: "Test".to_string(),
+            tasks: vec![TaskJson {
+                id: 0,
+                description: "Task".to_string(),
+                rationale: None,
+                dependencies: None,
+                worker: None,
+            }],
+            routing_rationale: "reason".to_string(),
+            planning_summary: "summary".to_string(),
+            phases: Some(vec![PhaseJson {
+                id: 0,
+                label: "Only phase".to_string(),
+                task_ids: vec![0],
+                continuation: Some("continue".to_string()),
+            }]),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"phases\""));
+        assert!(json.contains("\"Only phase\""));
+
+        let deserialized: PlanningResponse = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            PlanningResponse::Orchestrated { phases, .. } => {
+                let phases = phases.unwrap();
+                assert_eq!(phases.len(), 1);
+                assert_eq!(phases[0].label, "Only phase");
+            }
+            other => panic!("Expected Orchestrated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_flat_plan_serde_no_phases_field() {
+        let response = PlanningResponse::Orchestrated {
+            goal: "Test".to_string(),
+            tasks: vec![],
+            routing_rationale: "reason".to_string(),
+            planning_summary: "summary".to_string(),
+            phases: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        // phases: None with skip_serializing_if should omit the field
+        assert!(!json.contains("\"phases\""));
+
+        // Deserializing JSON without phases field should produce None
+        let deserialized: PlanningResponse = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            PlanningResponse::Orchestrated { phases, .. } => {
+                assert!(phases.is_none());
+            }
+            other => panic!("Expected Orchestrated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_phase_continuation_missing_defaults_to_continue() {
+        // When continuation is omitted from JSON, it should default to Continue
+        let response = PlanningResponse::Orchestrated {
+            goal: "Test".to_string(),
+            tasks: vec![TaskJson {
+                id: 0,
+                description: "Task".to_string(),
+                rationale: None,
+                dependencies: None,
+                worker: None,
+            }],
+            routing_rationale: "reason".to_string(),
+            planning_summary: "summary".to_string(),
+            phases: Some(vec![PhaseJson {
+                id: 0,
+                label: "Phase".to_string(),
+                task_ids: vec![0],
+                continuation: None, // omitted
+            }]),
+        };
+
+        let plan = response.into_plan().unwrap();
+        let phases = plan.phases.as_ref().unwrap();
+        assert_eq!(phases[0].continuation, PhaseContinuation::Continue);
+    }
+
+    #[test]
+    fn test_current_phase_ready_tasks_flat_plan_fallback() {
+        // For a flat plan, current_phase_ready_tasks should behave like ready_tasks
+        let mut plan = Plan::new("Flat");
+        plan.add_task(Task::new(0, "A", "r"));
+        plan.add_task(Task::new(1, "B", "r").with_dependency(0));
+
+        let ready = plan.current_phase_ready_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 0);
     }
 }
