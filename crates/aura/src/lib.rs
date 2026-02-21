@@ -19,6 +19,8 @@ pub mod mcp_streamable_http;
 pub mod mcp_tool_execution;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
+pub mod orchestration;
+pub mod prompts;
 mod provider_agent; // Private - internal implementation detail
 pub mod rag_tools;
 pub mod request_cancellation;
@@ -29,18 +31,29 @@ pub mod streaming;
 pub mod streaming_request_hook;
 pub mod bedrock_embedding;
 pub(crate) mod string_utils;
+pub mod todo_tool;
+pub mod tool_call_observer;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
+pub mod tool_wrapper;
 pub mod tools;
 pub mod vector_dynamic;
 pub mod vector_store;
 
-pub use builder::{Agent, AgentBuilder, FilesystemTools};
+pub use builder::{build_streaming_agent, Agent, AgentBuilder, FilesystemTools};
 pub use config::{
     AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, ToolsConfig, VectorStoreConfig, VectorStoreType,
+    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
 };
 pub use error::{BuilderError, BuilderResult};
+pub use orchestration::tools::{
+    CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,
+};
+pub use orchestration::{
+    ArtifactsConfig, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
+    OrchestratorEvent, Plan, PlanAttemptFailure, PlanningResponse, Task, TaskJson, TaskStatus,
+    TimeoutsConfig,
+};
 pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
     ToolCall, ToolResult,
@@ -68,9 +81,18 @@ pub use request_progress::{
     subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
-pub use stream_events::{AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
+pub use stream_events::{format_named_sse, AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
+pub use todo_tool::{
+    PlanIteration, PlanState, ReadTodosArgs, ReadTodosTool, Todo, TodoError, TodoState, TodoStatus,
+    TodoWriteTool, WriteTodosArgs, TODO_SYSTEM_PROMPT, TODO_TOOL_DESCRIPTION,
+};
+pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
+pub use tool_wrapper::{
+    ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
+    WrappedTool,
+};
 pub use tool_event_broker::{
     ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
     global as tool_event_global, peek_tool_call_id, pop_tool_call_id, publish_tool_start,

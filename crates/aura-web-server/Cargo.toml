@@ -52,6 +52,9 @@ integration-progress = []                 # mcp_progress_test, progress_disconne
 # Optional - requires Qdrant (separate epic)
 integration-vector = []         # vector_label_filter_tests
 
+# Orchestration tests (separate from integration - needs different server config)
+integration-orchestration = []  # orchestration_events_test
+
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json", "stream"] }
