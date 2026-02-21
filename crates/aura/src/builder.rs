@@ -6,6 +6,8 @@ use crate::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
     },
+    todo_tool::TodoWriteTool,
+    tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
@@ -18,11 +20,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Default maximum depth for multi-turn conversations
-pub const DEFAULT_MAX_DEPTH: usize = 8;
+/// Default maximum depth for multi-turn conversations.
+///
+/// This is the system-wide fallback when `[agent].turn_depth` is not set in TOML.
+/// Models with extended thinking (e.g. qwen3-coder) burn ReAct turns on reasoning
+/// before tool calls, so 12 gives adequate headroom.
+pub const DEFAULT_MAX_DEPTH: usize = 12;
 
 /// Check if model supports reasoning_effort parameter
-fn is_reasoning_model(model: &str) -> bool {
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
     model.starts_with("o1")
         || model.starts_with("o3")
         || model.starts_with("o4")
@@ -35,7 +41,7 @@ fn is_reasoning_model(model: &str) -> bool {
 /// JSON object that gets passed to Rig's `additional_params()` method.
 ///
 /// Returns `None` if no parameters are set.
-fn build_ollama_params(
+pub(crate) fn build_ollama_params(
     num_ctx: Option<u32>,
     num_predict: Option<u32>,
     additional_params: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -58,6 +64,28 @@ fn build_ollama_params(
         None
     } else {
         Some(serde_json::Value::Object(params))
+    }
+}
+
+/// Log tool count with optional filter indication
+fn log_filtered_tools(emoji: &str, transport: &str, server: &str, filtered: usize, total: usize) {
+    if filtered < total {
+        tracing::info!(
+            "{} Adding {}/{} {} tools from {}",
+            emoji,
+            filtered,
+            total,
+            transport,
+            server
+        );
+    } else {
+        tracing::info!(
+            "{} Adding {} {} tools from {}",
+            emoji,
+            total,
+            transport,
+            server
+        );
     }
 }
 
@@ -84,17 +112,17 @@ pub struct FilesystemTools {
 ///    patterns (JSON/XML), and executes via `McpManager::execute_fallback_tool()`.
 ///    This bypasses Rig's tool infrastructure entirely.
 pub struct Agent {
-    inner: ProviderAgent,
-    model: String,
-    max_depth: usize,
-    mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    pub(crate) inner: ProviderAgent,
+    pub(crate) model: String,
+    pub(crate) max_depth: usize,
+    pub(crate) mcp_manager: Option<Arc<crate::mcp::McpManager>>,
     /// Ollama text-to-tool parsing: when enabled, intercepts text output containing
     /// tool calls (JSON/XML) and executes them. Only applies to Ollama provider.
     /// See `maybe_wrap_with_fallback()` for the wrapping logic.
-    fallback_tool_parsing: bool,
+    pub(crate) fallback_tool_parsing: bool,
     /// Cached tool names for fallback parsing (avoids recomputing on each stream).
     /// Only populated when `fallback_tool_parsing` is enabled.
-    fallback_tool_names: Vec<String>,
+    pub(crate) fallback_tool_names: Vec<String>,
     /// Configured context window size in tokens (from TOML config).
     /// Used for usage percentage reporting in streaming events.
     context_window: Option<u32>,
@@ -185,7 +213,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -243,7 +271,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -297,7 +325,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -335,7 +363,7 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -371,7 +399,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -405,7 +433,11 @@ impl Agent {
     }
 
     /// Add all tools to a builder state (shared across all providers)
-    async fn add_all_tools<M>(
+    ///
+    /// When `config.tool_wrapper` is set, MCP tools are wrapped with the provided
+    /// wrapper. The `config.tool_context_factory` is used to create context for each
+    /// wrapped tool call.
+    pub(crate) async fn add_all_tools<M>(
         mut builder_state: BuilderState<M>,
         config: &AgentConfig,
         mcp_manager: &Option<Arc<McpManager>>,
@@ -413,18 +445,31 @@ impl Agent {
     where
         M: rig::completion::CompletionModel + Send + Sync,
     {
+        if config.tool_wrapper.is_some() {
+            tracing::info!("Tool wrapper configured");
+        }
+        if let Some(ref patterns) = config.mcp_filter {
+            tracing::info!("MCP filter: {} pattern(s)", patterns.len());
+        }
+
         // Add HTTP streamable tools using dynamic adaptors
         if let Some(mcp_manager) = mcp_manager.as_deref() {
             for (server_name, client) in &mcp_manager.streamable_clients {
                 if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
-                    tracing::info!(
-                        "Adding {} dynamic HTTP streamable tools from server: {}",
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "HTTP streamable",
+                        server_name,
+                        filtered_tools.len(),
                         server_tools.len(),
-                        server_name
                     );
 
                     let client_arc = Arc::new(client.clone());
-                    for mcp_tool in server_tools {
+                    for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
 
                         let tool_adaptor = crate::mcp_dynamic::HttpMcpToolAdaptor::new(
@@ -433,7 +478,8 @@ impl Agent {
                             client_arc.clone(),
                         );
 
-                        builder_state = builder_state.add_tool(tool_adaptor);
+                        // Wrap with tool_wrapper if configured
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
                     }
                 }
             }
@@ -487,9 +533,17 @@ impl Agent {
         if let Some(mcp_manager) = mcp_manager.as_deref()
             && !mcp_manager.tool_definitions.is_empty()
         {
-            tracing::info!(
-                "Adding {} STDIO MCP tools",
-                mcp_manager.tool_definitions.len()
+            let filtered_definitions: Vec<_> = mcp_manager
+                .tool_definitions
+                .iter()
+                .filter(|(tool, _)| config.tool_matches_filter(&tool.name))
+                .collect();
+            log_filtered_tools(
+                "",
+                "STDIO",
+                "MCP servers",
+                filtered_definitions.len(),
+                mcp_manager.tool_definitions.len(),
             );
 
             // Group tools by client (rmcp_tools takes Vec<Tool> + one client)
@@ -499,7 +553,7 @@ impl Agent {
                 (Vec<rmcp::model::Tool>, rmcp::service::ServerSink),
             > = HashMap::new();
 
-            for (tool, client) in &mcp_manager.tool_definitions {
+            for (tool, client) in filtered_definitions {
                 let client_key = format!("{client:?}");
                 tools_by_client
                     .entry(client_key)
@@ -514,7 +568,78 @@ impl Agent {
             }
         }
 
+        // Add Todo tools when todo_tools_config is set
+        // This allows the agent to plan and track complex multi-step tasks
+        if let Some(ref todo_config) = config.todo_tools_config {
+            let (todo_write_tool, todo_state) = if let Some(ref dir) = todo_config.plan_dir {
+                tracing::info!(
+                    "Adding write_todos and read_todos tools with persistence to: {}",
+                    dir
+                );
+                TodoWriteTool::new_with_persistence(dir)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+            } else {
+                tracing::info!("Adding write_todos and read_todos tools (in-memory)");
+                TodoWriteTool::new()
+            };
+
+            let todo_read_tool = crate::todo_tool::ReadTodosTool::with_state(todo_state);
+            builder_state = builder_state.add_tool(todo_write_tool);
+            builder_state = builder_state.add_tool(todo_read_tool);
+        }
+
+        // Add read_artifact tool when orchestration persistence is available
+        if let Some(ref persistence) = config.orchestration_persistence {
+            let read_artifact = crate::orchestration::ReadArtifactTool::new(persistence.clone());
+            builder_state = builder_state.add_tool(read_artifact);
+        }
+
+        // Add get_conversation_context tool when chat history is available
+        if let Some(ref history) = config.orchestration_chat_history {
+            let context_tool =
+                crate::orchestration::GetConversationContextTool::new(history.clone());
+            builder_state = builder_state.add_tool(context_tool);
+        }
+
         Ok(builder_state)
+    }
+
+    /// Helper to add an MCP tool, optionally wrapping with config.tool_wrapper.
+    ///
+    /// If `config.tool_wrapper` is set, the tool is wrapped and a context is
+    /// created using `config.tool_context_factory` (or a default context).
+    fn add_mcp_tool<M, T>(
+        builder_state: BuilderState<M>,
+        tool: T,
+        config: &AgentConfig,
+    ) -> BuilderState<M>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+        T: rig::tool::Tool<Args = serde_json::Value, Output = String, Error = rig::tool::ToolError>
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        match (&config.tool_wrapper, &config.tool_context_factory) {
+            (Some(wrapper), Some(ctx_factory)) => {
+                // Wrap with both wrapper and context factory
+                let tool_name = tool.name();
+                let ctx_factory = ctx_factory.clone();
+                let wrapped = WrappedTool::new(tool, wrapper.clone())
+                    .with_context_factory(move |_| ctx_factory(&tool_name));
+                builder_state.add_tool(wrapped)
+            }
+            (Some(wrapper), None) => {
+                // Wrap with wrapper only (default context)
+                let wrapped = WrappedTool::new(tool, wrapper.clone());
+                builder_state.add_tool(wrapped)
+            }
+            _ => {
+                // No wrapping
+                builder_state.add_tool(tool)
+            }
+        }
     }
 
     /// Process a query with the agent (no chat history).
@@ -938,6 +1063,52 @@ impl StreamingAgent for Agent {
         };
 
         (Box::pin(stream), cancel_tx)
+    }
+
+    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
+        // Delegate to the existing Agent method
+        Agent::cancel_and_close_mcp(self, request_id, reason).await
+    }
+
+    async fn set_mcp_request_id(&self, request_id: &str) {
+        // Delegate to the existing Agent method
+        Agent::set_mcp_request_id(self, request_id).await
+    }
+
+    async fn clear_mcp_request_id(&self) {
+        // Delegate to the existing Agent method
+        Agent::clear_mcp_request_id(self).await
+    }
+
+    fn context_window(&self) -> Option<u32> {
+        self.context_window
+    }
+}
+
+/// Build the appropriate streaming agent based on configuration.
+///
+/// This factory function examines the `orchestration.enabled` flag in the config
+/// and returns either:
+/// - An `Orchestrator` if orchestration is enabled
+/// - A standard `Agent` if orchestration is disabled (default)
+///
+/// Both implement `StreamingAgent`, so the caller can use them interchangeably.
+pub async fn build_streaming_agent(
+    config: &crate::config::AgentConfig,
+) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
+    // Import Orchestrator only when needed (keeps orchestration coupling minimal)
+    use crate::orchestration::Orchestrator;
+
+    if config.orchestration_enabled() {
+        // Use multi-agent orchestrator: plan -> execute (workers) -> synthesize
+        tracing::info!("Building Orchestrator (orchestration.enabled = true)");
+        let orchestrator = Orchestrator::new(config.clone()).await?;
+        Ok(Arc::new(orchestrator))
+    } else {
+        // Standard single-agent mode
+        tracing::info!("Building Agent (orchestration.enabled = false)");
+        let agent = Agent::new(config).await?;
+        Ok(Arc::new(agent))
     }
 }
 

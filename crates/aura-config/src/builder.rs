@@ -1,9 +1,11 @@
 use crate::{Config, ConfigError};
 use aura::{
-    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
-    McpServerConfig, ReasoningEffort, ToolsConfig, VectorStoreConfig,
+    orchestration::ToolVisibility as AuraToolVisibility, Agent, AgentBuilder, AgentConfig,
+    AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
+    OrchestrationConfig, ReasoningEffort, StreamingAgent, ToolsConfig, VectorStoreConfig,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct RigBuilder {
     config: Config,
@@ -161,12 +163,69 @@ impl RigBuilder {
             custom_tools: tools_config.custom_tools.clone(),
         });
 
+        // Convert orchestration config
+        let orchestration = self.config.orchestration.as_ref().map(|orch| {
+            let workers = orch
+                .workers
+                .iter()
+                .map(|(name, worker)| {
+                    (
+                        name.clone(),
+                        aura::orchestration::WorkerConfig {
+                            description: worker.description.clone(),
+                            preamble: worker.preamble.clone(),
+                            mcp_filter: worker.mcp_filter.clone(),
+                            vector_stores: worker.vector_stores.clone(),
+                            turn_depth: worker.turn_depth,
+                        },
+                    )
+                })
+                .collect();
+
+            let tools_in_planning = match orch.tools_in_planning {
+                crate::ToolVisibility::None => AuraToolVisibility::None,
+                crate::ToolVisibility::Summary => AuraToolVisibility::Summary,
+                crate::ToolVisibility::Full => AuraToolVisibility::Full,
+            };
+
+            OrchestrationConfig {
+                enabled: orch.enabled,
+                max_planning_cycles: orch.max_planning_cycles,
+                quality_threshold: orch.quality_threshold,
+                max_plan_parse_retries: orch.max_plan_parse_retries,
+                worker_system_prompt: orch.worker_system_prompt.clone(),
+                workers,
+                coordinator_vector_stores: orch.coordinator_vector_stores.clone(),
+                tools_in_planning,
+                max_tools_per_worker: orch.max_tools_per_worker,
+                allow_direct_answers: orch.allow_direct_answers,
+                allow_clarification: orch.allow_clarification,
+                timeouts: aura::orchestration::TimeoutsConfig {
+                    per_call_timeout_secs: orch.timeouts.per_call_timeout_secs,
+                },
+                artifacts: aura::orchestration::ArtifactsConfig {
+                    memory_dir: orch.artifacts.memory_dir.clone(),
+                    result_artifact_threshold: orch.artifacts.result_artifact_threshold,
+                    result_summary_length: orch.artifacts.result_summary_length,
+                },
+            }
+        });
+
         Ok(AgentConfig {
             llm,
             agent,
             vector_stores,
             mcp,
             tools,
+            orchestration,
+            // Extension fields default to None (set by orchestrator for workers)
+            tool_wrapper: None,
+            tool_context_factory: None,
+            preamble_override: None,
+            todo_tools_config: None,
+            mcp_filter: None,
+            orchestration_persistence: None,
+            orchestration_chat_history: None,
         })
     }
 
@@ -189,6 +248,23 @@ impl RigBuilder {
             .build_agent()
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build agent: {e}")))
+    }
+
+    /// Build a streaming agent with optional dynamic MCP headers.
+    ///
+    /// Returns either:
+    /// - An `Orchestrator` wrapped as `Arc<dyn StreamingAgent>` if `orchestration.enabled = true`
+    /// - A standard `Agent` wrapped as `Arc<dyn StreamingAgent>` otherwise
+    pub async fn build_streaming_agent_with_headers(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+    ) -> Result<Arc<dyn StreamingAgent>, ConfigError> {
+        let mut agent_config = self.to_agent_config()?;
+        resolve_mcp_headers(&mut agent_config, req_headers);
+
+        aura::build_streaming_agent(&agent_config)
+            .await
+            .map_err(|e| ConfigError::Validation(format!("Failed to build streaming agent: {e}")))
     }
 }
 

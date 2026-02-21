@@ -1,0 +1,114 @@
+# Example: Math Orchestration (Self-Contained Test Scenario)
+#
+# A contrived orchestration config for testing the full pipeline without
+# external dependencies. Uses the mock MCP server's generic tools with
+# math-themed worker personas.
+#
+# This exercises:
+#   - Three-way routing (direct answer, orchestrated plan, clarification)
+#   - Worker dispatch with mcp_filter
+#   - Tool call events within workers
+#   - Multi-iteration quality evaluation
+#
+# Usage (local, with mock MCP on port 9999):
+#   CONFIG_PATH=configs/example-math-orchestration.toml \
+#   AURA_CUSTOM_EVENTS=true \
+#   cargo run --bin aura-web-server
+#
+# Usage (Docker Compose):
+#   docker compose -f compose/base.yml -f compose/dev.yml up -d
+#   # Then use this config with the web server
+#
+# Test queries:
+#   Direct:        "What is 2 + 2?"
+#   Orchestrated:  "Calculate (3 + 7) * 2 and also find the files in /data"
+#   Clarification: "Compute the thing"
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o-mini"
+
+[agent]
+name = "Math Orchestrator"
+# In orchestration mode, [agent].system_prompt serves as the coordinator prompt.
+# It provides domain context and routing guidance to the coordinator agent.
+system_prompt = """
+You are a math assistant coordinator. You decompose math problems into
+specialized tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Simple arithmetic (single operation): answer directly
+- Multi-step calculations or mixed tasks: create a plan with workers
+- Vague requests ("compute the thing"): ask for clarification
+
+IMPORTANT: Always use the appropriate worker's tools for calculations.
+Do not try to compute results yourself — delegate to workers.
+"""
+turn_depth = 5
+
+# Mock MCP server (use compose service name or localhost)
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.mock]
+transport = "http_streamable"
+url = "http://{{ env.MCP_MOCK_HOST | default: '127.0.0.1' }}:9999/mcp"
+headers = {}
+description = "Mock MCP server providing math and file tools for testing"
+
+# Orchestration configuration
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+quality_threshold = 0.7
+memory_dir = "/tmp/aura-math-orchestration"
+
+# Routing behavior
+allow_direct_answers = true
+allow_clarification = true
+
+# Show tool names to coordinator during planning
+tools_in_planning = "summary"
+
+# Worker: arithmetic
+# Uses mock_tool as a stand-in for computation. The LLM formats the
+# calculation as a message, and the mock tool echoes it back.
+[orchestration.worker.arithmetic]
+description = "Arithmetic operations: addition, subtraction, multiplication, division"
+mcp_filter = ["mock_tool"]
+
+preamble = """
+You are an Arithmetic Specialist.
+
+YOUR ROLE:
+- Perform basic arithmetic: add, subtract, multiply, divide
+- Show your work step by step
+
+TOOL USAGE:
+- Use mock_tool to record each calculation step
+- Pass the expression and result as the message
+- Example: mock_tool(message="3 + 7 = 10")
+
+Always verify your calculations before reporting results.
+"""
+
+# Worker: data
+# Uses list_files and chain_tool for multi-step data operations.
+[orchestration.worker.data]
+description = "Data operations: listing files, multi-step data processing chains"
+mcp_filter = ["list_files", "chain_tool"]
+
+preamble = """
+You are a Data Operations Specialist.
+
+YOUR ROLE:
+- List files and directory contents
+- Execute multi-step data processing chains
+- Report findings with file paths and details
+
+TOOL USAGE:
+- Use list_files to explore directories
+- Use chain_tool for multi-step processing sequences
+- Always report what you found
+"""
