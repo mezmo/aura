@@ -67,4 +67,7 @@ pub use tools::GetConversationContextTool;
 pub use tools::ReadArtifactTool;
 
 pub use prompt_constants::{context, fields, sections};
-pub use types::{Plan, PlanAttemptFailure, PlanningResponse, Task, TaskJson, TaskStatus};
+pub use types::{
+    Phase, PhaseContinuation, PhaseJson, Plan, PlanAttemptFailure, PlanningResponse, Task, TaskJson,
+    TaskStatus,
+};
