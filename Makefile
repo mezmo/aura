@@ -158,6 +158,63 @@ test-integration-local::  ## Start local aura infra, run integration tests, then
 	$(MAKE) test-integration-local-down; \
 	exit $$test_exit
 
+# --- Orchestration integration tests ---
+# Orchestration tests require a different server config (orchestration.enabled = true).
+# These are NOT included in the parent `integration` feature flag.
+
+.PHONY:test-integration-orchestration
+test-integration-orchestration::  ## Run orchestration integration tests via Docker Compose
+	@echo "Starting orchestration integration test environment..."
+	docker compose -p aura-test-orchestration-$(GIT_SHA1) \
+		-f compose/base.yml \
+		-f compose/orchestration.yml \
+		-f compose/orchestration-test.yml \
+		up --build --force-recreate --exit-code-from aura-orchestration-test
+	@$(MAKE) test-integration-orchestration-down
+
+.PHONY:test-integration-orchestration-down
+test-integration-orchestration-down:  ## Cleanup orchestration integration test containers
+	-docker compose -p aura-test-orchestration-$(GIT_SHA1) \
+		-f compose/base.yml \
+		-f compose/orchestration.yml \
+		-f compose/orchestration-test.yml \
+		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+
+.PHONY:test-integration-orchestration-local-up
+test-integration-orchestration-local-up::  ## Start local aura infra for orchestration testing
+	@echo "Starting local aura infra for orchestration testing (math-mcp built via compose)..."
+	docker compose -f compose/base.yml -f compose/orchestration.yml -f compose/dev.yml up -d --build --force-recreate
+	@echo "Waiting for services to be healthy..."
+	@timeout=120; while [ $$timeout -gt 0 ]; do \
+		math_status=$$(docker compose -f compose/base.yml -f compose/orchestration.yml -f compose/dev.yml ps math-mcp --format '{{.Health}}' 2>/dev/null); \
+		aura_status=$$(docker compose -f compose/base.yml -f compose/orchestration.yml -f compose/dev.yml ps aura-web-server --format '{{.Health}}' 2>/dev/null); \
+		if [ "$$math_status" = "healthy" ] && [ "$$aura_status" = "healthy" ]; then \
+			echo "✅ math-mcp is healthy"; \
+			echo "✅ aura-web-server is healthy"; \
+			exit 0; \
+		fi; \
+		echo "Waiting... math-mcp: $$math_status, aura-web-server: $$aura_status ($$timeout s remaining)"; \
+		sleep 2; \
+		timeout=$$((timeout - 2)); \
+	done; \
+	echo "❌ Timeout waiting for services to become healthy"; \
+	exit 1
+
+.PHONY:test-integration-orchestration-local-down
+test-integration-orchestration-local-down::  ## Stop local aura infra for orchestration
+	@echo "Stopping local aura infra for orchestration..."
+	docker compose -f compose/base.yml -f compose/orchestration.yml -f compose/dev.yml down
+
+.PHONY:test-integration-orchestration-local
+test-integration-orchestration-local::  ## Start local orchestration infra, run tests, then cleanup
+	@$(MAKE) test-integration-orchestration-local-up
+	@echo "Running orchestration integration tests..."
+	@trap '$(MAKE) test-integration-orchestration-local-down; exit 130' INT TERM; \
+	cargo test --package aura-web-server --features integration-orchestration --no-fail-fast -- --test-threads=1; \
+	test_exit=$$?; \
+	$(MAKE) test-integration-orchestration-local-down; \
+	exit $$test_exit
+
 .PHONY:fmt
 fmt::                 ## Format code with rustfmt
 	cargo fmt --all

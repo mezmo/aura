@@ -1,7 +1,7 @@
 use actix_web::{web, HttpResponse};
 use aura::{
     request_progress_subscribe, tool_event_subscribe, tool_usage_subscribe, Agent,
-    RequestCancellation, ResponseContent, UsageState,
+    RequestCancellation, ResponseContent, StreamingAgent, UsageState,
 };
 use aura_config::RigBuilder;
 use chrono::Utc;
@@ -41,11 +41,11 @@ impl Drop for ActiveRequestGuard {
 /// Manages: cancellation, subscriptions (progress, tool events, tool usage), MCP state.
 struct RequestResourceGuard {
     request_id: String,
-    agent: Arc<Agent>,
+    agent: Arc<dyn StreamingAgent>,
 }
 
 impl RequestResourceGuard {
-    fn new(request_id: String, agent: Arc<Agent>) -> Self {
+    fn new(request_id: String, agent: Arc<dyn StreamingAgent>) -> Self {
         Self { request_id, agent }
     }
 }
@@ -140,10 +140,15 @@ async fn build_agent_for_request(
 
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
+///
+/// `streaming_agent` is the polymorphic agent (Agent or Orchestrator) used for stream
+/// creation and MCP lifecycle. `concrete_agent` is present only for the standard
+/// (non-orchestration) path where Agent-specific methods provide usage state tracking.
 struct RequestSetup {
     query: String,
     chat_history: Vec<aura::Message>,
-    agent: Arc<Agent>,
+    streaming_agent: Arc<dyn StreamingAgent>,
+    concrete_agent: Option<Arc<Agent>>,
     completion_id: String,
     model_str: String,
     created_timestamp: u64,
@@ -151,7 +156,7 @@ struct RequestSetup {
     has_chat_history: bool,
 }
 
-/// Extract query, chat history, and build agent — shared across both code paths.
+/// Extract query, chat history, and build agent -- shared across both code paths.
 async fn prepare_request(
     data: &web::Data<AppState>,
     req: &ChatCompletionRequest,
@@ -184,13 +189,39 @@ async fn prepare_request(
         })
         .collect();
 
-    // Build a fresh agent for this request
-    let agent = match build_agent_for_request(&data.config, req_headers_map).await {
-        Ok(agent) => agent,
-        Err(response) => return Err(response),
-    };
+    // Build the appropriate agent type based on orchestration config
+    let (streaming_agent, concrete_agent): (Arc<dyn StreamingAgent>, Option<Arc<Agent>>) =
+        if data.config.orchestration_enabled() {
+            // Orchestration path: build via streaming agent builder (returns Orchestrator)
+            let builder = RigBuilder::new((*data.config).clone());
+            match builder
+                .build_streaming_agent_with_headers(Some(req_headers_map))
+                .await
+            {
+                Ok(sa) => (sa, None),
+                Err(e) => {
+                    error!("Failed to build streaming agent: {}", e);
+                    return Err(HttpResponse::InternalServerError().json(ErrorResponse {
+                        error: ErrorDetail {
+                            message: format!("Failed to build streaming agent: {e}"),
+                            error_type: "internal_error".to_string(),
+                        },
+                    }));
+                }
+            }
+        } else {
+            // Standard path: build Agent (coerces to Arc<dyn StreamingAgent>)
+            match build_agent_for_request(&data.config, req_headers_map).await {
+                Ok(agent) => {
+                    let sa: Arc<dyn StreamingAgent> = agent.clone();
+                    (sa, Some(agent))
+                }
+                Err(response) => return Err(response),
+            }
+        };
 
-    let (provider, model) = agent.get_provider_info();
+    // Get provider info from config (works for both agent types)
+    let (provider, model) = data.config.get_provider_info();
     let model_str = format!("{provider}/{model}");
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_timestamp = Utc::now().timestamp() as u64;
@@ -199,7 +230,8 @@ async fn prepare_request(
     Ok(RequestSetup {
         query,
         chat_history,
-        agent,
+        streaming_agent,
+        concrete_agent,
         completion_id,
         model_str,
         created_timestamp,
@@ -296,7 +328,17 @@ fn build_completion_config(
         &setup.chat_session_id,
     );
 
-    let (provider, model) = setup.agent.get_provider_info();
+    // Use concrete agent for provider info when available, fall back to config
+    let (provider, model) = match &setup.concrete_agent {
+        Some(agent) => {
+            let (p, m) = agent.get_provider_info();
+            (p.to_string(), m.to_string())
+        }
+        None => {
+            let (p, m) = data.config.get_provider_info();
+            (p.to_string(), m.to_string())
+        }
+    };
     let response_content = ResponseContent::new();
     let message_count = setup.chat_history.len() + 1; // +1 for the current query
 
@@ -308,8 +350,8 @@ fn build_completion_config(
         turn_context,
         stream_shutdown_token: data.stream_shutdown_token.clone(),
         active_requests: data.active_requests.clone(),
-        provider: provider.to_string(),
-        model: model.to_string(),
+        provider,
+        model,
         query_for_otel: setup.query.clone(),
         message_count,
         response_content,
@@ -324,27 +366,48 @@ fn build_completion_config(
 async fn execute_completion(setup: RequestSetup, config: CompletionConfig, delivery: DeliveryMode) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
     let _cancellation = RequestCancellation::register(config.request_id.clone());
-    setup.agent.set_mcp_request_id(&config.request_id).await;
+    setup
+        .streaming_agent
+        .set_mcp_request_id(&config.request_id)
+        .await;
 
     // RAII guard ensures cleanup of all request resources even on panic
-    let _resource_guard = RequestResourceGuard::new(config.request_id.clone(), setup.agent.clone());
+    let _resource_guard =
+        RequestResourceGuard::new(config.request_id.clone(), setup.streaming_agent.clone());
 
-    // Create stream with timeout — gets hooks, usage tracking, cancellation
-    let (stream, cancel_tx, usage_state) = if setup.has_chat_history {
-        setup
-            .agent
-            .stream_chat_with_timeout(
+    // Create stream with timeout.
+    // Standard path: use Agent-specific methods for usage state tracking via Rig hooks.
+    // Orchestration path: use StreamingAgent trait method with fresh UsageState.
+    let (stream, cancel_tx, usage_state) = if let Some(ref agent) = setup.concrete_agent {
+        if setup.has_chat_history {
+            agent
+                .stream_chat_with_timeout(
+                    &setup.query,
+                    setup.chat_history.clone(),
+                    config.timeout_duration,
+                    &config.request_id,
+                )
+                .await
+        } else {
+            agent
+                .stream_prompt_with_timeout(
+                    &setup.query,
+                    config.timeout_duration,
+                    &config.request_id,
+                )
+                .await
+        }
+    } else {
+        let (stream, cancel_tx) = setup
+            .streaming_agent
+            .stream_with_timeout(
                 &setup.query,
-                setup.chat_history,
+                setup.chat_history.clone(),
                 config.timeout_duration,
                 &config.request_id,
             )
-            .await
-    } else {
-        setup
-            .agent
-            .stream_prompt_with_timeout(&setup.query, config.timeout_duration, &config.request_id)
-            .await
+            .await;
+        (stream, cancel_tx, UsageState::new())
     };
 
     let response_content = config.response_content.clone();
@@ -388,7 +451,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
 
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
-                agent: setup.agent.clone(),
+                agent: setup.streaming_agent.clone(),
                 tool_event_rx,
                 progress_rx,
                 tool_usage_rx,
@@ -735,7 +798,7 @@ mod tests {
             usage_state: aura::UsageState::new(),
         };
 
-        // max_tokens = 50, completion_tokens = 50 → finish_reason = "length"
+        // max_tokens = 50, completion_tokens = 50 -> finish_reason = "length"
         let resp = build_json_response(make_response_ctx(), Some(50), collected);
         let body =
             futures_util::FutureExt::now_or_never(actix_web::body::to_bytes(resp.into_body()))

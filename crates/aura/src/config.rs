@@ -1,5 +1,7 @@
 /// Configuration structs for building Rig agents
 /// These are pure Rust structs without any TOML-specific dependencies
+use crate::orchestration::OrchestrationConfig;
+use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
 use serde::{Deserialize, Serialize};
 
 /// Serde helpers for accepting whole-number floats (e.g. `8000.0`) as integers.
@@ -55,6 +57,10 @@ pub mod lenient_int {
     }
 }
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Type alias for tool context factory function.
+pub type ToolContextFactory = Arc<dyn Fn(&str) -> ToolCallContext + Send + Sync>;
 
 /// Reasoning effort level for GPT-5 models
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -67,13 +73,126 @@ pub enum ReasoningEffort {
 }
 
 /// Complete configuration for building an agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AgentConfig {
     pub llm: LlmConfig,
     pub agent: AgentSettings,
     pub vector_stores: Vec<VectorStoreConfig>,
     pub mcp: Option<McpConfig>,
     pub tools: Option<ToolsConfig>,
+    /// Orchestration mode configuration (multi-agent workflows)
+    #[serde(default)]
+    pub orchestration: Option<OrchestrationConfig>,
+
+    // === Extension fields (not serialized) ===
+    // These allow callers to customize agent building without modifying the builder.
+    // The orchestrator uses these to inject tool wrappers and override preambles.
+    /// Optional tool wrapper applied to all MCP tools (not serialized).
+    /// When set, all HTTP/SSE MCP tools are wrapped with this wrapper.
+    #[serde(skip)]
+    pub tool_wrapper: Option<Arc<dyn ToolWrapper + Send + Sync>>,
+
+    /// Factory for creating ToolCallContext per tool (not serialized).
+    /// Allows callers to inject metadata (task_id, attempt) into wrapped tool calls.
+    #[serde(skip)]
+    pub tool_context_factory: Option<ToolContextFactory>,
+
+    /// Override for system prompt (not serialized).
+    /// When set, this replaces agent.system_prompt entirely.
+    #[serde(skip)]
+    pub preamble_override: Option<String>,
+
+    /// Configuration for injecting TodoWrite/ReadTodos tools (not serialized).
+    /// When set, the builder adds todo tools with the specified config.
+    #[serde(skip)]
+    pub todo_tools_config: Option<TodoToolsConfig>,
+
+    /// Glob patterns for filtering which MCP tools to include (not serialized).
+    /// When set, only tools matching at least one pattern are added.
+    /// Supports glob syntax: `*` (any chars), `?` (single char).
+    /// Empty or None means all tools are included.
+    #[serde(skip)]
+    pub mcp_filter: Option<Vec<String>>,
+
+    /// Shared persistence for injecting `read_artifact` tool into workers (not serialized).
+    /// When set, workers get access to result artifacts via the read_artifact tool.
+    #[serde(skip)]
+    pub orchestration_persistence:
+        Option<Arc<tokio::sync::Mutex<crate::orchestration::ExecutionPersistence>>>,
+
+    /// Shared conversation history for injecting `get_conversation_context` tool into workers (not serialized).
+    /// When set, workers can retrieve conversation history on demand.
+    #[serde(skip)]
+    pub orchestration_chat_history: Option<Arc<Vec<rig::completion::Message>>>,
+}
+
+/// Configuration for TodoWrite/ReadTodos tool injection.
+#[derive(Debug, Clone, Default)]
+pub struct TodoToolsConfig {
+    /// Optional directory for persisting plans.
+    /// If None, plans are stored in-memory only.
+    pub plan_dir: Option<String>,
+}
+
+// Manual Clone implementation because Arc<dyn Trait> fields require special handling
+impl Clone for AgentConfig {
+    fn clone(&self) -> Self {
+        Self {
+            llm: self.llm.clone(),
+            agent: self.agent.clone(),
+            vector_stores: self.vector_stores.clone(),
+            mcp: self.mcp.clone(),
+            tools: self.tools.clone(),
+            orchestration: self.orchestration.clone(),
+            // Arc fields clone the Arc (shared reference)
+            tool_wrapper: self.tool_wrapper.clone(),
+            tool_context_factory: self.tool_context_factory.clone(),
+            preamble_override: self.preamble_override.clone(),
+            todo_tools_config: self.todo_tools_config.clone(),
+            mcp_filter: self.mcp_filter.clone(),
+            orchestration_persistence: self.orchestration_persistence.clone(),
+            orchestration_chat_history: self.orchestration_chat_history.clone(),
+        }
+    }
+}
+
+// Manual Debug implementation because Arc<dyn Trait> fields don't implement Debug
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("llm", &self.llm)
+            .field("agent", &self.agent)
+            .field("vector_stores", &self.vector_stores)
+            .field("mcp", &self.mcp)
+            .field("tools", &self.tools)
+            .field("orchestration", &self.orchestration)
+            .field(
+                "tool_wrapper",
+                &self.tool_wrapper.as_ref().map(|_| "<wrapper>"),
+            )
+            .field(
+                "tool_context_factory",
+                &self.tool_context_factory.as_ref().map(|_| "<factory>"),
+            )
+            .field("preamble_override", &self.preamble_override)
+            .field("todo_tools_config", &self.todo_tools_config)
+            .field("mcp_filter", &self.mcp_filter)
+            .field(
+                "orchestration_persistence",
+                &self
+                    .orchestration_persistence
+                    .as_ref()
+                    .map(|_| "<persistence>"),
+            )
+            .field(
+                "orchestration_chat_history",
+                &self
+                    .orchestration_chat_history
+                    .as_ref()
+                    .map(|h| format!("<{} messages>", h.len())),
+            )
+            .finish()
+    }
 }
 
 /// LLM provider configuration with strong typing per provider
@@ -262,12 +381,179 @@ impl Default for AgentConfig {
             vector_stores: Vec::new(),
             mcp: None,
             tools: None,
+            orchestration: None,
+            // Extension fields default to None
+            tool_wrapper: None,
+            tool_context_factory: None,
+            preamble_override: None,
+            todo_tools_config: None,
+            mcp_filter: None,
+            orchestration_persistence: None,
+            orchestration_chat_history: None,
         }
     }
 }
 
+impl AgentConfig {
+    /// Check if orchestration mode is enabled.
+    ///
+    /// Returns true if the `[orchestration]` section exists and `enabled = true`.
+    /// Used by `build_streaming_agent()` to decide between Agent and Orchestrator.
+    pub fn orchestration_enabled(&self) -> bool {
+        self.orchestration
+            .as_ref()
+            .map(|o| o.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Check if a tool name matches the mcp_filter patterns.
+    ///
+    /// Returns true if:
+    /// - No filter is set (None) - all tools pass
+    /// - Filter is empty - all tools pass
+    /// - Tool name matches at least one pattern
+    ///
+    /// Supports simple glob patterns:
+    /// - `*` matches any sequence of characters
+    /// - `?` matches any single character
+    pub fn tool_matches_filter(&self, tool_name: &str) -> bool {
+        match &self.mcp_filter {
+            None => true,
+            Some(patterns) if patterns.is_empty() => true,
+            Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
+        }
+    }
+
+    /// Get the effective system prompt for agent building.
+    ///
+    /// Returns `preamble_override` if set, otherwise `agent.system_prompt`.
+    /// This allows callers (like Orchestrator) to customize the preamble
+    /// without the builder knowing about orchestration.
+    pub fn effective_preamble(&self) -> &str {
+        self.preamble_override
+            .as_deref()
+            .unwrap_or(&self.agent.system_prompt)
+    }
+}
+
+/// Simple glob pattern matching for tool name filtering.
+///
+/// Supports:
+/// - `*` matches any sequence of characters (including empty)
+/// - `?` matches exactly one character
+///
+/// Examples:
+/// - `mezmo_*` matches `mezmo_logs`, `mezmo_pipelines`
+/// - `*Query*` matches `ListQuery`, `QueryKnowledgeBases`
+/// - `tool_?` matches `tool_a`, `tool_b`
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+
+    fn match_recursive(pattern: &[char], text: &[char]) -> bool {
+        match (pattern.first(), text.first()) {
+            // Both exhausted - match!
+            (None, None) => true,
+            // Pattern exhausted but text remains - no match
+            (None, Some(_)) => false,
+            // Wildcard * - try matching zero or more characters
+            (Some('*'), _) => {
+                // Try matching zero characters (skip *)
+                if match_recursive(&pattern[1..], text) {
+                    return true;
+                }
+                // Try matching one character and continue with *
+                if !text.is_empty() && match_recursive(pattern, &text[1..]) {
+                    return true;
+                }
+                false
+            }
+            // Text exhausted but pattern has non-* remaining - check for trailing *s
+            (Some(p), None) => *p == '*' && match_recursive(&pattern[1..], text),
+            // Single character wildcard ?
+            (Some('?'), Some(_)) => match_recursive(&pattern[1..], &text[1..]),
+            // Literal character match
+            (Some(p), Some(t)) => *p == *t && match_recursive(&pattern[1..], &text[1..]),
+        }
+    }
+
+    match_recursive(&pattern, &text)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match("hello", "hello"));
+        assert!(!glob_match("hello", "world"));
+    }
+
+    #[test]
+    fn test_glob_match_star() {
+        assert!(glob_match("mezmo_*", "mezmo_logs"));
+        assert!(glob_match("mezmo_*", "mezmo_pipelines"));
+        assert!(glob_match("mezmo_*", "mezmo_")); // empty suffix
+        assert!(!glob_match("mezmo_*", "other_logs"));
+    }
+
+    #[test]
+    fn test_glob_match_star_middle() {
+        assert!(glob_match("*Query*", "QueryKnowledgeBases"));
+        assert!(glob_match("*Query*", "ListQuery"));
+        assert!(glob_match("*Query*", "Query"));
+        assert!(!glob_match("*Query*", "ListKnowledge"));
+    }
+
+    #[test]
+    fn test_glob_match_question() {
+        assert!(glob_match("tool_?", "tool_a"));
+        assert!(glob_match("tool_?", "tool_1"));
+        assert!(!glob_match("tool_?", "tool_ab")); // too long
+        assert!(!glob_match("tool_?", "tool_")); // too short
+    }
+
+    #[test]
+    fn test_glob_match_star_only() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn test_tool_matches_filter_none() {
+        let config = AgentConfig::default();
+        assert!(config.tool_matches_filter("any_tool"));
+    }
+
+    #[test]
+    fn test_tool_matches_filter_empty() {
+        let config = AgentConfig {
+            mcp_filter: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(config.tool_matches_filter("any_tool"));
+    }
+
+    #[test]
+    fn test_tool_matches_filter_patterns() {
+        let config = AgentConfig {
+            mcp_filter: Some(vec![
+                "mezmo_*".to_string(),
+                "QueryKnowledgeBases".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(config.tool_matches_filter("mezmo_logs"));
+        assert!(config.tool_matches_filter("mezmo_pipelines"));
+        assert!(config.tool_matches_filter("QueryKnowledgeBases"));
+        assert!(!config.tool_matches_filter("other_tool"));
+    }
+}
+
+#[cfg(test)]
+mod lenient_int_tests {
     use super::lenient_int;
     use serde::Deserialize;
 

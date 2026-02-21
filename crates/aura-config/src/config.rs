@@ -22,6 +22,222 @@ pub struct Config {
     pub vector_stores: Vec<VectorStoreConfig>,
     pub tools: Option<ToolsConfig>,
     pub agent: AgentConfig,
+    /// Orchestration mode configuration (multi-agent workflows)
+    #[serde(default)]
+    pub orchestration: Option<OrchestrationConfig>,
+}
+
+/// Per-worker configuration for specialized workers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// Short description for planning prompt.
+    pub description: String,
+    /// System prompt for this worker.
+    pub preamble: String,
+    /// Glob patterns for which MCP tools this worker gets access to.
+    #[serde(default)]
+    pub mcp_filter: Vec<String>,
+    /// Vector stores this worker has access to (explicit names).
+    #[serde(default)]
+    pub vector_stores: Vec<String>,
+    /// Per-worker turn depth limit (overrides [agent].turn_depth).
+    #[serde(default)]
+    pub turn_depth: Option<usize>,
+}
+
+/// Timeout configuration for orchestration (aura-config side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutsConfig {
+    #[serde(default = "default_per_call_timeout_secs")]
+    pub per_call_timeout_secs: u64,
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            per_call_timeout_secs: default_per_call_timeout_secs(),
+        }
+    }
+}
+
+/// Artifact configuration for orchestration (aura-config side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactsConfig {
+    #[serde(default, alias = "memory_path")]
+    pub memory_dir: Option<String>,
+    #[serde(default = "default_result_artifact_threshold")]
+    pub result_artifact_threshold: usize,
+    #[serde(default = "default_result_summary_length")]
+    pub result_summary_length: usize,
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            memory_dir: None,
+            result_artifact_threshold: default_result_artifact_threshold(),
+            result_summary_length: default_result_summary_length(),
+        }
+    }
+}
+
+/// Configuration for orchestration mode.
+///
+/// Uses custom deserialization for backward compatibility with flat field format.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrchestrationConfig {
+    pub enabled: bool,
+    pub max_planning_cycles: usize,
+    pub quality_threshold: f32,
+    pub max_plan_parse_retries: usize,
+    pub worker_system_prompt: Option<String>,
+    pub workers: HashMap<String, WorkerConfig>,
+    pub coordinator_vector_stores: Vec<String>,
+    pub allow_direct_answers: bool,
+    pub allow_clarification: bool,
+    pub tools_in_planning: ToolVisibility,
+    pub max_tools_per_worker: usize,
+    pub timeouts: TimeoutsConfig,
+    pub artifacts: ArtifactsConfig,
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_planning_cycles: default_max_planning_cycles(),
+            quality_threshold: default_quality_threshold(),
+            max_plan_parse_retries: default_max_plan_parse_retries(),
+            worker_system_prompt: None,
+            workers: HashMap::new(),
+            coordinator_vector_stores: Vec::new(),
+            allow_direct_answers: true,
+            allow_clarification: true,
+            tools_in_planning: ToolVisibility::default(),
+            max_tools_per_worker: default_max_tools_per_worker(),
+            timeouts: TimeoutsConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+        }
+    }
+}
+
+/// Intermediate struct for backward-compatible deserialization.
+#[derive(Deserialize)]
+struct RawOrchestrationConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_max_planning_cycles")]
+    max_planning_cycles: usize,
+    #[serde(default = "default_quality_threshold")]
+    quality_threshold: f32,
+    #[serde(default = "default_max_plan_parse_retries")]
+    max_plan_parse_retries: usize,
+    #[serde(default)]
+    worker_system_prompt: Option<String>,
+    #[serde(default, rename = "worker")]
+    workers: HashMap<String, WorkerConfig>,
+    #[serde(default)]
+    coordinator_vector_stores: Vec<String>,
+    #[serde(default = "default_true")]
+    allow_direct_answers: bool,
+    #[serde(default = "default_true")]
+    allow_clarification: bool,
+    #[serde(default)]
+    tools_in_planning: ToolVisibility,
+    #[serde(default = "default_max_tools_per_worker")]
+    max_tools_per_worker: usize,
+    // Sub-tables
+    #[serde(default)]
+    timeouts: Option<TimeoutsConfig>,
+    #[serde(default)]
+    artifacts: Option<ArtifactsConfig>,
+    // Flat artifact fields (backward compat)
+    #[serde(default, alias = "memory_path")]
+    memory_dir: Option<String>,
+    #[serde(default)]
+    result_artifact_threshold: Option<usize>,
+    #[serde(default)]
+    result_summary_length: Option<usize>,
+}
+
+impl<'de> Deserialize<'de> for OrchestrationConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawOrchestrationConfig::deserialize(deserializer)?;
+
+        let timeouts = raw.timeouts.unwrap_or_default();
+
+        let mut artifacts = raw.artifacts.unwrap_or_default();
+        if let Some(v) = raw.memory_dir {
+            artifacts.memory_dir = Some(v);
+        }
+        if let Some(v) = raw.result_artifact_threshold {
+            artifacts.result_artifact_threshold = v;
+        }
+        if let Some(v) = raw.result_summary_length {
+            artifacts.result_summary_length = v;
+        }
+
+        Ok(OrchestrationConfig {
+            enabled: raw.enabled,
+            max_planning_cycles: raw.max_planning_cycles,
+            quality_threshold: raw.quality_threshold,
+            max_plan_parse_retries: raw.max_plan_parse_retries,
+            worker_system_prompt: raw.worker_system_prompt,
+            workers: raw.workers,
+            coordinator_vector_stores: raw.coordinator_vector_stores,
+            allow_direct_answers: raw.allow_direct_answers,
+            allow_clarification: raw.allow_clarification,
+            tools_in_planning: raw.tools_in_planning,
+            max_tools_per_worker: raw.max_tools_per_worker,
+            timeouts,
+            artifacts,
+        })
+    }
+}
+
+/// Tool visibility in planning prompts: none, summary (names only), or full (with descriptions).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolVisibility {
+    None,
+    #[default]
+    Summary,
+    Full,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_planning_cycles() -> usize {
+    3
+}
+
+fn default_max_tools_per_worker() -> usize {
+    10
+}
+
+fn default_quality_threshold() -> f32 {
+    0.8
+}
+
+fn default_per_call_timeout_secs() -> u64 {
+    0
+}
+
+fn default_max_plan_parse_retries() -> usize {
+    3
+}
+
+fn default_result_artifact_threshold() -> usize {
+    4000
+}
+
+fn default_result_summary_length() -> usize {
+    2000
 }
 
 impl Config {
@@ -282,6 +498,22 @@ impl Config {
         let config: Config = toml::from_str(contents)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Get provider name and model for response formatting.
+    pub fn get_provider_info(&self) -> (&str, &str) {
+        match &self.llm {
+            LlmConfig::OpenAI { model, .. } => ("openai", model),
+            LlmConfig::Anthropic { model, .. } => ("anthropic", model),
+            LlmConfig::Bedrock { model, .. } => ("bedrock", model),
+            LlmConfig::Gemini { model, .. } => ("gemini", model),
+            LlmConfig::Ollama { model, .. } => ("ollama", model),
+        }
+    }
+
+    /// Check if orchestration mode is enabled.
+    pub fn orchestration_enabled(&self) -> bool {
+        self.orchestration.as_ref().is_some_and(|o| o.enabled)
     }
 
     /// Validate the configuration

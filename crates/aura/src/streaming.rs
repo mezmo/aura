@@ -106,4 +106,19 @@ pub trait StreamingAgent: Send + Sync {
         BoxStream<'static, Result<StreamItem, StreamError>>,
         tokio::sync::watch::Sender<bool>,
     );
+
+    /// Cancel in-flight MCP requests and close connections.
+    ///
+    /// Called on client disconnect or timeout to propagate `notifications/cancelled`
+    /// to MCP servers. Returns the number of cancelled requests.
+    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize;
+
+    /// Set the current HTTP request ID for MCP request tracking.
+    ///
+    /// Must be called before creating the stream so that `call_tool_tracked()`
+    /// can associate tool calls with this request.
+    async fn set_mcp_request_id(&self, request_id: &str);
+
+    /// Clear the MCP request ID after streaming completes.
+    async fn clear_mcp_request_id(&self);
 }
