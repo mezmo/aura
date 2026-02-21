@@ -127,10 +127,7 @@ impl TemplateVars for PhaseContinuationVars<'_> {
             .replace("%%COMPLETED_PHASE_LABEL%%", self.completed_phase_label)
             .replace("%%COMPLETED_PHASE_ID%%", self.completed_phase_id)
             .replace("%%GOAL%%", self.goal)
-            .replace(
-                "%%COMPLETED_PHASE_RESULTS%%",
-                self.completed_phase_results,
-            )
+            .replace("%%COMPLETED_PHASE_RESULTS%%", self.completed_phase_results)
             .replace("%%REMAINING_PHASES%%", self.remaining_phases)
     }
 }

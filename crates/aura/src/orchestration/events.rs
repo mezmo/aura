@@ -100,4 +100,24 @@ pub enum OrchestratorEvent {
         /// The tool result (output string or error message)
         result: String,
     },
+    /// A phase has started execution.
+    PhaseStarted {
+        /// Phase identifier
+        phase_id: usize,
+        /// Human-readable phase label
+        label: String,
+        /// The ID of the orchestrator
+        orchestrator_id: String,
+    },
+    /// A phase has completed execution.
+    PhaseCompleted {
+        /// Phase identifier
+        phase_id: usize,
+        /// Human-readable phase label
+        label: String,
+        /// The continuation decision: "continue" or "replan"
+        continuation: String,
+        /// The ID of the orchestrator
+        orchestrator_id: String,
+    },
 }

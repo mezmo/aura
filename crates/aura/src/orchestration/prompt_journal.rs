@@ -67,7 +67,10 @@ impl<'a> JournalPhase<'a> {
             JournalPhase::Synthesis => format!("Synthesis (Iteration {})", iteration),
             JournalPhase::Evaluation => format!("Evaluation (Iteration {})", iteration),
             JournalPhase::PhaseContinuation { phase_id } => {
-                format!("PhaseContinuation (Iteration {}, Phase {})", iteration, phase_id)
+                format!(
+                    "PhaseContinuation (Iteration {}, Phase {})",
+                    iteration, phase_id
+                )
             }
         }
     }

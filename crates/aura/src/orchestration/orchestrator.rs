@@ -2248,7 +2248,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             if ready_tasks.is_empty() {
-                tracing::warn!("No ready tasks in current phase but phase not finished - possible cycle");
+                tracing::warn!(
+                    "No ready tasks in current phase but phase not finished - possible cycle"
+                );
                 break;
             }
 
@@ -2384,10 +2386,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// single-call decision — no quality scoring or evaluation tools.
     ///
     /// Returns `PhaseContinuation::Continue` or `PhaseContinuation::Replan`.
-    async fn phase_continuation(
-        &self,
-        plan: &Plan,
-    ) -> super::types::PhaseContinuation {
+    async fn phase_continuation(&self, plan: &Plan) -> super::types::PhaseContinuation {
         use super::templates::{render_phase_continuation_prompt, PhaseContinuationVars};
 
         let phase = match plan.current_phase() {
@@ -2430,7 +2429,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .filter(|p| p.id > phase.id)
             .map(|p| {
                 let task_ids: Vec<String> = p.task_ids.iter().map(|id| id.to_string()).collect();
-                format!("- Phase {}: {} (tasks: {})", p.id, p.label, task_ids.join(", "))
+                format!(
+                    "- Phase {}: {} (tasks: {})",
+                    p.id,
+                    p.label,
+                    task_ids.join(", ")
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -3260,11 +3264,39 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         phase.task_ids.len(),
                     );
 
+                    // Emit PhaseStarted event
+                    Self::emit_event(
+                        &event_tx,
+                        OrchestratorEvent::PhaseStarted {
+                            phase_id: phase.id,
+                            label: phase.label.clone(),
+                            orchestrator_id: self.orchestrator_id.clone(),
+                        },
+                    )
+                    .await;
+
                     self.execute_phase(&mut plan, &event_tx).await?;
 
                     // Phase continuation checkpoint (skip for last phase)
-                    if phase_idx + 1 < phases.len() {
+                    let continuation_str = if phase_idx + 1 < phases.len() {
                         let continuation = self.phase_continuation(&plan).await;
+                        let cont_str = match continuation {
+                            super::types::PhaseContinuation::Replan => "replan",
+                            super::types::PhaseContinuation::Continue => "continue",
+                        };
+
+                        // Emit PhaseCompleted event
+                        Self::emit_event(
+                            &event_tx,
+                            OrchestratorEvent::PhaseCompleted {
+                                phase_id: phase.id,
+                                label: phase.label.clone(),
+                                continuation: cont_str.to_string(),
+                                orchestrator_id: self.orchestrator_id.clone(),
+                            },
+                        )
+                        .await;
+
                         if continuation == super::types::PhaseContinuation::Replan {
                             tracing::info!(
                                 "Phase continuation chose REPLAN after phase '{}' — breaking to outer replan loop",
@@ -3273,7 +3305,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             replan = true;
                             break;
                         }
-                    }
+                        cont_str
+                    } else {
+                        // Last phase — emit completed with "continue" (terminal)
+                        Self::emit_event(
+                            &event_tx,
+                            OrchestratorEvent::PhaseCompleted {
+                                phase_id: phase.id,
+                                label: phase.label.clone(),
+                                continuation: "continue".to_string(),
+                                orchestrator_id: self.orchestrator_id.clone(),
+                            },
+                        )
+                        .await;
+                        "continue"
+                    };
+                    let _ = continuation_str; // suppress unused warning
 
                     plan.advance_phase();
                 }
@@ -3310,7 +3357,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let execution_summary = self.build_execution_summary(&plan);
-                tracing::info!("Phase continuation triggered replan:\n{}", execution_summary);
+                tracing::info!(
+                    "Phase continuation triggered replan:\n{}",
+                    execution_summary
+                );
 
                 let replan_evaluation = super::types::EvaluationResult {
                     score: 0.0,

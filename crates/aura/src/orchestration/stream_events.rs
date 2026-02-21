@@ -12,6 +12,8 @@
 //! - `aura.orchestrator.synthesizing` - Combining results into final response
 //! - `aura.orchestrator.tool_call_started` - Worker tool execution began
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
+//! - `aura.orchestrator.phase_started` - Phase execution began
+//! - `aura.orchestrator.phase_completed` - Phase execution finished
 //!
 //! # Separation from Base Events
 //!
@@ -33,6 +35,8 @@ pub mod event_names {
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
+    pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
+    pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
 }
 
 /// SSE events specific to orchestration mode.
@@ -143,6 +147,27 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted when a phase starts execution.
+    PhaseStarted {
+        phase_id: usize,
+        label: String,
+        orchestrator_id: String,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when a phase completes execution.
+    PhaseCompleted {
+        phase_id: usize,
+        label: String,
+        continuation: String,
+        orchestrator_id: String,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
 }
 
 impl OrchestrationStreamEvent {
@@ -158,6 +183,8 @@ impl OrchestrationStreamEvent {
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
+            Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
+            Self::PhaseCompleted { .. } => event_names::PHASE_COMPLETED,
         }
     }
 
@@ -322,6 +349,42 @@ impl OrchestrationStreamEvent {
             duration_ms,
             agent,
             result,
+            correlation,
+        }
+    }
+
+    /// Create a PhaseStarted event.
+    pub fn phase_started(
+        phase_id: usize,
+        label: impl Into<String>,
+        orchestrator_id: impl Into<String>,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::PhaseStarted {
+            phase_id,
+            label: label.into(),
+            orchestrator_id: orchestrator_id.into(),
+            agent,
+            correlation,
+        }
+    }
+
+    /// Create a PhaseCompleted event.
+    pub fn phase_completed(
+        phase_id: usize,
+        label: impl Into<String>,
+        continuation: impl Into<String>,
+        orchestrator_id: impl Into<String>,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::PhaseCompleted {
+            phase_id,
+            label: label.into(),
+            continuation: continuation.into(),
+            orchestrator_id: orchestrator_id.into(),
+            agent,
             correlation,
         }
     }
@@ -493,5 +556,93 @@ mod tests {
         assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_CALL_COMPLETED)));
         assert!(sse.contains("\"result\":\"30.0\""));
         assert!(sse.contains("\"success\":true"));
+    }
+
+    #[test]
+    fn test_phase_started_event_name() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event =
+            OrchestrationStreamEvent::phase_started(0, "Gather data", "orch-1", agent, correlation);
+
+        assert_eq!(event.event_name(), event_names::PHASE_STARTED);
+    }
+
+    #[test]
+    fn test_phase_completed_event_name() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::phase_completed(
+            0,
+            "Gather data",
+            "continue",
+            "orch-1",
+            agent,
+            correlation,
+        );
+
+        assert_eq!(event.event_name(), event_names::PHASE_COMPLETED);
+    }
+
+    #[test]
+    fn test_format_sse_phase_started() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::phase_started(
+            1,
+            "Analyze findings",
+            "orch-42",
+            agent,
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_STARTED)));
+        assert!(sse.contains("\"phase_id\":1"));
+        assert!(sse.contains("\"label\":\"Analyze findings\""));
+        assert!(sse.contains("\"orchestrator_id\":\"orch-42\""));
+    }
+
+    #[test]
+    fn test_format_sse_phase_completed_continue() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::phase_completed(
+            0,
+            "Gather data",
+            "continue",
+            "orch-1",
+            agent,
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_COMPLETED)));
+        assert!(sse.contains("\"phase_id\":0"));
+        assert!(sse.contains("\"label\":\"Gather data\""));
+        assert!(sse.contains("\"continuation\":\"continue\""));
+    }
+
+    #[test]
+    fn test_format_sse_phase_completed_replan() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::phase_completed(
+            1,
+            "Analyze findings",
+            "replan",
+            "orch-1",
+            agent,
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_COMPLETED)));
+        assert!(sse.contains("\"continuation\":\"replan\""));
     }
 }
