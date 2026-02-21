@@ -80,7 +80,9 @@ pub use request_progress::{
     subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
-pub use stream_events::{format_named_sse, AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
+pub use stream_events::{
+    format_named_sse, AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase,
+};
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use todo_tool::{
     PlanIteration, PlanState, ReadTodosArgs, ReadTodosTool, Todo, TodoError, TodoState, TodoStatus,
@@ -88,15 +90,15 @@ pub use todo_tool::{
 };
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
-pub use tool_wrapper::{
-    ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
-    WrappedTool,
-};
 pub use tool_event_broker::{
     ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
     global as tool_event_global, peek_tool_call_id, pop_tool_call_id, publish_tool_start,
     publish_tool_usage, push_tool_call_id, subscribe as tool_event_subscribe, tool_usage_subscribe,
     tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe,
+};
+pub use tool_wrapper::{
+    ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
+    WrappedTool,
 };
 pub use tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use vector_dynamic::DynamicVectorSearchTool;

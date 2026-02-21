@@ -1699,15 +1699,13 @@ mod tests {
         // Existing flat plan (no phases) should parse identically
         let response = PlanningResponse::Orchestrated {
             goal: "Simple query".to_string(),
-            tasks: vec![
-                TaskJson {
-                    id: 0,
-                    description: "Do thing".to_string(),
-                    rationale: Some("Reason".to_string()),
-                    dependencies: None,
-                    worker: None,
-                },
-            ],
+            tasks: vec![TaskJson {
+                id: 0,
+                description: "Do thing".to_string(),
+                rationale: Some("Reason".to_string()),
+                dependencies: None,
+                worker: None,
+            }],
             routing_rationale: "Needs tool".to_string(),
             planning_summary: "Just do it".to_string(),
             phases: None,
