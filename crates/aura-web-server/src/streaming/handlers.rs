@@ -29,9 +29,10 @@ use super::types::{
 use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    Agent, ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
-    StreamedAssistantContent, StreamedUserContent, ToolCall, ToolLifecycleEvent, ToolResult,
-    ToolUsageEvent, UsageState, get_context_limit,
+    OrchestrationStreamEvent, OrchestratorEvent, ProgressNotification, RequestCancellation,
+    ResponseContent, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
+    StreamingAgent, ToolCall, ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    get_context_limit,
 };
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
@@ -43,7 +44,7 @@ pub struct StreamingCallbacks {
     /// Request ID for cancellation registry
     pub request_id: String,
     /// Agent reference for MCP cleanup (cancel_and_close_mcp)
-    pub agent: Arc<Agent>,
+    pub agent: Arc<dyn StreamingAgent>,
     /// MCP tool event receiver (for aura.tool_requested and aura.tool_start events)
     pub tool_event_rx: mpsc::Receiver<ToolLifecycleEvent>,
     /// MCP progress event receiver (for aura.progress events)
@@ -591,6 +592,7 @@ fn handle_stream_item(
             tracing::debug!("Received final marker");
             vec![]
         }
+        StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),
     }
 }
 
@@ -891,6 +893,208 @@ fn handle_reasoning(config: &StreamConfig, ctx: &TurnContext, reasoning: String)
     } else {
         vec![]
     }
+}
+
+fn handle_orchestrator_event(
+    config: &StreamConfig,
+    ctx: &TurnContext,
+    event: &OrchestratorEvent,
+) -> Vec<Bytes> {
+    if !config.emit_custom_events {
+        tracing::debug!(
+            "Orchestrator event skipped (custom events disabled): {:?}",
+            event
+        );
+        return vec![];
+    }
+
+    let sse_event: OrchestrationStreamEvent = match event {
+        OrchestratorEvent::PlanCreated {
+            goal,
+            task_count,
+            routing_rationale,
+            planning_response,
+        } => {
+            tracing::info!(
+                "Orchestrator: plan created with {} tasks for goal: {} (rationale: {})",
+                task_count,
+                goal,
+                routing_rationale
+            );
+            let truncated_response = if planning_response.is_empty() {
+                None
+            } else {
+                Some(truncate_result(
+                    planning_response,
+                    config.tool_result_max_length,
+                ))
+            };
+            OrchestrationStreamEvent::plan_created(
+                goal,
+                *task_count,
+                routing_rationale,
+                truncated_response,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::DirectAnswer {
+            response,
+            routing_rationale,
+        } => {
+            tracing::info!(
+                "Orchestrator: direct answer (rationale: {})",
+                routing_rationale
+            );
+            OrchestrationStreamEvent::direct_answer(
+                response,
+                routing_rationale,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::ClarificationNeeded {
+            question,
+            options,
+            routing_rationale,
+        } => {
+            tracing::info!(
+                "Orchestrator: clarification needed - {} (rationale: {})",
+                question,
+                routing_rationale
+            );
+            OrchestrationStreamEvent::clarification_needed(
+                question,
+                options.clone(),
+                routing_rationale,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::TaskStarted {
+            task_id,
+            description,
+            orchestrator_id,
+            worker_id,
+        } => {
+            tracing::info!("Orchestrator: task {} started - {}", task_id, description);
+            OrchestrationStreamEvent::task_started(
+                *task_id,
+                description,
+                ctx.agent_context.clone(),
+                orchestrator_id,
+                worker_id,
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::TaskCompleted {
+            task_id,
+            success,
+            duration_ms,
+            orchestrator_id,
+            worker_id,
+            result,
+        } => {
+            tracing::info!(
+                "Orchestrator: task {} completed (success={}) in {}ms",
+                task_id,
+                success,
+                duration_ms
+            );
+            let truncated_result = if result.is_empty() {
+                None
+            } else {
+                Some(truncate_result(result, config.tool_result_max_length))
+            };
+            OrchestrationStreamEvent::task_completed(
+                *task_id,
+                *success,
+                *duration_ms,
+                ctx.agent_context.clone(),
+                orchestrator_id,
+                worker_id,
+                truncated_result,
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::IterationComplete {
+            iteration,
+            quality_score,
+        } => {
+            tracing::info!(
+                "Orchestrator: iteration {} complete with quality score {}",
+                iteration,
+                quality_score
+            );
+            OrchestrationStreamEvent::iteration_complete(
+                *iteration,
+                *quality_score,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::Synthesizing => {
+            tracing::info!("Orchestrator: synthesizing results");
+            OrchestrationStreamEvent::synthesizing(
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::ToolCallStarted {
+            task_id,
+            tool_call_id,
+            tool_name,
+            tool_initiator_id,
+            arguments,
+        } => {
+            tracing::info!(
+                "Orchestrator: task {:?} tool call started - {} ({})",
+                task_id,
+                tool_name,
+                tool_call_id
+            );
+            OrchestrationStreamEvent::tool_call_started(
+                *task_id,
+                tool_call_id,
+                tool_name,
+                ctx.agent_context.clone(),
+                tool_initiator_id,
+                Some(arguments.clone()),
+                ctx.correlation.clone(),
+            )
+        }
+        OrchestratorEvent::ToolCallCompleted {
+            task_id,
+            tool_call_id,
+            success,
+            duration_ms,
+            result,
+        } => {
+            tracing::info!(
+                "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
+                task_id,
+                tool_call_id,
+                success,
+                duration_ms
+            );
+            let truncated_result = if result.is_empty() {
+                None
+            } else {
+                Some(truncate_result(result, config.tool_result_max_length))
+            };
+            OrchestrationStreamEvent::tool_call_completed(
+                *task_id,
+                tool_call_id,
+                *success,
+                *duration_ms,
+                ctx.agent_context.clone(),
+                truncated_result,
+                ctx.correlation.clone(),
+            )
+        }
+    };
+
+    vec![Bytes::from(sse_event.format_sse())]
 }
 
 fn is_context_overflow_error(error_str: &str) -> bool {
