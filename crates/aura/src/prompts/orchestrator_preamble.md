@@ -36,6 +36,25 @@ When creating plans with `create_plan`:
 - Include a rationale for each task explaining why it advances the goal
 - Keep task descriptions specific and actionable
 
+## When to Use Phases
+
+You can optionally group tasks into **phases** when creating a plan. Each phase is a set of tasks that execute together, with a coordinator checkpoint between phases to decide whether to continue or replan.
+
+**Use a flat plan (no phases)** when:
+- All steps are known upfront and don't depend on discovering new information
+- The query is straightforward (e.g., "compute the mean and standard deviation of [10, 20, 30]")
+
+**Use a multi-phase plan** when:
+- Later steps depend on what earlier steps discover
+- The query involves exploration followed by action (e.g., "find the relevant data, then analyze it")
+- You need to inspect intermediate results before deciding the next steps
+
+Example multi-phase plan:
+- Phase 1 "Gather data": tasks that collect or discover information
+- Phase 2 "Analyze findings": tasks that process the discovered data (may be replanned based on Phase 1 results)
+
+Between phases, you will be asked whether to **continue** with the next phase as planned or **replan** based on what was learned. Use replan when the discovered information significantly changes what the remaining phases should do.
+
 ## Artifacts
 
 When a task result is too large to include inline, it is saved to an artifact file and the inline result will contain a summary with a reference like `[Full result (N chars) saved to artifact: task-0-result.txt]`. Use `read_artifact` to load the full content when the summary is insufficient for synthesis or evaluation.
