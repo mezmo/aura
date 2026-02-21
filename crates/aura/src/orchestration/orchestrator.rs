@@ -1966,29 +1966,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             String::new()
         };
 
-        let phases_context = if plan.is_phased() {
-            let phases = plan.phases.as_ref().unwrap();
-            let summary: Vec<String> = phases
-                .iter()
-                .filter(|p| p.id <= plan.current_phase_index)
-                .map(|p| format!("- Phase {}: \"{}\"", p.id, p.label))
-                .collect();
-            format!(
-                "\nPHASE EXECUTION CONTEXT:\n\
-                 This plan used phased execution:\n\
-                 {}\n\
-                 Discovery phases that identify available tools are legitimate intermediate results.\n",
-                summary.join("\n")
-            )
-        } else {
-            String::new()
-        };
-
         super::templates::render_evaluation_prompt(&super::templates::EvaluationVars {
             query,
             goal: &plan.goal,
             workers_context: &workers_context,
-            phases_context: &phases_context,
             result,
         })
     }
