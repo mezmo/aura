@@ -6,7 +6,7 @@
 //! The coordinator calls exactly one of these tools during the planning phase.
 //! A shared `RoutingDecision` captures the decision for the orchestrator to read.
 
-use crate::orchestration::types::{PlanningResponse, TaskJson};
+use crate::orchestration::types::{PhaseJson, PlanningResponse, TaskJson};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,19 @@ pub struct TaskJsonInput {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct PhaseJsonInput {
+    /// Phase identifier (0-indexed).
+    pub id: usize,
+    /// Human-readable label for this phase.
+    pub label: String,
+    /// IDs of tasks belonging to this phase.
+    pub task_ids: Vec<usize>,
+    /// What to do after this phase completes: "continue" or "replan".
+    #[serde(default)]
+    pub continuation: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CreatePlanArgs {
     /// The overall goal this plan addresses.
     pub goal: String,
@@ -166,6 +179,9 @@ pub struct CreatePlanArgs {
     pub routing_rationale: String,
     /// Natural-language summary of the plan.
     pub planning_summary: String,
+    /// Optional phase groupings for multi-phase execution.
+    #[serde(default)]
+    pub phases: Option<Vec<PhaseJsonInput>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -239,6 +255,34 @@ impl Tool for CreatePlanTool {
                         "type": "string",
                         "minLength": 1,
                         "description": "REQUIRED. Summarize the plan in natural language: what tasks will run, in what order, and what the expected outcome is."
+                    },
+                    "phases": {
+                        "type": "array",
+                        "description": "Optional phase groupings for multi-phase execution. When omitted, all tasks execute as a single flat plan.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "integer",
+                                    "description": "Phase identifier (0-indexed)"
+                                },
+                                "label": {
+                                    "type": "string",
+                                    "description": "Human-readable label for this phase (e.g., 'Gather data')"
+                                },
+                                "task_ids": {
+                                    "type": "array",
+                                    "items": { "type": "integer" },
+                                    "description": "IDs of tasks belonging to this phase"
+                                },
+                                "continuation": {
+                                    "type": "string",
+                                    "enum": ["continue", "replan"],
+                                    "description": "What to do after this phase completes. Defaults to 'continue'."
+                                }
+                            },
+                            "required": ["id", "label", "task_ids"]
+                        }
                     }
                 },
                 "required": ["goal", "tasks", "routing_rationale", "planning_summary"]
@@ -266,12 +310,25 @@ impl Tool for CreatePlanTool {
             })
             .collect();
 
+        let phases: Option<Vec<PhaseJson>> = args.phases.map(|phase_inputs| {
+            phase_inputs
+                .into_iter()
+                .map(|p| PhaseJson {
+                    id: p.id,
+                    label: p.label,
+                    task_ids: p.task_ids,
+                    continuation: p.continuation,
+                })
+                .collect()
+        });
+
         let task_count = tasks.len();
         *guard = Some(PlanningResponse::Orchestrated {
             goal: args.goal,
             tasks,
             routing_rationale: args.routing_rationale,
             planning_summary: args.planning_summary,
+            phases,
         });
         Ok(CreatePlanOutput {
             status: format!("Plan created with {} tasks.", task_count),
@@ -416,6 +473,7 @@ mod tests {
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),
+                phases: None,
             })
             .await
             .unwrap();
@@ -429,6 +487,7 @@ mod tests {
                 tasks,
                 routing_rationale,
                 planning_summary,
+                ..
             } => {
                 assert_eq!(goal, "Investigate logs");
                 assert_eq!(tasks.len(), 1);
@@ -493,6 +552,7 @@ mod tests {
                 tasks: vec![],
                 routing_rationale: "test".to_string(),
                 planning_summary: "test".to_string(),
+                phases: None,
             })
             .await
             .unwrap();
