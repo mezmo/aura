@@ -3,7 +3,7 @@ Evaluate how well this response answers the user's question.
 ORIGINAL USER QUERY: %%QUERY%%
 
 ORCHESTRATION GOAL: %%GOAL%%
-%%WORKERS_CONTEXT%%
+%%WORKERS_CONTEXT%%%%PHASES_CONTEXT%%
 SYNTHESIZED RESPONSE:
 %%RESULT%%
 

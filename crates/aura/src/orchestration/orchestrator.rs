@@ -1966,10 +1966,29 @@ Assign tasks to the worker whose tools best match the required operations."#,
             String::new()
         };
 
+        let phases_context = if plan.is_phased() {
+            let phases = plan.phases.as_ref().unwrap();
+            let summary: Vec<String> = phases
+                .iter()
+                .filter(|p| p.id <= plan.current_phase_index)
+                .map(|p| format!("- Phase {}: \"{}\"", p.id, p.label))
+                .collect();
+            format!(
+                "\nPHASE EXECUTION CONTEXT:\n\
+                 This plan used phased execution:\n\
+                 {}\n\
+                 Discovery phases that identify available tools are legitimate intermediate results.\n",
+                summary.join("\n")
+            )
+        } else {
+            String::new()
+        };
+
         super::templates::render_evaluation_prompt(&super::templates::EvaluationVars {
             query,
             goal: &plan.goal,
             workers_context: &workers_context,
+            phases_context: &phases_context,
             result,
         })
     }
@@ -3348,6 +3367,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if phase_triggered_replan {
                 let iterations_remaining = iteration < self.config.max_planning_cycles;
                 if !iterations_remaining {
+                    // Attempt partial synthesis if any tasks completed
+                    if plan.completed_count() > 0 {
+                        tracing::warn!(
+                            "Phase replan requested but max iterations reached ({}). \
+                             Synthesizing partial results from {} completed task(s).",
+                            iteration,
+                            plan.completed_count()
+                        );
+                        match self.synthesize(&plan, query).await {
+                            Ok(partial) => {
+                                final_result = partial;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("Partial synthesis failed: {}", e);
+                            }
+                        }
+                    }
                     let summary = self.build_execution_summary(&plan);
                     let error_msg = format!(
                         "Phase replan requested but max iterations reached ({}):\n{}",
@@ -3432,6 +3469,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let iterations_remaining = iteration < self.config.max_planning_cycles;
 
                 if !iterations_remaining {
+                    if plan.completed_count() > 0 {
+                        tracing::warn!(
+                            "Task failures but max iterations reached ({}). \
+                             Synthesizing partial results from {} completed task(s).",
+                            iteration,
+                            plan.completed_count()
+                        );
+                        match self.synthesize(&plan, query).await {
+                            Ok(partial) => {
+                                final_result = partial;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("Partial synthesis failed: {}", e);
+                            }
+                        }
+                    }
                     let summary = self.build_execution_summary(&plan);
                     let error_msg = format!(
                         "Plan execution failed after {} iterations:\n{}",
