@@ -1,0 +1,497 @@
+//! Orchestration-specific SSE streaming events.
+//!
+//! These events are emitted during orchestrated multi-agent execution to provide
+//! visibility into plan creation, task execution, and synthesis phases.
+//!
+//! # Event Types
+//!
+//! - `aura.orchestrator.plan_created` - Plan decomposed from user query
+//! - `aura.orchestrator.task_started` - Worker began task execution
+//! - `aura.orchestrator.task_completed` - Worker finished task (success/failure)
+//! - `aura.orchestrator.iteration_complete` - Plan-execute-synthesize cycle done
+//! - `aura.orchestrator.synthesizing` - Combining results into final response
+//! - `aura.orchestrator.tool_call_started` - Worker tool execution began
+//! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
+//!
+//! # Separation from Base Events
+//!
+//! These events are intentionally separate from `AuraStreamEvent` to:
+//! 1. Keep orchestration evolution isolated from base aura streaming
+//! 2. Allow different serialization or handling if needed
+
+use crate::stream_events::{AgentContext, CorrelationContext};
+use serde::Serialize;
+
+/// Constants for SSE event names. Import in tests for compile-time linkage.
+pub mod event_names {
+    pub const PLAN_CREATED: &str = "aura.orchestrator.plan_created";
+    pub const DIRECT_ANSWER: &str = "aura.orchestrator.direct_answer";
+    pub const CLARIFICATION_NEEDED: &str = "aura.orchestrator.clarification_needed";
+    pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
+    pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
+    pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
+    pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
+    pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
+    pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
+}
+
+/// SSE events specific to orchestration mode.
+///
+/// These events provide real-time visibility into multi-agent execution
+/// and are emitted alongside standard `AuraStreamEvent`s.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum OrchestrationStreamEvent {
+    /// Emitted when orchestrator creates a plan from user query.
+    PlanCreated {
+        goal: String,
+        task_count: usize,
+        routing_rationale: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        planning_response: Option<String>,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when orchestrator answers directly without orchestration.
+    DirectAnswer {
+        response: String,
+        routing_rationale: String,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when orchestrator needs clarification from the user.
+    ClarificationNeeded {
+        question: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<Vec<String>>,
+        routing_rationale: String,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when orchestrator starts a task.
+    TaskStarted {
+        task_id: usize,
+        description: String,
+        worker_id: String,
+        orchestrator_id: String,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when orchestrator completes a task.
+    TaskCompleted {
+        task_id: usize,
+        success: bool,
+        duration_ms: u64,
+        orchestrator_id: String,
+        worker_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when orchestrator completes an iteration.
+    IterationComplete {
+        iteration: usize,
+        quality_score: f32,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when orchestrator starts synthesizing results.
+    Synthesizing {
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when a tool call starts within a worker task.
+    ToolCallStarted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        tool_call_id: String,
+        tool_name: String,
+        tool_initiator_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments: Option<serde_json::Value>,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+    /// Emitted when a tool call completes within a worker task.
+    ToolCallCompleted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        tool_call_id: String,
+        success: bool,
+        duration_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
+}
+
+impl OrchestrationStreamEvent {
+    /// Get the SSE event name for this event type.
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            Self::PlanCreated { .. } => event_names::PLAN_CREATED,
+            Self::DirectAnswer { .. } => event_names::DIRECT_ANSWER,
+            Self::ClarificationNeeded { .. } => event_names::CLARIFICATION_NEEDED,
+            Self::TaskStarted { .. } => event_names::TASK_STARTED,
+            Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
+            Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
+            Self::Synthesizing { .. } => event_names::SYNTHESIZING,
+            Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
+            Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
+        }
+    }
+
+    /// Format this event as an SSE message with the event: field.
+    pub fn format_sse(&self) -> String {
+        crate::stream_events::format_named_sse(self.event_name(), self)
+    }
+
+    // ========================================================================
+    // Constructors
+    // ========================================================================
+
+    /// Create a PlanCreated event.
+    pub fn plan_created(
+        goal: impl Into<String>,
+        task_count: usize,
+        routing_rationale: impl Into<String>,
+        planning_response: Option<String>,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::PlanCreated {
+            goal: goal.into(),
+            task_count,
+            routing_rationale: routing_rationale.into(),
+            planning_response,
+            agent,
+            correlation,
+        }
+    }
+
+    /// Create a DirectAnswer event.
+    pub fn direct_answer(
+        response: impl Into<String>,
+        routing_rationale: impl Into<String>,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::DirectAnswer {
+            response: response.into(),
+            routing_rationale: routing_rationale.into(),
+            agent,
+            correlation,
+        }
+    }
+
+    /// Create a ClarificationNeeded event.
+    pub fn clarification_needed(
+        question: impl Into<String>,
+        options: Option<Vec<String>>,
+        routing_rationale: impl Into<String>,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::ClarificationNeeded {
+            question: question.into(),
+            options,
+            routing_rationale: routing_rationale.into(),
+            agent,
+            correlation,
+        }
+    }
+
+    /// Create a TaskStarted event.
+    pub fn task_started(
+        task_id: usize,
+        description: impl Into<String>,
+        agent: AgentContext,
+        orchestrator_id: impl Into<String>,
+        worker_id: impl Into<String>,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::TaskStarted {
+            task_id,
+            description: description.into(),
+            agent,
+            orchestrator_id: orchestrator_id.into(),
+            worker_id: worker_id.into(),
+            correlation,
+        }
+    }
+
+    /// Create a TaskCompleted event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn task_completed(
+        task_id: usize,
+        success: bool,
+        duration_ms: u64,
+        agent: AgentContext,
+        orchestrator_id: impl Into<String>,
+        worker_id: impl Into<String>,
+        result: Option<String>,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::TaskCompleted {
+            task_id,
+            success,
+            duration_ms,
+            agent,
+            orchestrator_id: orchestrator_id.into(),
+            worker_id: worker_id.into(),
+            result,
+            correlation,
+        }
+    }
+
+    /// Create an IterationComplete event.
+    pub fn iteration_complete(
+        iteration: usize,
+        quality_score: f32,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::IterationComplete {
+            iteration,
+            quality_score,
+            agent,
+            correlation,
+        }
+    }
+
+    /// Create a Synthesizing event.
+    pub fn synthesizing(agent: AgentContext, correlation: CorrelationContext) -> Self {
+        Self::Synthesizing { agent, correlation }
+    }
+
+    /// Create a ToolCallStarted event.
+    pub fn tool_call_started(
+        task_id: Option<usize>,
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        agent: AgentContext,
+        tool_initiator_id: impl Into<String>,
+        arguments: Option<serde_json::Value>,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::ToolCallStarted {
+            task_id,
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            agent,
+            tool_initiator_id: tool_initiator_id.into(),
+            arguments,
+            correlation,
+        }
+    }
+
+    /// Create a ToolCallCompleted event.
+    pub fn tool_call_completed(
+        task_id: Option<usize>,
+        tool_call_id: impl Into<String>,
+        success: bool,
+        duration_ms: u64,
+        agent: AgentContext,
+        result: Option<String>,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::ToolCallCompleted {
+            task_id,
+            tool_call_id: tool_call_id.into(),
+            success,
+            duration_ms,
+            agent,
+            result,
+            correlation,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_names() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        assert_eq!(
+            OrchestrationStreamEvent::plan_created(
+                "goal",
+                3,
+                "test rationale",
+                None,
+                agent.clone(),
+                correlation.clone()
+            )
+            .event_name(),
+            event_names::PLAN_CREATED
+        );
+
+        assert_eq!(
+            OrchestrationStreamEvent::direct_answer(
+                "answer",
+                "simple query",
+                agent.clone(),
+                correlation.clone()
+            )
+            .event_name(),
+            event_names::DIRECT_ANSWER
+        );
+
+        assert_eq!(
+            OrchestrationStreamEvent::clarification_needed(
+                "which one?",
+                None,
+                "ambiguous",
+                agent.clone(),
+                correlation.clone()
+            )
+            .event_name(),
+            event_names::CLARIFICATION_NEEDED
+        );
+
+        assert_eq!(
+            OrchestrationStreamEvent::task_started(
+                0,
+                "desc",
+                agent.clone(),
+                "orch-id".to_string(),
+                "worker-id".to_string(),
+                correlation.clone(),
+            )
+            .event_name(),
+            event_names::TASK_STARTED
+        );
+
+        assert_eq!(
+            OrchestrationStreamEvent::synthesizing(agent.clone(), correlation.clone()).event_name(),
+            event_names::SYNTHESIZING
+        );
+    }
+
+    #[test]
+    fn test_format_sse() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::plan_created(
+            "test goal",
+            2,
+            "test rationale",
+            Some("coordinator response text".to_string()),
+            agent,
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PLAN_CREATED)));
+        assert!(sse.contains("\"goal\":\"test goal\""));
+        assert!(sse.contains("\"task_count\":2"));
+        assert!(sse.contains("\"routing_rationale\":\"test rationale\""));
+        assert!(sse.contains("\"planning_response\":\"coordinator response text\""));
+    }
+
+    #[test]
+    fn test_format_sse_plan_created_without_response() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::plan_created(
+            "goal",
+            1,
+            "rationale",
+            None,
+            agent,
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(!sse.contains("planning_response"));
+    }
+
+    #[test]
+    fn test_format_sse_task_completed_with_result() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::task_completed(
+            0,
+            true,
+            1500,
+            agent,
+            "orch-1",
+            "worker-1",
+            Some("The mean is 30.0".to_string()),
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TASK_COMPLETED)));
+        assert!(sse.contains("\"result\":\"The mean is 30.0\""));
+        assert!(sse.contains("\"success\":true"));
+    }
+
+    #[test]
+    fn test_format_sse_tool_call_started_with_arguments() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let args = serde_json::json!({"numbers": [10, 20, 30]});
+        let event = OrchestrationStreamEvent::tool_call_started(
+            Some(0),
+            "call_1",
+            "mean",
+            agent,
+            "statistics",
+            Some(args),
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_CALL_STARTED)));
+        assert!(sse.contains("\"arguments\":{\"numbers\":[10,20,30]}"));
+    }
+
+    #[test]
+    fn test_format_sse_tool_call_completed_with_result() {
+        let agent = AgentContext::single_agent();
+        let correlation = CorrelationContext::new("test-session", None);
+
+        let event = OrchestrationStreamEvent::tool_call_completed(
+            Some(0),
+            "call_1",
+            true,
+            42,
+            agent,
+            Some("30.0".to_string()),
+            correlation,
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_CALL_COMPLETED)));
+        assert!(sse.contains("\"result\":\"30.0\""));
+        assert!(sse.contains("\"success\":true"));
+    }
+}

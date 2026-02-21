@@ -423,7 +423,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "1.14.12"
+version = "1.14.5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -444,10 +444,13 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "sse-stream",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -456,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "1.14.12"
+version = "1.14.5"
 dependencies = [
  "anyhow",
  "aura",
@@ -471,7 +474,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sse-stream",
- "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "toml",
@@ -481,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "1.14.12"
+version = "1.14.5"
 dependencies = [
  "reqwest",
  "serde",
@@ -491,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "1.14.12"
+version = "1.14.5"
 dependencies = [
  "actix-web",
  "actix-web-lab",
@@ -2473,9 +2475,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.175"
+version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
+checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 
 [[package]]
 name = "libloading"
@@ -2489,9 +2491,9 @@ dependencies = [
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.11.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -3359,7 +3361,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.28.0"
-source = "git+https://github.com/mezmo/rig.git?rev=0853ab14#0853ab1487b6cbdc4c8818e9fb8d475b8b59eaf6"
+source = "git+https://github.com/mezmo/rig.git?branch=mezmo#0853ab1487b6cbdc4c8818e9fb8d475b8b59eaf6"
 dependencies = [
  "as-any",
  "async-stream",
@@ -3514,9 +3516,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.2"
+version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd15f8a2c5551a84d56efdc1cd049089e409ac19a3072d5037a17fd70719ff3e"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
  "bitflags",
  "errno",
@@ -4000,9 +4002,9 @@ dependencies = [
 
 [[package]]
 name = "tempfile"
-version = "3.22.0"
+version = "3.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84fa4d11fadde498443cca10fd3ac23c951f0dc59e080e9f4b93d4df4e4eea53"
+checksum = "82a72c767771b47409d2345987fda8628641887d5466101319899796367354a0"
 dependencies = [
  "fastrand",
  "getrandom 0.3.3",
