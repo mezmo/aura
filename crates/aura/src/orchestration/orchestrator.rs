@@ -869,6 +869,7 @@ without this field will be rejected.";
                             tasks: tasks_json,
                             routing_rationale: "Fallback: text-based plan parsing".to_string(),
                             planning_summary: String::new(),
+                            phases: None,
                         },
                         final_prompt,
                         final_response,
@@ -934,6 +935,7 @@ without this field will be rejected.";
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
+            phases: None,
         };
 
         let (query_preview, _) = safe_truncate(query, 100);
@@ -975,6 +977,7 @@ without this field will be rejected.";
                         routing_rationale
                     ),
                     planning_summary: String::new(),
+                    phases: None,
                 }
             }
             PlanningResponse::Clarification {
@@ -1005,6 +1008,7 @@ without this field will be rejected.";
                         routing_rationale
                     ),
                     planning_summary: String::new(),
+                    phases: None,
                 }
             }
             _ => response,
@@ -4307,6 +4311,7 @@ Provide the synthesized response:"#,
             ],
             routing_rationale: "Test rationale".to_string(),
             planning_summary: "Test summary".to_string(),
+            phases: None,
         };
 
         let plan = response.into_plan().unwrap();
@@ -4395,6 +4400,7 @@ Provide the synthesized response:"#,
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),
+            phases: None,
         };
         let json = serde_json::to_string(&orchestrated).unwrap();
         let parsed: PlanningResponse = serde_json::from_str(&json).unwrap();

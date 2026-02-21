@@ -29,7 +29,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # Async runtime
-tokio = { version = "1.45", features = ["full"] }
+tokio = { version = "1.45", features = ["full", "test-util"] }
 
 # Error handling
 thiserror = "2.0"
