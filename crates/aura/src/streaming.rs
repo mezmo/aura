@@ -32,6 +32,7 @@
 //! ```
 
 use crate::provider_agent::{StreamError, StreamItem};
+use crate::streaming_request_hook::UsageState;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use rig::completion::Message;
@@ -57,6 +58,12 @@ use tokio_util::sync::CancellationToken;
 /// - Orchestrator can emit custom `StreamItem` variants for deep-agent events
 #[async_trait]
 pub trait StreamingAgent: Send + Sync {
+    /// Return the LLM provider name and model identifier.
+    ///
+    /// Used for OTel attributes and response metadata so the handler never
+    /// needs to know the concrete agent type.
+    fn get_provider_info(&self) -> (&str, &str);
+
     /// Stream a completion response.
     ///
     /// Returns a stream of `StreamItem`s. The caller is responsible for:
@@ -94,8 +101,9 @@ pub trait StreamingAgent: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A tuple of (stream, cancel_sender) where cancel_sender can be used
-    /// to signal cancellation to the underlying provider.
+    /// A tuple of (stream, cancel_sender, usage_state) where cancel_sender can
+    /// be used to signal cancellation to the underlying provider and usage_state
+    /// tracks token consumption via Rig hooks.
     async fn stream_with_timeout(
         &self,
         query: &str,
@@ -105,6 +113,7 @@ pub trait StreamingAgent: Send + Sync {
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         tokio::sync::watch::Sender<bool>,
+        UsageState,
     );
 
     /// Cancel in-flight MCP requests and close connections.
