@@ -3630,6 +3630,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
 #[async_trait]
 impl StreamingAgent for Orchestrator {
+    fn get_provider_info(&self) -> (&str, &str) {
+        self.agent_config.llm.model_info()
+    }
+
     async fn stream(
         &self,
         query: &str,
@@ -3729,6 +3733,7 @@ impl StreamingAgent for Orchestrator {
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
+        crate::UsageState,
     ) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let cancel_token = CancellationToken::new();
@@ -3745,7 +3750,8 @@ impl StreamingAgent for Orchestrator {
             Err(e) => Box::pin(stream::once(async move { Err(e) })),
         };
 
-        (stream, cancel_tx)
+        // Orchestration has its own usage tracking; return a fresh state for the handler.
+        (stream, cancel_tx, crate::UsageState::new())
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
