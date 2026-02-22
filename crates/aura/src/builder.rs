@@ -1025,6 +1025,10 @@ use tokio_util::sync::CancellationToken;
 
 #[async_trait]
 impl StreamingAgent for Agent {
+    fn get_provider_info(&self) -> (&str, &str) {
+        Agent::get_provider_info(self)
+    }
+
     async fn stream(
         &self,
         query: &str,
@@ -1050,11 +1054,10 @@ impl StreamingAgent for Agent {
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
+        crate::UsageState,
     ) {
         // Use the appropriate method based on whether we have chat history
-        // Note: We discard usage_state here as this trait method doesn't expose it.
-        // Callers needing usage_state should use stream_prompt_with_timeout/stream_chat_with_timeout directly.
-        let (stream, cancel_tx, _usage_state) = if chat_history.is_empty() {
+        let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, timeout, request_id)
                 .await
         } else {
@@ -1062,7 +1065,7 @@ impl StreamingAgent for Agent {
                 .await
         };
 
-        (Box::pin(stream), cancel_tx)
+        (Box::pin(stream), cancel_tx, usage_state)
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
