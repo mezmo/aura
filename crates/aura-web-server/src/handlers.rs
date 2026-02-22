@@ -1,6 +1,6 @@
 use actix_web::{HttpResponse, web};
 use aura::{
-    Agent, RequestCancellation, ResponseContent, StreamingAgent, UsageState,
+    RequestCancellation, ResponseContent, StreamingAgent, UsageState,
     request_progress_subscribe, tool_event_subscribe, tool_usage_subscribe,
 };
 use aura_config::RigBuilder;
@@ -140,20 +140,14 @@ async fn build_agent_for_request(
 
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
-///
-/// `streaming_agent` is the polymorphic agent (Agent or Orchestrator) used for stream
-/// creation and MCP lifecycle. `concrete_agent` is present only for the standard
-/// (non-orchestration) path where Agent-specific methods provide usage state tracking.
 struct RequestSetup {
     query: String,
     chat_history: Vec<aura::Message>,
     streaming_agent: Arc<dyn StreamingAgent>,
-    concrete_agent: Option<Arc<Agent>>,
     completion_id: String,
     model_str: String,
     created_timestamp: u64,
     chat_session_id: String,
-    has_chat_history: bool,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
@@ -190,53 +184,39 @@ async fn prepare_request(
         .collect();
 
     // Build the appropriate agent type based on orchestration config
-    let (streaming_agent, concrete_agent): (Arc<dyn StreamingAgent>, Option<Arc<Agent>>) =
-        if data.config.orchestration_enabled() {
-            // Orchestration path: build via streaming agent builder (returns Orchestrator)
-            let builder = RigBuilder::new((*data.config).clone());
-            match builder
-                .build_streaming_agent_with_headers(Some(req_headers_map))
-                .await
-            {
-                Ok(sa) => (sa, None),
-                Err(e) => {
-                    error!("Failed to build streaming agent: {}", e);
-                    return Err(HttpResponse::InternalServerError().json(ErrorResponse {
-                        error: ErrorDetail {
-                            message: format!("Failed to build streaming agent: {e}"),
-                            error_type: "internal_error".to_string(),
-                        },
-                    }));
-                }
-            }
-        } else {
-            // Standard path: build Agent (coerces to Arc<dyn StreamingAgent>)
-            match build_agent_for_request(&data.config, req_headers_map).await {
-                Ok(agent) => {
-                    let sa: Arc<dyn StreamingAgent> = agent.clone();
-                    (sa, Some(agent))
-                }
-                Err(response) => return Err(response),
-            }
-        };
+    let streaming_agent: Arc<dyn StreamingAgent> = if data.config.orchestration_enabled() {
+        // Orchestration path: build via streaming agent builder (returns Orchestrator)
+        let builder = RigBuilder::new((*data.config).clone());
+        builder
+            .build_streaming_agent_with_headers(Some(req_headers_map))
+            .await
+            .map_err(|e| {
+                error!("Failed to build streaming agent: {}", e);
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: ErrorDetail {
+                        message: format!("Failed to build streaming agent: {e}"),
+                        error_type: "internal_error".to_string(),
+                    },
+                })
+            })?
+    } else {
+        // Standard path: build Agent, coerce to Arc<dyn StreamingAgent>
+        build_agent_for_request(&data.config, req_headers_map).await? as Arc<dyn StreamingAgent>
+    };
 
-    // Get provider info from config (works for both agent types)
-    let (provider, model) = data.config.get_provider_info();
+    let (provider, model) = streaming_agent.get_provider_info();
     let model_str = format!("{provider}/{model}");
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_timestamp = Utc::now().timestamp() as u64;
-    let has_chat_history = !chat_history.is_empty();
 
     Ok(RequestSetup {
         query,
         chat_history,
         streaming_agent,
-        concrete_agent,
         completion_id,
         model_str,
         created_timestamp,
         chat_session_id: chat_session_id.to_string(),
-        has_chat_history,
     })
 }
 
@@ -328,17 +308,8 @@ fn build_completion_config(
         &setup.chat_session_id,
     );
 
-    // Use concrete agent for provider info when available, fall back to config
-    let (provider, model) = match &setup.concrete_agent {
-        Some(agent) => {
-            let (p, m) = agent.get_provider_info();
-            (p.to_string(), m.to_string())
-        }
-        None => {
-            let (p, m) = data.config.get_provider_info();
-            (p.to_string(), m.to_string())
-        }
-    };
+    let (p, m) = setup.streaming_agent.get_provider_info();
+    let (provider, model) = (p.to_string(), m.to_string());
     let response_content = ResponseContent::new();
     let message_count = setup.chat_history.len() + 1; // +1 for the current query
 
@@ -375,47 +346,33 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
     let _resource_guard =
         RequestResourceGuard::new(config.request_id.clone(), setup.streaming_agent.clone());
 
-    // Create stream with timeout.
-    // Standard path: use Agent-specific methods for usage state tracking via Rig hooks.
-    // Orchestration path: use StreamingAgent trait method with fresh UsageState.
-    let (stream, cancel_tx, usage_state) = if let Some(ref agent) = setup.concrete_agent {
-        if setup.has_chat_history {
-            agent
-                .stream_chat_with_timeout(
-                    &setup.query,
-                    setup.chat_history.clone(),
-                    config.timeout_duration,
-                    &config.request_id,
-                )
-                .await
-        } else {
-            agent
-                .stream_prompt_with_timeout(
-                    &setup.query,
-                    config.timeout_duration,
-                    &config.request_id,
-                )
-                .await
-        }
-    } else {
-        let (stream, cancel_tx) = setup
-            .streaming_agent
-            .stream_with_timeout(
-                &setup.query,
-                setup.chat_history.clone(),
-                config.timeout_duration,
-                &config.request_id,
-            )
-            .await;
-        (stream, cancel_tx, UsageState::new())
-    };
+    // Destructure to move chat_history instead of cloning
+    let RequestSetup {
+        query,
+        chat_history,
+        streaming_agent,
+        completion_id: _,
+        model_str,
+        created_timestamp: _,
+        chat_session_id,
+    } = setup;
+
+    // Create stream with timeout — single path for both Agent and Orchestrator
+    let (stream, cancel_tx, usage_state) = streaming_agent
+        .stream_with_timeout(
+            &query,
+            chat_history,
+            config.timeout_duration,
+            &config.request_id,
+        )
+        .await;
 
     let response_content = config.response_content.clone();
     let otel_ctx = StreamOtelContext {
         provider: config.provider,
         model: config.model,
         request_id: config.request_id.clone(),
-        session_id: setup.chat_session_id.clone(),
+        session_id: chat_session_id.clone(),
         query: config.query_for_otel,
         identity_id: String::new(),
         message_count: config.message_count,
@@ -451,13 +408,13 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
 
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
-                agent: setup.streaming_agent.clone(),
+                agent: streaming_agent.clone(),
                 tool_event_rx,
                 progress_rx,
                 tool_usage_rx,
                 usage_state: usage_state.clone(),
                 response_content,
-                model_name: setup.model_str.clone(),
+                model_name: model_str,
                 stream_shutdown_token: config.stream_shutdown_token.clone(),
             };
 

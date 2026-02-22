@@ -288,6 +288,17 @@ impl LlmConfig {
             | LlmConfig::Ollama { model, .. } => model,
         }
     }
+
+    /// Get provider name and model identifier as a tuple.
+    pub fn model_info(&self) -> (&str, &str) {
+        match self {
+            LlmConfig::OpenAI { model, .. } => ("openai", model),
+            LlmConfig::Anthropic { model, .. } => ("anthropic", model),
+            LlmConfig::Bedrock { model, .. } => ("bedrock", model),
+            LlmConfig::Gemini { model, .. } => ("gemini", model),
+            LlmConfig::Ollama { model, .. } => ("ollama", model),
+        }
+    }
 }
 
 /// Agent behavior settings
