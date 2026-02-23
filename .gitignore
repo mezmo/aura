@@ -64,6 +64,12 @@ Session.vim
 # Claude Code (keep local only)
 .claude/
 
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
 # Build artifacts and caches
 .cache/
 .build/
