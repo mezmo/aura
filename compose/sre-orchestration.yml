@@ -1,0 +1,53 @@
+# compose/sre-orchestration.yml
+# Overlay: Reconfigures aura-web-server for SRE orchestration mode with k8s-sre-mcp
+#
+# Adds k8s-sre-mcp service and overrides base config with SRE orchestration TOML.
+# Mock-mcp from base.yml is NOT used by SRE orchestration tests (k8s-sre-mcp replaces it).
+#
+# Usage:
+#   docker compose -f compose/base.yml -f compose/sre-orchestration.yml up -d
+#   docker compose -f compose/base.yml -f compose/sre-orchestration.yml -f compose/dev.yml up -d
+
+services:
+  # Stub out mock-mcp from base.yml — SRE orchestration tests don't use it.
+  # Override with a minimal container so the stack doesn't need the external
+  # aura-mock-mcp:local image (which requires `make mock-mcp-build`).
+  mock-mcp:
+    image: alpine:latest
+    command: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      timeout: 1s
+      retries: 1
+      start_period: 1s
+
+  k8s-sre-mcp:
+    build:
+      context: ../tests/integration/k8s-sre-mcp
+    environment:
+      - VERBOSE_MODE=${VERBOSE_MODE:-false}
+    healthcheck:
+      test: >
+        curl -sf http://localhost:8082/mcp -X POST
+        -H "Content-Type: application/json"
+        -H "Accept: application/json, text/event-stream"
+        -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}},"id":1}'
+        > /dev/null || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - aura-test
+
+  aura-web-server:
+    environment:
+      # Override config path to SRE orchestration config
+      - CONFIG_PATH=/app/config/test-sre-orchestration.toml
+    volumes:
+      # Mount SRE orchestration test config (instead of standard test config)
+      - ../configs/integration-sre-orchestration.toml:/app/config/test-sre-orchestration.toml:ro
+    depends_on:
+      k8s-sre-mcp:
+        condition: service_healthy
