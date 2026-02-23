@@ -1,0 +1,51 @@
+# compose/sre-orchestration-test.yml
+# CI test runner for SRE orchestration integration tests
+#
+# Uses integration-orchestration-sre feature flag (NOT in parent `integration` list).
+# SRE orchestration tests require a different server config with k8s-sre-mcp tools.
+#
+# Usage:
+#   docker compose -p aura-sre-orch-test \
+#     -f compose/base.yml \
+#     -f compose/sre-orchestration.yml \
+#     -f compose/sre-orchestration-test.yml \
+#     up --build --force-recreate --exit-code-from aura-sre-orchestration-test
+
+services:
+  # Silence infrastructure output during tests
+  mock-mcp:
+    attach: false
+    logging:
+      driver: "none"
+
+  aura-web-server:
+    attach: false
+    logging:
+      driver: "none"
+
+  # SRE orchestration test runner container
+  aura-sre-orchestration-test:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      target: base
+      args:
+        - GITHUB_TOKEN
+    environment:
+      # Point to containerized aura-web-server (SRE tests don't contact MCP directly)
+      - AURA_SERVER_URL=http://aura-web-server:8080
+    env_file:
+      - ./env/test.env
+    depends_on:
+      aura-web-server:
+        condition: service_healthy
+    # Run SRE orchestration tests only
+    # NOTE: --test-threads=1 required due to LLM API rate limits
+    command: >
+      cargo test
+      --package aura-web-server
+      --features integration-orchestration-sre
+      --no-fail-fast
+      -- --test-threads=1
+    networks:
+      - aura-test
