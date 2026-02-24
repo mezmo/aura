@@ -45,7 +45,6 @@ rig-qdrant = { workspace = true }
 qdrant-client = { workspace = true }
 uuid = { workspace = true }
 
-sha2 = "0.10"
 regex = "1"
 async-stream = "0.3"
 
