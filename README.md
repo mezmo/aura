@@ -118,17 +118,18 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 Core server options:
 
 | Option | Env Variable | Default | Description |
-| --- | --- | --- | --- |
-| `--config` | `CONFIG_PATH` | `config.toml` | Path to TOML config |
-| `--host` | `HOST` | `127.0.0.1` | Bind host |
-| `--port` | `PORT` | `8080` | Bind port |
-| `--streaming-timeout-secs` | `STREAMING_TIMEOUT_SECS` | `900` | Max SSE request duration |
-| `--streaming-buffer-size` | `STREAMING_BUFFER_SIZE` | `400` | SSE backpressure buffer |
-| `--aura-custom-events` | `AURA_CUSTOM_EVENTS` | `false` | Enable `aura.*` events |
-| `--aura-emit-reasoning` | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` |
-| `--tool-result-mode` | `TOOL_RESULT_MODE` | `none` | Tool result streaming: `none`, `open-web-ui`, `aura` |
-| `--tool-result-max-length` | `TOOL_RESULT_MAX_LENGTH` | `100` | Max chars before truncation |
-| `--shutdown-timeout-secs` | `SHUTDOWN_TIMEOUT_SECS` | `30` | Graceful shutdown window |
+|--------|--------------|---------|-------------|
+| `--config` | `CONFIG_PATH` | `config.toml` | Path to TOML configuration file |
+| `--host` | `HOST` | `127.0.0.1` | Host to bind to |
+| `--port` | `PORT` | `8080` | Port to bind to |
+| `--streaming-timeout-secs` | `STREAMING_TIMEOUT_SECS` | `900` | SSE request timeout (15 min default) |
+| `--first-chunk-timeout-secs` | `FIRST_CHUNK_TIMEOUT_SECS` | `30` | Max wait for first provider response (0 = disabled) |
+| `--streaming-buffer-size` | `STREAMING_BUFFER_SIZE` | `400` | SSE buffer size before backpressure |
+| `--aura-custom-events` | `AURA_CUSTOM_EVENTS` | `false` | Enable `aura.*` SSE events |
+| `--aura-emit-reasoning` | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` events |
+| `--tool-result-mode` | `TOOL_RESULT_MODE` | `none` | Tool result streaming mode |
+| `--tool-result-max-length` | `TOOL_RESULT_MAX_LENGTH` | `100` | Max chars for tool results |
+| `--shutdown-timeout-secs` | `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period for in-flight requests on shutdown |
 
 Tool result modes:
 
