@@ -405,6 +405,7 @@ impl Default for AgentConfig {
     }
 }
 
+<<<<<<< HEAD
 impl AgentConfig {
     /// Check if orchestration mode is enabled.
     ///
@@ -560,6 +561,80 @@ mod tests {
         assert!(config.tool_matches_filter("mezmo_pipelines"));
         assert!(config.tool_matches_filter("QueryKnowledgeBases"));
         assert!(!config.tool_matches_filter("other_tool"));
+    }
+
+    // --- lenient_int tests (from helm YAML config rendering) ---
+    use super::lenient_int;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestU32 {
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
+        val: Option<u32>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestU64 {
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        val: Option<u64>,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestUsize {
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
+        val: Option<usize>,
+    }
+
+    fn from_json<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn accepts_integer() {
+        let t: TestU32 = from_json(r#"{"val": 8000}"#).unwrap();
+        assert_eq!(t.val, Some(8000));
+    }
+
+    #[test]
+    fn accepts_whole_float() {
+        let t: TestU32 = from_json(r#"{"val": 8000.0}"#).unwrap();
+        assert_eq!(t.val, Some(8000));
+    }
+
+    #[test]
+    fn accepts_zero_float() {
+        let t: TestU32 = from_json(r#"{"val": 0.0}"#).unwrap();
+        assert_eq!(t.val, Some(0));
+    }
+
+    #[test]
+    fn rejects_fractional_float() {
+        let result = from_json::<TestU32>(r#"{"val": 3.14}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_none() {
+        let t: TestU32 = from_json(r#"{}"#).unwrap();
+        assert_eq!(t.val, None);
+    }
+
+    #[test]
+    fn u64_whole_float() {
+        let t: TestU64 = from_json(r#"{"val": 100000.0}"#).unwrap();
+        assert_eq!(t.val, Some(100000));
+    }
+
+    #[test]
+    fn usize_whole_float() {
+        let t: TestUsize = from_json(r#"{"val": 5.0}"#).unwrap();
+        assert_eq!(t.val, Some(5));
+    }
+
+    #[test]
+    fn rejects_negative() {
+        let result = from_json::<TestU32>(r#"{"val": -1.0}"#);
+        assert!(result.is_err());
     }
 }
 
