@@ -455,7 +455,6 @@ impl Default for AgentConfig {
     }
 }
 
-<<<<<<< HEAD
 impl AgentConfig {
     /// Check if orchestration mode is enabled.
     ///

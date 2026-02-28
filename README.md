@@ -23,7 +23,6 @@ Key capabilities:
   - [Quick Start](./examples/quickstart/README.md)
   - [Developer Setup](#setup)
   - [Usage](#usage)
-    - [CLI](#cli)
     - [Web API Server](#web-api-server)
   - [Configuration](#configuration)
     - [Orchestration](#orchestration)
@@ -43,7 +42,6 @@ aura/
 ├── crates/
 │   ├── aura/                # Core library (agent builder + orchestration)
 │   ├── aura-config/         # TOML parser and config loader
-│   ├── aura-cli/            # CLI for running and testing agents
 │   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
 │   └── aura-test-utils/     # Shared testing utilities
 ├── compose/                 # Docker Compose (integration + orchestration overlays)
@@ -53,6 +51,7 @@ aura/
 ├── docs/                    # Architecture and protocol documentation
 └── scripts/                 # CI and utility scripts
 ```
+
 
 ## Setup
 
@@ -77,26 +76,6 @@ aura/
 Security: keep secrets in environment variables and reference them in TOML using `{{ env.VAR_NAME }}`.
 
 ## Usage
-
-### CLI
-
-Run a single query:
-
-```bash
-cargo run --bin aura-cli -- --config config.toml --query "Hello!"
-```
-
-Interactive mode:
-
-```bash
-cargo run --bin aura-cli -- --config config.toml
-```
-
-Verbose mode:
-
-```bash
-cargo run --bin aura-cli -- --config config.toml --verbose --query "Investigate this issue"
-```
 
 ### Web API Server
 
@@ -375,6 +354,7 @@ Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 - Optional suite: `integration-vector` (requires external Qdrant setup)
 
 Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web-server/tests/README.md).
+
 
 ## Documentation
 
