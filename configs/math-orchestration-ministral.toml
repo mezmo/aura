@@ -1,33 +1,15 @@
-# Math Orchestration — Qwen3-Coder test config
-# Port: 8090
+# Math Orchestration — Ministral-3-Reasoning 14B test config
 #
 # Uses the math-mcp server (21 real math tools) with three specialized workers.
 # Start the math-mcp container first:
 #
 #   cd ~/workspace/aura-math-orchestration && docker compose up -d
-#
-# Then run aura locally:
-#
-#   CONFIG_PATH=configs/math-orchestration.toml PORT=8090 \
-#   OPENAI_API_KEY=sk-... \
-#   AURA_CUSTOM_EVENTS=true \
-#   cargo run --bin aura-web-server
-#
-# Test queries:
-#   Direct:        "What is 2 + 2?"
-#   Orchestrated:  "Calculate the mean of [10, 20, 30] then multiply the result by 3"
-#   Clarification: "Compute the thing"
 
 [llm]
 provider = "openai"
 api_key = "no-key-needed"
 base_url = "http://localhost:11435/v1"
-# model = "gpt-5.1"
-model = "qwen3-coder-64k"
-# model = "deepseek-r1:32b"
-
-# [llm.additional_params]
-# think = true  # only works in streaming mode; breaks worker (non-streaming) calls
+model = "ministral3-64k"
 
 [agent]
 name = "Math Orchestrator"
@@ -62,10 +44,10 @@ allow_clarification = true
 tools_in_planning = "summary"
 
 [orchestration.timeouts]
-per_call_timeout_secs = 60
+per_call_timeout_secs = 180
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-math-orchestration"
+memory_dir = "/tmp/aura-math-ministral"
 
 # Arithmetic worker: basic operations
 [orchestration.worker.arithmetic]

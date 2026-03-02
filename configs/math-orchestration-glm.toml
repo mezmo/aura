@@ -6,9 +6,10 @@
 #   cd ~/workspace/aura-math-orchestration && docker compose up -d
 
 [llm]
-provider = "ollama"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "glm-4.7-flash:q4_K_M"
+provider = "openai"
+api_key = "no-key-needed"
+base_url = "http://localhost:11435/v1"
+model = "glm-64k"
 
 [agent]
 name = "Math Orchestrator"
