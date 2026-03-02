@@ -3320,7 +3320,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         orchestration_start: Instant,
     ) -> Result<String, StreamError> {
         let mut iteration = 0;
-        let mut final_result = String::new();
+        let mut final_result: String;
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
         let mut failure_history: Vec<super::types::FailedTaskRecord> = Vec::new();
