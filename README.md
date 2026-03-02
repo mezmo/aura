@@ -10,6 +10,13 @@ Key capabilities:
 - RAG pipeline integration with in-memory and external vector stores
 - Embeddable Rust core independent from configuration layer
 
+> **Open Alpha** — Aura is under active development. APIs and configuration
+> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
+> are welcome — we'd love your feedback.
+
+> **Orchestration mode** (multi-agent coordination) is in development on the
+> [`feature/orchestration-mode`](https://github.com/mezmo/aura/tree/feature/orchestration-mode) branch.
+
 ## Table of Contents
 
 - [Aura](#aura)

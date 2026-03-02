@@ -1,5 +1,9 @@
 # Aura Web Server
 
+> **Open Alpha** — Aura is under active development. APIs and configuration
+> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
+> are welcome — we'd love your feedback.
+
 > **Part of the [Aura Project](../../README.md)** - A production-ready framework for building AI agents with declarative TOML configuration.
 
 OpenAI-compatible web API server that exposes Aura agents through a standard chat completions endpoint.
