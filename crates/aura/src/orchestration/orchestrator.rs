@@ -76,6 +76,11 @@ use super::types::{
 /// Number of characters per chunk when streaming the final orchestration response.
 const STREAM_CHUNK_SIZE: usize = 50;
 
+/// Maximum ReAct depth for the planning coordinator.
+/// Defense-in-depth alongside stream_and_collect's early exit.
+/// Allows: 1 recon tool (list_tools) + 1 routing tool + 1 spare.
+const PLANNING_COORDINATOR_MAX_DEPTH: usize = 3;
+
 // ============================================================================
 // Helper Structs
 // ============================================================================
@@ -599,7 +604,11 @@ without this field will be rejected.";
         Ok(AgentWithPreamble { agent, preamble })
     }
 
-    /// Call `agent.chat()` with a per-call timeout from config.
+    /// Execute a blocking chat call with timeout — for **worker tasks only**.
+    ///
+    /// Workers need the full ReAct loop for sequential MCP tool chains.
+    /// Coordinator phases (planning, evaluation) use `stream_and_collect()`
+    /// for early exit after one-shot tool decisions and reasoning forwarding.
     ///
     /// Returns `Err` with a timeout message if the call exceeds `per_call_timeout_secs`.
     /// A value of 0 (the default) disables the per-call timeout.
@@ -635,6 +644,128 @@ without this field will be rejected.";
         }
     }
 
+    /// Stream a coordinator call with early exit and optional reasoning forwarding.
+    ///
+    /// Replaces `chat_with_timeout` for one-shot tool phases (planning, evaluation).
+    /// Workers MUST NOT use this — they need the full ReAct loop for MCP tool chains.
+    ///
+    /// Key behaviors:
+    /// - Opens stream with `max_depth=1` (rig safety net, but early exit is primary guard)
+    /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx` when provided
+    /// - Short-circuits after first `ToolResult` when `decision_ready()` returns true
+    /// - Falls back to normal completion for text-only responses
+    ///
+    /// Usage may be zero when short-circuiting before `Final` — acceptable for
+    /// coordinator calls where token accounting is not critical.
+    async fn stream_and_collect(
+        &self,
+        agent: &Agent,
+        prompt: &str,
+        history: Vec<rig::completion::Message>,
+        phase: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
+    {
+        use crate::provider_agent::{
+            CompletionResponse, StreamedAssistantContent, StreamedUserContent,
+        };
+        use futures::StreamExt;
+        use rig::completion::Usage;
+
+        let timeout_secs = self.config.per_call_timeout_secs();
+        let stream_future = async {
+            let mut stream = agent.stream_chat_with_depth(prompt, history, 1).await;
+            let mut content = String::new();
+            let mut usage = Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+            };
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    // Text accumulation
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                        content.push_str(&t);
+                    }
+                    // Reasoning forwarding (fixes reasoning token discard during orchestration)
+                    Ok(StreamItem::StreamAssistantItem(
+                        ref sa @ StreamedAssistantContent::ReasoningDelta { .. },
+                    )) => {
+                        if let Some(tx) = event_tx {
+                            let _ = tx
+                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                                .await;
+                        }
+                    }
+                    Ok(StreamItem::StreamAssistantItem(
+                        ref sa @ StreamedAssistantContent::Reasoning(_),
+                    )) => {
+                        if let Some(tx) = event_tx {
+                            let _ = tx
+                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                                .await;
+                        }
+                    }
+                    // Tool result — check decision, short-circuit (fixes ReAct loop waste)
+                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                        tracing::debug!(
+                            "{}: tool result received (id={}, call_id={})",
+                            phase,
+                            tr.id,
+                            tr.call_id.as_deref().unwrap_or("-")
+                        );
+                        if decision_ready().await {
+                            tracing::debug!("{}: decision captured, exiting stream early", phase);
+                            break; // Drop stream — prevents rig re-prompt
+                        }
+                    }
+                    // Final response — authoritative content + usage
+                    Ok(StreamItem::Final(info)) => {
+                        content = info.content;
+                        usage = info.usage;
+                        break;
+                    }
+                    Ok(StreamItem::FinalMarker) => break,
+                    // MaxDepthError: success if decision was captured, error otherwise
+                    Err(ref e) if is_max_depth_error(e.as_ref()) => {
+                        if decision_ready().await {
+                            tracing::debug!("{}: depth cap hit but decision captured", phase);
+                            break;
+                        }
+                        return Err(format!("{}: {}", phase, e).into());
+                    }
+                    // Context overflow — propagate
+                    Err(ref e) if is_context_overflow_error(e.as_ref()) => {
+                        return Err(format!("{}: {}", phase, e).into());
+                    }
+                    Err(e) => return Err(e),
+                    _ => {} // ToolCall, ToolCallDelta — rig handles execution
+                }
+            }
+            Ok(CompletionResponse { content, usage })
+        };
+
+        // Timeout wrapping (preserves chat_with_timeout behavior)
+        if timeout_secs == 0 {
+            stream_future.await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), stream_future).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "{} coordinator timed out after {}s (per_call_timeout_secs={})",
+                        phase,
+                        timeout_secs,
+                        timeout_secs,
+                    );
+                    Err(format!("{} timed out after {}s", phase, timeout_secs).into())
+                }
+            }
+        }
+    }
+
     /// Plan with routing tool support.
     ///
     /// Creates a coordinator with routing tools (`respond_directly`, `create_plan`,
@@ -649,6 +780,7 @@ without this field will be rejected.";
         query: &str,
         chat_history: &[rig::completion::Message],
         previous: Option<&IterationContext>,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     ) -> Result<(PlanningResponse, String, String), StreamError> {
         use super::tools::routing_tools::RoutingDecision;
 
@@ -732,13 +864,19 @@ without this field will be rejected.";
                 &planning_prompt,
             );
 
-            // Call coordinator (will invoke routing tool via ReAct loop)
+            // Call coordinator with early-exit streaming (prevents ReAct loop waste)
+            let rd = routing_decision.clone();
             let response = match self
-                .chat_with_timeout(
+                .stream_and_collect(
                     &coordinator,
                     &planning_prompt,
                     chat_history.to_vec(),
                     "Planning",
+                    event_tx,
+                    || {
+                        let rd = rd.clone();
+                        Box::pin(async move { rd.lock().await.is_some() })
+                    },
                 )
                 .await
             {
@@ -1472,15 +1610,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let model_name = self.agent_config.llm.model_name().to_string();
 
-        // Each coordinator invocation (plan, synthesize, evaluate) gets a fresh depth budget.
-        // A single planning attempt may consume multiple Rig turns: inspect_tool_params
-        // calls, then one routing tool call.
-        // Uses [agent].turn_depth → DEFAULT_MAX_DEPTH (8).
-        let max_depth = self
-            .agent_config
-            .agent
-            .turn_depth
-            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+        // Planning coordinator uses a tight depth budget: 1 recon + 1 routing + 1 spare.
+        // stream_and_collect() provides the primary early-exit guard; this is defense-in-depth.
+        let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
         Ok(AgentWithPreamble {
             agent: Agent {
@@ -2967,8 +3099,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 // Record in prompt journal
                 self.journal_record(JournalPhase::Evaluation, &eval_preamble, &eval_prompt);
 
+                let d = decision.clone();
                 match self
-                    .chat_with_timeout(&coordinator, &eval_prompt, vec![], "Evaluation")
+                    .stream_and_collect(
+                        &coordinator,
+                        &eval_prompt,
+                        vec![],
+                        "Evaluation",
+                        None, // No reasoning forwarding for eval
+                        || {
+                            let d = d.clone();
+                            Box::pin(async move { d.lock().await.is_some() })
+                        },
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -3096,8 +3239,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Set iteration for initial planning (journal reads this via AtomicUsize)
         self.current_iteration.store(1, Ordering::Relaxed);
-        let (response, _prompt, _coordinator_text) =
-            self.plan_with_routing(query, &chat_history, None).await?;
+        let (response, _prompt, _coordinator_text) = self
+            .plan_with_routing(query, &chat_history, None, Some(&event_tx))
+            .await?;
 
         match response {
             PlanningResponse::Direct {
@@ -3203,7 +3347,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // On re-plan (iteration > 1), get a new plan from the coordinator
             if iteration > 1 {
                 let (response, _prompt, _coordinator_text) = self
-                    .plan_with_routing(query, &chat_history, previous_context.as_ref())
+                    .plan_with_routing(
+                        query,
+                        &chat_history,
+                        previous_context.as_ref(),
+                        Some(&event_tx),
+                    )
                     .await?;
 
                 let routing_rationale = response.routing_rationale().to_string();
@@ -3783,6 +3932,12 @@ fn truncate_query(query: &str, max_len: usize) -> String {
     } else {
         truncated.to_string()
     }
+}
+
+/// Check if an error indicates a MaxDepthError from rig's ReAct loop.
+fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let msg = error.to_string();
+    msg.contains("MaxDepthError") || msg.contains("reached limit")
 }
 
 /// Check if an error indicates a context length/token limit exceeded.
