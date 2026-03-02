@@ -751,6 +751,22 @@ impl Agent {
         self.maybe_wrap_with_fallback(stream)
     }
 
+    /// Stream a chat with explicit max_depth override.
+    ///
+    /// Unlike `stream_chat()` which uses `self.max_depth`, this allows callers
+    /// to specify depth. Used by orchestration phases that need tighter bounds.
+    #[tracing::instrument(name = "agent.stream_chat", skip(self, chat_history),
+        fields(model = %self.model, history_len = chat_history.len(), max_depth))]
+    pub async fn stream_chat_with_depth(
+        &self,
+        query: &str,
+        chat_history: Vec<rig::completion::Message>,
+        max_depth: usize,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let stream = self.inner.stream_chat(query, chat_history, max_depth).await;
+        self.maybe_wrap_with_fallback(stream)
+    }
+
     /// Conditionally wrap stream for Ollama text-to-tool parsing.
     ///
     /// When `fallback_tool_parsing` is enabled (Ollama config), this wraps the stream

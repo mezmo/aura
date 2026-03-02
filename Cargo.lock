@@ -3361,7 +3361,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.28.0"
-source = "git+https://github.com/mezmo/rig.git?branch=mezmo#0853ab1487b6cbdc4c8818e9fb8d475b8b59eaf6"
+source = "git+https://github.com/mezmo/rig.git?branch=mshearer%2FLOG-23351-openai-reasoning#34e837b245b60f33284b4b9438ca3a4c89987de5"
 dependencies = [
  "as-any",
  "async-stream",
