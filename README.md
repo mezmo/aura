@@ -11,6 +11,10 @@ Key capabilities:
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
 - Dependency-aware multi-wave execution with quality evaluation and iterative re-planning loops
 
+> **Open Alpha** — Aura is under active development. APIs and configuration
+> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
+> are welcome — we'd love your feedback.
+
 ## Table of Contents
 
 - [Aura](#aura)
