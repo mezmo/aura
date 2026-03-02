@@ -1,0 +1,150 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aura.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aura.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "aura.selectorLabels" . | nindent 6 }}
+  strategy:
+    {{- toYaml .Values.strategy | nindent 4 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "aura.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "aura.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.server.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.server.args }}
+          args:
+            {{- toYaml .Values.server.args | nindent 12 }}
+          {{- else }}
+          args:
+            - "--verbose"
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.httpPort }}
+              protocol: TCP
+          env:
+            # Server configuration
+            - name: HOST
+              value: {{ .Values.server.host | quote }}
+            - name: PORT
+              value: {{ .Values.server.httpPort | quote }}
+            - name: CONFIG_PATH
+              value: "/etc/aura/config.toml"
+            - name: RUST_LOG
+              value: {{ .Values.server.loglevel | quote }}
+            # Streaming configuration
+            - name: TOOL_RESULT_MODE
+              value: {{ .Values.streaming.toolResultMode | quote }}
+            - name: TOOL_RESULT_MAX_LENGTH
+              value: {{ .Values.streaming.toolResultMaxLength | quote }}
+            - name: AURA_CUSTOM_EVENTS
+              value: {{ .Values.streaming.customEvents | quote }}
+            - name: AURA_EMIT_REASONING
+              value: {{ .Values.streaming.emitReasoning | quote }}
+            - name: STREAMING_TIMEOUT_SECS
+              value: {{ .Values.streaming.timeoutSecs | quote }}
+            # Server identifier from pod name
+            - name: SERVER_GUID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            {{- if or .Values.secrets.existingSecret (include "aura.createSecret" .) }}
+            - secretRef:
+                name: {{ include "aura.secretName" . }}
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aura
+              readOnly: true
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "aura.configMapName" . }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

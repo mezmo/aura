@@ -1,0 +1,31 @@
+# LibreChat Configuration for Aura Server
+# See: https://docs.librechat.ai/install/configuration/custom_config.html
+
+version: 1.1.5
+
+# Custom endpoints configuration
+endpoints:
+  custom:
+    # Aura Server - OpenAI-compatible endpoint
+    - name: "Aura"
+      apiKey: "${MEZMO_API_KEY}"  # Use environment variable
+      baseURL: "http://host.docker.internal:8080/v1"
+      models:
+        default:
+          - "claude-3-5-sonnet-20241022"  # Your default model from config.toml
+          - "gpt-4o"
+          - "gpt-4o-mini"
+        fetch: false  # Don't try to fetch models from /v1/models
+      titleConvo: true
+      titleModel: "aura"
+      summarize: false
+      summaryModel: "aura 1.0.2"
+      forcePrompt: false
+      modelDisplayLabel: "Aura"
+      iconURL: ""
+
+      # Additional settings
+      addParams:
+        # These will be sent to aura-web-server
+        stream: true
+        max_tokens: 4096

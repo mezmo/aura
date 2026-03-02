@@ -1,0 +1,27 @@
+# compose/dev.yml
+# Development configuration with exposed ports
+#
+# Exposes service ports for local development and debugging.
+# Run tests locally against containerized dependencies.
+#
+# Usage:
+#   docker compose -f compose/base.yml -f compose/dev.yml up -d
+#   cargo test --features integration -- --test-threads=1
+#   docker compose -f compose/base.yml -f compose/dev.yml down
+
+services:
+  mock-mcp:
+    ports:
+      - "9998:9998"  # Rust cancellation server
+      - "9999:9999"  # Python FastMCP server
+
+  aura-web-server:
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount configs for hot-reload during development
+      - ../configs:/app/configs:ro
+      - ../crates/aura-web-server/tests/test-config.toml:/app/config/test-config.toml:ro
+    environment:
+      # More verbose logging for development
+      - RUST_LOG=info,aura=debug

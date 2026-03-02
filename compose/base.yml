@@ -1,0 +1,88 @@
+# compose/base.yml
+# Infrastructure services for aura integration tests
+#
+# This file defines the core services:
+# - mock-mcp: Python FastMCP (9999) + Rust cancellation server (9998)
+# - aura-web-server: The main aura API server (8080)
+#
+# Usage:
+#   docker compose -f compose/base.yml up -d
+#   docker compose -f compose/base.yml -f compose/dev.yml up -d
+
+services:
+  # Single container running BOTH mock MCP servers:
+  # - Python FastMCP (port 9999) - general tool mocking
+  # - Rust cancellation server (port 9998) - cancellation/progress tests
+  mock-mcp:
+    # Use GCR image in CI, local build for development (Mac ARM needs local build)
+    # CI: Set MOCK_MCP_IMAGE in Jenkinsfile
+    # Local: Run `make mock-mcp-build` to build from ../aura-mock-mcp
+    image: ${MOCK_MCP_IMAGE:-aura-mock-mcp:local}
+    volumes:
+      # Shared volume for marker files (written by slow_task, read by tests)
+      # Uses /tmp since that's where slow_task writes marker files
+      - mcp-markers:/tmp
+    healthcheck:
+      # Verify both MCP servers respond to initialize
+      # FastMCP requires Accept headers for both JSON and SSE
+      test: >
+        curl -sf http://localhost:9999/mcp -X POST
+        -H "Content-Type: application/json"
+        -H "Accept: application/json, text/event-stream"
+        -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}},"id":1}'
+        > /dev/null &&
+        curl -sf http://localhost:9998/mcp -X POST
+        -H "Content-Type: application/json"
+        -H "Accept: application/json, text/event-stream"
+        -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}},"id":1}'
+        > /dev/null || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - aura-test
+
+  aura-web-server:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    environment:
+      # API keys (passed from host environment or .env file)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Server configuration
+      - HOST=0.0.0.0
+      - PORT=8080
+      - CONFIG_PATH=/app/config/test-config.toml
+      # MCP server hostname (Docker service name)
+      - MCP_MOCK_HOST=mock-mcp
+      # Tool result format
+      - TOOL_RESULT_MODE=open-web-ui
+      # Enable custom aura events for testing
+      - AURA_CUSTOM_EVENTS=true
+      # Logging
+      - RUST_LOG=warn
+    env_file:
+      - ./env/test.env
+    volumes:
+      # Mount test config
+      - ../crates/aura-web-server/tests/test-config.toml:/app/config/test-config.toml:ro
+    depends_on:
+      mock-mcp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks:
+      - aura-test
+
+networks:
+  aura-test:
+    driver: bridge
+
+volumes:
+  # Shared volume for marker files between mock-mcp and test runner
+  mcp-markers:

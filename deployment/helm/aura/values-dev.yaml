@@ -1,0 +1,44 @@
+# Development environment overrides
+# Usage: helm install aura ./aura -f values.yaml -f values-dev.yaml
+
+replicaCount: 1
+
+imagePullSecrets:
+  - name: gcr
+
+# Use existing secrets from dev environment
+secrets:
+  existingSecret: "aura-secrets"
+
+# Dev-specific environment variables
+extraEnv:
+  - name: QDRANT_URL
+    value: "http://qdrant-a2-us-east-1-dev-logdna.logdna.sdm.network"
+  - name: MEZMO_MCP_URL
+    value: "https://mcp.use.dev.mezmo.it/mcp"
+
+config:
+  llm:
+    provider: openai
+    api_key: "{{ env.OPENAI_API_KEY }}"
+    model: gpt-4o
+
+  agent:
+    name: "Mezmo Dev Agent"
+    system_prompt: "You are a helpful assistant for Mezmo development."
+    context: []
+    turn_depth: 6
+
+# Lower resources for dev
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 4Gi
+
+# Disable workload-pipeline affinity for dev (may not have those nodes)
+# Use null to completely override the default affinity
+affinity: {}
+tolerations: []

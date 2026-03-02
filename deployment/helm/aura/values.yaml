@@ -1,0 +1,330 @@
+# Default values for aura
+# This is a YAML-formatted file.
+
+# -- Number of replicas
+replicaCount: 1
+
+image:
+  # -- Container image repository
+  repository: us.gcr.io/logdna-k8s/aura
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (default is the chart appVersion)
+  tag: ""
+
+# -- Image pull secrets (override per environment)
+imagePullSecrets: []
+
+# -- Override the name of the chart
+nameOverride: ""
+# -- Override the full name of the chart
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Specifies whether a service account should be created
+  create: true
+  # -- Annotations to add to the service account
+  annotations: {}
+  # -- The name of the service account to use (auto-generated if not set)
+  name: ""
+
+# -- Pod annotations
+podAnnotations: {}
+
+# -- Pod security context
+podSecurityContext: {}
+
+# -- Container security context
+securityContext: {}
+
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- Service port
+  port: 80
+
+# Server configuration
+server:
+  # -- Host to bind to
+  host: "0.0.0.0"
+  # -- HTTP port for the container
+  httpPort: 8080
+  # -- Log level
+  loglevel: info
+  # -- Command override (leave empty for default)
+  command: []
+  # -- Args override (leave empty for default --verbose)
+  args: []
+
+# Streaming configuration
+streaming:
+  # -- Tool result mode (aura or passthrough)
+  toolResultMode: "aura"
+  # -- Maximum length for tool results (0 = unlimited)
+  toolResultMaxLength: 0
+  # -- Enable custom aura events (aura.tool_requested, aura.tool_complete, etc.)
+  customEvents: true
+  # -- Emit reasoning events
+  emitReasoning: true
+  # -- Streaming timeout in seconds
+  timeoutSecs: 900
+
+# Aura TOML configuration
+# This will be mounted as /etc/aura/config.toml
+#
+# Priority order (highest wins):
+#   1. config.existingConfigMap — use an external ConfigMap as-is
+#   2. config.content           — raw TOML string (legacy, unchanged)
+#   3. Structured sections      — rendered to TOML by helper templates
+#
+# NOTE: {{ env.VAR }} syntax in values is Aura's own runtime template resolution,
+# NOT Helm/Go templating. These are resolved by the Aura binary at startup.
+config:
+  # -- Use an existing ConfigMap for aura config (highest priority)
+  existingConfigMap: ""
+
+  # -- Raw TOML configuration content (overrides structured sections below)
+  # When non-empty, this is used verbatim and structured sections are ignored.
+  # NOTE: At minimum, [llm] and [agent] sections are required for a valid config.
+  # Either provide them here as raw TOML, or populate the structured sections below.
+  content: ""
+
+  # -----------------------------------------------------------------------
+  # Structured sections — rendered to TOML when config.content is empty.
+  # All keys use snake_case matching TOML keys 1:1. Only non-empty sections
+  # are rendered. Set config.content to a raw TOML string to bypass these.
+  # -----------------------------------------------------------------------
+
+  # -- LLM provider configuration → [llm]
+  llm: {}
+  #   provider: openai
+  #   api_key: "{{ env.OPENAI_API_KEY }}"
+  #   model: gpt-4o
+  #   base_url: ""               # optional
+  #   region: ""                  # bedrock only
+  #   profile: ""                 # bedrock only
+  #   num_ctx: 0                  # ollama only
+  #   num_predict: 0              # ollama only
+  #   fallback_tool_parsing: false  # ollama only
+  #   additional_params:           # → [llm.additional_params]
+  #     seed: 42
+  #     top_k: 40
+  #     top_p: 0.9
+
+  # -- Agent configuration → [agent]
+  agent: {}
+  #   name: "My Agent"
+  #   system_prompt: "You are a helpful assistant."
+  #   context: []
+  #   turn_depth: 6
+  #   temperature: 0.7
+  #   max_tokens: 2000
+
+  # -- Vector stores → [[vector_stores]]
+  vector_stores: []
+  #   - name: mezmo_kb
+  #     type: qdrant
+  #     url: "{{ env.QDRANT_URL }}"
+  #     collection_name: mezmo_kb_collection
+  #     context_prefix: "Documentation"
+  #     embedding_model:
+  #       provider: openai
+  #       model: text-embedding-3-small
+  #       api_key: "{{ env.OPENAI_API_KEY }}"
+
+  # -- MCP server configuration → [mcp]
+  mcp: {}
+  #   sanitize_schemas: true
+  #   servers:
+  #     mezmo_log_analysis:
+  #       transport: http_streamable
+  #       url: "{{ env.MEZMO_MCP_URL }}"
+  #       headers:
+  #         Authorization: "Bearer {{ env.MEZMO_API_KEY }}"
+  #       headers_from_request:
+  #         Authorization: x-auth-header
+  #       description: "Mezmo MCP server"
+  #     local_tools:
+  #       transport: stdio
+  #       cmd: ["uvx", "mcp-server"]
+  #       args: ["--verbose"]
+  #       env:
+  #         AWS_PROFILE: default
+
+  # -- Tools configuration → [tools]
+  tools: {}
+  #   filesystem: false
+  #   custom_tools: []
+
+  # -- Orchestration configuration → [orchestration]
+  orchestration: {}
+  #   enabled: true
+  #   max_iterations: 3
+  #   quality_threshold: 0.8
+
+  # -- Orchestrator agent → [orchestrator]
+  orchestrator: {}
+  #   role: orchestrator
+  #   system_prompt: "..."
+
+  # -- Worker agents → [workers.*]
+  workers: {}
+  #   research:
+  #     role: research
+  #     specialization: "documentation search"
+  #     system_prompt: "..."
+  #     vector_stores:
+  #       - name: docs_kb
+  #         type: qdrant
+  #         url: "{{ env.QDRANT_URL }}"
+  #         collection_name: my_collection
+  #         embedding_model:
+  #           provider: openai
+  #           model: text-embedding-3-small
+  #           api_key: "{{ env.OPENAI_API_KEY }}"
+  #     mcp:
+  #       sanitize_schemas: true
+  #       servers:
+  #         tool_server:
+  #           transport: http_streamable
+  #           url: "http://example.com/mcp"
+
+  # -- Escape hatch: raw TOML appended after all structured sections
+  extra_toml: ""
+
+# Secrets configuration
+secrets:
+  # -- Use an existing Secret for API keys (mounted via envFrom)
+  # The secret should contain keys like OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+  existingSecret: ""
+  # -- Create a new secret with these values (leave empty to not create)
+  # WARNING: For production, use existingSecret or external secret management
+  openaiApiKey: ""
+  anthropicApiKey: ""
+  mezmoApiKey: ""
+  awsAccessKeyId: ""
+  awsSecretAccessKey: ""
+
+# Additional environment variables
+extraEnv: []
+  # - name: QDRANT_URL
+  #   value: "http://qdrant.example.com"
+  # - name: MEZMO_MCP_URL
+  #   value: "https://mcp.use.prod.logdna.net/mcp"
+  # - name: AWS_REGION
+  #   value: "us-east-1"
+
+# -- Extra environment variables from ConfigMaps or Secrets
+extraEnvFrom: []
+  # - configMapRef:
+  #     name: my-config
+  # - secretRef:
+  #     name: my-secret
+
+resources:
+  requests:
+    # -- CPU request
+    cpu: 1
+    # -- Memory request
+    memory: 2Gi
+  limits:
+    # -- CPU limit
+    cpu: 4
+    # -- Memory limit
+    memory: 8Gi
+
+# Health probes
+probes:
+  startup:
+    # -- Enable startup probe
+    enabled: true
+    # -- Startup probe period
+    periodSeconds: 5
+    # -- Startup probe failure threshold
+    failureThreshold: 60
+  liveness:
+    # -- Enable liveness probe
+    enabled: true
+    # -- Liveness probe initial delay
+    initialDelaySeconds: 5
+    # -- Liveness probe period
+    periodSeconds: 30
+    # -- Liveness probe timeout
+    timeoutSeconds: 15
+  readiness:
+    # -- Enable readiness probe
+    enabled: true
+    # -- Readiness probe initial delay
+    initialDelaySeconds: 5
+    # -- Readiness probe period
+    periodSeconds: 30
+    # -- Readiness probe timeout
+    timeoutSeconds: 15
+
+# -- Termination grace period in seconds (should exceed typical request duration)
+terminationGracePeriodSeconds: 60
+
+# Deployment strategy
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+    maxSurge: 1
+
+# Pod disruption budget
+podDisruptionBudget:
+  # -- Enable PodDisruptionBudget
+  enabled: false
+  # -- Maximum number of pods that can be unavailable during disruption
+  maxUnavailable: 1
+
+# Autoscaling
+autoscaling:
+  # -- Enable HorizontalPodAutoscaler
+  enabled: false
+  # -- Minimum number of replicas
+  minReplicas: 1
+  # -- Maximum number of replicas
+  maxReplicas: 10
+  # -- Target CPU utilization percentage
+  targetCPUUtilizationPercentage: 80
+  # -- Target memory utilization percentage (optional, leave empty to disable)
+  # targetMemoryUtilizationPercentage: 80
+  # -- HPA scaling behavior (controls scale-up/down speed)
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+
+# Node scheduling
+nodeSelector: {}
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 1
+        podAffinityTerm:
+          topologyKey: "kubernetes.io/hostname"
+          labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/name
+                operator: In
+                values:
+                  - aura
+
+# -- Extra volumes to add to the pod
+extraVolumes: []
+
+# -- Extra volume mounts to add to the container
+extraVolumeMounts: []

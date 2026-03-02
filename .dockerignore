@@ -1,0 +1,81 @@
+# Git
+.git
+.gitignore
+
+# Rust build artifacts
+target/
+**/target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.staging
+
+# Logs
+*.log
+logs/
+*.log.*
+kb-proxy.log
+kb-proxy.pid
+
+# Documentation (not needed in build)
+docs/
+README.md
+CLAUDE.md
+CHANGELOG.md
+
+# Scripts (not needed in build)
+*.sh
+manage-kb-proxy.sh
+diagnose_zshenv.sh
+setup_env.sh
+
+# Test files
+test_*.toml
+test-*.toml
+bedrock-only-config.toml
+
+# Local configuration
+config.local.toml
+*.local.*
+
+# Claude Code settings
+.claude/
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Session files
+Session.vim
+
+# Build artifacts and caches
+.cache/
+.build/
+
+# Rig source (if present)
+/rig-source/
+
+# Keep only what's needed for build
+!Cargo.toml
+!Cargo.lock
+!crates/

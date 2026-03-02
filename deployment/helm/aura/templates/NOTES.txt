@@ -1,0 +1,44 @@
+Thank you for installing {{ .Chart.Name }}.
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }}
+  $ helm get all {{ .Release.Name }}
+
+1. Get the application URL by running these commands:
+{{- if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "aura.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+     NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+           You can watch the status of by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "aura.fullname" . }}'
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "aura.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.service.port }}
+{{- else if contains "ClusterIP" .Values.service.type }}
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "aura.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  export CONTAINER_PORT=$(kubectl get pod --namespace {{ .Release.Namespace }} $POD_NAME -o jsonpath="{.spec.containers[0].ports[0].containerPort}")
+  echo "Visit http://127.0.0.1:{{ .Values.server.httpPort }} to use your application"
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME {{ .Values.server.httpPort }}:$CONTAINER_PORT
+{{- end }}
+
+2. To test the API:
+  curl http://localhost:{{ .Values.server.httpPort }}/health
+  curl -X POST http://localhost:{{ .Values.server.httpPort }}/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+3. Configuration:
+   - Config file is mounted at /etc/aura/config.toml
+   - Update values.yaml config.content or use config.existingConfigMap
+
+4. Secrets:
+{{- if .Values.secrets.existingSecret }}
+   - Using existing secret: {{ .Values.secrets.existingSecret }}
+{{- else if include "aura.createSecret" . }}
+   - Created secret: {{ include "aura.secretName" . }}
+{{- else }}
+   - No secrets configured. Set secrets.existingSecret or provide API keys in values.yaml
+{{- end }}

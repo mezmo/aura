@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "aura.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aura.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "aura.selectorLabels" . | nindent 4 }}

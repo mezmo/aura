@@ -1,0 +1,63 @@
+[package]
+name = "aura-web-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aura = { path = "../aura" }
+aura-config = { path = "../aura-config" }
+actix-web = "4.4"
+actix-web-lab = "0.22"
+async-stream = "0.3"
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+env_logger = "0.11"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = "0.4"
+
+[features]
+default = ["otel"]
+otel = ["aura/otel", "dep:tracing-opentelemetry", "dep:opentelemetry"]
+
+# Integration test feature flags
+# Parent flag - enables all integration tests
+integration = [
+    "integration-streaming",
+    "integration-header-forwarding",
+    "integration-mcp",
+    "integration-events",
+    "integration-cancellation",
+    "integration-progress",
+]
+
+# Per-suite flags (can run individually)
+integration-streaming = []                # streaming_tests, concurrent_streaming_isolation_test
+integration-header-forwarding = []        # header_forwarding_tests
+integration-mcp = []                      # fastmcp_structured_content_test
+integration-events = []                   # aura_events_test, proactive_tool_ui_tests
+integration-cancellation = []             # cancellation_test, cancellation_notification_test
+integration-progress = []                 # mcp_progress_test, progress_disconnect_test
+
+# Optional - requires Qdrant (separate epic)
+integration-vector = []         # vector_label_filter_tests
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+eventsource-stream = "0.2"
+rig-core = { workspace = true }
+futures-util = "0.3"
+uuid = { version = "1.0", features = ["v4"] }
+aura-test-utils = { path = "../aura-test-utils" }

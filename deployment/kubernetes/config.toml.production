@@ -1,0 +1,84 @@
+# Production Configuration for Aura (Kubernetes)
+# This config is deployed via ConfigMap and mounted at /etc/aura/config.toml
+
+# LLM Provider - Uses OpenAI GPT-4o by default
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+
+# Alternative providers (uncomment one to switch):
+# [llm]
+# provider = "anthropic"
+# api_key = "{{ env.ANTHROPIC_API_KEY }}"
+# model = "claude-sonnet-4-5-20250929"
+
+# [llm]
+# provider = "bedrock"
+# model = "us.anthropic.claude-sonnet-4-5-v1:0"
+# region = "{{ env.AWS_REGION }}"
+
+# Vector Store Configuration - Qdrant for knowledge bases
+# IMPORTANT: URL must be configured per environment
+# - Dev: http://qdrant-a2-us-east-1-dev-logdna.logdna.sdm.network
+# - Int: http://qdrant-<region>-int-logdna.logdna.sdm.network (TBD)
+# - Prod: http://qdrant-<region>-prod-logdna.logdna.sdm.network (TBD)
+
+[[vector_stores]]
+name = "mezmo_kb"
+type = "qdrant"
+url = "{{ env.QDRANT_URL }}"  # Set via ConfigMap per environment
+collection_name = "mezmo_kb"
+context_prefix = "Mezmo operations manual and customer documentation covering logging, monitoring, pipelines, troubleshooting, and platform usage"
+embedding_model = { provider = "openai", model = "text-embedding-ada-002", api_key = "{{ env.OPENAI_API_KEY }}" }
+
+[[vector_stores]]
+name = "mezmo_runbooks"
+type = "qdrant"
+url = "{{ env.QDRANT_URL }}"  # Set via ConfigMap per environment
+collection_name = "mezmo_runbooks"
+context_prefix = "Mezmo internal runbooks to help act as a bridge from internal constructs that can be seen from the mezmo MCP root cause analysis or log export tools to help us understand pipeline constructs and make recommendations when appropriate from the mezmo knowledge base"
+embedding_model = { provider = "openai", model = "text-embedding-ada-002", api_key = "{{ env.OPENAI_API_KEY }}" }
+
+# MCP Configuration - Mezmo Log Analysis Server
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.mezmo_log_analysis]
+transport = "http_streamable"
+# URL is environment-specific, set via ConfigMap:
+# - Dev: https://mcp.use.dev.mezmo.it/mcp
+# - Int: https://mcp.use.int.logdna.net/mcp
+# - Prod: https://mcp.use.prod.logdna.net/mcp (TBD)
+url = "{{ env.MEZMO_MCP_URL }}"
+description = "Mezmo MCP server providing log analysis, export, and monitoring tools"
+
+# Agent Configuration
+[agent]
+name = "Mezmo Operations Assistant"
+system_prompt = """
+You are a specialized operations assistant focused on Mezmo log analysis and monitoring:
+
+CAPABILITIES:
+- Log Analysis: Export logs, analyze for root causes, time-based filtering
+- Knowledge Base: Search Mezmo knowledge bases for documentation and procedures
+- Current Time: Get current timestamp for time-based operations
+- Pipeline Management: List and analyze Mezmo pipelines
+
+WORKFLOW:
+1. For operational issues: Start with log analysis using appropriate time ranges
+2. For procedures: Search the knowledge base first
+3. Always provide specific time ranges and pipeline context when analyzing logs
+
+Focus on actionable insights and root cause analysis.
+"""
+context = [
+    "You are connected to Mezmo's log analysis and monitoring platform.",
+    "You can export and analyze logs with time-based filtering.",
+    "You have access to the Mezmo Knowledge base for customer facing docs on using Mezmo and should be your first point of entry for answering questions about Mezmo",
+    "You can use the Mezmo Runbooks to correlate vector and pipeline logs to customer facing documentation but you should not surface the runbooks directly",
+    "Always specify time ranges when working with logs.",
+    "Combine log analysis with knowledge base searches for comprehensive troubleshooting and use the runbooks as a bridge for internal errors to provide customer facing solutions when appropriate.",
+    "You will interface directly with a customer as the user"
+]
+turn_depth = 6  # Max depth of tool calls and re-analysis per turn

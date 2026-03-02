@@ -1,0 +1,54 @@
+[package]
+name = "aura"
+version.workspace = true
+edition.workspace = true
+description = "Core agent builder library for Rig.rs - construct agents from configuration"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Rig dependencies
+rig-core = { workspace = true }
+rig-bedrock = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-bedrockruntime = { workspace = true }
+
+rmcp = { workspace = true }
+futures = "0.3"
+sse-stream = "0.2"
+reqwest = { version = "0.12", features = ["stream", "json"] }
+
+# Serialization (for tool schemas)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+tokio-util = "0.7"
+async-trait = "0.1"
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+chrono = "0.4"
+
+# Vector stores - Qdrant support
+rig-qdrant = { workspace = true }
+qdrant-client = { workspace = true }
+uuid = { workspace = true }
+
+regex = "1"
+async-stream = "0.3"
+
+[features]
+default = ["otel"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+

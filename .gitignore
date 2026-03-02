@@ -1,0 +1,90 @@
+# Rust
+/target
+**/target
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables and secrets
+.env
+.env.local
+.env.production
+.env.staging
+*.key
+*.pem
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bk
+*.bak
+/tmp/
+
+# Generated documentation
+/doc/
+
+# Local configuration overrides
+config.local.toml
+*.local.*
+config.toml
+
+# Docker compose local env files (may contain secrets)
+compose/env/*.local
+compose/env/.env*
+
+# Test artifacts
+/test_output/
+/test_results/
+
+# Rig source code (external dependency for research)
+/rig-source/
+
+# Vim session files
+Session.vim
+
+# Claude Code (keep local only)
+.claude/
+
+# Build artifacts and caches
+.cache/
+.build/
+
+# Temporary commit messages
+COMMIT_MESSAGE.txt
+
+# External dependencies and experimental code
+mcp-rust-sdk/
+tui/
+
+
+# Development documentation (keep local only)
+docs/architecture-decisions/
+docs/internal/
+docs/planning/
+docs/*-internal.md
+docs/archive/
+archive/
+TODO.md
+*.pid
+*.bundle
+
+# Test config files
+config-*-test.toml

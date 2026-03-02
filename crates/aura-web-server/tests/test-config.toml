@@ -1,0 +1,84 @@
+# Minimal Test Configuration for CI/CD
+# This config uses only publicly available services and minimal dependencies
+
+# LLM Configuration
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+
+# MCP Configuration - Mock MCP server for tool execution tests
+# URLs use environment variables with defaults for local development.
+# In containers, set MCP_MOCK_HOST=mock-mcp to use Docker service names.
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.mock_test_server]
+transport = "http_streamable"
+url = "http://{{ env.MCP_MOCK_HOST | default: '127.0.0.1' }}:9999/mcp"
+description = "Mock MCP server for testing tool execution and header forwarding"
+
+# Static headers for override testing
+# These should be overridden by dynamic session headers
+[mcp.servers.mock_test_server.headers]
+Authorization = "Bearer static-config-token-should-be-overridden"
+x-static-header = "static-value-from-config"
+
+[mcp.servers.mock_test_server.headers_from_request]
+"Authorization" = "authorization"
+
+# Cancellation test server (Rust rmcp-based) for cancellation propagation tests
+# Provides: slow_task, slow_task_with_progress tools
+# Has /cancellations HTTP endpoint to verify notifications/cancelled was received
+[mcp.servers.cancellation_test_server]
+transport = "http_streamable"
+url = "http://{{ env.MCP_MOCK_HOST | default: '127.0.0.1' }}:9998/mcp"
+description = "Cancellation test server for testing MCP cancellation propagation"
+
+# Vector Stores - Minimal dummy in-memory store (required by config parser)
+# This store is defined but won't be used in basic streaming tests
+[[vector_stores]]
+name = "test_docs"
+type = "in_memory"
+context_prefix = "Test documentation"
+
+# Embedding model for the vector store
+[vector_stores.embedding_model]
+provider = "openai"
+model = "text-embedding-ada-002"
+api_key = "{{ env.OPENAI_API_KEY }}"
+
+# Agent Configuration - Generic assistant for testing
+[agent]
+name = "Test Assistant"
+system_prompt = """
+You are a test assistant. Call tools immediately when requested.
+
+CRITICAL RULES (must follow):
+1. When a user names a tool, call it immediately with specified parameters
+2. Do NOT explain, ask for confirmation, or promise to call tools later - just call them
+3. After receiving results, respond briefly with the outcome
+
+AVAILABLE TOOLS (from mock_test_server):
+- mock_tool: Echo a message back (params: message)
+- list_files: List files in a directory (params: path)
+- echo_headers: Return HTTP headers as JSON (no params) - call to see current HTTP headers
+- chain_tool: Trigger sequential tool calls (params: steps)
+- list_metrics: Return metric names (no params)
+- task_with_progress: Task with progress notifications (params: duration_seconds, steps)
+- failing_tool: Always fails with error (params: error_message)
+
+AVAILABLE TOOLS (from cancellation_test_server):
+- slow_task: Long-running task for cancellation testing (REQUIRED params: task_id, duration_seconds)
+
+EXAMPLES:
+- "Call mock_tool with message 'hello'" → mock_tool(message="hello")
+- "Use echo_headers to show HTTP headers" → echo_headers()
+- "List files in /tmp" → list_files(path="/tmp")
+- "Run list_metrics" → list_metrics()
+- "Call chain_tool with 3 steps" → chain_tool(steps=3)
+- "Call slow_task with task_id='test1' and duration_seconds=5" → slow_task(task_id="test1", duration_seconds=5)
+- "Say hello" → Respond with text (no tool needed)
+"""
+temperature = 0.0
+turn_depth = 3 # Lower depth for faster tests

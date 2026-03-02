@@ -1,0 +1,53 @@
+# compose/test.yml
+# Test runner configuration for integration tests
+#
+# Silences infrastructure services and runs the test suite.
+#
+# Usage:
+#   docker compose -f compose/base.yml -f compose/test.yml up --build --exit-code-from aura-integration-test
+
+services:
+  # Silence infrastructure output during tests
+  mock-mcp:
+    attach: false
+    logging:
+      driver: "none"
+
+  aura-web-server:
+    attach: false
+    logging:
+      driver: "none"
+
+  # Test runner container
+  aura-integration-test:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      target: base
+      args:
+        - GITHUB_TOKEN
+    environment:
+      # Point to containerized services (use service names, not localhost)
+      - AURA_SERVER_URL=http://aura-web-server:8080
+      - MCP_SERVER_URL=http://mock-mcp:9998
+      - MCP_MOCK_SERVER_URL=http://mock-mcp:9999
+    volumes:
+      # Shared volume for marker files (written by slow_task, read by tests)
+      # Uses /tmp since that's where slow_task writes marker files
+      - mcp-markers:/tmp
+    env_file:
+      - ./env/test.env
+    depends_on:
+      aura-web-server:
+        condition: service_healthy
+    # Run integration tests with all feature flags
+    # NOTE: --test-threads=1 required due to LLM API rate limits, not shared test state.
+    # Cancellation tests now support ID-scoped queries for future partial parallelization.
+    command: >
+      cargo test
+      --package aura-web-server
+      --features integration
+      --no-fail-fast
+      -- --test-threads=1
+    networks:
+      - aura-test

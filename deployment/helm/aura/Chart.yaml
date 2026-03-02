@@ -1,0 +1,15 @@
+apiVersion: v2
+name: aura
+description: A Helm chart for deploying Aura - TOML-based AI agent orchestration with MCP tools
+type: application
+version: 0.1.0
+appVersion: "1.10.0"
+keywords:
+  - aura
+  - ai
+  - agents
+  - mcp
+  - llm
+maintainers:
+  - name: Mezmo
+    url: https://github.com/logdna/aura

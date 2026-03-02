@@ -1,0 +1,73 @@
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.mezmo_hosted]
+transport = "http_streamable"
+url = "https://mcp.mezmo.com/mcp"
+description = "Mezmo MCP server"
+
+[mcp.servers.mezmo_hosted.headers]
+Authorization = "Bearer {{ env.MEZMO_API_KEY }}"
+
+[mcp.servers.datadog_hosted]
+transport = "http_streamable"
+url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
+description = "Datadog hosted MCP server"
+
+[mcp.servers.datadog_hosted.headers]
+DD_API_KEY = "{{ env.DD_API_KEY }}"
+DD_APPLICATION_KEY = "{{ env.DD_APPLICATION_KEY }}"
+
+[mcp.servers.pagerduty_hosted]
+transport = "http_streamable"
+url = "https://mcp.pagerduty.com/mcp"
+description = "PagerDuty hosted MCP server"
+
+[mcp.servers.pagerduty_hosted.headers]
+Authorization = "Token {{ env.PAGERDUTY_API_TOKEN }}"
+
+[[vector_stores]]
+name = "store_in_memory"
+type = "in_memory"
+context_prefix = "Operational notes and runbook snippets"
+
+[vector_stores.embedding_model]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key = "{{ env.OPENAI_API_KEY }}"
+
+[[vector_stores]]
+name = "store_qdrant"
+type = "qdrant"
+url = "http://localhost:6334"
+collection_name = "documents"
+context_prefix = "Technical documentation and service references"
+
+[vector_stores.embedding_model]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key = "{{ env.OPENAI_API_KEY }}"
+
+[tools]
+filesystem = false
+custom_tools = []
+
+[agent]
+name = "Operations Assistant"
+system_prompt = """
+You are an operations assistant focused on log analysis and incident triage.
+
+Workflow:
+1. Gather evidence first.
+2. Correlate by timeframe and service boundaries.
+3. Return actionable findings and next steps.
+"""
+reasoning_effort = "medium"
+# Maximum number of tool-calling rounds per user turn.
+# Higher values allow deeper multi-step tool workflows.
+turn_depth = 6

@@ -1,0 +1,66 @@
+# Production environment overrides
+# Usage: helm install aura ./aura -f values.yaml -f values-prod.yaml
+#
+# Demonstrates per-section overrides for map-based sections: only specify
+# the sections you need to change. Helm merges maps across values files,
+# but lists/arrays (e.g., vector_stores or extraEnv) are replaced rather
+# than merged, so list sections must be fully specified when overridden.
+
+replicaCount: 3
+
+imagePullSecrets:
+  - name: gcr
+
+# Use existing secrets from production
+secrets:
+  existingSecret: "aura-secrets"
+
+# Production-specific environment variables
+extraEnv:
+  - name: QDRANT_URL
+    value: "http://qdrant-a2-us-east-1-prod-logdna.logdna.sdm.network"
+  - name: MEZMO_MCP_URL
+    value: "https://mcp.use.prod.logdna.net/mcp"
+
+config:
+  llm:
+    provider: openai
+    api_key: "{{ env.OPENAI_API_KEY }}"
+    model: gpt-4o
+
+  agent:
+    name: "Mezmo Production Agent"
+    system_prompt: "You are a helpful assistant for Mezmo operations."
+    context: []
+    turn_depth: 8
+
+  mcp:
+    sanitize_schemas: true
+    servers:
+      mezmo_log_analysis:
+        transport: http_streamable
+        url: "{{ env.MEZMO_MCP_URL }}"
+        headers:
+          Authorization: "Bearer {{ env.MEZMO_API_KEY }}"
+        description: "Mezmo MCP server for log analysis"
+
+# Full resources for production
+resources:
+  requests:
+    cpu: 1
+    memory: 2Gi
+  limits:
+    cpu: 4
+    memory: 8Gi
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Autoscaling
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80

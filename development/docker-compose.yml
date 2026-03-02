@@ -1,0 +1,82 @@
+services:
+  # OpenWebUI - Port 3000
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: aura-openwebui
+    ports:
+      - "3000:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://host.docker.internal:8080/v1
+      - ENABLE_FORWARD_USER_INFO_HEADERS=True
+    volumes:
+      - aura-openwebui-data:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - aura-dev
+
+  # MongoDB for LibreChat
+  librechat-mongodb:
+    image: mongo:latest
+    container_name: aura-librechat-mongodb
+    volumes:
+      - aura-librechat-mongodb-data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=LibreChat
+    restart: unless-stopped
+    networks:
+      - aura-dev
+
+  # LibreChat - Port 3001
+  librechat:
+    image: ghcr.io/danny-avila/librechat:latest
+    container_name: aura-librechat
+    ports:
+      - "3001:3080"
+    depends_on:
+      - librechat-mongodb
+    environment:
+      # MongoDB connection
+      - MONGO_URI=mongodb://librechat-mongodb:27017/LibreChat
+
+      # App configuration
+      - HOST=0.0.0.0
+      - PORT=3080
+
+      # Session secrets (change in production)
+      - CREDS_KEY=f34be427ebb29de8d88c107a71546019685ed8b241d8f2ed00c3df97ad2566f0
+      - CREDS_IV=e2341419ec3dd3d19b13a1a87fafcbfb
+      - JWT_SECRET=16f8c0ef4a5d391b26034086c628469d3f9f497f08163ab9b40137092f2909ef
+      - JWT_REFRESH_SECRET=eaa5191f2914e30b9387fd84e254e4ba6fc51b4654968a9b0803b456a54b8418
+
+      # Custom config
+      - CONFIG_PATH=/app/librechat.yaml
+
+      # Endpoints
+      - ENDPOINTS=custom
+
+      # Allow registration
+      - ALLOW_REGISTRATION=true
+
+      # Mezmo API Key (for aura endpoint)
+      - MEZMO_API_KEY=${MEZMO_API_KEY}
+
+    volumes:
+      - ./configs/librechat.yaml:/app/librechat.yaml:ro
+      - aura-librechat-data:/app/client/public/images
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - aura-dev
+
+networks:
+  aura-dev:
+    name: aura-dev
+    driver: bridge
+
+volumes:
+  aura-openwebui-data:
+  aura-librechat-mongodb-data:
+  aura-librechat-data:

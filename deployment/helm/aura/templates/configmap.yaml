@@ -1,0 +1,16 @@
+{{- if not .Values.config.existingConfigMap -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aura.configMapName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "aura.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- if .Values.config.content }}
+    {{- .Values.config.content | nindent 4 }}
+    {{- else }}
+    {{- include "aura.toml.renderConfig" . | nindent 4 }}
+    {{- end }}
+{{- end }}

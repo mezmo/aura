@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  aura-web-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aura-web-server
+    ports:
+      - "3030:3030"
+    environment:
+      # Server configuration
+      HOST: "0.0.0.0"
+      PORT: "3030"
+      CONFIG_PATH: "/app/config/config.toml"
+      
+      # Logging
+      RUST_LOG: "info,aura_config=debug,aura=debug"
+      
+      # LLM API Keys (required - set in .env file)
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      
+      # Optional: Mezmo configuration
+      MEZMO_API_KEY: "${MEZMO_API_KEY:-}"
+      
+      # Optional: AWS configuration for Bedrock KB
+      AWS_PROFILE: "${AWS_PROFILE:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      
+    volumes:
+      # Mount Docker-specific configuration (uses host.docker.internal)
+      - ./docker-claude-mezmo-config.toml:/app/config/config.toml:ro
+      
+      # Alternative Docker configurations (uncomment to use)
+      # - ./docker-mezmo-config.toml:/app/config/config.toml:ro
+      # - ./docker-comprehensive-config.toml:/app/config/config.toml:ro
+      
+      # Mount all Docker configs for switching via CONFIG_PATH
+      - ./docker-claude-mezmo-config.toml:/app/config/docker-claude-mezmo-config.toml:ro
+      
+      # Note: Regular configs won't work in Docker due to localhost references
+      # Use docker-* configs which have host.docker.internal addresses
+      
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3030/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    networks:
+      - aura-network
+
+  # Optional: MCP proxy for Knowledge Base access
+  # Uncomment if you need AWS Bedrock KB integration
+  # mcp-proxy:
+  #   image: ghcr.io/mark3labs/mcp-proxy:latest
+  #   container_name: mcp-proxy
+  #   ports:
+  #     - "8081:8081"
+  #   environment:
+  #     AWS_PROFILE: "${AWS_PROFILE}"
+  #     AWS_REGION: "${AWS_REGION:-us-east-1}"
+  #     AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"
+  #     AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY}"
+  #     KB_INCLUSION_TAG_KEY: "mcp_enabled"
+  #     BEDROCK_KB_RERANKING_ENABLED: "false"
+  #   command: >
+  #     mcp-proxy
+  #     --port=8081
+  #     --host=0.0.0.0
+  #     --pass-environment
+  #     uvx awslabs.bedrock-kb-retrieval-mcp-server@latest
+  #   networks:
+  #     - aura-network
+  #   restart: unless-stopped
+
+networks:
+  aura-network:
+    driver: bridge

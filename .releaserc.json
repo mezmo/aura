@@ -1,0 +1,25 @@
+{
+  "ci": false,
+  "branches": [
+    "main"
+  ],
+  "extends": [
+    "@answerbook/release-config-logdna"
+  ],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    "@semantic-release/changelog",
+    ["@semantic-release/exec", {
+      "prepareCmd": "./scripts/set-version.sh ${nextRelease.version}; sleep 2"
+    }],
+    "@semantic-release/github",
+    ["@semantic-release/git", {
+      "assets": [
+        "CHANGELOG.md",
+        "**/Cargo.toml",
+        "Cargo.lock"
+      ]
+    }]
+  ]
+}

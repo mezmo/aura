@@ -1,0 +1,51 @@
+[package]
+name = "aura-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Internal crates
+aura = { path = "../aura" }
+
+# Rig dependencies
+rig-core = { workspace = true }
+
+rmcp = { workspace = true }
+futures = "0.3"
+sse-stream = "0.2"
+reqwest = { version = "0.12", features = ["stream", "json"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Configuration
+clap = { workspace = true }
+config = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Environment variables
+dotenv = { workspace = true }
+regex = { workspace = true }
+
+# Logging for binaries
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "debug_config"
+path = "src/bin/debug_config.rs"
+
+[[bin]]
+name = "architecture_diagram"
+path = "src/bin/architecture_diagram.rs"
+
