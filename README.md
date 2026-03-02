@@ -381,7 +381,6 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, and client examples.
-- [docs/orchestration-flow-diagram.md](docs/orchestration-flow-diagram.md): prompt router, coordinator/worker architecture, and orchestration loop diagrams.
 - [docs/toml-schema-design.md](docs/toml-schema-design.md): TOML configuration schema reference.
 - [docs/rust-config-structs.md](docs/rust-config-structs.md): Rust config struct mapping.
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
