@@ -1,3 +1,10 @@
+## [1.14.3](https://github.com/mezmo/aura/compare/v1.14.2...v1.14.3) (2026-03-02)
+
+
+### Chores
+
+* **release**: trigger first automated build/release [f581889](https://github.com/mezmo/aura/commit/f58188936308873ec1087bc329ebf291eeb5009e) - Justin Gross [LOG-23309](https://logdna.atlassian.net/browse/LOG-23309)
+
 ## [1.14.3](https://github.com/answerbook/aura/compare/v1.14.2...v1.14.3) (2026-03-02)
 
 
