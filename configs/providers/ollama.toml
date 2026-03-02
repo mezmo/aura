@@ -1,0 +1,37 @@
+# Ollama (local model) configuration.
+# No API keys required — runs against a local Ollama instance.
+#
+# Prerequisites:
+#   1. Install Ollama: https://ollama.com
+#   2. Pull a model: ollama pull qwen3:30b-a3b
+#   3. Ollama serves on http://localhost:11434 by default
+#
+# Usage:
+#   CONFIG_PATH=configs/providers/ollama.toml cargo run --bin aura-web-server
+#
+# See docs/ollama-guide.md for model recommendations and caveats.
+
+[llm]
+provider = "ollama"
+model = "qwen3:30b-a3b"
+# base_url = "http://localhost:11434"  # default; uncomment to override
+
+# Enable fallback parsing for models that emit tool calls as text
+# instead of structured function-calling format.
+fallback_tool_parsing = true
+
+
+# Optional Ollama-specific parameters.
+# See: https://github.com/ollama/ollama/blob/main/docs/modelfile.md
+[llm.additional_params]
+# Context window size in tokens. Set this to match your model's
+# capacity and available VRAM. Larger values use more memory.
+num_ctx = 32000
+# seed = 42
+# top_p = 0.95
+
+[agent]
+name = "Local Assistant"
+system_prompt = "You are a helpful assistant."
+temperature = 0.7
+turn_depth = 5

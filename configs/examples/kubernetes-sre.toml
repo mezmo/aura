@@ -1,0 +1,56 @@
+# Kubernetes SRE agent — K8s cluster operations + Prometheus monitoring.
+# Inspects workloads, queries metrics, and assists with cluster troubleshooting.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#   export PROMETHEUS_URL="http://localhost:9090"
+#   Start the Prometheus MCP server:
+#     docker run -i --rm -e PROMETHEUS_URL -e PROMETHEUS_MCP_SERVER_TRANSPORT=http \
+#       -e PROMETHEUS_MCP_BIND_PORT=8082 -p 8082:8082 ghcr.io/pab1it0/prometheus-mcp-server:latest
+#
+# Usage:
+#   CONFIG_PATH=configs/examples/kubernetes-sre.toml cargo run --bin aura-web-server
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[mcp]
+sanitize_schemas = true
+
+# Kubernetes — cluster inspection and management
+# https://github.com/containers/kubernetes-mcp-server
+# Start with: npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes cluster operations: pods, deployments, services, logs"
+
+# Prometheus — metrics and alerting
+# https://github.com/pab1it0/prometheus-mcp-server
+# Start with the docker command in the Prerequisites above.
+[mcp.servers.prometheus]
+transport = "http_streamable"
+url = "http://localhost:8082/mcp"
+description = "Prometheus metrics queries and alert status"
+
+[agent]
+name = "Kubernetes SRE Agent"
+system_prompt = """
+You are a Kubernetes SRE assistant. Help with cluster operations
+and monitoring using the available tools.
+
+Workflow:
+1. Check cluster health: node status, pod conditions, recent events.
+2. Query Prometheus for relevant metrics (CPU, memory, error rates).
+3. Inspect workload logs for errors or anomalies.
+4. Provide diagnosis with specific resource names and namespaces.
+
+Always specify namespaces explicitly. Prefer read-only operations
+unless the user explicitly requests changes.
+"""
+turn_depth = 20

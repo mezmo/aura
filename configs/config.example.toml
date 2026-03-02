@@ -1,73 +1,140 @@
+# Full-featured Aura configuration reference.
+# This file demonstrates all available configuration sections.
+# Copy it to config.toml and customize for your environment:
+#
+#   cp configs/config.example.toml config.toml
+#
+# Quick-start provider configs (just add an API key):
+#   providers/openai.toml     - OpenAI (GPT-4o)
+#   providers/anthropic.toml  - Anthropic (Claude)
+#   providers/ollama.toml     - local Ollama models, no API key needed
+#   providers/bedrock.toml    - AWS Bedrock
+#   providers/gemini.toml     - Google Gemini
+#
+# Real-world example configs:
+#   examples/incident-response.toml         - PagerDuty + Mezmo
+#   examples/incident-response-datadog.toml - PagerDuty + Datadog
+#   examples/kubernetes-sre.toml     - K8s MCP + Prometheus
+#   examples/devops-assistant.toml   - GitHub MCP
+
+# ── LLM Provider ────────────────────────────────────────────────────
 [llm]
 provider = "openai"
 api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.2"
+# max_tokens = 8192
+# base_url = "https://api.openai.com/v1"  # custom endpoint
 
+# Anthropic alternative:
+# provider = "anthropic"
+# api_key = "{{ env.ANTHROPIC_API_KEY }}"
+# model = "claude-sonnet-4-20250514"
+
+# Ollama alternative (no API key needed):
+# provider = "ollama"
+# model = "qwen3:30b-a3b"
+# fallback_tool_parsing = true
+
+# AWS Bedrock alternative:
+# provider = "bedrock"
+# model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+# region = "{{ env.AWS_REGION }}"
+
+# Google Gemini alternative:
+# provider = "gemini"
+# api_key = "{{ env.GOOGLE_API_KEY }}"
+# model = "gemini-2.0-flash"
+
+# ── MCP Tool Servers ────────────────────────────────────────────────
 [mcp]
+# Sanitize tool schemas for OpenAI function-calling compatibility.
+# Fixes common issues like anyOf unions, missing types, and optional
+# parameters that OpenAI's strict mode rejects. Safe to leave enabled.
 sanitize_schemas = true
 
-[mcp.servers.mezmo_hosted]
+# ── HTTP Streamable transport (recommended for production) ──────────
+# Connect to any MCP server that exposes an HTTP endpoint.
+[mcp.servers.example_http]
 transport = "http_streamable"
-url = "https://mcp.mezmo.com/mcp"
-description = "Mezmo MCP server"
+url = "http://localhost:8081/mcp"
+description = "Example HTTP MCP server"
 
-[mcp.servers.mezmo_hosted.headers]
-Authorization = "Bearer {{ env.MEZMO_API_KEY }}"
+# Static headers sent with every request.
+[mcp.servers.example_http.headers]
+Authorization = "Bearer {{ env.MCP_TOKEN }}"
 
-[mcp.servers.datadog_hosted]
-transport = "http_streamable"
-url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
-description = "Datadog hosted MCP server"
+# ── Header forwarding ───────────────────────────────────────────────
+# Forward headers from the incoming HTTP request to an MCP server.
+# Useful for per-user auth delegation (e.g., the chat UI sends a
+# user token that gets forwarded to the MCP server).
+#
+# [mcp.servers.auth_aware_server]
+# transport = "http_streamable"
+# url = "http://localhost:8082/mcp"
+# description = "MCP server with per-request auth"
+#
+# [mcp.servers.auth_aware_server.headers_from_request]
+# # Maps: outgoing header name = incoming request header name
+# Authorization = "x-user-token"
 
-[mcp.servers.datadog_hosted.headers]
-DD_API_KEY = "{{ env.DD_API_KEY }}"
-DD_APPLICATION_KEY = "{{ env.DD_APPLICATION_KEY }}"
+# ── Vector Stores (RAG) ────────────────────────────────────────────
+# Connects to an external Qdrant instance. The agent gets a
+# vector_search tool it can call to retrieve relevant documents.
+#
+# Prerequisites:
+#   docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
+#
+# You need to index documents into Qdrant before the agent can search
+# them. See the Qdrant documentation for ingestion options:
+#   https://qdrant.tech/documentation/concepts/collections/
+#
+# [[vector_stores]]
+# name = "docs"
+# type = "qdrant"
+# url = "http://localhost:6334"
+# collection_name = "documents"
+# context_prefix = "Technical documentation and API references"
+#
+# [vector_stores.embedding_model]
+# provider = "openai"
+# model = "text-embedding-3-small"
+# api_key = "{{ env.OPENAI_API_KEY }}"
 
-[mcp.servers.pagerduty_hosted]
-transport = "http_streamable"
-url = "https://mcp.pagerduty.com/mcp"
-description = "PagerDuty hosted MCP server"
+# You can add multiple vector stores. Each one becomes a separate
+# search tool the agent can call (e.g., vector_search_docs,
+# vector_search_runbooks).
+#
+# [[vector_stores]]
+# name = "runbooks"
+# type = "qdrant"
+# url = "http://localhost:6334"
+# collection_name = "runbooks"
+# context_prefix = "Operational runbooks and troubleshooting guides"
+#
+# [vector_stores.embedding_model]
+# provider = "openai"
+# model = "text-embedding-3-small"
+# api_key = "{{ env.OPENAI_API_KEY }}"
 
-[mcp.servers.pagerduty_hosted.headers]
-Authorization = "Token {{ env.PAGERDUTY_API_TOKEN }}"
-
-[[vector_stores]]
-name = "store_in_memory"
-type = "in_memory"
-context_prefix = "Operational notes and runbook snippets"
-
-[vector_stores.embedding_model]
-provider = "openai"
-model = "text-embedding-3-small"
-api_key = "{{ env.OPENAI_API_KEY }}"
-
-[[vector_stores]]
-name = "store_qdrant"
-type = "qdrant"
-url = "http://localhost:6334"
-collection_name = "documents"
-context_prefix = "Technical documentation and service references"
-
-[vector_stores.embedding_model]
-provider = "openai"
-model = "text-embedding-3-small"
-api_key = "{{ env.OPENAI_API_KEY }}"
-
+# ── Tools ───────────────────────────────────────────────────────────
 [tools]
 filesystem = false
 custom_tools = []
 
+# ── Agent ───────────────────────────────────────────────────────────
 [agent]
-name = "Operations Assistant"
+name = "Assistant"
 system_prompt = """
-You are an operations assistant focused on log analysis and incident triage.
+You are a helpful assistant with access to external tools and
+knowledge bases. Use them to provide accurate, grounded answers.
 
 Workflow:
-1. Gather evidence first.
-2. Correlate by timeframe and service boundaries.
+1. Gather evidence using available tools and context.
+2. Correlate findings across sources.
 3. Return actionable findings and next steps.
 """
-reasoning_effort = "medium"
-# Maximum number of tool-calling rounds per user turn.
-# Higher values allow deeper multi-step tool workflows.
-turn_depth = 6
+# reasoning_effort = "medium"  # minimal, low, medium, high (provider support varies)
+# temperature = 0.7
+# Maximum tool-calling rounds per user turn. Higher values allow
+# deeper multi-step workflows but consume more tokens.
+turn_depth = 5

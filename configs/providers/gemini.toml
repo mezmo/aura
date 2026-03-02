@@ -1,0 +1,14 @@
+# Google Gemini provider configuration.
+#
+# Usage:
+#   export GOOGLE_API_KEY="..."
+#   CONFIG_PATH=configs/providers/gemini.toml cargo run --bin aura-web-server
+
+[llm]
+provider = "gemini"
+api_key = "{{ env.GOOGLE_API_KEY }}"
+model = "gemini-2.0-flash"
+
+[agent]
+name = "Gemini Assistant"
+system_prompt = "You are a helpful assistant."

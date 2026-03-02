@@ -1,0 +1,23 @@
+# AWS Bedrock provider configuration.
+# Uses the standard AWS credential chain (env vars, ~/.aws/credentials, IAM roles).
+#
+# Prerequisites:
+#   1. Enable model access in the AWS Bedrock console for your region
+#   2. Configure AWS credentials via one of:
+#      - Environment: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#      - AWS CLI: aws configure
+#      - IAM role (when running on EC2/ECS/Lambda)
+#
+# Usage:
+#   export AWS_REGION="us-east-1"
+#   CONFIG_PATH=configs/providers/bedrock.toml cargo run --bin aura-web-server
+
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "{{ env.AWS_REGION }}"
+# profile = "default"  # optional AWS profile name
+
+[agent]
+name = "Bedrock Assistant"
+system_prompt = "You are a helpful assistant."

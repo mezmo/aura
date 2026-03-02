@@ -1,0 +1,15 @@
+# OpenAI provider configuration.
+# The simplest config that produces a working chat agent.
+#
+# Usage:
+#   export OPENAI_API_KEY="sk-..."
+#   CONFIG_PATH=configs/providers/openai.toml cargo run --bin aura-web-server
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+
+[agent]
+name = "Assistant"
+system_prompt = "You are a helpful assistant."

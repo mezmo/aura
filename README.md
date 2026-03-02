@@ -156,7 +156,7 @@ Then point your config at the HTTP/SSE endpoint instead.
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
-The complete starter configuration is in [configs/config.example.toml](configs/config.example.toml).
+The complete starter configuration is in [configs/config.example.toml](configs/config.example.toml). Provider-specific minimal configs are in `configs/providers/` and real-world examples are in `configs/examples/`.
 
 Minimal example:
 

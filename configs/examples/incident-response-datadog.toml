@@ -1,0 +1,52 @@
+# Incident response agent — PagerDuty + Datadog.
+# Triages alerts, pulls metrics, and correlates monitoring data.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export PAGERDUTY_API_TOKEN="..."
+#   export DD_API_KEY="..."
+#   export DD_APPLICATION_KEY="..."
+#
+# Usage:
+#   CONFIG_PATH=configs/examples/incident-response.toml cargo run --bin aura-web-server
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+[mcp]
+sanitize_schemas = true
+
+# PagerDuty — incident and on-call management
+[mcp.servers.pagerduty]
+transport = "http_streamable"
+url = "https://mcp.pagerduty.com/mcp"
+description = "PagerDuty incident management, on-call schedules, and escalation"
+
+[mcp.servers.pagerduty.headers]
+Authorization = "Token {{ env.PAGERDUTY_API_TOKEN }}"
+
+# Datadog — metrics, monitors, and dashboards
+[mcp.servers.datadog]
+transport = "http_streamable"
+url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
+description = "Datadog metrics, monitors, dashboards, and APM traces"
+
+[mcp.servers.datadog.headers]
+DD-API-KEY = "{{ env.DD_API_KEY }}"
+DD-APPLICATION-KEY = "{{ env.DD_APPLICATION_KEY }}"
+
+[agent]
+name = "Incident Response Agent"
+system_prompt = """
+You are an incident response agent with access to PagerDuty and
+Datadog. Follow this triage workflow:
+
+1. Identify the triggering alert and affected services via PagerDuty.
+2. Pull relevant metrics and monitor status from Datadog.
+3. Summarize findings: timeline, root cause hypothesis, and next steps.
+
+Always include timestamps and link back to source data.
+"""
+turn_depth = 10
