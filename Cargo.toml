@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.14.3"
+version = "1.14.2"
 edition = "2021"
 authors = ["Your Name <you@example.com>"]
 license = "MIT"
