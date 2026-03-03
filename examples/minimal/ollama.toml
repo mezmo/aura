@@ -7,7 +7,7 @@
 #   3. Ollama serves on http://localhost:11434 by default
 #
 # Usage:
-#   CONFIG_PATH=examples/providers/ollama.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/minimal/ollama.toml cargo run --bin aura-web-server
 #
 # See docs/ollama-guide.md for model recommendations and caveats.
 

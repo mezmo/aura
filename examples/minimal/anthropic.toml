@@ -2,7 +2,7 @@
 #
 # Usage:
 #   export ANTHROPIC_API_KEY="sk-ant-..."
-#   CONFIG_PATH=examples/providers/anthropic.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/minimal/anthropic.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "anthropic"

@@ -2,7 +2,7 @@
 #
 # Usage:
 #   export GOOGLE_API_KEY="..."
-#   CONFIG_PATH=examples/providers/gemini.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/minimal/gemini.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "gemini"

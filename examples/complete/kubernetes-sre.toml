@@ -12,7 +12,7 @@
 #       -e PROMETHEUS_MCP_BIND_PORT=8082 -p 8082:8082 ghcr.io/pab1it0/prometheus-mcp-server:latest
 #
 # Usage:
-#   CONFIG_PATH=examples/agents/kubernetes-sre.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/complete/kubernetes-sre.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "openai"

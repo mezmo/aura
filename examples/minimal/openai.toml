@@ -3,7 +3,7 @@
 #
 # Usage:
 #   export OPENAI_API_KEY="sk-..."
-#   CONFIG_PATH=examples/providers/openai.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/minimal/openai.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "openai"

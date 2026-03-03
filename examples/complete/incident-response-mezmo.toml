@@ -1,14 +1,13 @@
-# Incident response agent — PagerDuty + Datadog.
-# Triages alerts, pulls metrics, and correlates monitoring data.
+# Incident response agent — PagerDuty + Mezmo.
+# Triages alerts, pulls logs, and correlates monitoring data.
 #
 # Prerequisites:
 #   export OPENAI_API_KEY="sk-..."
 #   export PAGERDUTY_API_TOKEN="..."
-#   export DD_API_KEY="..."
-#   export DD_APPLICATION_KEY="..."
+#   export MEZMO_API_KEY="..."
 #
 # Usage:
-#   CONFIG_PATH=examples/agents/incident-response-datadog.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/complete/incident-response-mezmo.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "openai"
@@ -27,24 +26,23 @@ description = "PagerDuty incident management, on-call schedules, and escalation"
 [mcp.servers.pagerduty.headers]
 Authorization = "Token {{ env.PAGERDUTY_API_TOKEN }}"
 
-# Datadog — metrics, monitors, and dashboards
-[mcp.servers.datadog]
+# Mezmo — log analysis and export
+[mcp.servers.mezmo]
 transport = "http_streamable"
-url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
-description = "Datadog metrics, monitors, dashboards, and APM traces"
+url = "https://mcp.mezmo.com/mcp"
+description = "Mezmo log analysis, export, and pipeline monitoring"
 
-[mcp.servers.datadog.headers]
-DD-API-KEY = "{{ env.DD_API_KEY }}"
-DD-APPLICATION-KEY = "{{ env.DD_APPLICATION_KEY }}"
+[mcp.servers.mezmo.headers]
+Authorization = "Bearer {{ env.MEZMO_API_KEY }}"
 
 [agent]
 name = "Incident Response Agent"
 system_prompt = """
 You are an incident response agent with access to PagerDuty and
-Datadog. Follow this triage workflow:
+Mezmo. Follow this triage workflow:
 
 1. Identify the triggering alert and affected services via PagerDuty.
-2. Pull relevant metrics and monitor status from Datadog.
+2. Search logs in Mezmo for correlated errors and anomalies.
 3. Summarize findings: timeline, root cause hypothesis, and next steps.
 
 Always include timestamps and link back to source data.
