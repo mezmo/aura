@@ -8,6 +8,7 @@ Key capabilities:
 - Dynamic [MCP](https://modelcontextprotocol.io) tool discovery across HTTP, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
 - RAG pipeline integration with in-memory and external vector stores
+- Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
 - Dependency-aware multi-wave execution with quality evaluation and iterative re-planning loops
 
@@ -46,9 +47,10 @@ aura/
 │   └── aura-test-utils/     # Shared testing utilities
 ├── compose/                 # Docker Compose (integration + orchestration overlays)
 ├── configs/                 # E2E test and orchestration configurations
-├── examples/                # Example and reference configurations
+├── deployment/              # Helm charts and K8s manifests
 ├── development/             # LibreChat and OpenWebUI setup
 ├── docs/                    # Architecture and protocol documentation
+├── examples/                # Example and reference configurations
 └── scripts/                 # CI and utility scripts
 ```
 
@@ -145,7 +147,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
 
-SSE protocol details, event types, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
+SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
 
 For LibreChat/OpenWebUI integration, see [development/README.md](development/README.md).
 
@@ -249,6 +251,8 @@ enabled = true
 quality_threshold = 0.8
 max_planning_cycles = 3
 tools_in_planning = "summary"
+allow_direct_answers = true
+allow_clarification = true
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
@@ -274,15 +278,45 @@ Workers run with isolated task context windows and filtered MCP/vector-store acc
 
 For a fuller multi-worker example, see [configs/example-workers.toml](configs/example-workers.toml).
 
+#### Orchestration fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable orchestration mode |
+| `quality_threshold` | float | `0.8` | Minimum quality score before accepting a synthesis |
+| `max_planning_cycles` | int | `3` | Maximum plan→execute→evaluate iterations |
+| `allow_direct_answers` | bool | `true` | Allow coordinator to answer simple queries directly |
+| `allow_clarification` | bool | `true` | Allow coordinator to ask for clarification |
+| `tools_in_planning` | string | `"summary"` | Tool visibility for coordinator: `"none"`, `"summary"` (names only), `"full"` (with descriptions) |
+| `max_phases` | int | `5` | Maximum dependency waves per execution cycle |
+| `max_plan_parse_retries` | int | `3` | Retries if coordinator produces unparseable plan JSON |
+| `max_tools_per_worker` | int | `10` | Cap on MCP tools exposed to each worker |
+| `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
+| `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
+| `memory_dir` | string | — | Directory for cross-iteration artifact persistence |
+| `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
+| `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
+| `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
+
+#### Worker fields (`[orchestration.worker.<name>]`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `description` | string | *required* | Short description shown to coordinator during planning |
+| `preamble` | string | *required* | System prompt for this worker |
+| `mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools this worker can use |
+| `vector_stores` | list | `[]` | Named vector stores this worker has access to |
+| `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
+
 ### Ollama
 
-Aura supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. See `fallback_tool_parsing` in existing config examples if you run local models.
+Aura supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
 
 ### Observability
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`). Rig-originated `gen_ai.*` attributes are translated at export time.
+Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Docker Deployment
 
@@ -296,6 +330,8 @@ Run with Docker Compose:
 ```bash
 docker compose up --build
 ```
+
+Default container port mapping is `3030:3030` in `docker-compose.yml`. Ensure your config path and API key environment variables are set for the container runtime.
 
 Orchestration testing overlays are available in `compose/` (for example `compose/orchestration.yml` and `compose/orchestration-test.yml`).
 
@@ -344,6 +380,12 @@ make test-integration-orchestration
 
 # Local orchestration integration run
 make test-integration-orchestration-local
+
+# SRE orchestration integration suites
+make test-integration-sre-orchestration
+
+# Local SRE orchestration integration run
+make test-integration-sre-orchestration-local
 ```
 
 Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
@@ -351,6 +393,7 @@ Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 - Parent flag: `integration`
 - Suite flags: `integration-streaming`, `integration-header-forwarding`, `integration-mcp`, `integration-events`, `integration-cancellation`, `integration-progress`
 - Orchestration suite: `integration-orchestration` (separate from parent `integration`)
+- SRE orchestration suite: `integration-orchestration-sre` (requires k8s-sre-mcp server config)
 - Optional suite: `integration-vector` (requires external Qdrant setup)
 
 Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web-server/tests/README.md).
@@ -359,11 +402,10 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
+- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
-- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, and client examples.
-- [docs/toml-schema-design.md](docs/toml-schema-design.md): TOML configuration schema reference.
-- [docs/rust-config-structs.md](docs/rust-config-structs.md): Rust config struct mapping.
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
+- [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
 - [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
 
@@ -380,6 +422,13 @@ This separation means:
 - Embeddable core: use `aura` directly in any Rust application without config file dependencies.
 - Flexible config: `aura-config` can be extended to support other formats (JSON, YAML).
 - Testable boundaries: each crate has focused responsibilities and clear interfaces.
+
+Key architectural characteristics:
+
+- Dynamic MCP tool discovery at runtime.
+- Automatic schema sanitization (anyOf, missing types, optional parameters) driven by OpenAI function-calling requirements — MCP tool schemas are transformed at discovery time to conform to OpenAI's strict subset of JSON Schema.
+- Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.
+- Config-driven composition with embeddable Rust core.
 
 Prompt routing and execution model:
 
