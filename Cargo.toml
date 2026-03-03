@@ -10,9 +10,9 @@ resolver = "2"
 [workspace.package]
 version = "1.14.3"
 edition = "2021"
-authors = ["Your Name <you@example.com>"]
-license = "MIT"
-repository = "https://github.com/yourusername/aura"
+authors = ["Mezmo <support@mezmo.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/mezmo/aura"
 
 [workspace.dependencies]
 rig-core = { git = "https://github.com/mezmo/rig.git", branch = "mezmo", features = ["rmcp"] }

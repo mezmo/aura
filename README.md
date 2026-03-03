@@ -26,6 +26,7 @@ Key capabilities:
   - [Testing](#testing)
   - [Documentation](#documentation)
   - [Architecture](#architecture)
+  - [License](#license)
 
 ## Project Structure
 
@@ -283,3 +284,7 @@ Key architectural characteristics:
 - Config-driven composition with embeddable Rust core.
 
 Request execution and cancellation flow are documented in [docs/request-lifecycle.md](docs/request-lifecycle.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
