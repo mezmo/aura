@@ -59,9 +59,6 @@ services:
       # Allow registration
       - ALLOW_REGISTRATION=true
 
-      # Mezmo API Key (for aura endpoint)
-      - MEZMO_API_KEY=${MEZMO_API_KEY}
-
     volumes:
       - ./configs/librechat.yaml:/app/librechat.yaml:ro
       - aura-librechat-data:/app/client/public/images
