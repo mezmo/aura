@@ -65,7 +65,7 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.tool_complete` | Tool execution finished (with duration_ms, result/error) | ✅ Implemented |
 | `aura.reasoning` | LLM reasoning content (requires `AURA_EMIT_REASONING=true`) | ✅ Implemented |
 | `aura.progress` | MCP progress notifications during long-running tools | ✅ Implemented |
-| `aura.worker_phase` | Multi-agent orchestrator/worker status | 🔲 Future |
+| `aura.orchestrator.*` | Orchestration lifecycle events (see [Orchestration Events](#orchestration-events) below) | ✅ Implemented |
 
 ### Event Flow
 
@@ -185,6 +185,89 @@ progress (progress_token: 42, progress: 50, total: 100) → correlates via token
       ↓
 tool_complete (tool_id: "call_abc", duration_ms: 1234) → final result
 ```
+
+## Orchestration Events
+
+When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server emits orchestration-specific events covering the Plan/Execute/Synthesize/Evaluate lifecycle. These events are emitted alongside the standard `aura.*` events above.
+
+### Orchestration Event Types
+
+| Event | Description |
+|-------|-------------|
+| `aura.orchestrator.plan_created` | Coordinator decomposed query into a task DAG |
+| `aura.orchestrator.direct_answer` | Coordinator answered without orchestration |
+| `aura.orchestrator.clarification_needed` | Coordinator needs user clarification |
+| `aura.orchestrator.task_started` | Worker began executing a task |
+| `aura.orchestrator.task_completed` | Worker finished task (success/failure with duration) |
+| `aura.orchestrator.iteration_complete` | Plan-execute-synthesize cycle finished with quality score |
+| `aura.orchestrator.synthesizing` | Coordinator merging worker results |
+| `aura.orchestrator.tool_call_started` | Tool execution began within a worker task |
+| `aura.orchestrator.tool_call_completed` | Tool execution finished within a worker task |
+| `aura.orchestrator.phase_started` | Dependency wave began execution |
+| `aura.orchestrator.phase_completed` | Dependency wave finished (continuation: "continue" or "replan") |
+
+### Orchestration Event Flow
+
+```
+User query received
+       ↓
+plan_created          ← goal, task_count, routing_rationale
+       ↓
+phase_started         ← Dependency wave begins (phase_id, label)
+       ↓
+task_started          ← Worker assigned (task_id, worker_id, orchestrator_id)
+       ↓
+tool_call_started     ← Worker calls MCP tool (tool_call_id, tool_name)
+       ↓
+tool_call_completed   ← Tool result (duration_ms, success)
+       ↓
+task_completed        ← Worker finished (duration_ms, success, result)
+       ↓
+phase_completed       ← Wave done (continuation: "continue" or "replan")
+       ↓
+synthesizing          ← Coordinator merging results
+       ↓
+iteration_complete    ← Quality scored (iteration, quality_score)
+       ↓
+If score < quality_threshold → loop back to plan_created
+```
+
+**Alternative routing**: The coordinator may emit `direct_answer` (simple queries) or `clarification_needed` (ambiguous queries) instead of `plan_created`, skipping the orchestration loop entirely.
+
+### Orchestration Event Formats
+
+**Plan created** (coordinator decomposed query into tasks):
+```
+event: aura.orchestrator.plan_created
+data: {"goal":"Calculate (3+7)*2 and list files","task_count":2,"routing_rationale":"Multi-step: arithmetic + file listing","agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+**Task started** (worker begins execution):
+```
+event: aura.orchestrator.task_started
+data: {"task_id":0,"description":"Calculate (3+7)*2","worker_id":"arithmetic","orchestrator_id":"orch-1","agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+**Task completed** (worker finished with result):
+```
+event: aura.orchestrator.task_completed
+data: {"task_id":0,"success":true,"duration_ms":1500,"orchestrator_id":"orch-1","worker_id":"arithmetic","result":"The result is 20","agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+**Iteration complete** (quality evaluation):
+```
+event: aura.orchestrator.iteration_complete
+data: {"iteration":1,"quality_score":0.85,"agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+### Orchestration Correlation
+
+| Correlation | Events | Field |
+|-------------|--------|-------|
+| Task lifecycle | `task_started` → `tool_call_*` → `task_completed` | `task_id` |
+| Phase lifecycle | `phase_started` → `phase_completed` | `phase_id` |
+| Tool lifecycle | `tool_call_started` → `tool_call_completed` | `tool_call_id` |
+| Agent hierarchy | All orchestration events | `agent_id` (from `AgentContext`) |
 
 ## SSE Event Reference
 
