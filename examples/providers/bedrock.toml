@@ -10,7 +10,7 @@
 #
 # Usage:
 #   export AWS_REGION="us-east-1"
-#   CONFIG_PATH=configs/providers/bedrock.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/providers/bedrock.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "bedrock"

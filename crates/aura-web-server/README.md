@@ -139,7 +139,7 @@ The server uses the Aura TOML configuration system. See the [main README](../../
 - Vector store and RAG integration
 - Agent settings and prompts
 
-Example configurations are in the [`configs/`](../../configs/) directory.
+Example configurations are in the [`examples/`](../../examples/) directory.
 
 ## Architecture
 

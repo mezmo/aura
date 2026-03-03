@@ -8,7 +8,7 @@
 #   export DD_APPLICATION_KEY="..."
 #
 # Usage:
-#   CONFIG_PATH=configs/examples/incident-response.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/agents/incident-response-datadog.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "openai"

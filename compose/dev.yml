@@ -19,8 +19,8 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mount configs for hot-reload during development
-      - ../configs:/app/configs:ro
+      # Mount examples for hot-reload during development
+      - ../examples:/app/examples:ro
       - ../crates/aura-web-server/tests/test-config.toml:/app/config/test-config.toml:ro
     environment:
       # More verbose logging for development

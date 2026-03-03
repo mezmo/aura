@@ -6,7 +6,7 @@
 #   export GITHUB_PERSONAL_ACCESS_TOKEN="ghp_..."
 #
 # Usage:
-#   CONFIG_PATH=configs/examples/devops-assistant.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/agents/devops-assistant.toml cargo run --bin aura-web-server
 
 [llm]
 provider = "openai"

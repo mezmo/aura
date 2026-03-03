@@ -45,7 +45,7 @@ aura/
 │   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
 │   └── aura-test-utils/     # Shared testing utilities
 ├── compose/                 # Docker Compose files for integration testing
-├── configs/                 # Example configuration files
+├── examples/                # Example configuration files
 ├── development/             # LibreChat and OpenWebUI setup
 ├── docs/                    # Architecture and protocol documentation
 └── scripts/                 # CI and utility scripts
@@ -60,7 +60,7 @@ aura/
 2. Clone and configure:
   ```bash
    cd aura
-   cp configs/config.example.toml config.toml
+   cp examples/reference.toml config.toml
   ```
 3. Set required environment variables:
   ```bash
@@ -163,7 +163,7 @@ Then point your config at the HTTP/SSE endpoint instead.
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
-The complete starter configuration is in [configs/config.example.toml](configs/config.example.toml). Provider-specific minimal configs are in `configs/providers/` and real-world examples are in `configs/examples/`.
+The complete starter configuration is in [examples/reference.toml](examples/reference.toml). Provider-specific minimal configs are in `examples/providers/` and real-world agent examples are in `examples/agents/`.
 
 Minimal example:
 

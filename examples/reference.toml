@@ -2,20 +2,20 @@
 # This file demonstrates all available configuration sections.
 # Copy it to config.toml and customize for your environment:
 #
-#   cp configs/config.example.toml config.toml
+#   cp examples/reference.toml config.toml
 #
 # Quick-start provider configs (just add an API key):
-#   providers/openai.toml     - OpenAI (GPT-4o)
-#   providers/anthropic.toml  - Anthropic (Claude)
-#   providers/ollama.toml     - local Ollama models, no API key needed
-#   providers/bedrock.toml    - AWS Bedrock
-#   providers/gemini.toml     - Google Gemini
+#   examples/providers/openai.toml     - OpenAI (GPT-4o)
+#   examples/providers/anthropic.toml  - Anthropic (Claude)
+#   examples/providers/ollama.toml     - local Ollama models, no API key needed
+#   examples/providers/bedrock.toml    - AWS Bedrock
+#   examples/providers/gemini.toml     - Google Gemini
 #
-# Real-world example configs:
-#   examples/incident-response.toml         - PagerDuty + Mezmo
-#   examples/incident-response-datadog.toml - PagerDuty + Datadog
-#   examples/kubernetes-sre.toml     - K8s MCP + Prometheus
-#   examples/devops-assistant.toml   - GitHub MCP
+# Real-world agent configs:
+#   examples/agents/incident-response-mezmo.toml    - PagerDuty + Mezmo
+#   examples/agents/incident-response-datadog.toml  - PagerDuty + Datadog
+#   examples/agents/kubernetes-sre.toml             - K8s MCP + Prometheus
+#   examples/agents/devops-assistant.toml           - GitHub MCP
 
 # ── LLM Provider ────────────────────────────────────────────────────
 [llm]
