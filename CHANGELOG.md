@@ -1,3 +1,10 @@
+## [1.14.4](https://github.com/mezmo/aura/compare/v1.14.3...v1.14.4) (2026-03-03)
+
+
+### Documentation
+
+* add Apache 2.0 license and update project metadata [a95c39c](https://github.com/mezmo/aura/commit/a95c39c35aa451408a22422907345c448773d3ee) - Mike Shearer [LOG-23349](https://logdna.atlassian.net/browse/LOG-23349)
+
 ## [1.14.3](https://github.com/mezmo/aura/compare/v1.14.2...v1.14.3) (2026-03-02)
 
 
