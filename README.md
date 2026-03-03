@@ -325,7 +325,6 @@ Aura separates concerns across crates:
 
 - `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.
-- `aura-cli`: command-line interface for local/interactive runs.
 - `aura-web-server`: OpenAI-compatible REST/SSE serving layer.
 
 This separation means:
