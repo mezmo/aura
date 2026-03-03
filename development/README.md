@@ -2,22 +2,10 @@
 
 You can use Aura within LibreChat and OpenWebUI because Aura supports an OpenAI-compatible HTTP API.
 
+
 ## Pre-requisites
 
-You must have the environment variable MEZMO_API_KEY populated with a valid Mezmo API Key.
-
-- Sign-in to https://app.mezmo.com/
-- Click the "settings" icon in the left panel
-- Click "Organization"
-- Click "API Keys"
-- Under the "Service Keys" section
-  - Click "Generate Service Key"
-  - Copy the key
-- When running the commands in `Starting LibreChat and OpenWebUI` section, be sure to have MEZMO_API_KEY environment variable defined
-  - You can supply it when you run the docker up command by preceding the command with the variable:
-    - `MEZMO_API_KEY=your_key_from_mezmo docker compose up -d`
-  - Alternatively, you can export the environment variable so it's available for the current terminal session like so:
-    - `export MEZMO_API_KEY=your_key_from_mezmo`
+- You have Aura web-server running on docker's host on port 8080.  See [running the web server](../README.md#web-api-server) for help on this.
 
 ## Starting LibreChat and OpenWebUI
 
