@@ -8,13 +8,13 @@ endpoints:
   custom:
     # Aura Server - OpenAI-compatible endpoint
     - name: "Aura"
-      apiKey: "${MEZMO_API_KEY}"  # Use environment variable
+      apiKey: "not_used"
       baseURL: "http://host.docker.internal:8080/v1"
       models:
         default:
-          - "claude-3-5-sonnet-20241022"  # Your default model from config.toml
           - "gpt-4o"
           - "gpt-4o-mini"
+          - "claude-3-5-sonnet-20241022"
         fetch: false  # Don't try to fetch models from /v1/models
       titleConvo: true
       titleModel: "aura"
