@@ -10,12 +10,18 @@ Key capabilities:
 - RAG pipeline integration with in-memory and external vector stores
 - Embeddable Rust core independent from configuration layer
 
-> **Open Alpha** — Aura is under active development. APIs and configuration
-> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
-> are welcome — we'd love your feedback.
-
-> **Orchestration mode** (multi-agent coordination) is in development on the
-> [`feature/orchestration-mode`](https://github.com/mezmo/aura/tree/feature/orchestration-mode) branch.
+> **Looking for orchestration mode?** Multi-agent orchestration is available
+> on the
+> [`feature/orchestration-mode`](https://github.com/mezmo/aura/tree/feature/orchestration-mode)
+> branch and is currently in **open alpha** — APIs, behavior, and configuration
+> are changing rapidly as we iterate.
+>
+> The `main` branch is Aura's **production-ready single-agent framework**:
+> declarative TOML-driven agents with MCP tool integration, RAG pipelines,
+> multi-provider LLM support, and an OpenAI-compatible streaming API.
+>
+> [Issues and feature requests](https://github.com/mezmo/aura/issues)
+> are welcome — we'd love your feedback on both.
 
 ## Table of Contents
 
