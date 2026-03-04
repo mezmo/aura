@@ -11,7 +11,8 @@ base_url = "https://api.openai.com/v1"
 
 [[vector_stores]]
 name = "default"
-type = "in_memory"
+url = "http://localhost:6334"
+collection_name = "test_collection"
 
 [vector_stores.embedding_model]
 provider = "openai"
@@ -82,7 +83,8 @@ temperature = 0.5
             "Should have at least one vector store"
         );
         let vector_store = &config.vector_stores[0];
-        assert_eq!(vector_store.store_type, "in_memory");
+        assert_eq!(vector_store.url, "http://localhost:6334");
+        assert_eq!(vector_store.collection_name, "test_collection");
         assert_eq!(vector_store.embedding_model.provider, "openai");
         assert_eq!(vector_store.embedding_model.model, "text-embedding-3-small");
         assert_eq!(vector_store.embedding_model.api_key, "test_embedding_key");
@@ -201,7 +203,8 @@ model = "claude-3-sonnet-20240229"
 
 [[vector_stores]]
 name = "default"
-type = "in_memory"
+url = "http://localhost:6334"
+collection_name = "test_collection"
 
 [vector_stores.embedding_model]
 provider = "openai"
@@ -242,7 +245,8 @@ model = "gpt-4"
 
 [[vector_stores]]
 name = "default"
-type = "in_memory"
+url = "http://localhost:6334"
+collection_name = "test_collection"
 
 [vector_stores.embedding_model]
 provider = "openai"
@@ -266,7 +270,8 @@ model = "gpt-4"
 
 [[vector_stores]]
 name = "default"
-type = "in_memory"
+url = "http://localhost:6334"
+collection_name = "test_collection"
 
 [vector_stores.embedding_model]
 provider = "openai"
@@ -293,7 +298,8 @@ model = "gpt-4"
 
 [[vector_stores]]
 name = "default"
-type = "in_memory"
+url = "http://localhost:6334"
+collection_name = "test_collection"
 
 [vector_stores.embedding_model]
 provider = "openai"
@@ -374,15 +380,6 @@ system_prompt = "Test with env vars"
 provider = "ollama"
 model = "llama3.2"
 
-[[vector_stores]]
-name = "default"
-type = "in_memory"
-
-[vector_stores.embedding_model]
-provider = "openai"
-model = "text-embedding-3-small"
-api_key = "test_key"
-
 [agent]
 name = "Ollama Agent"
 system_prompt = "You are a helpful assistant."
@@ -417,15 +414,6 @@ system_prompt = "You are a helpful assistant."
 provider = "ollama"
 model = "mistral"
 base_url = "http://my-ollama-server:11434"
-
-[[vector_stores]]
-name = "default"
-type = "in_memory"
-
-[vector_stores.embedding_model]
-provider = "openai"
-model = "text-embedding-3-small"
-api_key = "test_key"
 
 [agent]
 name = "Remote Ollama Agent"

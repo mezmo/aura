@@ -41,7 +41,6 @@ tracing-opentelemetry = { workspace = true, optional = true }
 chrono = "0.4"
 
 # Vector stores - Qdrant support
-rig-qdrant = { workspace = true }
 qdrant-client = { workspace = true }
 uuid = { workspace = true }
 

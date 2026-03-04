@@ -35,19 +35,6 @@ transport = "http_streamable"
 url = "http://{{ env.MCP_MOCK_HOST | default: '127.0.0.1' }}:9998/mcp"
 description = "Cancellation test server for testing MCP cancellation propagation"
 
-# Vector Stores - Minimal dummy in-memory store (required by config parser)
-# This store is defined but won't be used in basic streaming tests
-[[vector_stores]]
-name = "test_docs"
-type = "in_memory"
-context_prefix = "Test documentation"
-
-# Embedding model for the vector store
-[vector_stores.embedding_model]
-provider = "openai"
-model = "text-embedding-ada-002"
-api_key = "{{ env.OPENAI_API_KEY }}"
-
 # Agent Configuration - Generic assistant for testing
 [agent]
 name = "Test Assistant"

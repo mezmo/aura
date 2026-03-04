@@ -170,8 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.vector_stores.is_empty() {
         let store = &config.vector_stores[0]; // Show first store
         println!(
-            "│  │  Type: {} ({} stores)              │    │",
-            store.store_type,
+            "│  │  Qdrant: {} ({} stores)              │    │",
+            store.collection_name,
             config.vector_stores.len()
         );
         println!("│  │                                                 │    │");

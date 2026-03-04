@@ -71,6 +71,7 @@ pub enum ReasoningEffort {
 pub struct AgentConfig {
     pub llm: LlmConfig,
     pub agent: AgentSettings,
+    #[serde(default)]
     pub vector_stores: Vec<VectorStoreConfig>,
     pub mcp: Option<McpConfig>,
     pub tools: Option<ToolsConfig>,
@@ -185,17 +186,27 @@ pub struct AgentSettings {
     pub turn_depth: Option<usize>,
 }
 
-/// Vector store configuration
+/// Qdrant vector store configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStoreConfig {
     pub name: String,
-    pub store_type: String,
+    pub url: String,
+    pub collection_name: String,
     pub embedding_model: EmbeddingModelConfig,
-    pub connection_string: Option<String>,
-    pub url: Option<String>,
-    pub collection_name: Option<String>,
-    /// Optional context string to prepend to search results for better RAG integration
-    pub context_prefix: Option<String>,
+    /// Description of what the vector store contains (shown to LLM and prepended to results)
+    pub description: Option<String>,
+    /// Qdrant query timeout in seconds. Default: 30s.
+    /// Adjust based on collection size and network latency.
+    #[serde(default)]
+    pub query_timeout_secs: Option<u64>,
+    /// Embedding API timeout in seconds. Default: 15s.
+    /// Adjust if using slow embedding providers or high latency networks.
+    #[serde(default)]
+    pub embedding_timeout_secs: Option<u64>,
+    /// Maximum payload size (bytes) for fallback content extraction. Default: 50000 (50KB).
+    /// Limits LLM context window usage when structured extraction fails.
+    #[serde(default)]
+    pub max_payload_size: Option<usize>,
 }
 
 /// Embedding model configuration

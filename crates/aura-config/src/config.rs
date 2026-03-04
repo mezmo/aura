@@ -190,34 +190,41 @@ pub enum McpServerConfig {
     },
 }
 
-/// Vector store configuration (in-memory and Qdrant support)
+/// Qdrant vector store configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct VectorStoreConfig {
     /// Unique name to identify this vector store
     pub name: String,
-    #[serde(rename = "type")]
-    pub store_type: String, // "in_memory" or "qdrant"
+    /// Qdrant server URL
+    pub url: String,
+    /// Collection name in Qdrant
+    pub collection_name: String,
     pub embedding_model: EmbeddingConfig,
-    /// URL for external vector stores like Qdrant (optional)
+    /// Description of what the vector store contains (shown to LLM and prepended to results)
     #[serde(default)]
-    pub url: Option<String>,
-    /// Collection name for vector stores like Qdrant (optional)
+    pub description: Option<String>,
+    /// Qdrant query timeout in seconds (optional, defaults to 30s)
     #[serde(default)]
-    pub collection_name: Option<String>,
-    /// Optional context string describing what the vector store contains (for better LLM guidance)
+    pub query_timeout_secs: Option<u64>,
+    /// Embedding API timeout in seconds (optional, defaults to 15s)
     #[serde(default)]
-    pub context_prefix: Option<String>,
+    pub embedding_timeout_secs: Option<u64>,
+    /// Maximum payload size for fallback extraction (optional, defaults to 50000)
+    #[serde(default)]
+    pub max_payload_size: Option<usize>,
 }
 
 impl Default for VectorStoreConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            store_type: "in_memory".to_string(),
+            url: String::new(),
+            collection_name: String::new(),
             embedding_model: EmbeddingConfig::default(),
-            url: None,
-            collection_name: None,
-            context_prefix: None,
+            description: None,
+            query_timeout_secs: None,
+            embedding_timeout_secs: None,
+            max_payload_size: None,
         }
     }
 }

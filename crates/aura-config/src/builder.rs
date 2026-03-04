@@ -102,17 +102,19 @@ impl RigBuilder {
             .iter()
             .map(|store| VectorStoreConfig {
                 name: store.name.clone(),
-                store_type: store.store_type.clone(),
+                url: store.url.clone(),
+                collection_name: store.collection_name.clone(),
                 embedding_model: EmbeddingModelConfig {
                     provider: store.embedding_model.provider.clone(),
                     model: store.embedding_model.model.clone(),
                     api_key: store.embedding_model.api_key.clone(),
                     base_url: None,
                 },
-                connection_string: store.url.clone(),
-                url: store.url.clone(),
-                collection_name: store.collection_name.clone(),
-                context_prefix: store.context_prefix.clone(),
+                description: store.description.clone(),
+                // Optional timeout/size overrides - use defaults if not specified in TOML
+                query_timeout_secs: store.query_timeout_secs,
+                embedding_timeout_secs: store.embedding_timeout_secs,
+                max_payload_size: store.max_payload_size,
             })
             .collect();
 

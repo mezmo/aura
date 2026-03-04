@@ -7,8 +7,7 @@ use crate::{
         StreamedAssistantContent,
     },
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
-    vector_dynamic::DynamicVectorSearchTool,
-    vector_store::VectorStoreManager,
+    vector_tools::DynamicVectorSearchTool,
 };
 use futures::StreamExt;
 use rig::client::CompletionClient;
@@ -462,30 +461,9 @@ impl Agent {
             tracing::info!("Adding {} vector store tool(s)", config.vector_stores.len());
 
             for vector_store_config in &config.vector_stores {
-                tracing::info!("  Configuring vector store: {}", vector_store_config.name);
-
-                let vector_store_manager =
-                    Arc::new(VectorStoreManager::from_config(vector_store_config).await?);
-
-                let vector_search_tool = DynamicVectorSearchTool::new(
-                    vector_store_manager.clone(),
-                    vector_store_config.name.clone(),
-                );
-
-                tracing::info!(
-                    "  Created dynamic tool 'vector_search_{}'",
-                    vector_store_config.name
-                );
-
-                builder_state = builder_state.add_tool(vector_search_tool);
-
-                tracing::info!(
-                    "  Vector store '{}' configured with search tool",
-                    vector_store_config.name
-                );
+                let tool = DynamicVectorSearchTool::from_config(vector_store_config).await?;
+                builder_state = builder_state.add_tool(tool);
             }
-
-            tracing::info!("All vector stores configured successfully");
         }
 
         // Add STDIO MCP tools using rmcp_tools
@@ -1034,7 +1012,8 @@ impl AgentBuilder {
             tracing::info!("=== Vector Stores Configuration ===");
             for vector_store in &config.vector_stores {
                 tracing::info!("Store: {}", vector_store.name);
-                tracing::info!("  Type: {}", vector_store.store_type);
+                tracing::info!("  URL: {}", vector_store.url);
+                tracing::info!("  Collection: {}", vector_store.collection_name);
                 tracing::info!(
                     "  Embedding Provider: {}",
                     vector_store.embedding_model.provider

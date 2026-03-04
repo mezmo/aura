@@ -21,7 +21,6 @@ pub mod model_limits;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 mod provider_agent; // Private - internal implementation detail
-pub mod rag_tools;
 pub mod request_cancellation;
 pub mod request_progress;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
@@ -32,8 +31,7 @@ pub(crate) mod string_utils;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
 pub mod tools;
-pub mod vector_dynamic;
-pub mod vector_store;
+pub mod vector_tools;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools};
 pub use config::{
@@ -62,7 +60,6 @@ pub use mcp::McpManager;
 pub use mcp_progress::ProgressEnabledHandler;
 pub use mcp_streamable_http::InFlightRequests;
 pub use model_limits::get_context_limit;
-pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancellation, RequestId};
 pub use request_progress::{
     ProgressNotification, RequestProgressBroker, global as request_progress_global,
@@ -79,7 +76,7 @@ pub use tool_event_broker::{
     tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe,
 };
 pub use tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool};
-pub use vector_dynamic::DynamicVectorSearchTool;
+pub use vector_tools::DynamicVectorSearchTool;
 
 // Fallback tool parser and stream wrapper for Ollama
 pub use fallback_tool_parser::{ParsedToolCall, parse_fallback_tool_calls};

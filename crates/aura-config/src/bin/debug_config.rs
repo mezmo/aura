@@ -7,14 +7,6 @@ provider = "openai"
 api_key = "test_openai_key"
 model = "gpt-4o-mini"
 
-[vector_store]
-type = "in_memory"
-
-[vector_store.embedding_model]
-provider = "openai"
-model = "text-embedding-3-small"
-api_key = "test_openai_key"
-
 [mcp.servers.mezmo]
 transport = "http_streamable"
 url = "https://mcp.mezmo.com/mcp"
@@ -136,7 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.vector_stores.is_empty() {
         println!("Vector Stores: {} configured", config.vector_stores.len());
         for (i, store) in config.vector_stores.iter().enumerate() {
-            println!("  Store {}: {} ({})", i + 1, store.name, store.store_type);
+            println!("  Store {}: {} @ {}", i + 1, store.name, store.url);
+            println!("    Collection: {}", store.collection_name);
             println!(
                 "    Embedding Model: {} {}",
                 store.embedding_model.provider, store.embedding_model.model
