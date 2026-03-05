@@ -19,13 +19,13 @@
  */
 
 use rmcp::{
+    ClientHandler,
     handler::client::progress::ProgressDispatcher,
     model::ProgressNotificationParam,
     service::{NotificationContext, RoleClient},
-    ClientHandler,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 

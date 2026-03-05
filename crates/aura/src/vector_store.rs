@@ -1,13 +1,13 @@
 use crate::{config::VectorStoreConfig, error::BuilderError};
-use qdrant_client::{qdrant::QueryPoints, Qdrant};
+use qdrant_client::{Qdrant, qdrant::QueryPoints};
 use rig::{
+    OneOrMany,
     client::EmbeddingsClient,
     embeddings::Embedding,
     providers::openai::{Client, EmbeddingModel as OpenAIEmbeddingModel},
     vector_store::{
-        in_memory_store::InMemoryVectorStore, request::VectorSearchRequest, VectorStoreIndex,
+        VectorStoreIndex, in_memory_store::InMemoryVectorStore, request::VectorSearchRequest,
     },
-    OneOrMany,
 };
 use rig_qdrant::QdrantVectorStore;
 use serde_json::Value;

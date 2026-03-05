@@ -8,7 +8,7 @@
 
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::sse::{extract_openai_chunks, parse_data_line};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -219,12 +219,11 @@ async fn test_streaming_multi_turn() {
 
     let mut turn1_content = String::new();
     for line in turn1_body.lines() {
-        if let Some(chunk) = parse_data_line(line) {
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                    turn1_content.push_str(content);
-                }
-            }
+        if let Some(chunk) = parse_data_line(line)
+            && let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+            && let Some(content) = json["choices"][0]["delta"]["content"].as_str()
+        {
+            turn1_content.push_str(content);
         }
     }
 
@@ -249,12 +248,11 @@ async fn test_streaming_multi_turn() {
 
     let mut turn2_content = String::new();
     for line in turn2_body.lines() {
-        if let Some(chunk) = parse_data_line(line) {
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                    turn2_content.push_str(content);
-                }
-            }
+        if let Some(chunk) = parse_data_line(line)
+            && let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+            && let Some(content) = json["choices"][0]["delta"]["content"].as_str()
+        {
+            turn2_content.push_str(content);
         }
     }
 
@@ -532,11 +530,11 @@ async fn test_multiple_sequential_tool_calls_unique_indices() {
                         if let Some(index) = tool_call["index"].as_u64() {
                             all_tool_indices.push(index);
                         }
-                        if let Some(name) = tool_call["function"]["name"].as_str() {
-                            if !name.is_empty() {
-                                // Session 33: Second delta has empty name
-                                all_tool_names.push(name.to_string());
-                            }
+                        if let Some(name) = tool_call["function"]["name"].as_str()
+                            && !name.is_empty()
+                        {
+                            // Session 33: Second delta has empty name
+                            all_tool_names.push(name.to_string());
                         }
                         tool_call_chunks.push(tool_call.clone());
                     }
@@ -648,14 +646,14 @@ async fn test_tool_names_not_concatenated_in_streaming() {
                 continue;
             }
 
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                if let Some(tool_calls) = json["choices"][0]["delta"]["tool_calls"].as_array() {
-                    for tool_call in tool_calls {
-                        if let Some(name) = tool_call["function"]["name"].as_str() {
-                            // Session 33: Skip empty names (second delta with results)
-                            if !name.is_empty() {
-                                tool_names.push(name.to_string());
-                            }
+            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+                && let Some(tool_calls) = json["choices"][0]["delta"]["tool_calls"].as_array()
+            {
+                for tool_call in tool_calls {
+                    if let Some(name) = tool_call["function"]["name"].as_str() {
+                        // Session 33: Skip empty names (second delta with results)
+                        if !name.is_empty() {
+                            tool_names.push(name.to_string());
                         }
                     }
                 }
@@ -930,17 +928,17 @@ async fn test_consecutive_requests_tool_execution() {
     let mut combined_content_1 = String::new();
 
     for line in body1.lines() {
-        if let Some(chunk) = parse_data_line(line) {
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                    combined_content_1.push_str(content);
-                }
-                if json["choices"][0]["delta"]["tool_calls"]
-                    .as_array()
-                    .is_some()
-                {
-                    tool_call_chunks_1.push(json.clone());
-                }
+        if let Some(chunk) = parse_data_line(line)
+            && let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+        {
+            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                combined_content_1.push_str(content);
+            }
+            if json["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .is_some()
+            {
+                tool_call_chunks_1.push(json.clone());
             }
         }
     }
@@ -996,17 +994,17 @@ async fn test_consecutive_requests_tool_execution() {
     let mut combined_content_2 = String::new();
 
     for line in body2.lines() {
-        if let Some(chunk) = parse_data_line(line) {
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                    combined_content_2.push_str(content);
-                }
-                if json["choices"][0]["delta"]["tool_calls"]
-                    .as_array()
-                    .is_some()
-                {
-                    tool_call_chunks_2.push(json.clone());
-                }
+        if let Some(chunk) = parse_data_line(line)
+            && let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+        {
+            if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                combined_content_2.push_str(content);
+            }
+            if json["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .is_some()
+            {
+                tool_call_chunks_2.push(json.clone());
             }
         }
     }
@@ -1109,12 +1107,12 @@ async fn test_streaming_final_chunk_includes_usage() {
         if line == "data: [DONE]" {
             break;
         }
-        if let Some(chunk) = parse_data_line(line) {
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                // Look for chunk with finish_reason (the final chunk)
-                if json["choices"][0]["finish_reason"].as_str().is_some() {
-                    final_chunk = Some(json);
-                }
+        if let Some(chunk) = parse_data_line(line)
+            && let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+        {
+            // Look for chunk with finish_reason (the final chunk)
+            if json["choices"][0]["finish_reason"].as_str().is_some() {
+                final_chunk = Some(json);
             }
         }
     }

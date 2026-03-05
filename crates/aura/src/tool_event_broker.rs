@@ -23,7 +23,7 @@ use crate::request_cancellation::RequestId;
 use rmcp::model::ProgressToken;
 use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::debug;
 
 /// Channel capacity for tool events per request

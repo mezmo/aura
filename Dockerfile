@@ -1,5 +1,4 @@
-# Stage 1: base - Testing and linting (used by Jenkins)
-FROM rustlang/rust:nightly AS base
+FROM rustlang/rust:1.93.1 AS base
 
 WORKDIR /usr/src/app
 
@@ -19,7 +18,7 @@ RUN cargo test --workspace --lib
 RUN cargo clippy --all-targets --all-features -- -D warnings
 
 # Stage 2: release-build - Release compilation
-FROM rustlang/rust:nightly AS release-build
+FROM rustlang/rust:1.93.1 AS release-build
 
 WORKDIR /usr/src/app
 

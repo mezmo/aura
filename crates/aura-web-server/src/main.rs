@@ -1,4 +1,4 @@
-use actix_web::{middleware, web, App, HttpResponse, HttpServer};
+use actix_web::{App, HttpResponse, HttpServer, middleware, web};
 use aura_config::load_config;
 use clap::Parser;
 use std::sync::Arc;
@@ -182,7 +182,7 @@ async fn run() -> std::io::Result<()> {
     .shutdown_timeout(10)
     .run();
 
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     let server_handle = server.handle();
     tokio::spawn({

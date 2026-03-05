@@ -25,8 +25,8 @@ use crate::logging::{
 };
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
-use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
 
 /// A span exporter that adds OpenInference semantic convention attributes
 /// to every span before delegating to an inner exporter.
@@ -249,10 +249,10 @@ fn expand_messages(json_str: &str, prefix: &str, out: &mut Vec<KeyValue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::InstrumentationScope;
     use opentelemetry::trace::{
         SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
     };
-    use opentelemetry::InstrumentationScope;
     use opentelemetry_sdk::trace::{SpanEvents, SpanLinks};
     use std::borrow::Cow;
     use std::time::SystemTime;
@@ -768,9 +768,9 @@ mod tests {
 mod pipeline_tests {
     use super::*;
     use futures::future::BoxFuture;
+    use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
     use opentelemetry_sdk::trace::{SimpleSpanProcessor, TracerProvider};
-    use opentelemetry_sdk::Resource;
     use std::sync::{Arc, Mutex};
 
     // -- InMemoryExporter: collects exported spans for assertions -----------

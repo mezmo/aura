@@ -21,17 +21,17 @@
 use crate::streaming::types::openai::UsageInfo;
 
 use super::types::{
-    detect_tool_error, format_sse_chunk, truncate_result, ChatCompletionChunk,
-    ChatCompletionChunkChoice, ChatCompletionChunkDelta, FunctionCallChunk, MessageRole,
+    CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
+    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, FunctionCallChunk, MessageRole,
     StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus, TurnContext, TurnState,
-    CHUNK_OBJECT, FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE,
+    detect_tool_error, format_sse_chunk, truncate_result,
 };
 use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    get_context_limit, Agent, ProgressNotification, RequestCancellation, ResponseContent,
-    StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent, ToolCall,
-    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    Agent, ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
+    StreamedAssistantContent, StreamedUserContent, ToolCall, ToolLifecycleEvent, ToolResult,
+    ToolUsageEvent, UsageState, get_context_limit,
 };
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
@@ -77,8 +77,7 @@ pub enum StreamTermination {
 }
 
 /// User-facing message when context overflow is detected.
-const CONTEXT_OVERFLOW_MESSAGE: &str =
-    "My tools returned more data than I can work with at once.\n\n\
+const CONTEXT_OVERFLOW_MESSAGE: &str = "My tools returned more data than I can work with at once.\n\n\
     **To help me out, try:**\n\
     - Narrowing your search with filters\n\
     - Asking for a summary instead of full results\n\

@@ -1,12 +1,12 @@
 use crate::{
     config::McpServerConfig, error::BuilderError, mcp_streamable_http::StreamableHttpMcpClient,
 };
-use futures::{stream::BoxStream, StreamExt};
+use futures::{StreamExt, stream::BoxStream};
 use rig::tool::rmcp::McpTool;
 use rig::{completion::ToolDefinition, tool::Tool as RigTool};
+use rmcp::ServiceExt;
 use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, Tool};
 use rmcp::transport::streamable_http_client::StreamableHttpClient;
-use rmcp::ServiceExt;
 use serde_json::Value;
 use sse_stream::{Sse, SseStream};
 use std::collections::HashMap;
@@ -397,7 +397,9 @@ impl McpManager {
                 if e.to_string().contains("401 Unauthorized")
                     || e.to_string().contains("HTTP status client error (401")
                 {
-                    Err(BuilderError::McpInitError(format!("HTTP MCP server '{server_name}' authentication failed (401 Unauthorized). This is likely because rmcp does not yet support custom headers for authentication. Your Authorization header cannot be sent.")))
+                    Err(BuilderError::McpInitError(format!(
+                        "HTTP MCP server '{server_name}' authentication failed (401 Unauthorized). This is likely because rmcp does not yet support custom headers for authentication. Your Authorization header cannot be sent."
+                    )))
                 } else {
                     warn!("  HTTP Streamable MCP connection failed: {}", e);
                     // Continue without this server for now
@@ -684,13 +686,13 @@ impl McpManager {
         // VALIDATION: OpenAI requires tool schemas to have type: "object" at root level
         // MCP servers sometimes incorrectly return type definitions (e.g., type: "string") as tools
         // These are not valid tools and must be rejected
-        if let Some(schema_type) = schema.get("type").and_then(|t| t.as_str()) {
-            if schema_type != "object" {
-                return Err(format!(
-                    "Invalid MCP tool schema: root must be type 'object', got '{schema_type}'. \
+        if let Some(schema_type) = schema.get("type").and_then(|t| t.as_str())
+            && schema_type != "object"
+        {
+            return Err(format!(
+                "Invalid MCP tool schema: root must be type 'object', got '{schema_type}'. \
                     This is an MCP server bug - the server is returning a type definition as a tool."
-                ));
-            }
+            ));
         }
 
         // Step 1: Fix incomplete required arrays (makes optional fields nullable)
@@ -913,17 +915,17 @@ impl McpManager {
 
         // Try HTTP Streamable clients first
         for (server_name, client) in &self.streamable_clients {
-            if let Some(tools) = self.streamable_tools.get(server_name) {
-                if tools.iter().any(|t| t.name.as_ref() == tool_name) {
-                    info!(
-                        "Executing fallback tool '{}' via HTTP Streamable",
-                        tool_name
-                    );
-                    return client
-                        .call_tool(tool_name, args_map)
-                        .await
-                        .map_err(|e| format!("Tool execution failed: {}", e));
-                }
+            if let Some(tools) = self.streamable_tools.get(server_name)
+                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+            {
+                info!(
+                    "Executing fallback tool '{}' via HTTP Streamable",
+                    tool_name
+                );
+                return client
+                    .call_tool(tool_name, args_map)
+                    .await
+                    .map_err(|e| format!("Tool execution failed: {}", e));
             }
         }
 

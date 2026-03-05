@@ -129,7 +129,10 @@ host = "{{ env.TEST_HOST_NONEXISTENT | default: 'localhost' }}"
 
     #[test]
     fn test_default_value_when_env_set() {
-        env::set_var("TEST_HOST_EXISTS", "myhost");
+        unsafe {
+            env::set_var("TEST_HOST_EXISTS", "myhost");
+        }
+
         let toml_with_default = r#"
 [server]
 host = "{{ env.TEST_HOST_EXISTS | default: 'localhost' }}"
@@ -144,6 +147,8 @@ host = "{{ env.TEST_HOST_EXISTS | default: 'localhost' }}"
             "Should contain env var value 'myhost'"
         );
 
-        env::remove_var("TEST_HOST_EXISTS");
+        unsafe {
+            env::remove_var("TEST_HOST_EXISTS");
+        }
     }
 }

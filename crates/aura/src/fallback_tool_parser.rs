@@ -186,8 +186,28 @@ fn try_parse_json(content: &str, available_tools: &[String]) -> Option<Vec<Parse
     let mut results = Vec::new();
 
     // First, try to parse the entire content as a single JSON object
-    if let Ok(call) = serde_json::from_str::<JsonToolCall>(content) {
-        if available_tools.contains(&call.name) {
+    if let Ok(call) = serde_json::from_str::<JsonToolCall>(content)
+        && available_tools.contains(&call.name)
+    {
+        let arguments = call
+            .args
+            .map(|v| serde_json::to_string(&v).unwrap_or_default())
+            .unwrap_or_else(|| EMPTY_JSON_OBJECT.to_string());
+
+        results.push(ParsedToolCall {
+            name: call.name,
+            arguments,
+        });
+        return Some(results);
+    }
+
+    // Try to find JSON objects within the content (handle markdown code blocks, etc.)
+    // Look for patterns like ```json ... ``` or standalone JSON
+    let json_content = extract_json_from_content(content);
+    for json_str in json_content {
+        if let Ok(call) = serde_json::from_str::<JsonToolCall>(&json_str)
+            && available_tools.contains(&call.name)
+        {
             let arguments = call
                 .args
                 .map(|v| serde_json::to_string(&v).unwrap_or_default())
@@ -197,26 +217,6 @@ fn try_parse_json(content: &str, available_tools: &[String]) -> Option<Vec<Parse
                 name: call.name,
                 arguments,
             });
-            return Some(results);
-        }
-    }
-
-    // Try to find JSON objects within the content (handle markdown code blocks, etc.)
-    // Look for patterns like ```json ... ``` or standalone JSON
-    let json_content = extract_json_from_content(content);
-    for json_str in json_content {
-        if let Ok(call) = serde_json::from_str::<JsonToolCall>(&json_str) {
-            if available_tools.contains(&call.name) {
-                let arguments = call
-                    .args
-                    .map(|v| serde_json::to_string(&v).unwrap_or_default())
-                    .unwrap_or_else(|| EMPTY_JSON_OBJECT.to_string());
-
-                results.push(ParsedToolCall {
-                    name: call.name,
-                    arguments,
-                });
-            }
         }
     }
 
@@ -318,20 +318,19 @@ fn try_parse_hermes(content: &str, available_tools: &[String]) -> Option<Vec<Par
     let mut results = Vec::new();
 
     for cap in HERMES_TOOL_CALL_RE.captures_iter(content) {
-        if let Some(json_match) = cap.get(1) {
-            if let Ok(call) = serde_json::from_str::<JsonToolCall>(json_match.as_str()) {
-                if available_tools.contains(&call.name) {
-                    let arguments = call
-                        .args
-                        .map(|v| serde_json::to_string(&v).unwrap_or_default())
-                        .unwrap_or_else(|| EMPTY_JSON_OBJECT.to_string());
+        if let Some(json_match) = cap.get(1)
+            && let Ok(call) = serde_json::from_str::<JsonToolCall>(json_match.as_str())
+            && available_tools.contains(&call.name)
+        {
+            let arguments = call
+                .args
+                .map(|v| serde_json::to_string(&v).unwrap_or_default())
+                .unwrap_or_else(|| EMPTY_JSON_OBJECT.to_string());
 
-                    results.push(ParsedToolCall {
-                        name: call.name,
-                        arguments,
-                    });
-                }
-            }
+            results.push(ParsedToolCall {
+                name: call.name,
+                arguments,
+            });
         }
     }
 
@@ -352,12 +351,12 @@ fn try_parse_pythonic(content: &str, available_tools: &[String]) -> Option<Vec<P
         let tool_name = cap.get(1).map(|m| m.as_str().to_string());
         let args_str = cap.get(2).map(|m| m.as_str());
 
-        if let (Some(name), Some(args)) = (tool_name, args_str) {
-            if available_tools.contains(&name) {
-                // Parse Python-style arguments into JSON
-                let arguments = parse_pythonic_args(args);
-                results.push(ParsedToolCall { name, arguments });
-            }
+        if let (Some(name), Some(args)) = (tool_name, args_str)
+            && available_tools.contains(&name)
+        {
+            // Parse Python-style arguments into JSON
+            let arguments = parse_pythonic_args(args);
+            results.push(ParsedToolCall { name, arguments });
         }
     }
 
@@ -433,11 +432,11 @@ fn try_parse_qwen(content: &str, available_tools: &[String]) -> Option<Vec<Parse
         let tool_name = cap.get(1).map(|m| m.as_str().to_string());
         let params_content = cap.get(2).map(|m| m.as_str());
 
-        if let (Some(name), Some(params_str)) = (tool_name, params_content) {
-            if available_tools.contains(&name) {
-                let arguments = parse_qwen_parameters(params_str);
-                results.push(ParsedToolCall { name, arguments });
-            }
+        if let (Some(name), Some(params_str)) = (tool_name, params_content)
+            && available_tools.contains(&name)
+        {
+            let arguments = parse_qwen_parameters(params_str);
+            results.push(ParsedToolCall { name, arguments });
         }
     }
 

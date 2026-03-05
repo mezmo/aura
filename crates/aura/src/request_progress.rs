@@ -6,7 +6,7 @@
 use rmcp::model::ProgressToken;
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::debug;
 
 /// Channel capacity for progress notifications per request

@@ -8,7 +8,7 @@
 
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::sse::parse_data_line;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -85,15 +85,13 @@ async fn test_list_metrics_streaming_no_json_error() {
                             .and_then(|tc| tc.as_array())
                         {
                             for tool_call in tool_calls {
-                                if let Some(function) = tool_call.get("function") {
-                                    if let Some(name) =
+                                if let Some(function) = tool_call.get("function")
+                                    && let Some(name) =
                                         function.get("name").and_then(|n| n.as_str())
-                                    {
-                                        if name == "list_metrics" {
-                                            found_tool_call = true;
-                                            tool_call_name = name.to_string();
-                                        }
-                                    }
+                                    && name == "list_metrics"
+                                {
+                                    found_tool_call = true;
+                                    tool_call_name = name.to_string();
                                 }
                             }
                         }

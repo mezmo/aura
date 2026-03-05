@@ -54,7 +54,13 @@ impl RigTool for DynamicVectorSearchTool {
         );
 
         let description = if let Some(context) = self.vector_store.get_context_prefix() {
-            format!("{} This vector store contains: {}. Use this tool when you need to find information related to that domain.", base_description, context.replace("Based on the following information from the ", "").replace(":", ""))
+            format!(
+                "{} This vector store contains: {}. Use this tool when you need to find information related to that domain.",
+                base_description,
+                context
+                    .replace("Based on the following information from the ", "")
+                    .replace(":", "")
+            )
         } else {
             base_description
         };

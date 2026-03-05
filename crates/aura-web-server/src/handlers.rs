@@ -1,7 +1,7 @@
-use actix_web::{web, HttpResponse};
+use actix_web::{HttpResponse, web};
 use aura::{
-    request_progress_subscribe, tool_event_subscribe, tool_usage_subscribe, Agent,
-    RequestCancellation, ResponseContent, UsageState,
+    Agent, RequestCancellation, ResponseContent, UsageState, request_progress_subscribe,
+    tool_event_subscribe, tool_usage_subscribe,
 };
 use aura_config::RigBuilder;
 use chrono::Utc;
@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, Instrument};
+use tracing::{Instrument, error};
 use uuid::Uuid;
 
 use crate::streaming::{
-    collect_stream_to_completion, process_sse_stream_full, StreamConfig, StreamOtelContext,
-    StreamOutcome, StreamTermination, StreamingCallbacks, TurnContext,
+    StreamConfig, StreamOtelContext, StreamOutcome, StreamTermination, StreamingCallbacks,
+    TurnContext, collect_stream_to_completion, process_sse_stream_full,
 };
 use crate::types::*;
 
@@ -614,7 +614,7 @@ fn generate_chat_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use crate::streaming::{
-        truncate_result, ChatCompletionChunkDelta, MessageRole, ToolResultMode,
+        ChatCompletionChunkDelta, MessageRole, ToolResultMode, truncate_result,
     };
 
     #[test]

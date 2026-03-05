@@ -315,8 +315,10 @@ system_prompt = "Test with env vars"
         use crate::resolve_env_vars;
 
         // Mock environment variables for testing
-        std::env::set_var("OPENAI_API_KEY", "mock_openai_key");
-        std::env::set_var("TEST_API_KEY", "mock_test_key");
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "mock_openai_key");
+            std::env::set_var("TEST_API_KEY", "mock_test_key");
+        }
 
         let resolved = resolve_env_vars(env_config).expect("Failed to resolve env vars");
         println!("\n🔍 Resolved TOML content:");
@@ -356,8 +358,10 @@ system_prompt = "Test with env vars"
         }
 
         // Clean up
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TEST_API_KEY");
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("TEST_API_KEY");
+        }
     }
 
     #[test]
@@ -543,7 +547,9 @@ system_prompt = "Test"
     fn test_ollama_additional_params_env_resolution() {
         println!("\n=== TEST_OLLAMA_ADDITIONAL_PARAMS_ENV_RESOLUTION ===");
         // Set up test env var
-        std::env::set_var("TEST_SEED", "12345");
+        unsafe {
+            std::env::set_var("TEST_SEED", "12345");
+        }
 
         let config_str = r#"
 [llm]
@@ -583,7 +589,9 @@ system_prompt = "Test"
         }
 
         // Clean up
-        std::env::remove_var("TEST_SEED");
+        unsafe {
+            std::env::remove_var("TEST_SEED");
+        }
     }
 
     #[test]

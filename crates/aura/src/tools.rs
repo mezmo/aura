@@ -255,10 +255,8 @@ impl FilesystemTool {
         debug!("Writing file: {}", validated_path.display());
 
         // Create parent directories if requested
-        if create_dirs {
-            if let Some(parent) = validated_path.parent() {
-                fs::create_dir_all(parent).await?;
-            }
+        if create_dirs && let Some(parent) = validated_path.parent() {
+            fs::create_dir_all(parent).await?;
         }
 
         // Write the file
