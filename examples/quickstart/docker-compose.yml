@@ -1,0 +1,98 @@
+services:
+  # ── Aura Agent Server ───────────────────────────────────────────────
+  aura:
+    image: mezmo/aura:1
+    container_name: aura
+    command:
+      - ./aura-web-server
+      - --verbose
+    ports:
+      - "3000:3000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      CONFIG_PATH: "/app/config/config.toml"
+
+      # LLM API keys (from .env)
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+
+      # Optional: Mezmo
+      MEZMO_API_KEY: "${MEZMO_API_KEY:-}"
+
+      # Streaming — custom events disabled because LibreChat's SSE
+      # parser doesn't skip unknown event types (aura.session_info, etc.)
+      AURA_CUSTOM_EVENTS: "false"
+      AURA_EMIT_REASONING: "false"
+      TOOL_RESULT_MODE: "none"
+
+      # OpenTelemetry → Phoenix
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://phoenix:4317"
+      OTEL_RECORD_CONTENT: "true"
+    volumes:
+      - ./config.toml:/app/config/config.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - aura-quickstart
+
+  # ── LibreChat (Chat UI) ────────────────────────────────────────────
+  librechat-mongodb:
+    image: mongo:latest
+    container_name: aura-qs-mongodb
+    volumes:
+      - mongodb-data:/data/db
+    restart: unless-stopped
+    networks:
+      - aura-quickstart
+
+  librechat:
+    image: ghcr.io/danny-avila/librechat:v0.7.8
+    container_name: aura-qs-librechat
+    ports:
+      - "3080:3080"
+    depends_on:
+      aura:
+        condition: service_healthy
+      librechat-mongodb:
+        condition: service_started
+    environment:
+      MONGO_URI: "mongodb://librechat-mongodb:27017/LibreChat"
+      HOST: "0.0.0.0"
+      PORT: "3080"
+      ENDPOINTS: "custom"
+      ALLOW_REGISTRATION: "true"
+      CONFIG_PATH: "/app/librechat.yaml"
+      # Session secrets (change these in production)
+      CREDS_KEY: "f34be427ebb29de8d88c107a71546019685ed8b241d8f2ed00c3df97ad2566f0"
+      CREDS_IV: "e2341419ec3dd3d19b13a1a87fafcbfb"
+      JWT_SECRET: "16f8c0ef4a5d391b26034086c628469d3f9f497f08163ab9b40137092f2909ef"
+      JWT_REFRESH_SECRET: "eaa5191f2914e30b9387fd84e254e4ba6fc51b4654968a9b0803b456a54b8418"
+    volumes:
+      - ./configs/librechat.yaml:/app/librechat.yaml:ro
+    restart: unless-stopped
+    networks:
+      - aura-quickstart
+
+  # ── Phoenix (LLM Trace Viewer) ─────────────────────────────────────
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: aura-qs-phoenix
+    ports:
+      - "6006:6006"   # UI
+      - "4317:4317"   # OTLP gRPC
+    restart: unless-stopped
+    networks:
+      - aura-quickstart
+
+networks:
+  aura-quickstart:
+    driver: bridge
+
+volumes:
+  mongodb-data:

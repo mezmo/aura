@@ -1,0 +1,62 @@
+# Aura Quickstart Configuration
+#
+# Customize this file to change your agent's behavior, LLM provider,
+# tools, and RAG pipelines. Changes take effect on restart.
+#
+# For all available options, see: examples/reference.toml
+
+# ── LLM Provider ────────────────────────────────────────────────────
+# Switch providers by uncommenting the relevant block below.
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+
+# Anthropic:
+# provider = "anthropic"
+# api_key = "{{ env.ANTHROPIC_API_KEY }}"
+# model = "claude-sonnet-4-20250514"
+
+# Ollama (local, no API key needed):
+# provider = "ollama"
+# model = "llama3.1"
+# base_url = "http://host.docker.internal:11434"
+# fallback_tool_parsing = true
+
+# ── Agent ───────────────────────────────────────────────────────────
+
+[agent]
+name = "Aura Assistant"
+system_prompt = """
+You are a helpful assistant with access to external tools and
+knowledge bases. Use them to provide accurate, grounded answers.
+"""
+# Maximum tool-calling rounds per user turn
+turn_depth = 5
+
+# ── MCP Tool Servers (optional) ─────────────────────────────────────
+# Uncomment and configure to give your agent access to external tools.
+#
+# [mcp]
+# sanitize_schemas = true
+#
+# [mcp.servers.my_tools]
+# transport = "http_streamable"
+# url = "http://host.docker.internal:9000/mcp"
+# description = "My MCP tool server"
+
+# ── Vector Stores / RAG (optional) ──────────────────────────────────
+# Uncomment to enable retrieval-augmented generation with Qdrant.
+#
+# [[vector_stores]]
+# name = "docs"
+# type = "qdrant"
+# url = "http://host.docker.internal:6334"
+# collection_name = "my_collection"
+# context_prefix = "Relevant documentation"
+#
+# [vector_stores.embedding_model]
+# provider = "openai"
+# model = "text-embedding-3-small"
+# api_key = "{{ env.OPENAI_API_KEY }}"
