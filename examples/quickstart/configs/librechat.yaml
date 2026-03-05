@@ -1,0 +1,21 @@
+# LibreChat configuration for the Aura quickstart.
+# See: https://docs.librechat.ai/install/configuration/custom_config.html
+
+version: 1.1.5
+
+endpoints:
+  custom:
+    - name: "Aura"
+      apiKey: "not_used"
+      baseURL: "http://aura:3000/v1"
+      models:
+        default:
+          - "aura"
+        fetch: false
+      titleConvo: true
+      titleModel: "aura"
+      summarize: false
+      forcePrompt: false
+      modelDisplayLabel: "Aura"
+      addParams:
+        stream: true
