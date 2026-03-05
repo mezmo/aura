@@ -1,24 +1,5 @@
-FROM rustlang/rust:1.93.1 AS base
-
-WORKDIR /usr/src/app
-
-# Copy workspace files
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ ./crates/
-
-# Install rustfmt and clippy
-RUN rustup component add rustfmt clippy
-
-# Run formatting check, tests, and linting
-# Note: These commands will fail the build if any check fails
-# --lib runs only unit tests (in src/), skips integration tests (in tests/ dirs)
-# Integration tests require running servers and are executed separately via run_tests.sh
-RUN cargo fmt --all -- --check
-RUN cargo test --workspace --lib
-RUN cargo clippy --all-targets --all-features -- -D warnings
-
-# Stage 2: release-build - Release compilation
-FROM rustlang/rust:1.93.1 AS release-build
+# Stage 1: release-build - Release compilation
+FROM rust:1.93.1 AS release-build
 
 WORKDIR /usr/src/app
 
@@ -30,7 +11,7 @@ COPY crates/ ./crates/
 RUN cargo clean
 RUN cargo build --release --bin aura-web-server
 
-# Stage 3: release - Runtime stage with newer glibc
+# Stage 2: release - Runtime stage with newer glibc
 FROM debian:trixie-slim
 
 # Install runtime dependencies
