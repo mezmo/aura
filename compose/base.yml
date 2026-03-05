@@ -17,7 +17,7 @@ services:
     # Use GCR image in CI, local build for development (Mac ARM needs local build)
     # CI: Set MOCK_MCP_IMAGE in Jenkinsfile
     # Local: Run `make mock-mcp-build` to build from ../aura-mock-mcp
-    image: ${MOCK_MCP_IMAGE:-aura-mock-mcp:local}
+    image: ${MOCK_MCP_IMAGE:-mezmo/aura-mock-mcp}
     volumes:
       # Shared volume for marker files (written by slow_task, read by tests)
       # Uses /tmp since that's where slow_task writes marker files
