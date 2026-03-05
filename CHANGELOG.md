@@ -1,3 +1,10 @@
+## [1.14.7](https://github.com/mezmo/aura/compare/v1.14.6...v1.14.7) (2026-03-05)
+
+
+### Documentation
+
+* add quickstart with Docker Compose (Aura + LibreChat + Phoenix) [8081471](https://github.com/mezmo/aura/commit/80814713cc8277b43c11785e40d660002d2024b6) - Gregory Janco [LOG-22815](https://logdna.atlassian.net/browse/LOG-22815)
+
 ## [1.14.6](https://github.com/mezmo/aura/compare/v1.14.5...v1.14.6) (2026-03-04)
 
 
