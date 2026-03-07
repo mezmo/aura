@@ -1,0 +1,49 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Auto Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: "${{ github.workflow }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          show-progress: false
+          token: ${{ secrets.TOKEN_TO_TRIGGER_SUBSEQUENT_WORKFLOWS }}
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@385db9cc6bf65d19775b02084a4b698eaca9a4f2 # v2.68.19
+        with:
+          tool: git-cliff
+
+      - name: Compute version, update changelog, commit and tag
+        shell: bash
+        run: |
+          git config --global user.name github-actions[bot]
+          git config --global user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+          version=$(git-cliff --bumped-version --github-token ${{ secrets.GITHUB_TOKEN }})
+
+          commit_message="chore(release): ${version}"
+
+          git-cliff --output CHANGELOG.md --bump --with-commit "${commit_message}" --github-token ${{ secrets.GITHUB_TOKEN }}
+
+          git add CHANGELOG.md
+          git commit --message "${commit_message}"
+          git tag "${version}" --message "${commit_message}"
+          git push origin main "${version}"
