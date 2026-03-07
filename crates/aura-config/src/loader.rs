@@ -1,4 +1,4 @@
-use crate::{load_config_from_str, Config, ConfigError};
+use crate::{Config, ConfigError, load_config_from_str};
 use clap::ArgMatches;
 use std::path::Path;
 
@@ -55,7 +55,7 @@ impl ConfigLoader {
         self
     }
 
-    /// Add YAML file configuration layer  
+    /// Add YAML file configuration layer
     pub fn with_yaml_file<P: AsRef<Path>>(mut self, path: P) -> Self {
         if path.as_ref().exists() {
             self.yaml_files.push(path.as_ref().to_path_buf());
@@ -243,13 +243,18 @@ mod tests {
     #[test]
     fn test_standard_loader() {
         // Set some test environment variables
-        std::env::set_var("RIG_LLM_PROVIDER", "test_provider");
+        unsafe {
+            std::env::set_var("RIG_LLM_PROVIDER", "test_provider");
+        }
 
         // This should not panic even if config files don't exist
         let result = ConfigLoader::standard(Some("RIG_".to_string()), None);
 
         // Clean up
-        std::env::remove_var("RIG_LLM_PROVIDER");
+
+        unsafe {
+            std::env::remove_var("RIG_LLM_PROVIDER");
+        }
 
         // We expect this to fail because we don't have valid config files in test
         assert!(result.is_err());

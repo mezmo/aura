@@ -60,7 +60,7 @@ use opentelemetry_sdk::trace::TracerProvider;
 use std::sync::OnceLock;
 use std::sync::{atomic::AtomicBool, atomic::AtomicUsize, atomic::Ordering};
 use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[cfg(feature = "otel")]
 static TRACER_PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
@@ -137,10 +137,10 @@ fn init_content_config() {
             Ordering::Relaxed,
         );
     }
-    if let Ok(val) = std::env::var("OTEL_CONTENT_MAX_LENGTH") {
-        if let Ok(n) = val.parse::<usize>() {
-            CONTENT_MAX_LENGTH.store(n, Ordering::Relaxed);
-        }
+    if let Ok(val) = std::env::var("OTEL_CONTENT_MAX_LENGTH")
+        && let Ok(n) = val.parse::<usize>()
+    {
+        CONTENT_MAX_LENGTH.store(n, Ordering::Relaxed);
     }
 }
 

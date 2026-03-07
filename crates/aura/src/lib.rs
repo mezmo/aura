@@ -65,22 +65,22 @@ pub use model_limits::get_context_limit;
 pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancellation, RequestId};
 pub use request_progress::{
-    global as request_progress_global, subscribe as request_progress_subscribe,
-    unsubscribe as request_progress_unsubscribe, ProgressNotification, RequestProgressBroker,
+    ProgressNotification, RequestProgressBroker, global as request_progress_global,
+    subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use stream_events::{AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
-pub use tool_error_detection::{detect_tool_error, DetectedToolError, ToolResultStatus};
+pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_event_broker::{
+    ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,
     global as tool_event_global, peek_tool_call_id, pop_tool_call_id, publish_tool_start,
     publish_tool_usage, push_tool_call_id, subscribe as tool_event_subscribe, tool_usage_subscribe,
-    tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe, ToolCallId, ToolEventBroker,
-    ToolLifecycleEvent, ToolName, ToolUsageEvent,
+    tool_usage_unsubscribe, unsubscribe as tool_event_unsubscribe,
 };
 pub use tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use vector_dynamic::DynamicVectorSearchTool;
 
 // Fallback tool parser and stream wrapper for Ollama
-pub use fallback_tool_parser::{parse_fallback_tool_calls, ParsedToolCall};
+pub use fallback_tool_parser::{ParsedToolCall, parse_fallback_tool_calls};
 pub use fallback_tool_stream::FallbackToolExecutor;

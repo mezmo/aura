@@ -9,9 +9,9 @@
 
 #![cfg(feature = "integration-cancellation")]
 
+use aura_test_utils::TaskStatusChecker;
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::timeouts::{CANCELLATION_CHECK, HTTP_REQUEST, TOOL_START};
-use aura_test_utils::TaskStatusChecker;
 use reqwest::Client;
 use tokio::time::sleep;
 use uuid::Uuid;

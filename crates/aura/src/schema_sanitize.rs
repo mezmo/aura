@@ -95,7 +95,7 @@ pub fn recursive_set_additional_properties_false(schema: &mut Value) -> &mut Val
     normalize_const_null(schema);
 
     // Only process dictionary/object values
-    if let Value::Object(ref mut map) = schema {
+    if let &mut Value::Object(ref mut map) = schema {
         // Handle edge case: type: "object" with no properties field
         // This is common in MCP schemas for zero-argument tools
         let is_object_without_properties = map
@@ -231,7 +231,7 @@ pub fn fix_empty_root_required(schema: &mut Value) -> &mut Value {
 
 /// Recursively fixes missing required properties in all object schemas
 fn fix_required_recursive(schema: &mut Value) {
-    if let Value::Object(ref mut map) = schema {
+    if let &mut Value::Object(ref mut map) = schema {
         // Get properties if they exist
         if let Some(Value::Object(properties)) = map.get("properties") {
             // Get all property names
@@ -261,10 +261,10 @@ fn fix_required_recursive(schema: &mut Value) {
                 if let Some(Value::Object(properties)) = map.get_mut("properties") {
                     // Make all missing properties nullable
                     for prop_name in &missing_properties {
-                        if let Some(prop_schema) = properties.get_mut(prop_name) {
-                            if !is_nullable(prop_schema) {
-                                make_nullable(prop_schema);
-                            }
+                        if let Some(prop_schema) = properties.get_mut(prop_name)
+                            && !is_nullable(prop_schema)
+                        {
+                            make_nullable(prop_schema);
                         }
                     }
 
@@ -348,12 +348,12 @@ fn is_nullable(schema: &Value) -> bool {
 fn normalize_const_null(schema: &mut Value) {
     if let Value::Object(map) = schema {
         // If schema has const: null, convert to type: "null"
-        if let Some(const_val) = map.get("const") {
-            if const_val.is_null() {
-                map.remove("const");
-                map.remove("nullable"); // Also remove nullable flag
-                map.insert("type".to_string(), Value::String("null".to_string()));
-            }
+        if let Some(const_val) = map.get("const")
+            && const_val.is_null()
+        {
+            map.remove("const");
+            map.remove("nullable"); // Also remove nullable flag
+            map.insert("type".to_string(), Value::String("null".to_string()));
         }
 
         // Recursively process nested structures
@@ -392,7 +392,7 @@ fn make_nullable(schema: &mut Value) {
         let title = map.remove("title");
 
         // Check if anyOf already exists
-        if let Some(Value::Array(ref mut any_of)) = map.get_mut("anyOf") {
+        if let Some(&mut Value::Array(ref mut any_of)) = map.get_mut("anyOf") {
             // anyOf exists, add null if not present
             let has_null = any_of.iter().any(|item| {
                 item.get("type")

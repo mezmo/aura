@@ -212,7 +212,7 @@ pub mod context {
 // Re-export for convenience
 pub use config::{StreamConfig, ToolResultMode};
 pub use context::{
-    TurnContext, TurnState, CHUNK_OBJECT, FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE,
+    CHUNK_OBJECT, FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, TurnContext, TurnState,
 };
 pub use openai::{
     ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta, FunctionCallChunk,

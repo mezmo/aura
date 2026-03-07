@@ -36,8 +36,8 @@ mod types;
 
 // Main streaming functions
 pub use handlers::{
-    collect_stream_to_completion, process_sse_stream_full, StreamOutcome, StreamTermination,
-    StreamingCallbacks,
+    StreamOutcome, StreamTermination, StreamingCallbacks, collect_stream_to_completion,
+    process_sse_stream_full,
 };
 
 // OTel context for agent.stream span
@@ -48,4 +48,4 @@ pub use types::{StreamConfig, ToolResultMode, TurnContext};
 
 // Types exported for tests
 #[cfg(test)]
-pub use types::{truncate_result, ChatCompletionChunkDelta, MessageRole, UsageInfo};
+pub use types::{ChatCompletionChunkDelta, MessageRole, UsageInfo, truncate_result};

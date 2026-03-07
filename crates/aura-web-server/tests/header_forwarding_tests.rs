@@ -8,7 +8,7 @@
 //! in the mock MCP server to verify header forwarding.
 
 use aura_test_utils::server_urls::AURA_SERVER;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);

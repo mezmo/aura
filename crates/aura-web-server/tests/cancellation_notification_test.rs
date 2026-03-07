@@ -3,9 +3,9 @@
 //! Integration test: client disconnect triggers `notifications/cancelled` to MCP server.
 //!
 
+use aura_test_utils::TaskStatusChecker;
 use aura_test_utils::server_urls::{AURA_SERVER, MCP_SERVER};
 use aura_test_utils::timeouts::{HTTP_REQUEST, POST_DISCONNECT_WAIT, TOOL_START};
-use aura_test_utils::TaskStatusChecker;
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::time::sleep;

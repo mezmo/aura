@@ -138,7 +138,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<St
 mod tests {
     use super::*;
     use rmcp::model::{Content, RawContent, RawTextContent};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     #[test]
     fn test_extract_structured_content() {

@@ -7,8 +7,8 @@ use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::timeouts::{HTTP_REQUEST, POST_DISCONNECT_WAIT, PROGRESS_RECEIVE, TOOL_START};
 use futures_util::StreamExt;
 use reqwest::Client;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::time::{sleep, timeout};
 
 const MAX_RETRIES: usize = 3;

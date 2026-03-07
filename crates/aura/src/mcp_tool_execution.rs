@@ -26,7 +26,7 @@ use crate::request_cancellation::call_http_tool_cancellable;
 /// Sets parameter count and (when content recording is enabled) the
 /// serialised arguments. Called before tool execution.
 fn record_tool_call_input(span: &tracing::Span, args: &Value) {
-    if let Value::Object(ref map) = args {
+    if let Value::Object(map) = args {
         crate::logging::set_span_attribute(
             span,
             crate::logging::ATTR_TOOL_PARAMETERS_COUNT,

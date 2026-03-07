@@ -1,0 +1,290 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Build Rust
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_FEATURES: ""
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: --deny=warnings
+
+jobs:
+  warm-up-cache:
+    name: Warm up the cache
+    runs-on: ubuntu-latest
+    steps:
+      - &checkout
+        name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          show-progress: false
+
+      - name: Cache cargo
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        env:
+          CACHE_NAME: cargo
+        with:
+          path: |
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-warm-up-cache
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-
+            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-
+
+      - &set_up_mold
+        name: Set up mold
+        uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+
+      - &set_up_toolchain
+        name: Set up toolchain
+        shell: bash
+        run: |
+          rm ${HOME}/.cargo/bin/cargo-fmt
+          rm ${HOME}/.cargo/bin/rust-analyzer
+          rm ${HOME}/.cargo/bin/rustfmt
+
+          rustup self update
+          rustup update
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+          cargo --version
+
+      - name: Fetch
+        shell: bash
+        run: |
+          cargo fetch --locked
+
+  cargo-build:
+    name: Cargo build
+    runs-on: ubuntu-latest
+    needs:
+      - warm-up-cache
+    if: |
+      github.event_name == 'pull_request'
+    steps:
+      - *checkout
+
+      - &cache_cargo
+        name: Cache cargo
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        env:
+          CACHE_NAME: cargo
+        with:
+          path: |
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-warm-up-cache
+
+      - &cache_target
+        name: Cache target
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        env:
+          CACHE_NAME: target
+        with:
+          path: |
+            ./target
+          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-${{ github.job }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-
+            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-
+            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-
+
+      - *set_up_mold
+
+      - *set_up_toolchain
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build ${{ env.CARGO_FEATURES }} --all-targets --frozen --workspace
+
+  cargo-fmt:
+    name: Cargo fmt
+    runs-on: ubuntu-latest
+    needs:
+      - warm-up-cache
+    if: |
+      github.event_name == 'pull_request'
+    steps:
+      - *checkout
+
+      - *cache_cargo
+
+      - *set_up_toolchain
+
+      - name: Install rustfmt
+        shell: bash
+        run: |
+          rustup component add rustfmt
+
+          # restore symlinks
+          rustup update
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+
+  cargo-test-and-report:
+    name: Cargo test (and report)
+    runs-on: ubuntu-latest
+    needs:
+      - warm-up-cache
+    permissions:
+      checks: write
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - *checkout
+
+      - *cache_cargo
+
+      - *cache_target
+
+      - *set_up_mold
+
+      - *set_up_toolchain
+
+      - name: Install llvm-tools
+        shell: bash
+        run: |
+          rustup component add llvm-tools
+
+          # restore symlinks
+          rustup update
+
+      - name: Install nextest, custom test runner, with native support for junit and grcov
+        uses: taiki-e/install-action@385db9cc6bf65d19775b02084a4b698eaca9a4f2 # v2.68.19
+        with:
+          tool: cargo-nextest, grcov
+
+      - name: Build with instrumentation support
+        shell: bash
+        env:
+          RUSTFLAGS: "${{ env.RUSTFLAGS }} --allow=warnings -Cinstrument-coverage"
+          # build-* ones are not parsed by grcov
+          LLVM_PROFILE_FILE: "profiling/build-%p-%m.profraw"
+        run: |
+          cargo build ${{ env.CARGO_FEATURES }} --all-targets --frozen --workspace
+
+      - name: Run nextest
+        shell: bash
+        id: tests
+        env:
+          RUSTFLAGS: "${{ env.RUSTFLAGS }} --allow=warnings -Cinstrument-coverage"
+          LLVM_PROFILE_FILE: "profiling/profile-%p-%m.profraw"
+        run: |
+          cargo nextest run --profile ci --no-fail-fast ${{ env.CARGO_FEATURES }} --all-targets --workspace
+        continue-on-error: true
+
+      - name: Upload test results
+        uses: EnricoMi/publish-unit-test-result-action@c950f6fb443cb5af20a377fd0dfaa78838901040 # v2.23.0
+        with:
+          check_name: Test results for Rust
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            reports/results.xml
+
+      - name: Run grcov
+        shell: bash
+        run: |
+          grcov $(find . -name "profile-*.profraw" -print) \
+            --binary-path ./target/debug/ \
+            --branch \
+            --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!)" \
+            --excl-br-start "mod tests \{" \
+            --excl-line "(#\\[derive\\()|(^\s*.await[;,]?$)" \
+            --excl-start "mod tests \{" \
+            --ignore-not-existing \
+            --keep-only "crates/**" \
+            --llvm \
+            --output-path ./reports/ \
+            --output-type lcov \
+            --source-dir .
+
+      - name: Record Rust version
+        shell: bash
+        run: |
+          echo "RUST=$(rustc --version)" >> "$GITHUB_ENV"
+
+      - name: Fail if tests failed
+        shell: bash
+        if: |
+          steps.tests.outcome != 'success'
+        run: |
+          # the test reporter we use (or any for that matter)
+          # all show a report. But we cannot depend on that report because
+          # we don't know which subsection it belongs in GitHub
+          # so we explicitly fail this one
+          # which will fail All Done
+          exit 1
+
+  cargo-clippy-and-report:
+    name: Cargo clippy (and report)
+    runs-on: ubuntu-latest
+    needs:
+      - warm-up-cache
+    if: |
+      github.event_name == 'pull_request'
+    steps:
+      - *checkout
+
+      - *cache_cargo
+
+      - *cache_target
+
+      - *set_up_mold
+
+      - *set_up_toolchain
+
+      - name: Run Clippy for GitHub Actions report
+        uses: actions-rs-plus/clippy-check@a25517dc6178320cb29e6e5e4d4db30348df6f3f # v2.4.2
+        with:
+          args: ${{ env.CARGO_FEATURES }} --all-targets --frozen --workspace
+
+  all-done:
+    name: Rust All done
+    # this is the job that should be marked as required on GitHub. It's the only one that'll reliably trigger
+    # when any upstream fails: success
+    # when all upstream skips: pass
+    # when all upstream success: success
+    # combination of upstream skip and success: success
+    runs-on: ubuntu-slim
+    needs:
+      - cargo-build
+      - cargo-clippy-and-report
+      - cargo-fmt
+      - cargo-test-and-report
+    if: |
+      !cancelled()
+    steps:
+      - name: Fail!
+        shell: bash
+        if: |
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled')
+        run: |
+          echo "One / more upstream failed or was cancelled. Failing job..."
+
+          exit 1
+
+      - name: Success!
+        shell: bash
+        run: |
+          echo "Great success!"

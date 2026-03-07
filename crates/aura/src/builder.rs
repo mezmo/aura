@@ -445,16 +445,16 @@ impl Agent {
         }
 
         // Add filesystem tools if configured
-        if let Some(tools_config) = &config.tools {
-            if tools_config.filesystem {
-                tracing::info!("Adding filesystem tools");
-                let fs_tool = FilesystemTool::new()
-                    .with_write_access(false)
-                    .with_max_file_size(1_048_576);
+        if let Some(tools_config) = &config.tools
+            && tools_config.filesystem
+        {
+            tracing::info!("Adding filesystem tools");
+            let fs_tool = FilesystemTool::new()
+                .with_write_access(false)
+                .with_max_file_size(1_048_576);
 
-                builder_state = builder_state.add_tool(ReadFileTool(fs_tool.clone()));
-                builder_state = builder_state.add_tool(ListDirTool(fs_tool));
-            }
+            builder_state = builder_state.add_tool(ReadFileTool(fs_tool.clone()));
+            builder_state = builder_state.add_tool(ListDirTool(fs_tool));
         }
 
         // Add vector store tools if configured
@@ -489,33 +489,33 @@ impl Agent {
         }
 
         // Add STDIO MCP tools using rmcp_tools
-        if let Some(mcp_manager) = mcp_manager.as_deref() {
-            if !mcp_manager.tool_definitions.is_empty() {
-                tracing::info!(
-                    "Adding {} STDIO MCP tools",
-                    mcp_manager.tool_definitions.len()
-                );
+        if let Some(mcp_manager) = mcp_manager.as_deref()
+            && !mcp_manager.tool_definitions.is_empty()
+        {
+            tracing::info!(
+                "Adding {} STDIO MCP tools",
+                mcp_manager.tool_definitions.len()
+            );
 
-                // Group tools by client (rmcp_tools takes Vec<Tool> + one client)
-                use std::collections::HashMap;
-                let mut tools_by_client: HashMap<
-                    String,
-                    (Vec<rmcp::model::Tool>, rmcp::service::ServerSink),
-                > = HashMap::new();
+            // Group tools by client (rmcp_tools takes Vec<Tool> + one client)
+            use std::collections::HashMap;
+            let mut tools_by_client: HashMap<
+                String,
+                (Vec<rmcp::model::Tool>, rmcp::service::ServerSink),
+            > = HashMap::new();
 
-                for (tool, client) in &mcp_manager.tool_definitions {
-                    let client_key = format!("{client:?}");
-                    tools_by_client
-                        .entry(client_key)
-                        .or_insert_with(|| (Vec::new(), client.clone()))
-                        .0
-                        .push(tool.clone());
-                }
+            for (tool, client) in &mcp_manager.tool_definitions {
+                let client_key = format!("{client:?}");
+                tools_by_client
+                    .entry(client_key)
+                    .or_insert_with(|| (Vec::new(), client.clone()))
+                    .0
+                    .push(tool.clone());
+            }
 
-                for (_key, (tools, client)) in tools_by_client {
-                    tracing::info!("  Adding {} STDIO tools for client group", tools.len());
-                    builder_state = builder_state.add_rmcp_tools(tools, client);
-                }
+            for (_key, (tools, client)) in tools_by_client {
+                tracing::info!("  Adding {} STDIO tools for client group", tools.len());
+                builder_state = builder_state.add_rmcp_tools(tools, client);
             }
         }
 

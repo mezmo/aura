@@ -218,13 +218,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("│     → Need to connect to agent for RAG queries         │");
     println!("│                                                         │");
 
-    if let Some(ref tools) = config.tools {
-        if tools.filesystem {
-            println!("│  🔴 Filesystem Tool Integration                         │");
-            println!("│     → Need to add filesystem tool to agent             │");
-            println!("│     → Configure file access permissions                │");
-            println!("│                                                         │");
-        }
+    if let Some(ref tools) = config.tools
+        && tools.filesystem
+    {
+        println!("│  🔴 Filesystem Tool Integration                         │");
+        println!("│     → Need to add filesystem tool to agent             │");
+        println!("│     → Configure file access permissions                │");
+        println!("│                                                         │");
     }
 
     println!("└─────────────────────────────────────────────────────────┘");

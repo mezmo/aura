@@ -374,7 +374,8 @@ where
             } else {
                 tracing::warn!(
                     "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
-                    tool_name, request_id
+                    tool_name,
+                    request_id
                 );
             }
 

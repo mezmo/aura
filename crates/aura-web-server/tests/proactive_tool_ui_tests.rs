@@ -7,7 +7,7 @@
 
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::sse::parse_data_line;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -82,10 +82,10 @@ async fn test_tool_call_streaming_clean() {
 
             if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
                 // Check that we DON'T have status messages
-                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
-                    if content.contains("Calling") || content.contains("completed") {
-                        found_status_message = true;
-                    }
+                if let Some(content) = json["choices"][0]["delta"]["content"].as_str()
+                    && (content.contains("Calling") || content.contains("completed"))
+                {
+                    found_status_message = true;
                 }
 
                 // Verify tool call exists
@@ -259,10 +259,10 @@ async fn test_finish_reason_stop_without_tools() {
                 continue;
             }
 
-            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data) {
-                if let Some(fr) = json["choices"][0]["finish_reason"].as_str() {
-                    final_finish_reason = Some(fr.to_string());
-                }
+            if let Ok(json) = serde_json::from_str::<Value>(&chunk.data)
+                && let Some(fr) = json["choices"][0]["finish_reason"].as_str()
+            {
+                final_finish_reason = Some(fr.to_string());
             }
         }
     }

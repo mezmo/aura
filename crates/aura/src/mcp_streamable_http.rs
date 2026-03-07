@@ -5,6 +5,7 @@ use futures::StreamExt;
 use reqwest;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::{
+    RoleClient,
     model::{
         CallToolRequestParam, CancelledNotificationParam, ClientRequest, ProgressNotificationParam,
         Request, RequestId, Tool,
@@ -12,15 +13,14 @@ use rmcp::{
     serve_client,
     service::{PeerRequestOptions, RunningService},
     transport::{
-        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
-    RoleClient,
 };
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::mcp_progress::ProgressEnabledHandler;

@@ -8,7 +8,7 @@
 
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::sse::parse_data_line;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::sleep;
 
