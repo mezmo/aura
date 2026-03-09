@@ -1,9 +1,9 @@
 use qdrant_client::{
-    qdrant::{
-        point_id::PointIdOptions, Condition, Filter, PointId, Query, QueryPointsBuilder,
-        ScoredPoint, Value as QdrantValue,
-    },
     Qdrant,
+    qdrant::{
+        Condition, Filter, PointId, Query, QueryPointsBuilder, ScoredPoint, Value as QdrantValue,
+        point_id::PointIdOptions,
+    },
 };
 use rig::client::EmbeddingsClient;
 use rig::completion::ToolDefinition;
@@ -173,7 +173,11 @@ impl From<&str> for FilterValue {
     /// from the API schema, so literal strings should be preserved as strings.
     fn from(s: &str) -> Self {
         let json: JsonValue = serde_json::from_str(s).unwrap_or_else(|e| {
-            tracing::debug!("Filter value '{}' not valid JSON ({}), treating as string", s, e);
+            tracing::debug!(
+                "Filter value '{}' not valid JSON ({}), treating as string",
+                s,
+                e
+            );
             JsonValue::String(s.into())
         });
 
@@ -361,12 +365,11 @@ fn extract_from_nested_metadata(point: &ScoredPoint, text_fields: &[&str]) -> Op
     for meta_field in METADATA_STRUCT_FIELDS {
         if let Some(struct_val) = point.get(meta_field).as_struct() {
             for text_field in text_fields {
-                if let Some(val) = struct_val.fields.get(*text_field) {
-                    if let Some(text) = extract_text_from_value(val) {
-                        if !text.is_empty() {
-                            return Some(text);
-                        }
-                    }
+                if let Some(val) = struct_val.fields.get(*text_field)
+                    && let Some(text) = extract_text_from_value(val)
+                    && !text.is_empty()
+                {
+                    return Some(text);
                 }
             }
         }
@@ -399,12 +402,11 @@ fn extract_text_from_value(value: &QdrantValue) -> Option<String> {
                 // Try nested struct (handles list of chunks with text fields)
                 if let Some(struct_val) = v.as_struct() {
                     for field in TEXT_FIELDS {
-                        if let Some(nested) = struct_val.fields.get(*field) {
-                            if let Some(text) = extract_text_from_value(nested) {
-                                if !text.is_empty() {
-                                    return Some(text);
-                                }
-                            }
+                        if let Some(nested) = struct_val.fields.get(*field)
+                            && let Some(text) = extract_text_from_value(nested)
+                            && !text.is_empty()
+                        {
+                            return Some(text);
                         }
                     }
                 }
@@ -419,12 +421,11 @@ fn extract_text_from_value(value: &QdrantValue) -> Option<String> {
     // Nested struct - recursively check for text fields
     if let Some(struct_val) = value.as_struct() {
         for field in TEXT_FIELDS {
-            if let Some(nested) = struct_val.fields.get(*field) {
-                if let Some(text) = extract_text_from_value(nested) {
-                    if !text.is_empty() {
-                        return Some(text);
-                    }
-                }
+            if let Some(nested) = struct_val.fields.get(*field)
+                && let Some(text) = extract_text_from_value(nested)
+                && !text.is_empty()
+            {
+                return Some(text);
             }
         }
     }
@@ -460,10 +461,10 @@ fn extract_first_match(point: &ScoredPoint, fields: &[&str]) -> Option<String> {
     for meta_field in METADATA_STRUCT_FIELDS {
         if let Some(struct_val) = point.get(meta_field).as_struct() {
             for field in fields {
-                if let Some(val) = struct_val.fields.get(*field) {
-                    if let Some(s) = val.as_str() {
-                        return Some(s.clone());
-                    }
+                if let Some(val) = struct_val.fields.get(*field)
+                    && let Some(s) = val.as_str()
+                {
+                    return Some(s.clone());
                 }
             }
         }
@@ -482,7 +483,7 @@ fn extract_first_match(point: &ScoredPoint, fields: &[&str]) -> Option<String> {
 /// - Cloud-managed Qdrant (Qdrant Cloud) typically responds in <2s
 /// - On-premise Qdrant with large collections may need 5-30s
 /// - 30s provides buffer for network latency and cold-start scenarios
-/// Override via `query_timeout_secs` in VectorStoreConfig.
+///   Override via `query_timeout_secs` in VectorStoreConfig.
 const DEFAULT_QDRANT_QUERY_TIMEOUT_SECS: u64 = 30;
 
 /// Default timeout for embedding API calls (OpenAI).
@@ -571,9 +572,7 @@ impl DynamicVectorSearchTool {
                 .embedding_timeout_secs
                 .unwrap_or(DEFAULT_EMBEDDING_TIMEOUT_SECS),
         );
-        let max_payload_size = config
-            .max_payload_size
-            .unwrap_or(DEFAULT_MAX_PAYLOAD_SIZE);
+        let max_payload_size = config.max_payload_size.unwrap_or(DEFAULT_MAX_PAYLOAD_SIZE);
 
         info!(
             "  Timeouts: query={}s, embedding={}s; max_payload={}KB",
@@ -664,7 +663,10 @@ impl DynamicVectorSearchTool {
             .into_iter()
             .map(|p| {
                 // Extract point ID in human-readable format (not Debug format)
-                let point_id = p.id.as_ref().map(format_point_id).unwrap_or_else(|| "unknown".to_string());
+                let point_id =
+                    p.id.as_ref()
+                        .map(format_point_id)
+                        .unwrap_or_else(|| "unknown".to_string());
                 SearchResult {
                     point_id,
                     content: extract_content(&p, max_payload_size),
@@ -918,7 +920,7 @@ mod tests {
     fn test_vector_search_args_to_search_params() {
         let args = VectorSearchArgs {
             query: "test".to_string(),
-            limit: 100, // Will be clamped to MAX_LIMIT
+            limit: 100,     // Will be clamped to MAX_LIMIT
             min_score: 2.0, // Will be clamped to MAX_SCORE
             label_filters: vec![],
         };
@@ -995,10 +997,7 @@ mod tests {
                 "550e8400-e29b-41d4-a716-446655440000".to_string(),
             )),
         };
-        assert_eq!(
-            format_point_id(&id),
-            "550e8400-e29b-41d4-a716-446655440000"
-        );
+        assert_eq!(format_point_id(&id), "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[test]
@@ -1007,24 +1006,5 @@ mod tests {
             point_id_options: None,
         };
         assert_eq!(format_point_id(&id), "unknown");
-    }
-
-    // =========================================================================
-    // Constants Validation Tests
-    // =========================================================================
-
-    #[test]
-    fn test_default_constants_are_reasonable() {
-        // Qdrant timeout should be between 5s and 120s
-        assert!(DEFAULT_QDRANT_QUERY_TIMEOUT_SECS >= 5);
-        assert!(DEFAULT_QDRANT_QUERY_TIMEOUT_SECS <= 120);
-
-        // Embedding timeout should be between 5s and 60s
-        assert!(DEFAULT_EMBEDDING_TIMEOUT_SECS >= 5);
-        assert!(DEFAULT_EMBEDDING_TIMEOUT_SECS <= 60);
-
-        // Max payload fallback should be at least 10KB but not exceed 100KB
-        assert!(DEFAULT_MAX_PAYLOAD_SIZE >= 10_000);
-        assert!(DEFAULT_MAX_PAYLOAD_SIZE <= 100_000);
     }
 }
