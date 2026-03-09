@@ -195,13 +195,13 @@ impl ToolWrapper for PersistenceWrapper {
 /// 1. Add a `_aura_reasoning` property of type string with description
 /// 2. Add `_aura_reasoning` to the required array
 pub fn add_reasoning_to_schema(schema: &mut Value) {
-    if let Value::Object(ref mut obj) = schema {
+    if let Value::Object(obj) = schema {
         // Ensure "properties" exists
         let properties = obj
             .entry("properties")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
 
-        if let Value::Object(ref mut props) = properties {
+        if let Value::Object(props) = properties {
             // Add reasoning field definition
             props.insert(
                 REASONING_FIELD.to_string(),
@@ -218,7 +218,7 @@ pub fn add_reasoning_to_schema(schema: &mut Value) {
             .entry("required")
             .or_insert_with(|| Value::Array(Vec::new()));
 
-        if let Value::Array(ref mut req_arr) = required {
+        if let Value::Array(req_arr) = required {
             let reasoning_val = Value::String(REASONING_FIELD.to_string());
             if !req_arr.contains(&reasoning_val) {
                 req_arr.push(reasoning_val);
