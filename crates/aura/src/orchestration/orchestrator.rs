@@ -950,14 +950,13 @@ without this field will be rejected.";
                 let planning_response = self.enforce_routing_config(planning_response, query);
 
                 // Persist plan for Orchestrated variant
-                if let PlanningResponse::Orchestrated { .. } = &planning_response {
-                    if let Some(plan) = planning_response.clone().into_plan() {
+                if let PlanningResponse::Orchestrated { .. } = &planning_response
+                    && let Some(plan) = planning_response.clone().into_plan() {
                         let persistence = self.persistence.lock().await;
                         if let Err(e) = persistence.write_plan(&plan).await {
                             tracing::warn!("Failed to persist plan: {}", e);
                         }
                     }
-                }
 
                 return Ok((planning_response, final_prompt, final_response));
             }
@@ -1917,8 +1916,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(effort) = worker_config.agent.reasoning_effort {
-                    if crate::builder::is_reasoning_model(model) {
+                if let Some(effort) = worker_config.agent.reasoning_effort
+                    && crate::builder::is_reasoning_model(model) {
                         let effort_str = match effort {
                             crate::config::ReasoningEffort::Minimal => "minimal",
                             crate::config::ReasoningEffort::Low => "low",
@@ -1928,7 +1927,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         builder = builder
                             .additional_params(serde_json::json!({"reasoning_effort": effort_str}));
                     }
-                }
                 if let Some(max) = worker_config.agent.max_tokens {
                     builder = builder.max_tokens(max);
                 }
@@ -2709,7 +2707,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let task = plan.tasks.iter().find(|t| t.id == task_id)?;
 
         // Build structured dependency context — compact format to prevent scope creep
-        let dependency_context = if !task.dependencies.is_empty() {
+        
+
+        if !task.dependencies.is_empty() {
             let dep_parts: Vec<String> = task
                 .dependencies
                 .iter()
@@ -2738,9 +2738,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         } else {
             None
-        };
-
-        dependency_context
+        }
     }
 
     /// Execute a single task using a worker agent.
@@ -4196,8 +4194,8 @@ mod tests {
             }
 
             // Parse worker assignment (if present)
-            if let Some(worker_name) = task_value["worker"].as_str() {
-                if config.has_workers() {
+            if let Some(worker_name) = task_value["worker"].as_str()
+                && config.has_workers() {
                     if !valid_workers.contains(worker_name) {
                         return Err(format!(
                             "Task {} assigned to unknown worker '{}'. Valid workers: {:?}",
@@ -4208,7 +4206,6 @@ mod tests {
                     }
                     task = task.with_worker(worker_name);
                 }
-            }
 
             plan.add_task(task);
         }

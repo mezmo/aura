@@ -167,11 +167,10 @@ fn extract_placeholders(template: &str) -> HashSet<String> {
             // Find closing %%
             while i < bytes.len().saturating_sub(1) {
                 if bytes[i] == b'%' && bytes[i + 1] == b'%' {
-                    if i > start {
-                        if let Ok(var) = std::str::from_utf8(&bytes[start..i]) {
+                    if i > start
+                        && let Ok(var) = std::str::from_utf8(&bytes[start..i]) {
                             vars.insert(var.to_string());
                         }
-                    }
                     i += 2;
                     break;
                 }
