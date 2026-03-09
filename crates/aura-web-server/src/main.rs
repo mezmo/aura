@@ -124,6 +124,7 @@ async fn run() -> std::io::Result<()> {
     // Initialize logging using shared module
     aura::logging::init_logging(args.debug, args.verbose, "aura_web_server");
 
+    info!("Starting Aura Web Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Loading configuration from: {}", args.config);
 
     let configs = match load_config(&args.config) {
