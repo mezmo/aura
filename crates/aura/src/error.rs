@@ -26,6 +26,9 @@ pub enum BuilderError {
     #[error("Invalid provider: {0}")]
     InvalidProvider(String),
 
+    #[error("Config error: {0}")]
+    ConfigError(#[from] aura_config::ConfigError),
+
     #[error("MCP initialization error: {0}")]
     McpInitError(String),
 

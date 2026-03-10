@@ -15,7 +15,8 @@ use std::sync::Arc;
 // are the single source of truth — `aura` no longer defines its own copies.
 pub use aura_config::{
     AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig, OrchestrationConfig,
-    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match,
+    ReasoningEffort, SkillConfig, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
+    glob_match,
 };
 
 /// Type alias for tool context factory function.
