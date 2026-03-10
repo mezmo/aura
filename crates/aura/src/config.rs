@@ -313,6 +313,9 @@ pub struct AgentSettings {
     pub max_tokens: Option<u64>,
     #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
+    /// Additional provider-specific parameters merged into the API request.
+    /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+    pub additional_params: Option<serde_json::Value>,
 }
 
 /// Vector store configuration
@@ -388,6 +391,7 @@ impl Default for AgentConfig {
                 reasoning_effort: None,
                 max_tokens: None,
                 turn_depth: Some(5),
+                additional_params: None,
             },
             vector_stores: Vec::new(),
             mcp: None,

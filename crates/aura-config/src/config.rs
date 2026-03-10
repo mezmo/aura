@@ -481,6 +481,11 @@ pub struct AgentConfig {
     #[serde(default = "default_turn_depth")]
     #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
+    /// Additional provider-specific parameters merged into the API request.
+    /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+    /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
+    #[serde(default)]
+    pub additional_params: Option<serde_json::Value>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -497,6 +502,7 @@ impl Default for AgentConfig {
             reasoning_effort: None,
             max_tokens: None,
             turn_depth: default_turn_depth(),
+            additional_params: None,
         }
     }
 }

@@ -67,6 +67,28 @@ pub(crate) fn build_ollama_params(
     }
 }
 
+/// Shallow-merge two JSON values at the top level.
+///
+/// If both are objects, keys from `b` are inserted into `a` (overwriting on conflict).
+/// Otherwise, returns `a` unchanged.
+///
+/// Used to combine multiple sources of `additional_params` before passing to
+/// `AgentBuilder::additional_params()` which replaces (not merges) on each call.
+pub(crate) fn merge_json(
+    a: serde_json::Value,
+    b: serde_json::Value,
+) -> serde_json::Value {
+    match (a, b) {
+        (serde_json::Value::Object(mut a_map), serde_json::Value::Object(b_map)) => {
+            for (key, value) in b_map {
+                a_map.insert(key, value);
+            }
+            serde_json::Value::Object(a_map)
+        }
+        (a, _) => a,
+    }
+}
+
 /// Log tool count with optional filter indication
 fn log_filtered_tools(emoji: &str, transport: &str, server: &str, filtered: usize, total: usize) {
     if filtered < total {
@@ -223,6 +245,9 @@ impl Agent {
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
+                // Build combined additional_params: reasoning_effort + agent-level params
+                // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
+                let mut combined_params: Option<serde_json::Value> = None;
                 if let Some(effort) = config.agent.reasoning_effort {
                     if is_reasoning_model(model) {
                         let effort_str = match effort {
@@ -231,14 +256,23 @@ impl Agent {
                             crate::config::ReasoningEffort::Medium => "medium",
                             crate::config::ReasoningEffort::High => "high",
                         };
-                        agent_builder = agent_builder
-                            .additional_params(serde_json::json!({"reasoning_effort": effort_str}));
+                        combined_params =
+                            Some(serde_json::json!({"reasoning_effort": effort_str}));
                     } else {
                         tracing::warn!(
                             "reasoning_effort ignored for model '{}' (only supported on o1/o3/o4/gpt-5+)",
                             model
                         );
                     }
+                }
+                if let Some(ref params) = config.agent.additional_params {
+                    combined_params = Some(match combined_params {
+                        Some(existing) => merge_json(existing, params.clone()),
+                        None => params.clone(),
+                    });
+                }
+                if let Some(params) = combined_params {
+                    agent_builder = agent_builder.additional_params(params);
                 }
                 if let Some(max) = config.agent.max_tokens {
                     agent_builder = agent_builder.max_tokens(max);
@@ -283,6 +317,9 @@ impl Agent {
                 }
                 if let Some(max) = config.agent.max_tokens {
                     agent_builder = agent_builder.max_tokens(max);
+                }
+                if let Some(ref params) = config.agent.additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
@@ -338,6 +375,9 @@ impl Agent {
                 if let Some(max) = config.agent.max_tokens {
                     agent_builder = agent_builder.max_tokens(max);
                 }
+                if let Some(ref params) = config.agent.additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
+                }
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
@@ -372,6 +412,9 @@ impl Agent {
                 agent_builder = agent_builder.preamble(config.effective_preamble());
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
+                }
+                if let Some(ref params) = config.agent.additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
@@ -410,12 +453,24 @@ impl Agent {
                     agent_builder = agent_builder.temperature(temp);
                 }
 
-                // Build and apply Ollama-specific parameters (num_ctx, num_predict, etc.)
-                if let Some(ollama_params) =
-                    build_ollama_params(*num_ctx, *num_predict, additional_params.clone())
+                // Build combined params: Ollama-specific (num_ctx, num_predict) + agent-level
+                // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
                 {
-                    tracing::info!("  Ollama params: {}", ollama_params);
-                    agent_builder = agent_builder.additional_params(ollama_params);
+                    let mut combined = build_ollama_params(
+                        *num_ctx,
+                        *num_predict,
+                        additional_params.clone(),
+                    );
+                    if let Some(ref params) = config.agent.additional_params {
+                        combined = Some(match combined {
+                            Some(existing) => merge_json(existing, params.clone()),
+                            None => params.clone(),
+                        });
+                    }
+                    if let Some(params) = combined {
+                        tracing::info!("  Ollama+agent params: {}", params);
+                        agent_builder = agent_builder.additional_params(params);
+                    }
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
