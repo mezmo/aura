@@ -316,6 +316,9 @@ pub struct AgentSettings {
     /// Context window size in tokens. Used for usage percentage reporting.
     #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
     pub context_window: Option<u32>,
+    /// Additional provider-specific parameters merged into the API request.
+    /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+    pub additional_params: Option<serde_json::Value>,
 }
 
 /// Vector store configuration
@@ -392,6 +395,7 @@ impl Default for AgentConfig {
                 max_tokens: None,
                 turn_depth: Some(5),
                 context_window: None,
+                additional_params: None,
             },
             vector_stores: Vec::new(),
             mcp: None,

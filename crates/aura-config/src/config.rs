@@ -494,6 +494,11 @@ pub struct AgentConfig {
     /// When omitted, defaults to the underlying LLM provider (e.g. "openai", "anthropic").
     #[serde(default)]
     pub model_owner: Option<String>,
+    /// Additional provider-specific parameters merged into the API request.
+    /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+    /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
+    #[serde(default)]
+    pub additional_params: Option<serde_json::Value>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -521,6 +526,7 @@ impl Default for AgentConfig {
             context_window: None,
             created_at: default_created_at(),
             model_owner: None,
+            additional_params: None,
         }
     }
 }
