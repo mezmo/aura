@@ -423,6 +423,15 @@ impl Config {
             }
         }
 
+        // Validate skill sources
+        for source in &self.agent.skills.local {
+            if source.source.is_empty() {
+                return Err(crate::ConfigError::Validation(
+                    "Skill source path cannot be empty".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -610,6 +619,21 @@ pub struct ToolsConfig {
     pub custom_tools: Vec<String>,
 }
 
+/// Skills configuration - supports directory-based skill discovery
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SkillsConfig {
+    /// Local skill sources (directories containing skill subdirectories)
+    #[serde(default)]
+    pub local: Vec<LocalSkillSource>,
+}
+
+/// A local directory source for skill discovery
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct LocalSkillSource {
+    /// Path to directory containing skill subdirectories (absolute or relative to config file)
+    pub source: String,
+}
+
 /// Configuration for TodoWrite/ReadTodos tool injection.
 #[derive(Debug, Clone, Default)]
 pub struct TodoToolsConfig {
@@ -669,6 +693,9 @@ pub struct AgentConfig {
     /// provide `[orchestration.worker.<name>.scratchpad]`.
     #[serde(default)]
     pub scratchpad: Option<ScratchpadConfig>,
+    /// Skills configuration for directory-based skill discovery
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -697,8 +724,24 @@ impl Default for AgentConfig {
             client_tool_filter: None,
             llm: LlmConfig::default(),
             scratchpad: None,
+            skills: SkillsConfig::default(),
         }
     }
+}
+
+/// Skill configuration for on-demand loading via the load_skill tool.
+///
+/// Skills follow the Agent Skills specification (<https://agentskills.io/specification>).
+/// Each skill is a directory containing a `SKILL.md` file with YAML frontmatter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillConfig {
+    /// Unique name for this skill (must match directory name).
+    /// Lowercase alphanumeric and hyphens only, 1-64 chars.
+    pub name: String,
+    /// Human-readable description from SKILL.md frontmatter
+    pub description: String,
+    /// Absolute path to the skill directory
+    pub path: std::path::PathBuf,
 }
 
 /// Agent behavior settings (runtime-facing subset of [`AgentConfig`]).
@@ -734,6 +777,9 @@ pub struct AgentSettings {
     /// `enable_client_tools = true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_tool_filter: Option<Vec<String>>,
+    /// On-demand skill definitions loaded via the load_skill tool
+    #[serde(default)]
+    pub skills: Vec<SkillConfig>,
 }
 
 impl Default for AgentSettings {
@@ -747,6 +793,7 @@ impl Default for AgentSettings {
             scratchpad: None,
             enable_client_tools: false,
             client_tool_filter: None,
+            skills: Vec::new(),
         }
     }
 }

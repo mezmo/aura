@@ -32,6 +32,7 @@ pub mod request_progress;
 pub mod rig_builder;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
 pub mod scratchpad;
+pub mod skill_tool;
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
@@ -50,8 +51,8 @@ pub use config::{AgentRuntimeConfig, ToolContextFactory};
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
     AgentConfig, AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match,
-    lenient_int,
+    ReasoningEffort, SkillConfig, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
+    glob_match, lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{
@@ -95,6 +96,7 @@ pub use request_progress::{
     subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
+pub use skill_tool::LoadSkillTool;
 pub use stream_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
     format_named_sse,

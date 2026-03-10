@@ -65,6 +65,7 @@ impl DirectBackend {
 
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
+            config_dir: std::path::PathBuf::from("."),
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
@@ -193,6 +194,7 @@ impl DirectBackend {
         let old = &self.app_state;
         self.app_state = Arc::new(AppState {
             configs: Arc::new(configs),
+            config_dir: old.config_dir.clone(),
             tool_result_mode: old.tool_result_mode,
             tool_result_max_length: old.tool_result_max_length,
             streaming_buffer_size: old.streaming_buffer_size,
@@ -397,6 +399,7 @@ mod tests {
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
+            config_dir: std::path::PathBuf::from("."),
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
