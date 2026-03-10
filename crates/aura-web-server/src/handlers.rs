@@ -151,10 +151,11 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
+    config_dir: &std::path::Path,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
-    let builder = RigBuilder::new(config.clone());
+    let builder = RigBuilder::new(config.clone()).with_config_dir(config_dir.to_path_buf());
     let agent = builder
         .build_agent(Some(req_headers), additional_tools, client_tool_defs)
         .await
@@ -234,7 +235,7 @@ pub async fn prepare_request(
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
         // Orchestration path: build via streaming agent builder (returns Orchestrator).
         // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
-        let builder = RigBuilder::new(config.clone());
+        let builder = RigBuilder::new(config.clone()).with_config_dir(data.config_dir.clone());
         builder
             .build_streaming_agent_with_headers(
                 Some(req_headers_map),
@@ -254,8 +255,14 @@ pub async fn prepare_request(
         } else {
             None
         };
-        build_agent_for_request(&config, req_headers_map, additional_tools, client_tools).await?
-            as Arc<dyn StreamingAgent>
+        build_agent_for_request(
+            &config,
+            req_headers_map,
+            additional_tools,
+            client_tools,
+            &data.config_dir,
+        )
+        .await? as Arc<dyn StreamingAgent>
     };
 
     let (provider, model) = streaming_agent.get_provider_info();

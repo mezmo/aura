@@ -8,6 +8,7 @@ use crate::{
         StreamedAssistantContent,
     },
     scratchpad,
+    skill_tool::LoadSkillTool,
     tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
@@ -363,6 +364,17 @@ impl Agent {
         // Extract model name for logging
         let model_name = config.llm.model_name().to_string();
 
+        // Build effective system prompt, appending skill catalog if skills are configured
+        let mut system_prompt = config.effective_preamble().to_string();
+        if !config.agent.skills.is_empty() {
+            system_prompt.push_str(
+                "\n\nAvailable skills (use the `load_skill` tool to load before answering):\n",
+            );
+            for skill in &config.agent.skills {
+                system_prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            }
+        }
+
         // Build provider-specific agent with tools
         // Each branch creates its own completion model and agent builder,
         // adds tools using the shared BuilderState helper, then wraps in ProviderAgent
@@ -397,7 +409,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -463,7 +475,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -528,7 +540,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -577,7 +589,7 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -621,7 +633,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -669,7 +681,7 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -961,6 +973,15 @@ impl Agent {
         if !additional_tools.is_empty() {
             tracing::info!("Adding {} additional custom tools", additional_tools.len());
             builder_state = builder_state.add_tools_dyn(additional_tools);
+        }
+
+        // Add skill loading tool if skills are configured
+        if !config.agent.skills.is_empty() {
+            tracing::info!(
+                "Adding load_skill tool with {} skills",
+                config.agent.skills.len(),
+            );
+            builder_state = builder_state.add_tool(LoadSkillTool::new(&config.agent.skills));
         }
 
         Ok(builder_state)
