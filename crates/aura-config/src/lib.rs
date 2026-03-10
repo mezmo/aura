@@ -6,6 +6,7 @@ pub mod lenient_int;
 pub mod loader;
 pub mod orchestration;
 pub mod scratchpad;
+pub mod skills;
 
 #[cfg(test)]
 mod config_test;
