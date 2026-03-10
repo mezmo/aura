@@ -98,7 +98,7 @@ pipeline {
         stage('Unit Tests') {
           steps {
             script {
-              sh(script: 'docker build --target base .')
+              sh(script: 'docker build --target release-build .')
             }
           }
         }

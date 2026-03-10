@@ -34,7 +34,7 @@ echo ""
 echo "────────────────────────────────────────────────────────────────"
 echo "${BLUE}Stage 2: Test${NC}"
 echo "────────────────────────────────────────────────────────────────"
-echo "Running: docker build --target base ."
+echo "Running: docker build --target release-build ."
 echo ""
 echo "This will run (in Docker):"
 echo "  1. cargo fmt --all -- --check   (formatting)"
@@ -42,7 +42,7 @@ echo "  2. cargo test --workspace        (tests)"
 echo "  3. cargo clippy                  (linting)"
 echo ""
 
-if docker build --target base -t aura:test .; then
+if docker build --target release-build -t aura:test .; then
     echo ""
     echo "${GREEN}✓ Stage 2: Test - PASSED${NC}"
     echo ""

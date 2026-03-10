@@ -189,7 +189,7 @@ docker-build::        ## Build Docker image (full release)
 
 .PHONY:docker-test
 docker-test::         ## Run Docker build with test stage (base)
-	$(DOCKER) build --target base -t $(PROJECT_NAME):test .
+	$(DOCKER) build --target release-build -t $(PROJECT_NAME):test .
 
 .PHONY:docker-build-release
 docker-build-release:: ## Build Docker release stage only
