@@ -97,6 +97,7 @@ impl RigBuilder {
             max_tokens: self.config.agent.max_tokens,
             turn_depth: self.config.agent.turn_depth,
             context_window: self.config.agent.context_window,
+            additional_params: self.config.agent.additional_params.clone(),
         };
 
         let vector_stores: Vec<VectorStoreConfig> = self

@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::string_utils::safe_truncate;
+
 /// A plan representing a decomposed query.
 ///
 /// The coordinator creates a plan by analyzing the user's query and
@@ -745,18 +747,29 @@ impl IterationContext {
     /// This formats the previous iteration's results and evaluation
     /// in a way that helps the coordinator understand what to fix.
     ///
-    /// Key design choice: We include task summaries (status + result length) rather
-    /// than truncated results. The evaluation gaps are the primary signal for what
-    /// needs improvement. If the coordinator needs full task results, they can
-    /// request them via tools.
+    /// By default, completed task results are included inline (truncated to 500 bytes)
+    /// so the coordinator can replan with full context. This matches the pattern used
+    /// in `phase_continuation()`. Gate: `AURA_ENRICH_REPLAN` env var (default=true).
     pub fn build_reflection_prompt(&self) -> String {
-        // Build task summaries: status and result size (not content)
+        let enrich = std::env::var("AURA_ENRICH_REPLAN")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+
         let task_summaries = self
             .previous_plan
             .tasks
             .iter()
             .map(|t| {
                 let status_detail = match t.status {
+                    TaskStatus::Complete if enrich => {
+                        let result = t.result.as_deref().unwrap_or("(no result)");
+                        let (truncated, was_truncated) = safe_truncate(result, 500);
+                        if was_truncated {
+                            format!("Complete: {}...", truncated)
+                        } else {
+                            format!("Complete: {}", truncated)
+                        }
+                    }
                     TaskStatus::Complete => {
                         let len = t.result.as_ref().map(|r| r.len()).unwrap_or(0);
                         format!("✓ complete ({} chars)", len)
@@ -1081,6 +1094,9 @@ mod tests {
 
     #[test]
     fn test_iteration_context_reflection_prompt() {
+        // Ensure enriched mode is active (env may leak from other tests in parallel)
+        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
+
         let mut plan = Plan::new("Investigate the issue");
         let mut task = Task::new(0, "Gather logs", "Get system logs");
         task.complete("Here are the logs...".to_string());
@@ -1100,7 +1116,8 @@ mod tests {
         assert!(prompt.contains("Quality Score: 0.30"));
         assert!(prompt.contains("TASKS EXECUTED:"));
         assert!(prompt.contains("Task 0: Gather logs"));
-        assert!(prompt.contains("✓ complete"));
+        // Default enriched mode includes truncated results
+        assert!(prompt.contains("Complete: Here are the logs..."));
         assert!(prompt.contains("EVALUATION:"));
         assert!(prompt.contains("Response lacks detail"));
         assert!(prompt.contains("GAPS TO ADDRESS:"));
@@ -1183,6 +1200,55 @@ mod tests {
         assert!(prompt.contains("REPEATED FAILURES:"));
         assert!(prompt.contains("\"Fetch data\" has failed 2 times"));
         assert!(prompt.contains("fundamentally different approach"));
+    }
+
+    #[test]
+    fn test_reflection_prompt_enriched_truncation() {
+        // Ensure enriched mode is active (env may leak from other tests in parallel)
+        unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "true") };
+
+        let mut plan = Plan::new("Test truncation");
+        let mut task = Task::new(0, "Big result", "Produce output");
+        // 600-char result exceeds 500-byte truncation limit
+        let long_result = "x".repeat(600);
+        task.complete(long_result);
+        plan.add_task(task);
+
+        let eval = EvaluationResult::new(0.5, "Needs work");
+        let ctx = IterationContext::new(1, plan, eval, vec![]);
+        let prompt = ctx.build_reflection_prompt();
+
+        // Should contain truncated result with "..." suffix
+        assert!(prompt.contains("Complete: "));
+        assert!(prompt.contains("..."));
+        // Should NOT contain the full 600-char string
+        assert!(!prompt.contains(&"x".repeat(600)));
+        // But should contain 500 chars worth
+        assert!(prompt.contains(&"x".repeat(500)));
+
+        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
+    }
+
+    #[test]
+    fn test_reflection_prompt_legacy_mode() {
+        // SAFETY: tests run with --test-threads=1 per project convention
+        unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "false") };
+
+        let mut plan = Plan::new("Test legacy");
+        let mut task = Task::new(0, "Some task", "Do something");
+        task.complete("Result content here".to_string());
+        plan.add_task(task);
+
+        let eval = EvaluationResult::new(0.5, "OK");
+        let ctx = IterationContext::new(1, plan, eval, vec![]);
+        let prompt = ctx.build_reflection_prompt();
+
+        // Legacy mode shows char count, not content
+        assert!(prompt.contains("✓ complete (19 chars)"));
+        assert!(!prompt.contains("Result content here"));
+
+        // Clean up
+        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
     }
 
     // ========================================================================
