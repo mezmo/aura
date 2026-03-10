@@ -423,7 +423,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "1.14.8"
+version = "1.14.12"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "1.14.8"
+version = "1.14.12"
 dependencies = [
  "anyhow",
  "aura",
@@ -471,6 +471,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sse-stream",
+ "tempfile",
  "thiserror 2.0.16",
  "tokio",
  "toml",
@@ -480,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "1.14.8"
+version = "1.14.12"
 dependencies = [
  "reqwest",
  "serde",
@@ -490,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "1.14.8"
+version = "1.14.12"
 dependencies = [
  "actix-web",
  "actix-web-lab",

@@ -23,7 +23,7 @@ async fn send_tool_request(client: &reqwest::Client) -> reqwest::Response {
     client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{
                 "role": "user",
                 "content": "List all the available files in the mock directory. Use the list_files tool."
@@ -319,7 +319,7 @@ async fn test_session_id_correlation() {
     let response = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{
                 "role": "user",
                 "content": "List files in the mock directory"
@@ -477,7 +477,7 @@ async fn test_aura_tool_complete_failure_detection() {
     let response = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{
                 "role": "user",
                 "content": "Please call the failing_tool with the error_message 'Test error for integration test'. This tool is expected to fail."
@@ -796,7 +796,7 @@ async fn test_multiple_tools_fifo_ordering() {
     let response = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{
                 "role": "user",
                 "content": "Call chain_tool with steps=3 to trigger multiple sequential tool calls."

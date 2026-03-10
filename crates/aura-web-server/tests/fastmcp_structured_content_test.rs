@@ -27,7 +27,7 @@ async fn test_list_metrics_streaming_no_json_error() {
         .header("X-OpenWebUI-User-Id", &session_id)
         .header("X-OpenWebUI-Session-Id", &session_id)
         .json(&json!({
-            "model": "gpt-4o-mini",
+            "model": "test-assistant",
             "messages": [
                 {
                     "role": "user",
@@ -140,7 +140,7 @@ async fn test_list_metrics_non_streaming() {
         .header("X-OpenWebUI-User-Id", &session_id)
         .header("X-OpenWebUI-Session-Id", &session_id)
         .json(&json!({
-            "model": "gpt-4o-mini",
+            "model": "test-assistant",
             "messages": [
                 {
                     "role": "user",
@@ -201,7 +201,7 @@ async fn test_structured_content_error_handling() {
         .header("X-OpenWebUI-User-Id", &session_id)
         .header("X-OpenWebUI-Session-Id", &session_id)
         .json(&json!({
-            "model": "gpt-4o-mini",
+            "model": "test-assistant",
             "messages": [
                 {
                     "role": "user",

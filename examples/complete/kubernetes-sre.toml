@@ -40,6 +40,7 @@ description = "Prometheus metrics queries and alert status"
 
 [agent]
 name = "Kubernetes SRE Agent"
+model_owner = "mezmo"
 system_prompt = """
 You are a Kubernetes SRE assistant. Help with cluster operations
 and monitoring using the available tools.

@@ -22,7 +22,7 @@ async fn send_chat_request(
     client
         .post(format!("{}/v1/chat/completions", AURA_SERVER))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": messages,
             "stream": stream,
             "metadata": {

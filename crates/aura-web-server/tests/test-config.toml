@@ -51,6 +51,7 @@ api_key = "{{ env.OPENAI_API_KEY }}"
 # Agent Configuration - Generic assistant for testing
 [agent]
 name = "Test Assistant"
+alias = "test-assistant"
 system_prompt = """
 You are a test assistant. Call tools immediately when requested.
 

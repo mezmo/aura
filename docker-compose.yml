@@ -12,7 +12,7 @@ services:
       # Server configuration
       HOST: "0.0.0.0"
       PORT: "3030"
-      CONFIG_PATH: "/app/config/config.toml"
+      CONFIG_PATH: "/app/config/config.toml"  # Can also be a directory for multi-agent serving
       
       # Logging
       RUST_LOG: "info,aura_config=debug,aura=debug"

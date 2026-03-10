@@ -45,6 +45,7 @@ logs/
 config.local.toml
 *.local.*
 config.toml
+config
 
 # Docker compose local env files (may contain secrets)
 compose/env/*.local

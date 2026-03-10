@@ -84,6 +84,11 @@ struct Args {
     /// Default: 30 seconds
     #[arg(long, env = "SHUTDOWN_TIMEOUT_SECS", default_value = "30")]
     shutdown_timeout_secs: u64,
+
+    /// Default agent name or alias, used when `model` is omitted from the request.
+    /// Not required when only one configuration is loaded via CONFIG_PATH.
+    #[arg(long, env = "DEFAULT_AGENT")]
+    default_agent: Option<String>,
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
@@ -121,8 +126,8 @@ async fn run() -> std::io::Result<()> {
 
     info!("Loading configuration from: {}", args.config);
 
-    let config = match load_config(&args.config) {
-        Ok(cfg) => cfg,
+    let configs = match load_config(&args.config) {
+        Ok(cfgs) => cfgs,
         Err(e) => {
             error!("Failed to load configuration: {}", e);
             return Err(std::io::Error::new(
@@ -132,9 +137,34 @@ async fn run() -> std::io::Result<()> {
         }
     };
 
-    let config_arc = Arc::new(config);
-    let (provider, model) = config_arc.llm.model_info();
-    info!("Aura initialized with {}/{}", provider, model);
+    for config in &configs {
+        let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+        let (provider, model) = config.llm.model_info();
+        info!("Loaded agent '{}' ({}/{})", id, provider, model);
+    }
+
+    // Validate DEFAULT_AGENT matches a loaded config
+    if let Some(ref default_agent) = args.default_agent {
+        let exists = configs
+            .iter()
+            .any(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == default_agent);
+        if !exists {
+            error!(
+                "DEFAULT_AGENT '{}' does not match any loaded agent name or alias",
+                default_agent
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "DEFAULT_AGENT '{}' does not match any loaded agent name or alias",
+                    default_agent
+                ),
+            ));
+        }
+        info!("Default agent: '{}'", default_agent);
+    }
+
+    let configs_arc = Arc::new(configs);
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
@@ -145,7 +175,7 @@ async fn run() -> std::io::Result<()> {
 
     // Create app state
     let app_state = web::Data::new(AppState {
-        config: config_arc,
+        configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
@@ -156,6 +186,7 @@ async fn run() -> std::io::Result<()> {
         shutdown_token: shutdown_token.clone(),
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
+        default_agent: args.default_agent.clone(),
     });
 
     info!(

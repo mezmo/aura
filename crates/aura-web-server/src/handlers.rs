@@ -144,6 +144,7 @@ struct RequestSetup {
     query: String,
     chat_history: Vec<aura::Message>,
     agent: Arc<Agent>,
+    config: aura_config::Config,
     completion_id: String,
     model_str: String,
     created_timestamp: u64,
@@ -183,8 +184,27 @@ async fn prepare_request(
     // dropping system role messages and filtering empty content.
     let chat_history = convert_chat_messages(&req.messages);
 
+    // Find the matching config: explicit model > DEFAULT_AGENT > single-config fallback
+    // This logic allows users to omit the model field if they only have one config or if they set a default_agent,
+    // improving usability for simple cases while still supporting multiple agents.
+    let config = if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
+        data.configs
+            .iter()
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
+            .cloned()
+            .ok_or_else(|| {
+                HttpResponse::NotFound().json(ChatCompletionErrorResponse::ModelNotFound(
+                    model_name.to_string(),
+                ))
+            })?
+    } else if data.configs.len() == 1 {
+        data.configs[0].clone()
+    } else {
+        return Err(HttpResponse::BadRequest().json(ChatCompletionErrorResponse::ModelNotProvided));
+    };
+
     // Build a fresh agent for this request
-    let agent = match build_agent_for_request(&data.config, req_headers_map).await {
+    let agent = match build_agent_for_request(&config, req_headers_map).await {
         Ok(agent) => agent,
         Err(response) => return Err(response),
     };
@@ -199,6 +219,7 @@ async fn prepare_request(
         query,
         chat_history,
         agent,
+        config,
         completion_id,
         model_str,
         created_timestamp,
@@ -278,7 +299,7 @@ fn build_completion_config(
         None
     };
     let request_id = format!("req_{}", Uuid::new_v4().simple());
-    let fallback_tool_parsing = data.config.is_fallback_tool_parsing_enabled();
+    let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
     let stream_config = StreamConfig::new(
         emit_custom_events,
@@ -616,21 +637,31 @@ pub async fn health() -> HttpResponse {
     }))
 }
 
-/// OpenAI-compatible model listing endpoint
+/// OpenAI-compatible model listing endpoint.
+/// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
 pub async fn list_models(data: web::Data<AppState>) -> HttpResponse {
-    let (provider, model) = data.config.llm.model_info();
-    let model_id = format!("{provider}/{model}");
+    let models: Vec<serde_json::Value> = data
+        .configs
+        .iter()
+        .map(|config| {
+            let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+            let created = config.agent.created_at / 1000;
+            let owned_by = config.agent.model_owner.clone().unwrap_or_else(|| {
+                let (provider, _) = config.llm.model_info();
+                provider.to_string()
+            });
+            serde_json::json!({
+                "id": id,
+                "object": "model",
+                "created": created,
+                "owned_by": owned_by
+            })
+        })
+        .collect();
 
     HttpResponse::Ok().json(serde_json::json!({
         "object": "list",
-        "data": [
-            {
-                "id": model_id,
-                "object": "model",
-                "created": 1677649963,
-                "owned_by": provider
-            }
-        ]
+        "data": models
     }))
 }
 

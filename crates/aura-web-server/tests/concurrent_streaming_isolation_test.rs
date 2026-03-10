@@ -62,7 +62,7 @@ async fn test_concurrent_streaming_isolation() {
             let response = client_clone
                 .post(format!("{AURA_SERVER}/v1/chat/completions"))
                 .json(&json!({
-                    "model": "gpt-4o",
+                    "model": "test-assistant",
                     "messages": [{
                         "role": "user",
                         "content": format!("Say only the number {} and nothing else.", unique_number)
@@ -214,7 +214,7 @@ async fn test_rapid_sequential_streaming() {
         let response = client
             .post(format!("{AURA_SERVER}/v1/chat/completions"))
             .json(&json!({
-                "model": "gpt-4o",
+                "model": "test-assistant",
                 "messages": [{
                     "role": "user",
                     "content": format!("Say hello #{}", i + 1)

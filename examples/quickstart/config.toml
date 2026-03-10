@@ -28,6 +28,7 @@ model = "gpt-5.2"
 
 [agent]
 name = "Aura Assistant"
+# alias = "aura"  # optional: stable identifier for model selection by clients
 system_prompt = """
 You are a helpful assistant with access to external tools and
 knowledge bases. Use them to provide accurate, grounded answers.

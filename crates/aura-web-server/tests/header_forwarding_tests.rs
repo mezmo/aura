@@ -22,7 +22,7 @@ async fn send_chat_request_with_headers(
     let mut request = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{"role": "user", "content": message}],
             "stream": false,
             "metadata": {

@@ -630,6 +630,233 @@ system_prompt = "Test"
     }
 
     #[test]
+    fn test_alias_field_parsing() {
+        let config_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Test"
+alias = "my-alias"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.alias, Some("my-alias".to_string()));
+    }
+
+    #[test]
+    fn test_alias_field_defaults_to_none() {
+        let config_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.alias, None);
+    }
+
+    #[test]
+    fn test_load_config_single_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        write!(
+            f,
+            r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Agent1"
+system_prompt = "Hello"
+"#
+        )
+        .unwrap();
+
+        let configs = crate::load_config(&file_path).expect("Failed to load config");
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].agent.name, "Agent1");
+    }
+
+    #[test]
+    fn test_load_config_directory() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+
+        for (name, agent_name) in [("a.toml", "Agent A"), ("b.toml", "Agent B")] {
+            let mut f = std::fs::File::create(dir.path().join(name)).unwrap();
+            write!(
+                f,
+                r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "{agent_name}"
+system_prompt = "Hello"
+"#
+            )
+            .unwrap();
+        }
+
+        // Non-toml files should be ignored
+        std::fs::File::create(dir.path().join("readme.md")).unwrap();
+
+        let configs = crate::load_config(dir.path()).expect("Failed to load configs");
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].agent.name, "Agent A");
+        assert_eq!(configs[1].agent.name, "Agent B");
+    }
+
+    #[test]
+    fn test_load_config_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = crate::load_config(dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("No .toml configuration files found"));
+    }
+
+    #[test]
+    fn test_duplicate_alias_validation() {
+        use crate::validate_unique_identifiers;
+        let mut c1 = crate::Config::default();
+        c1.agent.alias = Some("same-alias".to_string());
+        let mut c2 = crate::Config::default();
+        c2.agent.alias = Some("same-alias".to_string());
+
+        let result = validate_unique_identifiers(&[c1, c2]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unique alias"));
+    }
+
+    #[test]
+    fn test_duplicate_name_without_alias_validation() {
+        use crate::validate_unique_identifiers;
+        let mut c1 = crate::Config::default();
+        c1.agent.name = "Same Name".to_string();
+        let mut c2 = crate::Config::default();
+        c2.agent.name = "Same Name".to_string();
+
+        let result = validate_unique_identifiers(&[c1, c2]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("same agent name"));
+    }
+
+    #[test]
+    fn test_alias_collides_with_name_validation() {
+        use crate::validate_unique_identifiers;
+        let mut c1 = crate::Config::default();
+        c1.agent.name = "MyAgent".to_string();
+        // c1 has no alias, so "MyAgent" is its identifier
+
+        let mut c2 = crate::Config::default();
+        c2.agent.name = "Other".to_string();
+        c2.agent.alias = Some("MyAgent".to_string());
+
+        let result = validate_unique_identifiers(&[c1, c2]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("same agent name"));
+    }
+
+    #[test]
+    fn test_same_name_with_different_aliases_is_ok() {
+        use crate::validate_unique_identifiers;
+        let mut c1 = crate::Config::default();
+        c1.agent.name = "Same".to_string();
+        c1.agent.alias = Some("alias-1".to_string());
+
+        let mut c2 = crate::Config::default();
+        c2.agent.name = "Same".to_string();
+        c2.agent.alias = Some("alias-2".to_string());
+
+        let result = validate_unique_identifiers(&[c1, c2]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_created_at_defaults_to_current_time() {
+        let config_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        assert!(
+            config.agent.created_at >= before && config.agent.created_at <= after,
+            "created_at should default to current time in ms"
+        );
+    }
+
+    #[test]
+    fn test_created_at_explicit_value() {
+        let config_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+created_at = 1677649963000
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.created_at, 1677649963000);
+    }
+
+    #[test]
+    fn test_model_owner_defaults_to_none() {
+        let config_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.model_owner, None);
+    }
+
+    #[test]
+    fn test_model_owner_explicit_value() {
+        let config_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+model_owner = "mezmo"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.model_owner, Some("mezmo".to_string()));
+    }
+
+    #[test]
     fn test_ollama_config_all_params() {
         println!("\n=== TEST_OLLAMA_CONFIG_ALL_PARAMS ===");
         let config_str = r#"

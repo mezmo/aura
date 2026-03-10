@@ -19,6 +19,16 @@ export OPENAI_API_KEY="sk-..."
 CONFIG_PATH=examples/minimal/openai.toml cargo run --bin aura-web-server
 ```
 
+### Serving Multiple Agents
+
+Point `CONFIG_PATH` at a directory to serve every `.toml` file as a selectable agent:
+
+```bash
+CONFIG_PATH=examples/complete/ cargo run --bin aura-web-server
+```
+
+Clients discover agents via `GET /v1/models` and select one with the `model` field in chat requests. Each agent is identified by its `alias` (if set) or `name`.
+
 ## Structure
 
 ```

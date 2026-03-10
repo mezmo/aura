@@ -11,7 +11,7 @@ services:
     environment:
       HOST: "0.0.0.0"
       PORT: "3000"
-      CONFIG_PATH: "/app/config/config.toml"
+      CONFIG_PATH: "/app/config/config.toml"  # Can also be a directory for multi-agent serving
 
       # LLM API keys (from .env)
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"

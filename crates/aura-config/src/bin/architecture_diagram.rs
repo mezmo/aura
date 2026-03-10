@@ -14,220 +14,231 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());
-    let config = load_config(&config_path)?;
+    let configs = load_config(&config_path)?;
 
     println!("\n🏗️  RIG.RS ARCHITECTURE DIAGRAM FROM CONFIG");
     println!("═══════════════════════════════════════════════════════════");
+    println!("  {} agent(s) loaded\n", configs.len());
 
-    // Current Implementation (What's Actually Built)
-    println!("\n📋 CURRENT IMPLEMENTATION (What's Actually Reified):");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│                    🤖 SIMPLE AGENT                      │");
-    println!("│                                                         │");
+    for (i, config) in configs.iter().enumerate() {
+        let agent_id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
 
-    let (provider, model) = match &config.llm {
-        aura_config::config::LlmConfig::OpenAI { model, .. } => ("openai", model.clone()),
-        aura_config::config::LlmConfig::Anthropic { model, .. } => ("anthropic", model.clone()),
-        aura_config::config::LlmConfig::Bedrock { model, .. } => ("bedrock", model.clone()),
-        aura_config::config::LlmConfig::Gemini { model, .. } => ("gemini", model.clone()),
-        aura_config::config::LlmConfig::Ollama { model, .. } => ("ollama", model.clone()),
-    };
-
-    match provider {
-        "openai" => {
-            println!("│  ┌─────────────────────────────────────────────────┐    │");
-            println!("│  │           🧠 OpenAI LLM Client                  │    │");
-            println!("│  │                                                 │    │");
-            println!("│  │  Provider: {provider}                        │    │");
-            println!("│  │  Model: {model}                     │    │");
-            println!(
-                "│  │  System Prompt: {}...        │    │",
-                config
-                    .agent
-                    .system_prompt
-                    .chars()
-                    .take(20)
-                    .collect::<String>()
-            );
-            println!("│  └─────────────────────────────────────────────────┘    │");
+        if i > 0 {
+            println!("\n───────────────────────────────────────────────────────────\n");
         }
-        "anthropic" => {
-            println!("│  ┌─────────────────────────────────────────────────┐    │");
-            println!("│  │          🧠 Anthropic LLM Client                │    │");
-            println!("│  │                                                 │    │");
-            println!("│  │  Provider: {provider}                      │    │");
-            println!("│  │  Model: {model}                        │    │");
-            println!(
-                "│  │  System Prompt: {}...        │    │",
-                config
-                    .agent
-                    .system_prompt
-                    .chars()
-                    .take(20)
-                    .collect::<String>()
-            );
-            println!("│  └─────────────────────────────────────────────────┘    │");
-        }
-        "bedrock" => {
-            println!("│  ┌─────────────────────────────────────────────────┐    │");
-            println!("│  │          🌩️  AWS Bedrock LLM Client             │    │");
-            println!("│  │                                                 │    │");
-            println!("│  │  Provider: {provider}                      │    │");
-            println!("│  │  Model: {model}       │    │");
-            println!(
-                "│  │  System Prompt: {}...        │    │",
-                config
-                    .agent
-                    .system_prompt
-                    .chars()
-                    .take(20)
-                    .collect::<String>()
-            );
-            println!("│  └─────────────────────────────────────────────────┘    │");
-        }
-        other => {
-            println!("│  ┌─────────────────────────────────────────────────┐    │");
-            println!("│  │            🧠 {other} LLM Client                 │    │");
-            println!("│  │                                                 │    │");
-            println!("│  │  ❌ NOT YET IMPLEMENTED                         │    │");
-            println!("│  └─────────────────────────────────────────────────┘    │");
-        }
-    }
-    println!("│                                                         │");
-    println!("│  ❌ NO TOOLS CONNECTED                                  │");
-    println!("│  ❌ NO MCP SERVERS CONNECTED                            │");
-    println!("│  ❌ NO VECTOR STORE CONNECTED                           │");
-    println!("└─────────────────────────────────────────────────────────┘");
 
-    // Configuration Available (What Could Be Built)
-    println!("\n🎯 TARGET ARCHITECTURE (What Config Defines):");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│                  🤖 INTELLIGENT AGENT                   │");
-    println!("│                                                         │");
-    println!("│  ┌─────────────────────────────────────────────────┐    │");
-    println!("│  │              🧠 LLM PROVIDER                    │    │");
-    println!("│  │                                                 │    │");
-    println!("│  │  Provider: {provider}                        │    │");
-    println!("│  │  Model: {model}                     │    │");
-    println!(
-        "│  │  Temperature: {}                           │    │",
-        config.agent.temperature.unwrap_or(0.7)
-    );
-    println!("│  └─────────────────────────────────────────────────┘    │");
-    println!("│                          │                              │");
-    println!("│                          ▼                              │");
+        println!("  Agent {}/{}: {}", i + 1, configs.len(), agent_id);
 
-    // Tools Section
-    if let Some(ref tools) = config.tools {
-        println!("│  ┌─────────────────────────────────────────────────┐    │");
-        println!("│  │                🔧 TOOLS                         │    │");
-        println!("│  │                                                 │    │");
-        if tools.filesystem {
-            println!("│  │  📁 Filesystem Tool (Rig built-in)             │    │");
-        }
-        for custom_tool in &tools.custom_tools {
-            println!("│  │  🔨 Custom Tool: {custom_tool}                         │    │");
-        }
-        println!("│  └─────────────────────────────────────────────────┘    │");
-        println!("│                          │                              │");
-        println!("│                          ▼                              │");
-    }
+        // Current Implementation (What's Actually Built)
+        println!("\n📋 CURRENT IMPLEMENTATION (What's Actually Reified):");
+        println!("┌─────────────────────────────────────────────────────────┐");
+        println!("│                    🤖 SIMPLE AGENT                      │");
+        println!("│                                                         │");
 
-    // MCP Servers Section
-    if let Some(ref mcp_config) = config.mcp {
-        println!("│  ┌─────────────────────────────────────────────────┐    │");
-        println!("│  │              🌐 MCP SERVERS                     │    │");
-        println!("│  │                                                 │    │");
+        let (provider, model) = match &config.llm {
+            aura_config::config::LlmConfig::OpenAI { model, .. } => ("openai", model.clone()),
+            aura_config::config::LlmConfig::Anthropic { model, .. } => ("anthropic", model.clone()),
+            aura_config::config::LlmConfig::Bedrock { model, .. } => ("bedrock", model.clone()),
+            aura_config::config::LlmConfig::Gemini { model, .. } => ("gemini", model.clone()),
+            aura_config::config::LlmConfig::Ollama { model, .. } => ("ollama", model.clone()),
+        };
 
-        for (name, server) in &mcp_config.servers {
-            match server {
-                aura_config::McpServerConfig::HttpStreamable { url, .. } => {
-                    println!("│  │  🌊 {name} (HTTP Streamable)                   │    │");
-                    println!(
-                        "│  │     URL: {}              │    │",
-                        if url.len() > 25 {
-                            format!("{}...", &url[..25])
-                        } else {
-                            url.clone()
-                        }
-                    );
-                }
-                aura_config::McpServerConfig::Stdio { cmd, .. } => {
-                    println!("│  │  💻 {name} (STDIO)                             │    │");
-                    println!("│  │     Command: {cmd:?}                           │    │");
-                }
+        match provider {
+            "openai" => {
+                println!("│  ┌─────────────────────────────────────────────────┐    │");
+                println!("│  │           🧠 OpenAI LLM Client                  │    │");
+                println!("│  │                                                 │    │");
+                println!("│  │  Provider: {provider}                        │    │");
+                println!("│  │  Model: {model}                     │    │");
+                println!(
+                    "│  │  System Prompt: {}...        │    │",
+                    config
+                        .agent
+                        .system_prompt
+                        .chars()
+                        .take(20)
+                        .collect::<String>()
+                );
+                println!("│  └─────────────────────────────────────────────────┘    │");
+            }
+            "anthropic" => {
+                println!("│  ┌─────────────────────────────────────────────────┐    │");
+                println!("│  │          🧠 Anthropic LLM Client                │    │");
+                println!("│  │                                                 │    │");
+                println!("│  │  Provider: {provider}                      │    │");
+                println!("│  │  Model: {model}                        │    │");
+                println!(
+                    "│  │  System Prompt: {}...        │    │",
+                    config
+                        .agent
+                        .system_prompt
+                        .chars()
+                        .take(20)
+                        .collect::<String>()
+                );
+                println!("│  └─────────────────────────────────────────────────┘    │");
+            }
+            "bedrock" => {
+                println!("│  ┌─────────────────────────────────────────────────┐    │");
+                println!("│  │          🌩️  AWS Bedrock LLM Client             │    │");
+                println!("│  │                                                 │    │");
+                println!("│  │  Provider: {provider}                      │    │");
+                println!("│  │  Model: {model}       │    │");
+                println!(
+                    "│  │  System Prompt: {}...        │    │",
+                    config
+                        .agent
+                        .system_prompt
+                        .chars()
+                        .take(20)
+                        .collect::<String>()
+                );
+                println!("│  └─────────────────────────────────────────────────┘    │");
+            }
+            other => {
+                println!("│  ┌─────────────────────────────────────────────────┐    │");
+                println!("│  │            🧠 {other} LLM Client                 │    │");
+                println!("│  │                                                 │    │");
+                println!("│  │  ❌ NOT YET IMPLEMENTED                         │    │");
+                println!("│  └─────────────────────────────────────────────────┘    │");
             }
         }
+        println!("│                                                         │");
+        println!("│  ❌ NO TOOLS CONNECTED                                  │");
+        println!("│  ❌ NO MCP SERVERS CONNECTED                            │");
+        println!("│  ❌ NO VECTOR STORE CONNECTED                           │");
+        println!("└─────────────────────────────────────────────────────────┘");
+
+        // Configuration Available (What Could Be Built)
+        println!("\n🎯 TARGET ARCHITECTURE (What Config Defines):");
+        println!("┌─────────────────────────────────────────────────────────┐");
+        println!("│                  🤖 INTELLIGENT AGENT                   │");
+        println!("│                                                         │");
+        println!("│  ┌─────────────────────────────────────────────────┐    │");
+        println!("│  │              🧠 LLM PROVIDER                    │    │");
+        println!("│  │                                                 │    │");
+        println!("│  │  Provider: {provider}                        │    │");
+        println!("│  │  Model: {model}                     │    │");
+        println!(
+            "│  │  Temperature: {}                           │    │",
+            config.agent.temperature.unwrap_or(0.7)
+        );
         println!("│  └─────────────────────────────────────────────────┘    │");
         println!("│                          │                              │");
         println!("│                          ▼                              │");
-    }
 
-    // Vector Store Section
-    println!("│  ┌─────────────────────────────────────────────────┐    │");
-    println!("│  │              🗃️  VECTOR STORE                    │    │");
-    println!("│  │                                                 │    │");
-    if !config.vector_stores.is_empty() {
-        let store = &config.vector_stores[0]; // Show first store
-        println!(
-            "│  │  Type: {} ({} stores)              │    │",
-            store.store_type,
-            config.vector_stores.len()
-        );
+        // Tools Section
+        if let Some(ref tools) = config.tools {
+            println!("│  ┌─────────────────────────────────────────────────┐    │");
+            println!("│  │                🔧 TOOLS                         │    │");
+            println!("│  │                                                 │    │");
+            if tools.filesystem {
+                println!("│  │  📁 Filesystem Tool (Rig built-in)             │    │");
+            }
+            for custom_tool in &tools.custom_tools {
+                println!("│  │  🔨 Custom Tool: {custom_tool}                         │    │");
+            }
+            println!("│  └─────────────────────────────────────────────────┘    │");
+            println!("│                          │                              │");
+            println!("│                          ▼                              │");
+        }
+
+        // MCP Servers Section
+        if let Some(ref mcp_config) = config.mcp {
+            println!("│  ┌─────────────────────────────────────────────────┐    │");
+            println!("│  │              🌐 MCP SERVERS                     │    │");
+            println!("│  │                                                 │    │");
+
+            for (name, server) in &mcp_config.servers {
+                match server {
+                    aura_config::McpServerConfig::HttpStreamable { url, .. } => {
+                        println!("│  │  🌊 {name} (HTTP Streamable)                   │    │");
+                        println!(
+                            "│  │     URL: {}              │    │",
+                            if url.len() > 25 {
+                                format!("{}...", &url[..25])
+                            } else {
+                                url.clone()
+                            }
+                        );
+                    }
+                    aura_config::McpServerConfig::Stdio { cmd, .. } => {
+                        println!("│  │  💻 {name} (STDIO)                             │    │");
+                        println!("│  │     Command: {cmd:?}                           │    │");
+                    }
+                }
+            }
+            println!("│  └─────────────────────────────────────────────────┘    │");
+            println!("│                          │                              │");
+            println!("│                          ▼                              │");
+        }
+
+        // Vector Store Section
+        println!("│  ┌─────────────────────────────────────────────────┐    │");
+        println!("│  │              🗃️  VECTOR STORE                    │    │");
         println!("│  │                                                 │    │");
-        println!("│  │  ┌─────────────────────────────────────────┐    │    │");
-        println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
-        println!("│  │  │                                         │    │    │");
-        println!(
-            "│  │  │  Provider: {}                │    │    │",
-            store.embedding_model.provider
-        );
-        println!(
-            "│  │  │  Model: {}    │    │    │",
-            store.embedding_model.model
-        );
-    } else {
-        println!("│  │  No vector stores configured               │    │");
-        println!("│  │                                                 │    │");
-        println!("│  │  ┌─────────────────────────────────────────┐    │    │");
-        println!("│  │  │        🔤 NO EMBEDDING MODEL            │    │    │");
-        println!("│  │  │                                         │    │    │");
-        println!("│  │  │  Provider: N/A              │    │    │");
-        println!("│  │  │  Model: N/A                 │    │    │");
-    }
-    println!("│  │  └─────────────────────────────────────────┘    │    │");
-    println!("│  └─────────────────────────────────────────────────┘    │");
-    println!("└─────────────────────────────────────────────────────────┘");
+        if !config.vector_stores.is_empty() {
+            let store = &config.vector_stores[0]; // Show first store
+            println!(
+                "│  │  Type: {} ({} stores)              │    │",
+                store.store_type,
+                config.vector_stores.len()
+            );
+            println!("│  │                                                 │    │");
+            println!("│  │  ┌─────────────────────────────────────────┐    │    │");
+            println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
+            println!("│  │  │                                         │    │    │");
+            println!(
+                "│  │  │  Provider: {}                │    │    │",
+                store.embedding_model.provider
+            );
+            println!(
+                "│  │  │  Model: {}    │    │    │",
+                store.embedding_model.model
+            );
+        } else {
+            println!("│  │  No vector stores configured               │    │");
+            println!("│  │                                                 │    │");
+            println!("│  │  ┌─────────────────────────────────────────┐    │    │");
+            println!("│  │  │        🔤 NO EMBEDDING MODEL            │    │    │");
+            println!("│  │  │                                         │    │    │");
+            println!("│  │  │  Provider: N/A              │    │    │");
+            println!("│  │  │  Model: N/A                 │    │    │");
+        }
+        println!("│  │  └─────────────────────────────────────────┘    │    │");
+        println!("│  └─────────────────────────────────────────────────┘    │");
+        println!("└─────────────────────────────────────────────────────────┘");
 
-    // Configuration vs Implementation Gap
-    println!("\n⚠️  IMPLEMENTATION GAPS:");
-    println!("┌─────────────────────────────────────────────────────────┐");
-    println!("│                  🚧 MISSING INTEGRATIONS                │");
-    println!("│                                                         │");
-
-    if config.mcp.is_some() {
-        println!("│  🔴 MCP Server Integration                              │");
-        println!("│     → Need to connect MCP servers to agent tools       │");
-        println!("│     → Requires rig::agent.tool() integration           │");
+        // Configuration vs Implementation Gap
+        println!("\n⚠️  IMPLEMENTATION GAPS:");
+        println!("┌─────────────────────────────────────────────────────────┐");
+        println!("│                  🚧 MISSING INTEGRATIONS                │");
         println!("│                                                         │");
-    }
 
-    println!("│  🔴 Vector Store Integration                            │");
-    println!("│     → Need to create vector store from config          │");
-    println!("│     → Need document ingestion pipeline                 │");
-    println!("│     → Need to connect to agent for RAG queries         │");
-    println!("│                                                         │");
+        if config.mcp.is_some() {
+            println!("│  🔴 MCP Server Integration                              │");
+            println!("│     → Need to connect MCP servers to agent tools       │");
+            println!("│     → Requires rig::agent.tool() integration           │");
+            println!("│                                                         │");
+        }
 
-    if let Some(ref tools) = config.tools
-        && tools.filesystem
-    {
-        println!("│  🔴 Filesystem Tool Integration                         │");
-        println!("│     → Need to add filesystem tool to agent             │");
-        println!("│     → Configure file access permissions                │");
+        println!("│  🔴 Vector Store Integration                            │");
+        println!("│     → Need to create vector store from config          │");
+        println!("│     → Need document ingestion pipeline                 │");
+        println!("│     → Need to connect to agent for RAG queries         │");
         println!("│                                                         │");
-    }
 
-    println!("└─────────────────────────────────────────────────────────┘");
+        if let Some(ref tools) = config.tools
+            && tools.filesystem
+        {
+            println!("│  🔴 Filesystem Tool Integration                         │");
+            println!("│     → Need to add filesystem tool to agent             │");
+            println!("│     → Configure file access permissions                │");
+            println!("│                                                         │");
+        }
+
+        println!("└─────────────────────────────────────────────────────────┘");
+    }
 
     // Implementation Roadmap
     println!("\n🗺️  IMPLEMENTATION ROADMAP:");

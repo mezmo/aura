@@ -243,6 +243,8 @@ pub struct ToolsConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AgentConfig {
     pub name: String,
+    #[serde(default)]
+    pub alias: Option<String>,
     pub system_prompt: String,
     #[serde(default)]
     pub context: Vec<String>,
@@ -260,16 +262,31 @@ pub struct AgentConfig {
     /// reporting in streaming events (aura.session_info).
     #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
     pub context_window: Option<u32>,
+    /// Creation timestamp in milliseconds since epoch (defaults to current time)
+    #[serde(default = "default_created_at")]
+    pub created_at: u64,
+    /// Override the `owned_by` field in /v1/models responses.
+    /// When omitted, defaults to the underlying LLM provider (e.g. "openai", "anthropic").
+    #[serde(default)]
+    pub model_owner: Option<String>,
 }
 
 fn default_turn_depth() -> Option<usize> {
     Some(5)
 }
 
+fn default_created_at() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_millis() as u64
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             name: "Assistant".to_string(),
+            alias: None,
             system_prompt: "You are a helpful assistant.".to_string(),
             context: Vec::new(),
             temperature: Some(0.7),
@@ -277,6 +294,8 @@ impl Default for AgentConfig {
             max_tokens: None,
             turn_depth: default_turn_depth(),
             context_window: None,
+            created_at: default_created_at(),
+            model_owner: None,
         }
     }
 }

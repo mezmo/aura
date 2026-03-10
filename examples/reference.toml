@@ -124,6 +124,10 @@ custom_tools = []
 # ── Agent ───────────────────────────────────────────────────────────
 [agent]
 name = "Assistant"
+# alias = "my-assistant"  # optional: stable identifier for client model selection
+#                         # Clients send this as the "model" field in requests.
+#                         # If omitted, the agent name is used as the identifier.
+#                         # Must be unique across all loaded configs.
 system_prompt = """
 You are a helpful assistant with access to external tools and
 knowledge bases. Use them to provide accurate, grounded answers.
@@ -133,6 +137,10 @@ Workflow:
 2. Correlate findings across sources.
 3. Return actionable findings and next steps.
 """
+# created_at = 1677649963000   # optional: creation timestamp in ms since epoch
+#                              # Used in /v1/models response. Defaults to current time.
+# model_owner = "mezmo"        # override `owned_by` in /v1/models responses.
+#                              # Defaults to the LLM provider (e.g. "openai", "anthropic").
 # reasoning_effort = "medium"  # minimal, low, medium, high (provider support varies)
 # temperature = 0.7
 # Maximum tool-calling rounds per user turn. Higher values allow

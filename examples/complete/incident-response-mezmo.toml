@@ -37,6 +37,8 @@ Authorization = "Bearer {{ env.MEZMO_API_KEY }}"
 
 [agent]
 name = "Incident Response Agent"
+alias = "incident-response/mezmo"
+model_owner = "mezmo"
 system_prompt = """
 You are an incident response agent with access to PagerDuty and
 Mezmo. Follow this triage workflow:

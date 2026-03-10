@@ -4,7 +4,7 @@ A production-ready framework for composing AI agents from declarative TOML confi
 
 Key capabilities:
 
-- Declarative agent composition via TOML with multi-provider LLM support
+- Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
 - Dynamic [MCP](https://modelcontextprotocol.io) tool discovery across HTTP, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
 - RAG pipeline integration with in-memory and external vector stores
@@ -89,8 +89,11 @@ Run the server:
 # Default: reads config.toml
 cargo run --bin aura-web-server
 
-# Custom config path
+# Custom config file
 CONFIG_PATH=my-config.toml cargo run --bin aura-web-server
+
+# Config directory (serves multiple agents)
+CONFIG_PATH=configs/ cargo run --bin aura-web-server
 
 # Host/port override
 HOST=0.0.0.0 PORT=3000 cargo run --bin aura-web-server
@@ -103,7 +106,7 @@ Core server options:
 
 | Option                       | Env Variable               | Default       | Description                         |
 | ---------------------------- | -------------------------- | ------------- | ----------------------------------- |
-| `--config`                   | `CONFIG_PATH`              | `config.toml` | Path to TOML config                 |
+| `--config`                   | `CONFIG_PATH`              | `config.toml` | Path to TOML config file or directory |
 | `--host`                     | `HOST`                     | `127.0.0.1`   | Bind host                           |
 | `--port`                     | `PORT`                     | `8080`        | Bind port                           |
 | `--streaming-timeout-secs`   | `STREAMING_TIMEOUT_SECS`   | `900`         | Max SSE request duration            |
@@ -127,10 +130,18 @@ API examples:
 # Health
 curl http://localhost:8080/health
 
+# List available models (agents)
+curl http://localhost:8080/v1/models
+
 # OpenAI-compatible chat completion
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hello"}]}'
+
+# Select a specific agent by name or alias via the model field
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "my-agent", "messages": [{"role": "user", "content": "Hello"}]}'
 
 # Streaming response
 curl -X POST http://localhost:8080/v1/chat/completions \
@@ -144,10 +155,43 @@ For LibreChat/OpenWebUI integration, see [development/README.md](development/REA
 
 ## Configuration
 
+`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
+
+### Multiple Agents
+
+To serve multiple agents, create a directory with one TOML file per agent:
+
+```
+configs/
+├── research-assistant.toml
+├── devops-agent.toml
+└── code-reviewer.toml
+```
+
+```bash
+CONFIG_PATH=configs/ cargo run --bin aura-web-server
+```
+
+Each agent is identified by its `alias` (if set) or `name`. Clients discover available agents via `GET /v1/models` and select one by passing its identifier as the `model` field in requests. When no `model` is specified, the server resolves the agent via `DEFAULT_AGENT`, or automatically when only one config is loaded.
+
+The `alias` field provides a stable, client-facing identifier that is independent of the agent's display name:
+
+```toml
+[agent]
+name = "DevOps Assistant"
+alias = "devops"             # clients send "model": "devops"
+system_prompt = "You are a DevOps expert."
+model_owner = "mezmo"        # override owned_by in /v1/models (defaults to LLM provider)
+```
+
+Aliases must be unique across all loaded configs. If two configs share the same `name` and neither has an alias, loading fails with a validation error.
+
+### Configuration Sections
+
 Configuration sections:
 
 - `[llm]`: provider and model configuration.
-- `[agent]`: system prompt and runtime behavior.
+- `[agent]`: identity, system prompt, and runtime behavior.
 - `[[vector_stores]]`: optional RAG/vector store configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
@@ -188,6 +232,7 @@ headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
 
 [agent]
 name = "Assistant"
+alias = "my-assistant"       # optional: stable client-facing identifier
 system_prompt = "You are a helpful assistant."
 turn_depth = 2
 ```

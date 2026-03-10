@@ -27,8 +27,11 @@ cargo build --release --bin aura-web-server
 # Start with default config (config.toml)
 cargo run --bin aura-web-server
 
-# Or with custom configuration
+# Or with custom configuration file
 CONFIG_PATH=my-config.toml cargo run --bin aura-web-server
+
+# Or with a directory of configs (serves multiple agents)
+CONFIG_PATH=configs/ cargo run --bin aura-web-server
 
 # Custom host/port
 HOST=0.0.0.0 PORT=3000 cargo run --bin aura-web-server
@@ -45,16 +48,38 @@ Response:
 {"status": "healthy"}
 ```
 
+### List Models (Agents)
+```bash
+GET /v1/models
+```
+Returns all loaded agents. Each agent's `alias` (or `name` if no alias is set) is its model `id`. The `owned_by` field defaults to the underlying LLM provider (e.g. `"openai"`, `"anthropic"`) and can be overridden with `model_owner` in the agent config. Clients like LibreChat and OpenWebUI use this endpoint to populate their model picker.
+
+Response:
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "devops", "object": "model", "created": 1677649963, "owned_by": "mezmo"},
+    {"id": "research-assistant", "object": "model", "created": 1677649963, "owned_by": "mezmo"}
+  ]
+}
+```
+
 ### Chat Completions
 ```bash
 POST /v1/chat/completions
 Content-Type: application/json
 ```
 
+The `model` field selects which agent handles the request by matching against agent `alias` or `name`. When `model` is omitted, the server resolves the agent in this order:
+1. `DEFAULT_AGENT` environment variable
+2. Automatic selection when only one config is loaded
+3. Returns a 400 error if multiple configs are loaded and no default is set
+
 Request body:
 ```json
 {
-  "model": "gpt-4o-mini",
+  "model": "devops",
   "messages": [
     {"role": "user", "content": "What tools do you have available?"}
   ]
@@ -86,11 +111,23 @@ Response:
 # Health check
 curl -X GET http://127.0.0.1:8080/health
 
-# Chat completion
+# List available agents
+curl http://127.0.0.1:8080/v1/models
+
+# Chat completion (uses DEFAULT_AGENT when model is omitted)
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o-mini",
+    "messages": [
+      {"role": "user", "content": "What tools do you have available?"}
+    ]
+  }'
+
+# Chat completion with a specific agent
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "devops",
     "messages": [
       {"role": "user", "content": "What tools do you have available?"}
     ]
@@ -143,7 +180,7 @@ Example configurations are in the [`examples/`](../../examples/) directory.
 
 ## Architecture
 
-- **Pre-built Agent**: Agent is built once at startup from TOML config
+- **Multi-Agent Serving**: Load multiple agents from a config directory, selectable via the `model` field
 - **Stateless Requests**: Each HTTP request is processed independently
 - **Multi-Turn Support**: Conversation history passed via messages array
 - **OpenAI Compatible**: Request/response schemas match OpenAI's format
@@ -154,9 +191,10 @@ Example configurations are in the [`examples/`](../../examples/) directory.
 **Docker**: See [DOCKER.md](../../DOCKER.md) for containerized deployment
 
 **Environment Variables**:
-- `CONFIG_PATH` - Path to configuration file (default: `config.toml`)
+- `CONFIG_PATH` - Path to configuration file or directory (default: `config.toml`)
 - `HOST` - Server bind address (default: `127.0.0.1`)
 - `PORT` - Server port (default: `8080`)
+- `DEFAULT_AGENT` - Default agent name or alias when `model` is omitted from requests. Not required when only one configuration is loaded via `CONFIG_PATH`.
 
 ## See Also
 

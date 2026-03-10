@@ -22,7 +22,7 @@ async fn send_chat_request(
     client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": messages,
             "stream": stream,
             "metadata": {
@@ -277,7 +277,7 @@ async fn test_streaming_error_handling() {
     let response = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [],  // Invalid: empty messages
             "stream": true
         }))
@@ -845,7 +845,7 @@ async fn test_streaming_response_headers() {
     let response = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{"role": "user", "content": "Say hello"}],
             "stream": true,
             "metadata": {
@@ -905,7 +905,7 @@ async fn test_consecutive_requests_tool_execution() {
     let response1 = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{
                 "role": "user",
                 "content": "Please list the files in the current directory."
@@ -971,7 +971,7 @@ async fn test_consecutive_requests_tool_execution() {
     let response2 = client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt-4o",
+            "model": "test-assistant",
             "messages": [{
                 "role": "user",
                 "content": "Please list the files in the current directory."

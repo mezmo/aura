@@ -63,6 +63,10 @@ Use `host.docker.internal` to reach services running on your host machine.
 
 Uncomment the `[[vector_stores]]` section in `config.toml`. You'll need a Qdrant instance — you can add one to the compose file or point at an external one.
 
+### Serve multiple agents
+
+Create a `configs/` directory with one TOML file per agent, update the `CONFIG_PATH` in `docker-compose.yml` to point to the directory, and mount it. Clients which support picking models will see each agent in their model picker via `GET /v1/models`.
+
 ### Full configuration reference
 
 See [`examples/reference.toml`](../reference.toml) for all available options.

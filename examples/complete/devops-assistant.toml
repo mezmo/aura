@@ -28,6 +28,7 @@ Authorization = "Bearer {{ env.GITHUB_PERSONAL_ACCESS_TOKEN }}"
 
 [agent]
 name = "DevOps Assistant"
+model_owner = "mezmo"
 system_prompt = """
 You are a DevOps assistant with access to GitHub.
 Help with code review, PR management, and repo exploration.

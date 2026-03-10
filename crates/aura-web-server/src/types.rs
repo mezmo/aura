@@ -48,7 +48,7 @@ impl ActiveRequestTracker {
 
 /// Application state
 pub struct AppState {
-    pub config: Arc<aura_config::Config>,
+    pub configs: Arc<Vec<aura_config::Config>>,
     pub tool_result_mode: ToolResultMode,
     /// Maximum length for tool results (0 = no truncation)
     pub tool_result_max_length: usize,
@@ -67,6 +67,8 @@ pub struct AppState {
     pub stream_shutdown_token: CancellationToken,
     /// Tracks in-flight requests for early shutdown when all requests complete
     pub active_requests: Arc<ActiveRequestTracker>,
+    /// Default agent name or alias, used when `model` is omitted from the request
+    pub default_agent: Option<String>,
 }
 
 /// OpenAI-compatible message role
@@ -111,6 +113,57 @@ pub struct ChatCompletionRequest {
     /// OpenAI-compatible metadata field (up to 16 key-value pairs)
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
+}
+
+/// OpenAI-compatible error responses for chat completion requests.
+pub enum ChatCompletionErrorResponse {
+    /// Model parameter was not provided (HTTP 400).
+    ModelNotProvided,
+    /// Model was specified but does not match any configured agent (HTTP 404).
+    ModelNotFound(String),
+}
+
+#[derive(Serialize)]
+struct ChatCompletionErrorDetail {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: String,
+    param: String,
+    code: String,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionErrorEnvelope {
+    error: ChatCompletionErrorDetail,
+}
+
+impl Serialize for ChatCompletionErrorResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (message, code) = match self {
+            ChatCompletionErrorResponse::ModelNotProvided => (
+                "you must provide a model parameter".to_string(),
+                "missing_required_parameter".to_string(),
+            ),
+            ChatCompletionErrorResponse::ModelNotFound(model_name) => (
+                format!(
+                    "The model `{}` does not exist or you do not have access to it.",
+                    model_name
+                ),
+                "model_not_found".to_string(),
+            ),
+        };
+
+        let envelope = ChatCompletionErrorEnvelope {
+            error: ChatCompletionErrorDetail {
+                message,
+                error_type: "invalid_request_error".to_string(),
+                param: "model".to_string(),
+                code,
+            },
+        };
+
+        envelope.serialize(serializer)
+    }
 }
 
 /// OpenAI-compatible choice structure
@@ -222,5 +275,33 @@ mod tests {
             .await
             .expect("wait_for_drain should resolve when count reaches 0")
             .expect("task should not panic");
+    }
+
+    #[test]
+    fn test_model_not_provided_serialization() {
+        let error = ChatCompletionErrorResponse::ModelNotProvided;
+        let json: serde_json::Value = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(
+            json["error"]["message"],
+            "you must provide a model parameter"
+        );
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "model");
+        assert_eq!(json["error"]["code"], "missing_required_parameter");
+    }
+
+    #[test]
+    fn test_model_not_found_serialization() {
+        let error = ChatCompletionErrorResponse::ModelNotFound("gpt-5".to_string());
+        let json: serde_json::Value = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(
+            json["error"]["message"],
+            "The model `gpt-5` does not exist or you do not have access to it."
+        );
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["param"], "model");
+        assert_eq!(json["error"]["code"], "model_not_found");
     }
 }
