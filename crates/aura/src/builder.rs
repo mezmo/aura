@@ -6,6 +6,7 @@ use crate::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
     },
+    skill_tool::LoadSkillTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
     vector_store::VectorStoreManager,
@@ -160,6 +161,20 @@ impl Agent {
             );
         }
 
+        // Build effective system prompt, appending skill catalog if skills are configured
+        let system_prompt = if config.agent.skills.is_empty() {
+            config.agent.system_prompt.clone()
+        } else {
+            let mut prompt = config.agent.system_prompt.clone();
+            prompt.push_str(
+                "\n\nAvailable skills (use the `load_skill` tool to load before answering):\n",
+            );
+            for skill in &config.agent.skills {
+                prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            }
+            prompt
+        };
+
         // Build provider-specific agent with tools
         // Each branch creates its own completion model and agent builder,
         // adds tools using the shared BuilderState helper, then wraps in ProviderAgent
@@ -191,7 +206,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -249,7 +264,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -303,7 +318,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -341,7 +356,7 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -377,7 +392,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(&config.agent.system_prompt);
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = config.agent.temperature {
                     agent_builder = agent_builder.temperature(temp);
                 }
@@ -517,6 +532,25 @@ impl Agent {
                 tracing::info!("  Adding {} STDIO tools for client group", tools.len());
                 builder_state = builder_state.add_rmcp_tools(tools, client);
             }
+        }
+
+        // Add skill loading tool if skills are configured
+        if !config.agent.skills.is_empty() {
+            tracing::info!(
+                "Adding load_skill tool with {} skills",
+                config.agent.skills.len(),
+            );
+            for skill in &config.agent.skills {
+                tracing::info!(
+                    "  Skill '{}': {} (dir: {:?})",
+                    skill.name,
+                    skill.description,
+                    skill.path
+                );
+            }
+
+            let skill_tool = LoadSkillTool::new(&config.agent.skills);
+            builder_state = builder_state.add_tool(skill_tool);
         }
 
         Ok(builder_state)

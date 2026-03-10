@@ -25,6 +25,7 @@ pub mod rag_tools;
 pub mod request_cancellation;
 pub mod request_progress;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
+pub mod skill_tool;
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
@@ -38,7 +39,7 @@ pub mod vector_store;
 pub use builder::{Agent, AgentBuilder, FilesystemTools};
 pub use config::{
     AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, ToolsConfig, VectorStoreConfig,
+    ReasoningEffort, SkillConfig, ToolsConfig, VectorStoreConfig,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use provider_agent::{
@@ -69,6 +70,7 @@ pub use request_progress::{
     subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
+pub use skill_tool::LoadSkillTool;
 pub use stream_events::{AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};

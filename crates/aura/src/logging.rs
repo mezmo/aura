@@ -197,6 +197,14 @@ where
     }
 }
 
+/// Ensure aura_config warnings are always visible regardless of RUST_LOG setting.
+///
+/// This is important for operational warnings like duplicate skill detection
+/// that should never be silently filtered.
+fn ensure_aura_config_warnings(filter: EnvFilter) -> EnvFilter {
+    filter.add_directive("aura_config=warn".parse().unwrap())
+}
+
 // ---------------------------------------------------------------------------
 // OTel provider / layer / filter (only when feature = "otel")
 // ---------------------------------------------------------------------------
@@ -333,6 +341,7 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
         // Default: Only binary-specific info level logging on console
         let console_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| format!("{binary_name}=info").into());
+        let console_filter = ensure_aura_config_warnings(console_filter);
 
         let registry =
             tracing_subscriber::registry().with(fmt::layer().with_filter(console_filter));

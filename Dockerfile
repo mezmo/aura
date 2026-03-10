@@ -24,9 +24,9 @@ RUN apt-get update && apt-get install -y \
 # Create app user for security
 RUN useradd -r -s /bin/false appuser
 
-# Create app directory and config directory
+# Create app directory, config directory, and skills directory
 WORKDIR /app
-RUN mkdir -p /app/config && chown -R appuser:appuser /app
+RUN mkdir -p /app/config /app/skills && chown -R appuser:appuser /app
 
 # Copy binary from release-build stage
 COPY --from=release-build /usr/src/app/target/release/aura-web-server /app/
@@ -41,6 +41,7 @@ EXPOSE 3030
 ENV HOST=0.0.0.0
 ENV PORT=3030
 ENV CONFIG_PATH=/app/config/config.toml
+ENV AURA_SKILLS_DIR=/app/skills
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
