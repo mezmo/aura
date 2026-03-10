@@ -256,6 +256,10 @@ pub struct AgentConfig {
     #[serde(default = "default_turn_depth")]
     #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
+    /// Context window size in tokens for this agent. Used for usage percentage
+    /// reporting in streaming events (aura.session_info).
+    #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
+    pub context_window: Option<u32>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -272,6 +276,7 @@ impl Default for AgentConfig {
             reasoning_effort: None,
             max_tokens: None,
             turn_depth: default_turn_depth(),
+            context_window: None,
         }
     }
 }

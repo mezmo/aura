@@ -94,6 +94,7 @@ impl RigBuilder {
             reasoning_effort,
             max_tokens: self.config.agent.max_tokens,
             turn_depth: self.config.agent.turn_depth,
+            context_window: self.config.agent.context_window,
         };
 
         let vector_stores: Vec<VectorStoreConfig> = self

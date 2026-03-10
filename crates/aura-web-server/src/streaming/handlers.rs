@@ -31,7 +31,7 @@ use aura::stream_events::AuraStreamEvent;
 use aura::{
     Agent, ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
     StreamedAssistantContent, StreamedUserContent, ToolCall, ToolLifecycleEvent, ToolResult,
-    ToolUsageEvent, UsageState, get_context_limit,
+    ToolUsageEvent, UsageState,
 };
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
@@ -114,7 +114,7 @@ where
 
     // Emit aura.session_info at stream start (if custom events enabled)
     if emit_custom_events {
-        let context_limit = get_context_limit(&callbacks.model_name);
+        let context_limit = callbacks.agent.context_window();
         let session_info = AuraStreamEvent::session_info(
             &callbacks.model_name,
             context_limit,

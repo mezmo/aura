@@ -65,6 +65,7 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.tool_complete` | Tool execution finished (with duration_ms, result/error) | ✅ Implemented |
 | `aura.reasoning` | LLM reasoning content (requires `AURA_EMIT_REASONING=true`) | ✅ Implemented |
 | `aura.progress` | MCP progress notifications during long-running tools | ✅ Implemented |
+| `aura.session_info` | Session metadata (model, context window) emitted at stream start | ✅ Implemented |
 | `aura.worker_phase` | Multi-agent orchestrator/worker status | 🔲 Future |
 
 ### Event Flow
@@ -138,6 +139,14 @@ data: {"message":"Processing step 3 of 5","phase":"mcp_progress","percent":60,"p
 Note: Progress events are only emitted when:
 1. `AURA_CUSTOM_EVENTS=true` is set
 2. The MCP server sends `notifications/progress` messages during tool execution
+
+**Session info** (emitted once at stream start):
+```
+event: aura.session_info
+data: {"model":"gpt-5.2","model_context_limit":200000,"agent_id":"main","session_id":"sess_xyz"}
+```
+
+Note: `model_context_limit` comes from the `context_window` field in the `[agent]` TOML config section. If `context_window` is not set, `model_context_limit` is omitted from the event.
 
 ### Client Handling
 

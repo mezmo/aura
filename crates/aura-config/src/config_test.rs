@@ -678,4 +678,55 @@ system_prompt = "You are helpful."
             _ => panic!("Expected Ollama config"),
         }
     }
+
+    #[test]
+    fn test_context_window_deserializes_from_toml() {
+        let config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+context_window = 200000
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn test_context_window_defaults_to_none() {
+        let config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.context_window, None);
+    }
+
+    #[test]
+    fn test_context_window_accepts_float() {
+        // Helm renders integers as floats (e.g. 200000.0)
+        let config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+context_window = 200000.0
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.context_window, Some(200_000));
+    }
 }

@@ -95,6 +95,9 @@ pub struct Agent {
     /// Cached tool names for fallback parsing (avoids recomputing on each stream).
     /// Only populated when `fallback_tool_parsing` is enabled.
     fallback_tool_names: Vec<String>,
+    /// Configured context window size in tokens (from TOML config).
+    /// Used for usage percentage reporting in streaming events.
+    context_window: Option<u32>,
 }
 
 impl Agent {
@@ -150,15 +153,6 @@ impl Agent {
 
         // Extract model name for logging
         let model_name = config.llm.model_name().to_string();
-
-        // Check if model has a known context limit (for usage tracking)
-        if crate::model_limits::get_context_limit(&model_name).is_none() {
-            tracing::warn!(
-                model = %model_name,
-                "Model not found in context limits registry - usage percentage will not be available. \
-                 Consider adding this model to model_limits.rs"
-            );
-        }
 
         // Build provider-specific agent with tools
         // Each branch creates its own completion model and agent builder,
@@ -406,6 +400,7 @@ impl Agent {
             mcp_manager,
             fallback_tool_parsing,
             fallback_tool_names,
+            context_window: config.agent.context_window,
         })
     }
 
@@ -832,6 +827,11 @@ impl Agent {
     /// Get reference to the MCP manager (if configured).
     pub fn mcp_manager(&self) -> Option<&McpManager> {
         self.mcp_manager.as_deref()
+    }
+
+    /// Get the configured context window size in tokens.
+    pub fn context_window(&self) -> Option<u32> {
+        self.context_window
     }
 }
 

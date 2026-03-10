@@ -138,3 +138,7 @@ Workflow:
 # Maximum tool-calling rounds per user turn. Higher values allow
 # deeper multi-step workflows but consume more tokens.
 turn_depth = 5
+# Context window size in tokens. Used for usage percentage reporting
+# in aura.session_info streaming events. Set this to your model's
+# actual context window.
+# context_window = 200000

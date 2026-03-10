@@ -17,7 +17,6 @@ pub mod mcp_progress;
 pub mod mcp_response;
 pub mod mcp_streamable_http;
 pub mod mcp_tool_execution;
-pub mod model_limits;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 mod provider_agent; // Private - internal implementation detail
@@ -61,7 +60,6 @@ pub type AuraToolResult = provider_agent::ToolResult;
 pub use mcp::McpManager;
 pub use mcp_progress::ProgressEnabledHandler;
 pub use mcp_streamable_http::InFlightRequests;
-pub use model_limits::get_context_limit;
 pub use rag_tools::{AutoIngest, VectorIngestTool};
 pub use request_cancellation::{RequestCancellation, RequestId};
 pub use request_progress::{

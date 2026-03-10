@@ -183,6 +183,9 @@ pub struct AgentSettings {
     pub max_tokens: Option<u64>,
     #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
+    /// Context window size in tokens. Used for usage percentage reporting.
+    #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
+    pub context_window: Option<u32>,
 }
 
 /// Vector store configuration
@@ -258,6 +261,7 @@ impl Default for AgentConfig {
                 reasoning_effort: None,
                 max_tokens: None,
                 turn_depth: Some(5),
+                context_window: None,
             },
             vector_stores: Vec::new(),
             mcp: None,
