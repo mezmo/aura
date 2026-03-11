@@ -5,13 +5,13 @@ on:
   push:
     branches:
       - main
-  pull_request:
+    tags:
+      - "v*"
+  pull_request_target:
     branches:
       - main
 
 concurrency:
-  # each new commit to a PR runs this workflow
-  # so we need to avoid a long running older one from overwriting the "pr-<number>-latest"
   group: "${{ github.workflow }} @ ${{ github.ref_name }}"
   cancel-in-progress: true
 
@@ -67,39 +67,6 @@ jobs:
       id-token: write
       pull-requests: write
 
-  calculate-version:
-    name: Calculate version
-    runs-on: ubuntu-slim
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    if: |
-      github.event_name == 'pull_request'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          show-progress: false
-          fetch-depth: 0
-
-      - name: Install git-cliff to generate changelog & next version number
-        uses: taiki-e/install-action@385db9cc6bf65d19775b02084a4b698eaca9a4f2 # v2.68.19
-        with:
-          tool: git-cliff
-
-      - name: Calculate next version
-        shell: bash
-        id: version
-        run: |
-          version=$(git-cliff --bumped-version --unreleased --github-token ${{ secrets.GITHUB_TOKEN }})
-
-          # remove v
-          version="${version//v/}"
-
-          # store
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-
   docker-prepare-variables:
     name: Prepare Docker variables and version bump patch
     runs-on: ubuntu-latest
@@ -110,8 +77,6 @@ jobs:
       full_image_name_local_registry: ${{ steps.variables.outputs.full_image_name_local_registry }}
       registry: ${{ steps.variables.outputs.registry }}
       unique_tag: ${{ steps.variables.outputs.unique_tag }}
-    needs:
-      - calculate-version
     steps:
       - &checkout
         name: Check out code
@@ -119,61 +84,30 @@ jobs:
         with:
           show-progress: false
 
-      - name: Cache cargo
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        env:
-          CACHE_NAME: cargo
-        with:
-          path: |
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-${{ github.job }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-${{ github.workflow }}-
-            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-${{ hashFiles('Cargo.lock') }}-
-            ${{ runner.os }}-${{ runner.arch }}-build-${{ env.CACHE_NAME }}-
-
-      - &set_up_mold
-        name: Set up mold
-        uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-
-      - &set_up_toolchain
-        name: Set up toolchain
-        shell: bash
-        run: |
-          rm ${HOME}/.cargo/bin/cargo-fmt
-          rm ${HOME}/.cargo/bin/rust-analyzer
-          rm ${HOME}/.cargo/bin/rustfmt
-
-          rustup self update
-          rustup update
-          rustup show active-toolchain || rustup toolchain install
-          rustup show
-
-          cargo --version
-
       - name: Install cargo-edit to do set-version
+        if: github.ref_type == 'tag'
         uses: taiki-e/install-action@385db9cc6bf65d19775b02084a4b698eaca9a4f2 # v2.68.19
         with:
           tool: cargo-edit
 
       - name: Update Cargo.toml's version
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
-          cargo set-version ${{ needs.calculate-version.outputs.version }}
+          version="${{ github.ref_name }}"
+          version="${version//v/}"
+          cargo set-version "${version}"
 
           git diff
 
       - name: Store version bump diff
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           git diff > /tmp/version-bump.patch
 
       - name: Upload version bump patch
+        if: github.ref_type == 'tag'
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           if-no-files-found: error
@@ -201,7 +135,7 @@ jobs:
               "EOF" >> "$GITHUB_OUTPUT"
 
           # This is the unique docker tag
-          unique_tag=pr-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
+          unique_tag=${{ github.sha }}
           echo "unique_tag=${unique_tag}" >> "${GITHUB_OUTPUT}"
 
           # The registry to which we'll push
@@ -229,19 +163,20 @@ jobs:
       contents: read
       packages: write
     needs:
-      - calculate-version
       - architectures
       - docker-prepare-variables
     steps:
       - *checkout
 
       - name: Download version bump patch
+        if: github.ref_type == 'tag'
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           name: version-bump-patch
           path: /tmp/
 
       - name: Apply version bump patch
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           git apply --allow-empty /tmp/version-bump.patch
@@ -249,7 +184,6 @@ jobs:
           echo "Applied patch:"
           git diff
 
-      # TODO validate no changes between github.event.pull_request.head.sha and the actual current sha (representing the hypothetical merge)
       - name: Set variables
         shell: bash
         id: variables
@@ -283,33 +217,13 @@ jobs:
           registry: ${{ needs.docker-prepare-variables.outputs.registry }}
           username: ${{ secrets.DOCKER_USERNAME }}
 
-      - name: Should we set up QEMU?
-        shell: bash
-        id: setup_qemu
-        run: |
-          base_platform="${{ matrix.platform }}"
-
-          if ! dpkg-architecture --equal "${base_platform%/*}"; then
-            echo "setup_qemu=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "setup_qemu=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
-        if: fromJSON(steps.setup_qemu.outputs.setup_qemu) == true
-        with:
-          platforms: linux/${{ matrix.platform }}
-
       - name: Extract Docker metadata
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         id: meta
         with:
           labels: |
             org.opencontainers.image.description=${{ needs.docker-prepare-variables.outputs.description }} (${{ matrix.platform }})
-            org.opencontainers.image.revision=${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
-            org.opencontainers.image.source=${{ github.event.pull_request.html_url }}
-            org.opencontainers.image.version=pr-${{ github.event.number }}
+            org.opencontainers.image.revision=${{ github.sha }}
           images: ${{ needs.docker-prepare-variables.outputs.full_image_name_local_registry }}
           tags: |
             type=raw,value=${{ steps.variables.outputs.unique_tag_arch }}
@@ -317,11 +231,7 @@ jobs:
       - name: Build Docker image
         uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
         with:
-          build-args: |
-            APPLICATION_NAME=${{ needs.docker-prepare-variables.outputs.application_name }}
           context: .
-          # this container is THE PR's artifact, and we will re-tag it
-          # once the PR has been accepted
           cache-from: type=registry,ref=${{ needs.docker-prepare-variables.outputs.full_image_name_remote_registry }}-cache:${{ needs.docker-prepare-variables.outputs.application_name }}-buildcache-${{ runner.arch }}-${{ steps.variables.outputs.platform_no_slashes }}
           cache-to: type=registry,ref=${{ needs.docker-prepare-variables.outputs.full_image_name_remote_registry }}-cache:${{ needs.docker-prepare-variables.outputs.application_name }}-buildcache-${{ runner.arch }}-${{ steps.variables.outputs.platform_no_slashes }},mode=max
           labels: ${{ steps.meta.outputs.labels }}
@@ -353,10 +263,7 @@ jobs:
       - docker-prepare-variables
       - docker-build
       - rust-build
-    # Check if the event is not triggered by a fork
-    if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event_name == 'pull_request'
+    if: github.ref_type == 'tag'
     steps:
       - name: Set up Docker
         uses: docker/setup-docker-action@1a6edb0ba9ac496f6850236981f15d8f9a82254d # v5.0.0
@@ -385,12 +292,12 @@ jobs:
           images: ${{ needs.docker-prepare-variables.outputs.full_image_name_remote_registry }}
           labels: |
             org.opencontainers.image.description=${{ needs.docker-prepare-variables.outputs.description }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
-            org.opencontainers.image.source=${{ github.event.pull_request.html_url }}
-            org.opencontainers.image.version=pr-${{ github.event.number }}
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: |
-            type=raw,value=${{ needs.docker-prepare-variables.outputs.unique_tag }}
-            type=ref,event=pr,suffix=-latest
+            type=semver,pattern={{version}},prefix=v
+            type=semver,pattern=v{{major}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=raw,value=latest
 
       - name: Download artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -483,10 +390,7 @@ jobs:
       - docker-prepare-variables
       - docker-build
       - docker-publish
-    # Check if the event is not triggered by a fork
-    if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event_name == 'pull_request'
+    if: github.ref_type == 'tag'
     steps:
       - name: Set up Docker
         uses: docker/setup-docker-action@1a6edb0ba9ac496f6850236981f15d8f9a82254d # v5.0.0
@@ -528,7 +432,6 @@ jobs:
     # combination of upstream skip and success: success
     runs-on: ubuntu-slim
     needs:
-      - calculate-version
       - docker-prepare-variables
       - rust-build
       - docker-build

@@ -71,7 +71,7 @@ jobs:
     needs:
       - warm-up-cache
     if: |
-      github.event_name == 'pull_request'
+      github.event_name == 'pull_request_target'
     steps:
       - *checkout
 
@@ -119,7 +119,7 @@ jobs:
     needs:
       - warm-up-cache
     if: |
-      github.event_name == 'pull_request'
+      github.event_name == 'pull_request_target'
     steps:
       - *checkout
 
@@ -241,7 +241,7 @@ jobs:
     needs:
       - warm-up-cache
     if: |
-      github.event_name == 'pull_request'
+      github.event_name == 'pull_request_target'
     steps:
       - *checkout
 
