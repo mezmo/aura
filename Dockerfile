@@ -1,3 +1,23 @@
+# Stage 0: linting & testing
+FROM rust:1.93.1 AS release-lint-test
+
+WORKDIR /usr/src/app
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+
+# Install rustfmt and clippy
+RUN rustup component add rustfmt clippy
+
+# Run formatting check, tests, and linting
+# Note: These commands will fail the build if any check fails
+# --lib runs only unit tests (in src/), skips integration tests (in tests/ dirs)
+# Integration tests require running servers and are executed separately via run_tests.sh
+RUN cargo fmt --all -- --check
+RUN cargo clippy --all-targets --all-features -- -D warnings
+RUN cargo test --workspace --lib
+
 # Stage 1: release-build - Release compilation
 FROM rust:1.93.1 AS release-build
 

@@ -243,7 +243,7 @@ spec:
               {{#args}}
               - "{{{.}}}"
               {{/args}}
-              image: us.gcr.io/logdna-k8s/aura:${RELEASE_VERSION}
+              image: mezmo/aura:${RELEASE_VERSION}
               imagePullPolicy: IfNotPresent
               env:
               # Server configuration

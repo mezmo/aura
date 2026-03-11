@@ -3,6 +3,7 @@ def PROJECT_NAME = 'aura-oss'
 def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
 def TRIGGER_PATTERN = '.*@logdnabot.*'
+def DOCKER_REPO = "docker.io/mezmo"
 
 pipeline {
   agent {
@@ -105,7 +106,7 @@ pipeline {
 
         stage('Integration Tests') {
           environment {
-            MOCK_MCP_IMAGE = 'us.gcr.io/logdna-k8s/aura-mock-mcp:1.0.0'
+            MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
           }
 
           steps {
@@ -175,9 +176,14 @@ pipeline {
 
           def RELEASE_VERSION = FEATURE_TAG
 
-          def image = gcr.build(PROJECT_NAME)
-          image.push(RELEASE_VERSION)
-          gcr.clean(image.id)
+          buildx.build(
+            project: PROJECT_NAME
+          , push: true
+          , tags: [FEATURE_TAG]
+          , dockerfile: "Dockerfile"
+          , args: [RELEASE_VERSION: FEATURE_TAG]
+          , docker_repo: DOCKER_REPO
+          )
 
           withCredentials([[
             $class: 'AmazonWebServicesCredentialsBinding',
@@ -216,14 +222,24 @@ pipeline {
           sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
           sh 'npx semantic-release'
 
-          def RELEASE_VERSION = sh(
+          // 1.2.3
+          def RELEASE_VERSION_PATCH = sh(
             returnStdout: true,
             script: 'cargo metadata -q --no-deps --format-version 1 | jq -r \'.packages[0].version\''
           ).trim()
+          // 1.2
+          def RELEASE_VERSION_MINOR = RELEASE_VERSION_PATCH.tokenize('.').take(2).join('.')
+          // 1
+          def RELEASE_VERSION_MAJOR = RELEASE_VERSION_PATCH.tokenize('.')[0]
 
-          def image = gcr.build(PROJECT_NAME)
-          image.push(RELEASE_VERSION)
-          gcr.clean(image.id)
+          buildx.build(
+            project: PROJECT_NAME
+          , push: true
+          , tags: ['latest', RELEASE_VERSION_PATCH, RELEASE_VERSION_MINOR, RELEASE_VERSION_MAJOR]
+          , dockerfile: "Dockerfile"
+          , args: [RELEASE_VERSION: RELEASE_VERSION_PATCH]
+          , docker_repo: DOCKER_REPO
+          )
 
           withCredentials([[
             $class: 'AmazonWebServicesCredentialsBinding',
@@ -232,8 +248,8 @@ pipeline {
             secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
           ]]) {
             sh script: 'make clean'
-            sh script: "make render RELEASE_VERSION=${RELEASE_VERSION}", label: "Generate k8s Artifacts"
-            sh script: "make publish RELEASE_VERSION=${RELEASE_VERSION}", label: "Publish k8s Artifacts"
+            sh script: "make render RELEASE_VERSION=${RELEASE_VERSION_PATCH}", label: "Generate k8s Artifacts"
+            sh script: "make publish RELEASE_VERSION=${RELEASE_VERSION_PATCH}", label: "Publish k8s Artifacts"
           }
         }
       }

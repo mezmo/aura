@@ -6,7 +6,7 @@ replicaCount: 1
 
 image:
   # -- Container image repository
-  repository: us.gcr.io/logdna-k8s/aura
+  repository: mezmo/aura
   # -- Image pull policy
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (default is the chart appVersion)
