@@ -589,7 +589,7 @@ impl Agent {
                     break;
                 }
                 Ok(StreamItem::FinalMarker) => {
-                    break;
+                    // Per-turn marker — not end-of-stream. Continue collecting.
                 }
                 Ok(_) => {
                     // Tool calls, deltas, reasoning - handled by fallback executor
