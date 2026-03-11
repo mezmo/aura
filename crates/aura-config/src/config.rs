@@ -239,6 +239,21 @@ pub struct ToolsConfig {
     pub custom_tools: Vec<String>,
 }
 
+/// Skills configuration - supports directory-based skill discovery
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SkillsConfig {
+    /// Local skill sources (directories containing skill subdirectories)
+    #[serde(default)]
+    pub local: Vec<LocalSkillSource>,
+}
+
+/// A local directory source for skill discovery
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct LocalSkillSource {
+    /// Path to directory containing skill subdirectories (absolute or relative to config file)
+    pub source: String,
+}
+
 /// Agent configuration
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AgentConfig {
@@ -256,6 +271,9 @@ pub struct AgentConfig {
     #[serde(default = "default_turn_depth")]
     #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
+    /// Skills configuration for directory-based skill discovery
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -272,6 +290,7 @@ impl Default for AgentConfig {
             reasoning_effort: None,
             max_tokens: None,
             turn_depth: default_turn_depth(),
+            skills: SkillsConfig::default(),
         }
     }
 }
@@ -312,6 +331,15 @@ impl Config {
                     "Embedding model API key is required for vector store '{}'",
                     store.name
                 )));
+            }
+        }
+
+        // Validate skill sources
+        for source in &self.agent.skills.local {
+            if source.source.is_empty() {
+                return Err(crate::ConfigError::Validation(
+                    "Skill source path cannot be empty".to_string(),
+                ));
             }
         }
 

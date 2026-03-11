@@ -121,8 +121,9 @@ struct ResponseContext {
 async fn build_agent_for_request(
     config: &aura_config::Config,
     req_headers: &HashMap<String, String>,
+    config_dir: &std::path::Path,
 ) -> Result<Arc<aura::Agent>, HttpResponse> {
-    let builder = RigBuilder::new(config.clone());
+    let builder = RigBuilder::new(config.clone()).with_config_dir(config_dir.to_path_buf());
     let agent = builder
         .build_agent_with_headers(Some(req_headers))
         .await
@@ -185,7 +186,7 @@ async fn prepare_request(
         .collect();
 
     // Build a fresh agent for this request
-    let agent = match build_agent_for_request(&data.config, req_headers_map).await {
+    let agent = match build_agent_for_request(&data.config, req_headers_map, &data.config_dir).await {
         Ok(agent) => agent,
         Err(response) => return Err(response),
     };

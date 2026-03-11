@@ -171,6 +171,21 @@ impl LlmConfig {
     }
 }
 
+/// Skill configuration for on-demand loading via the load_skill tool.
+///
+/// Skills follow the Agent Skills specification (<https://agentskills.io/specification>).
+/// Each skill is a directory containing a `SKILL.md` file with YAML frontmatter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillConfig {
+    /// Unique name for this skill (must match directory name).
+    /// Lowercase alphanumeric and hyphens only, 1-64 chars.
+    pub name: String,
+    /// Human-readable description from SKILL.md frontmatter
+    pub description: String,
+    /// Absolute path to the skill directory
+    pub path: std::path::PathBuf,
+}
+
 /// Agent behavior settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
@@ -183,6 +198,9 @@ pub struct AgentSettings {
     pub max_tokens: Option<u64>,
     #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
+    /// On-demand skill definitions loaded via the load_skill tool
+    #[serde(default)]
+    pub skills: Vec<SkillConfig>,
 }
 
 /// Vector store configuration
@@ -258,6 +276,7 @@ impl Default for AgentConfig {
                 reasoning_effort: None,
                 max_tokens: None,
                 turn_depth: Some(5),
+                skills: Vec::new(),
             },
             vector_stores: Vec::new(),
             mcp: None,

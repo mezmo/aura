@@ -136,6 +136,15 @@ async fn run() -> std::io::Result<()> {
     let (provider, model) = config_arc.llm.model_info();
     info!("Aura initialized with {}/{}", provider, model);
 
+    // Derive config directory from config file's parent directory.
+    // Path::parent() on a bare filename like "config.toml" returns Some("") (empty path),
+    // so we filter that out and fall back to "." for the current directory.
+    let config_dir = std::path::Path::new(&args.config)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
     let stream_shutdown_token = CancellationToken::new();
@@ -153,6 +162,7 @@ async fn run() -> std::io::Result<()> {
         aura_emit_reasoning: args.aura_emit_reasoning,
         streaming_timeout_secs: args.streaming_timeout_secs,
         first_chunk_timeout_secs: args.first_chunk_timeout_secs,
+        config_dir,
         shutdown_token: shutdown_token.clone(),
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),

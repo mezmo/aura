@@ -61,6 +61,8 @@ pub struct AppState {
     pub streaming_timeout_secs: u64,
     /// First chunk timeout in seconds (0 = disabled). Protects against hung provider connections.
     pub first_chunk_timeout_secs: u64,
+    /// Base directory for resolving relative config paths (skill sources, etc.)
+    pub config_dir: std::path::PathBuf,
     /// Shutdown gate — cancelled immediately on SIGTERM/SIGINT to reject new requests (503)
     pub shutdown_token: CancellationToken,
     /// Stream shutdown — cancelled after grace period to terminate in-flight streams
