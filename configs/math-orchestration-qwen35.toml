@@ -1,25 +1,16 @@
-# Math Orchestration — Sonnet 4.5 with adaptive thinking
+# Math Orchestration — Qwen3.5-35B-A3B (thinking disabled)
 #
-# Same as math-orchestration-sonnet.toml but with Anthropic adaptive thinking
-# enabled via additional_params. Used for A/B testing coordinator thinking.
-#
-# Requires temperature = 1.0 (Anthropic constraint for thinking models).
-#
-# Start the math-mcp container first:
-#
-#   cd ~/workspace/aura-math-orchestration && docker compose up -d
-#
-# Then run aura locally:
-#
-#   CONFIG_PATH=configs/math-orchestration-sonnet-adaptive.toml \
-#   ANTHROPIC_API_KEY=sk-... \
-#   AURA_CUSTOM_EVENTS=true \
-#   cargo run --bin aura-web-server
+# Uses the math-mcp server (21 real math tools) with three specialized workers.
+# Requires SSH tunnel to notanton: ssh -L 11435:127.0.0.1:8080 notanton
 
 [llm]
-provider = "anthropic"
-api_key = "{{ env.ANTHROPIC_API_KEY }}"
-model = "claude-sonnet-4-5-20250929"
+provider = "openai"
+api_key = "no-key-needed"
+base_url = "http://localhost:11435/v1"
+model = "qwen35-64k"
+
+[llm.additional_params]
+enable_thinking = false
 
 [agent]
 name = "Math Orchestrator"
@@ -32,8 +23,7 @@ ROUTING GUIDANCE:
 - Multi-step calculations or mixed domains: create a plan with workers
 - Vague or ambiguous requests: ask for clarification
 """
-temperature = 1.0
-additional_params = { thinking = { type = "adaptive" } }
+temperature = 0.3
 
 [mcp]
 sanitize_schemas = false
@@ -55,10 +45,10 @@ allow_clarification = true
 tools_in_planning = "summary"
 
 [orchestration.timeouts]
-per_call_timeout_secs = 60
+per_call_timeout_secs = 120
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-math-sonnet-adaptive"
+memory_dir = "/tmp/aura-math-qwen35"
 
 # Arithmetic worker: basic operations
 [orchestration.worker.arithmetic]
