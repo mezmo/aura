@@ -1,5 +1,5 @@
 library 'magic-butler-catalogue'
-def PROJECT_NAME = 'aura-oss'
+def PROJECT_NAME = 'aura'
 def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
 def TRIGGER_PATTERN = '.*@logdnabot.*'
