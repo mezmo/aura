@@ -15,7 +15,7 @@ license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
 [workspace.dependencies]
-rig-core = { git = "https://github.com/mezmo/rig.git", branch = "mshearer/LOG-23351-openai-reasoning", features = ["rmcp"] }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "34e837b245b60f33284b4b9438ca3a4c89987de5", features = ["rmcp"] }
 # Pinned to exact versions compatible with our rig-core 0.28.x fork.
 # Newer versions pull in rig-core 0.31+ which is semver-incompatible with the fork.
 rig-bedrock = "=0.3.10"
@@ -29,7 +29,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # Async runtime
-tokio = { version = "1.45", features = ["full", "test-util"] }
+tokio = { version = "1.45", features = ["full"] }
 
 # Error handling
 thiserror = "2.0"
@@ -70,5 +70,5 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
-rig-core = { git = "https://github.com/mezmo/rig.git", branch = "mshearer/LOG-23351-openai-reasoning" }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "34e837b245b60f33284b4b9438ca3a4c89987de5" }
 
