@@ -1,3 +1,10 @@
+## [1.14.11](https://github.com/mezmo/aura/compare/v1.14.10...v1.14.11) (2026-03-11)
+
+
+### Bug Fixes
+
+* strip system role and empty messages [3cf3580](https://github.com/mezmo/aura/commit/3cf3580a3b8f952aa684588fed24d33ca33b5982) - Mike Shearer [LOG-23402](https://logdna.atlassian.net/browse/LOG-23402)
+
 ## [1.14.10](https://github.com/mezmo/aura/compare/v1.14.9...v1.14.10) (2026-03-11)
 
 
