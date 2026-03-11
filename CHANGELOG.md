@@ -1,3 +1,10 @@
+## [1.14.12](https://github.com/mezmo/aura/compare/v1.14.11...v1.14.12) (2026-03-11)
+
+
+### Chores
+
+* **project**: change from aura-oss to aura [08a5eed](https://github.com/mezmo/aura/commit/08a5eed5471ff6dec49263589b9950d96d0fdb57) - Gregory Janco [LOG-23283](https://logdna.atlassian.net/browse/LOG-23283)
+
 ## [1.14.11](https://github.com/mezmo/aura/compare/v1.14.10...v1.14.11) (2026-03-11)
 
 
