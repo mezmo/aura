@@ -154,15 +154,13 @@ struct RequestSetup {
 /// Extract query, chat history, and build agent — shared across both code paths.
 async fn prepare_request(
     data: &web::Data<AppState>,
-    req: &ChatCompletionRequest,
+    req: &mut ChatCompletionRequest,
     chat_session_id: &str,
     req_headers_map: &HashMap<String, String>,
 ) -> Result<RequestSetup, HttpResponse> {
-    use aura::Message;
-
-    // Extract the last user message as the query
-    let query = match req.messages.last() {
-        Some(msg) if msg.role == "user" => msg.content.clone(),
+    // Pop the last message as the query — the remainder becomes chat history
+    let query = match req.messages.pop() {
+        Some(msg) if msg.role == Role::User => msg.content,
         Some(msg) => {
             return Err(HttpResponse::BadRequest().json(ErrorResponse {
                 error: ErrorDetail {
@@ -171,18 +169,19 @@ async fn prepare_request(
                 },
             }));
         }
-        None => unreachable!(), // Already checked for empty messages
+        None => {
+            return Err(HttpResponse::BadRequest().json(ErrorResponse {
+                error: ErrorDetail {
+                    message: "messages array is empty".to_string(),
+                    error_type: "invalid_request_error".to_string(),
+                },
+            }));
+        }
     };
 
-    // Convert OpenAI messages to Rig messages (all except the last user message)
-    let chat_history: Vec<Message> = req.messages[..req.messages.len() - 1]
-        .iter()
-        .map(|msg| match msg.role.as_str() {
-            "user" => Message::user(&msg.content),
-            "assistant" => Message::assistant(&msg.content),
-            _ => Message::user(&msg.content), // Fallback for system/other roles
-        })
-        .collect();
+    // Convert remaining OpenAI messages to Rig messages,
+    // dropping system role messages and filtering empty content.
+    let chat_history = convert_chat_messages(&req.messages);
 
     // Build a fresh agent for this request
     let agent = match build_agent_for_request(&data.config, req_headers_map).await {
@@ -249,7 +248,8 @@ pub async fn chat_completions(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
-    let setup = match prepare_request(&data, &req, &chat_session_id, &req_headers_map).await {
+    let mut req = req.into_inner();
+    let setup = match prepare_request(&data, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -473,7 +473,7 @@ fn build_json_response(
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessage {
-                role: "assistant".to_string(),
+                role: Role::Assistant,
                 content: collected.outcome.content,
             },
             finish_reason: finish_reason.to_string(),
@@ -581,6 +581,34 @@ async fn handle_streaming_completion(
         .streaming(response_stream)
 }
 
+/// Convert OpenAI-format chat messages to Rig messages, sanitizing the history:
+/// - Drops `system` role messages (Aura's preamble is the authoritative system prompt)
+/// - Filters messages with empty/whitespace-only content
+/// - Maps `user` and `assistant` roles; skips unknown roles
+fn convert_chat_messages(messages: &[ChatMessage]) -> Vec<aura::Message> {
+    use aura::Message;
+
+    messages
+        .iter()
+        .filter_map(|msg| match msg.role {
+            Role::System => {
+                tracing::warn!("Dropping system role message from chat history — Aura's preamble is authoritative");
+                None
+            }
+            _ if msg.content.trim().is_empty() => {
+                tracing::warn!(role = %msg.role, "Dropping empty message from chat history");
+                None
+            }
+            Role::User => Some(Message::user(&msg.content)),
+            Role::Assistant => Some(Message::assistant(&msg.content)),
+            Role::Unknown => {
+                tracing::warn!(role = %msg.role, "Skipping message with unknown role");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Health check endpoint
 pub async fn health() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
@@ -613,9 +641,85 @@ fn generate_chat_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::types::{ChatMessage, Role};
+
+    fn msg(role: Role, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_system_messages_dropped() {
+        let messages = vec![
+            msg(Role::System, "You are a helpful assistant"),
+            msg(Role::User, "Hello"),
+        ];
+        let result = convert_chat_messages(&messages);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_messages_filtered() {
+        let messages = vec![
+            msg(Role::User, "Hello"),
+            msg(Role::Assistant, ""),
+            msg(Role::Assistant, "   "),
+            msg(Role::User, "How are you?"),
+        ];
+        let result = convert_chat_messages(&messages);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_no_system_passthrough() {
+        let messages = vec![
+            msg(Role::User, "Hello"),
+            msg(Role::Assistant, "Hi there"),
+            msg(Role::User, "How are you?"),
+        ];
+        let result = convert_chat_messages(&messages);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_mixed_conversation() {
+        // Simulates LibreChat-style: system + prior messages + empty assistant
+        let messages = vec![
+            msg(Role::System, "You are a helpful assistant"),
+            msg(Role::User, "What is Rust?"),
+            msg(Role::Assistant, ""),
+            msg(Role::Assistant, "Rust is a systems programming language."),
+            msg(Role::User, "Tell me more"),
+        ];
+        let result = convert_chat_messages(&messages);
+        assert_eq!(result.len(), 3); // user, assistant(non-empty), user
+    }
+
+    #[test]
+    fn test_unknown_roles_skipped() {
+        let messages = vec![
+            msg(Role::Unknown, "some tool output"),
+            msg(Role::User, "Hello"),
+        ];
+        let result = convert_chat_messages(&messages);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_empty_input() {
+        let result = convert_chat_messages(&[]);
+        assert!(result.is_empty());
+    }
+
+    // --- streaming / response builder tests ---
+
     use crate::streaming::{
         ChatCompletionChunkDelta, MessageRole, ToolResultMode, truncate_result,
     };
+    use crate::streaming::{StreamOutcome, UsageInfo};
 
     #[test]
     fn test_truncate_result_no_truncation_when_zero() {
@@ -675,9 +779,6 @@ mod tests {
         assert!(!json.contains("role"));
         assert!(json.contains(r#""content":"World""#));
     }
-
-    use super::*;
-    use crate::streaming::{StreamOutcome, UsageInfo};
 
     fn make_response_ctx() -> ResponseContext {
         ResponseContext {

@@ -69,10 +69,33 @@ pub struct AppState {
     pub active_requests: Arc<ActiveRequestTracker>,
 }
 
+/// OpenAI-compatible message role
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    /// Catch-all for roles we don't handle (e.g. "tool", "function")
+    #[serde(other, rename = "unknown")]
+    Unknown,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::System => write!(f, "system"),
+            Role::User => write!(f, "user"),
+            Role::Assistant => write!(f, "assistant"),
+            Role::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 /// OpenAI-compatible chat message structure
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
+    pub role: Role,
     pub content: String,
 }
 
