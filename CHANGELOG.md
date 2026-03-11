@@ -1,3 +1,10 @@
+## [1.14.9](https://github.com/mezmo/aura/compare/v1.14.8...v1.14.9) (2026-03-11)
+
+
+### Bug Fixes
+
+* stop breaking early on pre tool text [1c73989](https://github.com/mezmo/aura/commit/1c739897ee006f912e46728ed11eb540388d1675) - Mike Shearer [LOG-23401](https://logdna.atlassian.net/browse/LOG-23401)
+
 ## [1.14.8](https://github.com/mezmo/aura/compare/v1.14.7...v1.14.8) (2026-03-10)
 
 
