@@ -369,6 +369,18 @@ pub struct OrchestrationConfig {
     /// Vector stores available to the coordinator agent.
     pub coordinator_vector_stores: Vec<String>,
 
+    // --- Safety ---
+    /// Maximum consecutive duplicate tool calls before rejection.
+    ///
+    /// When a worker calls the same tool with identical arguments and receives
+    /// the same result this many times in a row, subsequent calls are rejected
+    /// with a nudge to emit the final answer. Prevents infinite ReAct loops
+    /// in smaller/quantized models.
+    ///
+    /// Default: 2. Set to `None` / omit to use default. Set to a high value
+    /// (e.g., 999) to effectively disable.
+    pub max_consecutive_duplicate_tool_calls: Option<usize>,
+
     // --- Sub-configs ---
     /// Timeout settings for LLM calls.
     pub timeouts: TimeoutsConfig,
@@ -535,6 +547,7 @@ impl Default for OrchestrationConfig {
             worker_system_prompt: None,
             workers: HashMap::new(),
             coordinator_vector_stores: Vec::new(),
+            max_consecutive_duplicate_tool_calls: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
         }
@@ -580,6 +593,8 @@ struct RawOrchestrationConfig {
     workers: HashMap<String, WorkerConfig>,
     #[serde(default)]
     coordinator_vector_stores: Vec<String>,
+    #[serde(default)]
+    max_consecutive_duplicate_tool_calls: Option<usize>,
 
     // --- Sub-tables ---
     #[serde(default)]
@@ -630,6 +645,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             worker_system_prompt: raw.worker_system_prompt,
             workers: raw.workers,
             coordinator_vector_stores: raw.coordinator_vector_stores,
+            max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
             timeouts,
             artifacts,
         })

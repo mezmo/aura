@@ -25,6 +25,8 @@ services:
   k8s-sre-mcp:
     build:
       context: ../tests/integration/k8s-sre-mcp
+    ports:
+      - "8082:8082"  # K8s SRE MCP server
     environment:
       - VERBOSE_MODE=${VERBOSE_MODE:-false}
     healthcheck:

@@ -15,10 +15,6 @@ services:
       - "9998:9998"  # Rust cancellation server
       - "9999:9999"  # Python FastMCP server
 
-  math-mcp:
-    ports:
-      - "8081:8081"  # Math MCP server (orchestration tests)
-
   aura-web-server:
     ports:
       - "8080:8080"
