@@ -141,10 +141,11 @@ impl Plan {
     /// Advance to the next phase. Returns `true` if there is a next phase.
     pub fn advance_phase(&mut self) -> bool {
         if let Some(phases) = &self.phases
-            && self.current_phase_index + 1 < phases.len() {
-                self.current_phase_index += 1;
-                return true;
-            }
+            && self.current_phase_index + 1 < phases.len()
+        {
+            self.current_phase_index += 1;
+            return true;
+        }
         false
     }
 
