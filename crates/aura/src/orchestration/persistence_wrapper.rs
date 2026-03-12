@@ -91,14 +91,8 @@ impl ToolWrapper for PersistenceWrapper {
         if reasoning.trim().is_empty() {
             tracing::warn!(
                 tool = %ctx.tool_name,
-                "Rejected tool call: empty _aura_reasoning"
+                "Tool call with empty _aura_reasoning (allowed, reasoning is optional)"
             );
-            return Err(ToolError::ToolCallError(
-                "REQUIRED: You MUST provide a non-empty '_aura_reasoning' field explaining \
-                 your reasoning for this tool call. Retry this tool call with a detailed \
-                 reasoning string describing what you are trying to accomplish."
-                    .into(),
-            ));
         }
 
         Ok(())
@@ -213,17 +207,9 @@ pub fn add_reasoning_to_schema(schema: &mut Value) {
             );
         }
 
-        // Ensure "required" exists and includes "_aura_reasoning"
-        let required = obj
-            .entry("required")
-            .or_insert_with(|| Value::Array(Vec::new()));
-
-        if let Value::Array(req_arr) = required {
-            let reasoning_val = Value::String(REASONING_FIELD.to_string());
-            if !req_arr.contains(&reasoning_val) {
-                req_arr.push(reasoning_val);
-            }
-        }
+        // Note: _aura_reasoning is intentionally NOT added to the "required" array.
+        // Making it optional avoids validation rejection errors that break
+        // smaller/quantized models' ReAct loops.
     }
 }
 
@@ -264,9 +250,9 @@ mod tests {
         assert!(props.contains_key(REASONING_FIELD));
         assert_eq!(props[REASONING_FIELD]["type"], "string");
 
-        // Check reasoning is in required array
+        // Reasoning should NOT be in required array (optional to avoid breaking quantized models)
         let required = schema["required"].as_array().unwrap();
-        assert!(required.contains(&Value::String(REASONING_FIELD.to_string())));
+        assert!(!required.contains(&Value::String(REASONING_FIELD.to_string())));
     }
 
     #[test]
@@ -291,10 +277,10 @@ mod tests {
         // Check reasoning property was added
         assert!(props.contains_key(REASONING_FIELD));
 
-        // Check both are in required array
+        // Check pipeline_id still required, but reasoning is NOT required (optional)
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&Value::String("pipeline_id".to_string())));
-        assert!(required.contains(&Value::String(REASONING_FIELD.to_string())));
+        assert!(!required.contains(&Value::String(REASONING_FIELD.to_string())));
     }
 
     #[test]
@@ -308,13 +294,13 @@ mod tests {
         add_reasoning_to_schema(&mut schema);
         add_reasoning_to_schema(&mut schema);
 
-        // Should only have one reasoning field
+        // Reasoning should not be in required at all (optional)
         let required = schema["required"].as_array().unwrap();
         let reasoning_count = required
             .iter()
             .filter(|v| v == &&Value::String(REASONING_FIELD.to_string()))
             .count();
-        assert_eq!(reasoning_count, 1);
+        assert_eq!(reasoning_count, 0);
     }
 
     #[test]
@@ -331,10 +317,12 @@ mod tests {
             Some("I need to analyze this pipeline because...".to_string())
         );
         assert_eq!(clean_args["pipeline_id"], "abc123");
-        assert!(!clean_args
-            .as_object()
-            .unwrap()
-            .contains_key(REASONING_FIELD));
+        assert!(
+            !clean_args
+                .as_object()
+                .unwrap()
+                .contains_key(REASONING_FIELD)
+        );
     }
 
     #[test]
@@ -375,11 +363,13 @@ mod tests {
         let result = wrapper.transform_args(args, &ctx);
 
         // Args should have reasoning removed
-        assert!(!result
-            .args
-            .as_object()
-            .unwrap()
-            .contains_key("_aura_reasoning"));
+        assert!(
+            !result
+                .args
+                .as_object()
+                .unwrap()
+                .contains_key("_aura_reasoning")
+        );
         assert_eq!(result.args["param"], "value");
 
         // Extracted should contain reasoning
@@ -409,7 +399,7 @@ mod tests {
         assert!(props.contains_key("_aura_reasoning"));
 
         let required = modified["required"].as_array().unwrap();
-        assert!(required.contains(&Value::String("_aura_reasoning".to_string())));
+        assert!(!required.contains(&Value::String("_aura_reasoning".to_string())));
     }
 
     use std::future::Future;
@@ -497,8 +487,8 @@ mod tests {
 
         let required = def.parameters["required"].as_array().unwrap();
         assert!(
-            required.contains(&Value::String("_aura_reasoning".to_string())),
-            "Schema should require _aura_reasoning"
+            !required.contains(&Value::String("_aura_reasoning".to_string())),
+            "Schema should NOT require _aura_reasoning (optional)"
         );
     }
 
@@ -525,7 +515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wrapped_tool_rejects_missing_reasoning() {
+    async fn test_wrapped_tool_accepts_missing_reasoning() {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
@@ -541,16 +531,14 @@ mod tests {
         });
 
         let result = wrapped.call(args).await;
-        assert!(result.is_err(), "Should reject tool call without reasoning");
-        let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("_aura_reasoning"),
-            "Error should mention _aura_reasoning: {err}"
+            result.is_ok(),
+            "Should accept tool call without reasoning (optional)"
         );
     }
 
     #[tokio::test]
-    async fn test_wrapped_tool_rejects_empty_reasoning() {
+    async fn test_wrapped_tool_accepts_empty_reasoning() {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
@@ -568,8 +556,8 @@ mod tests {
 
         let result = wrapped.call(args).await;
         assert!(
-            result.is_err(),
-            "Should reject tool call with empty reasoning"
+            result.is_ok(),
+            "Should accept tool call with empty reasoning (optional)"
         );
     }
 

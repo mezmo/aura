@@ -40,9 +40,11 @@ mod tests {
     #[test]
     fn test_section_headers_are_uppercase() {
         assert_eq!(sections::ORCHESTRATION_GOAL.chars().next().unwrap(), 'O');
-        assert!(sections::PRIOR_WORK
-            .chars()
-            .all(|c| c.is_uppercase() || c.is_whitespace()));
+        assert!(
+            sections::PRIOR_WORK
+                .chars()
+                .all(|c| c.is_uppercase() || c.is_whitespace())
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 
 use aura::orchestration::event_names;
 use aura_test_utils::server_urls::AURA_SERVER;
-use aura_test_utils::sse::{events_by_type, parse_sse_stream, SseEvent};
-use serde_json::{json, Value};
+use aura_test_utils::sse::{SseEvent, events_by_type, parse_sse_stream};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(180);

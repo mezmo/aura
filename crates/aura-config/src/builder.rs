@@ -1,8 +1,8 @@
 use crate::{Config, ConfigError};
 use aura::{
-    orchestration::ToolVisibility as AuraToolVisibility, Agent, AgentBuilder, AgentConfig,
-    AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    OrchestrationConfig, ReasoningEffort, StreamingAgent, ToolsConfig, VectorStoreConfig,
+    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
+    McpServerConfig, OrchestrationConfig, ReasoningEffort, StreamingAgent, ToolsConfig,
+    VectorStoreConfig, orchestration::ToolVisibility as AuraToolVisibility,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -202,8 +202,7 @@ impl RigBuilder {
                 max_tools_per_worker: orch.max_tools_per_worker,
                 allow_direct_answers: orch.allow_direct_answers,
                 allow_clarification: orch.allow_clarification,
-                max_consecutive_duplicate_tool_calls: orch
-                    .max_consecutive_duplicate_tool_calls,
+                max_consecutive_duplicate_tool_calls: orch.max_consecutive_duplicate_tool_calls,
                 timeouts: aura::orchestration::TimeoutsConfig {
                     per_call_timeout_secs: orch.timeouts.per_call_timeout_secs,
                 },
