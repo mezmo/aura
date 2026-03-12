@@ -9,6 +9,118 @@ use serde::{Deserialize, Serialize};
 
 use crate::string_utils::safe_truncate;
 
+/// Maximum nesting depth for step structures.
+/// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
+/// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
+const MAX_STEP_NESTING: usize = 2;
+
+/// A step in a sequential plan. Deserialized via untagged enum — serde tries
+/// variants in declaration order: `ParallelGroup`, `SubChain`, then `LeafTask`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum StepInput {
+    /// A group of steps that execute in parallel.
+    ParallelGroup { parallel: Vec<StepInput> },
+    /// A sequential sub-chain (only valid inside a `ParallelGroup`).
+    SubChain { steps: Vec<StepInput> },
+    /// A single task to execute.
+    LeafTask {
+        task: String,
+        #[serde(default)]
+        worker: Option<String>,
+    },
+}
+
+/// Convert a list of `StepInput` into a flat `Vec<Task>` with auto-assigned IDs
+/// and frontier-based dependency tracking.
+///
+/// Top-level steps are sequential: each step depends on all tasks produced by
+/// the previous step (the "frontier"). Parallel groups run their branches
+/// concurrently, and the combined exit tasks form the new frontier.
+pub fn flatten_steps(steps: &[StepInput]) -> Result<Vec<Task>, String> {
+    if steps.is_empty() {
+        return Err("Steps list is empty".to_string());
+    }
+    let mut tasks = Vec::new();
+    let mut counter: usize = 0;
+    let frontier = Vec::new(); // initial frontier is empty (no deps for first step)
+    flatten_sequential(steps, &frontier, &mut counter, &mut tasks, 0)?;
+    Ok(tasks)
+}
+
+/// Flatten a sequential list of steps. Each step depends on the current frontier,
+/// and produces a new frontier for the next step.
+fn flatten_sequential(
+    steps: &[StepInput],
+    initial_frontier: &[usize],
+    counter: &mut usize,
+    tasks: &mut Vec<Task>,
+    depth: usize,
+) -> Result<Vec<usize>, String> {
+    let mut frontier = initial_frontier.to_vec();
+
+    for step in steps {
+        frontier = flatten_one(step, &frontier, counter, tasks, depth)?;
+    }
+
+    Ok(frontier)
+}
+
+/// Flatten a single step, returning the new frontier (task IDs produced).
+fn flatten_one(
+    step: &StepInput,
+    frontier: &[usize],
+    counter: &mut usize,
+    tasks: &mut Vec<Task>,
+    depth: usize,
+) -> Result<Vec<usize>, String> {
+    match step {
+        StepInput::LeafTask { task, worker } => {
+            let id = *counter;
+            *counter += 1;
+            let mut t = Task::new(id, task.clone(), String::new());
+            t.dependencies = frontier.to_vec();
+            if let Some(w) = worker {
+                t.worker = Some(w.clone());
+            }
+            tasks.push(t);
+            Ok(vec![id])
+        }
+        StepInput::ParallelGroup { parallel } => {
+            if parallel.is_empty() {
+                return Err("Empty parallel group".to_string());
+            }
+            if depth >= MAX_STEP_NESTING {
+                return Err(format!(
+                    "Step nesting depth exceeds maximum of {}",
+                    MAX_STEP_NESTING
+                ));
+            }
+            if parallel.len() == 1 {
+                tracing::warn!("Single-item parallel group is redundant, treating as sequential");
+            }
+            let mut exit_frontier = Vec::new();
+            for branch in parallel {
+                let branch_exit = flatten_one(branch, frontier, counter, tasks, depth + 1)?;
+                exit_frontier.extend(branch_exit);
+            }
+            Ok(exit_frontier)
+        }
+        StepInput::SubChain { steps } => {
+            if steps.is_empty() {
+                return Err("Empty sub-chain".to_string());
+            }
+            if depth >= MAX_STEP_NESTING {
+                return Err(format!(
+                    "Step nesting depth exceeds maximum of {}",
+                    MAX_STEP_NESTING
+                ));
+            }
+            flatten_sequential(steps, frontier, counter, tasks, depth + 1)
+        }
+    }
+}
+
 /// A plan representing a decomposed query.
 ///
 /// The coordinator creates a plan by analyzing the user's query and
@@ -399,6 +511,18 @@ pub enum PlanningResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phases: Option<Vec<PhaseJson>>,
     },
+    /// The query requires orchestration, expressed as ordered steps.
+    ///
+    /// Steps are sequential by default; parallel execution is opt-in via
+    /// `ParallelGroup`. Converted to `Plan` via `flatten_steps()` in `into_plan()`.
+    #[serde(rename = "steps_plan")]
+    StepsPlan {
+        goal: String,
+        steps: Vec<StepInput>,
+        routing_rationale: String,
+        #[serde(default)]
+        planning_summary: String,
+    },
     /// The query is ambiguous and needs clarification from the user.
     #[serde(rename = "clarification")]
     Clarification {
@@ -410,7 +534,7 @@ pub enum PlanningResponse {
 }
 
 impl PlanningResponse {
-    /// Convert an `Orchestrated` response into a `Plan`.
+    /// Convert an `Orchestrated` or `StepsPlan` response into a `Plan`.
     ///
     /// Returns `None` for `Direct` and `Clarification` variants.
     pub fn into_plan(self) -> Option<Plan> {
@@ -454,6 +578,19 @@ impl PlanningResponse {
                 });
                 Some(plan)
             }
+            PlanningResponse::StepsPlan { goal, steps, .. } => match flatten_steps(&steps) {
+                Ok(tasks) => {
+                    let mut plan = Plan::new(goal);
+                    for task in tasks {
+                        plan.add_task(task);
+                    }
+                    Some(plan)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to flatten steps plan: {}", e);
+                    None
+                }
+            },
             _ => None,
         }
     }
@@ -463,6 +600,7 @@ impl PlanningResponse {
         match self {
             PlanningResponse::Direct { .. } => "Direct",
             PlanningResponse::Orchestrated { .. } => "Orchestrated",
+            PlanningResponse::StepsPlan { .. } => "StepsPlan",
             PlanningResponse::Clarification { .. } => "Clarification",
         }
     }
@@ -472,20 +610,26 @@ impl PlanningResponse {
         match self {
             PlanningResponse::Direct {
                 routing_rationale, ..
-            } => routing_rationale,
-            PlanningResponse::Orchestrated {
+            }
+            | PlanningResponse::Orchestrated {
                 routing_rationale, ..
-            } => routing_rationale,
-            PlanningResponse::Clarification {
+            }
+            | PlanningResponse::StepsPlan {
+                routing_rationale, ..
+            }
+            | PlanningResponse::Clarification {
                 routing_rationale, ..
             } => routing_rationale,
         }
     }
 
-    /// Get the planning summary (only present on Orchestrated variant).
+    /// Get the planning summary (only present on Orchestrated/StepsPlan variants).
     pub fn planning_summary(&self) -> Option<&str> {
         match self {
             PlanningResponse::Orchestrated {
+                planning_summary, ..
+            }
+            | PlanningResponse::StepsPlan {
                 planning_summary, ..
             } => Some(planning_summary),
             _ => None,
@@ -1893,5 +2037,252 @@ mod tests {
         let ready = plan.current_phase_ready_tasks();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, 0);
+    }
+
+    // ========================================================================
+    // StepInput / flatten_steps tests
+    // ========================================================================
+
+    #[test]
+    fn test_flatten_sequential_two_steps() {
+        let steps = vec![
+            StepInput::LeafTask {
+                task: "Compute mean of [10,20,30]".into(),
+                worker: Some("statistics".into()),
+            },
+            StepInput::LeafTask {
+                task: "Multiply the result by 3".into(),
+                worker: Some("arithmetic".into()),
+            },
+        ];
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, 0);
+        assert!(tasks[0].dependencies.is_empty());
+        assert_eq!(tasks[0].worker.as_deref(), Some("statistics"));
+        assert_eq!(tasks[1].id, 1);
+        assert_eq!(tasks[1].dependencies, vec![0]);
+        assert_eq!(tasks[1].worker.as_deref(), Some("arithmetic"));
+    }
+
+    #[test]
+    fn test_flatten_parallel_then_sequential() {
+        let steps = vec![
+            StepInput::ParallelGroup {
+                parallel: vec![
+                    StepInput::LeafTask {
+                        task: "Compute median".into(),
+                        worker: Some("statistics".into()),
+                    },
+                    StepInput::LeafTask {
+                        task: "Compute sin(45)".into(),
+                        worker: Some("trigonometry".into()),
+                    },
+                ],
+            },
+            StepInput::LeafTask {
+                task: "Multiply the two results".into(),
+                worker: Some("arithmetic".into()),
+            },
+        ];
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(tasks.len(), 3);
+        // Both parallel tasks have no deps
+        assert!(tasks[0].dependencies.is_empty());
+        assert!(tasks[1].dependencies.is_empty());
+        // Third task depends on both parallel exits
+        assert_eq!(tasks[2].dependencies, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_flatten_recursive_parallel_with_subchain() {
+        // parallel { [Get A -> Transform A], Get B } -> Combine
+        let steps = vec![
+            StepInput::ParallelGroup {
+                parallel: vec![
+                    StepInput::SubChain {
+                        steps: vec![
+                            StepInput::LeafTask {
+                                task: "Get A".into(),
+                                worker: Some("ops".into()),
+                            },
+                            StepInput::LeafTask {
+                                task: "Transform A".into(),
+                                worker: Some("ops".into()),
+                            },
+                        ],
+                    },
+                    StepInput::LeafTask {
+                        task: "Get B".into(),
+                        worker: Some("ops".into()),
+                    },
+                ],
+            },
+            StepInput::LeafTask {
+                task: "Combine".into(),
+                worker: Some("ops".into()),
+            },
+        ];
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(tasks.len(), 4);
+        // Get A: id=0, deps=[]
+        assert_eq!(tasks[0].id, 0);
+        assert!(tasks[0].dependencies.is_empty());
+        // Transform A: id=1, deps=[0]
+        assert_eq!(tasks[1].id, 1);
+        assert_eq!(tasks[1].dependencies, vec![0]);
+        // Get B: id=2, deps=[]
+        assert_eq!(tasks[2].id, 2);
+        assert!(tasks[2].dependencies.is_empty());
+        // Combine: id=3, deps=[1, 2] (exits of both branches)
+        assert_eq!(tasks[3].id, 3);
+        assert_eq!(tasks[3].dependencies, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_flatten_empty_steps_error() {
+        let result = flatten_steps(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_flatten_empty_parallel_error() {
+        let steps = vec![StepInput::ParallelGroup { parallel: vec![] }];
+        let result = flatten_steps(&steps);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty parallel"));
+    }
+
+    #[test]
+    fn test_flatten_depth_exceeded() {
+        // Depth 0: top-level, depth 1: parallel, depth 2: sub-chain,
+        // depth 3: nested parallel inside sub-chain -> should fail
+        let steps = vec![StepInput::ParallelGroup {
+            parallel: vec![StepInput::SubChain {
+                steps: vec![StepInput::ParallelGroup {
+                    parallel: vec![StepInput::LeafTask {
+                        task: "too deep".into(),
+                        worker: None,
+                    }],
+                }],
+            }],
+        }];
+        let result = flatten_steps(&steps);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nesting depth"));
+    }
+
+    #[test]
+    fn test_flatten_single_step() {
+        let steps = vec![StepInput::LeafTask {
+            task: "Just one thing".into(),
+            worker: None,
+        }];
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, 0);
+        assert!(tasks[0].dependencies.is_empty());
+        assert!(tasks[0].worker.is_none());
+    }
+
+    #[test]
+    fn test_flatten_empty_subchain_error() {
+        let steps = vec![StepInput::ParallelGroup {
+            parallel: vec![StepInput::SubChain { steps: vec![] }],
+        }];
+        let result = flatten_steps(&steps);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Empty sub-chain"));
+    }
+
+    #[test]
+    fn test_step_input_deserialize_sequential() {
+        let json = r#"[
+            {"task": "Compute mean", "worker": "stats"},
+            {"task": "Multiply result", "worker": "math"}
+        ]"#;
+        let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
+        assert_eq!(steps.len(), 2);
+        match &steps[0] {
+            StepInput::LeafTask { task, worker } => {
+                assert_eq!(task, "Compute mean");
+                assert_eq!(worker.as_deref(), Some("stats"));
+            }
+            other => panic!("Expected LeafTask, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_step_input_deserialize_parallel() {
+        let json = r#"[
+            {"parallel": [
+                {"task": "A", "worker": "w1"},
+                {"task": "B", "worker": "w2"}
+            ]},
+            {"task": "C"}
+        ]"#;
+        let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
+        assert_eq!(steps.len(), 2);
+        match &steps[0] {
+            StepInput::ParallelGroup { parallel } => {
+                assert_eq!(parallel.len(), 2);
+            }
+            other => panic!("Expected ParallelGroup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_step_input_deserialize_recursive() {
+        let json = r#"[
+            {"parallel": [
+                {"steps": [
+                    {"task": "Get A"},
+                    {"task": "Transform A"}
+                ]},
+                {"task": "Get B"}
+            ]},
+            {"task": "Combine"}
+        ]"#;
+        let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(tasks.len(), 4);
+        assert_eq!(tasks[3].dependencies, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_steps_plan_into_plan() {
+        let response = PlanningResponse::StepsPlan {
+            goal: "Test goal".into(),
+            steps: vec![
+                StepInput::LeafTask {
+                    task: "Step 1".into(),
+                    worker: Some("w1".into()),
+                },
+                StepInput::LeafTask {
+                    task: "Step 2".into(),
+                    worker: Some("w2".into()),
+                },
+            ],
+            routing_rationale: "Needs orchestration".into(),
+            planning_summary: "Two sequential steps".into(),
+        };
+        let plan = response.into_plan().unwrap();
+        assert_eq!(plan.goal, "Test goal");
+        assert_eq!(plan.tasks.len(), 2);
+        assert!(plan.tasks[0].dependencies.is_empty());
+        assert_eq!(plan.tasks[1].dependencies, vec![0]);
+        assert!(plan.phases.is_none());
+    }
+
+    #[test]
+    fn test_steps_plan_variant_name() {
+        let response = PlanningResponse::StepsPlan {
+            goal: "g".into(),
+            steps: vec![],
+            routing_rationale: "r".into(),
+            planning_summary: "s".into(),
+        };
+        assert_eq!(response.variant_name(), "StepsPlan");
     }
 }
