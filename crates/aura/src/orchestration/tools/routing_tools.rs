@@ -6,7 +6,7 @@
 //! The coordinator calls exactly one of these tools during the planning phase.
 //! A shared `RoutingDecision` captures the decision for the orchestrator to read.
 
-use crate::orchestration::types::{PhaseJson, PlanningResponse, TaskJson};
+use crate::orchestration::types::{PlanningResponse, StepInput};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -140,48 +140,15 @@ pub struct CreatePlanTool {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct TaskJsonInput {
-    /// Unique task identifier (0-indexed).
-    pub id: usize,
-    /// What this task accomplishes.
-    pub description: String,
-    /// Why this task exists and how it advances the goal.
-    #[serde(default)]
-    pub rationale: Option<String>,
-    /// IDs of tasks that must complete before this one.
-    #[serde(default)]
-    pub dependencies: Option<Vec<usize>>,
-    /// Assigned worker name (when specialized workers are configured).
-    #[serde(default)]
-    pub worker: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct PhaseJsonInput {
-    /// Phase identifier (0-indexed).
-    pub id: usize,
-    /// Human-readable label for this phase.
-    pub label: String,
-    /// IDs of tasks belonging to this phase.
-    pub task_ids: Vec<usize>,
-    /// What to do after this phase completes: "continue" or "replan".
-    #[serde(default)]
-    pub continuation: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 pub struct CreatePlanArgs {
     /// The overall goal this plan addresses.
     pub goal: String,
-    /// The tasks to execute.
-    pub tasks: Vec<TaskJsonInput>,
+    /// Ordered steps to execute. Sequential by default; use `{"parallel": [...]}` for concurrency.
+    pub steps: Vec<StepInput>,
     /// Why this query requires orchestration.
     pub routing_rationale: String,
     /// Natural-language summary of the plan.
     pub planning_summary: String,
-    /// Optional phase groupings for multi-phase execution.
-    #[serde(default)]
-    pub phases: Option<Vec<PhaseJsonInput>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,11 +170,78 @@ impl Tool for CreatePlanTool {
     type Output = CreatePlanOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Depth-2 inlined schema (no $ref). The "step" object is one of:
+        //   - LeafTask: {"task": "...", "worker": "..."}
+        //   - ParallelGroup: {"parallel": [<step>, ...]}
+        //   - SubChain (inside parallel only): {"steps": [<leaf_or_parallel>, ...]}
+        let step_schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "description": "A single task to execute",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "What this task accomplishes. Fully resolve all references — workers do NOT see conversation history."
+                        },
+                        "worker": {
+                            "type": "string",
+                            "description": "Name of the specialized worker to assign this task to"
+                        }
+                    },
+                    "required": ["task"]
+                },
+                {
+                    "type": "object",
+                    "description": "A group of steps that execute in parallel. Use when tasks are independent.",
+                    "properties": {
+                        "parallel": {
+                            "type": "array",
+                            "description": "Steps to run concurrently. Each item is a task or a sub-chain.",
+                            "items": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "task": { "type": "string" },
+                                            "worker": { "type": "string" }
+                                        },
+                                        "required": ["task"]
+                                    },
+                                    {
+                                        "type": "object",
+                                        "description": "A sequential sub-chain inside a parallel group",
+                                        "properties": {
+                                            "steps": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "task": { "type": "string" },
+                                                        "worker": { "type": "string" }
+                                                    },
+                                                    "required": ["task"]
+                                                }
+                                            }
+                                        },
+                                        "required": ["steps"]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "required": ["parallel"]
+                }
+            ]
+        });
+
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Decompose the user's query into a multi-task plan for orchestrated \
-                execution. Use this for queries requiring tool execution, data gathering, \
-                system inspection, or multi-step analysis."
+            description: "Decompose the user's query into an ordered sequence of steps for \
+                orchestrated execution. Steps run sequentially by default. Use \
+                {\"parallel\": [...]} when tasks are independent. Use this for queries \
+                requiring tool execution, data gathering, system inspection, or multi-step \
+                analysis."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -216,36 +250,10 @@ impl Tool for CreatePlanTool {
                         "type": "string",
                         "description": "The overall goal this plan addresses"
                     },
-                    "tasks": {
+                    "steps": {
                         "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "integer",
-                                    "description": "Unique task identifier (0-indexed)"
-                                },
-                                "description": {
-                                    "type": "string",
-                                    "description": "What this task accomplishes"
-                                },
-                                "rationale": {
-                                    "type": "string",
-                                    "description": "Why this task exists and how it advances the goal"
-                                },
-                                "dependencies": {
-                                    "type": "array",
-                                    "items": { "type": "integer" },
-                                    "description": "IDs of tasks that must complete before this one"
-                                },
-                                "worker": {
-                                    "type": "string",
-                                    "description": "Name of the specialized worker to assign this task to"
-                                }
-                            },
-                            "required": ["id", "description"]
-                        },
-                        "description": "The tasks to execute"
+                        "description": "Ordered steps to execute. Each step runs after the previous one completes. Use {\"parallel\": [...]} to run independent steps concurrently.",
+                        "items": step_schema
                     },
                     "routing_rationale": {
                         "type": "string",
@@ -254,38 +262,10 @@ impl Tool for CreatePlanTool {
                     "planning_summary": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "REQUIRED. Summarize the plan in natural language: what tasks will run, in what order, and what the expected outcome is."
-                    },
-                    "phases": {
-                        "type": "array",
-                        "description": "Optional phase groupings for multi-phase execution. When omitted, all tasks execute as a single flat plan.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "integer",
-                                    "description": "Phase identifier (0-indexed)"
-                                },
-                                "label": {
-                                    "type": "string",
-                                    "description": "Human-readable label for this phase (e.g., 'Gather data')"
-                                },
-                                "task_ids": {
-                                    "type": "array",
-                                    "items": { "type": "integer" },
-                                    "description": "IDs of tasks belonging to this phase"
-                                },
-                                "continuation": {
-                                    "type": "string",
-                                    "enum": ["continue", "replan"],
-                                    "description": "What to do after this phase completes. Defaults to 'continue'."
-                                }
-                            },
-                            "required": ["id", "label", "task_ids"]
-                        }
+                        "description": "REQUIRED. Summarize the plan in natural language: what steps will run, in what order, and what the expected outcome is."
                     }
                 },
-                "required": ["goal", "tasks", "routing_rationale", "planning_summary"]
+                "required": ["goal", "steps", "routing_rationale", "planning_summary"]
             }),
         }
     }
@@ -298,41 +278,29 @@ impl Tool for CreatePlanTool {
             });
         }
 
-        let tasks: Vec<TaskJson> = args
-            .tasks
-            .into_iter()
-            .map(|t| TaskJson {
-                id: t.id,
-                description: t.description,
-                rationale: t.rationale,
-                dependencies: t.dependencies,
-                worker: t.worker,
-            })
-            .collect();
-
-        let phases: Option<Vec<PhaseJson>> = args.phases.map(|phase_inputs| {
-            phase_inputs
-                .into_iter()
-                .map(|p| PhaseJson {
-                    id: p.id,
-                    label: p.label,
-                    task_ids: p.task_ids,
-                    continuation: p.continuation,
-                })
-                .collect()
-        });
-
-        let task_count = tasks.len();
-        *guard = Some(PlanningResponse::Orchestrated {
+        let step_count = count_leaf_steps(&args.steps);
+        *guard = Some(PlanningResponse::StepsPlan {
             goal: args.goal,
-            tasks,
+            steps: args.steps,
             routing_rationale: args.routing_rationale,
             planning_summary: args.planning_summary,
-            phases,
         });
         Ok(CreatePlanOutput {
-            status: format!("Plan created with {} tasks.", task_count),
+            status: format!("Plan created with {} steps.", step_count),
         })
+    }
+}
+
+/// Count the number of leaf tasks in a step tree (for status messages).
+fn count_leaf_steps(steps: &[StepInput]) -> usize {
+    steps.iter().map(count_one).sum()
+}
+
+fn count_one(step: &StepInput) -> usize {
+    match step {
+        StepInput::LeafTask { .. } => 1,
+        StepInput::ParallelGroup { parallel } => count_leaf_steps(parallel),
+        StepInput::SubChain { steps } => count_leaf_steps(steps),
     }
 }
 
@@ -464,38 +432,32 @@ mod tests {
             .create_plan
             .call(CreatePlanArgs {
                 goal: "Investigate logs".to_string(),
-                tasks: vec![TaskJsonInput {
-                    id: 0,
-                    description: "Fetch recent logs".to_string(),
-                    rationale: Some("Need log data".to_string()),
-                    dependencies: None,
+                steps: vec![StepInput::LeafTask {
+                    task: "Fetch recent logs".to_string(),
                     worker: Some("operations".to_string()),
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),
-                phases: None,
             })
             .await
             .unwrap();
 
-        assert!(result.status.contains("1 tasks"));
+        assert!(result.status.contains("1 steps"));
 
         let decision = toolset.decision.lock().await;
         match decision.as_ref().unwrap() {
-            PlanningResponse::Orchestrated {
+            PlanningResponse::StepsPlan {
                 goal,
-                tasks,
+                steps,
                 routing_rationale,
                 planning_summary,
-                ..
             } => {
                 assert_eq!(goal, "Investigate logs");
-                assert_eq!(tasks.len(), 1);
-                assert_eq!(tasks[0].worker, Some("operations".to_string()));
+                assert_eq!(steps.len(), 1);
                 assert_eq!(routing_rationale, "Requires tool execution");
                 assert_eq!(planning_summary, "Fetch and analyze recent logs");
             }
-            other => panic!("Expected Orchestrated, got {:?}", other),
+            other => panic!("Expected StepsPlan, got {:?}", other),
         }
     }
 
@@ -549,10 +511,9 @@ mod tests {
             .create_plan
             .call(CreatePlanArgs {
                 goal: "test".to_string(),
-                tasks: vec![],
+                steps: vec![],
                 routing_rationale: "test".to_string(),
                 planning_summary: "test".to_string(),
-                phases: None,
             })
             .await
             .unwrap();
@@ -598,7 +559,7 @@ mod tests {
 
         let def = toolset.create_plan.definition("".to_string()).await;
         assert_eq!(def.name, "create_plan");
-        assert!(def.description.contains("multi-task"));
+        assert!(def.description.contains("ordered sequence"));
 
         let def = toolset
             .request_clarification
