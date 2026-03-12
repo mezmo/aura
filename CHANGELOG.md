@@ -1,3 +1,10 @@
+# [1.15.0](https://github.com/mezmo/aura/compare/v1.14.13...v1.15.0) (2026-03-12)
+
+
+### Features
+
+* add support for aliased agents listed/selected via /v1/models [4530733](https://github.com/mezmo/aura/commit/4530733e0726886b044158652a7abcc21d2bd0e0) - Justin Gross [LOG-22925](https://logdna.atlassian.net/browse/LOG-22925)
+
 ## [1.14.13](https://github.com/mezmo/aura/compare/v1.14.12...v1.14.13) (2026-03-12)
 
 
