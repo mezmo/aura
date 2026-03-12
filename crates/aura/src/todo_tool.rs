@@ -194,9 +194,10 @@ impl PlanState {
 
         // Persist to filesystem if configured
         if let Some(ref plan_dir) = self.plan_dir
-            && let Err(e) = self.persist_iteration(plan_dir, &iteration) {
-                tracing::warn!("Failed to persist iteration {}: {}", id, e);
-            }
+            && let Err(e) = self.persist_iteration(plan_dir, &iteration)
+        {
+            tracing::warn!("Failed to persist iteration {}: {}", id, e);
+        }
 
         self.iterations.push(iteration);
         self.iterations.last().unwrap()

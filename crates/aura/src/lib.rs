@@ -40,7 +40,7 @@ pub mod tools;
 pub mod vector_dynamic;
 pub mod vector_store;
 
-pub use builder::{build_streaming_agent, Agent, AgentBuilder, FilesystemTools};
+pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
 pub use config::{
     AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
     ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
@@ -82,12 +82,12 @@ pub use request_progress::{
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use stream_events::{
-    format_named_sse, AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase,
+    AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase, format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use todo_tool::{
-    PlanIteration, PlanState, ReadTodosArgs, ReadTodosTool, Todo, TodoError, TodoState, TodoStatus,
-    TodoWriteTool, WriteTodosArgs, TODO_SYSTEM_PROMPT, TODO_TOOL_DESCRIPTION,
+    PlanIteration, PlanState, ReadTodosArgs, ReadTodosTool, TODO_SYSTEM_PROMPT,
+    TODO_TOOL_DESCRIPTION, Todo, TodoError, TodoState, TodoStatus, TodoWriteTool, WriteTodosArgs,
 };
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
