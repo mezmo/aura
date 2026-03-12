@@ -90,8 +90,9 @@ mod tests {
         let tool = ListToolsTool::new(vec!["test".to_string()]);
         let def = tool.definition("".to_string()).await;
         assert_eq!(def.name, "list_tools");
-        assert!(def
-            .description
-            .contains("List all available MCP tool names"));
+        assert!(
+            def.description
+                .contains("List all available MCP tool names")
+        );
     }
 }

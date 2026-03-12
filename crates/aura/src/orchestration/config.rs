@@ -829,12 +829,16 @@ mod tests {
         "#;
         let config: WorkerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.mcp_filter.len(), 2);
-        assert!(config
-            .mcp_filter
-            .contains(&"ListKnowledgeBases".to_string()));
-        assert!(config
-            .mcp_filter
-            .contains(&"QueryKnowledgeBases".to_string()));
+        assert!(
+            config
+                .mcp_filter
+                .contains(&"ListKnowledgeBases".to_string())
+        );
+        assert!(
+            config
+                .mcp_filter
+                .contains(&"QueryKnowledgeBases".to_string())
+        );
     }
 
     #[test]
@@ -1032,12 +1036,16 @@ mod tests {
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
 
         assert_eq!(config.coordinator_vector_stores.len(), 2);
-        assert!(config
-            .coordinator_vector_stores
-            .contains(&"runbooks".to_string()));
-        assert!(config
-            .coordinator_vector_stores
-            .contains(&"procedures".to_string()));
+        assert!(
+            config
+                .coordinator_vector_stores
+                .contains(&"runbooks".to_string())
+        );
+        assert!(
+            config
+                .coordinator_vector_stores
+                .contains(&"procedures".to_string())
+        );
     }
 
     #[test]

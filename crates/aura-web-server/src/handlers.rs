@@ -1,7 +1,7 @@
 use actix_web::{HttpResponse, web};
 use aura::{
-    RequestCancellation, ResponseContent, StreamingAgent, UsageState,
-    request_progress_subscribe, tool_event_subscribe, tool_usage_subscribe,
+    RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
+    tool_event_subscribe, tool_usage_subscribe,
 };
 use aura_config::RigBuilder;
 use chrono::Utc;

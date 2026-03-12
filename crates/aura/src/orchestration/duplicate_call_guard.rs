@@ -250,21 +250,27 @@ mod tests {
         // Call 1 with reasoning A
         let args1 = serde_json::json!({"number": 45, "_aura_reasoning": "Converting 45 degrees"});
         let r = guard.transform_args(args1, &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("0.785".to_string(), &ctx, r.extracted.as_ref());
 
         // Call 2 with different reasoning but same functional args
         let args2 = serde_json::json!({"number": 45, "_aura_reasoning": "Need radians for sin"});
         let r = guard.transform_args(args2, &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("0.785".to_string(), &ctx, r.extracted.as_ref());
 
         // Call 3 — should be REJECTED
         let args3 = serde_json::json!({"number": 45, "_aura_reasoning": "Yet another reason"});
         let r = guard.transform_args(args3, &ctx);
-        assert!(guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .is_err());
+        assert!(
+            guard
+                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+                .is_err()
+        );
     }
 
     #[test]
@@ -289,9 +295,11 @@ mod tests {
         let args = serde_json::json!({"numbers": [1, 2, 3]});
 
         let result = guard.transform_args(args, &ctx);
-        assert!(guard
-            .validate_args(&result.args, result.extracted.as_ref(), &ctx)
-            .is_ok());
+        assert!(
+            guard
+                .validate_args(&result.args, result.extracted.as_ref(), &ctx)
+                .is_ok()
+        );
 
         // Simulate successful output
         guard.transform_output("2.0".to_string(), &ctx, result.extracted.as_ref());
@@ -305,16 +313,20 @@ mod tests {
 
         // Call 1: allowed, output recorded (count=1)
         let r1 = guard.transform_args(args.clone(), &ctx);
-        assert!(guard
-            .validate_args(&r1.args, r1.extracted.as_ref(), &ctx)
-            .is_ok());
+        assert!(
+            guard
+                .validate_args(&r1.args, r1.extracted.as_ref(), &ctx)
+                .is_ok()
+        );
         guard.transform_output("2.0".to_string(), &ctx, r1.extracted.as_ref());
 
         // Call 2: allowed (count becomes 2 = max_duplicates)
         let r2 = guard.transform_args(args.clone(), &ctx);
-        assert!(guard
-            .validate_args(&r2.args, r2.extracted.as_ref(), &ctx)
-            .is_ok());
+        assert!(
+            guard
+                .validate_args(&r2.args, r2.extracted.as_ref(), &ctx)
+                .is_ok()
+        );
         guard.transform_output("2.0".to_string(), &ctx, r2.extracted.as_ref());
 
         // Call 3: REJECTED (count=2 >= max_duplicates=2)
@@ -335,18 +347,24 @@ mod tests {
 
         // Fill up with args1
         let r = guard.transform_args(args1.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
 
         let r = guard.transform_args(args1.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
 
         // Different args → resets, allowed
         let r = guard.transform_args(args2, &ctx);
-        assert!(guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .is_ok());
+        assert!(
+            guard
+                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -357,24 +375,32 @@ mod tests {
 
         // Call 1: result "12:00"
         let r = guard.transform_args(args.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("12:00".to_string(), &ctx, r.extracted.as_ref());
 
         // Call 2: same args, different result → resets
         let r = guard.transform_args(args.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("12:01".to_string(), &ctx, r.extracted.as_ref());
 
         // Call 3: same args, same new result → count=2
         let r = guard.transform_args(args.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("12:01".to_string(), &ctx, r.extracted.as_ref());
 
         // Call 4: REJECTED
         let r = guard.transform_args(args.clone(), &ctx);
-        assert!(guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .is_err());
+        assert!(
+            guard
+                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+                .is_err()
+        );
     }
 
     #[test]
@@ -385,25 +411,27 @@ mod tests {
 
         // Fill up
         let r = guard.transform_args(args.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
 
         let r = guard.transform_args(args.clone(), &ctx);
-        guard.validate_args(&r.args, r.extracted.as_ref(), &ctx).ok();
+        guard
+            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+            .ok();
         guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
 
         // Error resets
-        guard.handle_error(
-            ToolError::ToolCallError("timeout".into()),
-            &ctx,
-            None,
-        );
+        guard.handle_error(ToolError::ToolCallError("timeout".into()), &ctx, None);
 
         // Now allowed again
         let r = guard.transform_args(args, &ctx);
-        assert!(guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .is_ok());
+        assert!(
+            guard
+                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -429,9 +457,11 @@ mod tests {
 
         // Different tool → resets
         let r = guard.transform_args(args, &ctx_b);
-        assert!(guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx_b)
-            .is_ok());
+        assert!(
+            guard
+                .validate_args(&r.args, r.extracted.as_ref(), &ctx_b)
+                .is_ok()
+        );
     }
 
     #[test]

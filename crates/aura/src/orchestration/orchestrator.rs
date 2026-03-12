@@ -38,23 +38,23 @@
 //! - `IterationComplete` - when a plan-execute-synthesize cycle completes
 //! - `Synthesizing` - when the synthesizer is combining results
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use rig::client::CompletionClient;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::Agent;
 use crate::config::{AgentConfig, LlmConfig};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
-use crate::Agent;
 
 use super::tools::RoutingToolSet;
 use super::tools::SubmitEvaluationTool;
@@ -436,15 +436,6 @@ impl Orchestrator {
     /// Create a worker agent for task execution.
     ///
     /// Workers are regular agents that execute individual tasks.
-    /// System-prompt reinforcement for `_aura_reasoning` enforcement.
-    /// Complements the JSON Schema `minLength: 1` constraint and
-    /// `PersistenceWrapper::validate_args` backstop.
-    const WORKER_REASONING_INSTRUCTION: &'static str = "\n\n\
-## Tool Call Requirements\n\n\
-Every tool call MUST include a `_aura_reasoning` parameter — a string explaining \
-why you are calling this tool and what you expect to accomplish. Tool calls \
-without this field will be rejected.";
-
     /// When persistence is enabled, MCP tools are wrapped with
     /// `PersistenceToolWrapper` to capture reasoning and execution details.
     /// When an observer is present, tools also emit events for real-time
@@ -493,11 +484,9 @@ without this field will be rejected.";
                 )
             })?;
             tracing::info!("Creating worker '{}' for task {}", name, task_id);
-            worker_config.preamble_override = Some(format!(
-                "{}{}",
-                worker.preamble,
-                Self::WORKER_REASONING_INSTRUCTION
-            ));
+            let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
+                .replace("{{worker_system_prompt}}", &worker.preamble);
+            worker_config.preamble_override = Some(full_preamble);
             if !worker.mcp_filter.is_empty() {
                 worker_config.mcp_filter = Some(worker.mcp_filter.clone());
             }
@@ -539,11 +528,7 @@ without this field will be rejected.";
                 )
             }));
         } else {
-            worker_config.preamble_override = Some(format!(
-                "{}{}",
-                self.config.build_worker_preamble(),
-                Self::WORKER_REASONING_INSTRUCTION
-            ));
+            worker_config.preamble_override = Some(self.config.build_worker_preamble());
             let orchestrator_id_copy = self.orchestrator_id.clone();
 
             // Orchestrator provides context factory with task metadata
@@ -958,12 +943,13 @@ without this field will be rejected.";
 
                 // Persist plan for Orchestrated variant
                 if let PlanningResponse::Orchestrated { .. } = &planning_response
-                    && let Some(plan) = planning_response.clone().into_plan() {
-                        let persistence = self.persistence.lock().await;
-                        if let Err(e) = persistence.write_plan(&plan).await {
-                            tracing::warn!("Failed to persist plan: {}", e);
-                        }
+                    && let Some(plan) = planning_response.clone().into_plan()
+                {
+                    let persistence = self.persistence.lock().await;
+                    if let Err(e) = persistence.write_plan(&plan).await {
+                        tracing::warn!("Failed to persist plan: {}", e);
                     }
+                }
 
                 return Ok((planning_response, final_prompt, final_response));
             }
@@ -1964,8 +1950,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         crate::config::ReasoningEffort::Medium => "medium",
                         crate::config::ReasoningEffort::High => "high",
                     };
-                    combined_params =
-                        Some(serde_json::json!({"reasoning_effort": effort_str}));
+                    combined_params = Some(serde_json::json!({"reasoning_effort": effort_str}));
                 }
                 if let Some(ref params) = worker_config.agent.additional_params {
                     combined_params = Some(match combined_params {
@@ -2107,9 +2092,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     );
                     if let Some(ref params) = worker_config.agent.additional_params {
                         combined = Some(match combined {
-                            Some(existing) => {
-                                crate::builder::merge_json(existing, params.clone())
-                            }
+                            Some(existing) => crate::builder::merge_json(existing, params.clone()),
                             None => params.clone(),
                         });
                     }
@@ -2270,8 +2253,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<(), StreamError> {
-        use futures::stream::FuturesUnordered;
         use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
 
         // Capture the plan goal to pass to each worker
         let plan_goal = plan.goal.clone();
@@ -2432,8 +2415,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<(), StreamError> {
-        use futures::stream::FuturesUnordered;
         use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
 
         let plan_goal = plan.goal.clone();
 
@@ -2587,7 +2570,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns `PhaseContinuation::Continue` or `PhaseContinuation::Replan`.
     async fn phase_continuation(&self, plan: &Plan) -> super::types::PhaseContinuation {
-        use super::templates::{render_phase_continuation_prompt, PhaseContinuationVars};
+        use super::templates::{PhaseContinuationVars, render_phase_continuation_prompt};
 
         let phase = match plan.current_phase() {
             Some(p) => p,
@@ -2777,7 +2760,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let task = plan.tasks.iter().find(|t| t.id == task_id)?;
 
         // Build structured dependency context — compact format to prevent scope creep
-        
 
         if !task.dependencies.is_empty() {
             let dep_parts: Vec<String> = task
@@ -3211,7 +3193,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         let fallback =
                             EvaluationResult::fallback(plan.completed_count(), plan.tasks.len())
                                 .with_gaps(vec![
-                                    "Evaluation skipped due to context limit".to_string()
+                                    "Evaluation skipped due to context limit".to_string(),
                                 ]);
                         (
                             "[CONTEXT OVERFLOW - heuristic fallback]".to_string(),
@@ -3220,9 +3202,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                     Err(e) if e.to_string().contains("timed out") => {
                         tracing::warn!(
-                                "Evaluation timed out (per_call_timeout={}s), falling back to heuristic",
-                                self.config.per_call_timeout_secs()
-                            );
+                            "Evaluation timed out (per_call_timeout={}s), falling back to heuristic",
+                            self.config.per_call_timeout_secs()
+                        );
                         let fallback =
                             EvaluationResult::fallback(plan.completed_count(), plan.tasks.len())
                                 .with_gaps(vec!["Evaluation skipped due to timeout".to_string()]);
@@ -4173,11 +4155,7 @@ mod tests {
     fn evaluate_plan(plan: &Plan) -> f32 {
         let total = plan.tasks.len() as f32;
         let completed = plan.completed_count() as f32;
-        if total == 0.0 {
-            0.0
-        } else {
-            completed / total
-        }
+        if total == 0.0 { 0.0 } else { completed / total }
     }
 
     fn synthesize_results(plan: &Plan) -> Result<String, String> {
@@ -4265,17 +4243,18 @@ mod tests {
 
             // Parse worker assignment (if present)
             if let Some(worker_name) = task_value["worker"].as_str()
-                && config.has_workers() {
-                    if !valid_workers.contains(worker_name) {
-                        return Err(format!(
-                            "Task {} assigned to unknown worker '{}'. Valid workers: {:?}",
-                            id,
-                            worker_name,
-                            valid_workers.iter().collect::<Vec<_>>()
-                        ));
-                    }
-                    task = task.with_worker(worker_name);
+                && config.has_workers()
+            {
+                if !valid_workers.contains(worker_name) {
+                    return Err(format!(
+                        "Task {} assigned to unknown worker '{}'. Valid workers: {:?}",
+                        id,
+                        worker_name,
+                        valid_workers.iter().collect::<Vec<_>>()
+                    ));
                 }
+                task = task.with_worker(worker_name);
+            }
 
             plan.add_task(task);
         }
@@ -4324,9 +4303,11 @@ mod tests {
         let result = parse_plan_json(response, "test");
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("missing required 'rationale' field"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("missing required 'rationale' field")
+        );
     }
 
     #[test]
@@ -4867,9 +4848,11 @@ Provide the synthesized response:"#,
         let knowledge_worker = config.workers.get("knowledge").unwrap();
         assert_eq!(knowledge_worker.vector_stores.len(), 2);
         assert!(knowledge_worker.vector_stores.contains(&"kb".to_string()));
-        assert!(knowledge_worker
-            .vector_stores
-            .contains(&"runbooks".to_string()));
+        assert!(
+            knowledge_worker
+                .vector_stores
+                .contains(&"runbooks".to_string())
+        );
         assert!(!knowledge_worker.vector_stores.contains(&"docs".to_string()));
 
         // Operations worker should have NO vector store access
@@ -4980,12 +4963,16 @@ Provide the synthesized response:"#,
 
         // Verify coordinator gets its own vector stores
         assert_eq!(config.coordinator_vector_stores.len(), 1);
-        assert!(config
-            .coordinator_vector_stores
-            .contains(&"coordinator_store".to_string()));
-        assert!(!config
-            .coordinator_vector_stores
-            .contains(&"worker_store".to_string()));
+        assert!(
+            config
+                .coordinator_vector_stores
+                .contains(&"coordinator_store".to_string())
+        );
+        assert!(
+            !config
+                .coordinator_vector_stores
+                .contains(&"worker_store".to_string())
+        );
 
         // Simulate coordinator tool building
         let coordinator_stores = &config.coordinator_vector_stores;
