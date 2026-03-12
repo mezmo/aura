@@ -31,30 +31,45 @@ Example: Instead of "compute the mean of those numbers", write "compute the mean
 
 ## Planning Guidelines
 
-When creating plans with `create_plan`:
-- Assign each task to the worker whose capabilities best match the task
-- Specify dependencies when one task needs output from another
-- Include a rationale for each task explaining why it advances the goal
-- Keep task descriptions specific and actionable
+When creating plans with `create_plan`, provide an ordered list of **steps**:
 
-## When to Use Phases
+- **Steps are sequential by default** — each step runs after the previous one completes and receives its results.
+- **Use `{"parallel": [...]}` only when tasks are truly independent** (no task in the group needs another's output).
+- Assign each step to the worker whose capabilities best match it.
+- Keep task descriptions specific and actionable.
 
-You can optionally group tasks into **phases** when creating a plan. Each phase is a set of tasks that execute together, with a coordinator checkpoint between phases to decide whether to continue or replan.
+### Example: Sequential (most common)
 
-**Use a flat plan (no phases)** when:
-- All steps are known upfront and don't depend on discovering new information
-- The query is straightforward (e.g., "compute the mean and standard deviation of [10, 20, 30]")
+```json
+{
+  "goal": "Compute the mean of [10,20,30] then multiply by 3",
+  "steps": [
+    {"task": "Compute the mean of the numbers 10, 20, 30", "worker": "statistics"},
+    {"task": "Multiply the result by 3", "worker": "arithmetic"}
+  ],
+  "routing_rationale": "Requires two dependent computations",
+  "planning_summary": "First compute the mean, then multiply"
+}
+```
 
-**Use a multi-phase plan** when:
-- Later steps depend on what earlier steps discover
-- The query involves exploration followed by action (e.g., "find the relevant data, then analyze it")
-- You need to inspect intermediate results before deciding the next steps
+### Example: Parallel + Sequential
 
-Example multi-phase plan:
-- Phase 1 "Gather data": tasks that collect or discover information
-- Phase 2 "Analyze findings": tasks that process the discovered data (may be replanned based on Phase 1 results)
+```json
+{
+  "goal": "Compute median and sin(45°), then multiply",
+  "steps": [
+    {"parallel": [
+      {"task": "Compute the median of 10, 20, 30", "worker": "statistics"},
+      {"task": "Compute the sine of 45 degrees", "worker": "trigonometry"}
+    ]},
+    {"task": "Multiply the two results together", "worker": "arithmetic"}
+  ],
+  "routing_rationale": "Two independent computations followed by a dependent one",
+  "planning_summary": "Compute median and sin(45°) in parallel, then multiply"
+}
+```
 
-Between phases, you will be asked whether to **continue** with the next phase as planned or **replan** based on what was learned. Use replan when the discovered information significantly changes what the remaining phases should do.
+Do NOT use parallel groups for steps that depend on each other — sequential ordering handles dependencies automatically.
 
 ## Artifacts
 

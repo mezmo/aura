@@ -942,8 +942,10 @@ impl Orchestrator {
                 let planning_response = self.enforce_routing_config(planning_response, query);
 
                 // Persist plan for Orchestrated variant
-                if let PlanningResponse::Orchestrated { .. } = &planning_response
-                    && let Some(plan) = planning_response.clone().into_plan()
+                if matches!(
+                    &planning_response,
+                    PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. }
+                ) && let Some(plan) = planning_response.clone().into_plan()
                 {
                     let persistence = self.persistence.lock().await;
                     if let Err(e) = persistence.write_plan(&plan).await {
@@ -3324,10 +3326,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Ok(question)
             }
-            PlanningResponse::Orchestrated { .. } => {
+            PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. } => {
                 let routing_rationale = response.routing_rationale().to_string();
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
-                let plan = response.into_plan().expect("Orchestrated always converts");
+                let plan = response
+                    .into_plan()
+                    .expect("Orchestrated/StepsPlan always converts");
 
                 Self::emit_event(
                     &event_tx,
