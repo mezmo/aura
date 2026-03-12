@@ -74,10 +74,7 @@ pub(crate) fn build_ollama_params(
 ///
 /// Used to combine multiple sources of `additional_params` before passing to
 /// `AgentBuilder::additional_params()` which replaces (not merges) on each call.
-pub(crate) fn merge_json(
-    a: serde_json::Value,
-    b: serde_json::Value,
-) -> serde_json::Value {
+pub(crate) fn merge_json(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     match (a, b) {
         (serde_json::Value::Object(mut a_map), serde_json::Value::Object(b_map)) => {
             for (key, value) in b_map {
@@ -256,8 +253,7 @@ impl Agent {
                             crate::config::ReasoningEffort::Medium => "medium",
                             crate::config::ReasoningEffort::High => "high",
                         };
-                        combined_params =
-                            Some(serde_json::json!({"reasoning_effort": effort_str}));
+                        combined_params = Some(serde_json::json!({"reasoning_effort": effort_str}));
                     } else {
                         tracing::warn!(
                             "reasoning_effort ignored for model '{}' (only supported on o1/o3/o4/gpt-5+)",
@@ -456,11 +452,8 @@ impl Agent {
                 // Build combined params: Ollama-specific (num_ctx, num_predict) + agent-level
                 // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
                 {
-                    let mut combined = build_ollama_params(
-                        *num_ctx,
-                        *num_predict,
-                        additional_params.clone(),
-                    );
+                    let mut combined =
+                        build_ollama_params(*num_ctx, *num_predict, additional_params.clone());
                     if let Some(ref params) = config.agent.additional_params {
                         combined = Some(match combined {
                             Some(existing) => merge_json(existing, params.clone()),
