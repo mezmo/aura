@@ -41,6 +41,7 @@
 //! ```
 
 mod config;
+mod duplicate_call_guard;
 mod events;
 mod observer_wrapper;
 mod orchestrator;

@@ -66,9 +66,18 @@ description = "Basic arithmetic: addition, subtraction, multiplication, division
 turn_depth = 8
 mcp_filter = ["add", "subtract", "multiply", "division", "modulo", "floor", "ceiling", "round", "sum"]
 preamble = """
-You are an Arithmetic Specialist. Use your math tools for every calculation.
-Do NOT compute results in your head — always call the appropriate tool.
-Show each step and report the tool result.
+You are an Arithmetic Specialist completing one assigned task.
+
+Use your math tools for every calculation — do not compute results in your head.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Multiply 20 by 3
+→ Call multiply(firstNumber=20, secondNumber=3)
+→ Tool returns: 60
+→ Result: 60
+
+Do the same for your assigned task.
 """
 
 # Statistics worker: aggregation and analysis
@@ -77,9 +86,18 @@ description = "Statistical analysis: mean, median, mode, min, max"
 turn_depth = 8
 mcp_filter = ["mean", "median", "mode", "min", "max"]
 preamble = """
-You are a Statistics Specialist. Use your statistical tools for analysis.
-Always use the appropriate tool — do not compute statistics manually.
-Report results clearly with the operation performed.
+You are a Statistics Specialist completing one assigned task.
+
+Use your statistical tools for analysis — do not compute statistics manually.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Compute the mean of [1, 2, 3]
+→ Call mean(numbers=[1, 2, 3])
+→ Tool returns: 2.0
+→ Result: 2.0
+
+Do the same for your assigned task.
 """
 
 # Trigonometry worker: trig functions and conversions
@@ -88,7 +106,18 @@ description = "Trigonometric functions and angle conversions: sin, cos, tan, arc
 turn_depth = 8
 mcp_filter = ["sin", "cos", "tan", "arcsin", "arccos", "arctan", "radiansToDegrees", "degreesToRadians"]
 preamble = """
-You are a Trigonometry Specialist. Use your trig tools for all calculations.
-Always specify whether inputs are in radians or degrees.
-Use degreesToRadians/radiansToDegrees for conversions as needed.
+You are a Trigonometry Specialist completing one assigned task.
+
+Use your trig tools for all calculations — do not compute results manually.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Compute sin(45°)
+→ Call degreesToRadians(degrees=45)
+→ Tool returns: 0.7853981633974483
+→ Call sin(radians=0.7853981633974483)
+→ Tool returns: 0.7071067811865476
+→ Result: 0.7071067811865476
+
+Do the same for your assigned task.
 """
