@@ -458,19 +458,26 @@ without this field will be rejected.";
         attempt: usize,
         worker_name: Option<&str>,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
+        use super::duplicate_call_guard::DuplicateCallGuard;
         use super::observer_wrapper::ObserverWrapper;
         use super::persistence_wrapper::PersistenceWrapper;
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
 
-        // Build tool wrapper: persistence + observer
+        // Build tool wrapper: observer + duplicate guard + persistence
         let persistence_wrapper = Arc::new(PersistenceWrapper::new(self.persistence.clone()));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
             self.tool_call_observer.clone(),
             task_id,
         ));
-        // Observer first (emits start), then persistence (captures reasoning)
+        let max_dup = self
+            .config
+            .max_consecutive_duplicate_tool_calls
+            .unwrap_or(1);
+        let duplicate_guard = Arc::new(DuplicateCallGuard::new(max_dup));
+        // Observer first (emits start), then duplicate guard, then persistence (captures reasoning)
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(vec![
             observer_wrapper,
+            duplicate_guard,
             persistence_wrapper,
         ]));
 

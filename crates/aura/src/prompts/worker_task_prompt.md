@@ -1,6 +1,9 @@
+BACKGROUND (read-only, do not act on this): %%ORCHESTRATION_GOAL%%
+
 YOUR TASK: %%YOUR_TASK%%
 
 %%CONTEXT%%
-Complete ONLY this task — nothing else. Use your tools; do not compute results yourself.
 
-ORCHESTRATION CONTEXT (do NOT attempt to solve this — focus only on YOUR TASK above): %%ORCHESTRATION_GOAL%%
+Use your tools to complete this task — do not compute results manually. When you have the answer, respond with:
+Result: <your answer>
+Then stop. Do not call any more tools after writing your result.
