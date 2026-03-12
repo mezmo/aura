@@ -12,6 +12,8 @@ services:
   math-mcp:
     build:
       context: ./math-mcp
+    ports:
+      - "8081:8081"  # Math MCP server (orchestration tests)
     healthcheck:
       test: >
         curl -sf http://localhost:8081/mcp -X POST
