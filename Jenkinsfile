@@ -32,8 +32,8 @@ pipeline {
     NPM_CONFIG_CACHE = '.npm'
     NPM_CONFIG_USERCONFIG = '.npm/rc'
     SPAWN_WRAP_SHIM_ROOT = '.npm'
-    RUSTUP_HOME = '/opt/rust/cargo'
-    CARGO_HOME = '/opt/rust/cargo'
+    RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
+    CARGO_HOME = "${env.WORKSPACE}/.cargo"
     PATH = """${sh(
        returnStdout: true,
        script: 'echo /opt/rust/cargo/bin:\$PATH'
