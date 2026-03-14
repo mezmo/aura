@@ -129,7 +129,13 @@ fn flatten_one(
 pub struct Plan {
     /// The original goal/query being addressed.
     pub goal: String,
+    /// Original step structure from the coordinator (when using steps format).
+    /// Present for `StepsPlan` responses, absent for legacy `Orchestrated` fallbacks.
+    /// This is purely for persistence/observability — execution uses `tasks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<Vec<StepInput>>,
     /// Ordered list of tasks to accomplish the goal.
+    /// Auto-generated from `steps` via `flatten_steps()` when steps are present.
     pub tasks: Vec<Task>,
     /// Optional phase groupings for multi-phase execution.
     ///
@@ -148,6 +154,7 @@ impl Plan {
     pub fn new(goal: impl Into<String>) -> Self {
         Self {
             goal: goal.into(),
+            steps: None,
             tasks: Vec::new(),
             phases: None,
             current_phase_index: 0,
@@ -578,17 +585,19 @@ impl PlanningResponse {
                 });
                 Some(plan)
             }
-            PlanningResponse::StepsPlan { goal, steps, .. } => match flatten_steps(&steps) {
-                Ok(tasks) => {
-                    let mut plan = Plan::new(goal);
-                    for task in tasks {
-                        plan.add_task(task);
+            PlanningResponse::StepsPlan { goal, steps, .. } => {
+                match flatten_steps(&steps) {
+                    Ok(tasks) => {
+                        let mut plan = Plan::new(goal);
+                        plan.steps = Some(steps);
+                        for task in tasks {
+                            plan.add_task(task);
+                        }
+                        Some(plan)
                     }
-                    Some(plan)
-                }
-                Err(e) => {
-                    tracing::error!("Failed to flatten steps plan: {}", e);
-                    None
+                    Err(e) => {
+                        tracing::error!("Failed to flatten steps plan: {}", e);
+                        None
                 }
             },
             _ => None,
