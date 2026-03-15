@@ -120,6 +120,7 @@ impl RigBuilder {
             turn_depth: self.config.agent.turn_depth,
             context_window: self.config.agent.context_window,
             additional_params: self.config.agent.additional_params.clone(),
+            mcp_filter: self.config.agent.mcp_filter.clone(),
         };
 
         let vector_stores: Vec<VectorStoreConfig> = self
