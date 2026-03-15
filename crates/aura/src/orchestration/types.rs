@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::string_utils::safe_truncate;
 
+/// Serde helper: skip serializing `current_phase_index` when it's 0 (non-phased plans).
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
 /// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
@@ -145,7 +150,7 @@ pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phases: Option<Vec<Phase>>,
     /// Index of the currently active phase (0-indexed).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub current_phase_index: usize,
 }
 
