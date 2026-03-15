@@ -504,6 +504,11 @@ pub struct AgentConfig {
     /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
     #[serde(default)]
     pub additional_params: Option<serde_json::Value>,
+    /// Glob patterns for filtering which MCP tools to include.
+    /// When set, only tools matching at least one pattern are added.
+    /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
+    #[serde(default)]
+    pub mcp_filter: Option<Vec<String>>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -532,6 +537,7 @@ impl Default for AgentConfig {
             created_at: default_created_at(),
             model_owner: None,
             additional_params: None,
+            mcp_filter: None,
         }
     }
 }

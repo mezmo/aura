@@ -107,11 +107,11 @@ pub struct AgentConfig {
     #[serde(skip)]
     pub todo_tools_config: Option<TodoToolsConfig>,
 
-    /// Glob patterns for filtering which MCP tools to include (not serialized).
+    /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added.
     /// Supports glob syntax: `*` (any chars), `?` (single char).
     /// Empty or None means all tools are included.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_filter: Option<Vec<String>>,
 
     /// Shared persistence for injecting `read_artifact` tool into workers (not serialized).
@@ -319,6 +319,13 @@ pub struct AgentSettings {
     /// Additional provider-specific parameters merged into the API request.
     /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
     pub additional_params: Option<serde_json::Value>,
+    /// Glob patterns for filtering which MCP tools to include.
+    /// When set, only tools matching at least one pattern are added.
+    /// Supports glob syntax: `*` (any chars), `?` (single char).
+    /// Empty or None means all tools are included.
+    /// Can be set via `[agent].mcp_filter` in TOML for single-agent configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_filter: Option<Vec<String>>,
 }
 
 /// Vector store configuration
@@ -396,6 +403,7 @@ impl Default for AgentConfig {
                 turn_depth: Some(5),
                 context_window: None,
                 additional_params: None,
+                mcp_filter: None,
             },
             vector_stores: Vec::new(),
             mcp: None,
@@ -432,11 +440,15 @@ impl AgentConfig {
     /// - Filter is empty - all tools pass
     /// - Tool name matches at least one pattern
     ///
+    /// Checks the extension field (`self.mcp_filter`, set by orchestrator) first,
+    /// then falls back to the TOML-parseable field (`self.agent.mcp_filter`).
+    ///
     /// Supports simple glob patterns:
     /// - `*` matches any sequence of characters
     /// - `?` matches any single character
     pub fn tool_matches_filter(&self, tool_name: &str) -> bool {
-        match &self.mcp_filter {
+        let effective = self.mcp_filter.as_ref().or(self.agent.mcp_filter.as_ref());
+        match effective {
             None => true,
             Some(patterns) if patterns.is_empty() => true,
             Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
