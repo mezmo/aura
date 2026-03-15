@@ -636,6 +636,101 @@ impl Orchestrator {
         }
     }
 
+    /// Stream a full ReAct chat, forwarding reasoning events and collecting the final response.
+    ///
+    /// Unlike `stream_and_collect` (which uses `max_depth=1` and early-exit for coordinator
+    /// one-shot tool phases), this uses the agent's configured `max_depth` and runs the
+    /// full multi-turn tool loop. Used for workers, synthesis, and phase continuation.
+    ///
+    /// Key behaviors:
+    /// - Uses `agent.stream_chat()` which respects the agent's configured `max_depth`
+    /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx`
+    /// - No early-exit — runs the complete ReAct loop
+    /// - Timeout wrapping via `per_call_timeout_secs`
+    async fn stream_and_forward(
+        &self,
+        agent: &Agent,
+        prompt: &str,
+        history: Vec<rig::completion::Message>,
+        phase: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
+    {
+        use crate::provider_agent::{CompletionResponse, StreamedAssistantContent};
+        use futures::StreamExt;
+        use rig::completion::Usage;
+
+        let timeout_secs = self.config.per_call_timeout_secs();
+        let stream_future = async {
+            let mut stream = agent.stream_chat(prompt, history).await;
+            let mut content = String::new();
+            let mut usage = Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+            };
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                        content.push_str(&t);
+                    }
+                    Ok(StreamItem::StreamAssistantItem(
+                        ref sa @ StreamedAssistantContent::ReasoningDelta { .. },
+                    )) => {
+                        if let Some(tx) = event_tx {
+                            let _ = tx
+                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                                .await;
+                        }
+                    }
+                    Ok(StreamItem::StreamAssistantItem(
+                        ref sa @ StreamedAssistantContent::Reasoning(_),
+                    )) => {
+                        if let Some(tx) = event_tx {
+                            let _ = tx
+                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                                .await;
+                        }
+                    }
+                    Ok(StreamItem::Final(info)) => {
+                        content = info.content;
+                        usage = info.usage;
+                        break;
+                    }
+                    Ok(StreamItem::FinalMarker) => {
+                        // Per-turn marker — not end-of-stream. Continue collecting.
+                    }
+                    Err(e) => return Err(e),
+                    _ => {} // ToolCall, ToolCallDelta, ToolResult — rig handles execution
+                }
+            }
+
+            Ok(CompletionResponse { content, usage })
+        };
+
+        if timeout_secs == 0 {
+            stream_future.await
+        } else {
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), stream_future).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "{} timed out after {}s (per_call_timeout_secs={})",
+                        phase,
+                        timeout_secs,
+                        timeout_secs,
+                    );
+                    Err(format!(
+                        "{} timed out after {}s — the LLM provider did not respond in time",
+                        phase, timeout_secs
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
     /// Stream a coordinator call with early exit and optional reasoning forwarding.
     ///
     /// Replaces `chat_with_timeout` for one-shot tool phases (planning, evaluation).
@@ -2324,7 +2419,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             worker_name: worker_name.as_deref(),
                             plan_goal: &goal,
                         };
-                        let result = self.execute_task(task_id, &params).await;
+                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
                     }
@@ -2482,7 +2577,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             worker_name: worker_name.as_deref(),
                             plan_goal: &goal,
                         };
-                        let result = self.execute_task(task_id, &params).await;
+                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
                     }
@@ -2571,7 +2666,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// single-call decision — no quality scoring or evaluation tools.
     ///
     /// Returns `PhaseContinuation::Continue` or `PhaseContinuation::Replan`.
-    async fn phase_continuation(&self, plan: &Plan) -> super::types::PhaseContinuation {
+    async fn phase_continuation(
+        &self,
+        plan: &Plan,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    ) -> super::types::PhaseContinuation {
         use super::templates::{PhaseContinuationVars, render_phase_continuation_prompt};
 
         let phase = match plan.current_phase() {
@@ -2653,7 +2752,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 );
 
                 match self
-                    .chat_with_timeout(&coordinator, &prompt, vec![], "PhaseContinuation")
+                    .stream_and_forward(
+                        &coordinator,
+                        &prompt,
+                        vec![],
+                        "PhaseContinuation",
+                        event_tx,
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -2800,6 +2905,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     ) -> Result<String, StreamError> {
         let TaskExecutionParams {
             task_description,
@@ -2840,7 +2946,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Execute the task (workers get context from the task prompt, not conversation history)
         let result = self
-            .chat_with_timeout(&worker, &worker_prompt, vec![], "Worker task")
+            .stream_and_forward(&worker, &worker_prompt, vec![], "Worker task", event_tx)
             .await;
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -2944,7 +3050,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// combine results into a coherent response.
     ///
     /// Also persists the synthesis artifacts via ExecutionPersistence.
-    async fn synthesize(&self, plan: &Plan, query: &str) -> Result<String, StreamError> {
+    async fn synthesize(
+        &self,
+        plan: &Plan,
+        query: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    ) -> Result<String, StreamError> {
         // Collect completed tasks with results
         let completed_tasks: Vec<&Task> = plan
             .tasks
@@ -3018,7 +3129,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 self.journal_record(JournalPhase::Synthesis, &synth_preamble, &synthesis_prompt);
 
                 match self
-                    .chat_with_timeout(&coordinator, &synthesis_prompt, vec![], "Synthesis")
+                    .stream_and_forward(
+                        &coordinator,
+                        &synthesis_prompt,
+                        vec![],
+                        "Synthesis",
+                        event_tx,
+                    )
                     .await
                 {
                     Ok(response) => {
@@ -3482,7 +3599,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                     // Phase continuation checkpoint (skip for last phase)
                     let continuation_str = if phase_idx + 1 < phases.len() {
-                        let continuation = self.phase_continuation(&plan).await;
+                        let continuation = self.phase_continuation(&plan, Some(&event_tx)).await;
                         let cont_str = match continuation {
                             super::types::PhaseContinuation::Replan => "replan",
                             super::types::PhaseContinuation::Continue => "continue",
@@ -3559,7 +3676,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             iteration,
                             plan.completed_count()
                         );
-                        match self.synthesize(&plan, query).await {
+                        match self.synthesize(&plan, query, Some(&event_tx)).await {
                             Ok(partial) => {
                                 final_result = partial;
                                 break;
@@ -3660,7 +3777,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             iteration,
                             plan.completed_count()
                         );
-                        match self.synthesize(&plan, query).await {
+                        match self.synthesize(&plan, query, Some(&event_tx)).await {
                             Ok(partial) => {
                                 final_result = partial;
                                 break;
@@ -3727,7 +3844,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if !is_single_task {
                     Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing).await;
                 }
-                final_result = self.synthesize(&plan, query).await?;
+                final_result = self.synthesize(&plan, query, Some(&event_tx)).await?;
             }
 
             // ----------------------------------------------------------------

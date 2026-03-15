@@ -501,7 +501,10 @@ impl Agent {
         if config.tool_wrapper.is_some() {
             tracing::info!("Tool wrapper configured");
         }
-        let effective_filter = config.mcp_filter.as_ref().or(config.agent.mcp_filter.as_ref());
+        let effective_filter = config
+            .mcp_filter
+            .as_ref()
+            .or(config.agent.mcp_filter.as_ref());
         if let Some(patterns) = effective_filter {
             tracing::info!("MCP filter: {} pattern(s): {:?}", patterns.len(), patterns);
         }
