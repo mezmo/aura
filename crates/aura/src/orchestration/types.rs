@@ -590,19 +590,18 @@ impl PlanningResponse {
                 });
                 Some(plan)
             }
-            PlanningResponse::StepsPlan { goal, steps, .. } => {
-                match flatten_steps(&steps) {
-                    Ok(tasks) => {
-                        let mut plan = Plan::new(goal);
-                        plan.steps = Some(steps);
-                        for task in tasks {
-                            plan.add_task(task);
-                        }
-                        Some(plan)
+            PlanningResponse::StepsPlan { goal, steps, .. } => match flatten_steps(&steps) {
+                Ok(tasks) => {
+                    let mut plan = Plan::new(goal);
+                    plan.steps = Some(steps);
+                    for task in tasks {
+                        plan.add_task(task);
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to flatten steps plan: {}", e);
-                        None
+                    Some(plan)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to flatten steps plan: {}", e);
+                    None
                 }
             },
             _ => None,
