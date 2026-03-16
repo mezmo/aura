@@ -107,24 +107,9 @@ test-integration-down:  ## Cleanup integration test containers
 		-f compose/test.yml \
 		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
 
-# Mock MCP source directory (override for worktrees: MOCK_MCP_SRC_DIR=../aura-mock-mcp/main)
-MOCK_MCP_SRC_DIR ?= ../aura-mock-mcp
-
-.PHONY:mock-mcp-build
-mock-mcp-build::      ## Build local mock-mcp image (set MOCK_MCP_SRC_DIR for custom path)
-	@echo "Building aura-mock-mcp:local from $(MOCK_MCP_SRC_DIR)..."
-	@if [ ! -d "$(MOCK_MCP_SRC_DIR)" ]; then \
-		echo "Error: $(MOCK_MCP_SRC_DIR) not found."; \
-		echo "  Clone it: git clone git@github.com:answerbook/aura-mock-mcp.git $(MOCK_MCP_SRC_DIR)"; \
-		echo "  Or set MOCK_MCP_SRC_DIR to your git branch/worktree path"; \
-		exit 1; \
-	fi
-	docker build -t aura-mock-mcp:local $(MOCK_MCP_SRC_DIR)
 
 .PHONY:test-integration-local-up
 test-integration-local-up::  ## Start local aura infra for testing
-	@echo "Building fresh mock-mcp image from $(MOCK_MCP_SRC_DIR)..."
-	@$(MAKE) mock-mcp-build
 	@echo "Starting local aura infra for testing..."
 	docker compose -f compose/base.yml -f compose/dev.yml up -d --build --force-recreate
 	@echo "Waiting for services to be healthy..."
