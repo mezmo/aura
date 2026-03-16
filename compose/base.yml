@@ -14,10 +14,9 @@ services:
   # - Python FastMCP (port 9999) - general tool mocking
   # - Rust cancellation server (port 9998) - cancellation/progress tests
   mock-mcp:
-    # Use GCR image in CI, local build for development (Mac ARM needs local build)
-    # CI: Set MOCK_MCP_IMAGE in Jenkinsfile
-    # Local: Run `make mock-mcp-build` to build from ../aura-mock-mcp
+    # Use Docker Hub image
     image: ${MOCK_MCP_IMAGE:-mezmo/aura-mock-mcp:latest}
+ 
     volumes:
       # Shared volume for marker files (written by slow_task, read by tests)
       # Uses /tmp since that's where slow_task writes marker files
