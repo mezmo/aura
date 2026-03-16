@@ -88,17 +88,20 @@ pub struct EvaluationVars<'a> {
     pub query: &'a str,
     pub goal: &'a str,
     pub workers_context: &'a str,
+    pub task_evidence: &'a str,
     pub result: &'a str,
 }
 
 impl TemplateVars for EvaluationVars<'_> {
-    const VARS: &'static [&'static str] = &["QUERY", "GOAL", "WORKERS_CONTEXT", "RESULT"];
+    const VARS: &'static [&'static str] =
+        &["QUERY", "GOAL", "WORKERS_CONTEXT", "TASK_EVIDENCE", "RESULT"];
 
     fn render(&self, template: &str) -> String {
         template
             .replace("%%QUERY%%", self.query)
             .replace("%%GOAL%%", self.goal)
             .replace("%%WORKERS_CONTEXT%%", self.workers_context)
+            .replace("%%TASK_EVIDENCE%%", self.task_evidence)
             .replace("%%RESULT%%", self.result)
     }
 }
@@ -655,6 +658,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             query,
             goal: "Calculate (3+7)*2 and find files in /data",
             workers_context: "\nSYSTEM CONTEXT:\nConfigured workers:\n- arithmetic: Arithmetic operations: addition, subtraction, multiplication, division\n- data: Data operations: listing files, multi-step data processing chains\n\n",
+            task_evidence: "\nTASK EXECUTION EVIDENCE:\n- Task 0 [arithmetic] (Complete): Calculate (3+7)*2 → (3+7)*2 = 20\n- Task 1 [data] (Complete): List files in /data → /data contains file1.txt, file2.txt\nSummary: 2/2 tasks completed, 0 failed\n",
             result: "(3+7)*2 equals 20. The /data directory contains file1.txt and file2.txt.",
         });
         let _ = writeln!(out, "{evaluation}");
