@@ -5563,5 +5563,4 @@ Provide the synthesized response:"#,
         assert_eq!(result.messages[0].role, "user");
         assert!(result.messages[0].content.contains("2+2"));
     }
-
 }
