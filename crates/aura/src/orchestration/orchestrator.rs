@@ -1827,9 +1827,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         &self,
         evaluation_tool: SubmitEvaluationTool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
-        let preamble = self
-            .config
-            .build_coordinator_preamble(self.agent_config.effective_preamble(), false);
+        let preamble = include_str!("../prompts/evaluation_preamble.md").to_string();
         let temperature = self.agent_config.agent.temperature;
 
         let coordinator_tools = CoordinatorTools {
@@ -2234,6 +2232,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// The prompt provides context about the query, goal, and synthesized
     /// response, asking the LLM to evaluate completeness, accuracy, and coherence.
+    /// When `AURA_ENRICH_EVALUATION` is enabled (default: true), includes truncated
+    /// task execution evidence so the evaluator can verify data in the synthesis
+    /// against actual tool results rather than assuming hallucination.
     fn build_evaluation_prompt(&self, plan: &Plan, query: &str, result: &str) -> String {
         // Include worker context so eval can detect factually wrong answers
         // (e.g., user asks "what workers do you have?" and response doesn't match)
@@ -2246,10 +2247,64 @@ Assign tasks to the worker whose tools best match the required operations."#,
             String::new()
         };
 
+        // Build task evidence when enrichment is enabled
+        let enrich = std::env::var("AURA_ENRICH_EVALUATION")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+
+        let task_evidence = if enrich && !plan.tasks.is_empty() {
+            let task_lines: Vec<String> = plan
+                .tasks
+                .iter()
+                .map(|t| {
+                    let worker_label = t
+                        .worker
+                        .as_deref()
+                        .map(|w| format!(" [{}]", w))
+                        .unwrap_or_default();
+                    match t.status {
+                        TaskStatus::Complete => {
+                            let result_text = t.result.as_deref().unwrap_or("(no result)");
+                            let (truncated, was_truncated) = safe_truncate(result_text, 500);
+                            let suffix = if was_truncated { "..." } else { "" };
+                            format!(
+                                "- Task {}{} (Complete): {} → {}{}",
+                                t.id, worker_label, t.description, truncated, suffix
+                            )
+                        }
+                        TaskStatus::Failed => {
+                            let err = t.error.as_deref().unwrap_or("unknown");
+                            format!(
+                                "- Task {}{} (Failed): {} → Error: {}",
+                                t.id, worker_label, t.description, err
+                            )
+                        }
+                        _ => {
+                            format!(
+                                "- Task {}{} ({:?}): {}",
+                                t.id, worker_label, t.status, t.description
+                            )
+                        }
+                    }
+                })
+                .collect();
+
+            format!(
+                "\nTASK EXECUTION EVIDENCE:\n{}\nSummary: {}/{} tasks completed, {} failed\n",
+                task_lines.join("\n"),
+                plan.completed_count(),
+                plan.tasks.len(),
+                plan.failed_count()
+            )
+        } else {
+            String::new()
+        };
+
         super::templates::render_evaluation_prompt(&super::templates::EvaluationVars {
             query,
             goal: &plan.goal,
             workers_context: &workers_context,
+            task_evidence: &task_evidence,
             result,
         })
     }
@@ -5508,4 +5563,5 @@ Provide the synthesized response:"#,
         assert_eq!(result.messages[0].role, "user");
         assert!(result.messages[0].content.contains("2+2"));
     }
+
 }
