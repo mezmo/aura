@@ -4,12 +4,13 @@ ORIGINAL USER QUERY: %%QUERY%%
 
 ORCHESTRATION GOAL: %%GOAL%%
 %%WORKERS_CONTEXT%%
+%%TASK_EVIDENCE%%
 SYNTHESIZED RESPONSE:
 %%RESULT%%
 
 EVALUATION CRITERIA:
 1. **Completeness**: Does it fully address the query?
-2. **Accuracy**: Is the information correct based on task results and system context?
+2. **Accuracy**: Is the information correct? Cross-reference the TASK EXECUTION EVIDENCE above — data that matches task results is verified, not hallucinated.
 3. **Coherence**: Is the response well-organized and clear?
 4. **Actionability**: If the user asked for help, can they act on this?
 
