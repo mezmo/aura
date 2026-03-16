@@ -93,8 +93,13 @@ pub struct EvaluationVars<'a> {
 }
 
 impl TemplateVars for EvaluationVars<'_> {
-    const VARS: &'static [&'static str] =
-        &["QUERY", "GOAL", "WORKERS_CONTEXT", "TASK_EVIDENCE", "RESULT"];
+    const VARS: &'static [&'static str] = &[
+        "QUERY",
+        "GOAL",
+        "WORKERS_CONTEXT",
+        "TASK_EVIDENCE",
+        "RESULT",
+    ];
 
     fn render(&self, template: &str) -> String {
         template
