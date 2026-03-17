@@ -1,4 +1,4 @@
-# Math Orchestration — Qwen3-Thinking 30B-A3B test config
+# Math Orchestration — Nemotron 3 Nano test config
 #
 # Uses the math-mcp server (21 real math tools) with three specialized workers.
 # Start the math-mcp container first:
@@ -9,7 +9,7 @@
 provider = "openai"
 api_key = "no-key-needed"
 base_url = "http://localhost:11435/v1"
-model = "qwen3-thinking-64k-p2"
+model = "nemotron-64k-p6"
 
 [agent]
 name = "Math Orchestrator"
@@ -44,10 +44,10 @@ allow_clarification = true
 tools_in_planning = "summary"
 
 [orchestration.timeouts]
-per_call_timeout_secs = 120
+per_call_timeout_secs = 60
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-math-qwen-thinking"
+memory_dir = "/tmp/aura-math-nemotron"
 
 # Arithmetic worker: basic operations
 [orchestration.worker.arithmetic]
