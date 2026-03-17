@@ -2165,7 +2165,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3108,7 +3108,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.31",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
@@ -3145,7 +3145,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3360,7 +3360,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.28.0"
-source = "git+https://github.com/mezmo/rig.git?rev=34e837b245b60f33284b4b9438ca3a4c89987de5#34e837b245b60f33284b4b9438ca3a4c89987de5"
+source = "git+https://github.com/mezmo/rig.git?rev=16f8081384fd21c78647c179a96f2b23767167f2#16f8081384fd21c78647c179a96f2b23767167f2"
 dependencies = [
  "as-any",
  "async-stream",
