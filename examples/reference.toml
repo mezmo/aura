@@ -95,10 +95,7 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # collection_name = "documents"
 # context_prefix = "Technical documentation and API references"
 #
-# [vector_stores.embedding_model]
-# provider = "openai"
-# model = "text-embedding-3-small"
-# api_key = "{{ env.OPENAI_API_KEY }}"
+# embedding_model = { provider = "openai", model = "text-embedding-3-small", api_key = "{{ env.OPENAI_API_KEY }}" }
 
 # You can add multiple vector stores. Each one becomes a separate
 # search tool the agent can call (e.g., vector_search_docs,
@@ -111,10 +108,7 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # collection_name = "runbooks"
 # context_prefix = "Operational runbooks and troubleshooting guides"
 #
-# [vector_stores.embedding_model]
-# provider = "openai"
-# model = "text-embedding-3-small"
-# api_key = "{{ env.OPENAI_API_KEY }}"
+# embedding_model = { provider = "openai", model = "text-embedding-3-small", api_key = "{{ env.OPENAI_API_KEY }}" }
 
 # ── Tools ───────────────────────────────────────────────────────────
 [tools]

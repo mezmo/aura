@@ -1,3 +1,10 @@
+## [1.15.1](https://github.com/mezmo/aura/compare/v1.15.0...v1.15.1) (2026-03-17)
+
+
+### Documentation
+
+* use inline table syntax for embedding_model in reference config [6d6b102](https://github.com/mezmo/aura/commit/6d6b102f9a3988a70a9d822dc087eb9dbd5cf4f6) - Mike Shearer [LOG-23445](https://logdna.atlassian.net/browse/LOG-23445)
+
 # [1.15.0](https://github.com/mezmo/aura/compare/v1.14.13...v1.15.0) (2026-03-12)
 
 
