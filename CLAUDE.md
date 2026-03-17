@@ -48,7 +48,8 @@ aura/
 ├── development/              # LibreChat and OpenWebUI setup
 ├── docs/                     # Architecture and protocol documentation
 ├── examples/                 # Example and reference configurations
-└── scripts/                  # CI and utility scripts
+├── scripts/                  # CI and utility scripts
+└── temp-prompt-eval/         # E2E eval scripts and results (gitignored)
 ```
 
 ## Key Features
@@ -125,6 +126,34 @@ make test           # Run all tests
 make docker-build   # Build Docker image
 make lint           # Run clippy + fmt check
 ```
+
+## E2E Model Comparison
+
+The `temp-prompt-eval/` directory contains scripts for running E2E model comparisons against the math-MCP orchestration setup.
+
+```bash
+# Prerequisites: release binary built, llama-server reachable on 11435 (for local models)
+cargo build --release
+
+# Run 3 iterations on specific configs (math-mcp started/stopped automatically)
+./temp-prompt-eval/run-qwen-comparison.sh 3 \
+  configs/math-orchestration-glm.toml \
+  configs/math-orchestration-qwen3.toml \
+  configs/math-orchestration-qwen35.toml
+
+# Run 5 iterations on all math-orchestration configs
+./temp-prompt-eval/run-qwen-comparison.sh 5 configs/math-orchestration-*.toml
+```
+
+The script automatically starts math-mcp via Docker Compose, then starts/stops the aura server per config. Model name is derived from the config filename. Each run sends 5 test prompts per iteration with `AURA_CUSTOM_EVENTS`, `AURA_EMIT_REASONING`, and `AURA_PROMPT_JOURNAL` enabled.
+
+Outputs:
+- `results-<timestamp>/results.csv` — raw data (timing, tool calls, timeouts, completion)
+- `results-<timestamp>/<model>/iter-<n>/<prompt>.sse` — full SSE captures
+- `results-<timestamp>/<model>/server.log` — server logs
+- Summary table printed to stdout
+
+Per-model configs live in `configs/math-orchestration-*.toml`. Local llama-server model aliases use `-p<N>` suffix for parallel slot profiles (e.g., `glm-64k-p6`, `qwen35-64k-p3`).
 
 ## Documentation
 

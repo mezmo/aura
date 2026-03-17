@@ -7,10 +7,7 @@
 provider = "openai"
 api_key = "no-key-needed"
 base_url = "http://localhost:11435/v1"
-model = "qwen35-64k"
-
-[llm.additional_params]
-enable_thinking = false
+model = "qwen35-64k-p3"
 
 [agent]
 name = "Math Orchestrator"
@@ -24,6 +21,9 @@ ROUTING GUIDANCE:
 - Vague or ambiguous requests: ask for clarification
 """
 temperature = 0.3
+
+[agent.additional_params.chat_template_kwargs]
+enable_thinking = false
 
 [mcp]
 sanitize_schemas = false
