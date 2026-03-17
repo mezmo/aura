@@ -1,15 +1,13 @@
-# Math Orchestration — Qwen3-Thinking 30B-A3B test config
+# Math Orchestration — Qwen3-30B-A3B (instruct, non-thinking)
 #
 # Uses the math-mcp server (21 real math tools) with three specialized workers.
-# Start the math-mcp container first:
-#
-#   cd ~/workspace/aura-math-orchestration && docker compose up -d
+# Requires SSH tunnel to notanton: ssh -L 11435:127.0.0.1:8080 notanton
 
 [llm]
 provider = "openai"
 api_key = "no-key-needed"
 base_url = "http://localhost:11435/v1"
-model = "qwen3-thinking-64k-p2"
+model = "qwen3-instruct-64k-p2"
 
 [agent]
 name = "Math Orchestrator"
@@ -23,6 +21,9 @@ ROUTING GUIDANCE:
 - Vague or ambiguous requests: ask for clarification
 """
 temperature = 0.3
+
+[agent.additional_params.chat_template_kwargs]
+enable_thinking = false
 
 [mcp]
 sanitize_schemas = false
@@ -47,7 +48,7 @@ tools_in_planning = "summary"
 per_call_timeout_secs = 120
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-math-qwen-thinking"
+memory_dir = "/tmp/aura-math-qwen3"
 
 # Arithmetic worker: basic operations
 [orchestration.worker.arithmetic]

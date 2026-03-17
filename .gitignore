@@ -95,3 +95,8 @@ TODO.md
 
 # Test config files
 config-*-test.toml
+
+# E2E eval results (keep scripts, ignore output)
+temp-prompt-eval/results-*/
+temp-prompt-eval/eval-loop/
+temp-prompt-eval/loop-history.jsonl
