@@ -47,6 +47,7 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `AURA_CUSTOM_EVENTS` | `false` | Enable custom `aura.*` events |
 | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` events |
 | `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period (seconds) for in-flight streams on shutdown |
+| `ENABLE_CLIENT_TOOLS` | `false` | Enable client-side tool execution via the `tools` request field |
 
 ## Custom Aura Events (Optional)
 
@@ -249,7 +250,7 @@ data: [DONE]
 | Value | Meaning |
 |-------|---------|
 | `stop` | Normal completion |
-| `tool_calls` | Response included tool execution |
+| `tool_calls` | Response included tool calls — server-side tools were executed inline; client-side tools require the client to execute and send results back |
 | `length` | Response truncated due to max_tokens limit |
 
 ## Client Examples
@@ -328,6 +329,65 @@ Here are the files I found:
 ```
 
 The separator is automatically injected when text chunks resume after a `ToolResult` event.
+
+## Client-Side Tool Execution
+
+When `ENABLE_CLIENT_TOOLS=true`, clients can pass tool definitions in the request's `tools` field (OpenAI format). These are registered as passthrough tools — the LLM sees them alongside any server-side MCP tools and can call them, but they are not executed server-side.
+
+When the LLM calls a client-side tool, the stream terminates with `finish_reason: "tool_calls"` and the tool call details in the final delta. The client is responsible for:
+
+1. Executing the tool locally
+2. Sending a follow-up request with the tool result in chat history
+
+### Request with Client Tools
+
+```json
+{
+  "messages": [{"role": "user", "content": "What time is it?"}],
+  "stream": true,
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_current_time",
+      "description": "Get the current time in ISO 8601 format",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  }]
+}
+```
+
+### Stream Output (Client Tool Called)
+
+```
+data: {"choices":[{"delta":{"role":"assistant","content":""}}]}
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_current_time","arguments":"{}"}}]}}]}
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+data: [DONE]
+```
+
+### Follow-Up with Tool Result
+
+The client executes the tool, then sends the result back as a `role: "tool"` message alongside the original conversation history:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "What time is it?"},
+    {"role": "assistant", "content": null, "tool_calls": [
+      {"id": "call_abc", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_abc", "content": "2025-03-18T14:30:00Z"}
+  ],
+  "stream": true,
+  "tools": [...]
+}
+```
+
+The server reconstructs the conversation history (including the tool call and result) and sends it to the LLM, which can then respond to the user using the tool output.
+
+### Coexistence with Server-Side Tools
+
+Client-side and MCP server-side tools coexist transparently. The LLM sees all tools and decides which to call. Server-side MCP tools execute automatically within the stream; client-side tools pause the stream for client execution. A single turn may involve server-side tool calls (executed inline) followed by a client-side tool call (which terminates the stream).
 
 ## Connection Behavior
 

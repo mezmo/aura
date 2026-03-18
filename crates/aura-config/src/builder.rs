@@ -1,7 +1,7 @@
 use crate::{Config, ConfigError};
 use aura::{
-    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
-    McpServerConfig, ReasoningEffort, ToolsConfig, VectorStoreConfig,
+    Agent, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
+    ReasoningEffort, ToolsConfig, VectorStoreConfig,
 };
 use std::collections::HashMap;
 
@@ -170,23 +170,15 @@ impl RigBuilder {
         })
     }
 
-    pub async fn build_agent(&self) -> Result<Agent, ConfigError> {
-        let agent_config = self.to_agent_config()?;
-        self.build_from_config(agent_config).await
-    }
-
-    pub async fn build_agent_with_headers(
+    pub async fn build_agent(
         &self,
         req_headers: Option<&HashMap<String, String>>,
+        client_tools: Option<Vec<aura::builder::ClientTool>>,
     ) -> Result<Agent, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
-        self.build_from_config(agent_config).await
-    }
 
-    async fn build_from_config(&self, agent_config: AgentConfig) -> Result<Agent, ConfigError> {
-        AgentBuilder::new(agent_config)
-            .build_agent()
+        Agent::new(&agent_config, client_tools)
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build agent: {e}")))
     }
