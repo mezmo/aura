@@ -89,6 +89,13 @@ struct Args {
     /// Not required when only one configuration is loaded via CONFIG_PATH.
     #[arg(long, env = "DEFAULT_AGENT")]
     default_agent: Option<String>,
+
+    /// Enable client-side tool execution.
+    /// When enabled, clients can pass tool definitions in the request `tools` field.
+    /// The LLM can call these tools, but instead of executing server-side, the stream
+    /// terminates with `finish_reason: "tool_calls"` for the client to execute locally.
+    #[arg(long, env = "ENABLE_CLIENT_TOOLS")]
+    enable_client_tools: bool,
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
@@ -188,6 +195,7 @@ async fn run() -> std::io::Result<()> {
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
+        enable_client_tools: args.enable_client_tools,
     });
 
     info!(
