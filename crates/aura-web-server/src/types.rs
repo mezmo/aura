@@ -69,6 +69,8 @@ pub struct AppState {
     pub active_requests: Arc<ActiveRequestTracker>,
     /// Default agent name or alias, used when `model` is omitted from the request
     pub default_agent: Option<String>,
+    /// Enable client-side tool execution via the `tools` request field
+    pub enable_client_tools: bool,
 }
 
 /// OpenAI-compatible message role
@@ -78,7 +80,9 @@ pub enum Role {
     System,
     User,
     Assistant,
-    /// Catch-all for roles we don't handle (e.g. "tool", "function")
+    /// Tool result message (role="tool") for client-side tool follow-ups
+    Tool,
+    /// Catch-all for roles we don't handle (e.g. "function")
     #[serde(other, rename = "unknown")]
     Unknown,
 }
@@ -89,6 +93,7 @@ impl std::fmt::Display for Role {
             Role::System => write!(f, "system"),
             Role::User => write!(f, "user"),
             Role::Assistant => write!(f, "assistant"),
+            Role::Tool => write!(f, "tool"),
             Role::Unknown => write!(f, "unknown"),
         }
     }
@@ -98,7 +103,70 @@ impl std::fmt::Display for Role {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Tool calls made by the assistant (role="assistant" with tool_calls)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatMessageToolCall>>,
+    /// Tool call ID this message is a result for (role="tool")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool name (role="tool")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A tool call in a chat message (role="assistant")
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatMessageToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ChatMessageFunctionCall,
+}
+
+/// Function call details within a tool call
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatMessageFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Client-side tool definition (OpenAI `tools` field).
+///
+/// The nested `function` structure matches the OpenAI API format.
+/// Converts to `aura::builder::ClientTool` via the `From` impl.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClientToolDefinition {
+    /// Always "function" in OpenAI's API — retained for deserialization fidelity.
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub tool_type: String,
+    pub function: ClientFunctionDefinition,
+}
+
+/// Function definition within a client tool
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClientFunctionDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
+}
+
+impl From<&ClientToolDefinition> for aura::builder::ClientTool {
+    fn from(def: &ClientToolDefinition) -> Self {
+        Self {
+            name: def.function.name.clone(),
+            description: def.function.description.clone().unwrap_or_default(),
+            parameters: def
+                .function
+                .parameters
+                .clone()
+                .unwrap_or(serde_json::json!({})),
+        }
+    }
 }
 
 /// OpenAI-compatible chat completions request
@@ -113,6 +181,10 @@ pub struct ChatCompletionRequest {
     /// OpenAI-compatible metadata field (up to 16 key-value pairs)
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// Client-side tool definitions (OpenAI tools field)
+    #[serde(default)]
+    pub tools: Option<Vec<ClientToolDefinition>>,
 }
 
 /// OpenAI-compatible error responses for chat completion requests.
