@@ -62,6 +62,7 @@ pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
 pub use persistence::{ExecutionPersistence, TaskExecutionRecord, ToolCallRecord};
 pub use persistence_wrapper::PersistenceWrapper;
+pub use stream_events::EventContext;
 pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;
 pub use tools::GetConversationContextTool;
