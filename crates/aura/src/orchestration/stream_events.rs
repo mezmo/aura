@@ -21,8 +21,27 @@
 //! 1. Keep orchestration evolution isolated from base aura streaming
 //! 2. Allow different serialization or handling if needed
 
+use crate::orchestration::types::PhaseContinuation;
 use crate::stream_events::{AgentContext, CorrelationContext};
 use serde::Serialize;
+
+/// Shared context included in every orchestration SSE event.
+///
+/// Bundles agent identity and correlation IDs (session, trace) to avoid
+/// repeating the same two `#[serde(flatten)]` fields on every variant.
+#[derive(Clone, Debug, Serialize)]
+pub struct EventContext {
+    #[serde(flatten)]
+    pub agent: AgentContext,
+    #[serde(flatten)]
+    pub correlation: CorrelationContext,
+}
+
+impl EventContext {
+    pub fn new(agent: AgentContext, correlation: CorrelationContext) -> Self {
+        Self { agent, correlation }
+    }
+}
 
 /// Constants for SSE event names. Import in tests for compile-time linkage.
 pub mod event_names {
@@ -32,6 +51,7 @@ pub mod event_names {
     pub const TASK_STARTED: &str = "aura.orchestrator.task_started";
     pub const TASK_COMPLETED: &str = "aura.orchestrator.task_completed";
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
+    pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
@@ -54,18 +74,14 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         planning_response: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when orchestrator answers directly without orchestration.
     DirectAnswer {
         response: String,
         routing_rationale: String,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when orchestrator needs clarification from the user.
     ClarificationNeeded {
@@ -74,9 +90,7 @@ pub enum OrchestrationStreamEvent {
         options: Option<Vec<String>>,
         routing_rationale: String,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when orchestrator starts a task.
     TaskStarted {
@@ -85,9 +99,7 @@ pub enum OrchestrationStreamEvent {
         worker_id: String,
         orchestrator_id: String,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when orchestrator completes a task.
     TaskCompleted {
@@ -99,25 +111,33 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when orchestrator completes an iteration.
     IterationComplete {
         iteration: usize,
         quality_score: f32,
+        quality_threshold: f32,
+        will_replan: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        gaps: Vec<String>,
         #[serde(flatten)]
-        agent: AgentContext,
+        context: EventContext,
+    },
+    /// Emitted when orchestrator starts a replan cycle.
+    ReplanStarted {
+        iteration: usize,
+        trigger: String,
         #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when orchestrator starts synthesizing results.
     Synthesizing {
+        iteration: usize,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when a tool call starts within a worker task.
     ToolCallStarted {
@@ -129,9 +149,7 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         arguments: Option<serde_json::Value>,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when a tool call completes within a worker task.
     ToolCallCompleted {
@@ -143,9 +161,7 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when a phase starts execution.
     PhaseStarted {
@@ -153,20 +169,16 @@ pub enum OrchestrationStreamEvent {
         label: String,
         orchestrator_id: String,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
     /// Emitted when a phase completes execution.
     PhaseCompleted {
         phase_id: usize,
         label: String,
-        continuation: String,
+        continuation: PhaseContinuation,
         orchestrator_id: String,
         #[serde(flatten)]
-        agent: AgentContext,
-        #[serde(flatten)]
-        correlation: CorrelationContext,
+        context: EventContext,
     },
 }
 
@@ -180,6 +192,7 @@ impl OrchestrationStreamEvent {
             Self::TaskStarted { .. } => event_names::TASK_STARTED,
             Self::TaskCompleted { .. } => event_names::TASK_COMPLETED,
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
+            Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
@@ -203,16 +216,14 @@ impl OrchestrationStreamEvent {
         task_count: usize,
         routing_rationale: impl Into<String>,
         planning_response: Option<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::PlanCreated {
             goal: goal.into(),
             task_count,
             routing_rationale: routing_rationale.into(),
             planning_response,
-            agent,
-            correlation,
+            context,
         }
     }
 
@@ -220,14 +231,12 @@ impl OrchestrationStreamEvent {
     pub fn direct_answer(
         response: impl Into<String>,
         routing_rationale: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::DirectAnswer {
             response: response.into(),
             routing_rationale: routing_rationale.into(),
-            agent,
-            correlation,
+            context,
         }
     }
 
@@ -236,15 +245,13 @@ impl OrchestrationStreamEvent {
         question: impl Into<String>,
         options: Option<Vec<String>>,
         routing_rationale: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::ClarificationNeeded {
             question: question.into(),
             options,
             routing_rationale: routing_rationale.into(),
-            agent,
-            correlation,
+            context,
         }
     }
 
@@ -252,63 +259,78 @@ impl OrchestrationStreamEvent {
     pub fn task_started(
         task_id: usize,
         description: impl Into<String>,
-        agent: AgentContext,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::TaskStarted {
             task_id,
             description: description.into(),
-            agent,
             orchestrator_id: orchestrator_id.into(),
             worker_id: worker_id.into(),
-            correlation,
+            context,
         }
     }
 
     /// Create a TaskCompleted event.
-    #[allow(clippy::too_many_arguments)]
     pub fn task_completed(
         task_id: usize,
         success: bool,
         duration_ms: u64,
-        agent: AgentContext,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
         result: Option<String>,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::TaskCompleted {
             task_id,
             success,
             duration_ms,
-            agent,
             orchestrator_id: orchestrator_id.into(),
             worker_id: worker_id.into(),
             result,
-            correlation,
+            context,
         }
     }
 
     /// Create an IterationComplete event.
+    #[allow(clippy::too_many_arguments)]
     pub fn iteration_complete(
         iteration: usize,
         quality_score: f32,
-        agent: AgentContext,
-        correlation: CorrelationContext,
+        quality_threshold: f32,
+        will_replan: bool,
+        reasoning: Option<String>,
+        gaps: Vec<String>,
+        context: EventContext,
     ) -> Self {
         Self::IterationComplete {
             iteration,
             quality_score,
-            agent,
-            correlation,
+            quality_threshold,
+            will_replan,
+            reasoning,
+            gaps,
+            context,
+        }
+    }
+
+    /// Create a ReplanStarted event.
+    pub fn replan_started(
+        iteration: usize,
+        trigger: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::ReplanStarted {
+            iteration,
+            trigger: trigger.into(),
+            context,
         }
     }
 
     /// Create a Synthesizing event.
-    pub fn synthesizing(agent: AgentContext, correlation: CorrelationContext) -> Self {
-        Self::Synthesizing { agent, correlation }
+    pub fn synthesizing(iteration: usize, context: EventContext) -> Self {
+        Self::Synthesizing { iteration, context }
     }
 
     /// Create a ToolCallStarted event.
@@ -316,19 +338,17 @@ impl OrchestrationStreamEvent {
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
-        agent: AgentContext,
         tool_initiator_id: impl Into<String>,
         arguments: Option<serde_json::Value>,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::ToolCallStarted {
             task_id,
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
-            agent,
             tool_initiator_id: tool_initiator_id.into(),
             arguments,
-            correlation,
+            context,
         }
     }
 
@@ -338,18 +358,16 @@ impl OrchestrationStreamEvent {
         tool_call_id: impl Into<String>,
         success: bool,
         duration_ms: u64,
-        agent: AgentContext,
         result: Option<String>,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
             success,
             duration_ms,
-            agent,
             result,
-            correlation,
+            context,
         }
     }
 
@@ -358,15 +376,13 @@ impl OrchestrationStreamEvent {
         phase_id: usize,
         label: impl Into<String>,
         orchestrator_id: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::PhaseStarted {
             phase_id,
             label: label.into(),
             orchestrator_id: orchestrator_id.into(),
-            agent,
-            correlation,
+            context,
         }
     }
 
@@ -374,18 +390,16 @@ impl OrchestrationStreamEvent {
     pub fn phase_completed(
         phase_id: usize,
         label: impl Into<String>,
-        continuation: impl Into<String>,
+        continuation: PhaseContinuation,
         orchestrator_id: impl Into<String>,
-        agent: AgentContext,
-        correlation: CorrelationContext,
+        context: EventContext,
     ) -> Self {
         Self::PhaseCompleted {
             phase_id,
             label: label.into(),
-            continuation: continuation.into(),
+            continuation,
             orchestrator_id: orchestrator_id.into(),
-            agent,
-            correlation,
+            context,
         }
     }
 }
@@ -394,32 +408,26 @@ impl OrchestrationStreamEvent {
 mod tests {
     use super::*;
 
+    fn test_ctx() -> EventContext {
+        EventContext::new(
+            AgentContext::single_agent(),
+            CorrelationContext::new("test-session", None),
+        )
+    }
+
     #[test]
     fn test_event_names() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
+        let ctx = test_ctx();
 
         assert_eq!(
-            OrchestrationStreamEvent::plan_created(
-                "goal",
-                3,
-                "test rationale",
-                None,
-                agent.clone(),
-                correlation.clone()
-            )
-            .event_name(),
+            OrchestrationStreamEvent::plan_created("goal", 3, "test rationale", None, ctx.clone())
+                .event_name(),
             event_names::PLAN_CREATED
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::direct_answer(
-                "answer",
-                "simple query",
-                agent.clone(),
-                correlation.clone()
-            )
-            .event_name(),
+            OrchestrationStreamEvent::direct_answer("answer", "simple query", ctx.clone())
+                .event_name(),
             event_names::DIRECT_ANSWER
         );
 
@@ -428,44 +436,32 @@ mod tests {
                 "which one?",
                 None,
                 "ambiguous",
-                agent.clone(),
-                correlation.clone()
+                ctx.clone()
             )
             .event_name(),
             event_names::CLARIFICATION_NEEDED
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::task_started(
-                0,
-                "desc",
-                agent.clone(),
-                "orch-id".to_string(),
-                "worker-id".to_string(),
-                correlation.clone(),
-            )
-            .event_name(),
+            OrchestrationStreamEvent::task_started(0, "desc", "orch-id", "worker-id", ctx.clone())
+                .event_name(),
             event_names::TASK_STARTED
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::synthesizing(agent.clone(), correlation.clone()).event_name(),
+            OrchestrationStreamEvent::synthesizing(1, ctx).event_name(),
             event_names::SYNTHESIZING
         );
     }
 
     #[test]
     fn test_format_sse() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::plan_created(
             "test goal",
             2,
             "test rationale",
             Some("coordinator response text".to_string()),
-            agent,
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 
@@ -478,17 +474,8 @@ mod tests {
 
     #[test]
     fn test_format_sse_plan_created_without_response() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
-        let event = OrchestrationStreamEvent::plan_created(
-            "goal",
-            1,
-            "rationale",
-            None,
-            agent,
-            correlation,
-        );
+        let event =
+            OrchestrationStreamEvent::plan_created("goal", 1, "rationale", None, test_ctx());
         let sse = event.format_sse();
 
         assert!(!sse.contains("planning_response"));
@@ -496,18 +483,14 @@ mod tests {
 
     #[test]
     fn test_format_sse_task_completed_with_result() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::task_completed(
             0,
             true,
             1500,
-            agent,
             "orch-1",
             "worker-1",
             Some("The mean is 30.0".to_string()),
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 
@@ -518,18 +501,14 @@ mod tests {
 
     #[test]
     fn test_format_sse_tool_call_started_with_arguments() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let args = serde_json::json!({"numbers": [10, 20, 30]});
         let event = OrchestrationStreamEvent::tool_call_started(
             Some(0),
             "call_1",
             "mean",
-            agent,
             "statistics",
             Some(args),
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 
@@ -539,17 +518,13 @@ mod tests {
 
     #[test]
     fn test_format_sse_tool_call_completed_with_result() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::tool_call_completed(
             Some(0),
             "call_1",
             true,
             42,
-            agent,
             Some("30.0".to_string()),
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 
@@ -560,27 +535,20 @@ mod tests {
 
     #[test]
     fn test_phase_started_event_name() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event =
-            OrchestrationStreamEvent::phase_started(0, "Gather data", "orch-1", agent, correlation);
+            OrchestrationStreamEvent::phase_started(0, "Gather data", "orch-1", test_ctx());
 
         assert_eq!(event.event_name(), event_names::PHASE_STARTED);
     }
 
     #[test]
     fn test_phase_completed_event_name() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::phase_completed(
             0,
             "Gather data",
-            "continue",
+            PhaseContinuation::Continue,
             "orch-1",
-            agent,
-            correlation,
+            test_ctx(),
         );
 
         assert_eq!(event.event_name(), event_names::PHASE_COMPLETED);
@@ -588,15 +556,11 @@ mod tests {
 
     #[test]
     fn test_format_sse_phase_started() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::phase_started(
             1,
             "Analyze findings",
             "orch-42",
-            agent,
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 
@@ -608,16 +572,12 @@ mod tests {
 
     #[test]
     fn test_format_sse_phase_completed_continue() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::phase_completed(
             0,
             "Gather data",
-            "continue",
+            PhaseContinuation::Continue,
             "orch-1",
-            agent,
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 
@@ -629,16 +589,12 @@ mod tests {
 
     #[test]
     fn test_format_sse_phase_completed_replan() {
-        let agent = AgentContext::single_agent();
-        let correlation = CorrelationContext::new("test-session", None);
-
         let event = OrchestrationStreamEvent::phase_completed(
             1,
             "Analyze findings",
-            "replan",
+            PhaseContinuation::Replan,
             "orch-1",
-            agent,
-            correlation,
+            test_ctx(),
         );
         let sse = event.format_sse();
 

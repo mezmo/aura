@@ -43,18 +43,36 @@ def parse_sse_file(path: Path) -> dict:
     worker_tools = sum(1 for e in events if e == "aura.tool_complete")
     tool_calls = orch_tools + worker_tools
 
-    # Loop detection: parse tool_call_completed data for duplicate errors
+    # Loop detection + per-worker tool call attribution
+    # Build tool_call_id → worker mapping from started events (which carry tool_initiator_id),
+    # then use it when parsing completed events (which don't).
     duplicate_tool_calls = 0
     failed_tool_calls = 0
+    call_id_to_worker = {}
+    tools_by_worker = defaultdict(lambda: {"total": 0, "failed": 0, "dupes": 0})
     for event_name, data in event_data_pairs:
-        if event_name in ("aura.orchestrator.tool_call_completed", "aura.tool_complete") and data:
+        if event_name == "aura.orchestrator.tool_call_started" and data:
             try:
                 payload = json.loads(data)
+                cid = payload.get("tool_call_id", "")
+                worker = payload.get("tool_initiator_id") or payload.get("worker_id") or ""
+                if cid and worker:
+                    call_id_to_worker[cid] = worker
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif event_name in ("aura.orchestrator.tool_call_completed", "aura.tool_complete") and data:
+            try:
+                payload = json.loads(data)
+                cid = payload.get("tool_call_id", "")
+                worker = call_id_to_worker.get(cid) or payload.get("tool_initiator_id") or payload.get("worker_id") or "unknown"
+                tools_by_worker[worker]["total"] += 1
                 if not payload.get("success", True):
                     failed_tool_calls += 1
+                    tools_by_worker[worker]["failed"] += 1
                     result = payload.get("result", "")
                     if "DUPLICATE TOOL CALL" in result:
                         duplicate_tool_calls += 1
+                        tools_by_worker[worker]["dupes"] += 1
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -102,6 +120,37 @@ def parse_sse_file(path: Path) -> dict:
     if pending_reasoning > 0:
         reasoning_by_phase[phase] += pending_reasoning
 
+    # Replan detection: parse replan_started and enriched iteration_complete
+    replans = []
+    iterations = []
+    for event_name, data in event_data_pairs:
+        if event_name == "aura.orchestrator.replan_started" and data:
+            try:
+                payload = json.loads(data)
+                replans.append({
+                    "iteration": payload.get("iteration"),
+                    "trigger": payload.get("trigger", "unknown"),
+                })
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif event_name == "aura.orchestrator.iteration_complete" and data:
+            try:
+                payload = json.loads(data)
+                iterations.append({
+                    "iteration": payload.get("iteration"),
+                    "quality_score": payload.get("quality_score"),
+                    "quality_threshold": payload.get("quality_threshold"),
+                    "will_replan": payload.get("will_replan", False),
+                    "gaps": payload.get("gaps", []),
+                })
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    replan_count = len(replans)
+    replan_triggers = defaultdict(int)
+    for r in replans:
+        replan_triggers[r["trigger"]] += 1
+
     return {
         "tool_calls": tool_calls,
         "orch_tools": orch_tools,
@@ -116,6 +165,11 @@ def parse_sse_file(path: Path) -> dict:
         "reasoning_total": reasoning_total,
         "reasoning_by_phase": dict(reasoning_by_phase),
         "event_counts": dict(event_counts),
+        "tools_by_worker": {k: dict(v) for k, v in tools_by_worker.items()},
+        "replan_count": replan_count,
+        "replan_triggers": dict(replan_triggers),
+        "replans": replans,
+        "iterations": iterations,
     }
 
 
@@ -283,6 +337,40 @@ def print_summary(rows: list[dict]):
                   f"{dupes:>6} {tasks:>6} {to:>4} {ok:>4}/{len(pr)}{flag}")
         print()
 
+    # ── Per-worker tool call breakdown ────────────────────────────
+    has_worker_data = any(r.get("tools_by_worker") for r in rows)
+    if has_worker_data:
+        # Collect all worker names across all rows
+        all_workers = sorted(set(
+            w for r in rows
+            for w in r.get("tools_by_worker", {}).keys()
+        ))
+        if all_workers:
+            worker_hdrs = "".join(f"{w[:12]:>14}" for w in all_workers)
+            print(f"{'Model':<20} {'Prompt':<22} {worker_hdrs}")
+            print("-" * (42 + 14 * len(all_workers)))
+            for model in models:
+                for prompt in prompts:
+                    pr = [r for r in rows
+                          if r["model"] == model and r["prompt"] == prompt]
+                    if not pr:
+                        continue
+                    # Sum per-worker totals across iterations
+                    worker_sums = defaultdict(int)
+                    worker_fails = defaultdict(int)
+                    for r in pr:
+                        for w, stats in r.get("tools_by_worker", {}).items():
+                            worker_sums[w] += stats.get("total", 0)
+                            worker_fails[w] += stats.get("failed", 0)
+                    vals = ""
+                    for w in all_workers:
+                        t = worker_sums.get(w, 0)
+                        f = worker_fails.get(w, 0)
+                        cell = f"{t}" if f == 0 else f"{t}({f}f)"
+                        vals += f"{cell:>14}"
+                    print(f"{model:<20} {prompt:<22} {vals}")
+                print()
+
     # ── Reasoning summary (only if any model emits reasoning) ─────
     has_reasoning = any(r.get("reasoning_total", 0) > 0 for r in rows)
     if has_reasoning:
@@ -315,6 +403,37 @@ def print_summary(rows: list[dict]):
                 phase_vals = "".join(f"{phase_sums.get(p, 0):>10}" for p in all_phases)
                 print(f"{model:<20} {prompt:<22} {total:>6} {phase_vals}")
             print()
+
+
+    # ── Replan summary (only if any replans occurred) ──────────────
+    has_replans = any(r.get("replan_count", 0) > 0 for r in rows)
+    if has_replans:
+        print(f"{'Model':<20} {'Prompt':<22} {'Replans':>8} {'Triggers':<30} {'Last Q':>8}")
+        print("-" * 92)
+        for model in models:
+            for prompt in prompts:
+                pr = [r for r in rows if r["model"] == model and r["prompt"] == prompt]
+                if not pr:
+                    continue
+                total_replans = sum(r.get("replan_count", 0) for r in pr)
+                if total_replans == 0:
+                    continue
+                # Aggregate triggers across iterations
+                triggers = defaultdict(int)
+                for r in pr:
+                    for t, c in r.get("replan_triggers", {}).items():
+                        triggers[t] += c
+                trigger_str = ", ".join(f"{c}x {t}" for t, c in sorted(triggers.items()))
+                # Last quality score from iterations
+                last_q = ""
+                for r in pr:
+                    for it in r.get("iterations", []):
+                        if it.get("quality_score") is not None:
+                            last_q = f"{it['quality_score']:.2f}"
+                print(f"{model:<20} {prompt:<22} {total_replans:>8} {trigger_str:<30} {last_q:>8}")
+            print()
+    else:
+        print("Replans: none detected\n")
 
 
 def print_loop_report(flags: list[dict]):
@@ -352,6 +471,7 @@ def write_csv(rows: list[dict], results_dir: Path):
         "duplicate_tool_calls", "failed_tool_calls",
         "tasks_started", "tasks_completed",
         "reasoning_total", *phase_cols,
+        "replan_count",
         "completed", "timeout", "planned",
     ]
     with open(csv_path, "w", newline="") as f:

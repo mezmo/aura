@@ -20,7 +20,7 @@ pub enum OrchestratorEvent {
         task_count: usize,
         /// Why the coordinator chose orchestration
         routing_rationale: String,
-        /// The coordinator's planning response text
+        /// The coordinator's planning response text (truncated to Option in SSE)
         planning_response: String,
     },
     /// The coordinator answered the query directly without orchestration.
@@ -45,7 +45,7 @@ pub enum OrchestratorEvent {
         task_id: usize,
         /// Human-readable task description
         description: String,
-        // The ID of the orchestrator
+        /// The ID of the orchestrator
         orchestrator_id: String,
         /// The ID of the Worker who is handling the task
         worker_id: String,
@@ -58,22 +58,49 @@ pub enum OrchestratorEvent {
         success: bool,
         /// How long the task took in milliseconds
         duration_ms: u64,
-        // The ID of the orchestrator
+        /// The ID of the orchestrator
         orchestrator_id: String,
         /// The ID of the Worker who is handling the task
         worker_id: String,
-        /// The task result (output string or error message)
+        /// The task result (output string or error message; truncated to Option in SSE)
         result: String,
     },
     /// An iteration of the plan-execute-synthesize loop has completed.
+    ///
+    /// Emitted after synthesis and evaluation. The quality score determines
+    /// whether the orchestrator will replan or accept the result.
     IterationComplete {
         /// Which iteration just completed (1-indexed)
         iteration: usize,
         /// Quality score from evaluation (0.0-1.0)
         quality_score: f32,
+        /// The configured quality threshold
+        quality_threshold: f32,
+        /// Whether the orchestrator will replan after this iteration
+        will_replan: bool,
+        /// Evaluator's reasoning about quality
+        reasoning: String,
+        /// Identified gaps or missing elements
+        gaps: Vec<String>,
+    },
+    /// The orchestrator is starting a replan cycle.
+    ///
+    /// Emitted when the orchestrator decides to create a new plan,
+    /// either due to quality evaluation, task failures, or phase continuation.
+    ReplanStarted {
+        /// Which iteration is about to start (1-indexed)
+        iteration: usize,
+        /// What triggered the replan: "quality", "failure", or "phase_continuation"
+        trigger: String,
     },
     /// The orchestrator is synthesizing results from completed tasks.
-    Synthesizing,
+    ///
+    /// Emitted before the synthesizer LLM call that combines worker
+    /// outputs into a coherent final response.
+    Synthesizing {
+        /// Which iteration is being synthesized (1-indexed)
+        iteration: usize,
+    },
     /// A tool call has started within a worker task.
     ToolCallStarted {
         /// Task ID the tool call belongs to (None if ID couldn't be parsed)
@@ -97,7 +124,7 @@ pub enum OrchestratorEvent {
         success: bool,
         /// How long the call took in milliseconds
         duration_ms: u64,
-        /// The tool result (output string or error message)
+        /// The tool result (output string or error message; truncated to Option in SSE)
         result: String,
     },
     /// A phase has started execution.
@@ -115,8 +142,8 @@ pub enum OrchestratorEvent {
         phase_id: usize,
         /// Human-readable phase label
         label: String,
-        /// The continuation decision: "continue" or "replan"
-        continuation: String,
+        /// The continuation decision
+        continuation: super::types::PhaseContinuation,
         /// The ID of the orchestrator
         orchestrator_id: String,
     },
