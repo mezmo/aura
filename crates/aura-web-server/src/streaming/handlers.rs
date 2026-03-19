@@ -29,7 +29,8 @@ use super::types::{
 use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    OrchestrationStreamEvent, OrchestratorEvent, ProgressNotification, RequestCancellation,
+    EventContext, OrchestrationStreamEvent, OrchestratorEvent, ProgressNotification,
+    RequestCancellation,
     ResponseContent, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
     StreamingAgent, ToolCall, ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
     get_context_limit,
@@ -895,6 +896,15 @@ fn handle_reasoning(config: &StreamConfig, ctx: &TurnContext, reasoning: String)
     }
 }
 
+/// Convert a non-empty string to `Some(truncated)`, or `None` if empty.
+fn maybe_truncate(s: &str, max_len: usize) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(truncate_result(s, max_len))
+    }
+}
+
 fn handle_orchestrator_event(
     config: &StreamConfig,
     ctx: &TurnContext,
@@ -907,6 +917,8 @@ fn handle_orchestrator_event(
         );
         return vec![];
     }
+
+    let ectx = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
 
     let sse_event: OrchestrationStreamEvent = match event {
         OrchestratorEvent::PlanCreated {
@@ -921,21 +933,12 @@ fn handle_orchestrator_event(
                 goal,
                 routing_rationale
             );
-            let truncated_response = if planning_response.is_empty() {
-                None
-            } else {
-                Some(truncate_result(
-                    planning_response,
-                    config.tool_result_max_length,
-                ))
-            };
             OrchestrationStreamEvent::plan_created(
                 goal,
                 *task_count,
                 routing_rationale,
-                truncated_response,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
+                maybe_truncate(planning_response, config.tool_result_max_length),
+                ectx,
             )
         }
         OrchestratorEvent::DirectAnswer {
@@ -946,12 +949,7 @@ fn handle_orchestrator_event(
                 "Orchestrator: direct answer (rationale: {})",
                 routing_rationale
             );
-            OrchestrationStreamEvent::direct_answer(
-                response,
-                routing_rationale,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
-            )
+            OrchestrationStreamEvent::direct_answer(response, routing_rationale, ectx)
         }
         OrchestratorEvent::ClarificationNeeded {
             question,
@@ -967,8 +965,7 @@ fn handle_orchestrator_event(
                 question,
                 options.clone(),
                 routing_rationale,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
+                ectx,
             )
         }
         OrchestratorEvent::TaskStarted {
@@ -981,10 +978,9 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::task_started(
                 *task_id,
                 description,
-                ctx.agent_context.clone(),
                 orchestrator_id,
                 worker_id,
-                ctx.correlation.clone(),
+                ectx,
             )
         }
         OrchestratorEvent::TaskCompleted {
@@ -1001,44 +997,55 @@ fn handle_orchestrator_event(
                 success,
                 duration_ms
             );
-            let truncated_result = if result.is_empty() {
-                None
-            } else {
-                Some(truncate_result(result, config.tool_result_max_length))
-            };
             OrchestrationStreamEvent::task_completed(
                 *task_id,
                 *success,
                 *duration_ms,
-                ctx.agent_context.clone(),
                 orchestrator_id,
                 worker_id,
-                truncated_result,
-                ctx.correlation.clone(),
+                maybe_truncate(result, config.tool_result_max_length),
+                ectx,
             )
         }
         OrchestratorEvent::IterationComplete {
             iteration,
             quality_score,
+            quality_threshold,
+            will_replan,
+            reasoning,
+            gaps,
         } => {
             tracing::info!(
-                "Orchestrator: iteration {} complete with quality score {}",
+                "Orchestrator: iteration {} complete (quality={:.2}, threshold={:.2}, will_replan={})",
                 iteration,
-                quality_score
+                quality_score,
+                quality_threshold,
+                will_replan
             );
             OrchestrationStreamEvent::iteration_complete(
                 *iteration,
                 *quality_score,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
+                *quality_threshold,
+                *will_replan,
+                maybe_truncate(reasoning, config.tool_result_max_length),
+                gaps.clone(),
+                ectx,
             )
         }
-        OrchestratorEvent::Synthesizing => {
-            tracing::info!("Orchestrator: synthesizing results");
-            OrchestrationStreamEvent::synthesizing(
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
-            )
+        OrchestratorEvent::ReplanStarted {
+            iteration,
+            trigger,
+        } => {
+            tracing::info!(
+                "Orchestrator: replan started (iteration={}, trigger={})",
+                iteration,
+                trigger
+            );
+            OrchestrationStreamEvent::replan_started(*iteration, trigger, ectx)
+        }
+        OrchestratorEvent::Synthesizing { iteration } => {
+            tracing::info!("Orchestrator: synthesizing results (iteration={})", iteration);
+            OrchestrationStreamEvent::synthesizing(*iteration, ectx)
         }
         OrchestratorEvent::ToolCallStarted {
             task_id,
@@ -1057,10 +1064,9 @@ fn handle_orchestrator_event(
                 *task_id,
                 tool_call_id,
                 tool_name,
-                ctx.agent_context.clone(),
                 tool_initiator_id,
                 Some(arguments.clone()),
-                ctx.correlation.clone(),
+                ectx,
             )
         }
         OrchestratorEvent::ToolCallCompleted {
@@ -1077,19 +1083,13 @@ fn handle_orchestrator_event(
                 success,
                 duration_ms
             );
-            let truncated_result = if result.is_empty() {
-                None
-            } else {
-                Some(truncate_result(result, config.tool_result_max_length))
-            };
             OrchestrationStreamEvent::tool_call_completed(
                 *task_id,
                 tool_call_id,
                 *success,
                 *duration_ms,
-                ctx.agent_context.clone(),
-                truncated_result,
-                ctx.correlation.clone(),
+                maybe_truncate(result, config.tool_result_max_length),
+                ectx,
             )
         }
         OrchestratorEvent::PhaseStarted {
@@ -1098,13 +1098,7 @@ fn handle_orchestrator_event(
             orchestrator_id,
         } => {
             tracing::info!("Orchestrator: phase {} started - '{}'", phase_id, label);
-            OrchestrationStreamEvent::phase_started(
-                *phase_id,
-                label,
-                orchestrator_id,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
-            )
+            OrchestrationStreamEvent::phase_started(*phase_id, label, orchestrator_id, ectx)
         }
         OrchestratorEvent::PhaseCompleted {
             phase_id,
@@ -1121,10 +1115,9 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::phase_completed(
                 *phase_id,
                 label,
-                continuation,
+                *continuation,
                 orchestrator_id,
-                ctx.agent_context.clone(),
-                ctx.correlation.clone(),
+                ectx,
             )
         }
     };
