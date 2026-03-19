@@ -529,7 +529,7 @@ async fn test_worker_reasoning_events_emitted() {
 #[tokio::test]
 async fn test_task_events_include_worker_id() {
     let events = orchestration_events(
-        "Calculate the mean of [2, 4, 6, 8] then add 100 to the result",
+        "Compute the variance of [3, 7, 11, 15] and then take the square root of the result",
     )
     .await;
 
@@ -565,7 +565,10 @@ async fn test_task_events_include_worker_id() {
 /// LENIENCY: LLM may not use tools or route to direct answer.
 #[tokio::test]
 async fn test_tool_call_events_include_worker_id() {
-    let events = orchestration_events("Multiply 7 by 8 using the multiplication tool").await;
+    let events = orchestration_events(
+        "Find the median of [12, 5, 8, 3, 19] then divide the result by 2",
+    )
+    .await;
 
     let tool_started = events_by_type(&events, event_names::TOOL_CALL_STARTED);
 
