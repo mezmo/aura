@@ -535,8 +535,7 @@ mod tests {
 
     #[test]
     fn test_phase_started_event_name() {
-        let event =
-            OrchestrationStreamEvent::phase_started(0, "Gather data", "orch-1", test_ctx());
+        let event = OrchestrationStreamEvent::phase_started(0, "Gather data", "orch-1", test_ctx());
 
         assert_eq!(event.event_name(), event_names::PHASE_STARTED);
     }
@@ -556,12 +555,8 @@ mod tests {
 
     #[test]
     fn test_format_sse_phase_started() {
-        let event = OrchestrationStreamEvent::phase_started(
-            1,
-            "Analyze findings",
-            "orch-42",
-            test_ctx(),
-        );
+        let event =
+            OrchestrationStreamEvent::phase_started(1, "Analyze findings", "orch-42", test_ctx());
         let sse = event.format_sse();
 
         assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_STARTED)));
