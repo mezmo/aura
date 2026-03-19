@@ -29,6 +29,7 @@ pub const SYNTHESIS_PROMPT_TEMPLATE: &str = include_str!("../prompts/synthesis_p
 pub const EVALUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/evaluation_prompt.md");
 pub const PHASE_CONTINUATION_PROMPT_TEMPLATE: &str =
     include_str!("../prompts/phase_continuation.md");
+pub const REFLECTION_PROMPT_TEMPLATE: &str = include_str!("../prompts/reflection_prompt.md");
 
 /// Trait for template variable providers.
 ///
@@ -140,6 +141,62 @@ impl TemplateVars for PhaseContinuationVars<'_> {
     }
 }
 
+/// Variables for the reflection prompt (replan cycle).
+#[derive(Debug, Clone)]
+pub struct ReflectionVars<'a> {
+    pub iteration: &'a str,
+    pub max_iterations: &'a str,
+    pub urgency: &'a str,
+    pub succeeded: &'a str,
+    pub total: &'a str,
+    pub goal: &'a str,
+    pub score: &'a str,
+    pub completed_section: &'a str,
+    pub blocked_section: &'a str,
+    pub redesign_section: &'a str,
+    pub reasoning: &'a str,
+    pub gaps: &'a str,
+    pub failure_history: &'a str,
+    pub reuse_guidance: &'a str,
+}
+
+impl TemplateVars for ReflectionVars<'_> {
+    const VARS: &'static [&'static str] = &[
+        "ITERATION",
+        "MAX_ITERATIONS",
+        "URGENCY",
+        "SUCCEEDED",
+        "TOTAL",
+        "GOAL",
+        "SCORE",
+        "COMPLETED_SECTION",
+        "BLOCKED_SECTION",
+        "REDESIGN_SECTION",
+        "REASONING",
+        "GAPS",
+        "FAILURE_HISTORY",
+        "REUSE_GUIDANCE",
+    ];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%ITERATION%%", self.iteration)
+            .replace("%%MAX_ITERATIONS%%", self.max_iterations)
+            .replace("%%URGENCY%%", self.urgency)
+            .replace("%%SUCCEEDED%%", self.succeeded)
+            .replace("%%TOTAL%%", self.total)
+            .replace("%%GOAL%%", self.goal)
+            .replace("%%SCORE%%", self.score)
+            .replace("%%COMPLETED_SECTION%%", self.completed_section)
+            .replace("%%BLOCKED_SECTION%%", self.blocked_section)
+            .replace("%%REDESIGN_SECTION%%", self.redesign_section)
+            .replace("%%REASONING%%", self.reasoning)
+            .replace("%%GAPS%%", self.gaps)
+            .replace("%%FAILURE_HISTORY%%", self.failure_history)
+            .replace("%%REUSE_GUIDANCE%%", self.reuse_guidance)
+    }
+}
+
 /// Render the phase continuation prompt with the given variables.
 pub fn render_phase_continuation_prompt(vars: &PhaseContinuationVars<'_>) -> String {
     vars.render(PHASE_CONTINUATION_PROMPT_TEMPLATE)
@@ -158,6 +215,11 @@ pub fn render_synthesis_prompt(vars: &SynthesisVars<'_>) -> String {
 /// Render the evaluation prompt with the given variables.
 pub fn render_evaluation_prompt(vars: &EvaluationVars<'_>) -> String {
     vars.render(EVALUATION_PROMPT_TEMPLATE)
+}
+
+/// Render the reflection prompt with the given variables.
+pub fn render_reflection_prompt(vars: &ReflectionVars<'_>) -> String {
+    vars.render(REFLECTION_PROMPT_TEMPLATE)
 }
 
 /// Extract `%%VAR%%` placeholders from a template string.
@@ -328,6 +390,12 @@ mod tests {
             .expect("Phase continuation template should match PhaseContinuationVars");
     }
 
+    #[test]
+    fn test_reflection_template_matches_context() {
+        validate_template::<ReflectionVars>(REFLECTION_PROMPT_TEMPLATE)
+            .expect("Reflection template should match ReflectionVars");
+    }
+
     // =========================================================================
     // Validation function tests
     // =========================================================================
@@ -415,6 +483,22 @@ mod tests {
         assert!(
             PHASE_CONTINUATION_PROMPT_TEMPLATE.contains("%%REMAINING_PHASES%%"),
             "Phase continuation template should contain REMAINING_PHASES placeholder"
+        );
+    }
+
+    #[test]
+    fn test_reflection_template_loaded() {
+        assert!(
+            !REFLECTION_PROMPT_TEMPLATE.is_empty(),
+            "Reflection template should be loaded"
+        );
+        assert!(
+            REFLECTION_PROMPT_TEMPLATE.contains("%%ITERATION%%"),
+            "Reflection template should contain ITERATION placeholder"
+        );
+        assert!(
+            REFLECTION_PROMPT_TEMPLATE.contains("%%REDESIGN_SECTION%%"),
+            "Reflection template should contain REDESIGN_SECTION placeholder"
         );
     }
 
@@ -667,6 +751,33 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             result: "(3+7)*2 equals 20. The /data directory contains file1.txt and file2.txt.",
         });
         let _ = writeln!(out, "{evaluation}");
+
+        // ================================================================
+        // 8. Reflection prompt (replan cycle)
+        // ================================================================
+        let _ = writeln!(out, "\n{separator}");
+        let _ = writeln!(
+            out,
+            "PHASE: REFLECTION PROMPT — Replan after quality threshold miss"
+        );
+        let _ = writeln!(out, "{separator}\n");
+        let reflection = render_reflection_prompt(&ReflectionVars {
+            iteration: "1",
+            max_iterations: "2",
+            urgency: " (FINAL ATTEMPT)",
+            succeeded: "1",
+            total: "2",
+            goal: "Calculate (3+7)*2 and find files in /data",
+            score: "0.45",
+            completed_section: "COMPLETED TASKS (do not re-plan these):\n- Task 0: Calculate (3+7)*2 using mock_tool → (3+7)*2 = 20\n\n",
+            blocked_section: "",
+            redesign_section: "TASKS TO REDESIGN:\n- Task 1: List files in /data using list_files → failed: Connection refused\n\n",
+            reasoning: "Arithmetic task completed correctly, but file listing failed due to connection error.",
+            gaps: "- File listing task needs retry or alternative approach",
+            failure_history: "\nFAILURE HISTORY:\n- Iteration 1: \"List files in /data using list_files\" (worker: data) — Connection refused\n",
+            reuse_guidance: "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID.",
+        });
+        let _ = writeln!(out, "{reflection}");
 
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(out, "END OF PROMPT RENDERING QA");

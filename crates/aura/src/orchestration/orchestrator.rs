@@ -65,8 +65,8 @@ use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    EvaluationResult, IterationContext, Plan, PlanAttemptFailure, PlanningResponse, Task,
-    TaskStatus,
+    EvaluationResult, FailedTaskRecord, IterationContext, Plan, PlanAttemptFailure,
+    PlanningResponse, Task, TaskStatus,
 };
 
 // ============================================================================
@@ -912,7 +912,7 @@ impl Orchestrator {
             self.build_worker_prompt_sections();
 
         let reflection_section = previous
-            .map(|ctx| ctx.build_reflection_prompt())
+            .map(|ctx| ctx.build_reflection_prompt(self.config.max_planning_cycles))
             .unwrap_or_default();
 
         let mut plan_errors: Vec<PlanAttemptFailure> = Vec::new();
@@ -1111,6 +1111,7 @@ impl Orchestrator {
                             rationale: Some(t.rationale.clone()),
                             dependencies: Some(t.dependencies.clone()),
                             worker: t.worker.clone(),
+                            reuse_result_from: None,
                         })
                         .collect();
 
@@ -1183,6 +1184,7 @@ impl Orchestrator {
                 ),
                 dependencies: None,
                 worker: None,
+                reuse_result_from: None,
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
@@ -1222,6 +1224,7 @@ impl Orchestrator {
                         )),
                         dependencies: None,
                         worker: None,
+                        reuse_result_from: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {}",
@@ -1253,6 +1256,7 @@ impl Orchestrator {
                         )),
                         dependencies: None,
                         worker: None,
+                        reuse_result_from: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {}",
@@ -3165,14 +3169,26 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Categorize a task failure error string into a human-readable category.
     fn categorize_failure_error(error: &str) -> &'static str {
-        if error.contains("timed out") {
+        let lower = error.to_lowercase();
+        if lower.contains("timed out") {
             "timeout"
-        } else if error.contains("context")
-            && (error.contains("limit") || error.contains("overflow"))
+        } else if lower.contains("context")
+            && (lower.contains("limit") || lower.contains("overflow"))
         {
             "context overflow"
-        } else if error.contains("MaxDepthError") || error.contains("reached limit") {
+        } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
             "depth exhaustion"
+        } else if lower.contains("rate limit")
+            || lower.contains("429")
+            || lower.contains("503")
+            || lower.contains("502")
+            || lower.contains("service unavailable")
+            || lower.contains("authentication")
+            || lower.contains("unauthorized")
+            || lower.contains("403")
+            || lower.contains("api key")
+        {
+            "provider_error"
         } else {
             "LLM error"
         }
@@ -3516,6 +3532,75 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await;
     }
 
+    /// Emit a ReplanStarted event and build the iteration context for the next cycle.
+    ///
+    /// Consolidates the common tail of all three replan paths (phase_continuation,
+    /// failure, quality). Callers handle path-specific pre-work (e.g. IterationComplete
+    /// events, persistence writes) before calling this.
+    async fn trigger_replan(
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        iteration: usize,
+        trigger: &str,
+        plan: Plan,
+        evaluation: EvaluationResult,
+        failure_history: &[FailedTaskRecord],
+    ) -> (Option<IterationContext>, Plan) {
+        Self::emit_event(
+            event_tx,
+            OrchestratorEvent::ReplanStarted {
+                iteration: iteration + 1,
+                trigger: trigger.to_string(),
+            },
+        )
+        .await;
+
+        let context = IterationContext::new(iteration, plan, evaluation, failure_history.to_vec());
+        (Some(context), Plan::new(""))
+    }
+
+    /// Apply result reuse from a previous plan to the new plan.
+    ///
+    /// When the coordinator sets `reuse_result_from` on a task in the new plan,
+    /// this function finds the referenced task in the previous plan and copies
+    /// its result, marking the task as Complete so `ready_tasks()` skips it.
+    fn apply_result_reuse(plan: &mut Plan, previous: Option<&Plan>) {
+        let previous = match previous {
+            Some(p) => p,
+            None => return,
+        };
+
+        for task in &mut plan.tasks {
+            if let Some(reuse_id) = task.reuse_result_from {
+                if let Some(prev_task) = previous.tasks.iter().find(|t| t.id == reuse_id) {
+                    if prev_task.status == TaskStatus::Complete {
+                        if let Some(ref result) = prev_task.result {
+                            tracing::info!(
+                                "Task {} reusing result from previous task {} ({})",
+                                task.id,
+                                reuse_id,
+                                prev_task.description
+                            );
+                            task.complete(result.clone());
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Task {} requested reuse from task {} but it was not complete (status: {:?})",
+                            task.id,
+                            reuse_id,
+                            prev_task.status
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Task {} requested reuse from task {} but it was not found in previous plan",
+                        task.id,
+                        reuse_id
+                    );
+                }
+            }
+        }
+    }
+
     /// Top-level orchestration entry point: route → loop.
     ///
     /// Uses `plan_with_routing()` for the initial routing decision, then
@@ -3680,6 +3765,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 };
 
+                // Carry forward results from previous iteration where coordinator requested reuse
+                Self::apply_result_reuse(
+                    &mut plan,
+                    previous_context.as_ref().map(|ctx| &ctx.previous_plan),
+                );
+
                 Self::emit_event(
                     &event_tx,
                     OrchestratorEvent::PlanCreated {
@@ -3824,28 +3915,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     execution_summary
                 );
 
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::ReplanStarted {
-                        iteration: iteration + 1,
-                        trigger: "phase_continuation".to_string(),
-                    },
-                )
-                .await;
-
                 let replan_evaluation = super::types::EvaluationResult {
                     score: 0.0,
                     reasoning: "Phase continuation requested replan based on intermediate results.".to_string(),
                     gaps: vec!["Coordinator determined remaining phases need redesign based on discovered information.".to_string()],
                 };
 
-                previous_context = Some(IterationContext::new(
+                (previous_context, plan) = Self::trigger_replan(
+                    &event_tx,
                     iteration,
+                    "phase_continuation",
                     plan,
                     replan_evaluation,
-                    failure_history.clone(),
-                ));
-                plan = Plan::new("");
+                    &failure_history,
+                )
+                .await;
                 continue;
             }
 
@@ -3913,17 +3997,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .into());
                 }
 
+                // Provider error short-circuit: if ALL failures are provider errors,
+                // don't waste an iteration asking the coordinator to fix what it can't.
+                if !this_iteration_failures.is_empty() {
+                    let all_provider_errors = this_iteration_failures
+                        .iter()
+                        .all(|f| Self::categorize_failure_error(&f.error) == "provider_error");
+                    if all_provider_errors && plan.completed_count() == 0 {
+                        let summary = self.build_execution_summary(&plan);
+                        tracing::error!(
+                            "All {} failures are provider errors — skipping replan:\n{}",
+                            this_iteration_failures.len(),
+                            summary
+                        );
+                        return Err(format!(
+                            "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
+                            summary
+                        ).into());
+                    }
+                }
+
                 let execution_summary = self.build_execution_summary(&plan);
                 tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
-
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::ReplanStarted {
-                        iteration: iteration + 1,
-                        trigger: "failure".to_string(),
-                    },
-                )
-                .await;
 
                 let failure_evaluation = EvaluationResult {
                     score: 0.0,
@@ -3959,14 +4054,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 }
 
-                previous_context = Some(IterationContext::new(
+                (previous_context, plan) = Self::trigger_replan(
+                    &event_tx,
                     iteration,
+                    "failure",
                     plan,
                     failure_evaluation,
-                    failure_history.clone(),
-                ));
-                // Allocate new plan for next iteration (set in the replan block above)
-                plan = Plan::new("");
+                    &failure_history,
+                )
+                .await;
                 continue;
             }
 
@@ -4081,22 +4177,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 plan.failed_count(),
             );
 
-            Self::emit_event(
+            (previous_context, plan) = Self::trigger_replan(
                 &event_tx,
-                OrchestratorEvent::ReplanStarted {
-                    iteration: iteration + 1,
-                    trigger: "quality".to_string(),
-                },
-            )
-            .await;
-
-            previous_context = Some(IterationContext::new(
                 iteration,
+                "quality",
                 plan,
                 evaluation,
-                failure_history.clone(),
-            ));
-            plan = Plan::new(""); // Will be replaced by replan
+                &failure_history,
+            )
+            .await;
         }
 
         Ok(final_result)
@@ -5279,6 +5368,7 @@ Provide the synthesized response:"#,
                     rationale: Some("Reason A".to_string()),
                     dependencies: Some(vec![]),
                     worker: Some("operations".to_string()),
+                    reuse_result_from: None,
                 },
                 TaskJson {
                     id: 1,
@@ -5286,6 +5376,7 @@ Provide the synthesized response:"#,
                     rationale: Some("Reason B".to_string()),
                     dependencies: Some(vec![0]),
                     worker: None,
+                    reuse_result_from: None,
                 },
             ],
             routing_rationale: "Test rationale".to_string(),
@@ -5376,6 +5467,7 @@ Provide the synthesized response:"#,
                 rationale: Some("because".to_string()),
                 dependencies: None,
                 worker: None,
+                reuse_result_from: None,
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),
@@ -5662,5 +5754,128 @@ Provide the synthesized response:"#,
         assert_eq!(result.count, 1);
         assert_eq!(result.messages[0].role, "user");
         assert!(result.messages[0].content.contains("2+2"));
+    }
+
+    // ========================================================================
+    // apply_result_reuse tests
+    // ========================================================================
+
+    #[test]
+    fn test_apply_result_reuse_carries_forward() {
+        // Previous plan with a completed task
+        let mut prev = Plan::new("prev");
+        let mut t = Task::new(0, "Fetch data", "Get data");
+        t.complete("data result".to_string());
+        prev.add_task(t);
+
+        // New plan references previous task 0
+        let mut new_plan = Plan::new("new");
+        let mut new_task = Task::new(0, "Fetch data (reused)", "Reuse");
+        new_task.reuse_result_from = Some(0);
+        new_plan.add_task(new_task);
+        new_plan.add_task(Task::new(1, "Analyze data", "New work"));
+
+        Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
+
+        // Task 0 should be marked complete with the previous result
+        assert_eq!(new_plan.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(new_plan.tasks[0].result.as_deref(), Some("data result"));
+        // Task 1 should be unchanged
+        assert_eq!(new_plan.tasks[1].status, TaskStatus::Pending);
+        assert!(new_plan.tasks[1].result.is_none());
+    }
+
+    #[test]
+    fn test_apply_result_reuse_ignores_failed_tasks() {
+        let mut prev = Plan::new("prev");
+        let mut t = Task::new(0, "Bad task", "Failed");
+        t.fail("error");
+        prev.add_task(t);
+
+        let mut new_plan = Plan::new("new");
+        let mut new_task = Task::new(0, "Retry", "Retry");
+        new_task.reuse_result_from = Some(0);
+        new_plan.add_task(new_task);
+
+        Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
+
+        // Should NOT carry forward since previous task was failed
+        assert_eq!(new_plan.tasks[0].status, TaskStatus::Pending);
+        assert!(new_plan.tasks[0].result.is_none());
+    }
+
+    #[test]
+    fn test_apply_result_reuse_no_previous_plan() {
+        let mut plan = Plan::new("new");
+        let mut t = Task::new(0, "Task", "Work");
+        t.reuse_result_from = Some(0);
+        plan.add_task(t);
+
+        // Should not panic with None previous
+        Orchestrator::apply_result_reuse(&mut plan, None);
+        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn test_apply_result_reuse_missing_task_id() {
+        let mut prev = Plan::new("prev");
+        prev.add_task(Task::new(0, "Only task", "Single"));
+
+        let mut new_plan = Plan::new("new");
+        let mut t = Task::new(0, "Reuse", "Reuse");
+        t.reuse_result_from = Some(99); // doesn't exist
+        new_plan.add_task(t);
+
+        Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
+        // Should not carry forward — task 99 doesn't exist
+        assert_eq!(new_plan.tasks[0].status, TaskStatus::Pending);
+    }
+
+    // ========================================================================
+    // categorize_failure_error tests
+    // ========================================================================
+
+    #[test]
+    fn test_categorize_failure_provider_errors() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Rate limit exceeded"),
+            "provider_error"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("HTTP 429 Too Many Requests"),
+            "provider_error"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("503 Service Unavailable"),
+            "provider_error"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Authentication failed: invalid API key"),
+            "provider_error"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Unauthorized: 403"),
+            "provider_error"
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_other_categories() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Request timed out after 30s"),
+            "timeout"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("context limit exceeded"),
+            "context overflow"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("MaxDepthError: reached limit"),
+            "depth exhaustion"
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Something went wrong"),
+            "LLM error"
+        );
     }
 }
