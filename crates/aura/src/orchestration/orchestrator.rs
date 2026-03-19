@@ -246,7 +246,7 @@ fn tool_event_to_orchestrator_event(
             task_id: extract_task_id(&tool_call_id),
             tool_call_id,
             tool_name,
-            tool_initiator_id,
+            worker_id: tool_initiator_id,
             arguments,
         },
         crate::tool_call_observer::ToolEvent::CallCompleted {
@@ -342,6 +342,16 @@ pub struct Orchestrator {
     /// Current orchestration iteration, set at the top of `run_orchestration_loop`.
     /// Read by `journal_record` so that iteration doesn't pollute method signatures.
     current_iteration: AtomicUsize,
+}
+
+/// Worker identity for reasoning attribution in `stream_and_forward`.
+///
+/// When `Some`, reasoning items are wrapped as `OrchestratorEvent::WorkerReasoning`
+/// with proper task/worker attribution. When `None`, reasoning is forwarded raw
+/// (coordinator context — attributed as `agent_id: "main"` by handlers).
+struct WorkerIdentity<'a> {
+    task_id: usize,
+    worker_name: &'a str,
 }
 
 impl Orchestrator {
@@ -655,6 +665,7 @@ impl Orchestrator {
         history: Vec<rig::completion::Message>,
         phase: &str,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        worker: Option<WorkerIdentity<'_>>,
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
         use crate::provider_agent::{CompletionResponse, StreamedAssistantContent};
@@ -677,22 +688,34 @@ impl Orchestrator {
                         content.push_str(&t);
                     }
                     Ok(StreamItem::StreamAssistantItem(
-                        ref sa @ StreamedAssistantContent::ReasoningDelta { .. },
+                        StreamedAssistantContent::ReasoningDelta { delta, .. },
                     )) => {
                         if let Some(tx) = event_tx {
-                            let _ = tx
-                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
-                                .await;
+                            if let Some(ref w) = worker {
+                                let _ = tx
+                                    .send(Ok(StreamItem::OrchestratorEvent(
+                                        OrchestratorEvent::WorkerReasoning {
+                                            task_id: w.task_id,
+                                            worker_id: w.worker_name.to_string(),
+                                            content: delta,
+                                        },
+                                    )))
+                                    .await;
+                            } else {
+                                let _ = tx
+                                    .send(Ok(StreamItem::StreamAssistantItem(
+                                        StreamedAssistantContent::ReasoningDelta {
+                                            delta,
+                                            id: None,
+                                        },
+                                    )))
+                                    .await;
+                            }
                         }
                     }
-                    Ok(StreamItem::StreamAssistantItem(
-                        ref sa @ StreamedAssistantContent::Reasoning(_),
-                    )) => {
-                        if let Some(tx) = event_tx {
-                            let _ = tx
-                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
-                                .await;
-                        }
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(_))) => {
+                        // Final reasoning block — already forwarded as deltas above.
+                        // Skip to avoid double-emission.
                     }
                     Ok(StreamItem::Final(info)) => {
                         content = info.content;
@@ -2814,6 +2837,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         vec![],
                         "PhaseContinuation",
                         event_tx,
+                        None,
                     )
                     .await
                 {
@@ -3002,7 +3026,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Execute the task (workers get context from the task prompt, not conversation history)
         let result = self
-            .stream_and_forward(&worker, &worker_prompt, vec![], "Worker task", event_tx)
+            .stream_and_forward(
+                &worker,
+                &worker_prompt,
+                vec![],
+                "Worker task",
+                event_tx,
+                worker_name.map(|name| WorkerIdentity {
+                    task_id,
+                    worker_name: name,
+                }),
+            )
             .await;
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -3236,6 +3270,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         vec![],
                         "Synthesis",
                         event_tx,
+                        None,
                     )
                     .await
                 {

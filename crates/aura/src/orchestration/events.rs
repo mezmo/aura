@@ -101,6 +101,18 @@ pub enum OrchestratorEvent {
         /// Which iteration is being synthesized (1-indexed)
         iteration: usize,
     },
+    /// Reasoning content from a worker agent.
+    ///
+    /// Wraps raw `ReasoningDelta`/`Reasoning` stream items from workers
+    /// with task and worker identity for proper SSE attribution.
+    WorkerReasoning {
+        /// Task identifier
+        task_id: usize,
+        /// The worker that produced this reasoning (e.g., "statistics")
+        worker_id: String,
+        /// The reasoning text content
+        content: String,
+    },
     /// A tool call has started within a worker task.
     ToolCallStarted {
         /// Task ID the tool call belongs to (None if ID couldn't be parsed)
@@ -109,8 +121,8 @@ pub enum OrchestratorEvent {
         tool_call_id: String,
         /// Name of the tool being called
         tool_name: String,
-        /// ID of either the worker or orchestrator that called the tool
-        tool_initiator_id: String,
+        /// ID of the worker or orchestrator that called the tool
+        worker_id: String,
         /// Arguments passed to the tool
         arguments: serde_json::Value,
     },

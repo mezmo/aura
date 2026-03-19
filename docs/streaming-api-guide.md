@@ -208,8 +208,10 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 | `aura.orchestrator.clarification_needed` | Coordinator needs user clarification |
 | `aura.orchestrator.task_started` | Worker began executing a task |
 | `aura.orchestrator.task_completed` | Worker finished task (success/failure with duration) |
-| `aura.orchestrator.iteration_complete` | Plan-execute-synthesize cycle finished with quality score |
-| `aura.orchestrator.synthesizing` | Coordinator merging worker results |
+| `aura.orchestrator.worker_reasoning` | Worker reasoning content with task/worker attribution |
+| `aura.orchestrator.iteration_complete` | Iteration finished with quality score, threshold, replan decision |
+| `aura.orchestrator.replan_started` | Replan cycle triggered (quality, failure, or phase_continuation) |
+| `aura.orchestrator.synthesizing` | Coordinator merging worker results (includes iteration number) |
 | `aura.orchestrator.tool_call_started` | Tool execution began within a worker task |
 | `aura.orchestrator.tool_call_completed` | Tool execution finished within a worker task |
 | `aura.orchestrator.phase_started` | Dependency wave began execution |
@@ -226,7 +228,9 @@ phase_started         ← Dependency wave begins (phase_id, label)
        ↓
 task_started          ← Worker assigned (task_id, worker_id, orchestrator_id)
        ↓
-tool_call_started     ← Worker calls MCP tool (tool_call_id, tool_name)
+worker_reasoning      ← Worker thinking (task_id, worker_id, content)
+       ↓
+tool_call_started     ← Worker calls MCP tool (tool_call_id, tool_name, worker_id)
        ↓
 tool_call_completed   ← Tool result (duration_ms, success)
        ↓
@@ -234,11 +238,15 @@ task_completed        ← Worker finished (duration_ms, success, result)
        ↓
 phase_completed       ← Wave done (continuation: "continue" or "replan")
        ↓
-synthesizing          ← Coordinator merging results
+synthesizing          ← Coordinator merging results (iteration)
        ↓
-iteration_complete    ← Quality scored (iteration, quality_score)
+iteration_complete    ← Quality scored (quality_score, quality_threshold,
+                         will_replan, reasoning, gaps)
        ↓
-If score < quality_threshold → loop back to plan_created
+If will_replan:
+  replan_started      ← trigger: "quality" | "failure" | "phase_continuation"
+       ↓
+  → loop back to plan_created
 ```
 
 **Alternative routing**: The coordinator may emit `direct_answer` (simple queries) or `clarification_needed` (ambiguous queries) instead of `plan_created`, skipping the orchestration loop entirely.
@@ -263,20 +271,44 @@ event: aura.orchestrator.task_completed
 data: {"task_id":0,"success":true,"duration_ms":1500,"orchestrator_id":"orch-1","worker_id":"arithmetic","result":"The result is 20","agent_id":"coordinator","session_id":"sess_xyz"}
 ```
 
-**Iteration complete** (quality evaluation):
+**Worker reasoning** (worker thinking with attribution):
+```
+event: aura.orchestrator.worker_reasoning
+data: {"task_id":0,"worker_id":"arithmetic","content":"I need to add 15 and 27...","agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+Worker reasoning is also emitted as `aura.reasoning` with `agent_id` set to the worker name (e.g., `"arithmetic"`) and `parent_agent_id: "coordinator"` for backward-compatible aggregation.
+
+**Iteration complete** (quality evaluation with replan decision):
 ```
 event: aura.orchestrator.iteration_complete
-data: {"iteration":1,"quality_score":0.85,"agent_id":"coordinator","session_id":"sess_xyz"}
+data: {"iteration":1,"quality_score":0.85,"quality_threshold":0.7,"will_replan":false,"reasoning":"Response is complete and accurate","gaps":[],"agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+**Replan started** (new planning cycle triggered):
+```
+event: aura.orchestrator.replan_started
+data: {"iteration":2,"trigger":"quality","agent_id":"coordinator","session_id":"sess_xyz"}
+```
+
+Triggers: `"quality"` (score below threshold), `"failure"` (worker task failures), `"phase_continuation"` (coordinator decided to replan between phases).
+
+**Synthesizing** (combining worker results):
+```
+event: aura.orchestrator.synthesizing
+data: {"iteration":1,"agent_id":"coordinator","session_id":"sess_xyz"}
 ```
 
 ### Orchestration Correlation
 
 | Correlation | Events | Field |
 |-------------|--------|-------|
-| Task lifecycle | `task_started` → `tool_call_*` → `task_completed` | `task_id` |
+| Task lifecycle | `task_started` → `worker_reasoning` → `tool_call_*` → `task_completed` | `task_id` |
 | Phase lifecycle | `phase_started` → `phase_completed` | `phase_id` |
 | Tool lifecycle | `tool_call_started` → `tool_call_completed` | `tool_call_id` |
-| Agent hierarchy | All orchestration events | `agent_id` (from `AgentContext`) |
+| Worker identity | `task_*`, `worker_reasoning`, `tool_call_started` | `worker_id` |
+| Agent hierarchy | All orchestration events | `agent_id` (`"coordinator"` or worker name) |
+| Replan cycle | `iteration_complete` → `replan_started` → `plan_created` | `iteration` |
 
 ## SSE Event Reference
 
