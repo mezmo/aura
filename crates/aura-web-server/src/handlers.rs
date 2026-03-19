@@ -300,13 +300,20 @@ fn build_completion_config(
     )
     .with_fallback_tool_parsing(fallback_tool_parsing);
 
-    let turn_context = TurnContext::new(
-        setup.completion_id.clone(),
-        setup.model_str.clone(),
-        setup.created_timestamp,
-        max_tokens,
-        &setup.chat_session_id,
-    );
+    let turn_context = {
+        let ctx = TurnContext::new(
+            setup.completion_id.clone(),
+            setup.model_str.clone(),
+            setup.created_timestamp,
+            max_tokens,
+            &setup.chat_session_id,
+        );
+        if data.config.orchestration_enabled() {
+            ctx.with_orchestration()
+        } else {
+            ctx
+        }
+    };
 
     let (p, m) = setup.streaming_agent.get_provider_info();
     let (provider, model) = (p.to_string(), m.to_string());

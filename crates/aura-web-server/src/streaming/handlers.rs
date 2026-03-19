@@ -1046,11 +1046,41 @@ fn handle_orchestrator_event(
             );
             OrchestrationStreamEvent::synthesizing(*iteration, ectx)
         }
+        OrchestratorEvent::WorkerReasoning {
+            task_id,
+            worker_id,
+            content,
+        } => {
+            if !config.emit_custom_events || !config.emit_reasoning {
+                return vec![];
+            }
+            tracing::debug!(
+                "Orchestrator: worker reasoning (task={}, worker={})",
+                task_id,
+                worker_id
+            );
+            // Emit as aura.orchestrator.worker_reasoning (orchestration event)
+            let orch_event = OrchestrationStreamEvent::worker_reasoning(
+                *task_id,
+                worker_id,
+                content,
+                ectx.clone(),
+            );
+            let mut bytes = vec![Bytes::from(orch_event.format_sse())];
+            // Also emit as aura.reasoning with agent_id set to the worker name
+            // for backward-compatible reasoning aggregation
+            let worker_agent =
+                aura::stream_events::AgentContext::worker(worker_id, None, "coordinator");
+            let reasoning_event =
+                AuraStreamEvent::reasoning(content, worker_agent, ctx.correlation.clone());
+            bytes.push(Bytes::from(reasoning_event.format_sse()));
+            return bytes;
+        }
         OrchestratorEvent::ToolCallStarted {
             task_id,
             tool_call_id,
             tool_name,
-            tool_initiator_id,
+            worker_id,
             arguments,
         } => {
             tracing::info!(
@@ -1063,7 +1093,7 @@ fn handle_orchestrator_event(
                 *task_id,
                 tool_call_id,
                 tool_name,
-                tool_initiator_id,
+                worker_id,
                 Some(arguments.clone()),
                 ectx,
             )
