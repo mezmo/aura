@@ -181,6 +181,16 @@ pub mod context {
                 correlation: CorrelationContext::from_current_span(session_id),
             }
         }
+
+        /// Set agent_context to "coordinator" for orchestration mode.
+        pub fn with_orchestration(mut self) -> Self {
+            self.agent_context = AgentContext {
+                agent_id: "coordinator".to_string(),
+                agent_name: None,
+                parent_agent_id: None,
+            };
+            self
+        }
     }
 
     /// Mutable state accumulated during a streaming turn.

@@ -53,6 +53,7 @@ pub mod event_names {
     pub const ITERATION_COMPLETE: &str = "aura.orchestrator.iteration_complete";
     pub const REPLAN_STARTED: &str = "aura.orchestrator.replan_started";
     pub const SYNTHESIZING: &str = "aura.orchestrator.synthesizing";
+    pub const WORKER_REASONING: &str = "aura.orchestrator.worker_reasoning";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
     pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
@@ -139,13 +140,21 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
+    /// Emitted when a worker produces reasoning content.
+    WorkerReasoning {
+        task_id: usize,
+        worker_id: String,
+        content: String,
+        #[serde(flatten)]
+        context: EventContext,
+    },
     /// Emitted when a tool call starts within a worker task.
     ToolCallStarted {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
         tool_name: String,
-        tool_initiator_id: String,
+        worker_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         arguments: Option<serde_json::Value>,
         #[serde(flatten)]
@@ -194,6 +203,7 @@ impl OrchestrationStreamEvent {
             Self::IterationComplete { .. } => event_names::ITERATION_COMPLETE,
             Self::ReplanStarted { .. } => event_names::REPLAN_STARTED,
             Self::Synthesizing { .. } => event_names::SYNTHESIZING,
+            Self::WorkerReasoning { .. } => event_names::WORKER_REASONING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
             Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
@@ -333,12 +343,27 @@ impl OrchestrationStreamEvent {
         Self::Synthesizing { iteration, context }
     }
 
+    /// Create a WorkerReasoning event.
+    pub fn worker_reasoning(
+        task_id: usize,
+        worker_id: impl Into<String>,
+        content: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::WorkerReasoning {
+            task_id,
+            worker_id: worker_id.into(),
+            content: content.into(),
+            context,
+        }
+    }
+
     /// Create a ToolCallStarted event.
     pub fn tool_call_started(
         task_id: Option<usize>,
         tool_call_id: impl Into<String>,
         tool_name: impl Into<String>,
-        tool_initiator_id: impl Into<String>,
+        worker_id: impl Into<String>,
         arguments: Option<serde_json::Value>,
         context: EventContext,
     ) -> Self {
@@ -346,7 +371,7 @@ impl OrchestrationStreamEvent {
             task_id,
             tool_call_id: tool_call_id.into(),
             tool_name: tool_name.into(),
-            tool_initiator_id: tool_initiator_id.into(),
+            worker_id: worker_id.into(),
             arguments,
             context,
         }
