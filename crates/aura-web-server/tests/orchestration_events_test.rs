@@ -477,3 +477,150 @@ async fn test_division_error_emits_task_failure() {
         assert_event_fields(event, &["task_id", "success", "duration_ms"]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Worker reasoning events
+// ---------------------------------------------------------------------------
+
+/// Verifies that complex multi-step queries emit worker_reasoning events
+/// with task_id, worker_id, and content fields.
+///
+/// LENIENCY: Not all models emit reasoning. If no events, pass with note.
+#[tokio::test]
+async fn test_worker_reasoning_events_emitted() {
+    let events = orchestration_events(
+        "Calculate the standard deviation of [10, 20, 30, 40, 50] and then multiply by pi",
+    )
+    .await;
+
+    let reasoning = events_by_type(&events, event_names::WORKER_REASONING);
+
+    if reasoning.is_empty() {
+        // Reasoning events depend on model capability (thinking models only)
+        println!(
+            "Note: No worker_reasoning events emitted. Model may not support reasoning output."
+        );
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    for event in &reasoning {
+        assert_event_fields(event, &["task_id", "worker_id", "content"]);
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        let content = json["content"].as_str().unwrap_or("");
+        assert!(!content.is_empty(), "worker_reasoning content should not be empty");
+        println!(
+            "worker_reasoning: task_id={}, worker_id={}, content_len={}",
+            json["task_id"],
+            json["worker_id"],
+            content.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker ID in task events
+// ---------------------------------------------------------------------------
+
+/// Verifies that task_started and task_completed events include worker_id
+/// and orchestrator_id fields for multi-worker queries.
+///
+/// LENIENCY: LLM may route to direct answer.
+#[tokio::test]
+async fn test_task_events_include_worker_id() {
+    let events = orchestration_events(
+        "Calculate the mean of [2, 4, 6, 8] then add 100 to the result",
+    )
+    .await;
+
+    let task_started = events_by_type(&events, event_names::TASK_STARTED);
+    let task_completed = events_by_type(&events, event_names::TASK_COMPLETED);
+
+    if task_started.is_empty() && task_completed.is_empty() {
+        println!("Note: No task events. LLM may have answered directly.");
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    for event in &task_started {
+        assert_event_fields(event, &["task_id", "worker_id", "orchestrator_id"]);
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        println!(
+            "task_started: task_id={}, worker_id={}, orchestrator_id={}",
+            json["task_id"], json["worker_id"], json["orchestrator_id"]
+        );
+    }
+
+    for event in &task_completed {
+        assert_event_fields(event, &["task_id", "worker_id", "orchestrator_id"]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker ID in tool call events
+// ---------------------------------------------------------------------------
+
+/// Verifies that tool_call_started events include worker_id for attribution.
+///
+/// LENIENCY: LLM may not use tools or route to direct answer.
+#[tokio::test]
+async fn test_tool_call_events_include_worker_id() {
+    let events = orchestration_events("Multiply 7 by 8 using the multiplication tool").await;
+
+    let tool_started = events_by_type(&events, event_names::TOOL_CALL_STARTED);
+
+    if tool_started.is_empty() {
+        println!("Note: No tool_call_started events. LLM may have answered directly.");
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    for event in &tool_started {
+        assert_event_fields(event, &["tool_call_id", "tool_name", "worker_id"]);
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        println!(
+            "tool_call_started: tool={}, worker_id={}",
+            json["tool_name"], json["worker_id"]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Iteration complete replan fields
+// ---------------------------------------------------------------------------
+
+/// Verifies that iteration_complete events include quality_threshold and will_replan fields.
+///
+/// LENIENCY: LLM may route to direct answer (no iteration events).
+#[tokio::test]
+async fn test_iteration_complete_includes_replan_fields() {
+    let events = orchestration_events(
+        "First compute the mean of [1, 2, 3], then compute the factorial of 5",
+    )
+    .await;
+
+    let iteration_complete = events_by_type(&events, event_names::ITERATION_COMPLETE);
+
+    if iteration_complete.is_empty() {
+        println!("Note: No iteration_complete events. LLM may have answered directly.");
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    for event in &iteration_complete {
+        assert_event_fields(
+            event,
+            &["iteration", "quality_score", "quality_threshold", "will_replan"],
+        );
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        let threshold = json["quality_threshold"]
+            .as_f64()
+            .expect("quality_threshold must be a number");
+        let will_replan = json["will_replan"]
+            .as_bool()
+            .expect("will_replan must be a bool");
+        println!(
+            "iteration_complete: quality_threshold={threshold:.2}, will_replan={will_replan}"
+        );
+    }
+}

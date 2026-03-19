@@ -3194,6 +3194,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
+    /// Whether the orchestrator should skip replanning because all failures
+    /// are provider-level errors (rate limits, auth, network) and no tasks
+    /// succeeded. Replanning can't fix provider issues.
+    fn should_short_circuit_provider_errors(
+        failures: &[FailedTaskRecord],
+        completed_count: usize,
+    ) -> bool {
+        if failures.is_empty() || completed_count > 0 {
+            return false;
+        }
+        failures
+            .iter()
+            .all(|f| Self::categorize_failure_error(&f.error) == "provider_error")
+    }
+
     /// Synthesize phase: combine task results into final response.
     ///
     /// For single-task plans, just returns the task result.
@@ -3563,7 +3578,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// When the coordinator sets `reuse_result_from` on a task in the new plan,
     /// this function finds the referenced task in the previous plan and copies
     /// its result, marking the task as Complete so `ready_tasks()` skips it.
-    fn apply_result_reuse(plan: &mut Plan, previous: Option<&Plan>) {
+    pub(crate) fn apply_result_reuse(plan: &mut Plan, previous: Option<&Plan>) {
         let previous = match previous {
             Some(p) => p,
             None => return,
@@ -3999,22 +4014,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 // Provider error short-circuit: if ALL failures are provider errors,
                 // don't waste an iteration asking the coordinator to fix what it can't.
-                if !this_iteration_failures.is_empty() {
-                    let all_provider_errors = this_iteration_failures
-                        .iter()
-                        .all(|f| Self::categorize_failure_error(&f.error) == "provider_error");
-                    if all_provider_errors && plan.completed_count() == 0 {
-                        let summary = self.build_execution_summary(&plan);
-                        tracing::error!(
-                            "All {} failures are provider errors — skipping replan:\n{}",
-                            this_iteration_failures.len(),
-                            summary
-                        );
-                        return Err(format!(
-                            "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
-                            summary
-                        ).into());
-                    }
+                if Self::should_short_circuit_provider_errors(
+                    this_iteration_failures,
+                    plan.completed_count(),
+                ) {
+                    let summary = self.build_execution_summary(&plan);
+                    tracing::error!(
+                        "All {} failures are provider errors — skipping replan:\n{}",
+                        this_iteration_failures.len(),
+                        summary
+                    );
+                    return Err(format!(
+                        "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
+                        summary
+                    ).into());
                 }
 
                 let execution_summary = self.build_execution_summary(&plan);
@@ -5877,5 +5890,59 @@ Provide the synthesized response:"#,
             Orchestrator::categorize_failure_error("Something went wrong"),
             "LLM error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider error short-circuit decision
+    // -----------------------------------------------------------------------
+
+    fn make_failure(error: &str) -> FailedTaskRecord {
+        FailedTaskRecord {
+            description: "test task".into(),
+            error: error.into(),
+            iteration: 1,
+            worker: None,
+        }
+    }
+
+    #[test]
+    fn test_should_short_circuit_all_provider_errors() {
+        let failures = vec![
+            make_failure("rate limit exceeded (429)"),
+            make_failure("service unavailable"),
+            make_failure("Authentication failed: invalid API key"),
+        ];
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
+    }
+
+    #[test]
+    fn test_should_not_short_circuit_mixed_errors() {
+        let failures = vec![
+            make_failure("rate limit exceeded (429)"),
+            make_failure("Request timed out after 30s"),
+        ];
+        assert!(!Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
+    }
+
+    #[test]
+    fn test_should_not_short_circuit_when_some_completed() {
+        let failures = vec![
+            make_failure("rate limit exceeded (429)"),
+            make_failure("service unavailable"),
+        ];
+        assert!(!Orchestrator::should_short_circuit_provider_errors(
+            &failures, 1
+        ));
+    }
+
+    #[test]
+    fn test_should_not_short_circuit_empty_failures() {
+        assert!(!Orchestrator::should_short_circuit_provider_errors(
+            &[], 0
+        ));
     }
 }
