@@ -2466,4 +2466,146 @@ mod tests {
         };
         assert_eq!(response.variant_name(), "StepsPlan");
     }
+
+    // -----------------------------------------------------------------------
+    // Serde roundtrip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_task_json_reuse_result_from_serde_roundtrip() {
+        let task = TaskJson {
+            id: 1,
+            description: "Compute sum".into(),
+            rationale: Some("Needed for total".into()),
+            dependencies: Some(vec![0]),
+            worker: Some("math".into()),
+            reuse_result_from: Some(3),
+        };
+        let json = serde_json::to_string(&task).unwrap();
+        let deserialized: TaskJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.id, 1);
+        assert_eq!(deserialized.reuse_result_from, Some(3));
+        assert_eq!(deserialized.worker, Some("math".into()));
+    }
+
+    #[test]
+    fn test_task_json_reuse_result_from_absent_defaults_none() {
+        let json = r#"{"id": 0, "description": "Do thing"}"#;
+        let task: TaskJson = serde_json::from_str(json).unwrap();
+        assert_eq!(task.reuse_result_from, None);
+        assert_eq!(task.dependencies, None);
+        assert_eq!(task.worker, None);
+    }
+
+    #[test]
+    fn test_into_plan_preserves_reuse_result_from() {
+        let response = PlanningResponse::Orchestrated {
+            goal: "Test reuse".into(),
+            tasks: vec![
+                TaskJson {
+                    id: 0,
+                    description: "Fresh task".into(),
+                    rationale: None,
+                    dependencies: None,
+                    worker: None,
+                    reuse_result_from: None,
+                },
+                TaskJson {
+                    id: 1,
+                    description: "Reused task".into(),
+                    rationale: Some("Carry forward".into()),
+                    dependencies: Some(vec![0]),
+                    worker: None,
+                    reuse_result_from: Some(5),
+                },
+            ],
+            routing_rationale: "test".into(),
+            planning_summary: "test".into(),
+            phases: None,
+        };
+        let plan = response.into_plan().unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].reuse_result_from, None);
+        assert_eq!(plan.tasks[1].reuse_result_from, Some(5));
+    }
+
+    #[test]
+    fn test_into_plan_then_apply_reuse_pipeline() {
+        use crate::orchestration::orchestrator::Orchestrator;
+
+        // Build a "previous" plan with a completed task at id=0
+        let mut previous = Plan::new("Previous goal");
+        let mut prev_task = Task::new(0, "Compute mean", "stats");
+        prev_task.complete("42".to_string());
+        previous.add_task(prev_task);
+
+        // Build a new plan via PlanningResponse with reuse_result_from
+        let response = PlanningResponse::Orchestrated {
+            goal: "New goal".into(),
+            tasks: vec![TaskJson {
+                id: 0,
+                description: "Reuse mean".into(),
+                rationale: None,
+                dependencies: None,
+                worker: None,
+                reuse_result_from: Some(0),
+            }],
+            routing_rationale: "test".into(),
+            planning_summary: "test".into(),
+            phases: None,
+        };
+        let mut plan = response.into_plan().unwrap();
+        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+
+        Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
+
+        assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(plan.tasks[0].result.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn test_failed_task_record_serde_roundtrip() {
+        let record = FailedTaskRecord {
+            description: "Divide numbers".into(),
+            error: "Division by zero".into(),
+            iteration: 2,
+            worker: Some("math".into()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: FailedTaskRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.description, "Divide numbers");
+        assert_eq!(deserialized.error, "Division by zero");
+        assert_eq!(deserialized.iteration, 2);
+        assert_eq!(deserialized.worker, Some("math".into()));
+    }
+
+    #[test]
+    fn test_iteration_context_serde_roundtrip() {
+        let mut plan = Plan::new("Test");
+        let mut t = Task::new(0, "Task 0", "reason");
+        t.complete("result".to_string());
+        plan.add_task(t);
+
+        let ctx = IterationContext::new(
+            1,
+            plan,
+            EvaluationResult {
+                score: 0.7,
+                reasoning: "Decent".into(),
+                gaps: vec!["Missing detail".into()],
+            },
+            vec![FailedTaskRecord {
+                description: "bad task".into(),
+                error: "oops".into(),
+                iteration: 1,
+                worker: None,
+            }],
+        );
+        let json = serde_json::to_string(&ctx).unwrap();
+        let deserialized: IterationContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.iteration, 1);
+        assert_eq!(deserialized.evaluation.score, 0.7);
+        assert_eq!(deserialized.previous_plan.tasks.len(), 1);
+        assert_eq!(deserialized.failure_history.len(), 1);
+    }
 }
