@@ -604,6 +604,7 @@ impl Orchestrator {
     ///
     /// Returns `Err` with a timeout message if the call exceeds `per_call_timeout_secs`.
     /// A value of 0 (the default) disables the per-call timeout.
+    #[allow(dead_code)]
     async fn chat_with_timeout(
         &self,
         agent: &Agent,
@@ -3947,11 +3948,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .unwrap_or_default();
             } else {
                 if !is_single_task {
-                    Self::emit_event(
-                        &event_tx,
-                        OrchestratorEvent::Synthesizing { iteration },
-                    )
-                    .await;
+                    Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration })
+                        .await;
                 }
                 final_result = self.synthesize(&plan, query, Some(&event_tx)).await?;
             }

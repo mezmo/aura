@@ -30,9 +30,9 @@ use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
     EventContext, OrchestrationStreamEvent, OrchestratorEvent, ProgressNotification,
-    RequestCancellation,
-    ResponseContent, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
-    StreamingAgent, ToolCall, ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
+    RequestCancellation, ResponseContent, StreamError, StreamItem, StreamedAssistantContent,
+    StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent, ToolResult, ToolUsageEvent,
+    UsageState,
 };
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
@@ -1031,10 +1031,7 @@ fn handle_orchestrator_event(
                 ectx,
             )
         }
-        OrchestratorEvent::ReplanStarted {
-            iteration,
-            trigger,
-        } => {
+        OrchestratorEvent::ReplanStarted { iteration, trigger } => {
             tracing::info!(
                 "Orchestrator: replan started (iteration={}, trigger={})",
                 iteration,
@@ -1043,7 +1040,10 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::replan_started(*iteration, trigger, ectx)
         }
         OrchestratorEvent::Synthesizing { iteration } => {
-            tracing::info!("Orchestrator: synthesizing results (iteration={})", iteration);
+            tracing::info!(
+                "Orchestrator: synthesizing results (iteration={})",
+                iteration
+            );
             OrchestrationStreamEvent::synthesizing(*iteration, ectx)
         }
         OrchestratorEvent::ToolCallStarted {
