@@ -3098,6 +3098,51 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .join("\n")
     }
 
+    /// Attempt partial synthesis when max iterations are reached.
+    ///
+    /// If completed tasks exist, tries to synthesize a partial result.
+    /// Returns `Ok(Some(result))` if partial synthesis succeeded,
+    /// `Ok(None)` if no completed tasks or synthesis failed,
+    /// allowing the caller to decide whether to break or return an error.
+    async fn try_partial_synthesis(
+        &self,
+        plan: &Plan,
+        query: &str,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        iteration: usize,
+        reason: &str,
+    ) -> Option<String> {
+        if plan.completed_count() > 0 {
+            tracing::warn!(
+                "{} but max iterations reached ({}). \
+                 Synthesizing partial results from {} completed task(s).",
+                reason,
+                iteration,
+                plan.completed_count()
+            );
+            match self.synthesize(plan, query, Some(event_tx)).await {
+                Ok(partial) => return Some(partial),
+                Err(e) => tracing::error!("Partial synthesis failed: {}", e),
+            }
+        }
+        None
+    }
+
+    /// Categorize a task failure error string into a human-readable category.
+    fn categorize_failure_error(error: &str) -> &'static str {
+        if error.contains("timed out") {
+            "timeout"
+        } else if error.contains("context")
+            && (error.contains("limit") || error.contains("overflow"))
+        {
+            "context overflow"
+        } else if error.contains("MaxDepthError") || error.contains("reached limit") {
+            "depth exhaustion"
+        } else {
+            "LLM error"
+        }
+    }
+
     /// Synthesize phase: combine task results into final response.
     ///
     /// For single-task plans, just returns the task result.
@@ -3653,12 +3698,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     self.execute_phase(&mut plan, &event_tx).await?;
 
                     // Phase continuation checkpoint (skip for last phase)
-                    let continuation_str = if phase_idx + 1 < phases.len() {
+                    if phase_idx + 1 < phases.len() {
                         let continuation = self.phase_continuation(&plan, Some(&event_tx)).await;
-                        let cont_str = match continuation {
-                            super::types::PhaseContinuation::Replan => "replan",
-                            super::types::PhaseContinuation::Continue => "continue",
-                        };
 
                         // Emit PhaseCompleted event
                         Self::emit_event(
@@ -3666,7 +3707,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             OrchestratorEvent::PhaseCompleted {
                                 phase_id: phase.id,
                                 label: phase.label.clone(),
-                                continuation: cont_str.to_string(),
+                                continuation,
                                 orchestrator_id: self.orchestrator_id.clone(),
                             },
                         )
@@ -3680,7 +3721,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             replan = true;
                             break;
                         }
-                        cont_str
                     } else {
                         // Last phase — emit completed with "continue" (terminal)
                         Self::emit_event(
@@ -3688,14 +3728,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             OrchestratorEvent::PhaseCompleted {
                                 phase_id: phase.id,
                                 label: phase.label.clone(),
-                                continuation: "continue".to_string(),
+                                continuation: super::types::PhaseContinuation::Continue,
                                 orchestrator_id: self.orchestrator_id.clone(),
                             },
                         )
                         .await;
-                        "continue"
                     };
-                    let _ = continuation_str; // suppress unused warning
 
                     plan.advance_phase();
                 }
@@ -3723,30 +3761,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if phase_triggered_replan {
                 let iterations_remaining = iteration < self.config.max_planning_cycles;
                 if !iterations_remaining {
-                    // Attempt partial synthesis if any tasks completed
-                    if plan.completed_count() > 0 {
-                        tracing::warn!(
-                            "Phase replan requested but max iterations reached ({}). \
-                             Synthesizing partial results from {} completed task(s).",
+                    if let Some(partial) = self
+                        .try_partial_synthesis(
+                            &plan,
+                            query,
+                            &event_tx,
                             iteration,
-                            plan.completed_count()
-                        );
-                        match self.synthesize(&plan, query, Some(&event_tx)).await {
-                            Ok(partial) => {
-                                final_result = partial;
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!("Partial synthesis failed: {}", e);
-                            }
-                        }
+                            "Phase replan requested",
+                        )
+                        .await
+                    {
+                        final_result = partial;
+                        break;
                     }
                     let summary = self.build_execution_summary(&plan);
-                    let error_msg = format!(
+                    return Err(format!(
                         "Phase replan requested but max iterations reached ({}):\n{}",
                         iteration, summary
-                    );
-                    return Err(error_msg.into());
+                    )
+                    .into());
                 }
 
                 let execution_summary = self.build_execution_summary(&plan);
@@ -3754,6 +3787,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     "Phase continuation triggered replan:\n{}",
                     execution_summary
                 );
+
+                Self::emit_event(
+                    &event_tx,
+                    OrchestratorEvent::ReplanStarted {
+                        iteration: iteration + 1,
+                        trigger: "phase_continuation".to_string(),
+                    },
+                )
+                .await;
 
                 let replan_evaluation = super::types::EvaluationResult {
                     score: 0.0,
@@ -3783,20 +3825,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     let mut category_counts: std::collections::HashMap<&str, usize> =
                         std::collections::HashMap::new();
                     for f in this_iteration_failures {
-                        let cat = if f.error.contains("timed out") {
-                            "timeout"
-                        } else if f.error.contains("context")
-                            && (f.error.contains("limit") || f.error.contains("overflow"))
-                        {
-                            "context overflow"
-                        } else if f.error.contains("MaxDepthError")
-                            || f.error.contains("reached limit")
-                        {
-                            "depth exhaustion"
-                        } else {
-                            "LLM error"
-                        };
-                        *category_counts.entry(cat).or_insert(0) += 1;
+                        *category_counts
+                            .entry(Self::categorize_failure_error(&f.error))
+                            .or_insert(0) += 1;
                     }
                     let mut categories: Vec<_> = category_counts.into_iter().collect();
                     categories.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
@@ -3825,33 +3856,38 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let iterations_remaining = iteration < self.config.max_planning_cycles;
 
                 if !iterations_remaining {
-                    if plan.completed_count() > 0 {
-                        tracing::warn!(
-                            "Task failures but max iterations reached ({}). \
-                             Synthesizing partial results from {} completed task(s).",
+                    if let Some(partial) = self
+                        .try_partial_synthesis(
+                            &plan,
+                            query,
+                            &event_tx,
                             iteration,
-                            plan.completed_count()
-                        );
-                        match self.synthesize(&plan, query, Some(&event_tx)).await {
-                            Ok(partial) => {
-                                final_result = partial;
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!("Partial synthesis failed: {}", e);
-                            }
-                        }
+                            "Task failures detected",
+                        )
+                        .await
+                    {
+                        final_result = partial;
+                        break;
                     }
                     let summary = self.build_execution_summary(&plan);
-                    let error_msg = format!(
+                    return Err(format!(
                         "Plan execution failed after {} iterations:\n{}",
                         iteration, summary
-                    );
-                    return Err(error_msg.into());
+                    )
+                    .into());
                 }
 
                 let execution_summary = self.build_execution_summary(&plan);
                 tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
+
+                Self::emit_event(
+                    &event_tx,
+                    OrchestratorEvent::ReplanStarted {
+                        iteration: iteration + 1,
+                        trigger: "failure".to_string(),
+                    },
+                )
+                .await;
 
                 let failure_evaluation = EvaluationResult {
                     score: 0.0,
@@ -3864,6 +3900,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         format!("Execution summary:\n{}", execution_summary),
                     ],
                 };
+
+                // Emit IterationComplete on failure path (was previously skipped)
+                Self::emit_event(
+                    &event_tx,
+                    OrchestratorEvent::IterationComplete {
+                        iteration,
+                        quality_score: 0.0,
+                        quality_threshold: self.config.quality_threshold,
+                        will_replan: true,
+                        reasoning: failure_evaluation.reasoning.clone(),
+                        gaps: failure_evaluation.gaps.clone(),
+                    },
+                )
+                .await;
 
                 // Persist plan state before replan
                 {
@@ -3897,7 +3947,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .unwrap_or_default();
             } else {
                 if !is_single_task {
-                    Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing).await;
+                    Self::emit_event(
+                        &event_tx,
+                        OrchestratorEvent::Synthesizing { iteration },
+                    )
+                    .await;
                 }
                 final_result = self.synthesize(&plan, query, Some(&event_tx)).await?;
             }
@@ -3942,6 +3996,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 OrchestratorEvent::IterationComplete {
                     iteration,
                     quality_score,
+                    quality_threshold: self.config.quality_threshold,
+                    will_replan,
+                    reasoning: evaluation.reasoning.clone(),
+                    gaps: evaluation.gaps.clone(),
                 },
             )
             .await;
@@ -3989,6 +4047,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 plan.tasks.len(),
                 plan.failed_count(),
             );
+
+            Self::emit_event(
+                &event_tx,
+                OrchestratorEvent::ReplanStarted {
+                    iteration: iteration + 1,
+                    trigger: "quality".to_string(),
+                },
+            )
+            .await;
 
             previous_context = Some(IterationContext::new(
                 iteration,

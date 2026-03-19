@@ -49,7 +49,7 @@ pub use orchestration::tools::{
     CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,
 };
 pub use orchestration::{
-    ArtifactsConfig, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
+    ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
     OrchestratorEvent, Plan, PlanAttemptFailure, PlanningResponse, Task, TaskJson, TaskStatus,
     TimeoutsConfig,
 };
