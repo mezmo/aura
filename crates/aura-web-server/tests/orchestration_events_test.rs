@@ -508,7 +508,10 @@ async fn test_worker_reasoning_events_emitted() {
         assert_event_fields(event, &["task_id", "worker_id", "content"]);
         let json: Value = serde_json::from_str(&event.data).unwrap();
         let content = json["content"].as_str().unwrap_or("");
-        assert!(!content.is_empty(), "worker_reasoning content should not be empty");
+        assert!(
+            !content.is_empty(),
+            "worker_reasoning content should not be empty"
+        );
         println!(
             "worker_reasoning: task_id={}, worker_id={}, content_len={}",
             json["task_id"],
@@ -565,10 +568,9 @@ async fn test_task_events_include_worker_id() {
 /// LENIENCY: LLM may not use tools or route to direct answer.
 #[tokio::test]
 async fn test_tool_call_events_include_worker_id() {
-    let events = orchestration_events(
-        "Find the median of [12, 5, 8, 3, 19] then divide the result by 2",
-    )
-    .await;
+    let events =
+        orchestration_events("Find the median of [12, 5, 8, 3, 19] then divide the result by 2")
+            .await;
 
     let tool_started = events_by_type(&events, event_names::TOOL_CALL_STARTED);
 
@@ -613,7 +615,12 @@ async fn test_iteration_complete_includes_replan_fields() {
     for event in &iteration_complete {
         assert_event_fields(
             event,
-            &["iteration", "quality_score", "quality_threshold", "will_replan"],
+            &[
+                "iteration",
+                "quality_score",
+                "quality_threshold",
+                "will_replan",
+            ],
         );
         let json: Value = serde_json::from_str(&event.data).unwrap();
         let threshold = json["quality_threshold"]
@@ -622,8 +629,6 @@ async fn test_iteration_complete_includes_replan_fields() {
         let will_replan = json["will_replan"]
             .as_bool()
             .expect("will_replan must be a bool");
-        println!(
-            "iteration_complete: quality_threshold={threshold:.2}, will_replan={will_replan}"
-        );
+        println!("iteration_complete: quality_threshold={threshold:.2}, will_replan={will_replan}");
     }
 }

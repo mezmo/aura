@@ -60,7 +60,9 @@ pub use config::{
 pub use events::OrchestratorEvent;
 pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
-pub use persistence::{ExecutionPersistence, TaskExecutionRecord, ToolCallRecord};
+pub use persistence::{
+    ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
+};
 pub use persistence_wrapper::PersistenceWrapper;
 pub use stream_events::EventContext;
 pub use stream_events::OrchestrationStreamEvent;

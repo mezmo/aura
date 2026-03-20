@@ -96,7 +96,7 @@ mod tests {
 
     async fn setup_tool() -> (ReadArtifactTool, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
         let persistence = Arc::new(Mutex::new(persistence));
