@@ -207,7 +207,10 @@ async fn prepare_request(
         // Orchestration path: build via streaming agent builder (returns Orchestrator)
         let builder = RigBuilder::new(config.clone());
         builder
-            .build_streaming_agent_with_headers(Some(req_headers_map))
+            .build_streaming_agent_with_headers(
+                Some(req_headers_map),
+                Some(chat_session_id.to_string()),
+            )
             .await
             .map_err(|e| {
                 error!("Failed to build streaming agent: {}", e);
