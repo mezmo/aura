@@ -382,7 +382,7 @@ impl Orchestrator {
                 memory_dir
             );
             Arc::new(Mutex::new(
-                ExecutionPersistence::new(memory_dir)
+                ExecutionPersistence::new(memory_dir, agent_config.session_id.clone())
                     .await
                     .map_err(|e| format!("Failed to initialize persistence: {}", e))?,
             ))
@@ -3863,6 +3863,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
         let mut failure_history: Vec<super::types::FailedTaskRecord> = Vec::new();
+        let mut last_quality_score: Option<f32> = None;
 
         loop {
             iteration += 1;
@@ -3898,14 +3899,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             // On re-plan (iteration > 1), get a new plan from the coordinator
             if iteration > 1 {
-                let (response, _prompt, _coordinator_text) = self
+                let (response, _prompt, _coordinator_text) = match self
                     .plan_with_routing(
                         query,
                         &chat_history,
                         previous_context.as_ref(),
                         Some(&event_tx),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                            .await;
+                        return Err(e);
+                    }
+                };
 
                 let routing_rationale = response.routing_rationale().to_string();
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
@@ -3985,7 +3994,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     )
                     .await;
 
-                    self.execute_phase(&mut plan, &event_tx).await?;
+                    if let Err(e) = self.execute_phase(&mut plan, &event_tx).await {
+                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                            .await;
+                        return Err(e);
+                    }
 
                     // Phase continuation checkpoint (skip for last phase)
                     if phase_idx + 1 < phases.len() {
@@ -4031,7 +4044,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 replan
             } else {
                 // Flat plan: existing execute() path, unchanged
-                self.execute(&mut plan, &event_tx).await?;
+                if let Err(e) = self.execute(&mut plan, &event_tx).await {
+                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                        .await;
+                    return Err(e);
+                }
                 false
             };
             let new_failure_start = failure_history.len();
@@ -4065,6 +4082,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         break;
                     }
                     let summary = self.build_execution_summary(&plan);
+                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                        .await;
                     return Err(format!(
                         "Phase replan requested but max iterations reached ({}):\n{}",
                         iteration, summary
@@ -4153,6 +4172,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         break;
                     }
                     let summary = self.build_execution_summary(&plan);
+                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                        .await;
                     return Err(format!(
                         "Plan execution failed after {} iterations:\n{}",
                         iteration, summary
@@ -4172,6 +4193,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         this_iteration_failures.len(),
                         summary
                     );
+                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                        .await;
                     return Err(format!(
                         "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
                         summary
@@ -4180,6 +4203,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 let execution_summary = self.build_execution_summary(&plan);
                 tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
+                last_quality_score = Some(0.0);
 
                 let failure_evaluation = EvaluationResult {
                     score: 0.0,
@@ -4247,7 +4271,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration })
                         .await;
                 }
-                final_result = self.synthesize(&plan, query, Some(&event_tx)).await?;
+                final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                            .await;
+                        return Err(e);
+                    }
+                };
             }
 
             // ----------------------------------------------------------------
@@ -4264,6 +4295,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 self.evaluate(&plan, query, &final_result).await
             };
             let quality_score = evaluation.score;
+            last_quality_score = Some(quality_score);
 
             let quality_met = quality_score >= self.config.quality_threshold;
             let iterations_remaining = iteration < self.config.max_planning_cycles;
@@ -4360,7 +4392,70 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await;
         }
 
+        // Write run manifest on completion (best-effort)
+        self.write_run_manifest(&plan, iteration, last_quality_score)
+            .await;
+
         Ok(final_result)
+    }
+
+    /// Write a typed `RunManifest` summarizing this orchestration run.
+    ///
+    /// Called at the end of `run_orchestration_loop()` on all exit paths.
+    /// Errors are logged but not propagated — manifest is observability, not control flow.
+    async fn write_run_manifest(&self, plan: &Plan, iterations: usize, quality_score: Option<f32>) {
+        use super::persistence::{RunManifest, RunStatus, TaskSummary};
+        use crate::string_utils::safe_truncate;
+
+        let persistence = self.persistence.lock().await;
+
+        let all_complete = plan.completed_count() == plan.tasks.len();
+        let status = if all_complete {
+            RunStatus::Success
+        } else if plan.completed_count() > 0 {
+            RunStatus::PartialSuccess
+        } else {
+            RunStatus::Failed
+        };
+
+        let task_summaries = plan
+            .tasks
+            .iter()
+            .map(|t| TaskSummary {
+                task_id: t.id,
+                description: t.description.clone(),
+                status: t.status,
+                worker: t.worker.clone(),
+                result_preview: t
+                    .result
+                    .as_ref()
+                    .map(|r| safe_truncate(r, 200).0.to_string()),
+            })
+            .collect();
+
+        let artifact_paths = match persistence.list_artifacts().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!("Failed to list artifacts for manifest: {}", e);
+                Vec::new()
+            }
+        };
+
+        let manifest = RunManifest {
+            run_id: persistence.run_id().to_string(),
+            session_id: persistence.session_id().map(|s| s.to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            goal: plan.goal.clone(),
+            status,
+            iterations,
+            quality_score,
+            task_summaries,
+            artifact_paths,
+        };
+
+        if let Err(e) = persistence.write_manifest(&manifest).await {
+            tracing::warn!("Failed to write run manifest: {}", e);
+        }
     }
 }
 
@@ -5789,7 +5884,7 @@ Provide the synthesized response:"#,
         use rig::tool::Tool;
 
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
         let persistence = Arc::new(Mutex::new(persistence));
@@ -5821,7 +5916,7 @@ Provide the synthesized response:"#,
         use super::super::persistence::ExecutionPersistence;
 
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
@@ -5841,7 +5936,7 @@ Provide the synthesized response:"#,
         use rig::tool::Tool;
 
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
         let persistence = Arc::new(Mutex::new(persistence));
@@ -6102,8 +6197,6 @@ Provide the synthesized response:"#,
 
     #[test]
     fn test_should_not_short_circuit_empty_failures() {
-        assert!(!Orchestrator::should_short_circuit_provider_errors(
-            &[], 0
-        ));
+        assert!(!Orchestrator::should_short_circuit_provider_errors(&[], 0));
     }
 }

@@ -6,26 +6,27 @@
 //!
 //! ## Directory Structure
 //!
+//! With session_id (web server path):
 //! ```text
-//! {base_path}/
-//! ├── latest -> {run_id}/              # Symlink to most recent run
+//! {base_path}/{session_id}/
+//! ├── latest -> {run_id}/              # Symlink to most recent run in session
 //! └── {run_id}/
+//!     ├── manifest.json                # Typed run manifest (RunManifest)
 //!     ├── artifacts/                   # Run-level result artifacts
 //!     │   └── task-0-result.txt
 //!     └── iteration-{n}/              # One flat dir per iteration
 //!         ├── plan.json
-//!         ├── summary.json
-//!         ├── planning.prompt.txt
-//!         ├── planning.response.txt
-//!         ├── task-{id}.attempt-{n}.prompt.txt
-//!         ├── task-{id}.attempt-{n}.response.txt
-//!         ├── task-{id}.attempt-{n}.tool-calls.json
-//!         ├── task-{id}.attempt-{n}.result.json
-//!         ├── synthesis.prompt.txt
-//!         ├── synthesis.response.txt
-//!         ├── evaluation.prompt.txt
-//!         ├── evaluation.response.txt
-//!         └── evaluation.result.json
+//!         ├── ...
+//! ```
+//!
+//! Without session_id (CLI/test path):
+//! ```text
+//! {base_path}/
+//! ├── latest -> {run_id}/
+//! └── {run_id}/
+//!     ├── manifest.json
+//!     ├── artifacts/
+//!     └── iteration-{n}/
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,65 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::types::Plan;
+use super::types::{Plan, TaskStatus};
+
+// ============================================================================
+// Run Manifest Types
+// ============================================================================
+
+/// Typed manifest written at the end of each orchestration run.
+///
+/// This is the "typed metadata, untyped blobs" pattern: the manifest is a
+/// structured index into the run's artifacts. Phase 2 uses manifests for
+/// cross-turn context without reading raw artifact files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunManifest {
+    /// Unique run identifier.
+    pub run_id: String,
+    /// Session that owns this run (None for CLI/test).
+    pub session_id: Option<String>,
+    /// ISO 8601 timestamp of run completion.
+    pub timestamp: String,
+    /// The goal from the orchestration plan.
+    pub goal: String,
+    /// Overall run outcome.
+    pub status: RunStatus,
+    /// Number of plan-execute-evaluate cycles.
+    pub iterations: usize,
+    /// Final quality evaluation score (if evaluation ran).
+    pub quality_score: Option<f32>,
+    /// Summary of each task in the plan.
+    pub task_summaries: Vec<TaskSummary>,
+    /// Relative paths to large artifact files.
+    pub artifact_paths: Vec<String>,
+}
+
+/// Summary of a single task for the run manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    /// Task ID within the plan.
+    pub task_id: usize,
+    /// Human-readable task description.
+    pub description: String,
+    /// Final task status.
+    pub status: TaskStatus,
+    /// Assigned worker name (if any).
+    pub worker: Option<String>,
+    /// First ~200 chars of the result (for quick scanning).
+    pub result_preview: Option<String>,
+}
+
+/// Overall outcome of an orchestration run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    /// All tasks completed successfully and quality threshold met.
+    Success,
+    /// Run completed but some tasks failed or quality threshold not met.
+    PartialSuccess,
+    /// Run failed entirely.
+    Failed,
+}
 
 /// A single tool call made during task execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +141,7 @@ pub struct TaskExecutionRecord {
 pub struct ExecutionPersistence {
     base_path: PathBuf,
     run_id: String,
+    session_id: Option<String>,
     current_iteration: usize,
     enabled: bool,
 }
@@ -90,17 +150,38 @@ impl ExecutionPersistence {
     /// Create new persistence manager with unique run ID.
     ///
     /// Creates the run directory and a `latest` symlink.
-    pub async fn new<P: AsRef<Path>>(base_path: P) -> io::Result<Self> {
+    ///
+    /// When `session_id` is provided, the directory structure becomes
+    /// `{base_path}/{session_id}/{run_id}/...`, grouping runs by session.
+    /// Without a session_id, the flat `{base_path}/{run_id}/...` layout is used.
+    pub async fn new<P: AsRef<Path>>(base_path: P, session_id: Option<String>) -> io::Result<Self> {
         let base_path = base_path.as_ref().to_path_buf();
+
+        // Validate session_id to prevent path traversal
+        if let Some(ref sid) = session_id
+            && (sid.is_empty() || sid.contains('/') || sid.contains('\\') || sid.contains(".."))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid session_id for persistence path: {:?}", sid),
+            ));
+        }
+
+        // Compute effective base: with session namespace or flat
+        let effective_base = if let Some(ref sid) = session_id {
+            base_path.join(sid)
+        } else {
+            base_path.clone()
+        };
 
         // Generate unique run ID
         let run_id = uuid::Uuid::new_v4().to_string();
-        let run_path = base_path.join(&run_id);
+        let run_path = effective_base.join(&run_id);
 
         fs::create_dir_all(&run_path).await?;
 
         // Create symlink to latest run (best effort, ignore errors)
-        let latest_path = base_path.join("latest");
+        let latest_path = effective_base.join("latest");
         let _ = tokio::fs::remove_file(&latest_path).await;
 
         #[cfg(unix)]
@@ -122,6 +203,7 @@ impl ExecutionPersistence {
         Ok(Self {
             base_path: run_path,
             run_id,
+            session_id,
             current_iteration: 0,
             enabled: true,
         })
@@ -132,6 +214,7 @@ impl ExecutionPersistence {
         Self {
             base_path: PathBuf::new(),
             run_id: String::new(),
+            session_id: None,
             current_iteration: 0,
             enabled: false,
         }
@@ -400,6 +483,34 @@ impl ExecutionPersistence {
         Ok(filenames)
     }
 
+    // ========================================================================
+    // Run Manifest
+    // ========================================================================
+
+    /// Get the session ID (if set).
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Write a typed run manifest to `{run_path}/manifest.json`.
+    ///
+    /// Called at the end of `run_orchestration_loop()` on both success and
+    /// failure paths. The manifest serves as a structured index for Phase 2
+    /// cross-turn context.
+    pub async fn write_manifest(&self, manifest: &RunManifest) -> io::Result<PathBuf> {
+        if !self.enabled {
+            return Ok(PathBuf::new());
+        }
+
+        let manifest_path = self.base_path.join("manifest.json");
+        let json = serde_json::to_string_pretty(manifest)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(&manifest_path, json).await?;
+
+        tracing::info!("Written run manifest to: {}", manifest_path.display());
+        Ok(manifest_path)
+    }
+
     /// Append a tool call record to the current task's execution.
     ///
     /// This is called by PersistenceWrapper during tool execution.
@@ -454,14 +565,14 @@ mod tests {
     #[tokio::test]
     async fn test_persistence_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory")).await;
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None).await;
         assert!(persistence.is_ok());
     }
 
     #[tokio::test]
     async fn test_iteration_tracking() {
         let temp_dir = TempDir::new().unwrap();
-        let mut persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let mut persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
@@ -487,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_and_read_artifact() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
@@ -504,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_artifacts() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
@@ -531,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_artifact_not_found() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
@@ -543,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_artifact_path_traversal() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"))
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
             .await
             .unwrap();
 
@@ -573,5 +684,164 @@ mod tests {
         // List returns empty
         let artifacts = persistence.list_artifacts().await.unwrap();
         assert!(artifacts.is_empty());
+    }
+
+    // ========================================================================
+    // Session Namespace Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_session_id_creates_namespaced_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_id = "cs_test123".to_string();
+        let persistence =
+            ExecutionPersistence::new(temp_dir.path().join("memory"), Some(session_id.clone()))
+                .await
+                .unwrap();
+
+        assert_eq!(persistence.session_id(), Some("cs_test123"));
+
+        // Verify the run directory is under the session namespace
+        let expected_prefix = temp_dir
+            .path()
+            .join("memory")
+            .join(&session_id)
+            .join(persistence.run_id());
+        assert_eq!(persistence.base_path, expected_prefix);
+        assert!(expected_prefix.exists());
+    }
+
+    #[tokio::test]
+    async fn test_session_id_path_traversal_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        for bad_id in &["../escape", "foo/bar", "..\\win", ""] {
+            let result =
+                ExecutionPersistence::new(temp_dir.path().join("memory"), Some(bad_id.to_string()))
+                    .await;
+            assert!(result.is_err(), "Should reject session_id: {:?}", bad_id);
+            let err = result.err().unwrap();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_session_id_uses_flat_layout() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        assert!(persistence.session_id().is_none());
+
+        // Verify flat layout: memory/{run_id}/
+        let expected = temp_dir.path().join("memory").join(persistence.run_id());
+        assert_eq!(persistence.base_path, expected);
+    }
+
+    // ========================================================================
+    // Run Manifest Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_manifest_serde_roundtrip() {
+        let manifest = RunManifest {
+            run_id: "test-run-id".to_string(),
+            session_id: Some("cs_abc".to_string()),
+            timestamp: "2026-03-19T12:00:00Z".to_string(),
+            goal: "Test the system".to_string(),
+            status: RunStatus::Success,
+            iterations: 2,
+            quality_score: Some(0.95),
+            task_summaries: vec![
+                TaskSummary {
+                    task_id: 0,
+                    description: "First task".to_string(),
+                    status: TaskStatus::Complete,
+                    worker: Some("research".to_string()),
+                    result_preview: Some("The answer is 42".to_string()),
+                },
+                TaskSummary {
+                    task_id: 1,
+                    description: "Second task".to_string(),
+                    status: TaskStatus::Failed,
+                    worker: None,
+                    result_preview: None,
+                },
+            ],
+            artifact_paths: vec!["task-0-result.txt".to_string()],
+        };
+
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        let deserialized: RunManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.run_id, "test-run-id");
+        assert_eq!(deserialized.session_id, Some("cs_abc".to_string()));
+        assert_eq!(deserialized.status, RunStatus::Success);
+        assert_eq!(deserialized.iterations, 2);
+        assert_eq!(deserialized.quality_score, Some(0.95));
+        assert_eq!(deserialized.task_summaries.len(), 2);
+        assert_eq!(deserialized.task_summaries[0].status, TaskStatus::Complete);
+        assert_eq!(deserialized.task_summaries[1].status, TaskStatus::Failed);
+        assert_eq!(deserialized.artifact_paths, vec!["task-0-result.txt"]);
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let manifest = RunManifest {
+            run_id: persistence.run_id().to_string(),
+            session_id: None,
+            timestamp: "2026-03-19T12:00:00Z".to_string(),
+            goal: "Test goal".to_string(),
+            status: RunStatus::PartialSuccess,
+            iterations: 1,
+            quality_score: Some(0.6),
+            task_summaries: vec![],
+            artifact_paths: vec![],
+        };
+
+        let path = persistence.write_manifest(&manifest).await.unwrap();
+        assert!(path.exists());
+
+        // Read back and verify
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let read_back: RunManifest = serde_json::from_str(&content).unwrap();
+        assert_eq!(read_back.goal, "Test goal");
+        assert_eq!(read_back.status, RunStatus::PartialSuccess);
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        let manifest = RunManifest {
+            run_id: String::new(),
+            session_id: None,
+            timestamp: String::new(),
+            goal: String::new(),
+            status: RunStatus::Failed,
+            iterations: 0,
+            quality_score: None,
+            task_summaries: vec![],
+            artifact_paths: vec![],
+        };
+        let path = persistence.write_manifest(&manifest).await.unwrap();
+        assert_eq!(path, PathBuf::new());
+    }
+
+    #[tokio::test]
+    async fn test_run_status_serde() {
+        // Verify snake_case serialization
+        let json = serde_json::to_string(&RunStatus::PartialSuccess).unwrap();
+        assert_eq!(json, "\"partial_success\"");
+
+        let json = serde_json::to_string(&RunStatus::Success).unwrap();
+        assert_eq!(json, "\"success\"");
+
+        let json = serde_json::to_string(&RunStatus::Failed).unwrap();
+        assert_eq!(json, "\"failed\"");
     }
 }
