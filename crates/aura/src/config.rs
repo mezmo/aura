@@ -124,6 +124,12 @@ pub struct AgentConfig {
     /// When set, workers can retrieve conversation history on demand.
     #[serde(skip)]
     pub orchestration_chat_history: Option<Arc<Vec<rig::completion::Message>>>,
+
+    /// Session ID for grouping orchestration runs under a shared namespace (not serialized).
+    /// When set, persistence paths become `{memory_dir}/{session_id}/{run_id}/...`.
+    /// Threaded from the web server's `chat_session_id`.
+    #[serde(skip)]
+    pub session_id: Option<String>,
 }
 
 /// Configuration for TodoWrite/ReadTodos tool injection.
@@ -152,6 +158,7 @@ impl Clone for AgentConfig {
             mcp_filter: self.mcp_filter.clone(),
             orchestration_persistence: self.orchestration_persistence.clone(),
             orchestration_chat_history: self.orchestration_chat_history.clone(),
+            session_id: self.session_id.clone(),
         }
     }
 }
@@ -191,6 +198,7 @@ impl std::fmt::Debug for AgentConfig {
                     .as_ref()
                     .map(|h| format!("<{} messages>", h.len())),
             )
+            .field("session_id", &self.session_id)
             .finish()
     }
 }
@@ -463,6 +471,7 @@ impl Default for AgentConfig {
             mcp_filter: None,
             orchestration_persistence: None,
             orchestration_chat_history: None,
+            session_id: None,
         }
     }
 }

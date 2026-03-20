@@ -270,6 +270,7 @@ impl RigBuilder {
             mcp_filter: None,
             orchestration_persistence: None,
             orchestration_chat_history: None,
+            session_id: None,
         })
     }
 
@@ -302,9 +303,11 @@ impl RigBuilder {
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,
+        session_id: Option<String>,
     ) -> Result<Arc<dyn StreamingAgent>, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
+        agent_config.session_id = session_id;
 
         aura::build_streaming_agent(&agent_config)
             .await
