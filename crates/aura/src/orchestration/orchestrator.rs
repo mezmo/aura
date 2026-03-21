@@ -886,6 +886,11 @@ impl Orchestrator {
     /// Falls back to text-based plan parsing if no routing tool was called.
     /// Enforces config flags: converts Direct/Clarification to single-task
     /// Orchestrated when `allow_direct_answers`/`allow_clarification` is false.
+    #[tracing::instrument(
+        name = "orchestration.planning",
+        skip_all,
+        fields(orchestration.phase = "planning")
+    )]
     async fn plan_with_routing(
         &self,
         query: &str,
@@ -991,7 +996,16 @@ impl Orchestrator {
                 )
                 .await
             {
-                Ok(r) => r,
+                Ok(r) => {
+                    crate::logging::set_token_usage(
+                        &tracing::Span::current(),
+                        r.usage.input_tokens,
+                        r.usage.output_tokens,
+                        r.usage.total_tokens,
+                        0,
+                    );
+                    r
+                }
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
                     let suggestion = context_overflow_suggestion("planning");
                     return Err(
@@ -2985,6 +2999,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// Execute a single task using a worker agent.
+    #[tracing::instrument(
+        name = "orchestration.worker",
+        skip_all,
+        fields(
+            orchestration.task_id = task_id,
+            orchestration.worker = tracing::field::Empty,
+            orchestration.task = tracing::field::Empty,
+        )
+    )]
     async fn execute_task(
         &self,
         task_id: usize,
@@ -2997,6 +3020,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
             worker_name,
             plan_goal,
         } = params;
+
+        {
+            let span = tracing::Span::current();
+            let (task_preview, _) = safe_truncate(task_description, 200);
+            span.record("orchestration.task", task_preview);
+            if let Some(name) = worker_name {
+                span.record("orchestration.worker", *name);
+            }
+        }
+
         // Create worker with persistence context (attempt 1 for now - retry logic is Phase 2+)
         let attempt = 1;
         let start_time = std::time::Instant::now();
@@ -3043,6 +3076,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await;
         let duration_ms = start_time.elapsed().as_millis() as u64;
+
+        // Record token usage on the orchestration.worker span
+        if let Ok(ref response) = result {
+            let span = tracing::Span::current();
+            crate::logging::set_token_usage(
+                &span,
+                response.usage.input_tokens,
+                response.usage.output_tokens,
+                response.usage.total_tokens,
+                0,
+            );
+        }
 
         // Detect context overflow in worker and provide actionable message
         let result = match result {
@@ -3093,6 +3138,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
+        {
+            let span = tracing::Span::current();
+            match &result {
+                Ok(_) => crate::logging::set_span_ok(&span),
+                Err(e) => crate::logging::set_span_error(&span, e.to_string()),
+            }
+        }
         result
     }
 
@@ -3216,6 +3268,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// combine results into a coherent response.
     ///
     /// Also persists the synthesis artifacts via ExecutionPersistence.
+    #[tracing::instrument(
+        name = "orchestration.synthesis",
+        skip_all,
+        fields(
+            orchestration.phase = "synthesis",
+            orchestration.completed_tasks = tracing::field::Empty,
+        )
+    )]
     async fn synthesize(
         &self,
         plan: &Plan,
@@ -3228,6 +3288,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .iter()
             .filter(|t| t.status == TaskStatus::Complete && t.result.is_some())
             .collect();
+
+        tracing::Span::current().record(
+            "orchestration.completed_tasks",
+            completed_tasks.len() as i64,
+        );
 
         if completed_tasks.is_empty() {
             // All tasks failed
@@ -3309,6 +3374,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         tracing::debug!(
                             "LLM synthesis successful for {} tasks",
                             completed_tasks.len()
+                        );
+                        crate::logging::set_token_usage(
+                            &tracing::Span::current(),
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                            response.usage.total_tokens,
+                            0,
                         );
                         response.content
                     }
@@ -3403,6 +3475,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// the LLM fails or doesn't call the tool.
     ///
     /// Returns an `EvaluationResult` containing the score, reasoning, and gaps.
+    #[tracing::instrument(
+        name = "orchestration.evaluation",
+        skip_all,
+        fields(
+            orchestration.phase = "evaluation",
+            orchestration.quality_score = tracing::field::Empty,
+        )
+    )]
     async fn evaluate(
         &self,
         plan: &Plan,
@@ -3451,6 +3531,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .await
                 {
                     Ok(response) => {
+                        crate::logging::set_token_usage(
+                            &tracing::Span::current(),
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                            response.usage.total_tokens,
+                            0,
+                        );
                         // Read the evaluation from the tool's shared state
                         let eval = decision.lock().await.take();
                         match eval {
@@ -3527,6 +3614,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 tracing::warn!("Failed to persist evaluation: {}", e);
             }
         }
+
+        tracing::Span::current().record(
+            "orchestration.quality_score",
+            format!("{:.2}", eval_result.score).as_str(),
+        );
 
         tracing::info!(
             "Evaluation: score={:.2}, reasoning={}",
@@ -3623,12 +3715,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - `Direct` → emit event, return response
     /// - `Clarification` → emit event, return question
     /// - `Orchestrated` → delegate to `run_orchestration_loop()`
+    #[tracing::instrument(
+        name = "orchestration",
+        skip_all,
+        fields(
+            orchestration.goal = tracing::field::Empty,
+            orchestration.max_iterations = self.config.max_planning_cycles,
+            orchestration.routing = tracing::field::Empty,
+        )
+    )]
     async fn run_orchestration(
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<String, StreamError> {
+        let span = tracing::Span::current();
+        let (goal_preview, _) = safe_truncate(query, 200);
+        span.record("orchestration.goal", goal_preview);
+
         let orchestration_start = Instant::now();
         let default_turn_depth = self
             .agent_config
@@ -3648,11 +3753,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .plan_with_routing(query, &chat_history, None, Some(&event_tx))
             .await?;
 
-        match response {
+        let result = match response {
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
             } => {
+                span.record("orchestration.routing", "direct");
                 Self::emit_event(
                     &event_tx,
                     OrchestratorEvent::DirectAnswer {
@@ -3668,6 +3774,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 options,
                 routing_rationale,
             } => {
+                span.record("orchestration.routing", "clarification");
                 Self::emit_event(
                     &event_tx,
                     OrchestratorEvent::ClarificationNeeded {
@@ -3680,6 +3787,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Ok(question)
             }
             PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. } => {
+                span.record("orchestration.routing", "orchestrated");
                 let routing_rationale = response.routing_rationale().to_string();
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
                 let plan = response
@@ -3706,7 +3814,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await
             }
+        };
+
+        match &result {
+            Ok(_) => crate::logging::set_span_ok(&span),
+            Err(e) => crate::logging::set_span_error(&span, e.to_string()),
         }
+        result
     }
 
     /// The plan-execute-synthesize-evaluate loop.
@@ -3736,6 +3850,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             iteration += 1;
             self.current_iteration.store(iteration, Ordering::Relaxed);
             let elapsed = orchestration_start.elapsed().as_secs_f64();
+
+            // Create a span for this iteration. Child spans (planning, worker,
+            // synthesis, evaluation) inherit this as parent via Span::current().
+            // Using enter() rather than instrument() because the loop body has
+            // break/continue control flow that can't cross async block boundaries.
+            let iter_span = tracing::info_span!(
+                "orchestration.iteration",
+                orchestration.iteration = iteration,
+                orchestration.task_count = tracing::field::Empty,
+                orchestration.quality_score = tracing::field::Empty,
+                orchestration.will_replan = tracing::field::Empty,
+            );
+            let _iter_guard = iter_span.enter();
 
             tracing::info!(
                 "Starting iteration {}/{} (elapsed={:.1}s, per_call_timeout={}s)",
@@ -3797,6 +3924,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )
                 .await;
             }
+
+            // Record task count on the iteration span now that the plan is finalized
+            iter_span.record("orchestration.task_count", plan.tasks.len() as i64);
 
             // ----------------------------------------------------------------
             // EXECUTE: Run workers on tasks (parallel when possible)
@@ -4045,6 +4175,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     ],
                 };
 
+                // Record failure on the iteration span
+                iter_span.record("orchestration.quality_score", "0.00");
+                iter_span.record("orchestration.will_replan", true);
+
                 // Emit IterationComplete on failure path (was previously skipped)
                 Self::emit_event(
                     &event_tx,
@@ -4116,6 +4250,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let quality_met = quality_score >= self.config.quality_threshold;
             let iterations_remaining = iteration < self.config.max_planning_cycles;
             let will_replan = !quality_met && iterations_remaining;
+
+            // Record evaluation results on the iteration span
+            iter_span.record(
+                "orchestration.quality_score",
+                format!("{:.2}", quality_score).as_str(),
+            );
+            iter_span.record("orchestration.will_replan", will_replan);
 
             // Persist iteration summary
             {
@@ -4233,7 +4374,9 @@ impl StreamingAgent for Orchestrator {
         // Note: Creates a fresh Orchestrator with its own MCP connections and persistence run.
         // The factory instance (self) only exists to satisfy the StreamingAgent trait.
         let cancel_token_clone = cancel_token.clone();
-        tokio::spawn(async move {
+        // Capture the current span (agent.stream root) so child spans nest correctly in Phoenix.
+        let parent_span = tracing::Span::current();
+        tokio::spawn(tracing::Instrument::instrument(async move {
             let orchestrator = match Orchestrator::new(agent_config).await {
                 Ok(o) => o,
                 Err(e) => {
@@ -4291,7 +4434,7 @@ impl StreamingAgent for Orchestrator {
                     }
                 }
             }
-        });
+        }, parent_span));
 
         // Convert receiver to stream
         let stream = stream::unfold(event_rx, |mut rx| async move {
