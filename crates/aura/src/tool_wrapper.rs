@@ -428,10 +428,17 @@ where
                 return Err(validation_error);
             }
 
-            // Call inner tool (spawn to handle non-Sync futures)
+            // Call inner tool (spawn to handle non-Sync futures).
+            // Propagate the current span so mcp.tool_call nests under execute_tool.
             let inner_clone = inner.clone();
             let args_clone = clean_args.clone();
-            let result_handle = tokio::spawn(async move { inner_clone.call(args_clone).await });
+            let tool_span = tracing::Span::current();
+            let result_handle = tokio::spawn(
+                tracing::Instrument::instrument(
+                    async move { inner_clone.call(args_clone).await },
+                    tool_span,
+                )
+            );
 
             let result = match result_handle.await {
                 Ok(r) => r,
