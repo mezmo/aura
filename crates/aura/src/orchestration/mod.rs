@@ -62,6 +62,7 @@ pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
 pub use persistence::{
     ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
+    build_session_context, load_session_manifests,
 };
 pub use persistence_wrapper::PersistenceWrapper;
 pub use stream_events::EventContext;

@@ -53,8 +53,9 @@ impl Tool for ReadArtifactTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Read the full content of a result artifact. Use this when a task \
-                result was too large to include inline and references an artifact file."
+            description: "Read the full content of a result artifact from the current \
+                orchestration run only. Use this when a task result was too large to include \
+                inline and references an artifact file."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
