@@ -69,6 +69,12 @@ pub struct ArtifactsConfig {
     pub result_artifact_threshold: usize,
     #[serde(default = "default_result_summary_length")]
     pub result_summary_length: usize,
+    #[serde(default = "default_session_history_turns")]
+    pub session_history_turns: usize,
+}
+
+fn default_session_history_turns() -> usize {
+    3
 }
 
 impl Default for ArtifactsConfig {
@@ -77,6 +83,7 @@ impl Default for ArtifactsConfig {
             memory_dir: None,
             result_artifact_threshold: default_result_artifact_threshold(),
             result_summary_length: default_result_summary_length(),
+            session_history_turns: default_session_history_turns(),
         }
     }
 }
@@ -166,6 +173,8 @@ struct RawOrchestrationConfig {
     result_artifact_threshold: Option<usize>,
     #[serde(default)]
     result_summary_length: Option<usize>,
+    #[serde(default)]
+    session_history_turns: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -186,6 +195,9 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         }
         if let Some(v) = raw.result_summary_length {
             artifacts.result_summary_length = v;
+        }
+        if let Some(v) = raw.session_history_turns {
+            artifacts.session_history_turns = v;
         }
 
         Ok(OrchestrationConfig {
