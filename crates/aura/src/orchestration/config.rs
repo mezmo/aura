@@ -271,6 +271,16 @@ pub struct ArtifactsConfig {
     /// Default: 2000 characters.
     #[serde(default = "default_result_summary_length")]
     pub result_summary_length: usize,
+
+    /// Maximum number of prior run manifests auto-injected into the coordinator
+    /// preamble as session context. Set to 0 to disable session history injection.
+    /// Default: 3.
+    #[serde(default = "default_session_history_turns")]
+    pub session_history_turns: usize,
+}
+
+fn default_session_history_turns() -> usize {
+    3
 }
 
 impl Default for ArtifactsConfig {
@@ -279,6 +289,7 @@ impl Default for ArtifactsConfig {
             memory_dir: None,
             result_artifact_threshold: default_result_artifact_threshold(),
             result_summary_length: default_result_summary_length(),
+            session_history_turns: default_session_history_turns(),
         }
     }
 }
@@ -408,6 +419,11 @@ impl OrchestrationConfig {
     /// Maximum summary length for artifact extraction.
     pub fn result_summary_length(&self) -> usize {
         self.artifacts.result_summary_length
+    }
+
+    /// Maximum prior run manifests to inject as session context.
+    pub fn session_history_turns(&self) -> usize {
+        self.artifacts.session_history_turns
     }
 }
 
@@ -609,6 +625,8 @@ struct RawOrchestrationConfig {
     result_artifact_threshold: Option<usize>,
     #[serde(default)]
     result_summary_length: Option<usize>,
+    #[serde(default)]
+    session_history_turns: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -630,6 +648,9 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         }
         if let Some(v) = raw.result_summary_length {
             artifacts.result_summary_length = v;
+        }
+        if let Some(v) = raw.session_history_turns {
+            artifacts.session_history_turns = v;
         }
 
         Ok(OrchestrationConfig {
@@ -677,6 +698,7 @@ mod tests {
         assert_eq!(config.result_artifact_threshold(), 4000);
         assert_eq!(config.result_summary_length(), 2000);
         assert!(config.memory_dir().is_none());
+        assert_eq!(config.session_history_turns(), 3);
     }
 
     #[test]
@@ -1241,5 +1263,62 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.memory_dir(), Some("/tmp/flat-alias"));
+    }
+
+    // ========================================================================
+    // Session History Turns Tests
+    // ========================================================================
+
+    #[test]
+    fn test_session_history_turns_default() {
+        let config = OrchestrationConfig::default();
+        assert_eq!(config.session_history_turns(), 3);
+    }
+
+    #[test]
+    fn test_session_history_turns_in_artifacts_sub_table() {
+        let toml = r#"
+            enabled = true
+
+            [artifacts]
+            memory_dir = "/tmp/test"
+            session_history_turns = 5
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.session_history_turns(), 5);
+    }
+
+    #[test]
+    fn test_session_history_turns_flat_backward_compat() {
+        let toml = r#"
+            enabled = true
+            session_history_turns = 0
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.session_history_turns(), 0);
+    }
+
+    #[test]
+    fn test_session_history_turns_flat_overrides_sub_table() {
+        let toml = r#"
+            enabled = true
+            session_history_turns = 7
+
+            [artifacts]
+            session_history_turns = 2
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        // Flat field takes precedence
+        assert_eq!(config.session_history_turns(), 7);
+    }
+
+    #[test]
+    fn test_session_history_turns_omitted_uses_default() {
+        let toml = r#"
+            enabled = true
+            memory_dir = "/tmp/test"
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.session_history_turns(), 3);
     }
 }

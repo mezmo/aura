@@ -210,6 +210,7 @@ impl RigBuilder {
                     memory_dir: orch.artifacts.memory_dir.clone(),
                     result_artifact_threshold: orch.artifacts.result_artifact_threshold,
                     result_summary_length: orch.artifacts.result_summary_length,
+                    session_history_turns: orch.artifacts.session_history_turns,
                 },
             }
         });

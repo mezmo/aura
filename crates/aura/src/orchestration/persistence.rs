@@ -557,6 +557,131 @@ impl ExecutionPersistence {
     }
 }
 
+// ============================================================================
+// Session History — Cross-Run Manifest Loading
+// ============================================================================
+
+/// Session history template loaded at compile time.
+const SESSION_HISTORY_TEMPLATE: &str = include_str!("../prompts/session_history.md");
+
+/// Load run manifests from prior runs in a session directory.
+///
+/// Reads `{base_path}/{session_id}/*/manifest.json`, sorts by timestamp
+/// descending, excludes the current run, and returns up to `limit` manifests.
+pub async fn load_session_manifests(
+    base_path: &Path,
+    session_id: &str,
+    exclude_run_id: &str,
+    limit: usize,
+) -> io::Result<Vec<RunManifest>> {
+    let session_dir = base_path.join(session_id);
+    if !session_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut manifests = Vec::new();
+    let mut entries = fs::read_dir(&session_dir).await?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        // Skip the current run and the "latest" symlink
+        if let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
+            && (dir_name == exclude_run_id || dir_name == "latest")
+        {
+            continue;
+        }
+
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+
+        match fs::read_to_string(&manifest_path).await {
+            Ok(content) => match serde_json::from_str::<RunManifest>(&content) {
+                Ok(manifest) => manifests.push(manifest),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse manifest at {}: {}",
+                        manifest_path.display(),
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read manifest at {}: {}",
+                    manifest_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Sort by timestamp descending (most recent first)
+    manifests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Take the most recent `limit` manifests
+    manifests.truncate(limit);
+
+    Ok(manifests)
+}
+
+/// Build a session context string from prior run manifests.
+///
+/// Renders the `session_history.md` template with turn entries built from
+/// each manifest. All static guidance lives in the template; this function
+/// only fills `%%VAR%%` placeholders.
+pub fn build_session_context(manifests: &[RunManifest]) -> String {
+    if manifests.is_empty() {
+        return String::new();
+    }
+
+    let mut turn_entries = String::new();
+
+    // Manifests are sorted most-recent-first; number turns chronologically
+    for (i, manifest) in manifests.iter().rev().enumerate() {
+        let turn_num = i + 1;
+        let status = format!("{:?}", manifest.status);
+        let score = manifest
+            .quality_score
+            .map(|s| format!("{:.2}", s))
+            .unwrap_or_else(|| "N/A".to_string());
+
+        turn_entries.push_str(&format!(
+            "### Turn {} ({}) — {} (quality: {})\n",
+            turn_num, manifest.timestamp, status, score
+        ));
+        turn_entries.push_str(&format!("Goal: \"{}\"\n", manifest.goal));
+
+        if !manifest.task_summaries.is_empty() {
+            turn_entries.push_str("Tasks:\n");
+            for task in &manifest.task_summaries {
+                let worker = task.worker.as_deref().unwrap_or("unassigned");
+                let result = match (&task.status, &task.result_preview) {
+                    (TaskStatus::Complete, Some(preview)) => format!("→ \"{}\"", preview),
+                    (TaskStatus::Failed, Some(preview)) => format!("→ FAILED: \"{}\"", preview),
+                    (TaskStatus::Failed, None) => "→ FAILED".to_string(),
+                    (status, _) => format!("→ {}", status),
+                };
+                turn_entries.push_str(&format!(
+                    "  - Task {} [{}]: {} {}\n",
+                    task.task_id, worker, task.description, result
+                ));
+            }
+        }
+
+        turn_entries.push('\n');
+    }
+
+    SESSION_HISTORY_TEMPLATE
+        .replace("%%TURN_COUNT%%", &manifests.len().to_string())
+        .replace("%%TURN_ENTRIES%%", turn_entries.trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,5 +968,236 @@ mod tests {
 
         let json = serde_json::to_string(&RunStatus::Failed).unwrap();
         assert_eq!(json, "\"failed\"");
+    }
+
+    // ========================================================================
+    // Session History Tests
+    // ========================================================================
+
+    fn make_test_manifest(run_id: &str, timestamp: &str, goal: &str) -> RunManifest {
+        RunManifest {
+            run_id: run_id.to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: timestamp.to_string(),
+            goal: goal.to_string(),
+            status: RunStatus::Success,
+            iterations: 1,
+            quality_score: Some(0.95),
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Compute mean".to_string(),
+                status: TaskStatus::Complete,
+                worker: Some("statistics".to_string()),
+                result_preview: Some("Result: 20".to_string()),
+            }],
+            artifact_paths: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_session_manifests_empty_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let result = load_session_manifests(temp_dir.path(), "cs_nonexistent", "exclude-me", 3)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_session_manifests_excludes_current_run() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join("cs_test");
+
+        // Create two run directories with manifests
+        let run1_dir = session_dir.join("run-1");
+        let run2_dir = session_dir.join("run-2");
+        fs::create_dir_all(&run1_dir).await.unwrap();
+        fs::create_dir_all(&run2_dir).await.unwrap();
+
+        let m1 = make_test_manifest("run-1", "2026-03-20T01:00:00Z", "First query");
+        let m2 = make_test_manifest("run-2", "2026-03-20T02:00:00Z", "Second query");
+
+        fs::write(
+            run1_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&m1).unwrap(),
+        )
+        .await
+        .unwrap();
+        fs::write(
+            run2_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&m2).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Exclude run-2 (current run)
+        let result = load_session_manifests(temp_dir.path(), "cs_test", "run-2", 3)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].run_id, "run-1");
+    }
+
+    #[tokio::test]
+    async fn test_load_session_manifests_sorts_by_timestamp_desc() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join("cs_test");
+
+        // Create runs out of chronological order
+        for (id, ts) in &[
+            ("run-a", "2026-03-20T03:00:00Z"),
+            ("run-b", "2026-03-20T01:00:00Z"),
+            ("run-c", "2026-03-20T02:00:00Z"),
+        ] {
+            let dir = session_dir.join(id);
+            fs::create_dir_all(&dir).await.unwrap();
+            let m = make_test_manifest(id, ts, &format!("Query {}", id));
+            fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_string_pretty(&m).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 3);
+        // Most recent first
+        assert_eq!(result[0].run_id, "run-a");
+        assert_eq!(result[1].run_id, "run-c");
+        assert_eq!(result[2].run_id, "run-b");
+    }
+
+    #[tokio::test]
+    async fn test_load_session_manifests_respects_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join("cs_test");
+
+        for i in 0..5 {
+            let id = format!("run-{}", i);
+            let dir = session_dir.join(&id);
+            fs::create_dir_all(&dir).await.unwrap();
+            let m = make_test_manifest(&id, &format!("2026-03-20T0{}:00:00Z", i), "Query");
+            fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_string_pretty(&m).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_load_session_manifests_skips_latest_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join("cs_test");
+
+        let run_dir = session_dir.join("run-1");
+        fs::create_dir_all(&run_dir).await.unwrap();
+        let m = make_test_manifest("run-1", "2026-03-20T01:00:00Z", "Query");
+        fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Create a "latest" symlink (should be skipped)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("run-1", session_dir.join("latest")).unwrap();
+        }
+
+        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].run_id, "run-1");
+    }
+
+    #[test]
+    fn test_build_session_context_empty() {
+        let result = build_session_context(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_context_single_turn() {
+        let manifests = vec![make_test_manifest(
+            "run-1",
+            "2026-03-20T01:57:24Z",
+            "Compute mean of [10,20,30]",
+        )];
+
+        let result = build_session_context(&manifests);
+
+        assert!(result.contains("## Session History"));
+        assert!(result.contains("1 previous orchestration run(s)"));
+        assert!(result.contains("### Turn 1 (2026-03-20T01:57:24Z)"));
+        assert!(result.contains("Success"));
+        assert!(result.contains("quality: 0.95"));
+        assert!(result.contains("Compute mean of [10,20,30]"));
+        assert!(result.contains("Task 0 [statistics]: Compute mean"));
+        assert!(result.contains("Result: 20"));
+        // Guidance text from template
+        assert!(result.contains("Avoid redundant work"));
+        assert!(result.contains("Embed results for workers"));
+    }
+
+    #[test]
+    fn test_build_session_context_multi_turn_chronological_order() {
+        // Manifests arrive most-recent-first from load_session_manifests
+        let manifests = vec![
+            make_test_manifest("run-2", "2026-03-20T02:00:00Z", "Second query"),
+            make_test_manifest("run-1", "2026-03-20T01:00:00Z", "First query"),
+        ];
+
+        let result = build_session_context(&manifests);
+
+        assert!(result.contains("2 previous orchestration run(s)"));
+        // Turn 1 should be the older one (chronological order)
+        let turn1_pos = result.find("### Turn 1").unwrap();
+        let turn2_pos = result.find("### Turn 2").unwrap();
+        assert!(turn1_pos < turn2_pos);
+        assert!(result[turn1_pos..turn2_pos].contains("First query"));
+        assert!(result[turn2_pos..].contains("Second query"));
+    }
+
+    #[test]
+    fn test_build_session_context_failed_task() {
+        let manifest = RunManifest {
+            run_id: "run-fail".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Failing query".to_string(),
+            status: RunStatus::Failed,
+            iterations: 1,
+            quality_score: Some(0.3),
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Bad task".to_string(),
+                status: TaskStatus::Failed,
+                worker: Some("worker1".to_string()),
+                result_preview: Some("Connection refused".to_string()),
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Failed"));
+        assert!(result.contains("FAILED: \"Connection refused\""));
     }
 }

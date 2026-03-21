@@ -1739,6 +1739,32 @@ Assign tasks to the worker whose tools best match the required operations."#,
             preamble.push_str(&vs_context);
         }
 
+        // Load and inject session history from prior runs
+        if self.config.session_history_turns() > 0
+            && let Some(memory_dir) = self.config.memory_dir()
+        {
+            let persistence = self.persistence.lock().await;
+            if let Some(session_id) = persistence.session_id() {
+                let manifests = super::persistence::load_session_manifests(
+                    std::path::Path::new(memory_dir),
+                    session_id,
+                    persistence.run_id(),
+                    self.config.session_history_turns(),
+                )
+                .await
+                .unwrap_or_default();
+                if !manifests.is_empty() {
+                    tracing::info!(
+                        "Injecting session history: {} prior run(s) for session {}",
+                        manifests.len(),
+                        session_id
+                    );
+                    preamble.push('\n');
+                    preamble.push_str(&super::persistence::build_session_context(&manifests));
+                }
+            }
+        }
+
         // Bundle all coordinator tools
         let coordinator_tools = CoordinatorTools {
             list_tools: if include_recon_tools {
@@ -5982,7 +6008,10 @@ Provide the synthesized response:"#,
         let history = Arc::new(vec![Message::user("hello"), Message::assistant("hi there")]);
         let tool = GetConversationContextTool::new(history);
         let result = tool
-            .call(GetConversationContextArgs { last_n: Some(100) })
+            .call(GetConversationContextArgs {
+                last_n: Some(100),
+                max_chars: None,
+            })
             .await
             .unwrap();
         assert_eq!(result.count, 2);
@@ -6000,7 +6029,10 @@ Provide the synthesized response:"#,
         let history = Arc::new(vec![Message::user("hello"), Message::assistant("hi there")]);
         let tool = GetConversationContextTool::new(history);
         let result = tool
-            .call(GetConversationContextArgs { last_n: Some(0) })
+            .call(GetConversationContextArgs {
+                last_n: Some(0),
+                max_chars: None,
+            })
             .await
             .unwrap();
         assert_eq!(result.count, 2);
@@ -6017,7 +6049,10 @@ Provide the synthesized response:"#,
         let history = Arc::new(vec![Message::user("what is 2+2?")]);
         let tool = GetConversationContextTool::new(history);
         let result = tool
-            .call(GetConversationContextArgs { last_n: None })
+            .call(GetConversationContextArgs {
+                last_n: None,
+                max_chars: None,
+            })
             .await
             .unwrap();
         assert_eq!(result.count, 1);
