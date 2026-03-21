@@ -72,10 +72,16 @@ fn infer_span_kind(name: &str) -> &'static str {
         "chat" | "chat_streaming" | "agent.turn" => "LLM",
         // Tool execution spans
         "execute_tool" | "mcp.tool_call" => "TOOL",
-        // Aura agent orchestration
-        "agent.stream" | "agent.prompt" | "agent.chat" => "AGENT",
-        // Aura chain / entry-point spans
-        "chat_completions" | "streaming_completion" => "CHAIN",
+        // Aura agent orchestration (worker is an autonomous agent with its own LLM + tools)
+        "agent.stream" | "agent.prompt" | "agent.chat" | "orchestration.worker" => "AGENT",
+        // Aura chain / entry-point spans + orchestration phases
+        "chat_completions"
+        | "streaming_completion"
+        | "orchestration"
+        | "orchestration.planning"
+        | "orchestration.iteration"
+        | "orchestration.synthesis"
+        | "orchestration.evaluation" => "CHAIN",
         // Safe default
         _ => "CHAIN",
     }

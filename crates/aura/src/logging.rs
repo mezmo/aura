@@ -22,6 +22,8 @@
 //! `output.value`, token counts, `user.id`, `session.id`, `metadata`) live on
 //! this span.
 //!
+//! ### Single-agent mode
+//!
 //! ```text
 //! agent.stream (AGENT, ROOT)        <- Phoenix root span, lives for full stream duration
 //!   ├── user.id, session.id, metadata, input.value, output.value, tokens
@@ -30,7 +32,25 @@
 //!       ├── execute_tool (TOOL)     <- from Rig (no error status — see below)
 //!       │   └── mcp.tool_call (TOOL) <- from Aura, canonical tool span with error status
 //!       └── chat_streaming (LLM)    <- from Rig
+//! ```
 //!
+//! ### Orchestration mode
+//!
+//! ```text
+//! agent.stream (AGENT, ROOT)
+//!   └── orchestration (CHAIN)                   <- full orchestration lifecycle
+//!         ├── orchestration.planning (CHAIN)     <- coordinator routing/planning
+//!         │   └── agent.turn (LLM) → ...
+//!         └── orchestration.iteration (CHAIN)    <- per plan-execute-synth-eval cycle
+//!             ├── orchestration.worker (AGENT)   <- per worker task
+//!             │   └── agent.turn (LLM) → chat_streaming → execute_tool → mcp.tool_call
+//!             ├── orchestration.synthesis (CHAIN)
+//!             │   └── agent.turn (LLM) → ...
+//!             └── orchestration.evaluation (CHAIN)
+//!                 └── agent.turn (LLM) → ...
+//! ```
+//!
+//! ```text
 //! chat_completions (separate trace)  <- HTTP infrastructure
 //!   └── streaming_completion         <- HTTP infrastructure
 //! ```
@@ -39,6 +59,10 @@
 //! so that `Span::current()` is active when rig's `send()` runs. Rig reuses
 //! the caller's span instead of creating its own `invoke_agent` span,
 //! keeping `agent.turn` as a direct child of `agent.stream`.
+//!
+//! For orchestration, the spawned task in `Orchestrator::stream()` is
+//! instrumented with the `agent.stream` span so that all orchestration
+//! child spans nest correctly under the trace root.
 //!
 //! Tool errors are only recorded on the `mcp.tool_call` child span (by
 //! `mcp_tool_execution.rs`), not on Rig's `execute_tool` parent.  This is
