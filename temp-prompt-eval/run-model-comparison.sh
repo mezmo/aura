@@ -2,17 +2,21 @@
 # E2E model comparison — captures timing, tool calls, timeouts, and completion stats
 #
 # Usage:
-#   ./temp-prompt-eval/run-qwen-comparison.sh <iterations> <config1> [config2 ...]
+#   ./temp-prompt-eval/run-model-comparison.sh <iterations> <config1> [config2 ...]
 #
 # Starts math-mcp automatically, then starts/stops aura server per config.
 # Model name is derived from the config filename (minus math-orchestration- prefix and .toml suffix).
 #
-# Examples:
-#   # Run 3 iterations on two configs
-#   ./temp-prompt-eval/run-qwen-comparison.sh 3 configs/math-orchestration-glm.toml configs/math-orchestration-qwen3.toml
+# Environment:
+#   PROMPT_SET=independent (default) — standalone math prompts
+#   PROMPT_SET=dependent — chained prompts where each turn builds on the prior
 #
-#   # Run 5 iterations on all math-orchestration configs
-#   ./temp-prompt-eval/run-qwen-comparison.sh 5 configs/math-orchestration-*.toml
+# Examples:
+#   # Run 3 iterations on two configs (independent prompts)
+#   ./temp-prompt-eval/run-model-comparison.sh 3 configs/math-orchestration-glm.toml configs/math-orchestration-qwen3.toml
+#
+#   # Run 1 iteration with dependent prompts
+#   PROMPT_SET=dependent ./temp-prompt-eval/run-model-comparison.sh 1 configs/math-orchestration-opus-bedrock.toml
 #
 # Prerequisites: cargo build --release, llama-server reachable on 11435 (for local models)
 set -euo pipefail
@@ -46,21 +50,39 @@ model_name_from_config() {
 mkdir -p "$RESULTS_DIR"
 
 # ── Test Prompts ────────────────────────────────────────────────────
-PROMPTS=(
-  "What is 2 + 2?"
-  "Calculate the mean of [10, 20, 30] then multiply the result by 3"
-  "What is sin(45 degrees)?"
-  "Add 15 and 27, then find the mean of the result and 100"
-  "Calculate 7 * 8, then subtract 6, then find the median of [result, 10, 25, 50]"
-)
+PROMPT_SET="${PROMPT_SET:-independent}"
 
-PROMPT_LABELS=(
-  "direct-add"
-  "mean-then-multiply"
-  "trig-sin45"
-  "add-then-mean"
-  "multi-step-median"
-)
+if [[ "$PROMPT_SET" == "dependent" ]]; then
+  PROMPTS=(
+    "Calculate the mean of [12, 24, 36, 48]"
+    "Take the result from my previous question (the mean) and multiply it by 4"
+    "Subtract 20 from that multiplication result, then compute the sine of that many degrees"
+    "Compute the median of these three results from our conversation: the original mean, the multiplication result, and the subtraction result"
+    "Add the median you just computed to 50, then find the maximum of that sum and 200"
+  )
+  PROMPT_LABELS=(
+    "t1-mean-baseline"
+    "t2-multiply-prior"
+    "t3-subtract-sin"
+    "t4-median-three"
+    "t5-add-max"
+  )
+else
+  PROMPTS=(
+    "What is 2 + 2?"
+    "Calculate the mean of [10, 20, 30] then multiply the result by 3"
+    "What is sin(45 degrees)?"
+    "Add 15 and 27, then find the mean of the result and 100"
+    "Calculate 7 * 8, then subtract 6, then find the median of [result, 10, 25, 50]"
+  )
+  PROMPT_LABELS=(
+    "direct-add"
+    "mean-then-multiply"
+    "trig-sin45"
+    "add-then-mean"
+    "multi-step-median"
+  )
+fi
 
 # ── Helpers ─────────────────────────────────────────────────────────
 SERVER_PID=""
