@@ -678,6 +678,10 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
     }
 
     SESSION_HISTORY_TEMPLATE
+        .replace(
+            "%%CURRENT_TIME%%",
+            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
         .replace("%%TURN_COUNT%%", &manifests.len().to_string())
         .replace("%%TURN_ENTRIES%%", turn_entries.trim_end())
 }
@@ -1144,6 +1148,7 @@ mod tests {
         let result = build_session_context(&manifests);
 
         assert!(result.contains("## Session History"));
+        assert!(result.contains("Current time: "));
         assert!(result.contains("1 previous orchestration run(s)"));
         assert!(result.contains("### Turn 1 (2026-03-20T01:57:24Z)"));
         assert!(result.contains("Success"));
@@ -1153,7 +1158,7 @@ mod tests {
         assert!(result.contains("Result: 20"));
         // Guidance text from template
         assert!(result.contains("Avoid redundant work"));
-        assert!(result.contains("Embed results for workers"));
+        assert!(result.contains("Embed concrete values for workers"));
     }
 
     #[test]
