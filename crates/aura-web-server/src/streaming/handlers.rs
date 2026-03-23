@@ -587,9 +587,9 @@ fn handle_stream_item(
 
             vec![]
         }
-        StreamItem::FinalMarker => {
-            // Internal marker - filtered out
-            tracing::debug!("Received final marker");
+        StreamItem::FinalMarker | StreamItem::TurnUsage(_) => {
+            // Internal markers - filtered out
+            tracing::debug!("Received final/turn-usage marker");
             vec![]
         }
         StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),

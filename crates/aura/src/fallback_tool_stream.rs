@@ -114,7 +114,7 @@ impl FallbackToolExecutor {
                         // Forward the original text
                         yield item;
                     }
-                    Ok(StreamItem::Final(_)) | Ok(StreamItem::FinalMarker) => {
+                    Ok(StreamItem::Final(_)) | Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(_)) => {
                         // Stream is ending - check if buffered text contains a tool call
                         // BUT only if no proper tool_calls were already executed
                         let (buffered_text, has_native_tool_calls) = {

@@ -28,10 +28,10 @@
 //! agent.stream (AGENT, ROOT)        <- Phoenix root span, lives for full stream duration
 //!   ├── user.id, session.id, metadata, input.value, output.value, tokens
 //!   └── agent.turn (LLM)           <- from Rig fork (reuses agent.stream as parent)
-//!       ├── chat_streaming (LLM)    <- from Rig
 //!       ├── execute_tool (TOOL)     <- from Rig (no error status — see below)
 //!       │   └── mcp.tool_call (TOOL) <- from Aura, canonical tool span with error status
-//!       └── chat_streaming (LLM)    <- from Rig
+//!       └── execute_tool (TOOL)
+//!           └── mcp.tool_call (TOOL)
 //! ```
 //!
 //! ### Orchestration mode
@@ -43,7 +43,7 @@
 //!         │   └── agent.turn (LLM) → ...
 //!         └── orchestration.iteration (CHAIN)    <- per plan-execute-synth-eval cycle
 //!             ├── orchestration.worker (AGENT)   <- per worker task
-//!             │   └── agent.turn (LLM) → chat_streaming → execute_tool → mcp.tool_call
+//!             │   └── agent.turn (LLM) → execute_tool → mcp.tool_call
 //!             ├── orchestration.synthesis (CHAIN)
 //!             │   └── agent.turn (LLM) → ...
 //!             └── orchestration.evaluation (CHAIN)
