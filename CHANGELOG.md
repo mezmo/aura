@@ -1,3 +1,10 @@
+# [1.16.0](https://github.com/mezmo/aura/compare/v1.15.2...v1.16.0) (2026-03-23)
+
+
+### Features
+
+* print the version of aura web server at start [19019c4](https://github.com/mezmo/aura/commit/19019c4003cbcf27afe0a6ea3613a3a7e20434b3) - Justin Gross [LOG-22963](https://logdna.atlassian.net/browse/LOG-22963)
+
 ## [1.15.2](https://github.com/mezmo/aura/compare/v1.15.1...v1.15.2) (2026-03-17)
 
 
