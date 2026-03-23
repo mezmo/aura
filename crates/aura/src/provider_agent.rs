@@ -330,6 +330,10 @@ pub enum StreamItem {
     Final(FinalResponseInfo),
     /// Internal marker for final response (filtered out before returning to caller)
     FinalMarker,
+    /// Per-turn token usage from intermediate turns (not end-of-stream).
+    /// Emitted on every Rig `Final` chunk so callers can capture usage
+    /// even when they short-circuit before the terminal `FinalResponse`.
+    TurnUsage(Usage),
     /// Orchestrator status event (plan progress, task status, etc.)
     OrchestratorEvent(OrchestratorEvent),
 }
@@ -396,7 +400,7 @@ pub type StreamError = Box<dyn std::error::Error + Send + Sync>;
 /// This function handles the conversion from rig's generic streaming types
 /// to our provider-agnostic types. The generic parameter R is the provider's
 /// streaming response type, which we don't need to inspect.
-fn map_stream_item<R>(
+fn map_stream_item<R: rig::completion::GetTokenUsage>(
     item: Result<MultiTurnStreamItem<R>, impl std::error::Error + Send + Sync + 'static>,
 ) -> Result<StreamItem, StreamError> {
     use rig::streaming::{
@@ -428,10 +432,16 @@ fn map_stream_item<R>(
                         delta: reasoning,
                     }
                 }
-                RigAssistant::Final(_) => {
-                    // Final response marker - we don't need to forward this
-                    // as we handle FinalResponse separately
-                    return Ok(StreamItem::FinalMarker);
+                RigAssistant::Final(ref resp) => {
+                    // Per-turn usage — not end-of-stream. Callers that
+                    // short-circuit (e.g. stream_and_collect) can capture
+                    // token counts from this without waiting for FinalResponse.
+                    let usage = resp.token_usage().unwrap_or(Usage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        total_tokens: 0,
+                    });
+                    return Ok(StreamItem::TurnUsage(usage));
                 }
             };
             Ok(StreamItem::StreamAssistantItem(mapped))
