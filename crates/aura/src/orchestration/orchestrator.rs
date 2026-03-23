@@ -725,6 +725,11 @@ impl Orchestrator {
                     Ok(StreamItem::FinalMarker) => {
                         // Per-turn marker — not end-of-stream. Continue collecting.
                     }
+                    Ok(StreamItem::TurnUsage(turn)) => {
+                        usage.input_tokens += turn.input_tokens;
+                        usage.output_tokens += turn.output_tokens;
+                        usage.total_tokens += turn.total_tokens;
+                    }
                     Err(e) => return Err(e),
                     _ => {} // ToolCall, ToolCallDelta, ToolResult — rig handles execution
                 }
@@ -766,8 +771,8 @@ impl Orchestrator {
     /// - Short-circuits after first `ToolResult` when `decision_ready()` returns true
     /// - Falls back to normal completion for text-only responses
     ///
-    /// Usage may be zero when short-circuiting before `Final` — acceptable for
-    /// coordinator calls where token accounting is not critical.
+    /// Per-turn usage is captured from `TurnUsage` events even when
+    /// short-circuiting before the terminal `Final`.
     async fn stream_and_collect(
         &self,
         agent: &Agent,
@@ -828,8 +833,16 @@ impl Orchestrator {
                             tr.call_id.as_deref().unwrap_or("-")
                         );
                         if decision_ready().await {
-                            tracing::debug!("{}: decision captured, exiting stream early", phase);
-                            break; // Drop stream — prevents rig re-prompt
+                            tracing::debug!("{}: decision captured, reading turn usage", phase);
+                            // Read one more item to capture per-turn token usage
+                            // before dropping the stream. With the always-yield-Final
+                            // fix in Rig, TurnUsage is the next item after ToolResult.
+                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
+                                usage.input_tokens += turn.input_tokens;
+                                usage.output_tokens += turn.output_tokens;
+                                usage.total_tokens += turn.total_tokens;
+                            }
+                            break;
                         }
                     }
                     // Final response — authoritative content + usage
@@ -837,6 +850,11 @@ impl Orchestrator {
                         content = info.content;
                         usage = info.usage;
                         break;
+                    }
+                    Ok(StreamItem::TurnUsage(turn)) => {
+                        usage.input_tokens += turn.input_tokens;
+                        usage.output_tokens += turn.output_tokens;
+                        usage.total_tokens += turn.total_tokens;
                     }
                     Ok(StreamItem::FinalMarker) => break,
                     // MaxDepthError: success if decision was captured, error otherwise
