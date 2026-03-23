@@ -765,7 +765,7 @@ impl Agent {
                     usage = response.usage;
                     break;
                 }
-                Ok(StreamItem::FinalMarker) => {
+                Ok(StreamItem::FinalMarker) | Ok(StreamItem::TurnUsage(_)) => {
                     // Per-turn marker — not end-of-stream. Continue collecting.
                 }
                 Ok(_) => {
