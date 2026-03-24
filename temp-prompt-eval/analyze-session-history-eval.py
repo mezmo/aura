@@ -22,12 +22,14 @@ import sys
 
 # ── Turn Definitions ──────────────────────────────────────────────────
 
+# Each turn has multiple match patterns to handle coordinator rephrasing.
+# First matching turn wins (checked in t1-t5 order).
 TURN_MATCHERS = {
-    "t1": "mean of [12",
-    "t2": "multiply",
-    "t3": "subtract 20",
-    "t4": "median of the",
-    "t5": "add the median",
+    "t1": ["mean of [12", "mean of the numbers 12"],
+    "t2": ["multiply the", "multiply 30"],
+    "t3": ["subtract 20", "subtract 20 from"],
+    "t4": ["median of the", "median of three", "median of these"],
+    "t5": ["add the median", "add 100 to 50", "median to 50"],
 }
 
 EXPECTED_SESSION_TOOLS = {
@@ -82,11 +84,24 @@ def find_run_dirs(memory_dir, session_id):
 
 
 def match_turn(goal_text):
-    """Match a manifest goal to a turn key (t1-t5)."""
+    """Match a manifest goal to a turn key (t1-t5).
+
+    Uses a two-pass approach: first try specific turns (t2-t5) which
+    reference prior results, then fall back to t1 (baseline). This
+    prevents t1 patterns from stealing goals that mention the original
+    inputs but are actually later turns (e.g., "Multiply the mean of
+    [12, 24, 36, 48] by 4" contains "mean of [12" but is really t2).
+    """
     goal_lower = goal_text.lower()
-    for turn_key, pattern in TURN_MATCHERS.items():
+    # Pass 1: check t2-t5 first (they reference prior results)
+    for turn_key in ["t2", "t3", "t4", "t5"]:
+        for pattern in TURN_MATCHERS[turn_key]:
+            if pattern.lower() in goal_lower:
+                return turn_key
+    # Pass 2: check t1 (baseline, broadest patterns)
+    for pattern in TURN_MATCHERS["t1"]:
         if pattern.lower() in goal_lower:
-            return turn_key
+            return "t1"
     return None
 
 
