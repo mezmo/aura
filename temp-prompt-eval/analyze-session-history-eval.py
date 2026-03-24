@@ -26,7 +26,7 @@ TURN_MATCHERS = {
     "t1": "mean of [12",
     "t2": "multiply",
     "t3": "subtract 20",
-    "t4": "median of these three",
+    "t4": "median of the",
     "t5": "add the median",
 }
 
