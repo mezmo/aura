@@ -98,5 +98,8 @@ config-*-test.toml
 
 # E2E eval results (keep scripts, ignore output)
 temp-prompt-eval/results-*/
+temp-prompt-eval/session-results-*/
+temp-prompt-eval/eval-*.json
+temp-prompt-eval/multi-model-eval-*.log
 temp-prompt-eval/eval-loop/
 temp-prompt-eval/loop-history.jsonl
