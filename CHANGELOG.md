@@ -1,3 +1,10 @@
+## [1.16.1](https://github.com/mezmo/aura/compare/v1.16.0...v1.16.1) (2026-03-25)
+
+
+### Bug Fixes
+
+* **jenkins**: fix intermittent ci failures due to instance re-use [b1cc8bb](https://github.com/mezmo/aura/commit/b1cc8bb8e897ebc1f4d17632b42e47561285246c) - Justin Gross [LOG-23413](https://logdna.atlassian.net/browse/LOG-23413)
+
 # [1.16.0](https://github.com/mezmo/aura/compare/v1.15.2...v1.16.0) (2026-03-23)
 
 
