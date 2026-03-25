@@ -1,0 +1,51 @@
+# compose/scratchpad-test.yml
+# CI test runner for scratchpad integration tests
+#
+# Uses integration-scratchpad feature flag (NOT in parent `integration` list).
+# Scratchpad tests require a different server config with scratchpad-test-mcp tools.
+#
+# Usage:
+#   docker compose -p aura-scratchpad-test \
+#     -f compose/base.yml \
+#     -f compose/scratchpad.yml \
+#     -f compose/scratchpad-test.yml \
+#     up --build --force-recreate --exit-code-from aura-scratchpad-test
+
+services:
+  # Silence infrastructure output during tests
+  mock-mcp:
+    attach: false
+    logging:
+      driver: "none"
+
+  aura-web-server:
+    attach: false
+    logging:
+      driver: "none"
+
+  # Scratchpad test runner container
+  aura-scratchpad-test:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      target: release-build
+      args:
+        - GITHUB_TOKEN
+    environment:
+      # Point to containerized aura-web-server (scratchpad tests don't contact MCP directly)
+      - AURA_SERVER_URL=http://aura-web-server:8080
+    env_file:
+      - ./env/test.env
+    depends_on:
+      aura-web-server:
+        condition: service_healthy
+    # Run scratchpad tests only
+    # NOTE: --test-threads=1 required due to LLM API rate limits
+    command: >
+      cargo test
+      --package aura-web-server
+      --features integration-scratchpad
+      --no-fail-fast
+      -- --test-threads=1
+    networks:
+      - aura-test

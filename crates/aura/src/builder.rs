@@ -619,6 +619,46 @@ impl Agent {
             }
         }
 
+        // Add scratchpad tools when configured
+        if let Some(ref scratchpad) = config.scratchpad_tools_config {
+            tracing::info!(
+                "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
+            );
+            let storage = scratchpad.storage.clone();
+            let budget = scratchpad.budget.clone();
+
+            builder_state = builder_state.add_tool(crate::scratchpad::HeadTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::SliceTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::GrepTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::SchemaTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::ItemSchemaTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::GetInTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::IterateOverTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state =
+                builder_state.add_tool(crate::scratchpad::ReadTool::new(storage, budget));
+        }
+
         // Add read_artifact tool when orchestration persistence is available
         if let Some(ref persistence) = config.orchestration_persistence {
             let read_artifact = crate::orchestration::ReadArtifactTool::new(persistence.clone());
@@ -1219,6 +1259,7 @@ impl AgentBuilder {
                         args,
                         env,
                         description,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (STDIO):", name);
                         tracing::info!("  Command: {:?}", cmd);
@@ -1233,6 +1274,7 @@ impl AgentBuilder {
                         headers,
                         description,
                         headers_from_request,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (HTTP Streamable):", name);
                         tracing::info!("  URL: {}", url);

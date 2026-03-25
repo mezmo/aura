@@ -132,22 +132,46 @@ impl RigBuilder {
                             args,
                             env,
                             description,
+                            scratchpad,
                         } => McpServerConfig::Stdio {
                             cmd: cmd.first().unwrap_or(&String::new()).clone(),
                             args: args.clone(),
                             env: env.clone(),
                             description: description.clone(),
+                            scratchpad: scratchpad
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.clone(),
+                                        aura::config::ScratchpadToolEntry {
+                                            min_bytes: v.min_bytes,
+                                        },
+                                    )
+                                })
+                                .collect(),
                         },
                         crate::config::McpServerConfig::HttpStreamable {
                             url,
                             headers,
                             description,
                             headers_from_request,
+                            scratchpad,
                         } => McpServerConfig::HttpStreamable {
                             url: url.clone(),
                             headers: headers.clone(),
                             description: description.clone(),
                             headers_from_request: headers_from_request.clone(),
+                            scratchpad: scratchpad
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.clone(),
+                                        aura::config::ScratchpadToolEntry {
+                                            min_bytes: v.min_bytes,
+                                        },
+                                    )
+                                })
+                                .collect(),
                         },
                     };
                     (name.clone(), converted_server)
@@ -213,8 +237,34 @@ impl RigBuilder {
                     result_summary_length: orch.artifacts.result_summary_length,
                     session_history_turns: orch.artifacts.session_history_turns,
                 },
+                scratchpad: orch.scratchpad.as_ref().map(|sp| {
+                    aura::orchestration::ScratchpadConfig {
+                        enabled: sp.enabled,
+                        context_safety_margin: sp.context_safety_margin,
+                    }
+                }),
             }
         });
+
+        // Validate: scratchpad requires context_window and memory_dir
+        if let Some(ref orch) = orchestration
+            && orch.scratchpad.as_ref().is_some_and(|sp| sp.enabled)
+        {
+            if agent.context_window.is_none() {
+                return Err(ConfigError::Validation(
+                    "Scratchpad is enabled but `context_window` is not set. \
+                         Add `context_window = <tokens>` to the [agent] section of your config."
+                        .to_string(),
+                ));
+            }
+            if orch.memory_dir().is_none() {
+                return Err(ConfigError::Validation(
+                        "Scratchpad is enabled but `memory_dir` is not set. \
+                         Add `memory_dir = \"<path>\"` to the [orchestration] or [orchestration.artifacts] section of your config."
+                            .to_string(),
+                    ));
+            }
+        }
 
         Ok(AgentConfig {
             llm,
@@ -231,6 +281,7 @@ impl RigBuilder {
             orchestration_persistence: None,
             orchestration_chat_history: None,
             session_id: None,
+            scratchpad_tools_config: None,
         })
     }
 
@@ -347,6 +398,7 @@ mod tests {
                 headers: static_headers,
                 description: None,
                 headers_from_request,
+                scratchpad: HashMap::new(),
             },
         );
 
