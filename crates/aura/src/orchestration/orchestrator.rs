@@ -342,6 +342,10 @@ pub struct Orchestrator {
     /// Current orchestration iteration, set at the top of `run_orchestration_loop`.
     /// Read by `journal_record` so that iteration doesn't pollute method signatures.
     current_iteration: AtomicUsize,
+
+    /// Shared scratchpad budget across all workers for aggregate savings tracking.
+    /// `None` when scratchpad is not configured.
+    scratchpad_budget: Option<crate::scratchpad::ContextBudget>,
 }
 
 /// Worker identity for reasoning attribution in `stream_and_forward`.
@@ -420,6 +424,17 @@ impl Orchestrator {
             orchestration_config.max_plan_parse_retries,
         );
 
+        // Create shared scratchpad budget if scratchpad is configured
+        let scratchpad_budget = orchestration_config
+            .scratchpad
+            .as_ref()
+            .filter(|sp| sp.enabled)
+            .map(|sp| {
+                let context_window =
+                    agent_config.agent.context_window.unwrap_or(128_000) as usize;
+                crate::scratchpad::ContextBudget::new(context_window, sp.context_safety_margin)
+            });
+
         Ok(Self {
             orchestrator_id,
             config: orchestration_config,
@@ -429,6 +444,7 @@ impl Orchestrator {
             persistence,
             prompt_journal,
             current_iteration: AtomicUsize::new(0),
+            scratchpad_budget,
         })
     }
 
@@ -475,12 +491,20 @@ impl Orchestrator {
             .max_consecutive_duplicate_tool_calls
             .unwrap_or(1);
         let duplicate_guard = Arc::new(DuplicateCallGuard::new(max_dup));
-        // Observer first (emits start), then duplicate guard, then persistence (captures reasoning)
-        let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(vec![
-            observer_wrapper,
-            duplicate_guard,
-            persistence_wrapper,
-        ]));
+        // Build scratchpad wrapper if configured
+        let scratchpad_config = self.build_scratchpad_config().await;
+        let mut wrappers: Vec<Arc<dyn ToolWrapper>> =
+            vec![observer_wrapper, duplicate_guard, persistence_wrapper];
+        if let Some(ref sp) = scratchpad_config {
+            wrappers.push(Arc::new(crate::scratchpad::ScratchpadWrapper::new(
+                sp.scratchpad_tools.clone(),
+                sp.storage.clone(),
+                sp.budget.clone(),
+            )));
+        }
+
+        // Observer first (emits start), then duplicate guard, then persistence, then scratchpad (outermost output transform)
+        let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
 
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
@@ -556,6 +580,14 @@ impl Orchestrator {
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
+
+        // Inject scratchpad tools config and preamble if active
+        if let Some(sp) = scratchpad_config {
+            worker_config.scratchpad_tools_config = Some(sp);
+            if let Some(ref mut preamble) = worker_config.preamble_override {
+                preamble.push_str(crate::scratchpad::SCRATCHPAD_PREAMBLE);
+            }
+        }
 
         // Disable orchestration in worker config to avoid nested orchestration
         worker_config.orchestration = None;
@@ -2088,6 +2120,109 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 )))
             }
         }
+    }
+
+    /// Build a ScratchpadToolsConfig if scratchpad is enabled in orchestration config.
+    ///
+    /// Collects scratchpad tool mappings from `mcp.servers.<name>.scratchpad` config.
+    /// The key `"*"` applies to all tools from that server. Per-tool entries take
+    /// precedence over `"*"`.
+    async fn build_scratchpad_config(&self) -> Option<crate::scratchpad::ScratchpadToolsConfig> {
+        let scratchpad = self.config.scratchpad.as_ref()?;
+        if !scratchpad.enabled {
+            return None;
+        }
+
+        // Collect tool names and per-tool min_bytes from MCP server scratchpad configs
+        let mut scratchpad_tools: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        if let Some(ref mcp_config) = self.agent_config.mcp
+            && let Some(ref mcp_manager) = self.mcp_manager
+        {
+            for (server_name, server_config) in &mcp_config.servers {
+                let sp_config = server_config.scratchpad();
+                if sp_config.is_empty() {
+                    continue;
+                }
+
+                if let Some(wildcard) = sp_config.get("*") {
+                    // Apply wildcard to all tools from this server
+                    let server_tools = mcp_manager
+                        .streamable_tools
+                        .get(server_name)
+                        .map(|tools| {
+                            tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    for tool_name in &server_tools {
+                        // Per-tool entry overrides wildcard
+                        let min_bytes = sp_config
+                            .get(tool_name)
+                            .map(|e| e.min_bytes)
+                            .unwrap_or(wildcard.min_bytes);
+                        scratchpad_tools.insert(tool_name.clone(), min_bytes);
+                    }
+                } else {
+                    // No wildcard — only explicitly listed tools
+                    for (tool_name, entry) in sp_config {
+                        scratchpad_tools.insert(tool_name.clone(), entry.min_bytes);
+                    }
+                }
+            }
+        }
+
+        if scratchpad_tools.is_empty() {
+            tracing::warn!(
+                "Scratchpad enabled but no MCP servers have scratchpad tool entries configured"
+            );
+            return None;
+        }
+
+        // Scratchpad files live inside the current iteration directory
+        let iteration_dir = {
+            let persistence = self.persistence.lock().await;
+            if persistence.run_dir().as_os_str().is_empty() {
+                tracing::warn!("Scratchpad requires memory_dir for storage — skipping");
+                return None;
+            }
+            persistence.iteration_path()
+        };
+
+        let storage = match crate::scratchpad::ScratchpadStorage::in_dir(&iteration_dir).await {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::error!("Failed to create scratchpad storage: {}", e);
+                return None;
+            }
+        };
+
+        // Use the shared budget from the orchestrator (aggregates across all workers/iterations)
+        let budget = match &self.scratchpad_budget {
+            Some(b) => b.clone(),
+            None => {
+                // This shouldn't happen since scratchpad_budget is set when scratchpad is configured
+                let context_window =
+                    self.agent_config.agent.context_window.unwrap_or(128_000) as usize;
+                crate::scratchpad::ContextBudget::new(
+                    context_window,
+                    scratchpad.context_safety_margin,
+                )
+            }
+        };
+
+        tracing::info!(
+            "Scratchpad active: {} tools flagged, budget={}",
+            scratchpad_tools.len(),
+            budget.window_hint()
+        );
+
+        Some(crate::scratchpad::ScratchpadToolsConfig {
+            storage,
+            budget,
+            scratchpad_tools,
+        })
     }
 
     /// Build a provider-specific worker agent with MCP tools from the shared manager.
@@ -4501,22 +4636,23 @@ impl StreamingAgent for Orchestrator {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         cancel_token: CancellationToken,
+        _request_id: &str,
+        _session_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         let query = query.to_string();
         let chat_history = chat_history.clone();
+        let mut agent_config = self.agent_config.clone();
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
-        // Clone self fields for the spawned task
-        let mut agent_config = self.agent_config.clone();
         // Inject conversation history for worker access via get_conversation_context tool
         agent_config.orchestration_chat_history = Some(Arc::new(chat_history.clone()));
 
         // Spawn orchestration in background task
         // Note: Creates a fresh Orchestrator with its own MCP connections and persistence run.
-        // The factory instance (self) only exists to satisfy the StreamingAgent trait.
+        // The factory instance only exists to satisfy the StreamingAgent trait.
         let cancel_token_clone = cancel_token.clone();
         // Capture the current span (agent.stream root) so child spans nest correctly in Phoenix.
         let parent_span = tracing::Span::current();
@@ -4540,6 +4676,19 @@ impl StreamingAgent for Orchestrator {
                 result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
                     match result {
                         Ok(final_result) => {
+                            // Emit scratchpad savings if active
+                            if let Some(ref budget) = orchestrator.scratchpad_budget {
+                                let (intercepted, extracted) = budget.scratchpad_usage();
+                                if intercepted > 0 {
+                                    let _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(
+                                        OrchestratorEvent::ScratchpadUsage {
+                                            bytes_intercepted: intercepted,
+                                            bytes_extracted: extracted,
+                                        },
+                                    ))).await;
+                                }
+                            }
+
                             // Emit final response as text chunks
                             // Split into chunks to simulate streaming
                             for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
@@ -4594,6 +4743,7 @@ impl StreamingAgent for Orchestrator {
         chat_history: Vec<rig::completion::Message>,
         timeout: Duration,
         request_id: &str,
+        session_id: &str,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
@@ -4608,8 +4758,10 @@ impl StreamingAgent for Orchestrator {
         let _watcher_handle =
             spawn_cancellation_watcher(cancel_rx, timeout, watcher_cancel_token, request_id_owned);
 
-        // Get the stream — returned directly, no wrapper needed
-        let stream = match self.stream(query, chat_history, cancel_token).await {
+        let stream = match self
+            .stream(query, chat_history, cancel_token, request_id, session_id)
+            .await
+        {
             Ok(s) => s,
             Err(e) => Box::pin(stream::once(async move { Err(e) })),
         };

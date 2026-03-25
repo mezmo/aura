@@ -216,6 +216,7 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 | `aura.orchestrator.tool_call_completed` | Tool execution finished within a worker task |
 | `aura.orchestrator.phase_started` | Dependency wave began execution |
 | `aura.orchestrator.phase_completed` | Dependency wave finished (continuation: "continue" or "replan") |
+| `aura.orchestrator.scratchpad_usage` | Scratchpad context usage summary (bytes_intercepted, bytes_extracted) |
 
 ### Orchestration Event Flow
 

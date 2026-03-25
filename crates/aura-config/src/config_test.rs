@@ -150,6 +150,7 @@ temperature = 0.5
                 args,
                 env,
                 description,
+                ..
             } => {
                 assert_eq!(cmd, &vec!["uvx"]);
                 assert_eq!(
