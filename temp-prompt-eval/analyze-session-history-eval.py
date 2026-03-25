@@ -23,21 +23,13 @@ import sys
 # ── Turn Definitions ──────────────────────────────────────────────────
 
 # Each turn has multiple match patterns to handle coordinator rephrasing.
-# First matching turn wins (checked in t1-t5 order).
+# Checked t2-t5 first, then t1 (see match_turn for rationale).
 TURN_MATCHERS = {
     "t1": ["mean of [12", "mean of the numbers 12"],
     "t2": ["multiply the", "multiply 30"],
     "t3": ["subtract 20", "subtract 20 from"],
     "t4": ["median of the", "median of three", "median of these"],
     "t5": ["add the median", "add 100 to 50", "median to 50"],
-}
-
-EXPECTED_SESSION_TOOLS = {
-    "t1": {"mean"},
-    "t2": {"multiply"},
-    "t3": {"subtract", "degreesToRadians", "sin"},
-    "t4": {"median"},
-    "t5": {"add", "max"},
 }
 
 REDUNDANT_IF_PRESENT = {
@@ -336,12 +328,48 @@ def print_scorecard(turn_metrics):
     print(f"  Total tools:      {total_tools} (session)")
 
 
-def analyze_independent(memory_dir, session_ids):
-    """Analyze independent runs (one session ID per turn)."""
+def find_independent_run_dirs(memory_dir):
+    """Find run directories for independent mode (no session grouping).
+
+    Independent runs from run-model-comparison.sh don't use session IDs,
+    so run dirs (UUIDs with manifest.json) are directly under memory_dir.
+    """
+    if not os.path.isdir(memory_dir):
+        return []
+    runs = []
+    for entry in os.listdir(memory_dir):
+        run_path = os.path.join(memory_dir, entry)
+        if entry == "latest" or not os.path.isdir(run_path):
+            continue
+        # Skip session directories (session_e2e_* contain nested run dirs)
+        if entry.startswith("session_"):
+            continue
+        # Only include dirs that have a manifest (actual runs, not empty)
+        if os.path.isfile(os.path.join(run_path, "manifest.json")):
+            runs.append(run_path)
+    return sorted(runs)
+
+
+def analyze_independent(memory_dir, run_ids=None):
+    """Analyze independent runs for tool count comparison.
+
+    If run_ids provided, looks for those specific run dirs under memory_dir.
+    Otherwise, finds all non-session run dirs with manifests.
+    """
     total_tools = 0
-    for sid in session_ids:
-        run_dirs = find_run_dirs(memory_dir, sid)
-        for rd in run_dirs:
+    if run_ids:
+        for rid in run_ids:
+            # Try as session_id first, then as direct run_id
+            run_dirs = find_run_dirs(memory_dir, rid)
+            if not run_dirs:
+                rd = os.path.join(memory_dir, rid)
+                if os.path.isdir(rd):
+                    run_dirs = [rd]
+            for rd in run_dirs:
+                m = extract_turn_metrics(rd)
+                total_tools += m["tool_call_count"]
+    else:
+        for rd in find_independent_run_dirs(memory_dir):
             m = extract_turn_metrics(rd)
             total_tools += m["tool_call_count"]
     return total_tools
