@@ -26,6 +26,7 @@ pub mod rag_tools;
 pub mod request_cancellation;
 pub mod request_progress;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
+pub mod scratchpad;
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;

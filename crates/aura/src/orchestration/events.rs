@@ -195,4 +195,11 @@ pub enum OrchestratorEvent {
         /// The ID of the orchestrator
         orchestrator_id: String,
     },
+    /// Scratchpad context usage summary.
+    ScratchpadUsage {
+        /// Total bytes of raw tool output diverted to scratchpad.
+        bytes_intercepted: usize,
+        /// Total bytes extracted from scratchpad back into context.
+        bytes_extracted: usize,
+    },
 }

@@ -258,6 +258,63 @@ test-integration-sre-orchestration-local::  ## Start local SRE orchestration inf
 	$(MAKE) test-integration-sre-orchestration-local-down; \
 	exit $$test_exit
 
+# --- Scratchpad integration tests ---
+# Scratchpad tests use scratchpad-test-mcp (not math-mcp) and a separate feature flag.
+# These are NOT included in the parent `integration` or `integration-orchestration` flags.
+
+.PHONY:test-integration-scratchpad
+test-integration-scratchpad::  ## Run scratchpad integration tests via Docker Compose
+	@echo "Starting scratchpad integration test environment..."
+	docker compose -p aura-test-scratchpad-$(GIT_SHA1) \
+		-f compose/base.yml \
+		-f compose/scratchpad.yml \
+		-f compose/scratchpad-test.yml \
+		up --build --force-recreate --exit-code-from aura-scratchpad-test
+	@$(MAKE) test-integration-scratchpad-down
+
+.PHONY:test-integration-scratchpad-down
+test-integration-scratchpad-down:  ## Cleanup scratchpad integration test containers
+	-docker compose -p aura-test-scratchpad-$(GIT_SHA1) \
+		-f compose/base.yml \
+		-f compose/scratchpad.yml \
+		-f compose/scratchpad-test.yml \
+		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+
+.PHONY:test-integration-scratchpad-local-up
+test-integration-scratchpad-local-up::  ## Start local aura infra for scratchpad testing
+	@echo "Starting local aura infra for scratchpad testing..."
+	docker compose -f compose/base.yml -f compose/scratchpad.yml -f compose/dev.yml up -d --build --force-recreate
+	@echo "Waiting for services to be healthy..."
+	@timeout=120; while [ $$timeout -gt 0 ]; do \
+		mcp_status=$$(docker compose -f compose/base.yml -f compose/scratchpad.yml -f compose/dev.yml ps scratchpad-test-mcp --format '{{.Health}}' 2>/dev/null); \
+		aura_status=$$(docker compose -f compose/base.yml -f compose/scratchpad.yml -f compose/dev.yml ps aura-web-server --format '{{.Health}}' 2>/dev/null); \
+		if [ "$$mcp_status" = "healthy" ] && [ "$$aura_status" = "healthy" ]; then \
+			echo "✅ scratchpad-test-mcp is healthy"; \
+			echo "✅ aura-web-server is healthy"; \
+			exit 0; \
+		fi; \
+		echo "Waiting... scratchpad-test-mcp: $$mcp_status, aura-web-server: $$aura_status ($$timeout s remaining)"; \
+		sleep 2; \
+		timeout=$$((timeout - 2)); \
+	done; \
+	echo "❌ Timeout waiting for services to become healthy"; \
+	exit 1
+
+.PHONY:test-integration-scratchpad-local-down
+test-integration-scratchpad-local-down::  ## Stop local aura infra for scratchpad testing
+	@echo "Stopping local aura infra for scratchpad testing..."
+	docker compose -f compose/base.yml -f compose/scratchpad.yml -f compose/dev.yml down
+
+.PHONY:test-integration-scratchpad-local
+test-integration-scratchpad-local::  ## Start local scratchpad infra, run tests, then cleanup
+	@$(MAKE) test-integration-scratchpad-local-up
+	@echo "Running scratchpad integration tests..."
+	@trap '$(MAKE) test-integration-scratchpad-local-down; exit 130' INT TERM; \
+	cargo test --package aura-web-server --features integration-scratchpad --no-fail-fast -- --test-threads=1; \
+	test_exit=$$?; \
+	$(MAKE) test-integration-scratchpad-local-down; \
+	exit $$test_exit
+
 .PHONY:fmt
 fmt::                 ## Format code with rustfmt
 	cargo fmt --all
