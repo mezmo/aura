@@ -97,9 +97,9 @@ TODO.md
 config-*-test.toml
 
 # E2E eval output (keep scripts, ignore results)
-temp-prompt-eval/results-*/
-temp-prompt-eval/session-results-*/
-temp-prompt-eval/eval-*.json
-temp-prompt-eval/*.log
-temp-prompt-eval/*.jsonl
-temp-prompt-eval/eval-loop/
+e2e-eval/results-*/
+e2e-eval/session-results-*/
+e2e-eval/eval-*.json
+e2e-eval/*.log
+e2e-eval/*.jsonl
+e2e-eval/eval-loop/
