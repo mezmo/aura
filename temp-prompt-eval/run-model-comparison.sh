@@ -129,7 +129,7 @@ run_prompt() {
     -X POST "http://localhost:${PORT}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg p "$prompt" '{
-      model: "unused",
+      model: null,
       stream: true,
       messages: [{role: "user", content: $p}]
     }')" 2>"$outdir/${label}.curl-err" || true)
