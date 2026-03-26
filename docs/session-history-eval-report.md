@@ -22,7 +22,7 @@
 
 **`crates/aura/src/orchestration/persistence.rs`** — `build_session_context()` now fills `%%CURRENT_TIME%%` with `chrono::Utc::now().to_rfc3339()`. Single `.replace()` call in the existing chain. All 4 session context tests updated and passing.
 
-### Eval Scripts (temp-prompt-eval/)
+### Eval Scripts (e2e-eval/)
 
 | File | Change |
 |------|--------|
@@ -114,20 +114,20 @@ T5: Injecting session history: 3 prior run(s)  (capped at session_history_turns=
 cargo build --release
 
 # 2. Run dependent session E2E (single model)
-PROMPT_SET=dependent ./temp-prompt-eval/run-session-e2e.sh \
+PROMPT_SET=dependent ./e2e-eval/run-session-e2e.sh \
   configs/math-orchestration-opus-bedrock.toml
 
 # 3. Analyze (session ID printed by step 2)
-python3 temp-prompt-eval/analyze-session-history-eval.py \
+python3 e2e-eval/analyze-session-history-eval.py \
   --memory-dir /tmp/aura-math-opus-bedrock \
   --session-id <session_id_from_step_2>
 
 # 4. Optional: run independent baseline for comparison
-PROMPT_SET=dependent ./temp-prompt-eval/run-model-comparison.sh 1 \
+PROMPT_SET=dependent ./e2e-eval/run-model-comparison.sh 1 \
   configs/math-orchestration-opus-bedrock.toml
 
 # 5. Optional: compare session vs independent
-python3 temp-prompt-eval/analyze-session-history-eval.py \
+python3 e2e-eval/analyze-session-history-eval.py \
   --memory-dir /tmp/aura-math-opus-bedrock \
   --session-id <session_id> \
   --independent-session-ids <id1>,<id2>,<id3>,<id4>,<id5>

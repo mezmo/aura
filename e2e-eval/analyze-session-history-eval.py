@@ -7,7 +7,7 @@ Reads ONLY structured persistence artifacts (manifest.json, plan.json,
 tool-calls.json). No SSE regex.
 
 Usage:
-  python3 temp-prompt-eval/analyze-session-history-eval.py \
+  python3 e2e-eval/analyze-session-history-eval.py \
     --memory-dir /tmp/aura-math-opus-bedrock \
     --session-id session_e2e_<ts>_opus-bedrock \
     [--independent-session-ids id1,id2,id3,id4,id5]

@@ -6,8 +6,8 @@ independent of any CSV the runner may have produced. Includes loop
 detection via duplicate tool call errors and cross-model outlier analysis.
 
 Usage:
-    python3 temp-prompt-eval/parse-results.py <results-dir>
-    python3 temp-prompt-eval/parse-results.py <results-dir> --csv
+    python3 e2e-eval/parse-results.py <results-dir>
+    python3 e2e-eval/parse-results.py <results-dir> --csv
 """
 import argparse
 import csv

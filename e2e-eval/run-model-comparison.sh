@@ -2,7 +2,7 @@
 # E2E model comparison — captures timing, tool calls, timeouts, and completion stats
 #
 # Usage:
-#   ./temp-prompt-eval/run-model-comparison.sh <iterations> <config1> [config2 ...]
+#   ./e2e-eval/run-model-comparison.sh <iterations> <config1> [config2 ...]
 #
 # Starts math-mcp automatically, then starts/stops aura server per config.
 # Model name is derived from the config filename (minus math-orchestration- prefix and .toml suffix).
@@ -13,10 +13,10 @@
 #
 # Examples:
 #   # Run 3 iterations on two configs (independent prompts)
-#   ./temp-prompt-eval/run-model-comparison.sh 3 configs/math-orchestration-glm.toml configs/math-orchestration-qwen3.toml
+#   ./e2e-eval/run-model-comparison.sh 3 configs/math-orchestration-glm.toml configs/math-orchestration-qwen3.toml
 #
 #   # Run 1 iteration with dependent prompts
-#   PROMPT_SET=dependent ./temp-prompt-eval/run-model-comparison.sh 1 configs/math-orchestration-opus-bedrock.toml
+#   PROMPT_SET=dependent ./e2e-eval/run-model-comparison.sh 1 configs/math-orchestration-opus-bedrock.toml
 #
 # Prerequisites: cargo build --release, llama-server reachable on 11435 (for local models)
 set -euo pipefail
@@ -31,8 +31,8 @@ CONFIGS=("$@")
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$PROJECT_DIR/target/release/aura-web-server"
-PARSE_SCRIPT="$PROJECT_DIR/temp-prompt-eval/parse-results.py"
-RESULTS_DIR="$PROJECT_DIR/temp-prompt-eval/results-$(date +%Y%m%d-%H%M%S)"
+PARSE_SCRIPT="$PROJECT_DIR/e2e-eval/parse-results.py"
+RESULTS_DIR="$PROJECT_DIR/e2e-eval/results-$(date +%Y%m%d-%H%M%S)"
 PORT=8090
 
 if [[ ! -x "$BINARY" ]]; then
