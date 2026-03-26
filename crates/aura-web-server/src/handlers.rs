@@ -332,7 +332,7 @@ fn build_completion_config(
             max_tokens,
             &setup.chat_session_id,
         );
-        if data.config.orchestration_enabled() {
+        if setup.config.orchestration_enabled() {
             ctx.with_orchestration()
         } else {
             ctx

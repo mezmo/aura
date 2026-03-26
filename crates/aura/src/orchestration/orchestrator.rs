@@ -601,6 +601,7 @@ impl Orchestrator {
             mcp_manager: self.mcp_manager.clone(),
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
+            context_window: None,
         };
 
         Ok(AgentWithPreamble { agent, preamble })
@@ -1806,6 +1807,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 mcp_manager: None, // Coordinator doesn't have MCP tools
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
+                context_window: None,
             },
             preamble,
         })
@@ -1853,6 +1855,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 mcp_manager: None,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
+                context_window: None,
             },
             preamble,
         })
@@ -1899,6 +1902,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 mcp_manager: None,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
+                context_window: None,
             },
             preamble,
         })
@@ -1946,6 +1950,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 mcp_manager: None,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
+                context_window: None,
             },
             preamble,
         })

@@ -144,7 +144,7 @@ pub struct Agent {
     pub(crate) fallback_tool_names: Vec<String>,
     /// Configured context window size in tokens (from TOML config).
     /// Used for usage percentage reporting in streaming events.
-    context_window: Option<u32>,
+    pub(crate) context_window: Option<u32>,
 }
 
 impl Agent {
