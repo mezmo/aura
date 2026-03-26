@@ -129,7 +129,7 @@ print(json.dumps(history))
     --arg sid "$session_id" \
     --argjson msgs "$messages_json" \
     '{
-      model: "unused",
+      model: null,
       stream: true,
       messages: $msgs,
       metadata: { chat_session_id: $sid }
