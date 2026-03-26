@@ -2,7 +2,7 @@
 # Multi-turn session E2E — sends Q1..Q5 in a single session to test session history injection
 #
 # Usage:
-#   ./temp-prompt-eval/run-session-e2e.sh <config1> [config2 ...]
+#   ./e2e-eval/run-session-e2e.sh <config1> [config2 ...]
 #
 # Each config gets a fresh server instance. All 5 prompts share a single session ID,
 # building up a conversation history that the coordinator should see in later turns.
@@ -23,7 +23,7 @@ CONFIGS=("$@")
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY="$PROJECT_DIR/target/release/aura-web-server"
-RESULTS_DIR="$PROJECT_DIR/temp-prompt-eval/session-results-$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="$PROJECT_DIR/e2e-eval/session-results-$(date +%Y%m%d-%H%M%S)"
 PORT=8090
 
 if [[ ! -x "$BINARY" ]]; then
