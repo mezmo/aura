@@ -955,8 +955,12 @@ impl McpManager {
                         rmcp::model::RawContent::Text(t) => t.text.to_string(),
                         rmcp::model::RawContent::Image(_) => "[Image content]".to_string(),
                         rmcp::model::RawContent::Audio(_) => "[Audio content]".to_string(),
-                        rmcp::model::RawContent::Resource(_) => "[Resource content]".to_string(),
-                        rmcp::model::RawContent::ResourceLink(_) => "[Resource link]".to_string(),
+                        rmcp::model::RawContent::Resource(res) => {
+                            crate::mcp_response::extract_resource_contents(&res.resource)
+                        }
+                        rmcp::model::RawContent::ResourceLink(link) => {
+                            format!("[Resource link: {} ({})]", link.name, link.uri)
+                        }
                     })
                     .collect();
 
