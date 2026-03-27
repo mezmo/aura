@@ -183,10 +183,12 @@ async fn prepare_request(
     // dropping system role messages and filtering empty content.
     let chat_history = convert_chat_messages(&req.messages);
 
-    // Find the matching config: explicit model > DEFAULT_AGENT > single-config fallback
-    // This logic allows users to omit the model field if they only have one config or if they set a default_agent,
-    // improving usability for simple cases while still supporting multiple agents.
-    let config = if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
+    // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
+    // Single-config servers accept any model field value (clients like LibreChat always send one).
+    // Multi-config servers require the model field to match an alias or agent name.
+    let config = if data.configs.len() == 1 {
+        data.configs[0].clone()
+    } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
         data.configs
             .iter()
             .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
@@ -196,8 +198,6 @@ async fn prepare_request(
                     model_name.to_string(),
                 ))
             })?
-    } else if data.configs.len() == 1 {
-        data.configs[0].clone()
     } else {
         return Err(HttpResponse::BadRequest().json(ChatCompletionErrorResponse::ModelNotProvided));
     };
