@@ -430,6 +430,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-bedrockruntime",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "opentelemetry",
