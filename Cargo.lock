@@ -422,6 +422,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrockagentruntime",
  "aws-sdk-bedrockruntime",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "opentelemetry",

@@ -7,8 +7,65 @@
  */
 
 use anyhow::Result;
+use base64::Engine;
 use rmcp::model::CallToolResult;
 use tracing::{debug, info, warn};
+
+/// Maximum size (in bytes) for extracted resource content.
+/// Content exceeding this limit is truncated with a notice.
+const MAX_RESOURCE_CONTENT_BYTES: usize = 100_000;
+
+/// Extract text or decoded blob content from an MCP ResourceContents.
+///
+/// - `TextResourceContents`: returns the text directly
+/// - `BlobResourceContents`: base64-decodes and returns as UTF-8 if the MIME type
+///   indicates text (`text/*`, `application/json`, `application/xml`, etc.);
+///   otherwise returns a metadata placeholder.
+///
+/// Content exceeding `MAX_RESOURCE_CONTENT_BYTES` is truncated.
+pub fn extract_resource_contents(resource: &rmcp::model::ResourceContents) -> String {
+    let raw = match resource {
+        rmcp::model::ResourceContents::TextResourceContents { text, .. } => text.clone(),
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            blob,
+            mime_type,
+            ..
+        } => {
+            let is_text_mime = mime_type.as_deref().is_some_and(|m| {
+                m.starts_with("text/")
+                    || m == "application/json"
+                    || m == "application/xml"
+                    || m == "application/yaml"
+            });
+            if !is_text_mime {
+                return format!(
+                    "[Binary resource: {uri} (mime: {})]",
+                    mime_type.as_deref().unwrap_or("unknown")
+                );
+            }
+            match base64::engine::general_purpose::STANDARD.decode(blob) {
+                Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| {
+                    format!("[Binary resource: {uri} (not valid UTF-8)]")
+                }),
+                Err(_) => {
+                    format!("[Binary resource: {uri} (invalid base64)]")
+                }
+            }
+        }
+    };
+
+    if raw.len() > MAX_RESOURCE_CONTENT_BYTES {
+        let truncated =
+            &raw[..raw.floor_char_boundary(MAX_RESOURCE_CONTENT_BYTES)];
+        format!(
+            "{truncated}\n\n[Resource truncated: showing {MAX_RESOURCE_CONTENT_BYTES} of {} bytes]",
+            raw.len()
+        )
+    } else {
+        raw
+    }
+}
 
 /// Extract the result from an MCP tool call response
 ///
@@ -102,11 +159,10 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<St
                 format!("[Image: {} ({})]", img.mime_type, img.data.len())
             }
             rmcp::model::RawContent::Resource(res) => {
-                let uri = match &res.resource {
-                    rmcp::model::ResourceContents::TextResourceContents { uri, .. } => uri,
-                    rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => uri,
-                };
-                format!("[Resource: {uri}]")
+                extract_resource_contents(&res.resource)
+            }
+            rmcp::model::RawContent::ResourceLink(link) => {
+                format!("[Resource link: {} ({})]", link.name, link.uri)
             }
             _ => "[Unsupported content type]".to_string(),
         })
@@ -137,7 +193,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{Content, RawContent, RawTextContent};
+    use rmcp::model::{Content, RawContent, RawEmbeddedResource, RawResource, RawTextContent, ResourceContents};
     use serde_json::{Value, json};
 
     #[test]
@@ -284,5 +340,189 @@ mod tests {
         let extracted = extract_tool_result(result, "test").unwrap();
         assert_eq!(extracted, "Success message");
         assert!(!extracted.contains("Tool returned an error"));
+    }
+
+    // --- Embedded Resource extraction tests ---
+
+    #[test]
+    fn test_extract_text_resource_content() {
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::Resource(RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::TextResourceContents {
+                        uri: "repo://owner/repo/contents/README.md".to_string(),
+                        mime_type: Some("text/markdown".to_string()),
+                        text: "# Hello World\nThis is a readme.".to_string(),
+                        meta: None,
+                    },
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+
+        let extracted = extract_tool_result(result, "get_file").unwrap();
+        assert_eq!(extracted, "# Hello World\nThis is a readme.");
+    }
+
+    #[test]
+    fn test_extract_blob_resource_text_mime() {
+        use base64::Engine;
+        let text = "console.log('hello');";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::Resource(RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::BlobResourceContents {
+                        uri: "repo://owner/repo/contents/index.js".to_string(),
+                        mime_type: Some("text/javascript".to_string()),
+                        blob: encoded,
+                        meta: None,
+                    },
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+
+        let extracted = extract_tool_result(result, "get_file").unwrap();
+        assert_eq!(extracted, "console.log('hello');");
+    }
+
+    #[test]
+    fn test_extract_blob_resource_binary_mime() {
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::Resource(RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::BlobResourceContents {
+                        uri: "repo://owner/repo/contents/image.png".to_string(),
+                        mime_type: Some("image/png".to_string()),
+                        blob: "iVBORw0KGgo=".to_string(),
+                        meta: None,
+                    },
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+
+        let extracted = extract_tool_result(result, "get_file").unwrap();
+        assert!(extracted.starts_with("[Binary resource:"));
+        assert!(extracted.contains("image/png"));
+    }
+
+    #[test]
+    fn test_extract_blob_resource_json_mime() {
+        use base64::Engine;
+        let json_text = r#"{"key": "value"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json_text);
+
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::Resource(RawEmbeddedResource {
+                    meta: None,
+                    resource: ResourceContents::BlobResourceContents {
+                        uri: "repo://owner/repo/contents/data.json".to_string(),
+                        mime_type: Some("application/json".to_string()),
+                        blob: encoded,
+                        meta: None,
+                    },
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+
+        let extracted = extract_tool_result(result, "get_file").unwrap();
+        assert_eq!(extracted, r#"{"key": "value"}"#);
+    }
+
+    #[test]
+    fn test_extract_resource_link_placeholder() {
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::ResourceLink(RawResource {
+                    uri: "repo://owner/repo/contents/big-file.md".to_string(),
+                    name: "big-file.md".to_string(),
+                    title: None,
+                    description: None,
+                    mime_type: None,
+                    size: None,
+                    icons: None,
+                    meta: None,
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+
+        let extracted = extract_tool_result(result, "get_file").unwrap();
+        assert!(extracted.contains("Resource link:"));
+        assert!(extracted.contains("big-file.md"));
+        assert!(extracted.contains("repo://"));
+    }
+
+    #[test]
+    fn test_extract_text_resource_truncation() {
+        let large_text = "x".repeat(MAX_RESOURCE_CONTENT_BYTES + 1000);
+
+        let contents = ResourceContents::TextResourceContents {
+            uri: "file:///large.txt".to_string(),
+            mime_type: Some("text/plain".to_string()),
+            text: large_text.clone(),
+            meta: None,
+        };
+
+        let extracted = extract_resource_contents(&contents);
+        assert!(extracted.len() < large_text.len());
+        assert!(extracted.contains("[Resource truncated:"));
+    }
+
+    #[test]
+    fn test_mixed_text_and_resource_content() {
+        let result = CallToolResult {
+            content: vec![
+                Content {
+                    raw: RawContent::Text(RawTextContent {
+                        text: "Successfully downloaded file".to_string(),
+                        meta: None,
+                    }),
+                    annotations: None,
+                },
+                Content {
+                    raw: RawContent::Resource(RawEmbeddedResource {
+                        meta: None,
+                        resource: ResourceContents::TextResourceContents {
+                            uri: "repo://owner/repo/contents/file.md".to_string(),
+                            mime_type: Some("text/markdown".to_string()),
+                            text: "# File Content".to_string(),
+                            meta: None,
+                        },
+                    }),
+                    annotations: None,
+                },
+            ],
+            structured_content: None,
+            is_error: None,
+            meta: None,
+        };
+
+        let extracted = extract_tool_result(result, "get_file").unwrap();
+        assert!(extracted.contains("Successfully downloaded file"));
+        assert!(extracted.contains("# File Content"));
     }
 }
