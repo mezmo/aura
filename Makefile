@@ -93,6 +93,7 @@ test::                ## Run all tests (cargo + integration)
 
 .PHONY:test-integration
 test-integration::    ## Run integration tests via Docker Compose
+	@$(MAKE) test-integration-down
 	@echo "Starting integration test environment..."
 	docker compose -p aura-test-$(GIT_SHA1) \
 		-f compose/base.yml \
