@@ -130,6 +130,11 @@ pub struct AgentConfig {
     /// Threaded from the web server's `chat_session_id`.
     #[serde(skip)]
     pub session_id: Option<String>,
+
+    /// Scratchpad tools configuration (not serialized).
+    /// When set, scratchpad tools are registered and ScratchpadWrapper is active.
+    #[serde(skip)]
+    pub scratchpad_tools_config: Option<crate::scratchpad::ScratchpadToolsConfig>,
 }
 
 /// Configuration for TodoWrite/ReadTodos tool injection.
@@ -159,6 +164,7 @@ impl Clone for AgentConfig {
             orchestration_persistence: self.orchestration_persistence.clone(),
             orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
+            scratchpad_tools_config: self.scratchpad_tools_config.clone(),
         }
     }
 }
@@ -199,6 +205,13 @@ impl std::fmt::Debug for AgentConfig {
                     .map(|h| format!("<{} messages>", h.len())),
             )
             .field("session_id", &self.session_id)
+            .field(
+                "scratchpad_tools_config",
+                &self
+                    .scratchpad_tools_config
+                    .as_ref()
+                    .map(|_| "<scratchpad>"),
+            )
             .finish()
     }
 }
@@ -365,6 +378,18 @@ pub struct McpConfig {
     pub servers: HashMap<String, McpServerConfig>,
 }
 
+/// Per-tool scratchpad entry within an MCP server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchpadToolEntry {
+    /// Minimum output size (bytes) before scratchpad interception. Default: 4096.
+    #[serde(default = "default_scratchpad_min_bytes")]
+    pub min_bytes: usize,
+}
+
+fn default_scratchpad_min_bytes() -> usize {
+    4096
+}
+
 /// Individual MCP server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport")]
@@ -375,6 +400,8 @@ pub enum McpServerConfig {
         args: Vec<String>,
         env: HashMap<String, String>,
         description: Option<String>,
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -382,7 +409,19 @@ pub enum McpServerConfig {
         headers: HashMap<String, String>,
         description: Option<String>,
         headers_from_request: HashMap<String, String>,
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
+}
+
+impl McpServerConfig {
+    /// Get the scratchpad configuration map for this server.
+    pub fn scratchpad(&self) -> &HashMap<String, ScratchpadToolEntry> {
+        match self {
+            McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+            McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
+        }
+    }
 }
 
 /// Tools configuration
@@ -426,6 +465,7 @@ impl Default for AgentConfig {
             orchestration_persistence: None,
             orchestration_chat_history: None,
             session_id: None,
+            scratchpad_tools_config: None,
         }
     }
 }

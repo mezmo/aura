@@ -14,6 +14,7 @@
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
 //! - `aura.orchestrator.phase_started` - Phase execution began
 //! - `aura.orchestrator.phase_completed` - Phase execution finished
+//! - `aura.orchestrator.scratchpad_usage` - Scratchpad context usage (bytes intercepted vs extracted)
 //!
 //! # Separation from Base Events
 //!
@@ -58,6 +59,7 @@ pub mod event_names {
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
     pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
     pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
+    pub const SCRATCHPAD_USAGE: &str = "aura.orchestrator.scratchpad_usage";
 }
 
 /// SSE events specific to orchestration mode.
@@ -189,6 +191,15 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
+    /// Emitted at orchestration end with scratchpad context usage.
+    ScratchpadUsage {
+        bytes_intercepted: usize,
+        bytes_extracted: usize,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
 }
 
 impl OrchestrationStreamEvent {
@@ -208,6 +219,7 @@ impl OrchestrationStreamEvent {
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
             Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
             Self::PhaseCompleted { .. } => event_names::PHASE_COMPLETED,
+            Self::ScratchpadUsage { .. } => event_names::SCRATCHPAD_USAGE,
         }
     }
 
@@ -425,6 +437,21 @@ impl OrchestrationStreamEvent {
             continuation,
             orchestrator_id: orchestrator_id.into(),
             context,
+        }
+    }
+
+    /// Create a ScratchpadUsage event.
+    pub fn scratchpad_usage(
+        bytes_intercepted: usize,
+        bytes_extracted: usize,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::ScratchpadUsage {
+            bytes_intercepted,
+            bytes_extracted,
+            agent,
+            correlation,
         }
     }
 }

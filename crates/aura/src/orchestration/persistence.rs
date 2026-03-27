@@ -14,7 +14,9 @@
 //!     ├── manifest.json                # Typed run manifest (RunManifest)
 //!     ├── artifacts/                   # Run-level result artifacts
 //!     │   └── task-0-result.txt
-//!     └── iteration-{n}/              # One flat dir per iteration
+//!     └── iteration-{n}/               # One flat dir per iteration
+//!         ├── scratchpad/              # Intercepted large tool outputs
+//!         │   └── task_{id}-{worker}-{tool}-{attempt}.json
 //!         ├── plan.json
 //!         ├── ...
 //! ```
@@ -225,6 +227,11 @@ impl ExecutionPersistence {
         &self.run_id
     }
 
+    /// Get the run directory path (e.g., `{memory_dir}/{run_id}/`).
+    pub fn run_dir(&self) -> &Path {
+        &self.base_path
+    }
+
     /// Get current iteration number.
     pub fn current_iteration(&self) -> usize {
         self.current_iteration
@@ -237,7 +244,7 @@ impl ExecutionPersistence {
     }
 
     /// Get iteration directory path (flat, directly under run dir).
-    fn iteration_path(&self) -> PathBuf {
+    pub fn iteration_path(&self) -> PathBuf {
         self.base_path
             .join(format!("iteration-{}", self.current_iteration))
     }

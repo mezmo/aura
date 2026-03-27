@@ -640,6 +640,46 @@ impl Agent {
             builder_state = builder_state.add_tool(todo_read_tool);
         }
 
+        // Add scratchpad tools when configured
+        if let Some(ref scratchpad) = config.scratchpad_tools_config {
+            tracing::info!(
+                "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
+            );
+            let storage = scratchpad.storage.clone();
+            let budget = scratchpad.budget.clone();
+
+            builder_state = builder_state.add_tool(crate::scratchpad::HeadTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::SliceTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::GrepTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::SchemaTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::ItemSchemaTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::GetInTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state = builder_state.add_tool(crate::scratchpad::IterateOverTool::new(
+                storage.clone(),
+                budget.clone(),
+            ));
+            builder_state =
+                builder_state.add_tool(crate::scratchpad::ReadTool::new(storage, budget));
+        }
+
         // Add read_artifact tool when orchestration persistence is available
         if let Some(ref persistence) = config.orchestration_persistence {
             let read_artifact = crate::orchestration::ReadArtifactTool::new(persistence.clone());
@@ -1102,6 +1142,8 @@ impl StreamingAgent for Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         _cancel_token: CancellationToken,
+        _request_id: &str,
+        _session_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         // Use the appropriate method based on whether we have chat history
         let stream = if chat_history.is_empty() {
@@ -1119,6 +1161,7 @@ impl StreamingAgent for Agent {
         chat_history: Vec<rig::completion::Message>,
         timeout: Duration,
         request_id: &str,
+        _session_id: &str,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         watch::Sender<bool>,
@@ -1240,6 +1283,7 @@ impl AgentBuilder {
                         args,
                         env,
                         description,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (STDIO):", name);
                         tracing::info!("  Command: {:?}", cmd);
@@ -1254,6 +1298,7 @@ impl AgentBuilder {
                         headers,
                         description,
                         headers_from_request,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (HTTP Streamable):", name);
                         tracing::info!("  URL: {}", url);

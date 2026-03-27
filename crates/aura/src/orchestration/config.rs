@@ -398,6 +398,9 @@ pub struct OrchestrationConfig {
 
     /// Artifact and persistence settings.
     pub artifacts: ArtifactsConfig,
+
+    /// Scratchpad configuration for large tool output management.
+    pub scratchpad: Option<ScratchpadConfig>,
 }
 
 impl OrchestrationConfig {
@@ -548,6 +551,22 @@ impl OrchestrationConfig {
     }
 }
 
+/// Scratchpad configuration for intercepting large MCP tool outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchpadConfig {
+    pub enabled: bool,
+    pub context_safety_margin: f32,
+}
+
+impl Default for ScratchpadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            context_safety_margin: 0.20,
+        }
+    }
+}
+
 impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
@@ -566,6 +585,7 @@ impl Default for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
+            scratchpad: None,
         }
     }
 }
@@ -627,6 +647,10 @@ struct RawOrchestrationConfig {
     result_summary_length: Option<usize>,
     #[serde(default)]
     session_history_turns: Option<usize>,
+
+    // --- Scratchpad ---
+    #[serde(default)]
+    scratchpad: Option<ScratchpadConfig>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -669,6 +693,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
             timeouts,
             artifacts,
+            scratchpad: raw.scratchpad,
         })
     }
 }

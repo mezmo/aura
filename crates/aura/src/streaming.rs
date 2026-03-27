@@ -18,7 +18,7 @@
 //!
 //! async fn handle_request(agent: impl StreamingAgent, query: &str) {
 //!     let cancel_token = CancellationToken::new();
-//!     let stream = agent.stream(query, vec![], cancel_token).await?;
+//!     let stream = agent.stream(query, vec![], cancel_token, "req_123", "cs_456").await?;
 //!
 //!     // Process stream items (convert to SSE, etc.)
 //!     while let Some(item) = stream.next().await {
@@ -76,6 +76,8 @@ pub trait StreamingAgent: Send + Sync {
     /// * `query` - The user's query/message
     /// * `chat_history` - Previous messages in the conversation
     /// * `cancel_token` - Token for cancellation (e.g., on client disconnect)
+    /// * `request_id` - Request ID for MCP cancellation and scratchpad directory structure
+    /// * `session_id` - Chat session ID
     ///
     /// # Returns
     ///
@@ -85,6 +87,8 @@ pub trait StreamingAgent: Send + Sync {
         query: &str,
         chat_history: Vec<Message>,
         cancel_token: CancellationToken,
+        request_id: &str,
+        session_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError>;
 
     /// Stream with timeout support.
@@ -97,7 +101,8 @@ pub trait StreamingAgent: Send + Sync {
     /// * `query` - The user's query/message
     /// * `chat_history` - Previous messages in the conversation
     /// * `timeout` - Maximum duration for the entire stream
-    /// * `request_id` - Request ID for MCP cancellation correlation
+    /// * `request_id` - Request ID for MCP cancellation correlation and scratchpad directory structure
+    /// * `session_id` - Chat session ID
     ///
     /// # Returns
     ///
@@ -110,6 +115,7 @@ pub trait StreamingAgent: Send + Sync {
         chat_history: Vec<Message>,
         timeout: Duration,
         request_id: &str,
+        session_id: &str,
     ) -> (
         BoxStream<'static, Result<StreamItem, StreamError>>,
         tokio::sync::watch::Sender<bool>,

@@ -74,12 +74,23 @@ aura/
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 
+### Scratchpad (Context Window Management)
+- Intercepts large MCP tool outputs and saves them to disk instead of filling the context window
+- Per-tool size thresholds configured via `[mcp.servers.<name>.scratchpad]` TOML sections
+- Eight read-only exploration tools: `head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`
+- Context budget tracking to prevent token overflow
+- Usage tracking: bytes intercepted (diverted to disk) vs bytes extracted (read back into context)
+- `aura.orchestrator.scratchpad_usage` SSE event emitted at orchestration end with totals
+- Storage under persistence iteration directory: `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`
+- File IDs derived from orchestration context: `task_{task_id}-{initiator}-{tool}-{attempt}`
+- Requires `memory_dir` to be configured (shared with execution persistence)
+
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution
 - Dependency-aware multi-wave execution with quality evaluation
 - Iterative re-planning loops (`quality_threshold`, `max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
-- 11 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
+- 12 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
 
 ## Environment Setup
 
@@ -103,6 +114,7 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - Request lifecycle management
 - `tool_event_broker.rs` - FIFO queue for tool_call_id correlation (see critical assumption below)
+- `scratchpad/` - Context window management: intercepts large tool outputs, provides exploration tools
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution

@@ -37,7 +37,7 @@
 //!     Box::new(Agent::new(&config).await?)
 //! };
 //!
-//! let stream = agent.stream(query, history, cancel_token).await?;
+//! let stream = agent.stream(query, history, cancel_token, "req_123", "cs_456").await?;
 //! ```
 
 mod config;
@@ -55,7 +55,8 @@ pub mod tools;
 mod types;
 
 pub use config::{
-    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
+    ArtifactsConfig, OrchestrationConfig, ScratchpadConfig, TimeoutsConfig, ToolVisibility,
+    WorkerConfig,
 };
 pub use events::OrchestratorEvent;
 pub use observer_wrapper::ObserverWrapper;

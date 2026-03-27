@@ -108,6 +108,33 @@ pub struct OrchestrationConfig {
     pub max_consecutive_duplicate_tool_calls: Option<usize>,
     pub timeouts: TimeoutsConfig,
     pub artifacts: ArtifactsConfig,
+    /// Scratchpad configuration for large tool output management.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
+}
+
+/// Scratchpad configuration for intercepting large MCP tool outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchpadConfig {
+    /// Whether scratchpad is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Safety margin (0.0-1.0) reserved for model reasoning. Default: 0.20.
+    #[serde(default = "default_context_safety_margin")]
+    pub context_safety_margin: f32,
+}
+
+impl Default for ScratchpadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            context_safety_margin: default_context_safety_margin(),
+        }
+    }
+}
+
+fn default_context_safety_margin() -> f32 {
+    0.20
 }
 
 impl Default for OrchestrationConfig {
@@ -128,6 +155,7 @@ impl Default for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
+            scratchpad: None,
         }
     }
 }
@@ -175,6 +203,9 @@ struct RawOrchestrationConfig {
     result_summary_length: Option<usize>,
     #[serde(default)]
     session_history_turns: Option<usize>,
+    // Scratchpad
+    #[serde(default)]
+    scratchpad: Option<ScratchpadConfig>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -216,6 +247,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
             timeouts,
             artifacts,
+            scratchpad: raw.scratchpad,
         })
     }
 }
@@ -419,6 +451,10 @@ pub enum McpServerConfig {
         env: HashMap<String, String>,
         #[serde(default)]
         description: Option<String>,
+        /// Per-tool scratchpad configuration. Key is tool name or `"*"` for all tools.
+        /// Per-tool entries take precedence over `"*"`.
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -429,7 +465,33 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad configuration. Key is tool name or `"*"` for all tools.
+        /// Per-tool entries take precedence over `"*"`.
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
+}
+
+/// Per-tool scratchpad entry within an MCP server configuration.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ScratchpadToolEntry {
+    /// Minimum output size (bytes) before scratchpad interception. Default: 4096.
+    #[serde(default = "default_scratchpad_min_bytes")]
+    pub min_bytes: usize,
+}
+
+fn default_scratchpad_min_bytes() -> usize {
+    4096
+}
+
+impl McpServerConfig {
+    /// Get the scratchpad configuration map for this server.
+    pub fn scratchpad(&self) -> &HashMap<String, ScratchpadToolEntry> {
+        match self {
+            McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+            McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
+        }
+    }
 }
 
 /// Vector store configuration (in-memory and Qdrant support)

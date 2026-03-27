@@ -396,6 +396,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
             chat_history,
             config.timeout_duration,
             &config.request_id,
+            &chat_session_id,
         )
         .await;
 
