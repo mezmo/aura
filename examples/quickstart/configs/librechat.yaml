@@ -10,10 +10,10 @@ endpoints:
       baseURL: "http://aura:3000/v1"
       models:
         default:
-          - "aura"
-        fetch: false
+          - "Aura Assistant"
+        fetch: true
       titleConvo: true
-      titleModel: "aura"
+      titleModel: "Aura Assistant"
       summarize: false
       forcePrompt: false
       modelDisplayLabel: "Aura"

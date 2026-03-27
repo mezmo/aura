@@ -13,9 +13,11 @@ services:
       PORT: "3000"
       CONFIG_PATH: "/app/config/config.toml"  # Can also be a directory for multi-agent serving
 
-      # LLM API keys (from .env)
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      # LLM provider config (from .env)
+      LLM_PROVIDER: "${LLM_PROVIDER:-openai}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-5.2}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
 
       # Optional: Mezmo
       MEZMO_API_KEY: "${MEZMO_API_KEY:-}"

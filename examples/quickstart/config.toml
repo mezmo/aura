@@ -1,28 +1,19 @@
 # Aura Quickstart Configuration
 #
-# Customize this file to change your agent's behavior, LLM provider,
-# tools, and RAG pipelines. Changes take effect on restart.
+# Customize this file to change your agent's behavior, tools, and
+# RAG pipelines. Changes take effect after: docker compose restart aura
 #
 # For all available options, see: examples/reference.toml
 
 # ── LLM Provider ────────────────────────────────────────────────────
-# Switch providers by uncommenting the relevant block below.
+# Provider, model, and API key are set in .env — no changes needed here.
 
 [llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.2"
-
-# Anthropic:
-# provider = "anthropic"
-# api_key = "{{ env.ANTHROPIC_API_KEY }}"
-# model = "claude-sonnet-4-20250514"
-
-# Ollama (local, no API key needed):
-# provider = "ollama"
-# model = "llama3.1"
-# base_url = "http://host.docker.internal:11434"
-# fallback_tool_parsing = true
+provider = "{{ env.LLM_PROVIDER }}"
+api_key = "{{ env.LLM_API_KEY }}"
+model = "{{ env.LLM_MODEL }}"
+# base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama
+# fallback_tool_parsing = true            # Uncomment for Ollama
 
 # ── Agent ───────────────────────────────────────────────────────────
 

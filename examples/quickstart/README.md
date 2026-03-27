@@ -1,6 +1,6 @@
 # Aura Quickstart
 
-One command to spin up a fully working AI agent stack:
+Spin up a fully working AI agent stack in under a minute:
 
 - **Aura** — the AI agent server
 - **LibreChat** — a ChatGPT-style web UI connected to Aura
@@ -8,18 +8,32 @@ One command to spin up a fully working AI agent stack:
 
 ## Setup
 
-### 1. Add your API key
+All commands below should be run from the quickstart directory:
+
+```bash
+cd examples/quickstart
+```
+
+### 1. Configure your LLM provider
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and paste your OpenAI (or Anthropic) API key.
+Edit `.env` and set your provider, model, and API key:
+
+```bash
+LLM_PROVIDER=openai          # or: anthropic, ollama
+LLM_MODEL=gpt-5.2            # or: claude-sonnet-4-20250514, llama3.1
+LLM_API_KEY=sk-...            # your API key (use "unused" for Ollama)
+```
+
+That's it — the config is wired up automatically. See `.env.example` for all provider examples.
 
 ### 2. Start everything
 
 ```bash
-docker compose up
+docker compose up -d
 ```
 
 ### 3. Open the UIs
@@ -32,17 +46,25 @@ docker compose up
 
 **LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "Aura".
 
+> **Tip:** Check startup progress with `docker compose logs -f aura`.
+
 ## Customize Your Agent
 
-Edit `config.toml` in this directory, then restart:
+Edit `config.toml` to change agent behavior, add tools, or enable RAG.
+Edit `.env` to switch LLM providers. Then apply changes:
 
 ```bash
-docker compose restart aura
+docker compose up -d        # picks up .env changes and recreates if needed
 ```
+
+> **Note:** `docker compose restart aura` is fine for `config.toml`-only changes, but
+> `.env` changes require `docker compose up -d` to take effect.
 
 ### Switch LLM provider
 
-Uncomment the Anthropic or Ollama block in `config.toml` and set the matching API key in `.env`.
+Update `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY` in `.env`, then `docker compose up -d`.
+
+For **Ollama**, also uncomment the `base_url` and `fallback_tool_parsing` lines in `config.toml` and set `LLM_BASE_URL` in `.env`.
 
 ### Add MCP tool servers
 
