@@ -1,0 +1,129 @@
+# Aura Orchestration Quickstart — Math MCP
+#
+# Orchestration mode routes requests through a coordinator agent that
+# decomposes problems into tasks and dispatches them to specialized workers.
+# Each worker has access to a filtered subset of MCP tools.
+#
+# This config connects to the math-mcp service defined in docker-compose.yml.
+# For all available options, see: examples/reference.toml
+
+# ── LLM Provider ────────────────────────────────────────────────────
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.4-mini"
+
+# Anthropic:
+# provider = "anthropic"
+# api_key = "{{ env.ANTHROPIC_API_KEY }}"
+# model = "claude-sonnet-4-20250514"
+
+# ── Agent (Coordinator) ─────────────────────────────────────────────
+# In orchestration mode the [agent] system_prompt is given to the
+# coordinator. It provides routing guidance and domain context.
+
+[agent]
+name = "Math Orchestrator"
+system_prompt = """
+You are a math assistant coordinator. You decompose math problems into
+specialized tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Simple single-operation arithmetic (e.g., "What is 2+2?"): answer directly
+- Multi-step calculations or mixed domains: create a plan with workers
+- Vague or ambiguous requests: ask for clarification
+
+IMPORTANT: Always delegate calculations to workers — do not compute results yourself.
+"""
+turn_depth = 5
+
+# ── MCP Tool Server ──────────────────────────────────────────────────
+# Points at the math-mcp container defined in docker-compose.yml.
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.math]
+transport = "http_streamable"
+url = "http://math-mcp:8081/mcp"
+headers = {}
+description = "Math MCP server providing arithmetic, statistics, and trigonometry tools"
+
+# ── Orchestration ───────────────────────────────────────────────────
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+quality_threshold = 0.7
+allow_direct_answers = true
+allow_clarification = true
+tools_in_planning = "summary"
+
+[orchestration.timeouts]
+per_call_timeout_secs = 60
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-orchestration"
+
+# Worker: arithmetic
+# Handles basic arithmetic operations using the math MCP tools.
+
+[orchestration.worker.arithmetic]
+description = "Basic arithmetic: addition, subtraction, multiplication, division, modulo, rounding"
+turn_depth = 5
+mcp_filter = ["add", "subtract", "multiply", "division", "modulo", "floor", "ceiling", "round", "sum"]
+preamble = """
+You are an Arithmetic Specialist completing one assigned task.
+
+Use your math tools for every calculation — do not compute results in your head.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Multiply 20 by 3
+→ Call multiply(firstNumber=20, secondNumber=3)
+→ Tool returns: 60
+→ Result: 60
+"""
+
+# Worker: statistics
+# Handles statistical analysis using the math MCP tools.
+
+[orchestration.worker.statistics]
+description = "Statistical analysis: mean, median, mode, min, max"
+turn_depth = 5
+mcp_filter = ["mean", "median", "mode", "min", "max"]
+preamble = """
+You are a Statistics Specialist completing one assigned task.
+
+Use your statistical tools for analysis — do not compute statistics manually.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Compute the mean of [1, 2, 3]
+→ Call mean(numbers=[1, 2, 3])
+→ Tool returns: 2.0
+→ Result: 2.0
+"""
+
+# Worker: trigonometry
+# Handles trigonometric calculations using the math MCP tools.
+
+[orchestration.worker.trigonometry]
+description = "Trigonometric functions and angle conversions"
+turn_depth = 5
+mcp_filter = ["sin", "cos", "tan", "arcsin", "arccos", "arctan", "radiansToDegrees", "degreesToRadians"]
+preamble = """
+You are a Trigonometry Specialist completing one assigned task.
+
+Use your trig tools for all calculations — do not compute results manually.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Compute sin(45°)
+→ Call degreesToRadians(degrees=45)
+→ Tool returns: 0.7853981633974483
+→ Call sin(radians=0.7853981633974483)
+→ Tool returns: 0.7071067811865476
+→ Result: 0.7071067811865476
+"""
