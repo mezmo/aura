@@ -109,6 +109,10 @@ pub mod config {
         /// Enable fallback tool call parsing for Ollama models.
         /// When true, text content that looks like tool calls will be parsed and executed.
         pub fallback_tool_parsing: bool,
+        /// Whether the request includes client-side tool definitions.
+        /// When true, passthrough tool results are suppressed and
+        /// `finish_reason: "tool_calls"` is used instead of `"stop"`.
+        pub has_client_tools: bool,
     }
 
     impl StreamConfig {
@@ -124,12 +128,19 @@ pub mod config {
                 tool_result_mode,
                 tool_result_max_length,
                 fallback_tool_parsing: false,
+                has_client_tools: false,
             }
         }
 
         /// Enable fallback tool call parsing (for Ollama models).
         pub fn with_fallback_tool_parsing(mut self, enabled: bool) -> Self {
             self.fallback_tool_parsing = enabled;
+            self
+        }
+
+        /// Set whether the request includes client-side tool definitions.
+        pub fn with_client_tools(mut self, has_client_tools: bool) -> Self {
+            self.has_client_tools = has_client_tools;
             self
         }
     }
@@ -152,6 +163,8 @@ pub mod context {
     pub const FINISH_REASON_STOP: &str = "stop";
     /// OpenAI finish_reason: hit max_tokens limit.
     pub const FINISH_REASON_LENGTH: &str = "length";
+    /// OpenAI finish_reason: model wants client to execute tool calls.
+    pub const FINISH_REASON_TOOL_CALLS: &str = "tool_calls";
 
     /// Immutable context for a single streaming turn (created once per request).
     #[derive(Clone)]
@@ -197,6 +210,8 @@ pub mod context {
         pub accumulated_content: String,
         /// Stream error captured for OTel span recording.
         pub stream_error: Option<String>,
+        /// Whether any passthrough (client-side) tool calls were detected in this turn.
+        pub has_passthrough_tool_calls: bool,
     }
 
     impl TurnState {
@@ -212,7 +227,8 @@ pub mod context {
 // Re-export for convenience
 pub use config::{StreamConfig, ToolResultMode};
 pub use context::{
-    CHUNK_OBJECT, FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, TurnContext, TurnState,
+    CHUNK_OBJECT, FINISH_REASON_LENGTH, FINISH_REASON_STOP, FINISH_REASON_TOOL_CALLS,
+    FUNCTION_TYPE, TurnContext, TurnState,
 };
 pub use openai::{
     ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta, FunctionCallChunk,
