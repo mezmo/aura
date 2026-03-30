@@ -213,7 +213,7 @@ impl ExecutionPersistence {
     pub fn disabled() -> Self {
         Self {
             base_path: PathBuf::new(),
-            run_id: String::new(),
+            run_id: uuid::Uuid::new_v4().to_string(),
             session_id: None,
             current_iteration: 0,
             enabled: false,

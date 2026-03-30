@@ -412,7 +412,7 @@ impl Orchestrator {
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
         tracing::info!(
             "Orchestrator initialized (run={}, max_planning_cycles={}, quality_threshold={:.2}, per_call_timeout={}s, default_turn_depth={}, max_plan_parse_retries={})",
-            &run_id_str[..8],
+            run_id_str.get(..8).unwrap_or(&run_id_str),
             orchestration_config.max_planning_cycles,
             orchestration_config.quality_threshold,
             orchestration_config.per_call_timeout_secs(),
