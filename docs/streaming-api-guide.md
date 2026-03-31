@@ -222,7 +222,7 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 ```
 User query received
        ↓
-plan_created          ← goal, task_count, routing_rationale
+plan_created          ← goal, task_count, routing_mode, routing_rationale
        ↓
 phase_started         ← Dependency wave begins (phase_id, label)
        ↓
@@ -241,7 +241,7 @@ phase_completed       ← Wave done (continuation: "continue" or "replan")
 synthesizing          ← Coordinator merging results (iteration)
        ↓
 iteration_complete    ← Quality scored (quality_score, quality_threshold,
-                         will_replan, reasoning, gaps)
+                         will_replan, evaluation_skipped, reasoning, gaps)
        ↓
 If will_replan:
   replan_started      ← trigger: "quality" | "failure" | "phase_continuation"
@@ -256,8 +256,12 @@ If will_replan:
 **Plan created** (coordinator decomposed query into tasks):
 ```
 event: aura.orchestrator.plan_created
-data: {"goal":"Calculate (3+7)*2 and list files","task_count":2,"routing_rationale":"Multi-step: arithmetic + file listing","agent_id":"coordinator","session_id":"sess_xyz"}
+data: {"goal":"Calculate (3+7)*2 and list files","task_count":2,"routing_mode":"orchestrated","routing_rationale":"Multi-step: arithmetic + file listing","agent_id":"coordinator","session_id":"sess_xyz"}
 ```
+
+The `routing_mode` field indicates how the coordinator routed the query:
+- `"routed"` — classified to a single worker (no synthesis/evaluation)
+- `"orchestrated"` — multi-task DAG with synthesis + evaluation
 
 **Task started** (worker begins execution):
 ```
@@ -282,8 +286,10 @@ Worker reasoning is also emitted as `aura.reasoning` with `agent_id` set to the 
 **Iteration complete** (quality evaluation with replan decision):
 ```
 event: aura.orchestrator.iteration_complete
-data: {"iteration":1,"quality_score":0.85,"quality_threshold":0.7,"will_replan":false,"reasoning":"Response is complete and accurate","gaps":[],"agent_id":"coordinator","session_id":"sess_xyz"}
+data: {"iteration":1,"quality_score":0.85,"quality_threshold":0.7,"will_replan":false,"evaluation_skipped":false,"reasoning":"Response is complete and accurate","gaps":[],"agent_id":"coordinator","session_id":"sess_xyz"}
 ```
+
+The `evaluation_skipped` field is `true` when a single-task plan completes successfully — the quality evaluation LLM call is skipped and `quality_score` defaults to `1.0`.
 
 **Replan started** (new planning cycle triggered):
 ```

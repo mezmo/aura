@@ -6,6 +6,38 @@
 //! This separation keeps orchestration-specific types isolated from the base
 //! aura streaming infrastructure.
 
+use serde::{Deserialize, Serialize};
+
+/// How the coordinator routed a query that produced a plan.
+///
+/// Provides a machine-readable signal in `plan_created` SSE events and
+/// `RunManifest` persistence so clients can distinguish single-worker
+/// classification from full orchestration without parsing text fields.
+///
+/// Direct answers and clarifications have their own event types
+/// (`aura.orchestrator.direct_answer`, `aura.orchestrator.clarification_needed`)
+/// and never produce a `PlanCreated` event, so they are not represented here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    /// Coordinator classified query to a single worker.
+    /// Synthesis and evaluation are skipped.
+    Routed,
+    /// Full orchestration — multi-task DAG with synthesis + evaluation.
+    Orchestrated,
+}
+
+impl RoutingMode {
+    /// Derive routing mode from the number of tasks in a plan.
+    pub fn for_plan(task_count: usize) -> Self {
+        if task_count == 1 {
+            Self::Routed
+        } else {
+            Self::Orchestrated
+        }
+    }
+}
+
 /// Events emitted by the orchestrator during execution.
 ///
 /// These are internal events that flow through the stream and are converted
@@ -18,6 +50,8 @@ pub enum OrchestratorEvent {
         goal: String,
         /// Number of tasks in the plan
         task_count: usize,
+        /// How the coordinator routed this query
+        routing_mode: RoutingMode,
         /// Why the coordinator chose orchestration
         routing_rationale: String,
         /// The coordinator's planning response text (truncated to Option in SSE)
@@ -78,6 +112,8 @@ pub enum OrchestratorEvent {
         quality_threshold: f32,
         /// Whether the orchestrator will replan after this iteration
         will_replan: bool,
+        /// Whether evaluation was skipped (single-task plans)
+        evaluation_skipped: bool,
         /// Evaluator's reasoning about quality
         reasoning: String,
         /// Identified gaps or missing elements

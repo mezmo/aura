@@ -21,6 +21,7 @@
 //! 1. Keep orchestration evolution isolated from base aura streaming
 //! 2. Allow different serialization or handling if needed
 
+use crate::orchestration::events::RoutingMode;
 use crate::orchestration::types::PhaseContinuation;
 use crate::stream_events::{AgentContext, CorrelationContext};
 use serde::Serialize;
@@ -71,6 +72,7 @@ pub enum OrchestrationStreamEvent {
     PlanCreated {
         goal: String,
         task_count: usize,
+        routing_mode: RoutingMode,
         routing_rationale: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         planning_response: Option<String>,
@@ -120,6 +122,7 @@ pub enum OrchestrationStreamEvent {
         quality_score: f32,
         quality_threshold: f32,
         will_replan: bool,
+        evaluation_skipped: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -224,6 +227,7 @@ impl OrchestrationStreamEvent {
     pub fn plan_created(
         goal: impl Into<String>,
         task_count: usize,
+        routing_mode: RoutingMode,
         routing_rationale: impl Into<String>,
         planning_response: Option<String>,
         context: EventContext,
@@ -231,6 +235,7 @@ impl OrchestrationStreamEvent {
         Self::PlanCreated {
             goal: goal.into(),
             task_count,
+            routing_mode,
             routing_rationale: routing_rationale.into(),
             planning_response,
             context,
@@ -310,6 +315,7 @@ impl OrchestrationStreamEvent {
         quality_score: f32,
         quality_threshold: f32,
         will_replan: bool,
+        evaluation_skipped: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
         context: EventContext,
@@ -319,6 +325,7 @@ impl OrchestrationStreamEvent {
             quality_score,
             quality_threshold,
             will_replan,
+            evaluation_skipped,
             reasoning,
             gaps,
             context,
@@ -445,8 +452,15 @@ mod tests {
         let ctx = test_ctx();
 
         assert_eq!(
-            OrchestrationStreamEvent::plan_created("goal", 3, "test rationale", None, ctx.clone())
-                .event_name(),
+            OrchestrationStreamEvent::plan_created(
+                "goal",
+                3,
+                RoutingMode::Orchestrated,
+                "test rationale",
+                None,
+                ctx.clone()
+            )
+            .event_name(),
             event_names::PLAN_CREATED
         );
 
@@ -484,6 +498,7 @@ mod tests {
         let event = OrchestrationStreamEvent::plan_created(
             "test goal",
             2,
+            RoutingMode::Orchestrated,
             "test rationale",
             Some("coordinator response text".to_string()),
             test_ctx(),
@@ -493,17 +508,58 @@ mod tests {
         assert!(sse.starts_with(&format!("event: {}\n", event_names::PLAN_CREATED)));
         assert!(sse.contains("\"goal\":\"test goal\""));
         assert!(sse.contains("\"task_count\":2"));
+        assert!(sse.contains("\"routing_mode\":\"orchestrated\""));
         assert!(sse.contains("\"routing_rationale\":\"test rationale\""));
         assert!(sse.contains("\"planning_response\":\"coordinator response text\""));
     }
 
     #[test]
+    fn test_format_sse_plan_created_routed() {
+        let event = OrchestrationStreamEvent::plan_created(
+            "simple math",
+            1,
+            RoutingMode::Routed,
+            "single worker",
+            None,
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.contains("\"routing_mode\":\"routed\""));
+        assert!(!sse.contains("planning_response"));
+    }
+
+    #[test]
     fn test_format_sse_plan_created_without_response() {
-        let event =
-            OrchestrationStreamEvent::plan_created("goal", 1, "rationale", None, test_ctx());
+        let event = OrchestrationStreamEvent::plan_created(
+            "goal",
+            1,
+            RoutingMode::Routed,
+            "rationale",
+            None,
+            test_ctx(),
+        );
         let sse = event.format_sse();
 
         assert!(!sse.contains("planning_response"));
+    }
+
+    #[test]
+    fn test_format_sse_iteration_complete_with_evaluation_skipped() {
+        let event = OrchestrationStreamEvent::iteration_complete(
+            1,
+            1.0,
+            0.7,
+            false,
+            true,
+            Some("Single-task plan completed successfully".to_string()),
+            vec![],
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.contains("\"evaluation_skipped\":true"));
+        assert!(sse.contains("\"quality_score\":1.0"));
     }
 
     #[test]
