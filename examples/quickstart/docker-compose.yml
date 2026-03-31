@@ -20,6 +20,10 @@ services:
       # Optional: Mezmo
       MEZMO_API_KEY: "${MEZMO_API_KEY:-}"
 
+      # Optional: GitHub MCP server
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN:-}"
+
       # Streaming — custom events disabled because LibreChat's SSE
       # parser doesn't skip unknown event types (aura.session_info, etc.)
       AURA_CUSTOM_EVENTS: "false"
@@ -78,6 +82,20 @@ services:
     restart: unless-stopped
     networks:
       - aura-quickstart
+
+  # ── GitHub MCP Server (optional, use if not using hosted MCP) ─────
+  # github-mcp:
+  #   image: ghcr.io/github/github-mcp-server:v0.32.0
+  #   container_name: aura-qs-github-mcp
+  #   command: ["http", "--port", "8082"]
+  #   ports:
+  #     - "8082:8082"
+  #   environment:
+  #     GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN:-}"
+  #     GITHUB_TOOLS: "get_file_contents,create_branch,create_or_update_file,create_pull_request"
+  #   restart: unless-stopped
+  #   networks:
+  #     - aura-quickstart
 
   # ── Phoenix (LLM Trace Viewer) ─────────────────────────────────────
   phoenix:
