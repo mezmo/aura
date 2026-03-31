@@ -57,7 +57,7 @@ mod types;
 pub use config::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
-pub use events::OrchestratorEvent;
+pub use events::{OrchestratorEvent, RoutingMode};
 pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
 pub use persistence::{

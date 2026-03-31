@@ -923,18 +923,21 @@ fn handle_orchestrator_event(
         OrchestratorEvent::PlanCreated {
             goal,
             task_count,
+            routing_mode,
             routing_rationale,
             planning_response,
         } => {
             tracing::info!(
-                "Orchestrator: plan created with {} tasks for goal: {} (rationale: {})",
+                "Orchestrator: plan created with {} tasks for goal: {} (routing={:?}, rationale: {})",
                 task_count,
                 goal,
+                routing_mode,
                 routing_rationale
             );
             OrchestrationStreamEvent::plan_created(
                 goal,
                 *task_count,
+                routing_mode.clone(),
                 routing_rationale,
                 maybe_truncate(planning_response, config.tool_result_max_length),
                 ectx,
@@ -1011,21 +1014,24 @@ fn handle_orchestrator_event(
             quality_score,
             quality_threshold,
             will_replan,
+            evaluation_skipped,
             reasoning,
             gaps,
         } => {
             tracing::info!(
-                "Orchestrator: iteration {} complete (quality={:.2}, threshold={:.2}, will_replan={})",
+                "Orchestrator: iteration {} complete (quality={:.2}, threshold={:.2}, will_replan={}, eval_skipped={})",
                 iteration,
                 quality_score,
                 quality_threshold,
-                will_replan
+                will_replan,
+                evaluation_skipped
             );
             OrchestrationStreamEvent::iteration_complete(
                 *iteration,
                 *quality_score,
                 *quality_threshold,
                 *will_replan,
+                *evaluation_skipped,
                 maybe_truncate(reasoning, config.tool_result_max_length),
                 gaps.clone(),
                 ectx,

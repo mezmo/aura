@@ -34,6 +34,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+use super::events::RoutingMode;
 use super::types::{Plan, TaskStatus};
 
 // ============================================================================
@@ -61,6 +62,9 @@ pub struct RunManifest {
     pub iterations: usize,
     /// Final quality evaluation score (if evaluation ran).
     pub quality_score: Option<f32>,
+    /// How the coordinator routed this query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_mode: Option<RoutingMode>,
     /// Summary of each task in the plan.
     pub task_summaries: Vec<TaskSummary>,
     /// Relative paths to large artifact files.
@@ -881,6 +885,7 @@ mod tests {
             status: RunStatus::Success,
             iterations: 2,
             quality_score: Some(0.95),
+            routing_mode: Some(RoutingMode::Orchestrated),
             task_summaries: vec![
                 TaskSummary {
                     task_id: 0,
@@ -929,6 +934,7 @@ mod tests {
             status: RunStatus::PartialSuccess,
             iterations: 1,
             quality_score: Some(0.6),
+            routing_mode: Some(RoutingMode::Routed),
             task_summaries: vec![],
             artifact_paths: vec![],
         };
@@ -954,6 +960,7 @@ mod tests {
             status: RunStatus::Failed,
             iterations: 0,
             quality_score: None,
+            routing_mode: None,
             task_summaries: vec![],
             artifact_paths: vec![],
         };
@@ -987,6 +994,7 @@ mod tests {
             status: RunStatus::Success,
             iterations: 1,
             quality_score: Some(0.95),
+            routing_mode: Some(RoutingMode::Routed),
             task_summaries: vec![TaskSummary {
                 task_id: 0,
                 description: "Compute mean".to_string(),
@@ -1190,6 +1198,7 @@ mod tests {
             status: RunStatus::Failed,
             iterations: 1,
             quality_score: Some(0.3),
+            routing_mode: Some(RoutingMode::Orchestrated),
             task_summaries: vec![TaskSummary {
                 task_id: 0,
                 description: "Bad task".to_string(),

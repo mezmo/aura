@@ -87,8 +87,28 @@ def parse_sse_file(path: Path) -> dict:
     for e in events:
         event_counts[e] += 1
 
-    # Plan created?
+    # Plan created? Extract routing_mode from first plan_created event.
     planned = "aura.orchestrator.plan_created" in event_counts
+    routing_mode = None
+    routing_rationale = None
+    for event_name, data in event_data_pairs:
+        if event_name == "aura.orchestrator.plan_created" and data:
+            try:
+                payload = json.loads(data)
+                routing_mode = payload.get("routing_mode")
+                routing_rationale = payload.get("routing_rationale")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            break
+        # Also capture rationale from direct_answer / clarification_needed
+        if event_name in ("aura.orchestrator.direct_answer",
+                          "aura.orchestrator.clarification_needed") and data:
+            try:
+                payload = json.loads(data)
+                routing_rationale = payload.get("routing_rationale")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            break
 
     # Tasks started/completed
     tasks_started = event_counts.get("aura.orchestrator.task_started", 0)
@@ -141,6 +161,7 @@ def parse_sse_file(path: Path) -> dict:
                     "quality_score": payload.get("quality_score"),
                     "quality_threshold": payload.get("quality_threshold"),
                     "will_replan": payload.get("will_replan", False),
+                    "evaluation_skipped": payload.get("evaluation_skipped", False),
                     "gaps": payload.get("gaps", []),
                 })
             except (json.JSONDecodeError, TypeError):
@@ -160,6 +181,8 @@ def parse_sse_file(path: Path) -> dict:
         "completed": completed,
         "timeout": timeout,
         "planned": planned,
+        "routing_mode": routing_mode,
+        "routing_rationale": routing_rationale,
         "tasks_started": tasks_started,
         "tasks_completed": tasks_completed,
         "reasoning_total": reasoning_total,
@@ -171,6 +194,11 @@ def parse_sse_file(path: Path) -> dict:
         "replans": replans,
         "iterations": iterations,
     }
+
+
+def effective_routing_mode(record: dict) -> str:
+    """Return routing_mode from SSE data, falling back to planned flag for old captures."""
+    return record.get("routing_mode") or ("plan" if record.get("planned") else "direct")
 
 
 def collect_results(results_dir: Path) -> list[dict]:
@@ -296,8 +324,8 @@ def print_summary(rows: list[dict]):
 
     # ── Model-level summary ─────────────────────────────────────────
     print(f"{'Model':<20} {'Avg ms':>8} {'Med ms':>8} {'P95 ms':>8} "
-          f"{'Tools':>6} {'Dupes':>6} {'Tasks':>6} {'TOs':>4} {'Done':>8}")
-    print("-" * 86)
+          f"{'Tools':>6} {'Dupes':>6} {'Tasks':>6} {'TOs':>4} {'Done':>8} {'Route':>10}")
+    print("-" * 98)
 
     for model in models:
         mr = [r for r in rows if r["model"] == model]
@@ -311,15 +339,21 @@ def print_summary(rows: list[dict]):
         tasks = sum(r["tasks_completed"] for r in mr)
         tos = sum(1 for r in mr if r["timeout"])
         done = sum(1 for r in mr if r["completed"])
+        # Routing mode distribution
+        route_counts = defaultdict(int)
+        for r in mr:
+            rm = effective_routing_mode(r)
+            route_counts[rm] += 1
+        route_str = "/".join(f"{c}{k[0].upper()}" for k, c in sorted(route_counts.items()))
         print(f"{model:<20} {avg:>8} {med:>8} {p95:>8} "
-              f"{tools:>6} {dupes:>6} {tasks:>6} {tos:>4} {done:>5}/{n}")
+              f"{tools:>6} {dupes:>6} {tasks:>6} {tos:>4} {done:>5}/{n} {route_str:>10}")
 
     print()
 
     # ── Per-prompt breakdown ────────────────────────────────────────
-    print(f"{'Model':<20} {'Prompt':<22} {'Avg ms':>8} {'Tools':>6} "
+    print(f"{'Model':<20} {'Prompt':<22} {'Route':<12} {'Avg ms':>8} {'Tools':>6} "
           f"{'Dupes':>6} {'Tasks':>6} {'TOs':>4} {'OK':>6}")
-    print("-" * 82)
+    print("-" * 96)
     for model in models:
         for prompt in prompts:
             pr = [r for r in rows if r["model"] == model and r["prompt"] == prompt]
@@ -332,10 +366,55 @@ def print_summary(rows: list[dict]):
             tasks = sum(r["tasks_completed"] for r in pr)
             to = sum(1 for r in pr if r["timeout"])
             ok = sum(1 for r in pr if r["completed"])
+            # Most common routing mode for this prompt
+            route = effective_routing_mode(pr[0])
             flag = " ⚠ LOOP" if dupes > 0 else ""
-            print(f"{model:<20} {prompt:<22} {avg:>8} {tools:>6} "
+            print(f"{model:<20} {prompt:<22} {route:<12} {avg:>8} {tools:>6} "
                   f"{dupes:>6} {tasks:>6} {to:>4} {ok:>4}/{len(pr)}{flag}")
         print()
+
+    # ── Routing rationale breakdown ─────────────────────────────
+    has_rationale = any(r.get("routing_rationale") for r in rows)
+    if has_rationale:
+        print(f"{'Model':<20} {'Prompt':<22} {'Route':<12} Rationale")
+        print("-" * 100)
+        for model in models:
+            for prompt in prompts:
+                pr = [r for r in rows if r["model"] == model and r["prompt"] == prompt]
+                if not pr:
+                    continue
+                route = effective_routing_mode(pr[0])
+                # Show first iteration's rationale (truncated)
+                rationale = pr[0].get("routing_rationale") or ""
+                if len(rationale) > 60:
+                    rationale = rationale[:57] + "..."
+                print(f"{model:<20} {prompt:<22} {route:<12} {rationale}")
+            print()
+
+    # ── Routing consistency (flag non-deterministic routing) ──────
+    # For each (model, prompt), check if routing_mode is the same across all iterations.
+    inconsistencies = []
+    for model in models:
+        for prompt in prompts:
+            pr = [r for r in rows if r["model"] == model and r["prompt"] == prompt]
+            if len(pr) < 2:
+                continue
+            routes = [effective_routing_mode(r) for r in pr]
+            unique = set(routes)
+            if len(unique) > 1:
+                counts = {u: routes.count(u) for u in sorted(unique)}
+                inconsistencies.append((model, prompt, counts))
+
+    if inconsistencies:
+        print(f"Routing Consistency: {len(inconsistencies)} INCONSISTENCY(S)\n")
+        print(f"{'Model':<20} {'Prompt':<22} Distribution")
+        print("-" * 70)
+        for model, prompt, counts in inconsistencies:
+            dist = ", ".join(f"{v}x {k}" for k, v in sorted(counts.items()))
+            print(f"{model:<20} {prompt:<22} {dist}")
+        print()
+    else:
+        print("Routing Consistency: STABLE — all models route consistently across iterations\n")
 
     # ── Per-worker tool call breakdown ────────────────────────────
     has_worker_data = any(r.get("tools_by_worker") for r in rows)
@@ -408,8 +487,8 @@ def print_summary(rows: list[dict]):
     # ── Replan summary (only if any replans occurred) ──────────────
     has_replans = any(r.get("replan_count", 0) > 0 for r in rows)
     if has_replans:
-        print(f"{'Model':<20} {'Prompt':<22} {'Replans':>8} {'Triggers':<30} {'Last Q':>8}")
-        print("-" * 92)
+        print(f"{'Model':<20} {'Prompt':<22} {'Replans':>8} {'Triggers':<30} {'Last Q':>8} {'EvalSkip':>9}")
+        print("-" * 102)
         for model in models:
             for prompt in prompts:
                 pr = [r for r in rows if r["model"] == model and r["prompt"] == prompt]
@@ -424,13 +503,17 @@ def print_summary(rows: list[dict]):
                     for t, c in r.get("replan_triggers", {}).items():
                         triggers[t] += c
                 trigger_str = ", ".join(f"{c}x {t}" for t, c in sorted(triggers.items()))
-                # Last quality score from iterations
+                # Last quality score and eval_skipped from iterations
                 last_q = ""
+                eval_skipped = False
                 for r in pr:
                     for it in r.get("iterations", []):
                         if it.get("quality_score") is not None:
                             last_q = f"{it['quality_score']:.2f}"
-                print(f"{model:<20} {prompt:<22} {total_replans:>8} {trigger_str:<30} {last_q:>8}")
+                        if it.get("evaluation_skipped"):
+                            eval_skipped = True
+                skip_str = "yes" if eval_skipped else "no"
+                print(f"{model:<20} {prompt:<22} {total_replans:>8} {trigger_str:<30} {last_q:>8} {skip_str:>9}")
             print()
     else:
         print("Replans: none detected\n")
@@ -472,7 +555,7 @@ def write_csv(rows: list[dict], results_dir: Path):
         "tasks_started", "tasks_completed",
         "reasoning_total", *phase_cols,
         "replan_count",
-        "completed", "timeout", "planned",
+        "completed", "timeout", "planned", "routing_mode", "routing_rationale",
     ]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
