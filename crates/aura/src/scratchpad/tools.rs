@@ -1,10 +1,12 @@
 //! Scratchpad exploration tools.
 //!
-//! Six read-only tools that let the LLM selectively explore large
-//! tool outputs stored on disk, rather than loading everything into context.
+//! Tools that let the LLM selectively explore large tool outputs stored on disk, rather
+//! than loading everything into context.
 
 use super::context_budget::ContextBudget;
-use super::schema::{analyze_json_structure, format_schema};
+use super::schema::{
+    analyze_json_structure, analyze_markdown_structure, format_markdown_schema, format_schema,
+};
 use super::storage::ScratchpadStorage;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
@@ -34,6 +36,35 @@ pub enum ScratchpadToolError {
 // Shared Helpers
 // ============================================================================
 
+/// Max lines of a string value to include inline in `iterate_over` results.
+/// Strings longer than this are truncated with a preview and a `get_in` hint.
+const ITERATE_OVER_STRING_PREVIEW_LINES: usize = 5;
+
+/// Truncate a large string value for `iterate_over`, keeping a preview of the
+/// first few lines and appending a hint to use `get_in` for the full content.
+/// Non-string values are returned as-is.
+fn truncate_large_string(
+    val: &serde_json::Value,
+    max_lines: usize,
+    array_path: &str,
+    item_index: usize,
+    field: &str,
+) -> serde_json::Value {
+    let Some(s) = val.as_str() else {
+        return val.clone();
+    };
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= max_lines {
+        return val.clone();
+    }
+    let preview = lines[..max_lines].join("\n");
+    let hint = format!(
+        "{preview}\n...[truncated, {} total lines — use get_in(file, '{array_path}.{item_index}.{field}') for full content]",
+        lines.len(),
+    );
+    serde_json::Value::String(hint)
+}
+
 /// Add 1-indexed line numbers to content.
 fn add_line_numbers(content: &str) -> String {
     content
@@ -48,7 +79,7 @@ fn add_line_numbers(content: &str) -> String {
 fn build_metadata(lines: usize, content: &str, budget: &ContextBudget) -> serde_json::Value {
     json!({
         "lines": lines,
-        "estimated_tokens": ContextBudget::estimate_tokens(content),
+        "estimated_tokens": budget.count_tokens(content),
         "window_hint": budget.window_hint()
     })
 }
@@ -66,19 +97,67 @@ async fn read_scratchpad_file(
         .map_err(ScratchpadToolError::Io)
 }
 
+/// Format a BudgetCheckError into a JSON string suitable for tool output.
+fn format_budget_error(
+    error: BudgetCheckError,
+    error_code: &str,
+    extra_fields: serde_json::Value,
+) -> String {
+    let mut obj = match error {
+        BudgetCheckError::ExtractionLimit(e) => json!({
+            "error": error_code,
+            "message": e.to_string(),
+            "estimated_tokens": e.estimated_tokens,
+            "per_call_limit": e.limit,
+        }),
+        BudgetCheckError::BudgetExceeded(e) => json!({
+            "error": error_code,
+            "message": format!(
+                "Too large for remaining context (~{} tokens requested, ~{} remaining). Narrow your request.",
+                e.requested_tokens, e.remaining_tokens
+            ),
+            "estimated_tokens": e.requested_tokens,
+            "remaining_budget_tokens": e.remaining_tokens,
+        }),
+    };
+    // Merge extra fields
+    if let (Some(obj_map), Some(extra_map)) = (obj.as_object_mut(), extra_fields.as_object()) {
+        for (k, v) in extra_map {
+            obj_map.insert(k.clone(), v.clone());
+        }
+    }
+    obj.to_string()
+}
+
+/// Result of a budget check — either Ok or one of two exceeded variants.
+enum BudgetCheckError {
+    ExtractionLimit(super::context_budget::ExtractionLimitExceeded),
+    BudgetExceeded(super::context_budget::BudgetExceeded),
+}
+
 /// Check budget and record usage. Returns `Ok(())` if within budget,
-/// or `Err(BudgetExceeded)` with token details for the caller to format.
-fn check_and_record_budget(
-    budget: &ContextBudget,
-    content: &str,
-) -> Result<(), super::context_budget::BudgetExceeded> {
+/// or `Err` with details for the caller to format.
+fn check_and_record_budget(budget: &ContextBudget, content: &str) -> Result<(), BudgetCheckError> {
+    // Per-call extraction limit check first
+    if let Some(limit) = budget.max_extraction_tokens() {
+        let tokens = budget.count_tokens(content);
+        if tokens > limit {
+            return Err(BudgetCheckError::ExtractionLimit(
+                super::context_budget::ExtractionLimitExceeded {
+                    estimated_tokens: tokens,
+                    limit,
+                },
+            ));
+        }
+    }
+    // Cumulative budget check
     match budget.check_fits(content) {
         Ok(tokens) => {
             budget.record_usage(tokens);
-            budget.record_extracted(content.len());
+            budget.record_extracted(tokens);
             Ok(())
         }
-        Err(e) => Err(e),
+        Err(e) => Err(BudgetCheckError::BudgetExceeded(e)),
     }
 }
 
@@ -96,28 +175,10 @@ impl HeadTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct HeadArgs {
-    pub file: String,
-    #[serde(default = "default_head_lines")]
-    pub lines: usize,
-}
-
-fn default_head_lines() -> usize {
-    50
-}
-
-impl Tool for HeadTool {
-    const NAME: &'static str = "head";
-    type Error = ScratchpadToolError;
-    type Args = HeadArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "head".to_string(),
             description: "Read the first N lines of a scratchpad file. Use this to preview \
                           large tool outputs before deciding what to extract."
                 .to_string(),
@@ -139,6 +200,29 @@ impl Tool for HeadTool {
             }),
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct HeadArgs {
+    pub file: String,
+    #[serde(default = "default_head_lines")]
+    pub lines: usize,
+}
+
+fn default_head_lines() -> usize {
+    50
+}
+
+impl Tool for HeadTool {
+    const NAME: &'static str = "head";
+    type Error = ScratchpadToolError;
+    type Args = HeadArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
+    }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::debug!("scratchpad head: file={}, lines={}", args.file, args.lines);
@@ -150,25 +234,19 @@ impl Tool for HeadTool {
             .join("\n");
         let total_lines = content.lines().count();
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &selected) {
-            return Ok(json!({
-                "error": "head_too_large",
-                "message": format!(
-                    "The head of this file is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "requested_lines": args.lines,
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    format!("Try a smaller number of lines: head(file, {})",
-                        (exceeded.remaining_tokens * 4).min(args.lines / 2).max(10)),
-                    "Use grep to find specific lines first",
-                    "Use get_in to extract a specific key if it's structured data"
-                ]
-            })
-            .to_string());
+        if let Err(e) = check_and_record_budget(&self.budget, &selected) {
+            return Ok(format_budget_error(
+                e,
+                "head_too_large",
+                json!({
+                    "requested_lines": args.lines,
+                    "suggestions": [
+                        format!("Try a smaller number of lines: head(file, {})", args.lines / 2),
+                        "Use grep to find specific lines first",
+                        "Use get_in to extract a specific key if it's structured data"
+                    ]
+                }),
+            ));
         }
 
         let numbered = add_line_numbers(&selected);
@@ -197,26 +275,10 @@ impl SliceTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct SliceArgs {
-    pub file: String,
-    /// 1-indexed start line.
-    pub start: usize,
-    /// 1-indexed end line (inclusive).
-    pub end: usize,
-}
-
-impl Tool for SliceTool {
-    const NAME: &'static str = "slice";
-    type Error = ScratchpadToolError;
-    type Args = SliceArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "slice".to_string(),
             description: "Extract a range of lines (1-indexed, inclusive) from a scratchpad file."
                 .to_string(),
             parameters: json!({
@@ -240,6 +302,27 @@ impl Tool for SliceTool {
             }),
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct SliceArgs {
+    pub file: String,
+    /// 1-indexed start line.
+    pub start: usize,
+    /// 1-indexed end line (inclusive).
+    pub end: usize,
+}
+
+impl Tool for SliceTool {
+    const NAME: &'static str = "slice";
+    type Error = ScratchpadToolError;
+    type Args = SliceArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
+    }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         if args.start == 0 || args.end < args.start {
@@ -262,25 +345,20 @@ impl Tool for SliceTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &selected) {
-            let suggested_end = args.start + (exceeded.remaining_tokens * 4 / 80).max(1);
-            return Ok(json!({
-                "error": "slice_too_large",
-                "message": format!(
-                    "This slice is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "requested_lines": [args.start, args.end],
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    format!("Try a smaller range: slice(file, {}, {})", args.start, suggested_end),
-                    "Use grep to find specific lines first",
-                    "Use get_in to extract a specific key if it's structured data"
-                ]
-            })
-            .to_string());
+        if let Err(e) = check_and_record_budget(&self.budget, &selected) {
+            let suggested_end = args.start + (args.end - args.start) / 2;
+            return Ok(format_budget_error(
+                e,
+                "slice_too_large",
+                json!({
+                    "requested_lines": [args.start, args.end],
+                    "suggestions": [
+                        format!("Try a smaller range: slice(file, {}, {})", args.start, suggested_end),
+                        "Use grep to find specific lines first",
+                        "Use get_in to extract a specific key if it's structured data"
+                    ]
+                }),
+            ));
         }
 
         // Add line numbers starting from args.start
@@ -316,29 +394,10 @@ impl GrepTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct GrepArgs {
-    pub file: String,
-    pub pattern: String,
-    #[serde(default = "default_context_lines")]
-    pub context: usize,
-}
-
-fn default_context_lines() -> usize {
-    3
-}
-
-impl Tool for GrepTool {
-    const NAME: &'static str = "grep";
-    type Error = ScratchpadToolError;
-    type Args = GrepArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "grep".to_string(),
             description: "Search a scratchpad file with a regex pattern. Returns matching lines \
                           with surrounding context."
                 .to_string(),
@@ -363,6 +422,30 @@ impl Tool for GrepTool {
                 "additionalProperties": false
             }),
         }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct GrepArgs {
+    pub file: String,
+    pub pattern: String,
+    #[serde(default = "default_context_lines")]
+    pub context: usize,
+}
+
+fn default_context_lines() -> usize {
+    3
+}
+
+impl Tool for GrepTool {
+    const NAME: &'static str = "grep";
+    type Error = ScratchpadToolError;
+    type Args = GrepArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -416,24 +499,19 @@ impl Tool for GrepTool {
 
         let result = output_parts.join("\n---\n\n");
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &result) {
-            return Ok(json!({
-                "error": "grep_too_large",
-                "message": format!(
-                    "This grep result is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "requested_pattern": args.pattern,
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    format!("Try a more specific pattern: grep(file, '{}')", args.pattern),
-                    "Use head or slice to limit the number of lines first",
-                    "Use get_in to extract a specific key if it's structured data"
-                ]
-            })
-            .to_string());
+        if let Err(e) = check_and_record_budget(&self.budget, &result) {
+            return Ok(format_budget_error(
+                e,
+                "grep_too_large",
+                json!({
+                    "requested_pattern": args.pattern,
+                    "suggestions": [
+                        format!("Try a more specific pattern: grep(file, '{}')", args.pattern),
+                        "Use head or slice to limit the number of lines first",
+                        "Use get_in to extract a specific key if it's structured data"
+                    ]
+                }),
+            ));
         }
 
         let meta = build_metadata(result.lines().count(), &result, &self.budget);
@@ -481,6 +559,32 @@ impl SchemaTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
+
+    pub fn tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "schema".to_string(),
+            description: "Show the structure of a scratchpad file with line ranges. \
+                          Works on JSON (keys, types, arrays) and Markdown (sections, keys). \
+                          Helps you decide which parts to extract with slice or get_in."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Scratchpad filename (.json or .md)"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum depth to show (default: 4)",
+                        "default": 4
+                    }
+                },
+                "required": ["file"],
+                "additionalProperties": false
+            }),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -501,28 +605,8 @@ impl Tool for SchemaTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Show the JSON structure of a scratchpad file: keys, types, array \
-                          lengths, and line ranges. Helps you decide which parts to extract."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "file": {
-                        "type": "string",
-                        "description": "Scratchpad filename (must be JSON)"
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Maximum depth to show (default: 4)",
-                        "default": 4
-                    }
-                },
-                "required": ["file"],
-                "additionalProperties": false
-            }),
-        }
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -532,26 +616,52 @@ impl Tool for SchemaTool {
             args.max_depth
         );
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
-        let node = analyze_json_structure(&content).ok_or(ScratchpadToolError::NotJson)?;
-        let schema = format_schema(&node, args.max_depth);
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &schema) {
-            return Ok(json!({
-                "error": "schema_too_large",
-                "message": format!(
-                    "The schema output is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "requested_file": args.file,
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    format!("Try a smaller depth: schema(file, max_depth={})", (args.max_depth / 2).max(1)),
-                    "Use get_in to explore a specific subtree",
-                    "Use head to preview the first few lines instead"
-                ]
-            }).to_string());
+        // Dispatch based on file extension
+        let is_markdown = args.file.ends_with(".md");
+        let schema = if is_markdown {
+            let sections = analyze_markdown_structure(&content).ok_or_else(|| {
+                ScratchpadToolError::InvalidArg(
+                    "File has no markdown headers (expected # or ## or ### sections)".to_string(),
+                )
+            })?;
+            format_markdown_schema(&sections, args.max_depth)
+        } else {
+            let node = analyze_json_structure(&content).ok_or(ScratchpadToolError::NotJson)?;
+            format_schema(&node, args.max_depth)
+        };
+
+        if let Err(e) = check_and_record_budget(&self.budget, &schema) {
+            let suggestions = if is_markdown {
+                json!([
+                    format!(
+                        "Try a smaller depth: schema(file, max_depth={})",
+                        (args.max_depth / 2).max(1)
+                    ),
+                    "Use head to preview the first sections",
+                    "Use grep to search for a specific section header (e.g., grep(file, '### Groups'))",
+                    "Use slice to extract a section by its line range"
+                ])
+            } else {
+                json!([
+                    format!(
+                        "Try a smaller depth: schema(file, max_depth={})",
+                        (args.max_depth / 2).max(1)
+                    ),
+                    "Use get_in to explore a specific JSON subtree",
+                    "Use item_schema to see keys across array items",
+                    "Use head to preview the first few lines"
+                ])
+            };
+            return Ok(format_budget_error(
+                e,
+                "schema_too_large",
+                json!({
+                    "requested_file": args.file,
+                    "format": if is_markdown { "markdown" } else { "json" },
+                    "suggestions": suggestions,
+                }),
+            ));
         }
 
         let meta = build_metadata(schema.lines().count(), &schema, &self.budget);
@@ -576,26 +686,13 @@ impl GetInTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct GetInArgs {
-    pub file: String,
-    /// Dot-separated key path, e.g. "results.0.metadata" or "data.items".
-    pub path: String,
-}
-
-impl Tool for GetInTool {
-    const NAME: &'static str = "get_in";
-    type Error = ScratchpadToolError;
-    type Args = GetInArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "get_in".to_string(),
             description: "Extract a value at a nested key path from a JSON scratchpad file. \
-                          Use dot notation: 'results.0.metadata.title'"
+                          Use dot notation: 'results.0.metadata.title'. For large string values \
+                          (e.g. embedded markdown), use offset/limit to paginate by line."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -607,12 +704,95 @@ impl Tool for GetInTool {
                     "path": {
                         "type": "string",
                         "description": "Dot-separated key path (e.g., 'results.0.name')"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line offset (0-indexed) for paginating large string values"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max lines to return when paginating a large string value"
                     }
                 },
                 "required": ["file", "path"],
                 "additionalProperties": false
             }),
         }
+    }
+
+    /// Return a paginated slice of a string value's lines.
+    fn get_in_paginated(
+        &self,
+        path: &str,
+        lines: &[&str],
+        total_lines: usize,
+        offset: usize,
+        limit: usize,
+    ) -> Result<String, ScratchpadToolError> {
+        if offset >= total_lines {
+            return Ok(json!({
+                "error": "offset_out_of_range",
+                "message": format!("Offset {} exceeds total lines ({})", offset, total_lines),
+                "total_lines": total_lines,
+            })
+            .to_string());
+        }
+
+        let end = total_lines.min(offset + limit);
+        let chunk: String = lines[offset..end].join("\n");
+
+        if let Err(e) = check_and_record_budget(&self.budget, &chunk) {
+            return Ok(format_budget_error(
+                e,
+                "get_in_too_large",
+                json!({
+                    "requested_path": path,
+                    "total_lines": total_lines,
+                    "offset": offset,
+                    "limit": limit,
+                    "suggestions": ["Reduce the limit parameter to read fewer lines"]
+                }),
+            ));
+        }
+
+        let numbered = add_line_numbers(&chunk);
+        let meta = build_metadata(end - offset, &chunk, &self.budget);
+        Ok(format!(
+            "{}\n\n--- scratchpad get_in: $.{} (string, lines {}-{} of {}) | {} ---",
+            numbered,
+            path,
+            offset + 1,
+            end,
+            total_lines,
+            meta
+        ))
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct GetInArgs {
+    pub file: String,
+    /// Dot-separated key path, e.g. "results.0.metadata" or "data.items".
+    pub path: String,
+    /// Line offset (0-indexed) for paginating large string values.
+    /// When the value at `path` is a string with embedded newlines, use
+    /// offset/limit to read a chunk instead of the entire value.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Maximum number of lines to return when paginating a large string value.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl Tool for GetInTool {
+    const NAME: &'static str = "get_in";
+    type Error = ScratchpadToolError;
+    type Args = GetInArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -623,30 +803,69 @@ impl Tool for GetInTool {
 
         let current = navigate_path(&root, &args.path)?;
 
-        let result = serde_json::to_string_pretty(current).unwrap_or_else(|_| current.to_string());
+        // Non-string values: pretty-print, check budget, return
+        let Some(raw_str) = current.as_str() else {
+            let result =
+                serde_json::to_string_pretty(current).unwrap_or_else(|_| current.to_string());
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &result) {
-            return Ok(json!({
-                "error": "get_in_too_large",
-                "message": format!(
-                    "The value at this path is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "requested_path": args.path,
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    format!("Try a deeper path: get_in(file, '{}.0')", args.path),
-                    "Use schema to see the structure and pick a smaller subtree",
-                    "Use grep to find specific content within the value"
-                ]
-            })
-            .to_string());
+            if let Err(e) = check_and_record_budget(&self.budget, &result) {
+                return Ok(format_budget_error(
+                    e,
+                    "get_in_too_large",
+                    json!({
+                        "requested_path": args.path,
+                        "suggestions": [
+                            format!("Try a deeper path: get_in(file, '{}.0')", args.path),
+                            "Use schema to see the structure and pick a smaller subtree",
+                            "Use grep to find specific content within the value"
+                        ]
+                    }),
+                ));
+            }
+
+            let numbered = add_line_numbers(&result);
+            let meta = build_metadata(result.lines().count(), &result, &self.budget);
+            return Ok(format!(
+                "{}\n\n--- scratchpad get_in: $.{} | {} ---",
+                numbered, args.path, meta
+            ));
+        };
+
+        // String values: use raw content so embedded newlines become real lines.
+        // Supports offset/limit pagination for large values.
+        let lines: Vec<&str> = raw_str.lines().collect();
+        let total_lines = lines.len();
+
+        if args.offset.is_some() || args.limit.is_some() {
+            return self.get_in_paginated(
+                &args.path,
+                &lines,
+                total_lines,
+                args.offset.unwrap_or(0),
+                args.limit.unwrap_or(100),
+            );
         }
 
-        let numbered = add_line_numbers(&result);
-        let meta = build_metadata(result.lines().count(), &result, &self.budget);
+        // No pagination — return full string if it fits in budget
+        if let Err(e) = check_and_record_budget(&self.budget, raw_str) {
+            return Ok(format_budget_error(
+                e,
+                "get_in_too_large",
+                json!({
+                    "requested_path": args.path,
+                    "value_type": "string",
+                    "total_lines": total_lines,
+                    "suggestions": [
+                        format!("This is a large string value ({total_lines} lines). Use offset/limit to paginate:"),
+                        format!("  get_in file=\"{}\" path=\"{}\" offset=0 limit=100", args.file, args.path),
+                        "Use grep to search for specific content within the file"
+                    ]
+                }),
+            ));
+        }
+
+        let numbered = add_line_numbers(raw_str);
+        let meta = build_metadata(total_lines, raw_str, &self.budget);
         Ok(format!(
             "{}\n\n--- scratchpad get_in: $.{} | {} ---",
             numbered, args.path, meta
@@ -668,26 +887,10 @@ impl IterateOverTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct IterateOverArgs {
-    pub file: String,
-    /// Dot-separated path to an array (e.g., "results" or "data.items").
-    pub path: String,
-    /// Comma-separated field names to extract from each item (e.g., "id,title,score").
-    pub fields: String,
-}
-
-impl Tool for IterateOverTool {
-    const NAME: &'static str = "iterate_over";
-    type Error = ScratchpadToolError;
-    type Args = IterateOverArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "iterate_over".to_string(),
             description:
                 "Iterate over items in a JSON array and extract selected fields from each. \
                           Use dot-notation for the array path and comma-separated field names. \
@@ -714,6 +917,27 @@ impl Tool for IterateOverTool {
             }),
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct IterateOverArgs {
+    pub file: String,
+    /// Dot-separated path to an array (e.g., "results" or "data.items").
+    pub path: String,
+    /// Comma-separated field names to extract from each item (e.g., "id,title,score").
+    pub fields: String,
+}
+
+impl Tool for IterateOverTool {
+    const NAME: &'static str = "iterate_over";
+    type Error = ScratchpadToolError;
+    type Args = IterateOverArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
+    }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::debug!(
@@ -739,32 +963,34 @@ impl Tool for IterateOverTool {
             row.insert("_index".to_string(), json!(i));
             for &field in &field_names {
                 let val = navigate_path_value(item, field).unwrap_or(&serde_json::Value::Null);
-                row.insert(field.to_string(), val.clone());
+                let val = truncate_large_string(
+                    val,
+                    ITERATE_OVER_STRING_PREVIEW_LINES,
+                    &args.path,
+                    i,
+                    field,
+                );
+                row.insert(field.to_string(), val);
             }
             rows.push(serde_json::Value::Object(row));
         }
 
         let result = serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string());
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &result) {
-            return Ok(json!({
-                "error": "iterate_over_too_large",
-                "message": format!(
-                    "The iteration result is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "item_count": items.len(),
-                "requested_fields": field_names,
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    "Request fewer fields",
-                    "Use get_in to access specific items by index (e.g., 'results.0.title')",
-                    "Use grep to find specific items first"
-                ]
-            })
-            .to_string());
+        if let Err(e) = check_and_record_budget(&self.budget, &result) {
+            return Ok(format_budget_error(
+                e,
+                "iterate_over_too_large",
+                json!({
+                    "item_count": items.len(),
+                    "requested_fields": field_names,
+                    "suggestions": [
+                        "Request fewer fields",
+                        "Use get_in to access specific items by index (e.g., 'results.0.title')",
+                        "Use grep to find specific items first"
+                    ]
+                }),
+            ));
         }
 
         let meta = build_metadata(result.lines().count(), &result, &self.budget);
@@ -793,24 +1019,10 @@ impl ItemSchemaTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct ItemSchemaArgs {
-    pub file: String,
-    /// Dot-separated path to an array (e.g., "results" or "data.items").
-    pub path: String,
-}
-
-impl Tool for ItemSchemaTool {
-    const NAME: &'static str = "item_schema";
-    type Error = ScratchpadToolError;
-    type Args = ItemSchemaArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "item_schema".to_string(),
             description: "Show all unique keys found across all items in a JSON array, with their \
                           types and how many items contain each key. Use this to discover the full \
                           schema of array items before using iterate_over to extract fields."
@@ -831,6 +1043,25 @@ impl Tool for ItemSchemaTool {
                 "additionalProperties": false
             }),
         }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ItemSchemaArgs {
+    pub file: String,
+    /// Dot-separated path to an array (e.g., "results" or "data.items").
+    pub path: String,
+}
+
+impl Tool for ItemSchemaTool {
+    const NAME: &'static str = "item_schema";
+    type Error = ScratchpadToolError;
+    type Args = ItemSchemaArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -876,18 +1107,8 @@ impl Tool for ItemSchemaTool {
             result.push_str(&format!("{:<40} {:<20} {}\n", key, types_str, presence));
         }
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &result) {
-            return Ok(json!({
-                "error": "item_schema_too_large",
-                "message": format!(
-                    "The item schema is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining).",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-            })
-            .to_string());
+        if let Err(e) = check_and_record_budget(&self.budget, &result) {
+            return Ok(format_budget_error(e, "item_schema_too_large", json!({})));
         }
 
         let meta = build_metadata(result.lines().count(), &result, &self.budget);
@@ -994,22 +1215,10 @@ impl ReadTool {
     pub fn new(storage: Arc<ScratchpadStorage>, budget: ContextBudget) -> Self {
         Self { storage, budget }
     }
-}
 
-#[derive(Deserialize, Serialize)]
-pub struct ReadArgs {
-    pub file: String,
-}
-
-impl Tool for ReadTool {
-    const NAME: &'static str = "read";
-    type Error = ScratchpadToolError;
-    type Args = ReadArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: Self::NAME.to_string(),
+            name: "read".to_string(),
             description: "Read an entire scratchpad file. WARNING: may be large. Prefer \
                           head, slice, or grep for targeted reading."
                 .to_string(),
@@ -1026,30 +1235,42 @@ impl Tool for ReadTool {
             }),
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ReadArgs {
+    pub file: String,
+}
+
+impl Tool for ReadTool {
+    const NAME: &'static str = "read";
+    type Error = ScratchpadToolError;
+    type Args = ReadArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
+    }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::debug!("scratchpad read: file={}", args.file);
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
 
-        if let Err(exceeded) = check_and_record_budget(&self.budget, &content) {
-            return Ok(json!({
-                "error": "read_too_large",
-                "message": format!(
-                    "This file is too large for your remaining context \
-                     (estimated {} tokens, ~{} tokens remaining). Narrow your request.",
-                    exceeded.requested_tokens, exceeded.remaining_tokens
-                ),
-                "requested_file": args.file,
-                "estimated_tokens": exceeded.requested_tokens,
-                "remaining_budget_tokens": exceeded.remaining_tokens,
-                "suggestions": [
-                    "Use head to read just the beginning of the file: head(file, 50)",
-                    "Use slice to read a specific range of lines: slice(file, 100, 150)",
-                    "Use grep to find specific lines first",
-                    "Use get_in to extract a specific key if it's structured data"
-                ]
-            })
-            .to_string());
+        if let Err(e) = check_and_record_budget(&self.budget, &content) {
+            return Ok(format_budget_error(
+                e,
+                "read_too_large",
+                json!({
+                    "requested_file": args.file,
+                    "suggestions": [
+                        "Use head to read just the beginning of the file: head(file, 50)",
+                        "Use slice to read a specific range of lines: slice(file, 100, 150)",
+                        "Use grep to find specific lines first",
+                        "Use get_in to extract a specific key if it's structured data"
+                    ]
+                }),
+            ));
         }
 
         let numbered = add_line_numbers(&content);
@@ -1062,6 +1283,20 @@ impl Tool for ReadTool {
             meta
         ))
     }
+}
+
+/// All scratchpad tool definitions, for token counting without constructing tool instances.
+pub fn all_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        HeadTool::tool_definition(),
+        SliceTool::tool_definition(),
+        GrepTool::tool_definition(),
+        SchemaTool::tool_definition(),
+        ItemSchemaTool::tool_definition(),
+        GetInTool::tool_definition(),
+        IterateOverTool::tool_definition(),
+        ReadTool::tool_definition(),
+    ]
 }
 
 // ============================================================================
@@ -1080,7 +1315,8 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let budget = ContextBudget::new(100_000, 0.20);
+        let counter = crate::scratchpad::context_budget::TiktokenCounter::default_counter();
+        let budget = ContextBudget::new(100_000, 0.20, 0, std::sync::Arc::new(counter));
         (tmp, storage, budget)
     }
 
@@ -1207,6 +1443,8 @@ mod tests {
             .call(GetInArgs {
                 file: "test.json".to_string(),
                 path: "results.0.title".to_string(),
+                offset: None,
+                limit: None,
             })
             .await
             .unwrap();
@@ -1223,9 +1461,69 @@ mod tests {
             .call(GetInArgs {
                 file: "test.json".to_string(),
                 path: "results.99.title".to_string(),
+                offset: None,
+                limit: None,
             })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_in_string_pagination() {
+        let (_tmp, storage, budget) = setup().await;
+        // JSON with a large multi-line string value
+        let json = r#"{"kv_markdown": "line1\nline2\nline3\nline4\nline5"}"#;
+        storage.write_output("md", json).await.unwrap();
+
+        let tool = GetInTool::new(storage, budget);
+
+        // Without pagination, should return the raw string content
+        let result = tool
+            .call(GetInArgs {
+                file: "md.json".to_string(),
+                path: "kv_markdown".to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("line1"));
+        assert!(result.contains("line5"));
+
+        // With pagination, should return a slice
+        let result = tool
+            .call(GetInArgs {
+                file: "md.json".to_string(),
+                path: "kv_markdown".to_string(),
+                offset: Some(1),
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("line2"));
+        assert!(result.contains("line3"));
+        assert!(!result.contains("line1"));
+        assert!(!result.contains("line4"));
+        assert!(result.contains("lines 2-3 of 5"));
+    }
+
+    #[tokio::test]
+    async fn test_get_in_string_pagination_offset_out_of_range() {
+        let (_tmp, storage, budget) = setup().await;
+        let json = r#"{"data": "a\nb\nc"}"#;
+        storage.write_output("small", json).await.unwrap();
+
+        let tool = GetInTool::new(storage, budget);
+        let result = tool
+            .call(GetInArgs {
+                file: "small.json".to_string(),
+                path: "data".to_string(),
+                offset: Some(100),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("offset_out_of_range"));
     }
 
     #[tokio::test]
@@ -1280,6 +1578,45 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_iterate_over_truncates_large_strings() {
+        let (_tmp, storage, budget) = setup().await;
+        // JSON array where each item has a large string field
+        let big_str = (0..20)
+            .map(|i| format!("### Section {i}\n- key: value"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let json = serde_json::json!({
+            "items": [
+                { "id": 1, "content": big_str },
+                { "id": 2, "content": "short value" },
+            ]
+        });
+        storage
+            .write_output("trunc", &json.to_string())
+            .await
+            .unwrap();
+
+        let tool = IterateOverTool::new(storage, budget);
+        let result = tool
+            .call(IterateOverArgs {
+                file: "trunc.json".to_string(),
+                path: "items".to_string(),
+                fields: "id,content".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Item 0's content should be truncated with a preview + get_in hint
+        assert!(result.contains("truncated"));
+        assert!(result.contains("get_in"));
+        assert!(result.contains("items.0.content"));
+        // Should show the first few lines as preview
+        assert!(result.contains("### Section 0"));
+        // Item 1's short content should be intact
+        assert!(result.contains("short value"));
     }
 
     #[tokio::test]
@@ -1352,7 +1689,8 @@ mod tests {
     async fn test_budget_exceeded() {
         let (_tmp, storage, _budget) = setup().await;
         // Create a small budget that will be exceeded
-        let tiny_budget = ContextBudget::new(100, 0.20); // 80 tokens usable
+        let counter = crate::scratchpad::context_budget::TiktokenCounter::default_counter();
+        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter)); // 80 tokens usable
 
         // Write a large file
         let large_content = "x".repeat(1000);
@@ -1369,10 +1707,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["error"], "read_too_large");
         assert!(parsed["estimated_tokens"].as_u64().unwrap() > 0);
-        assert!(
-            parsed["remaining_budget_tokens"].as_u64().unwrap()
-                < parsed["estimated_tokens"].as_u64().unwrap()
-        );
+        assert!(parsed["message"].as_str().unwrap().contains("remaining"));
         assert!(parsed["suggestions"].as_array().unwrap().len() >= 3);
     }
 
@@ -1387,5 +1722,139 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_schema_markdown_file() {
+        let (_tmp, storage, budget) = setup().await;
+        // Write a markdown file directly (simulating a companion file)
+        let md = "### Summary\n- total: 5\n- status: ok\n\n### Details\n- item: 1\n  - name: foo\n- item: 2\n  - name: bar\n";
+        let path = storage.dir().join("test.md");
+        tokio::fs::write(&path, md).await.unwrap();
+
+        let tool = SchemaTool::new(storage, budget);
+        let result = tool
+            .call(SchemaArgs {
+                file: "test.md".to_string(),
+                max_depth: 4,
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("Summary"));
+        assert!(result.contains("Details"));
+        assert!(result.contains("total, status"));
+        assert!(result.contains("[L"));
+    }
+
+    #[tokio::test]
+    async fn test_schema_companion_json_file() {
+        let (_tmp, storage, budget) = setup().await;
+        // Simulate a companion .json file extracted from an escaped JSON string
+        let inner = serde_json::json!({
+            "data": [
+                {"id": 1, "value": "alpha"},
+                {"id": 2, "value": "beta"},
+            ],
+            "count": 2,
+        });
+        let pretty = serde_json::to_string_pretty(&inner).unwrap();
+        let path = storage.dir().join("test.payload.json");
+        tokio::fs::write(&path, &pretty).await.unwrap();
+
+        let tool = SchemaTool::new(storage, budget);
+        let result = tool
+            .call(SchemaArgs {
+                file: "test.payload.json".to_string(),
+                max_depth: 4,
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("$.data"));
+        assert!(result.contains("$.count"));
+        assert!(result.contains("array(2 items)"));
+    }
+
+    #[tokio::test]
+    async fn test_get_in_raw_string_not_json_escaped() {
+        let (_tmp, storage, budget) = setup().await;
+        let json = serde_json::json!({"msg": "line one\nline two\nline three"});
+        storage
+            .write_output("raw", &json.to_string())
+            .await
+            .unwrap();
+
+        let tool = GetInTool::new(storage, budget);
+        let result = tool
+            .call(GetInArgs {
+                file: "raw.json".to_string(),
+                path: "msg".to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        // Raw string content, not JSON-quoted with escape sequences
+        assert!(result.contains("line one"));
+        assert!(result.contains("line two"));
+        assert!(!result.contains(r#"\n"#)); // should NOT have escaped newlines
+    }
+
+    #[tokio::test]
+    async fn test_get_in_pagination_budget_exceeded() {
+        let (_tmp, storage, _budget) = setup().await;
+        // Tiny budget with per-call extraction limit
+        let counter = crate::scratchpad::context_budget::TiktokenCounter::default_counter();
+        let tiny_budget = ContextBudget::new(1000, 0.20, 0, std::sync::Arc::new(counter))
+            .with_max_extraction_tokens(5); // very low per-call limit
+
+        // Write JSON with a large string value
+        let big_str = (0..100)
+            .map(|i| format!("line {i} with some content"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let json = serde_json::json!({"content": big_str});
+        storage
+            .write_output("bigstr", &json.to_string())
+            .await
+            .unwrap();
+
+        let tool = GetInTool::new(storage, tiny_budget);
+        // With offset/limit, the chunk should still exceed the tiny per-call limit
+        let result = tool
+            .call(GetInArgs {
+                file: "bigstr.json".to_string(),
+                path: "content".to_string(),
+                offset: Some(0),
+                limit: Some(50),
+            })
+            .await
+            .unwrap();
+        // Should get a budget error, not a panic
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error"], "get_in_too_large");
+        assert!(parsed["suggestions"].is_array());
+    }
+
+    #[test]
+    fn test_all_tool_definitions_count() {
+        let defs = all_tool_definitions();
+        assert_eq!(defs.len(), 8, "expected 8 scratchpad tool definitions");
+    }
+
+    #[tokio::test]
+    async fn test_tool_definition_matches_trait_definition() {
+        let (_tmp, storage, budget) = setup().await;
+
+        let head = HeadTool::new(storage.clone(), budget.clone());
+        assert_eq!(
+            HeadTool::tool_definition(),
+            head.definition(String::new()).await
+        );
+
+        let read = ReadTool::new(storage, budget);
+        assert_eq!(
+            ReadTool::tool_definition(),
+            read.definition(String::new()).await
+        );
     }
 }

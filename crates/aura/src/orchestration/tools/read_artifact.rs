@@ -21,6 +21,26 @@ impl ReadArtifactTool {
     pub fn new(persistence: Arc<Mutex<ExecutionPersistence>>) -> Self {
         Self { persistence }
     }
+
+    pub fn tool_definition() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_artifact".to_string(),
+            description: "Read the full content of a result artifact from the current \
+                orchestration run only. Use this when a task result was too large to include \
+                inline and references an artifact file."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "The artifact filename (e.g. 'task-0-result.txt')"
+                    }
+                },
+                "required": ["filename"]
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -51,23 +71,8 @@ impl Tool for ReadArtifactTool {
     type Output = ReadArtifactOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Read the full content of a result artifact from the current \
-                orchestration run only. Use this when a task result was too large to include \
-                inline and references an artifact file."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "filename": {
-                        "type": "string",
-                        "description": "The artifact filename (e.g. 'task-0-result.txt')"
-                    }
-                },
-                "required": ["filename"]
-            }),
-        }
+        // Delegates to static method so callers can get the definition without a tool instance.
+        Self::tool_definition()
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
@@ -159,8 +164,10 @@ mod tests {
     async fn test_read_artifact_definition() {
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let tool = ReadArtifactTool::new(persistence);
-        let def = tool.definition("".to_string()).await;
-        assert_eq!(def.name, "read_artifact");
-        assert!(def.description.contains("artifact"));
+        let trait_def = tool.definition("".to_string()).await;
+        let static_def = ReadArtifactTool::tool_definition();
+        assert_eq!(trait_def, static_def);
+        assert_eq!(static_def.name, "read_artifact");
+        assert!(static_def.description.contains("artifact"));
     }
 }

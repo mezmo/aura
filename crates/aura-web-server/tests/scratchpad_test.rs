@@ -95,14 +95,14 @@ fn tool_names_from_events(events: &[SseEvent]) -> Vec<String> {
         .collect()
 }
 
-/// Extract the scratchpad_usage event and return (bytes_intercepted, bytes_extracted).
+/// Extract the scratchpad_usage event and return (tokens_intercepted, tokens_extracted).
 /// Returns None if no scratchpad_usage event was emitted.
 fn scratchpad_usage_from_events(events: &[SseEvent]) -> Option<(u64, u64)> {
     let usage_events = events_by_type(events, event_names::SCRATCHPAD_USAGE);
     usage_events.first().and_then(|e| {
         let json: Value = serde_json::from_str(&e.data).ok()?;
-        let intercepted = json["bytes_intercepted"].as_u64()?;
-        let extracted = json["bytes_extracted"].as_u64()?;
+        let intercepted = json["tokens_intercepted"].as_u64()?;
+        let extracted = json["tokens_extracted"].as_u64()?;
         Some((intercepted, extracted))
     })
 }
@@ -129,7 +129,7 @@ fn has_scratchpad_pointer(events: &[SseEvent]) -> bool {
 /// successfully extracts data from the scratchpad file.
 ///
 /// Checks: tool_call_completed shows [scratchpad: ...] pointer,
-/// scratchpad_usage has bytes_intercepted > 0 and bytes_extracted > 0.
+/// scratchpad_usage has tokens_intercepted > 0 and tokens_extracted > 0.
 #[tokio::test]
 async fn test_large_json_intercepted_and_explored() {
     let events = scratchpad_events(
@@ -154,12 +154,18 @@ async fn test_large_json_intercepted_and_explored() {
         "Expected [scratchpad: ...] pointer in tool_call_completed result"
     );
 
-    // Verify scratchpad_usage: bytes_intercepted > 0 proves interception,
-    // bytes_extracted > 0 proves exploration tools were used
-    let (intercepted, extracted) = scratchpad_usage_from_events(&events)
-        .expect("Expected scratchpad_usage event");
-    assert!(intercepted > 0, "Expected bytes_intercepted > 0, got {intercepted}");
-    assert!(extracted > 0, "Expected bytes_extracted > 0, got {extracted}");
+    // Verify scratchpad_usage: tokens_intercepted > 0 proves interception,
+    // tokens_extracted > 0 proves exploration tools were used
+    let (intercepted, extracted) =
+        scratchpad_usage_from_events(&events).expect("Expected scratchpad_usage event");
+    assert!(
+        intercepted > 0,
+        "Expected tokens_intercepted > 0, got {intercepted}"
+    );
+    assert!(
+        extracted > 0,
+        "Expected tokens_extracted > 0, got {extracted}"
+    );
     println!("scratchpad_usage: intercepted={intercepted}, extracted={extracted}");
 }
 
@@ -185,10 +191,16 @@ async fn test_large_text_intercepted_and_explored() {
         "Expected [scratchpad: ...] pointer in tool_call_completed result"
     );
 
-    let (intercepted, extracted) = scratchpad_usage_from_events(&events)
-        .expect("Expected scratchpad_usage event");
-    assert!(intercepted > 0, "Expected bytes_intercepted > 0, got {intercepted}");
-    assert!(extracted > 0, "Expected bytes_extracted > 0, got {extracted}");
+    let (intercepted, extracted) =
+        scratchpad_usage_from_events(&events).expect("Expected scratchpad_usage event");
+    assert!(
+        intercepted > 0,
+        "Expected tokens_intercepted > 0, got {intercepted}"
+    );
+    assert!(
+        extracted > 0,
+        "Expected tokens_extracted > 0, got {extracted}"
+    );
     println!("scratchpad_usage: intercepted={intercepted}, extracted={extracted}");
 }
 
@@ -210,7 +222,7 @@ async fn test_small_output_passes_through() {
     );
 
     // Check that no tool results contain scratchpad pointers for sp_get_small_json
-    // (output was below the 99999-byte threshold)
+    // (output was below the 99999-token threshold)
     let small_tool_intercepted = events_by_type(&events, event_names::TOOL_CALL_COMPLETED)
         .iter()
         .any(|e| {
@@ -250,31 +262,33 @@ async fn test_scratchpad_usage_event_fields() {
         assert_event_fields(
             event,
             &[
-                "bytes_intercepted",
-                "bytes_extracted",
+                "tokens_intercepted",
+                "tokens_extracted",
                 "agent_id",
                 "session_id",
             ],
         );
 
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let bytes_intercepted = json["bytes_intercepted"]
+        let tokens_intercepted = json["tokens_intercepted"]
             .as_u64()
-            .expect("bytes_intercepted must be a number");
-        let bytes_extracted = json["bytes_extracted"]
+            .expect("tokens_intercepted must be a number");
+        let tokens_extracted = json["tokens_extracted"]
             .as_u64()
-            .expect("bytes_extracted must be a number");
+            .expect("tokens_extracted must be a number");
 
         assert!(
-            bytes_intercepted > 0,
-            "Expected bytes_intercepted > 0, got {bytes_intercepted}"
+            tokens_intercepted > 0,
+            "Expected tokens_intercepted > 0, got {tokens_intercepted}"
         );
         assert!(
-            bytes_extracted > 0,
-            "Expected bytes_extracted > 0 (worker should have used exploration tools), got {bytes_extracted}"
+            tokens_extracted > 0,
+            "Expected tokens_extracted > 0 (worker should have used exploration tools), got {tokens_extracted}"
         );
 
-        println!("scratchpad_usage: intercepted={bytes_intercepted}, extracted={bytes_extracted}");
+        println!(
+            "scratchpad_usage: intercepted={tokens_intercepted}, extracted={tokens_extracted}"
+        );
     }
 }
 
@@ -303,10 +317,16 @@ async fn test_nested_json_exploration() {
         "Expected [scratchpad: ...] pointer in tool_call_completed result"
     );
 
-    let (intercepted, extracted) = scratchpad_usage_from_events(&events)
-        .expect("Expected scratchpad_usage event");
-    assert!(intercepted > 0, "Expected bytes_intercepted > 0, got {intercepted}");
-    assert!(extracted > 0, "Expected bytes_extracted > 0, got {extracted}");
+    let (intercepted, extracted) =
+        scratchpad_usage_from_events(&events).expect("Expected scratchpad_usage event");
+    assert!(
+        intercepted > 0,
+        "Expected tokens_intercepted > 0, got {intercepted}"
+    );
+    assert!(
+        extracted > 0,
+        "Expected tokens_extracted > 0, got {extracted}"
+    );
     println!("scratchpad_usage: intercepted={intercepted}, extracted={extracted}");
 }
 

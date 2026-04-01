@@ -55,11 +55,11 @@ description = "Kubernetes SRE tools: cluster discovery, Prometheus metrics, Aler
 
 [mcp.servers.k8s-sre.scratchpad]
 # All tools whose name includes *_list_* 
-"*_list_*" = { min_bytes = 512 }
-# All tools whose name includes *_get_* 
-"*_get_*" = { min_bytes = 128 }
+"*_list_*" = { min_tokens = 512 }
+# All tools whose name includes *_get_*
+"*_get_*" = { min_tokens = 256 }
 # Specific tool override
-"k8s_list_service_monitors" = { min_bytes = 256 }
+"k8s_list_service_monitors" = { min_tokens = 384 }
 
 [orchestration]
 enabled = true

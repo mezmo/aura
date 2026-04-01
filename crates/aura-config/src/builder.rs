@@ -138,17 +138,7 @@ impl RigBuilder {
                             args: args.clone(),
                             env: env.clone(),
                             description: description.clone(),
-                            scratchpad: scratchpad
-                                .iter()
-                                .map(|(k, v)| {
-                                    (
-                                        k.clone(),
-                                        aura::config::ScratchpadToolEntry {
-                                            min_bytes: v.min_bytes,
-                                        },
-                                    )
-                                })
-                                .collect(),
+                            scratchpad: scratchpad.clone(),
                         },
                         crate::config::McpServerConfig::HttpStreamable {
                             url,
@@ -161,17 +151,7 @@ impl RigBuilder {
                             headers: headers.clone(),
                             description: description.clone(),
                             headers_from_request: headers_from_request.clone(),
-                            scratchpad: scratchpad
-                                .iter()
-                                .map(|(k, v)| {
-                                    (
-                                        k.clone(),
-                                        aura::config::ScratchpadToolEntry {
-                                            min_bytes: v.min_bytes,
-                                        },
-                                    )
-                                })
-                                .collect(),
+                            scratchpad: scratchpad.clone(),
                         },
                     };
                     (name.clone(), converted_server)
@@ -241,6 +221,8 @@ impl RigBuilder {
                     aura::orchestration::ScratchpadConfig {
                         enabled: sp.enabled,
                         context_safety_margin: sp.context_safety_margin,
+                        max_extraction_tokens: sp.max_extraction_tokens,
+                        turn_depth_bonus: sp.turn_depth_bonus,
                     }
                 }),
             }

@@ -905,7 +905,7 @@ impl Agent {
     ) {
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_prompt_with_timeout(query, self.max_depth, timeout, request_id)
+            .stream_prompt_with_timeout(query, self.max_depth, timeout, request_id, None)
             .await;
         (
             self.maybe_wrap_with_fallback(stream),
@@ -942,7 +942,14 @@ impl Agent {
     ) {
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_chat_with_timeout(query, chat_history, self.max_depth, timeout, request_id)
+            .stream_chat_with_timeout(
+                query,
+                chat_history,
+                self.max_depth,
+                timeout,
+                request_id,
+                None,
+            )
             .await;
         (
             self.maybe_wrap_with_fallback(stream),

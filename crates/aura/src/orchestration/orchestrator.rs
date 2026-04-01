@@ -435,7 +435,25 @@ impl Orchestrator {
             .map(|sp| {
                 let context_window = agent_config.agent.context_window
                     .expect("scratchpad enabled without context_window — should have been caught at config validation") as usize;
-                crate::scratchpad::ContextBudget::new(context_window, sp.context_safety_margin)
+
+                let (provider, model) = agent_config.llm.model_info();
+                let token_counter = crate::scratchpad::token_counter_for_provider(provider, model);
+
+                let initial_used = estimate_worker_overhead(
+                    &*token_counter,
+                    &orchestration_config,
+                    mcp_manager.as_ref(),
+                );
+
+                tracing::info!(
+                    "Scratchpad budget: context_window={}, initial_used={}, max_extraction_tokens={} (preamble+schemas+task overhead)",
+                    context_window, initial_used, sp.max_extraction_tokens
+                );
+
+                crate::scratchpad::ContextBudget::new(
+                    context_window, sp.context_safety_margin, initial_used, token_counter
+                )
+                .with_max_extraction_tokens(sp.max_extraction_tokens)
             });
 
         Ok(Self {
@@ -596,13 +614,32 @@ impl Orchestrator {
         worker_config.orchestration = None;
 
         // Per-worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH
-        let resolved_depth = worker_name
+        let base_depth = worker_name
             .and_then(|name| self.config.workers.get(name))
             .and_then(|w| w.turn_depth)
             .or(self.agent_config.agent.turn_depth)
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+        // Add scratchpad bonus when scratchpad is active
+        let scratchpad_bonus = self
+            .config
+            .scratchpad
+            .as_ref()
+            .filter(|sp| sp.enabled)
+            .map(|sp| sp.turn_depth_bonus)
+            .unwrap_or(0);
+        let resolved_depth = base_depth + scratchpad_bonus;
         worker_config.agent.turn_depth = Some(resolved_depth);
-        tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
+        if scratchpad_bonus > 0 {
+            tracing::info!(
+                "Worker {} turn_depth={} (base={}, scratchpad_bonus={})",
+                task_id,
+                resolved_depth,
+                base_depth,
+                scratchpad_bonus
+            );
+        } else {
+            tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
+        }
 
         tracing::debug!(
             "Worker {} config: preamble length = {} chars, mcp_filter = {:?}",
@@ -765,6 +802,10 @@ impl Orchestrator {
                         usage.input_tokens += turn.input_tokens;
                         usage.output_tokens += turn.output_tokens;
                         usage.total_tokens += turn.total_tokens;
+                        // Update scratchpad budget with LLM-reported ground truth
+                        if let Some(ref budget) = self.scratchpad_budget {
+                            budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                        }
                     }
                     Err(e) => return Err(e),
                     _ => {} // ToolCall, ToolCallDelta, ToolResult — rig handles execution
@@ -891,6 +932,10 @@ impl Orchestrator {
                         usage.input_tokens += turn.input_tokens;
                         usage.output_tokens += turn.output_tokens;
                         usage.total_tokens += turn.total_tokens;
+                        // Update scratchpad budget with LLM-reported ground truth
+                        if let Some(ref budget) = self.scratchpad_budget {
+                            budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                        }
                     }
                     Ok(StreamItem::FinalMarker) => break,
                     // MaxDepthError: success if decision was captured, error otherwise
@@ -2147,15 +2192,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Build a ScratchpadToolsConfig if scratchpad is enabled in orchestration config.
     ///
     /// Collects scratchpad tool mappings from `mcp.servers.<name>.scratchpad` config.
-    /// The key `"*"` applies to all tools from that server. Per-tool entries take
-    /// precedence over `"*"`.
+    /// The key supports `crate::config::glob_match` patterns like "*_get_*". Per-tool entries take
+    /// precedence over tool entries configured via glob_match patterns.
     async fn build_scratchpad_config(&self) -> Option<crate::scratchpad::ScratchpadToolsConfig> {
         let scratchpad = self.config.scratchpad.as_ref()?;
         if !scratchpad.enabled {
             return None;
         }
 
-        // Collect tool names and per-tool min_bytes from MCP server scratchpad configs
+        // Collect tool names and per-tool min_tokens from MCP server scratchpad configs
         let mut scratchpad_tools: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
 
@@ -2176,7 +2221,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if pattern_entries.is_empty() {
                     // No patterns — only explicitly listed tools
                     for (tool_name, entry) in &exact_entries {
-                        scratchpad_tools.insert((*tool_name).clone(), entry.min_bytes);
+                        scratchpad_tools.insert((*tool_name).clone(), entry.min_tokens);
                     }
                 } else {
                     // Has glob patterns — resolve against actual server tools
@@ -2189,12 +2234,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     for tool_name in &server_tools {
                         // Exact entry takes priority over pattern match
                         if let Some(exact) = sp_config.get(tool_name) {
-                            scratchpad_tools.insert(tool_name.clone(), exact.min_bytes);
+                            scratchpad_tools.insert(tool_name.clone(), exact.min_tokens);
                         } else if let Some((_, entry)) = pattern_entries
                             .iter()
                             .find(|(pattern, _)| crate::config::glob_match(pattern, tool_name))
                         {
-                            scratchpad_tools.insert(tool_name.clone(), entry.min_bytes);
+                            scratchpad_tools.insert(tool_name.clone(), entry.min_tokens);
                         }
                     }
                 }
@@ -2234,10 +2279,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let context_window = self.agent_config.agent.context_window.expect(
                     "scratchpad enabled without context_window — should have been caught at init",
                 ) as usize;
+                let (provider, model) = self.agent_config.llm.model_info();
+                let token_counter = crate::scratchpad::token_counter_for_provider(provider, model);
                 crate::scratchpad::ContextBudget::new(
                     context_window,
                     scratchpad.context_safety_margin,
+                    0,
+                    token_counter,
                 )
+                .with_max_extraction_tokens(scratchpad.max_extraction_tokens)
             }
         };
 
@@ -3273,6 +3323,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             &worker_preamble,
             &worker_prompt,
         );
+
+        // Record actual task prompt tokens in the budget before the worker runs.
+        // The initial_used baseline covers templates and tool schemas but not the
+        // task-specific content (description, context, dependencies).
+        if let Some(ref budget) = self.scratchpad_budget {
+            let task_prompt_tokens = budget.count_tokens(&worker_prompt);
+            budget.record_usage(task_prompt_tokens);
+            tracing::debug!(
+                "Task {}: task prompt ~{} tokens recorded in budget",
+                task_id,
+                task_prompt_tokens
+            );
+        }
 
         // Execute the task (workers get context from the task prompt, not conversation history)
         let result = self
@@ -4727,62 +4790,62 @@ impl StreamingAgent for Orchestrator {
                     cancel_token_clone.clone(),
                 );
 
-                    tokio::select! {
-                        result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
-                            match result {
-                                Ok(final_result) => {
-                                    // Emit scratchpad savings if active
-                                if let Some(ref budget) = orchestrator.scratchpad_budget {
-                                    let (intercepted, extracted) = budget.scratchpad_usage();
-                                    if intercepted > 0 {
-                                        let _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(
-                                            OrchestratorEvent::ScratchpadUsage {
-                                                bytes_intercepted: intercepted,
-                                                bytes_extracted: extracted,
-                                            },
-                                        ))).await;
-                                    }
-                                }
-
-                                // Emit final response as text chunks
-                                    // Split into chunks to simulate streaming
-                                    for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
-                                        let text: String = chunk.iter().collect();
-                                        let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                            crate::provider_agent::StreamedAssistantContent::Text(text)
-                                        ))).await;
-                                    }
-
-                                    // Emit Final marker
-                                    let _ = event_tx.send(Ok(StreamItem::Final(
-                                        crate::provider_agent::FinalResponseInfo {
-                                            content: final_result,
-                                            usage: Default::default(),
-                                        }
+                tokio::select! {
+                    result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
+                        match result {
+                            Ok(final_result) => {
+                                // Emit scratchpad usage if active
+                            if let Some(ref budget) = orchestrator.scratchpad_budget {
+                                let (intercepted, extracted) = budget.scratchpad_usage();
+                                if intercepted > 0 {
+                                    let _ = event_tx.send(Ok(StreamItem::OrchestratorEvent(
+                                        OrchestratorEvent::ScratchpadUsage {
+                                            tokens_intercepted: intercepted,
+                                            tokens_extracted: extracted,
+                                        },
                                     ))).await;
                                 }
-                                Err(e) => {
-                                    let _ = event_tx.send(Err(e)).await;
-                                }
                             }
-                        }
-                        _ = cancel_token_clone.cancelled() => {
-                            tracing::info!("Orchestration cancelled");
-                            // Best-effort: send notifications/cancelled to the inner orchestrator's
-                            // MCP connections (coordinator tools like list_tools, inspect_tool_params).
-                            // Note: Worker-level MCP connections are handled via drop when the spawned
-                            // task returns, since workers create independent Agent instances. Clean
-                            // protocol-level cancellation for worker MCP calls would require propagating
-                            // CancellationToken through Rig's tool execution layer.
-                            let cancelled = orchestrator
-                                .cancel_and_close_mcp("orchestration", "Client disconnected or timeout")
-                                .await;
-                            if cancelled > 0 {
-                                tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
+
+                            // Emit final response as text chunks
+                                // Split into chunks to simulate streaming
+                                for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
+                                    let text: String = chunk.iter().collect();
+                                    let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
+                                        crate::provider_agent::StreamedAssistantContent::Text(text)
+                                    ))).await;
+                                }
+
+                                // Emit Final marker
+                                let _ = event_tx.send(Ok(StreamItem::Final(
+                                    crate::provider_agent::FinalResponseInfo {
+                                        content: final_result,
+                                        usage: Default::default(),
+                                    }
+                                ))).await;
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(Err(e)).await;
                             }
                         }
                     }
-                },
+                    _ = cancel_token_clone.cancelled() => {
+                        tracing::info!("Orchestration cancelled");
+                        // Best-effort: send notifications/cancelled to the inner orchestrator's
+                        // MCP connections (coordinator tools like list_tools, inspect_tool_params).
+                        // Note: Worker-level MCP connections are handled via drop when the spawned
+                        // task returns, since workers create independent Agent instances. Clean
+                        // protocol-level cancellation for worker MCP calls would require propagating
+                        // CancellationToken through Rig's tool execution layer.
+                        let cancelled = orchestrator
+                            .cancel_and_close_mcp("orchestration", "Client disconnected or timeout")
+                            .await;
+                        if cancelled > 0 {
+                            tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
+                        }
+                    }
+                }
+            },
             parent_span,
         ));
 
@@ -4814,10 +4877,8 @@ impl StreamingAgent for Orchestrator {
         let _watcher_handle =
             spawn_cancellation_watcher(cancel_rx, timeout, watcher_cancel_token, request_id_owned);
 
-        let stream = match self
-            .stream(query, chat_history, cancel_token)
-            .await
-        {
+        // Get the stream — returned directly, no wrapper needed
+        let stream = match self.stream(query, chat_history, cancel_token).await {
             Ok(s) => s,
             Err(e) => Box::pin(stream::once(async move { Err(e) })),
         };
@@ -4897,6 +4958,144 @@ fn context_overflow_suggestion(phase: &str) -> String {
         }
         _ => "Request exceeded context limits. Reduce query complexity.".to_string(),
     }
+}
+
+/// Estimate worker context overhead by tokenizing actual prompt components and
+/// tool schemas. Task variable content (description, context, dependencies) is
+/// not included here — it is added in `execute_task()` once the actual prompt
+/// is assembled, before any scratchpad tools can run.
+///
+/// Computes per-worker totals (preamble + filtered MCP tools) and takes the
+/// worst case, since any worker could be the first to run before LLM-reported
+/// usage corrects the budget.
+fn estimate_worker_overhead(
+    counter: &dyn crate::scratchpad::TokenCounter,
+    orchestration_config: &super::config::OrchestrationConfig,
+    mcp_manager: Option<&Arc<crate::mcp::McpManager>>,
+) -> usize {
+    // --- Shared overhead (same for every worker) ---
+    let preamble_template = counter.count_tokens(super::config::WORKER_PREAMBLE_TEMPLATE);
+    let scratchpad_preamble = counter.count_tokens(crate::scratchpad::SCRATCHPAD_PREAMBLE);
+    let task_template = counter.count_tokens(super::templates::WORKER_TASK_PROMPT_TEMPLATE);
+    let scratchpad_tool_tokens = count_scratchpad_tool_tokens(counter);
+    let builtin_tool_tokens = count_builtin_tool_tokens(counter);
+
+    let shared_overhead = preamble_template
+        + scratchpad_preamble
+        + task_template
+        + scratchpad_tool_tokens
+        + builtin_tool_tokens;
+
+    // --- Pre-tokenize every MCP tool: name → tokens ---
+    let tool_token_map = mcp_manager
+        .map(|mgr| tokenize_mcp_tools(counter, mgr))
+        .unwrap_or_default();
+
+    // --- Per-worker: preamble + filtered MCP tools → take worst case ---
+    let (worst_worker, worst_preamble, worst_mcp) = if orchestration_config.workers.is_empty() {
+        // No workers configured — all tools available
+        let all_mcp: usize = tool_token_map.values().sum();
+        ("(default)".to_string(), 0usize, all_mcp)
+    } else {
+        orchestration_config
+            .workers
+            .iter()
+            .map(|(name, worker)| {
+                let preamble_tokens = counter.count_tokens(&worker.preamble);
+                let mcp_tokens: usize = if worker.mcp_filter.is_empty() {
+                    // Empty filter = all tools
+                    tool_token_map.values().sum()
+                } else {
+                    tool_token_map
+                        .iter()
+                        .filter(|(tool_name, _)| {
+                            worker
+                                .mcp_filter
+                                .iter()
+                                .any(|p| crate::config::glob_match(p, tool_name))
+                        })
+                        .map(|(_, tokens)| tokens)
+                        .sum()
+                };
+                (name.clone(), preamble_tokens, mcp_tokens)
+            })
+            .max_by_key(|(_, preamble, mcp)| preamble + mcp)
+            .unwrap_or_default()
+    };
+
+    let total = shared_overhead + worst_preamble + worst_mcp;
+
+    tracing::info!(
+        "Scratchpad initial_used: total={} (shared={} [preamble_tpl={}, scratchpad_pre={}, \
+         task_tpl={}, sp_tools={}, builtin={}] + worst_worker=\"{}\" \
+         [preamble={}, mcp_tools={}])",
+        total,
+        shared_overhead,
+        preamble_template,
+        scratchpad_preamble,
+        task_template,
+        scratchpad_tool_tokens,
+        builtin_tool_tokens,
+        worst_worker,
+        worst_preamble,
+        worst_mcp
+    );
+
+    total
+}
+
+/// Tokenize every MCP tool definition, returning a map of tool_name → token count.
+fn tokenize_mcp_tools(
+    counter: &dyn crate::scratchpad::TokenCounter,
+    mgr: &crate::mcp::McpManager,
+) -> std::collections::HashMap<String, usize> {
+    let mut map = std::collections::HashMap::new();
+
+    // Streamable HTTP tools
+    for tools in mgr.streamable_tools.values() {
+        for tool in tools {
+            let tool_json = serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": serde_json::Value::Object((*tool.input_schema).clone()),
+            });
+            if let Ok(s) = serde_json::to_string(&tool_json) {
+                map.insert(tool.name.to_string(), counter.count_tokens(&s));
+            }
+        }
+    }
+
+    // STDIO tools
+    for (tool, _) in &mgr.tool_definitions {
+        let tool_json = serde_json::json!({
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": serde_json::Value::Object((*tool.input_schema).clone()),
+        });
+        if let Ok(s) = serde_json::to_string(&tool_json) {
+            map.insert(tool.name.to_string(), counter.count_tokens(&s));
+        }
+    }
+
+    map
+}
+
+/// Count tokens for the 8 static scratchpad tool definitions.
+fn count_scratchpad_tool_tokens(counter: &dyn crate::scratchpad::TokenCounter) -> usize {
+    crate::scratchpad::all_tool_definitions()
+        .iter()
+        .filter_map(|def| serde_json::to_string(def).ok())
+        .map(|s| counter.count_tokens(&s))
+        .sum()
+}
+
+/// Count tokens for builtin tools added to worker agents (read_artifact).
+fn count_builtin_tool_tokens(counter: &dyn crate::scratchpad::TokenCounter) -> usize {
+    let def = ReadArtifactTool::tool_definition();
+    serde_json::to_string(&def)
+        .ok()
+        .map(|s| counter.count_tokens(&s))
+        .unwrap_or(200)
 }
 
 #[cfg(test)]
