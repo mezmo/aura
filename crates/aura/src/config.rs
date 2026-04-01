@@ -374,13 +374,13 @@ pub struct McpConfig {
 /// Per-tool scratchpad entry within an MCP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScratchpadToolEntry {
-    /// Minimum output size (bytes) before scratchpad interception. Default: 4096.
-    #[serde(default = "default_scratchpad_min_bytes")]
-    pub min_bytes: usize,
+    /// Minimum output size (tokens) before scratchpad interception. Default: 1024.
+    #[serde(default = "default_scratchpad_min_tokens")]
+    pub min_tokens: usize,
 }
 
-fn default_scratchpad_min_bytes() -> usize {
-    4096
+fn default_scratchpad_min_tokens() -> usize {
+    1024
 }
 
 /// Individual MCP server configuration

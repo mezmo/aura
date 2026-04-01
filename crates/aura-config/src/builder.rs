@@ -144,7 +144,7 @@ impl RigBuilder {
                                     (
                                         k.clone(),
                                         aura::config::ScratchpadToolEntry {
-                                            min_bytes: v.min_bytes,
+                                            min_tokens: v.min_tokens,
                                         },
                                     )
                                 })
@@ -167,7 +167,7 @@ impl RigBuilder {
                                     (
                                         k.clone(),
                                         aura::config::ScratchpadToolEntry {
-                                            min_bytes: v.min_bytes,
+                                            min_tokens: v.min_tokens,
                                         },
                                     )
                                 })
@@ -241,6 +241,8 @@ impl RigBuilder {
                     aura::orchestration::ScratchpadConfig {
                         enabled: sp.enabled,
                         context_safety_margin: sp.context_safety_margin,
+                        max_extraction_tokens: sp.max_extraction_tokens,
+                        turn_depth_bonus: sp.turn_depth_bonus,
                     }
                 }),
             }

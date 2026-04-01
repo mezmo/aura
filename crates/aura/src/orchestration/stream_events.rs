@@ -14,7 +14,7 @@
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
 //! - `aura.orchestrator.phase_started` - Phase execution began
 //! - `aura.orchestrator.phase_completed` - Phase execution finished
-//! - `aura.orchestrator.scratchpad_usage` - Scratchpad context usage (bytes intercepted vs extracted)
+//! - `aura.orchestrator.scratchpad_usage` - Scratchpad context usage (tokens intercepted vs extracted)
 //!
 //! # Separation from Base Events
 //!
@@ -196,8 +196,8 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted at orchestration end with scratchpad context usage.
     ScratchpadUsage {
-        bytes_intercepted: usize,
-        bytes_extracted: usize,
+        tokens_intercepted: usize,
+        tokens_extracted: usize,
         #[serde(flatten)]
         agent: AgentContext,
         #[serde(flatten)]
@@ -449,14 +449,14 @@ impl OrchestrationStreamEvent {
 
     /// Create a ScratchpadUsage event.
     pub fn scratchpad_usage(
-        bytes_intercepted: usize,
-        bytes_extracted: usize,
+        tokens_intercepted: usize,
+        tokens_extracted: usize,
         agent: AgentContext,
         correlation: CorrelationContext,
     ) -> Self {
         Self::ScratchpadUsage {
-            bytes_intercepted,
-            bytes_extracted,
+            tokens_intercepted,
+            tokens_extracted,
             agent,
             correlation,
         }

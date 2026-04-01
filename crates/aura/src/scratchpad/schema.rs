@@ -228,6 +228,171 @@ fn find_matching_delimiter(content: &str, open_pos: usize, open: u8, close: u8) 
     None
 }
 
+// ============================================================================
+// Markdown structure analysis
+// ============================================================================
+
+/// A section in a markdown document, identified by a `#` header.
+#[derive(Debug, Clone)]
+pub struct MarkdownSection {
+    /// The header text (without the `#` prefix).
+    pub title: String,
+    /// Header depth (1 for `#`, 2 for `##`, 3 for `###`, etc.).
+    pub depth: usize,
+    /// 1-indexed start line of the header.
+    pub line_start: usize,
+    /// 1-indexed end line (last line before the next section or EOF).
+    pub line_end: usize,
+    /// Top-level list keys found in this section (e.g., "version", "total_groups").
+    pub keys: Vec<String>,
+    /// Child sections (nested headers of greater depth).
+    pub children: Vec<MarkdownSection>,
+}
+
+/// Analyze markdown content and produce a section tree with line ranges and keys.
+///
+/// Returns None if the content has no markdown headers.
+pub fn analyze_markdown_structure(content: &str) -> Option<Vec<MarkdownSection>> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    // First pass: find all headers with their positions and depths
+    let mut headers: Vec<(usize, usize, String)> = Vec::new(); // (line_idx, depth, title)
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let depth = trimmed.chars().take_while(|&c| c == '#').count();
+            let title = trimmed[depth..].trim().to_string();
+            if !title.is_empty() {
+                headers.push((i, depth, title));
+            }
+        }
+    }
+
+    if headers.is_empty() {
+        return None;
+    }
+
+    // Build flat sections with line ranges and keys
+    let total_lines = lines.len();
+    let mut flat_sections: Vec<MarkdownSection> = Vec::new();
+
+    for (idx, (line_idx, depth, title)) in headers.iter().enumerate() {
+        let line_start = line_idx + 1; // 1-indexed
+        let line_end = if idx + 1 < headers.len() {
+            headers[idx + 1].0 // line before next header (0-indexed)
+        } else {
+            total_lines // EOF
+        };
+
+        // Collect top-level list keys in this section
+        let mut keys = Vec::new();
+        for line in &lines[*line_idx + 1..line_end] {
+            let trimmed = line.trim_start();
+            // Top-level list items (not indented sub-items)
+            if trimmed.starts_with("- ")
+                && !line.starts_with("  ")
+                && let Some(key) = trimmed.strip_prefix("- ")
+            {
+                // Extract key from "key: value", "key:", or bare "key" patterns
+                let key_str = if let Some((k, _)) = key.split_once(": ") {
+                    k.to_string()
+                } else {
+                    key.trim_end_matches(':').to_string()
+                };
+                keys.push(key_str);
+            }
+        }
+
+        flat_sections.push(MarkdownSection {
+            title: title.clone(),
+            depth: *depth,
+            line_start,
+            line_end,
+            keys,
+            children: Vec::new(),
+        });
+    }
+
+    // Build tree structure by nesting children under parents
+    let sections = build_section_tree(&flat_sections);
+    Some(sections)
+}
+
+/// Build a tree of sections from a flat list, nesting deeper sections under shallower ones.
+fn build_section_tree(flat: &[MarkdownSection]) -> Vec<MarkdownSection> {
+    let mut result: Vec<MarkdownSection> = Vec::new();
+    let mut stack: Vec<MarkdownSection> = Vec::new();
+
+    for section in flat {
+        // Pop sections from the stack that are at the same or deeper depth
+        while let Some(top) = stack.last() {
+            if top.depth >= section.depth {
+                let completed = stack.pop().unwrap();
+                if let Some(parent) = stack.last_mut() {
+                    parent.children.push(completed);
+                } else {
+                    result.push(completed);
+                }
+            } else {
+                break;
+            }
+        }
+        stack.push(section.clone());
+    }
+
+    // Flush remaining stack
+    while let Some(completed) = stack.pop() {
+        if let Some(parent) = stack.last_mut() {
+            parent.children.push(completed);
+        } else {
+            result.push(completed);
+        }
+    }
+
+    result
+}
+
+/// Format a markdown section tree into a human-readable string with line numbers.
+pub fn format_markdown_schema(sections: &[MarkdownSection], max_depth: usize) -> String {
+    let mut output = String::new();
+    for section in sections {
+        format_md_section(&mut output, section, 0, max_depth);
+    }
+    output
+}
+
+fn format_md_section(
+    output: &mut String,
+    section: &MarkdownSection,
+    indent: usize,
+    max_depth: usize,
+) {
+    if indent > max_depth {
+        return;
+    }
+    let prefix = "  ".repeat(indent);
+    output.push_str(&format!(
+        "{}{} {} [L{}-L{}]",
+        prefix,
+        "#".repeat(section.depth),
+        section.title,
+        section.line_start,
+        section.line_end,
+    ));
+
+    if !section.keys.is_empty() {
+        output.push_str(&format!(" (keys: {})", section.keys.join(", ")));
+    }
+    output.push('\n');
+
+    for child in &section.children {
+        format_md_section(output, child, indent + 1, max_depth);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +439,162 @@ mod tests {
     #[test]
     fn test_invalid_json() {
         assert!(analyze_json_structure("not json").is_none());
+    }
+
+    #[test]
+    fn test_markdown_sections() {
+        let md = "\
+### Root Cause Analysis
+- version: v2-doc
+- window_ms: 1234..=5678
+
+### Summary
+- total_groups: 2
+- total_logs_weighted: 15
+- by_level:
+  - ERROR: 5
+  - WARN: 10
+
+### Groups
+- group: 1
+  - id: abc
+  - level: WARN
+- group: 2
+  - id: def
+  - level: ERROR";
+
+        let sections = analyze_markdown_structure(md).unwrap();
+        assert_eq!(sections.len(), 3);
+
+        assert_eq!(sections[0].title, "Root Cause Analysis");
+        assert_eq!(sections[0].line_start, 1);
+        assert_eq!(sections[0].line_end, 4); // before Summary header
+        assert_eq!(sections[0].keys, vec!["version", "window_ms"]);
+
+        assert_eq!(sections[1].title, "Summary");
+        assert_eq!(sections[1].line_start, 5);
+        assert_eq!(sections[1].line_end, 11); // before Groups header
+        assert_eq!(
+            sections[1].keys,
+            vec!["total_groups", "total_logs_weighted", "by_level"]
+        );
+
+        assert_eq!(sections[2].title, "Groups");
+        assert_eq!(sections[2].line_start, 12);
+        assert_eq!(sections[2].line_end, 18); // EOF
+        assert_eq!(sections[2].keys, vec!["group", "group"]);
+    }
+
+    #[test]
+    fn test_markdown_format_output() {
+        let md = "### Header\n- key1: val\n- key2: val\n";
+        let sections = analyze_markdown_structure(md).unwrap();
+        let formatted = format_markdown_schema(&sections, 10);
+        assert!(formatted.contains("### Header"));
+        assert!(formatted.contains("L1-L3"));
+        assert!(formatted.contains("keys: key1, key2"));
+    }
+
+    #[test]
+    fn test_markdown_no_headers() {
+        assert!(analyze_markdown_structure("just plain text\nwith lines").is_none());
+    }
+
+    #[test]
+    fn test_markdown_mezmo_rca_format() {
+        // Realistic Mezmo analyze_logs kv_markdown output
+        let md = "\
+### Root Cause Analysis
+- version: v2-doc
+- window_ms: 1775078646300..=1775078946300
+- earliest_observed_ts_ms: 1775078919140
+
+### Summary
+- total_groups: 2
+- total_logs_weighted: 15
+- by_level:
+  - ERROR: 5
+  - WARN: 10
+- top_apps:
+  - prometheus-server: 15
+
+### Groups
+- group: 1
+  - id: fb4f3269219fcffc
+  - level: WARN
+  - app: prometheus-server
+  - host: prometheus-78c65d57fd-jfqvj
+  - count: 10
+  - percent_of_total: 1.00
+  - first_ts_ms: 1775078919140
+  - last_ts_ms: 1775078919140
+  - first_rel_ms: 0
+  - last_rel_ms: 0
+  - template: `time=[VAR]-[VAR]-[VAR]T[VAR]:[VAR]:[VAR]Z level=WARN source=write_handler.go:[VAR] msg=\"Error on ingesting out-of-order exemplars\" component=web num_dropped=[VAR]`
+  - representatives:
+    - 1:
+      - ts_ms: 1775078919140
+      - message: `time=2026-04-01T21:28:39.140Z level=WARN source=write_handler.go:288 msg=\"Error on ingesting out-of-order exemplars\" component=web num_dropped=225`
+- group: 2
+  - id: 4294cace96cb35a3
+  - level: ERROR
+  - app: prometheus-server
+  - host: prometheus-78c65d57fd-jfqvj
+  - count: 5
+  - percent_of_total: 1.00
+  - first_ts_ms: 1775078919540
+  - last_ts_ms: 1775078919540
+  - first_rel_ms: 400
+  - last_rel_ms: 400
+  - template: `time=[VAR]-[VAR]-[VAR]T[VAR]:[VAR]:[VAR]Z level=ERROR source=write_handler.go:[VAR] msg=\"Error appending remote write\" component=web err=\"too old sample\"`
+  - representatives:
+    - 1:
+      - ts_ms: 1775078919540
+      - message: `time=2026-04-01T21:28:39.540Z level=ERROR source=write_handler.go:653 msg=\"Error appending remote write\" component=web err=\"too old sample\"`";
+
+        let sections = analyze_markdown_structure(md).unwrap();
+        assert_eq!(sections.len(), 3);
+
+        // Root Cause Analysis: line 1-4
+        assert_eq!(sections[0].title, "Root Cause Analysis");
+        assert_eq!(
+            sections[0].keys,
+            vec!["version", "window_ms", "earliest_observed_ts_ms"]
+        );
+
+        // Summary: line 6 to before Groups
+        assert_eq!(sections[1].title, "Summary");
+        assert_eq!(
+            sections[1].keys,
+            vec![
+                "total_groups",
+                "total_logs_weighted",
+                "by_level",
+                "top_apps"
+            ]
+        );
+
+        // Groups: line 16 to EOF
+        assert_eq!(sections[2].title, "Groups");
+        assert_eq!(sections[2].keys, vec!["group", "group"]);
+
+        // Verify the formatted output gives useful navigation hints
+        let formatted = format_markdown_schema(&sections, 10);
+        assert!(formatted.contains("Root Cause Analysis"));
+        assert!(formatted.contains("Summary"));
+        assert!(formatted.contains("Groups"));
+        // All sections should show line ranges
+        assert!(formatted.contains("[L"));
+    }
+
+    #[test]
+    fn test_markdown_nested_headers() {
+        let md = "# Top\n## Sub A\n- key: val\n## Sub B\n- key2: val\n";
+        let sections = analyze_markdown_structure(md).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].title, "Top");
+        assert_eq!(sections[0].children.len(), 2);
+        assert_eq!(sections[0].children[0].title, "Sub A");
+        assert_eq!(sections[0].children[1].title, "Sub B");
     }
 }

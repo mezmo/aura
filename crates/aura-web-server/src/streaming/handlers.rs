@@ -1164,17 +1164,17 @@ fn handle_orchestrator_event(
             )
         }
         OrchestratorEvent::ScratchpadUsage {
-            bytes_intercepted,
-            bytes_extracted,
+            tokens_intercepted,
+            tokens_extracted,
         } => {
             tracing::info!(
-                "Orchestrator: scratchpad usage - intercepted={} bytes, extracted={} bytes",
-                bytes_intercepted,
-                bytes_extracted
+                "Orchestrator: scratchpad usage - intercepted=~{} tokens, extracted=~{} tokens",
+                tokens_intercepted,
+                tokens_extracted
             );
             OrchestrationStreamEvent::scratchpad_usage(
-                *bytes_intercepted,
-                *bytes_extracted,
+                *tokens_intercepted,
+                *tokens_extracted,
                 ctx.agent_context.clone(),
                 ctx.correlation.clone(),
             )

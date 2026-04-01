@@ -313,7 +313,7 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 
 ### Scratchpad (Context Window Management)
 
-When MCP tools return large outputs (e.g., knowledge base searches, API responses), the scratchpad intercepts them and saves them to disk, replacing the output with a compact pointer. The LLM then uses built-in exploration tools to selectively read only the parts it needs.
+When MCP tools return large outputs (e.g., knowledge base searches, API responses), the scratchpad intercepts them and saves them to disk, replacing the output with a compact pointer. JSON outputs are pretty-printed at write time so line-based tools work on minified responses. The LLM then uses built-in exploration tools to selectively read only the parts it needs.
 
 Scratchpad files are stored under the current iteration directory at `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`, keeping them alongside other iteration artifacts (plans, task results, prompts). This requires `memory_dir` to be configured.
 
@@ -321,8 +321,8 @@ Scratchpad files are stored under the current iteration directory at `{memory_di
 
 ```toml
 [mcp.servers.my_server.scratchpad]
-"*" = { min_bytes = 2000 }                    # All tools from this server
-"search_knowledge_base" = { min_bytes = 500 } # Override for specific tool
+"*" = { min_tokens = 1024 }                    # All tools from this server
+"search_knowledge_base" = { min_tokens = 256 } # Override for specific tool
 ```
 
 **Global scratchpad settings** (orchestration mode):
@@ -337,16 +337,25 @@ context_safety_margin = 0.20  # Reserve 20% of context window
 
 | Tool | Description |
 |------|-------------|
-| `schema` | JSON structure overview (keys, types, line ranges) |
+| `schema` | Structure overview with line ranges — JSON (keys, types, arrays) or Markdown (sections, keys) |
 | `item_schema` | Union of all keys across items in a JSON array |
 | `head` | Preview first N lines |
 | `grep` | Regex search with context lines |
-| `get_in` | Extract value at a nested JSON path |
+| `get_in` | Extract value at a nested JSON path; supports `offset`/`limit` for paginating large string values |
 | `iterate_over` | Extract selected fields from every item in a JSON array |
 | `slice` | Extract a specific line range |
 | `read` | Read entire file (use sparingly) |
 
-**Usage tracking**: The scratchpad tracks how many bytes were intercepted (diverted to disk) versus how many bytes were extracted back into the context via exploration tools. At the end of orchestration, an `aura.orchestrator.scratchpad_usage` SSE event is emitted with `bytes_intercepted` and `bytes_extracted` totals. The delta represents bytes kept out of the context window.
+**Companion files**: When a JSON object contains large structured string values (10+ lines), they are automatically extracted to companion files alongside the primary `.json` file:
+
+| String content | Companion format | Example |
+|---------------|-----------------|---------|
+| Valid JSON (escaped) | `.json` (pretty-printed) | `{id}.payload.json` |
+| Markdown (headers + lists) | `.md` | `{id}.kv_markdown.md` |
+
+Only structured formats with dedicated tooling (JSON schema/navigation, markdown sections) are extracted. Plain text strings are left in the parent JSON — use `get_in` with `offset`/`limit` or `grep` to explore them.
+
+**Usage tracking**: The scratchpad tracks how many tokens were intercepted (diverted to disk) versus how many tokens were extracted back into the context via exploration tools. At the end of orchestration, an `aura.orchestrator.scratchpad_usage` SSE event is emitted with `tokens_intercepted` and `tokens_extracted` totals. The delta represents tokens kept out of the context window.
 
 ### Ollama
 

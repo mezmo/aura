@@ -122,6 +122,20 @@ pub struct ScratchpadConfig {
     /// Safety margin (0.0-1.0) reserved for model reasoning. Default: 0.20.
     #[serde(default = "default_context_safety_margin")]
     pub context_safety_margin: f32,
+    /// Maximum tokens a single extraction tool call may return. Default: 10000.
+    #[serde(default = "default_max_extraction_tokens")]
+    pub max_extraction_tokens: usize,
+    /// Bonus turn_depth added to workers when scratchpad is active. Default: 6.
+    #[serde(default = "default_turn_depth_bonus")]
+    pub turn_depth_bonus: usize,
+}
+
+fn default_max_extraction_tokens() -> usize {
+    10_000
+}
+
+fn default_turn_depth_bonus() -> usize {
+    6
 }
 
 impl Default for ScratchpadConfig {
@@ -129,6 +143,8 @@ impl Default for ScratchpadConfig {
         Self {
             enabled: false,
             context_safety_margin: default_context_safety_margin(),
+            max_extraction_tokens: default_max_extraction_tokens(),
+            turn_depth_bonus: default_turn_depth_bonus(),
         }
     }
 }
@@ -450,8 +466,8 @@ pub enum McpServerConfig {
         env: HashMap<String, String>,
         #[serde(default)]
         description: Option<String>,
-        /// Per-tool scratchpad configuration. Key is tool name or `"*"` for all tools.
-        /// Per-tool entries take precedence over `"*"`.
+        /// Per-tool scratchpad configuration. Key is tool name or `crate::config::glob_match` pattern
+        /// (e.g. "my_tool", "*_get_*", "update_*").
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
@@ -464,8 +480,8 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
-        /// Per-tool scratchpad configuration. Key is tool name or `"*"` for all tools.
-        /// Per-tool entries take precedence over `"*"`.
+        /// Per-tool scratchpad configuration. Key is tool name or `crate::config::glob_match` pattern
+        /// (e.g. "my_tool", "*_get_*", "update_*").
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
@@ -474,13 +490,13 @@ pub enum McpServerConfig {
 /// Per-tool scratchpad entry within an MCP server configuration.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ScratchpadToolEntry {
-    /// Minimum output size (bytes) before scratchpad interception. Default: 4096.
-    #[serde(default = "default_scratchpad_min_bytes")]
-    pub min_bytes: usize,
+    /// Minimum output size (tokens) before scratchpad interception. Default: 1024.
+    #[serde(default = "default_scratchpad_min_tokens")]
+    pub min_tokens: usize,
 }
 
-fn default_scratchpad_min_bytes() -> usize {
-    4096
+fn default_scratchpad_min_tokens() -> usize {
+    1024
 }
 
 impl McpServerConfig {

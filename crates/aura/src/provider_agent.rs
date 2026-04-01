@@ -154,12 +154,18 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        context_budget: Option<crate::scratchpad::ContextBudget>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let hook = if let Some(budget) = context_budget {
+            hook.with_context_budget(budget)
+        } else {
+            hook
+        };
 
         match self {
             Self::OpenAI(agent) => {
@@ -238,12 +244,18 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        context_budget: Option<crate::scratchpad::ContextBudget>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let hook = if let Some(budget) = context_budget {
+            hook.with_context_budget(budget)
+        } else {
+            hook
+        };
 
         match self {
             Self::OpenAI(agent) => {

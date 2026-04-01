@@ -38,10 +38,10 @@ description = "Scratchpad test tools: returns controlled-size datasets for testi
 
 # Scratchpad thresholds — designed for controlled testing
 [mcp.servers.scratchpad-test.scratchpad]
-"sp_get_large_*" = { min_bytes = 200 }      # Low threshold — large tools always intercepted
-"sp_get_small_*" = { min_bytes = 99999 }     # High threshold — small tools never intercepted
-"sp_get_boundary_json" = { min_bytes = 500 } # Exact boundary for threshold tests
-"sp_get_nested_json" = { min_bytes = 200 }   # Always intercepted
+"sp_get_large_*" = { min_tokens = 50 }       # Low threshold — large tools always intercepted
+"sp_get_small_*" = { min_tokens = 99999 }    # High threshold — small tools never intercepted
+"sp_get_boundary_json" = { min_tokens = 125 } # Exact boundary for threshold tests
+"sp_get_nested_json" = { min_tokens = 50 }   # Always intercepted
 
 [orchestration]
 enabled = true

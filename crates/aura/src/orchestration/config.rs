@@ -556,6 +556,20 @@ impl OrchestrationConfig {
 pub struct ScratchpadConfig {
     pub enabled: bool,
     pub context_safety_margin: f32,
+    /// Maximum tokens a single extraction tool call may return. Default: 10000.
+    #[serde(default = "default_max_extraction_tokens")]
+    pub max_extraction_tokens: usize,
+    /// Bonus turn_depth added to workers when scratchpad is active. Default: 6.
+    #[serde(default = "default_turn_depth_bonus")]
+    pub turn_depth_bonus: usize,
+}
+
+fn default_max_extraction_tokens() -> usize {
+    10_000
+}
+
+fn default_turn_depth_bonus() -> usize {
+    6
 }
 
 impl Default for ScratchpadConfig {
@@ -563,6 +577,8 @@ impl Default for ScratchpadConfig {
         Self {
             enabled: false,
             context_safety_margin: 0.20,
+            max_extraction_tokens: default_max_extraction_tokens(),
+            turn_depth_bonus: default_turn_depth_bonus(),
         }
     }
 }

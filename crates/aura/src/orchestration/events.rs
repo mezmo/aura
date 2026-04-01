@@ -197,9 +197,9 @@ pub enum OrchestratorEvent {
     },
     /// Scratchpad context usage summary.
     ScratchpadUsage {
-        /// Total bytes of raw tool output diverted to scratchpad.
-        bytes_intercepted: usize,
-        /// Total bytes extracted from scratchpad back into context.
-        bytes_extracted: usize,
+        /// Total tokens of raw tool output diverted to scratchpad.
+        tokens_intercepted: usize,
+        /// Total tokens extracted from scratchpad back into context.
+        tokens_extracted: usize,
     },
 }

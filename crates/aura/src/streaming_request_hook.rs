@@ -257,6 +257,8 @@ pub struct StreamingRequestHook {
     request_id: String,
     /// Shared usage state (returned separately for handler access)
     usage_state: UsageState,
+    /// Optional scratchpad context budget — updated with LLM-reported usage.
+    context_budget: Option<crate::scratchpad::ContextBudget>,
 }
 
 impl StreamingRequestHook {
@@ -278,8 +280,19 @@ impl StreamingRequestHook {
             cancelled: rx,
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
+            context_budget: None,
         };
         (hook, tx, usage_state)
+    }
+
+    /// Attach a scratchpad context budget to this hook.
+    ///
+    /// When set, the hook updates the budget with LLM-reported token usage
+    /// in `on_stream_completion_response_finish`, providing ground-truth
+    /// context pressure instead of estimation.
+    pub fn with_context_budget(mut self, budget: crate::scratchpad::ContextBudget) -> Self {
+        self.context_budget = Some(budget);
+        self
     }
 
     /// Check if the request should be cancelled (timeout or external signal).
@@ -456,6 +469,7 @@ where
     {
         let usage_state = self.usage_state.clone();
         let request_id = self.request_id.clone();
+        let context_budget = self.context_budget.clone();
 
         // Extract usage if the response type supports it
         // StreamingResponse implements GetTokenUsage which has token_usage()
@@ -476,6 +490,15 @@ where
                     usage.total_tokens,
                     is_tool_turn,
                 );
+
+                // Update scratchpad context budget with LLM-reported ground truth
+                if let Some(ref budget) = context_budget {
+                    budget.set_estimated_used(usage.input_tokens, usage.output_tokens);
+                    tracing::debug!(
+                        "Scratchpad budget updated from LLM usage: {}",
+                        budget.window_hint()
+                    );
+                }
 
                 if is_tool_turn {
                     tracing::debug!(

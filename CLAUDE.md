@@ -78,10 +78,16 @@ aura/
 
 ### Scratchpad (Context Window Management)
 - Intercepts large MCP tool outputs and saves them to disk instead of filling the context window
-- Per-tool size thresholds configured via `[mcp.servers.<name>.scratchpad]` TOML sections
+- JSON outputs are pretty-printed at write time so line-based tools work on minified responses
+- Large structured string values in JSON auto-extracted to companion files: escaped JSON (`.json`, pretty-printed) or markdown (`.md`)
+- Per-tool token thresholds configured via `[mcp.servers.<name>.scratchpad]` TOML sections (`min_tokens`)
 - Eight read-only exploration tools: `head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`
-- Context budget tracking to prevent token overflow
-- Usage tracking: bytes intercepted (diverted to disk) vs bytes extracted (read back into context)
+- `schema` supports both JSON (keys, types, arrays) and Markdown (sections, keys with line ranges)
+- `get_in` supports `offset`/`limit` pagination for large string values (e.g. embedded markdown)
+- Context budget tracking with LLM-reported usage feedback (ground-truth context pressure from `input_tokens`)
+- Per-call extraction limit (`max_extraction_tokens`, default 10k) prevents single reads from flooding context
+- Auto-increased worker `turn_depth` when scratchpad active (`turn_depth_bonus`, default 6)
+- Usage tracking: tokens intercepted (diverted to disk) vs tokens extracted (read back into context)
 - `aura.orchestrator.scratchpad_usage` SSE event emitted at orchestration end with totals
 - Storage under persistence iteration directory: `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`
 - File IDs derived from orchestration context: `task_{task_id}-{initiator}-{tool}-{attempt}`
