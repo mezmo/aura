@@ -19,6 +19,12 @@ export OPENAI_API_KEY="sk-..."
 CONFIG_PATH=examples/minimal/openai.toml cargo run --bin aura-web-server
 ```
 
+If encountering issues and more verbose debugging output is necessary, add the --verbose flag for the running binary
+```bash
+export OPENAI_API_KEY="sk-..."
+CONFIG_PATH=examples/minimal/openai.toml cargo run --bin aura-web-server -- --verbose
+```
+
 ### Serving Multiple Agents
 
 Point `CONFIG_PATH` at a directory to serve every `.toml` file as a selectable agent:

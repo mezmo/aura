@@ -28,7 +28,7 @@ services:
     build:
       context: ../
       dockerfile: Dockerfile
-      target: base
+      target: release-build
       args:
         - GITHUB_TOKEN
     environment:
