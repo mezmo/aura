@@ -253,6 +253,7 @@ max_planning_cycles = 3
 tools_in_planning = "summary"
 allow_direct_answers = true
 allow_clarification = true
+memory_dir = "/tmp/orchestration-memory"
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
