@@ -267,7 +267,6 @@ impl RigBuilder {
             tool_wrapper: None,
             tool_context_factory: None,
             preamble_override: None,
-            todo_tools_config: None,
             mcp_filter: None,
             orchestration_persistence: None,
             orchestration_chat_history: None,

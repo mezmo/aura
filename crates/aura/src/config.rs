@@ -102,11 +102,6 @@ pub struct AgentConfig {
     #[serde(skip)]
     pub preamble_override: Option<String>,
 
-    /// Configuration for injecting TodoWrite/ReadTodos tools (not serialized).
-    /// When set, the builder adds todo tools with the specified config.
-    #[serde(skip)]
-    pub todo_tools_config: Option<TodoToolsConfig>,
-
     /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added.
     /// Supports glob syntax: `*` (any chars), `?` (single char).
@@ -154,7 +149,6 @@ impl Clone for AgentConfig {
             tool_wrapper: self.tool_wrapper.clone(),
             tool_context_factory: self.tool_context_factory.clone(),
             preamble_override: self.preamble_override.clone(),
-            todo_tools_config: self.todo_tools_config.clone(),
             mcp_filter: self.mcp_filter.clone(),
             orchestration_persistence: self.orchestration_persistence.clone(),
             orchestration_chat_history: self.orchestration_chat_history.clone(),
@@ -182,7 +176,6 @@ impl std::fmt::Debug for AgentConfig {
                 &self.tool_context_factory.as_ref().map(|_| "<factory>"),
             )
             .field("preamble_override", &self.preamble_override)
-            .field("todo_tools_config", &self.todo_tools_config)
             .field("mcp_filter", &self.mcp_filter)
             .field(
                 "orchestration_persistence",
@@ -467,7 +460,6 @@ impl Default for AgentConfig {
             tool_wrapper: None,
             tool_context_factory: None,
             preamble_override: None,
-            todo_tools_config: None,
             mcp_filter: None,
             orchestration_persistence: None,
             orchestration_chat_history: None,

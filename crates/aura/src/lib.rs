@@ -31,7 +31,6 @@ pub mod streaming;
 pub mod streaming_request_hook;
 pub mod bedrock_embedding;
 pub(crate) mod string_utils;
-pub mod todo_tool;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
@@ -85,10 +84,6 @@ pub use stream_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase, format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
-pub use todo_tool::{
-    PlanIteration, PlanState, ReadTodosArgs, ReadTodosTool, TODO_SYSTEM_PROMPT,
-    TODO_TOOL_DESCRIPTION, Todo, TodoError, TodoState, TodoStatus, TodoWriteTool, WriteTodosArgs,
-};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_event_broker::{

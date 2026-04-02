@@ -6,7 +6,6 @@ use crate::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
     },
-    todo_tool::TodoWriteTool,
     tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
@@ -618,26 +617,6 @@ impl Agent {
                 tracing::info!("  Adding {} STDIO tools for client group", tools.len());
                 builder_state = builder_state.add_rmcp_tools(tools, client);
             }
-        }
-
-        // Add Todo tools when todo_tools_config is set
-        // This allows the agent to plan and track complex multi-step tasks
-        if let Some(ref todo_config) = config.todo_tools_config {
-            let (todo_write_tool, todo_state) = if let Some(ref dir) = todo_config.plan_dir {
-                tracing::info!(
-                    "Adding write_todos and read_todos tools with persistence to: {}",
-                    dir
-                );
-                TodoWriteTool::new_with_persistence(dir)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-            } else {
-                tracing::info!("Adding write_todos and read_todos tools (in-memory)");
-                TodoWriteTool::new()
-            };
-
-            let todo_read_tool = crate::todo_tool::ReadTodosTool::with_state(todo_state);
-            builder_state = builder_state.add_tool(todo_write_tool);
-            builder_state = builder_state.add_tool(todo_read_tool);
         }
 
         // Add read_artifact tool when orchestration persistence is available
