@@ -208,7 +208,7 @@ impl ExecutionPersistence {
             base_path: run_path,
             run_id,
             session_id,
-            current_iteration: 0,
+            current_iteration: 1,
             enabled: true,
         })
     }
@@ -219,7 +219,7 @@ impl ExecutionPersistence {
             base_path: PathBuf::new(),
             run_id: uuid::Uuid::new_v4().to_string(),
             session_id: None,
-            current_iteration: 0,
+            current_iteration: 1,
             enabled: false,
         }
     }
@@ -227,6 +227,11 @@ impl ExecutionPersistence {
     /// Get the run ID for this execution.
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// Get the base path for this run's artifacts.
+    pub fn run_path(&self) -> &Path {
+        &self.base_path
     }
 
     /// Get current iteration number.
@@ -709,9 +714,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(persistence.current_iteration(), 0);
-        assert_eq!(persistence.start_new_iteration(), 1);
         assert_eq!(persistence.current_iteration(), 1);
+        assert_eq!(persistence.start_new_iteration(), 2);
+        assert_eq!(persistence.current_iteration(), 2);
     }
 
     #[tokio::test]

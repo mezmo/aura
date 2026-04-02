@@ -397,9 +397,11 @@ impl Orchestrator {
         let journal_enabled = std::env::var("AURA_PROMPT_JOURNAL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let prompt_journal = if let Some(memory_dir) = orchestration_config.memory_dir() {
-            let run_id = persistence.lock().await.run_id().to_string();
-            let run_path = std::path::PathBuf::from(memory_dir).join(&run_id);
+        let prompt_journal = if orchestration_config.memory_dir().is_some() {
+            let guard = persistence.lock().await;
+            let run_id = guard.run_id().to_string();
+            let run_path = guard.run_path().to_path_buf();
+            drop(guard);
             PromptJournal::from_persistence(&run_path, &run_id, &orchestrator_id, journal_enabled)
         } else {
             None
@@ -3942,14 +3944,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 self.config.per_call_timeout_secs(),
             );
 
-            // Start new iteration for persistence tracking
-            {
-                let mut persistence = self.persistence.lock().await;
-                persistence.start_new_iteration();
-            }
-
-            // On re-plan (iteration > 1), get a new plan from the coordinator
+            // On re-plan (iteration > 1), advance persistence iteration so
+            // the new plan and its execution share a single directory.
+            // Iteration 1 is already set by persistence initialization.
             if iteration > 1 {
+                {
+                    let mut persistence = self.persistence.lock().await;
+                    persistence.start_new_iteration();
+                }
                 let (response, _prompt, _coordinator_text) = match self
                     .plan_with_routing(
                         query,
