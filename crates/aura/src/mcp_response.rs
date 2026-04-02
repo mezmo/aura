@@ -45,9 +45,8 @@ pub fn extract_resource_contents(resource: &rmcp::model::ResourceContents) -> St
                 );
             }
             match base64::engine::general_purpose::STANDARD.decode(blob) {
-                Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| {
-                    format!("[Binary resource: {uri} (not valid UTF-8)]")
-                }),
+                Ok(bytes) => String::from_utf8(bytes)
+                    .unwrap_or_else(|_| format!("[Binary resource: {uri} (not valid UTF-8)]")),
                 Err(_) => {
                     format!("[Binary resource: {uri} (invalid base64)]")
                 }
@@ -56,8 +55,7 @@ pub fn extract_resource_contents(resource: &rmcp::model::ResourceContents) -> St
     };
 
     if raw.len() > MAX_RESOURCE_CONTENT_BYTES {
-        let truncated =
-            &raw[..raw.floor_char_boundary(MAX_RESOURCE_CONTENT_BYTES)];
+        let truncated = &raw[..raw.floor_char_boundary(MAX_RESOURCE_CONTENT_BYTES)];
         format!(
             "{truncated}\n\n[Resource truncated: showing {MAX_RESOURCE_CONTENT_BYTES} of {} bytes]",
             raw.len()
@@ -158,9 +156,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<St
             rmcp::model::RawContent::Image(img) => {
                 format!("[Image: {} ({})]", img.mime_type, img.data.len())
             }
-            rmcp::model::RawContent::Resource(res) => {
-                extract_resource_contents(&res.resource)
-            }
+            rmcp::model::RawContent::Resource(res) => extract_resource_contents(&res.resource),
             rmcp::model::RawContent::ResourceLink(link) => {
                 format!("[Resource link: {} ({})]", link.name, link.uri)
             }
@@ -193,7 +189,9 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{Content, RawContent, RawEmbeddedResource, RawResource, RawTextContent, ResourceContents};
+    use rmcp::model::{
+        Content, RawContent, RawEmbeddedResource, RawResource, RawTextContent, ResourceContents,
+    };
     use serde_json::{Value, json};
 
     #[test]

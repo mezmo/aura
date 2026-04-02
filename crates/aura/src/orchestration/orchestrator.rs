@@ -1063,24 +1063,32 @@ impl Orchestrator {
                 }
             };
 
-            // Persist planning phase artifacts
-            {
-                let persistence = self.persistence.lock().await;
-                if let Err(e) = persistence
-                    .write_planning_phase(&planning_prompt, &response.content)
-                    .await
-                {
-                    tracing::warn!("Failed to persist planning phase: {}", e);
-                }
-            }
-
             final_prompt = planning_prompt;
-            final_response = response.content.clone();
 
             // Check if a routing tool was called
             let decision = routing_decision.lock().await.take();
 
             if let Some(planning_response) = decision {
+                // Use the routing decision as the planning response for persistence.
+                // The stream's text content is typically empty because the coordinator
+                // produces its output via tool calls, not streamed text.
+                final_response = if response.content.trim().is_empty() {
+                    serde_json::to_string_pretty(&planning_response)
+                        .unwrap_or_else(|_| response.content.clone())
+                } else {
+                    response.content.clone()
+                };
+
+                // Persist planning phase artifacts (after routing decision is available)
+                {
+                    let persistence = self.persistence.lock().await;
+                    if let Err(e) = persistence
+                        .write_planning_phase(&final_prompt, &final_response)
+                        .await
+                    {
+                        tracing::warn!("Failed to persist planning phase: {}", e);
+                    }
+                }
                 let routing_rationale = planning_response.routing_rationale().to_string();
                 tracing::info!(
                     "Routing decision (attempt {}, {:.1}s): {} (rationale: {})",
@@ -1108,7 +1116,18 @@ impl Orchestrator {
                 return Ok((planning_response, final_prompt, final_response));
             }
 
-            // Fallback: no routing tool called, try text-based parsing
+            // Fallback: no routing tool called — persist the raw text response
+            final_response = response.content.clone();
+            {
+                let persistence = self.persistence.lock().await;
+                if let Err(e) = persistence
+                    .write_planning_phase(&final_prompt, &final_response)
+                    .await
+                {
+                    tracing::warn!("Failed to persist planning phase: {}", e);
+                }
+            }
+
             let (response_preview, _) = safe_truncate(&response.content, 300);
             tracing::warn!(
                 "No routing tool called (attempt {}/{}). The coordinator responded with text instead of calling create_plan/respond_directly/request_clarification. Response: {}",
@@ -4321,10 +4340,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let evaluation = if is_single_task && plan.completed_count() == 1 {
                 // Single-task plan completed successfully — skip evaluation LLM call
                 tracing::info!("Single-task plan: skipping evaluation LLM call");
-                super::types::EvaluationResult::new(
-                    1.0,
-                    "Single-task plan completed successfully",
-                )
+                super::types::EvaluationResult::new(1.0, "Single-task plan completed successfully")
             } else {
                 self.evaluate(&plan, query, &final_result).await
             };
@@ -4525,65 +4541,68 @@ impl StreamingAgent for Orchestrator {
         let cancel_token_clone = cancel_token.clone();
         // Capture the current span (agent.stream root) so child spans nest correctly in Phoenix.
         let parent_span = tracing::Span::current();
-        tokio::spawn(tracing::Instrument::instrument(async move {
-            let orchestrator = match Orchestrator::new(agent_config).await {
-                Ok(o) => o,
-                Err(e) => {
-                    let _ = event_tx.send(Err(e)).await;
-                    return;
-                }
-            };
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let orchestrator = match Orchestrator::new(agent_config).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        let _ = event_tx.send(Err(e)).await;
+                        return;
+                    }
+                };
 
-            // Forward tool call events from workers to SSE stream
-            spawn_tool_event_forwarder(
-                &orchestrator.tool_call_observer,
-                event_tx.clone(),
-                cancel_token_clone.clone(),
-            );
+                // Forward tool call events from workers to SSE stream
+                spawn_tool_event_forwarder(
+                    &orchestrator.tool_call_observer,
+                    event_tx.clone(),
+                    cancel_token_clone.clone(),
+                );
 
-            tokio::select! {
-                result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
-                    match result {
-                        Ok(final_result) => {
-                            // Emit final response as text chunks
-                            // Split into chunks to simulate streaming
-                            for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
-                                let text: String = chunk.iter().collect();
-                                let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                    crate::provider_agent::StreamedAssistantContent::Text(text)
+                tokio::select! {
+                    result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
+                        match result {
+                            Ok(final_result) => {
+                                // Emit final response as text chunks
+                                // Split into chunks to simulate streaming
+                                for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
+                                    let text: String = chunk.iter().collect();
+                                    let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
+                                        crate::provider_agent::StreamedAssistantContent::Text(text)
+                                    ))).await;
+                                }
+
+                                // Emit Final marker
+                                let _ = event_tx.send(Ok(StreamItem::Final(
+                                    crate::provider_agent::FinalResponseInfo {
+                                        content: final_result,
+                                        usage: Default::default(),
+                                    }
                                 ))).await;
                             }
-
-                            // Emit Final marker
-                            let _ = event_tx.send(Ok(StreamItem::Final(
-                                crate::provider_agent::FinalResponseInfo {
-                                    content: final_result,
-                                    usage: Default::default(),
-                                }
-                            ))).await;
+                            Err(e) => {
+                                let _ = event_tx.send(Err(e)).await;
+                            }
                         }
-                        Err(e) => {
-                            let _ = event_tx.send(Err(e)).await;
+                    }
+                    _ = cancel_token_clone.cancelled() => {
+                        tracing::info!("Orchestration cancelled");
+                        // Best-effort: send notifications/cancelled to the inner orchestrator's
+                        // MCP connections (coordinator tools like list_tools, inspect_tool_params).
+                        // Note: Worker-level MCP connections are handled via drop when the spawned
+                        // task returns, since workers create independent Agent instances. Clean
+                        // protocol-level cancellation for worker MCP calls would require propagating
+                        // CancellationToken through Rig's tool execution layer.
+                        let cancelled = orchestrator
+                            .cancel_and_close_mcp("orchestration", "Client disconnected or timeout")
+                            .await;
+                        if cancelled > 0 {
+                            tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
                         }
                     }
                 }
-                _ = cancel_token_clone.cancelled() => {
-                    tracing::info!("Orchestration cancelled");
-                    // Best-effort: send notifications/cancelled to the inner orchestrator's
-                    // MCP connections (coordinator tools like list_tools, inspect_tool_params).
-                    // Note: Worker-level MCP connections are handled via drop when the spawned
-                    // task returns, since workers create independent Agent instances. Clean
-                    // protocol-level cancellation for worker MCP calls would require propagating
-                    // CancellationToken through Rig's tool execution layer.
-                    let cancelled = orchestrator
-                        .cancel_and_close_mcp("orchestration", "Client disconnected or timeout")
-                        .await;
-                    if cancelled > 0 {
-                        tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
-                    }
-                }
-            }
-        }, parent_span));
+            },
+            parent_span,
+        ));
 
         // Convert receiver to stream
         let stream = stream::unfold(event_rx, |mut rx| async move {
