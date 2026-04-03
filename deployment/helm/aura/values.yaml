@@ -51,6 +51,9 @@ server:
   httpPort: 8080
   # -- Log level
   loglevel: info
+  # -- Default agent name or alias when multiple configs are loaded via config.configs.
+  # Not required when only one configuration is loaded.
+  defaultAgent: ""
   # -- Command override (leave empty for default)
   command: []
   # -- Args override (leave empty for default --verbose)
@@ -70,12 +73,13 @@ streaming:
   timeoutSecs: 900
 
 # Aura TOML configuration
-# This will be mounted as /etc/aura/config.toml
+# Config files are mounted in /etc/aura/ and CONFIG_PATH points to the directory.
 #
 # Priority order (highest wins):
 #   1. config.existingConfigMap — use an external ConfigMap as-is
-#   2. config.content           — raw TOML string (legacy, unchanged)
-#   3. Structured sections      — rendered to TOML by helper templates
+#   2. config.content (map)     — each key becomes a file in /etc/aura/
+#   3. config.content (string)  — raw TOML rendered as config.toml
+#   4. Structured sections      — rendered to config.toml by helper templates
 #
 # NOTE: {{ env.VAR }} syntax in values is Aura's own runtime template resolution,
 # NOT Helm/Go templating. These are resolved by the Aura binary at startup.
@@ -83,11 +87,30 @@ config:
   # -- Use an existing ConfigMap for aura config (highest priority)
   existingConfigMap: ""
 
-  # -- Raw TOML configuration content (overrides structured sections below)
-  # When non-empty, this is used verbatim and structured sections are ignored.
+  # -- Raw TOML configuration content (overrides structured sections below).
+  # As a string: used verbatim as config.toml.
+  # As a map: each key becomes a file in /etc/aura/ (config directory pattern).
+  # When empty, structured sections below are rendered into config.toml.
   # NOTE: At minimum, [llm] and [agent] sections are required for a valid config.
-  # Either provide them here as raw TOML, or populate the structured sections below.
   content: ""
+  # Multi-config example:
+  #   content:
+  #     sre-agent.toml: |
+  #       [llm]
+  #       provider = "openai"
+  #       model = "gpt-4o"
+  #       api_key = "{{ env.OPENAI_API_KEY }}"
+  #       [agent]
+  #       name = "SRE Agent"
+  #       system_prompt = "You are an SRE assistant."
+  #     incident-response.toml: |
+  #       [llm]
+  #       provider = "anthropic"
+  #       model = "claude-sonnet-4-5-20250929"
+  #       api_key = "{{ env.ANTHROPIC_API_KEY }}"
+  #       [agent]
+  #       name = "Incident Response"
+  #       system_prompt = "You are an incident response assistant."
 
   # -----------------------------------------------------------------------
   # Structured sections — rendered to TOML when config.content is empty.
