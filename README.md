@@ -15,6 +15,7 @@ Key capabilities:
 > [`feature/orchestration-mode`](https://github.com/mezmo/aura/tree/feature/orchestration-mode)
 > branch and is currently in **open alpha** — APIs, behavior, and configuration
 > are changing rapidly as we iterate.
+> It is also available as `aura:orchestration` in [dockerHub](https://hub.docker.com/repository/docker/mezmo/aura/tags?name=orchestration&ordering=name&page=1).
 >
 > The `main` branch is Aura's **production-ready single-agent framework**:
 > declarative TOML-driven agents with MCP tool integration, RAG pipelines,

@@ -87,7 +87,7 @@ pipeline {
       }
     }
 
-    stage('Test') {
+    stage('Test Suite') {
       when {
         beforeAgent true
         not {
@@ -95,61 +95,97 @@ pipeline {
         }
       }
 
-      parallel {
-        stage('Unit Tests') {
+      stages {
+        stage('Test Suite: Run') {
           steps {
-            script {
-              sh(script: 'docker build --target release-build .')
-            }
+            publishChecks(
+              name: 'test-suite',
+              title: 'Test Suite',
+              summary: 'Running tests...',
+              status: 'IN_PROGRESS'
+            )
           }
         }
 
-        stage('Integration Tests') {
-          environment {
-            MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
-          }
+        stage('Test Suite: Parallel') {
+          parallel {
+            stage('Unit Tests') {
+              steps {
+                script {
+                  sh(script: 'docker build --target release-build .')
+                }
+              }
+            }
 
-          steps {
-            withCredentials([
-              string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
-            ]) {
-              sh 'make test-integration'
+            stage('Integration Tests') {
+              environment {
+                MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
+              }
+
+              steps {
+                withCredentials([
+                  string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
+                ]) {
+                  sh 'make test-integration'
+                }
+              }
+              post {
+                always {
+                  sh 'make test-integration-down'
+                }
+              }
+            }
+
+            stage('Release Tests') {
+              when {
+                beforeAgent true
+                not {
+                  branch DEFAULT_BRANCH
+                }
+              }
+
+              environment {
+                GIT_BRANCH = "${CURRENT_BRANCH}"
+                BRANCH_NAME = "${CURRENT_BRANCH}"
+                CHANGE_ID = ""
+              }
+
+              tools {
+                nodejs 'NodeJS 20'
+              }
+
+              steps {
+                script {
+                  sh "mkdir -p ${NPM_CONFIG_CACHE}"
+                  npm.auth token: GITHUB_TOKEN
+                  // Trigger rustup to read rust-toolchain.toml and auto-install the specified nightly
+                  // Running any cargo command will cause rustup to install the toolchain if not present
+                  sh 'echo "Cargo version:" && cargo --version'
+                  sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
+                  sh 'npx semantic-release --dry-run --no-ci'
+                }
+              }
             }
           }
+
           post {
-            always {
-              sh 'make test-integration-down'
+            success {
+              publishChecks(
+                name: 'test-suite',
+                title: 'Test Suite',
+                summary: 'All tests passed',
+                status: 'COMPLETED',
+                conclusion: 'SUCCESS'
+              )
             }
-          }
-        }
-
-        stage('Release Tests') {
-          when {
-            beforeAgent true
-            not {
-              branch DEFAULT_BRANCH
-            }
-          }
-
-          environment {
-            GIT_BRANCH = "${CURRENT_BRANCH}"
-            BRANCH_NAME = "${CURRENT_BRANCH}"
-            CHANGE_ID = ""
-          }
-
-          tools {
-            nodejs 'NodeJS 20'
-          }
-
-          steps {
-            script {
-              sh "mkdir -p ${NPM_CONFIG_CACHE}"
-              npm.auth token: GITHUB_TOKEN
-              // Trigger rustup to read rust-toolchain.toml and auto-install the specified nightly
-              // Running any cargo command will cause rustup to install the toolchain if not present
-              sh 'echo "Cargo version:" && cargo --version'
-              sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-              sh 'npx semantic-release --dry-run --no-ci'
+            failure {
+              publishChecks(
+                name: 'test-suite',
+                title: 'Test Suite',
+                summary: 'Tests failed',
+                status: 'COMPLETED',
+                conclusion: 'FAILURE'
+              )
             }
           }
         }
