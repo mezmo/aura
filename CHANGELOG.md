@@ -1,3 +1,10 @@
+## [1.17.1](https://github.com/mezmo/aura/compare/v1.17.0...v1.17.1) (2026-04-03)
+
+
+### Continuous Integration
+
+* **deploy**: add multi-config directory support [751129f](https://github.com/mezmo/aura/commit/751129fec9d622b6563374305ceb298c9fc27d47) - Tony Rogers [LOG-23574](https://logdna.atlassian.net/browse/LOG-23574)
+
 # [1.17.0](https://github.com/mezmo/aura/compare/v1.16.4...v1.17.0) (2026-04-03)
 
 
