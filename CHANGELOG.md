@@ -1,3 +1,10 @@
+# [1.17.0](https://github.com/mezmo/aura/compare/v1.16.4...v1.17.0) (2026-04-03)
+
+
+### Features
+
+* **examples**: add orchestration mode quickstart with math MCP [6ec5f21](https://github.com/mezmo/aura/commit/6ec5f2164e347dc9caef4352702a31ba4d721642) - Gregory Janco [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
 ## [1.16.4](https://github.com/mezmo/aura/compare/v1.16.3...v1.16.4) (2026-04-03)
 
 
