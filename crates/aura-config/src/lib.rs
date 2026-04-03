@@ -75,15 +75,15 @@ pub fn validate_unique_identifiers(configs: &[Config]) -> Result<(), ConfigError
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
 
         if config.agent.alias.is_some() && !seen_aliases.insert(id) {
-            return Err(ConfigError::Validation(
-                "Configurations must have a unique alias!".to_string(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "Duplicate alias '{id}'! Configurations must have a unique alias."
+            )));
         }
 
         if !seen_ids.insert(id) {
-            return Err(ConfigError::Validation(
-                "Multiple configurations with the same agent name! Use an alias to differentiate between two agents with the same name.".to_string(),
-            ));
+            return Err(ConfigError::Validation(format!(
+                "Multiple configurations with the same agent name '{id}'! Use an alias to differentiate between two agents with the same name."
+            )));
         }
     }
 
