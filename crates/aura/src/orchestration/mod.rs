@@ -18,8 +18,9 @@
 //!
 //! # Architecture
 //!
-//! The orchestrator implements `StreamingAgent`, allowing it to be used as a
-//! drop-in replacement for the standard `Agent`. It coordinates:
+//! `OrchestratorFactory` implements `StreamingAgent`, allowing it to be used as a
+//! drop-in replacement for the standard `Agent`. It creates the real `Orchestrator`
+//! lazily inside `stream()` to avoid duplicate resource allocation. It coordinates:
 //!
 //! 1. **Coordinator** - decomposes queries into plans
 //! 2. **Workers** - execute individual tasks
@@ -28,11 +29,11 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use aura::{AgentConfig, Orchestrator, StreamingAgent};
+//! use aura::{AgentConfig, OrchestratorFactory, StreamingAgent};
 //!
 //! let config = AgentConfig::from_file("config.toml")?;
 //! let agent: Box<dyn StreamingAgent> = if config.orchestration_enabled() {
-//!     Box::new(Orchestrator::new(config).await?)
+//!     Box::new(OrchestratorFactory::new(config))
 //! } else {
 //!     Box::new(Agent::new(&config).await?)
 //! };
@@ -43,6 +44,7 @@
 mod config;
 mod duplicate_call_guard;
 mod events;
+mod factory;
 mod observer_wrapper;
 mod orchestrator;
 mod persistence;
@@ -59,6 +61,7 @@ pub use config::{
 };
 pub use events::{OrchestratorEvent, RoutingMode};
 pub use observer_wrapper::ObserverWrapper;
+pub use factory::OrchestratorFactory;
 pub use orchestrator::Orchestrator;
 pub use persistence::{
     ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
