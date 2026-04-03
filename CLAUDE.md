@@ -30,7 +30,9 @@ cargo run --bin aura-web-server
 CONFIG_PATH=configs/example-math-orchestration.toml AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 
 # Run integration tests (local, requires Docker)
-make test-integration-local
+make test-integration-local                        # base integration
+make test-integration-orchestration-local          # orchestration integration
+make test-integration-sre-orchestration-local      # SRE orchestration integration
 ```
 
 ## Project Structure

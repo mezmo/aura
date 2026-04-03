@@ -939,7 +939,11 @@ fn handle_orchestrator_event(
                 *task_count,
                 routing_mode.clone(),
                 routing_rationale,
-                maybe_truncate(planning_response, config.tool_result_max_length),
+                if planning_response.is_empty() {
+                    None
+                } else {
+                    Some(planning_response.to_string())
+                },
                 ectx,
             )
         }
@@ -1032,7 +1036,11 @@ fn handle_orchestrator_event(
                 *quality_threshold,
                 *will_replan,
                 *evaluation_skipped,
-                maybe_truncate(reasoning, config.tool_result_max_length),
+                if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning.to_string())
+                },
                 gaps.clone(),
                 ectx,
             )
