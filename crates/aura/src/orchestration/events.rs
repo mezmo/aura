@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
     /// Coordinator classified query to a single worker.
-    /// Synthesis and evaluation are skipped.
+    /// Evaluation is skipped.
     Routed,
     /// Full orchestration — multi-task DAG with synthesis + evaluation.
     Orchestrated,
