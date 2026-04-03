@@ -2,7 +2,7 @@ library 'magic-butler-catalogue'
 def PROJECT_NAME = 'aura'
 def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
-def TRIGGER_PATTERN = '.*@logdnabot.*'
+def TRIGGER_PATTERN = '.*@triggerbuild.*'
 def DOCKER_REPO = "docker.io/mezmo"
 
 pipeline {
@@ -149,7 +149,7 @@ pipeline {
               // Running any cargo command will cause rustup to install the toolchain if not present
               sh 'echo "Cargo version:" && cargo --version'
               sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-              sh 'npx semantic-release --dry-run --no-ci --branches=${BRANCH_NAME:-main}'
+              sh 'npx semantic-release --dry-run --no-ci'
             }
           }
         }
@@ -159,7 +159,7 @@ pipeline {
     stage('Feature Build') {
       when {
         expression {
-          CURRENT_BRANCH ==~ /feature\/((.*)|aura-next(-.*)?)/
+          CURRENT_BRANCH ==~ /feature\/(([A-Z]{2,5}-\d+.*)|aura-next(-.*)?)/
         }
       }
 
