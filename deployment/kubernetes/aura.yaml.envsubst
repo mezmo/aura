@@ -100,6 +100,15 @@ spec:
         key: streaming_timeout_secs
         type: number
 
+  - name: default_agent
+    optional: true
+    default: "Operations Assistant (GPT-5.2)"
+    valueFrom:
+      configMapKeyRef:
+        name: aura-api
+        namespace: aura
+        key: default_agent
+
   - name: requests_cpu
     optional: true
     default: 1
@@ -254,7 +263,12 @@ spec:
                 value: "{{{http_port}}}"
 
               - name: CONFIG_PATH
-                value: "/etc/aura/config.toml"
+                value: "/etc/aura/"
+
+              {{#default_agent}}
+              - name: DEFAULT_AGENT
+                value: "{{{default_agent}}}"
+              {{/default_agent}}
 
               # Streaming configuration
               - name: TOOL_RESULT_MODE
