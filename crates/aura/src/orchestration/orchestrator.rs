@@ -3394,31 +3394,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return Err(error_msg.into());
         }
 
-        // For single result, return directly (no synthesis needed)
-        if completed_tasks.len() == 1 {
-            // The filter at line 1508 ensures result.is_some(), but we use
-            // unwrap_or_default() defensively to avoid panics if invariants change
-            let result = completed_tasks[0].result.clone().unwrap_or_default();
-
-            // Persist single-result synthesis
-            {
-                let persistence = self.persistence.lock().await;
-                let synthesis_prompt = format!(
-                    "[SINGLE RESULT - NO SYNTHESIS NEEDED]\n\nTask: {}\nRationale: {}",
-                    completed_tasks[0].description, completed_tasks[0].rationale
-                );
-                if let Err(e) = persistence
-                    .write_synthesis(&synthesis_prompt, &result)
-                    .await
-                {
-                    tracing::warn!("Failed to persist synthesis: {}", e);
-                }
-            }
-
-            return Ok(result);
-        }
-
-        // Multiple results - use LLM to synthesize
+        // Use LLM to synthesize (even single results get coordinator framing)
         let synthesis_prompt = self.build_synthesis_prompt(plan, query, &completed_tasks);
 
         let synthesized = match self.create_synthesis_coordinator().await {
@@ -3969,23 +3945,84 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 };
 
+                // Handle non-plan responses during replan: Direct/Clarification
+                // short-circuit the loop, mirroring the initial routing in run_orchestration().
+                match &response {
+                    PlanningResponse::Direct {
+                        response: direct_response,
+                        routing_rationale,
+                    } => {
+                        Self::emit_event(
+                            &event_tx,
+                            OrchestratorEvent::DirectAnswer {
+                                response: direct_response.clone(),
+                                routing_rationale: routing_rationale.clone(),
+                            },
+                        )
+                        .await;
+                        Self::emit_event(
+                            &event_tx,
+                            OrchestratorEvent::IterationComplete {
+                                iteration,
+                                quality_score: 0.0,
+                                quality_threshold: self.config.quality_threshold,
+                                will_replan: false,
+                                evaluation_skipped: true,
+                                reasoning: "Coordinator provided direct answer during replan"
+                                    .to_string(),
+                                gaps: vec![],
+                            },
+                        )
+                        .await;
+                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                            .await;
+                        return Ok(direct_response.clone());
+                    }
+                    PlanningResponse::Clarification {
+                        question,
+                        options,
+                        routing_rationale,
+                    } => {
+                        Self::emit_event(
+                            &event_tx,
+                            OrchestratorEvent::ClarificationNeeded {
+                                question: question.clone(),
+                                options: options.clone(),
+                                routing_rationale: routing_rationale.clone(),
+                            },
+                        )
+                        .await;
+                        Self::emit_event(
+                            &event_tx,
+                            OrchestratorEvent::IterationComplete {
+                                iteration,
+                                quality_score: 0.0,
+                                quality_threshold: self.config.quality_threshold,
+                                will_replan: false,
+                                evaluation_skipped: true,
+                                reasoning: "Coordinator requested clarification during replan"
+                                    .to_string(),
+                                gaps: vec![],
+                            },
+                        )
+                        .await;
+                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                            .await;
+                        return Ok(question.clone());
+                    }
+                    PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. } => {
+                        // Fall through to plan extraction below
+                    }
+                }
+
                 let routing_rationale = response.routing_rationale().to_string();
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
 
-                // Extract plan from response (convert non-Orchestrated to single-task)
-                plan = match response.into_plan() {
-                    Some(p) => p,
-                    None => {
-                        // Direct/Clarification during replan — create single-task fallback
-                        let mut fallback = Plan::new(query.to_string());
-                        fallback.add_task(Task::new(
-                            0,
-                            format!("Execute: {}", truncate_query(query, 100)),
-                            "Fallback single task during re-plan".to_string(),
-                        ));
-                        fallback
-                    }
-                };
+                // Extract plan from response — Direct/Clarification handled above,
+                // so into_plan() will always return Some here.
+                plan = response
+                    .into_plan()
+                    .expect("Orchestrated/StepsPlan always converts to plan");
 
                 // Carry forward results from previous iteration where coordinator requested reuse
                 Self::apply_result_reuse(
@@ -4314,27 +4351,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // SYNTHESIZE: Combine task results into coherent response
             // ----------------------------------------------------------------
             let is_single_task = plan.tasks.len() == 1;
-            if is_single_task && plan.completed_count() == 1 {
-                // Single-task plan — grab result directly, skip synthesis entirely
-                final_result = plan
-                    .tasks
-                    .first()
-                    .and_then(|t| t.result.clone())
-                    .unwrap_or_default();
-            } else {
-                if !is_single_task {
-                    Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration })
+            Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
+            final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    self.write_run_manifest(&plan, iteration, last_quality_score)
                         .await;
+                    return Err(e);
                 }
-                final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.write_run_manifest(&plan, iteration, last_quality_score)
-                            .await;
-                        return Err(e);
-                    }
-                };
-            }
+            };
 
             // ----------------------------------------------------------------
             // EVALUATE: Assess quality of synthesized response

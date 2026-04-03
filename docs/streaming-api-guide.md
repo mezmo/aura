@@ -260,7 +260,7 @@ data: {"goal":"Calculate (3+7)*2 and list files","task_count":2,"routing_mode":"
 ```
 
 The `routing_mode` field indicates how the coordinator routed the query:
-- `"routed"` — classified to a single worker (no synthesis/evaluation)
+- `"routed"` — classified to a single worker (evaluation skipped, synthesis still runs)
 - `"orchestrated"` — multi-task DAG with synthesis + evaluation
 
 **Task started** (worker begins execution):
