@@ -78,7 +78,7 @@ config:
 
     [orchestration]
     enabled = true
-    max_planning_cycles = 3
+    max_planning_cycles = 2
     quality_threshold = 0.7
     allow_direct_answers = true
     allow_clarification = false
@@ -141,14 +141,20 @@ config:
       "list_metrics",
     ]
     preamble = """
-    You are a Prometheus metrics specialist. Use execute_query and
-    execute_range_query to run targeted PromQL queries for specific metrics.
+    You are a Prometheus metrics specialist.
 
-    IMPORTANT: Do NOT call list_metrics or get_metric_metadata without a
-    filter_pattern — the OTel demo has hundreds of metrics and unfiltered
-    results will exceed context limits. Always use filter_pattern to narrow
-    results (e.g. filter_pattern="cpu", filter_pattern="http_request").
+    Workflow:
+    1. Call list_metrics with a filter_pattern for the domain
+       (e.g. "cpu", "http_request", "memory").
+    2. Run execute_query or execute_range_query with the
+       exact metric name from step 1.
+    3. Use get_metric_metadata with a filter_pattern if you
+       need to understand what a metric measures.
 
-    When analyzing metrics, provide specific values with units. Flag anomalies
-    and suggest thresholds when relevant.
+    Always pass filter_pattern to list_metrics and
+    get_metric_metadata — filtered results are faster and
+    more relevant.
+
+    Be concise and decisive. Report metric values with
+    units. Flag anomalies with specific numbers.
     """
