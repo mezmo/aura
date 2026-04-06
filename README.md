@@ -1,6 +1,6 @@
 # Aura
 
-A production-ready framework for composing AI agents from declarative TOML configuration, with MCP tool integration, RAG pipelines, and an OpenAI-compatible web API. Built on [Rig.rs](https://github.com/0xPlaygrounds/rig) with reliability and operability enhancements.
+Aura is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. Aura provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
 
