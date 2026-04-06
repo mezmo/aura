@@ -1,0 +1,79 @@
+# Integration test configuration for scratchpad context window management
+# Used by: compose/scratchpad.yml → compose/scratchpad-test.yml
+# Exercises scratchpad interception, exploration tools, context budget tracking,
+# and scratchpad_usage SSE event emission.
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+
+[agent]
+name = "Scratchpad Test Orchestrator"
+system_prompt = """
+You are a data retrieval and analysis assistant with scratchpad capability.
+
+When you call a tool and the output is too large to fit in context, you will
+receive a pointer like [scratchpad: file_id=...]. When you see this:
+1. Use the scratchpad exploration tools (head, slice, grep, schema, get_in,
+   iterate_over, item_schema, read) to selectively read the data you need.
+2. Do NOT try to re-call the original tool — the data is already saved.
+3. Extract only the specific fields or sections needed to answer the question.
+
+Always use the exploration tools to answer questions about large datasets.
+Report the actual values you find — do not fabricate data.
+"""
+turn_depth = 10
+temperature = 0.1
+context_window = 128000
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.scratchpad-test]
+transport = "http_streamable"
+url = "http://scratchpad-test-mcp:8083/mcp"
+headers = {}
+description = "Scratchpad test tools: returns controlled-size datasets for testing context window management"
+
+# Scratchpad thresholds — designed for controlled testing
+[mcp.servers.scratchpad-test.scratchpad]
+"sp_get_large_*" = { min_tokens = 50 }       # Low threshold — large tools always intercepted
+"sp_get_small_*" = { min_tokens = 99999 }    # High threshold — small tools never intercepted
+"sp_get_boundary_json" = { min_tokens = 125 } # Exact boundary for threshold tests
+"sp_get_nested_json" = { min_tokens = 50 }   # Always intercepted
+
+[orchestration]
+enabled = true
+max_planning_cycles = 1
+quality_threshold = 0.5
+allow_direct_answers = false
+allow_clarification = false
+
+[orchestration.timeouts]
+per_call_timeout_secs = 90
+
+[orchestration.scratchpad]
+enabled = true
+context_safety_margin = 0.20
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-scratchpad-test"
+
+[orchestration.worker.data-explorer]
+description = "Data retrieval and exploration using scratchpad tools"
+turn_depth = 10
+mcp_filter = ["sp_*"]
+preamble = """
+You are a data exploration specialist. Use the sp_* tools to retrieve datasets,
+then use scratchpad exploration tools (head, slice, grep, schema, get_in,
+iterate_over, item_schema) to selectively read large outputs.
+
+When you see a [scratchpad: ...] pointer after calling a tool:
+1. Use 'schema' to understand the structure
+2. Use 'get_in' or 'iterate_over' for specific values
+3. Use 'grep' to find patterns in text data
+4. Use 'head' or 'slice' for previews
+
+Always report actual values from the data. Never fabricate results.
+"""

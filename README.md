@@ -191,7 +191,7 @@ Configuration sections:
 - `[llm]`: provider and model configuration.
 - `[agent]`: identity, system prompt, and runtime behavior.
 - `[[vector_stores]]`: optional RAG/vector store configuration.
-- `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
+- `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, transports, and per-server scratchpad thresholds.
 
 Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
 
@@ -298,6 +298,8 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
+| `scratchpad.enabled` | bool | `false` | Enable scratchpad interception of large tool outputs |
+| `scratchpad.context_safety_margin` | float | `0.20` | Fraction of context window to reserve as safety margin |
 
 #### Worker fields (`[orchestration.worker.<name>]`)
 
@@ -308,6 +310,52 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools this worker can use |
 | `vector_stores` | list | `[]` | Named vector stores this worker has access to |
 | `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
+
+### Scratchpad (Context Window Management)
+
+When MCP tools return large outputs (e.g., knowledge base searches, API responses), the scratchpad intercepts them and saves them to disk, replacing the output with a compact pointer. JSON outputs are pretty-printed at write time so line-based tools work on minified responses. The LLM then uses built-in exploration tools to selectively read only the parts it needs.
+
+Scratchpad files are stored under the current iteration directory at `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`, keeping them alongside other iteration artifacts (plans, task results, prompts). This requires `memory_dir` to be configured.
+
+**Per-server configuration** — flag tools for interception with size thresholds:
+
+```toml
+[mcp.servers.my_server.scratchpad]
+"*" = { min_tokens = 1024 }                    # All tools from this server
+"search_knowledge_base" = { min_tokens = 256 } # Override for specific tool
+```
+
+**Global scratchpad settings** (orchestration mode):
+
+```toml
+[orchestration.scratchpad]
+enabled = true
+context_safety_margin = 0.20  # Reserve 20% of context window
+```
+
+**Exploration tools** available to the LLM when scratchpad is active:
+
+| Tool | Description |
+|------|-------------|
+| `schema` | Structure overview with line ranges — JSON (keys, types, arrays) or Markdown (sections, keys) |
+| `item_schema` | Union of all keys across items in a JSON array |
+| `head` | Preview first N lines |
+| `grep` | Regex search with context lines |
+| `get_in` | Extract value at a nested JSON path; supports `offset`/`limit` for paginating large string values |
+| `iterate_over` | Extract selected fields from every item in a JSON array |
+| `slice` | Extract a specific line range |
+| `read` | Read entire file (use sparingly) |
+
+**Companion files**: When a JSON object contains large structured string values (10+ lines), they are automatically extracted to companion files alongside the primary `.json` file:
+
+| String content | Companion format | Example |
+|---------------|-----------------|---------|
+| Valid JSON (escaped) | `.json` (pretty-printed) | `{id}.payload.json` |
+| Markdown (headers + lists) | `.md` | `{id}.kv_markdown.md` |
+
+Only structured formats with dedicated tooling (JSON schema/navigation, markdown sections) are extracted. Plain text strings are left in the parent JSON — use `get_in` with `offset`/`limit` or `grep` to explore them.
+
+**Usage tracking**: The scratchpad tracks how many tokens were intercepted (diverted to disk) versus how many tokens were extracted back into the context via exploration tools. At the end of orchestration, an `aura.orchestrator.scratchpad_usage` SSE event is emitted with `tokens_intercepted` and `tokens_extracted` totals. The delta represents tokens kept out of the context window.
 
 ### Ollama
 
@@ -429,6 +477,7 @@ Key architectural characteristics:
 - Dynamic MCP tool discovery at runtime.
 - Automatic schema sanitization (anyOf, missing types, optional parameters) driven by OpenAI function-calling requirements — MCP tool schemas are transformed at discovery time to conform to OpenAI's strict subset of JSON Schema.
 - Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.
+- Scratchpad context management: large tool outputs are intercepted and saved to disk, with exploration tools for selective retrieval.
 - Config-driven composition with embeddable Rust core.
 
 Prompt routing and execution model:

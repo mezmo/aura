@@ -76,12 +76,29 @@ aura/
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 
+### Scratchpad (Context Window Management)
+- Intercepts large MCP tool outputs and saves them to disk instead of filling the context window
+- JSON outputs are pretty-printed at write time so line-based tools work on minified responses
+- Large structured string values in JSON auto-extracted to companion files: escaped JSON (`.json`, pretty-printed) or markdown (`.md`)
+- Per-tool token thresholds configured via `[mcp.servers.<name>.scratchpad]` TOML sections (`min_tokens`)
+- Eight read-only exploration tools: `head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`
+- `schema` supports both JSON (keys, types, arrays) and Markdown (sections, keys with line ranges)
+- `get_in` supports `offset`/`limit` pagination for large string values (e.g. embedded markdown)
+- Context budget tracking with LLM-reported usage feedback (ground-truth context pressure from `input_tokens`)
+- Per-call extraction limit (`max_extraction_tokens`, default 10k) prevents single reads from flooding context
+- Auto-increased worker `turn_depth` when scratchpad active (`turn_depth_bonus`, default 6)
+- Usage tracking: tokens intercepted (diverted to disk) vs tokens extracted (read back into context)
+- `aura.orchestrator.scratchpad_usage` SSE event emitted at orchestration end with totals
+- Storage under persistence iteration directory: `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`
+- File IDs derived from orchestration context: `task_{task_id}-{initiator}-{tool}-{attempt}`
+- Requires `memory_dir` to be configured (shared with execution persistence)
+
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution
 - Dependency-aware multi-wave execution with quality evaluation
 - Iterative re-planning loops (`quality_threshold`, `max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
-- 11 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
+- 12 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
 
 ## Environment Setup
 
@@ -105,6 +122,7 @@ export AWS_REGION="your-region"       # For Knowledge Base
 - `stream_events.rs` - Custom aura SSE events
 - `request_cancellation.rs` - Request lifecycle management
 - `tool_event_broker.rs` - FIFO queue for tool_call_id correlation (see critical assumption below)
+- `scratchpad/` - Context window management: intercepts large tool outputs, provides exploration tools
 - `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
 
 ### Critical Assumption: Rig Sequential Tool Execution

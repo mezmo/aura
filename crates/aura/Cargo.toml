@@ -49,6 +49,9 @@ uuid = { workspace = true }
 regex = "1"
 async-stream = "0.3"
 
+# Tokenizer for context budget estimation
+tiktoken-rs = "0.9.1"
+
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
@@ -57,4 +60,3 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 tempfile = "3.23.0"
 toml = "0.8"
 tokio = { version = "1.45", features = ["test-util", "macros", "rt"] }
-

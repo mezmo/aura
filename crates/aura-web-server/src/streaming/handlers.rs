@@ -1163,6 +1163,22 @@ fn handle_orchestrator_event(
                 ectx,
             )
         }
+        OrchestratorEvent::ScratchpadUsage {
+            tokens_intercepted,
+            tokens_extracted,
+        } => {
+            tracing::info!(
+                "Orchestrator: scratchpad usage - intercepted=~{} tokens, extracted=~{} tokens",
+                tokens_intercepted,
+                tokens_extracted
+            );
+            OrchestrationStreamEvent::scratchpad_usage(
+                *tokens_intercepted,
+                *tokens_extracted,
+                ctx.agent_context.clone(),
+                ctx.correlation.clone(),
+            )
+        }
     };
 
     vec![Bytes::from(sse_event.format_sse())]

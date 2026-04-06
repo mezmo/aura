@@ -108,6 +108,49 @@ pub struct OrchestrationConfig {
     pub max_consecutive_duplicate_tool_calls: Option<usize>,
     pub timeouts: TimeoutsConfig,
     pub artifacts: ArtifactsConfig,
+    /// Scratchpad configuration for large tool output management.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
+}
+
+/// Scratchpad configuration for intercepting large MCP tool outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScratchpadConfig {
+    /// Whether scratchpad is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Safety margin (0.0-1.0) reserved for model reasoning. Default: 0.20.
+    #[serde(default = "default_context_safety_margin")]
+    pub context_safety_margin: f32,
+    /// Maximum tokens a single extraction tool call may return. Default: 10000.
+    #[serde(default = "default_max_extraction_tokens")]
+    pub max_extraction_tokens: usize,
+    /// Bonus turn_depth added to workers when scratchpad is active. Default: 6.
+    #[serde(default = "default_turn_depth_bonus")]
+    pub turn_depth_bonus: usize,
+}
+
+fn default_max_extraction_tokens() -> usize {
+    10_000
+}
+
+fn default_turn_depth_bonus() -> usize {
+    6
+}
+
+impl Default for ScratchpadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            context_safety_margin: default_context_safety_margin(),
+            max_extraction_tokens: default_max_extraction_tokens(),
+            turn_depth_bonus: default_turn_depth_bonus(),
+        }
+    }
+}
+
+fn default_context_safety_margin() -> f32 {
+    0.20
 }
 
 impl Default for OrchestrationConfig {
@@ -128,6 +171,7 @@ impl Default for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
+            scratchpad: None,
         }
     }
 }
@@ -164,6 +208,8 @@ struct RawOrchestrationConfig {
     // Sub-tables
     #[serde(default)]
     timeouts: Option<TimeoutsConfig>,
+    #[serde(default)]
+    scratchpad: Option<ScratchpadConfig>,
     #[serde(default)]
     artifacts: Option<ArtifactsConfig>,
     // Flat artifact fields (backward compat)
@@ -216,6 +262,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
             timeouts,
             artifacts,
+            scratchpad: raw.scratchpad,
         })
     }
 }
@@ -419,6 +466,10 @@ pub enum McpServerConfig {
         env: HashMap<String, String>,
         #[serde(default)]
         description: Option<String>,
+        /// Per-tool scratchpad configuration. Key is tool name or `crate::config::glob_match` pattern
+        /// (e.g. "my_tool", "*_get_*", "update_*").
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -429,7 +480,33 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad configuration. Key is tool name or `crate::config::glob_match` pattern
+        /// (e.g. "my_tool", "*_get_*", "update_*").
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
+}
+
+/// Per-tool scratchpad entry within an MCP server configuration.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ScratchpadToolEntry {
+    /// Minimum output size (tokens) before scratchpad interception. Default: 1024.
+    #[serde(default = "default_scratchpad_min_tokens")]
+    pub min_tokens: usize,
+}
+
+fn default_scratchpad_min_tokens() -> usize {
+    1024
+}
+
+impl McpServerConfig {
+    /// Get the scratchpad configuration map for this server.
+    pub fn scratchpad(&self) -> &HashMap<String, ScratchpadToolEntry> {
+        match self {
+            McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+            McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
+        }
+    }
 }
 
 /// Vector store configuration (in-memory and Qdrant support)
