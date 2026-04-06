@@ -18,6 +18,8 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::watch;
 
+use std::collections::HashSet;
+
 use crate::streaming_request_hook::StreamingRequestHook;
 
 // Type aliases for provider-specific completion models
@@ -153,12 +155,14 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
             Self::OpenAI(agent) => {
@@ -237,12 +241,14 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
         let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
             Self::OpenAI(agent) => {

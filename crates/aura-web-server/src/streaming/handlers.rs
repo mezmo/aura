@@ -22,16 +22,16 @@ use crate::streaming::types::openai::UsageInfo;
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
-    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, FunctionCallChunk, MessageRole,
-    StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus, TurnContext, TurnState,
-    detect_tool_error, format_sse_chunk, truncate_result,
+    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FINISH_REASON_TOOL_CALLS, FUNCTION_TYPE,
+    FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
+    TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
 };
 use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    Agent, ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
-    StreamedAssistantContent, StreamedUserContent, ToolCall, ToolLifecycleEvent, ToolResult,
-    ToolUsageEvent, UsageState,
+    Agent, PASSTHROUGH_MARKER, ProgressNotification, RequestCancellation, ResponseContent,
+    StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent, ToolCall,
+    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
 };
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
@@ -339,7 +339,7 @@ where
     // client gets clean stream termination regardless of how long MCP cleanup takes.
     match termination {
         StreamTermination::Complete | StreamTermination::StreamError(_) => {
-            send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
+            send_final_events(config, emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
         }
 
         StreamTermination::Disconnected => {
@@ -352,14 +352,14 @@ where
             let _ = cancel_tx.send(true);
             RequestCancellation::cancel(&callbacks.request_id, "timeout");
             cancel_mcp(&callbacks, "timeout").await;
-            send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
+            send_final_events(config, emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
         }
 
         StreamTermination::Shutdown => {
             // [DONE] before MCP cleanup so client gets clean termination regardless of MCP latency
             let _ = cancel_tx.send(true);
             RequestCancellation::cancel(&callbacks.request_id, "server shutdown");
-            send_final_events(emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
+            send_final_events(config, emit_custom_events, &mut callbacks, ctx, &state, &tx).await;
             cancel_mcp(&callbacks, "server shutdown").await;
         }
     }
@@ -370,6 +370,7 @@ where
 
 /// Send final usage events, finish chunk, and [DONE] marker to the client.
 async fn send_final_events(
+    config: &StreamConfig,
     emit_custom_events: bool,
     callbacks: &mut StreamingCallbacks,
     ctx: &TurnContext,
@@ -412,7 +413,7 @@ async fn send_final_events(
         }
     }
 
-    let final_bytes = build_final_chunk(ctx, state);
+    let final_bytes = build_final_chunk(config, ctx, state);
     for bytes in final_bytes {
         let _ = tx.send(Ok(bytes)).await;
     }
@@ -517,6 +518,18 @@ fn process_stream_next(
         }
         Some(Err(e)) => {
             let error_str = e.to_string();
+
+            // When client tools are active and a client tool was called,
+            // the hook cancels the stream. This produces a cancellation error
+            // which is expected — treat it as normal end-of-stream.
+            if config.has_client_tools && state.has_passthrough_tool_calls {
+                tracing::info!(
+                    "Stream cancelled after client tool call (expected): {}",
+                    error_str
+                );
+                return NextItemResult::End(vec![]);
+            }
+
             tracing::error!("Stream error: {}", error_str);
 
             // Capture for OTel span recording after loop ends
@@ -752,6 +765,16 @@ fn handle_tool_result(
         tool_result.call_id
     );
 
+    // Detect passthrough tool results (client-side tools)
+    if tool_result.result.contains(PASSTHROUGH_MARKER) {
+        tracing::info!(
+            "Passthrough tool result detected for call: {} — suppressing",
+            tool_result.id
+        );
+        state.has_passthrough_tool_calls = true;
+        return vec![];
+    }
+
     let mut output = Vec::with_capacity(2);
     state.needs_separator = true;
 
@@ -928,8 +951,10 @@ fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCom
 }
 
 /// Build the final chunk with finish_reason.
-fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
-    let finish_reason = if let (Some(max), Some(usage)) = (ctx.max_tokens, &state.usage_stats) {
+fn build_final_chunk(_config: &StreamConfig, ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
+    let finish_reason = if state.has_passthrough_tool_calls {
+        FINISH_REASON_TOOL_CALLS
+    } else if let (Some(max), Some(usage)) = (ctx.max_tokens, &state.usage_stats) {
         if usage.completion_tokens >= max as u64 {
             FINISH_REASON_LENGTH
         } else {
@@ -938,7 +963,6 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
     } else {
         FINISH_REASON_STOP
     };
-
     let final_chunk = ChatCompletionChunk {
         id: ctx.completion_id.clone(),
         object: CHUNK_OBJECT.to_string(),
@@ -981,6 +1005,7 @@ mod tests {
             tool_result_mode: ToolResultMode::None,
             tool_result_max_length: 1000,
             fallback_tool_parsing: false,
+            has_client_tools: false,
         };
 
         let ctx = TurnContext {

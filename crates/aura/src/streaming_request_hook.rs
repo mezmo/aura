@@ -36,6 +36,7 @@ use crate::tool_event_broker::{
 };
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -257,6 +258,10 @@ pub struct StreamingRequestHook {
     request_id: String,
     /// Shared usage state (returned separately for handler access)
     usage_state: UsageState,
+    /// Names of client-side tools (passthrough tools)
+    client_tool_names: HashSet<String>,
+    /// Whether a client tool has been called in this request
+    client_tool_called: Arc<AtomicBool>,
 }
 
 impl StreamingRequestHook {
@@ -278,8 +283,16 @@ impl StreamingRequestHook {
             cancelled: rx,
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
+            client_tool_names: HashSet::new(),
+            client_tool_called: Arc::new(AtomicBool::new(false)),
         };
         (hook, tx, usage_state)
+    }
+
+    /// Set client tool names for passthrough tool detection.
+    pub fn with_client_tool_names(mut self, names: HashSet<String>) -> Self {
+        self.client_tool_names = names;
+        self
     }
 
     /// Check if the request should be cancelled (timeout or external signal).
@@ -318,7 +331,18 @@ where
         _history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
+        let has_client_tools = !self.client_tool_names.is_empty();
+        let client_tool_called = self.client_tool_called.clone();
         async move {
+            // If client tools were called, cancel before the next LLM turn.
+            // The client needs to execute the tool and send results back.
+            if has_client_tools && client_tool_called.load(Ordering::Acquire) {
+                tracing::info!(
+                    "Client tool was called — cancelling before next LLM completion call"
+                );
+                cancel_sig.cancel();
+                return;
+            }
             self.check_and_cancel(cancel_sig, "completion call");
         }
     }
@@ -362,7 +386,17 @@ where
         let request_id = self.request_id.clone();
         let tool_call_id = id;
         let args_str = args.to_string();
+        let is_client_tool = self.client_tool_names.contains(&tool_name);
+        let client_tool_called = self.client_tool_called.clone();
         async move {
+            if is_client_tool {
+                tracing::info!(
+                    "Client tool '{}' called for request '{}' — marking for passthrough",
+                    tool_name,
+                    request_id
+                );
+                client_tool_called.store(true, Ordering::Release);
+            }
             // Parse args as JSON (fallback to empty object if invalid)
             let arguments: serde_json::Value =
                 serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
