@@ -1,6 +1,6 @@
 [package]
 name = "aura-test-utils"
-version = "1.17.2"
+version = "1.17.3"
 edition = "2021"
 publish = false
 

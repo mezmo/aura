@@ -1,3 +1,10 @@
+## [1.17.3](https://github.com/mezmo/aura/compare/v1.17.2...v1.17.3) (2026-04-07)
+
+
+### Chores
+
+* **build**: Create custom check [3540da3](https://github.com/mezmo/aura/commit/3540da329e770588eb921bbebedd971812bafeb9) - Gregory Janco [LOG-23558](https://logdna.atlassian.net/browse/LOG-23558)
+
 ## [1.17.2](https://github.com/mezmo/aura/compare/v1.17.1...v1.17.2) (2026-04-06)
 
 
