@@ -1,3 +1,10 @@
+## [1.17.2](https://github.com/mezmo/aura/compare/v1.17.1...v1.17.2) (2026-04-06)
+
+
+### Chores
+
+* **errors**: add hint to agent name collision [8baac1c](https://github.com/mezmo/aura/commit/8baac1c54779b3abcfcd63c0ea366ca5921fcaca) - Justin Gross [LOG-23571](https://logdna.atlassian.net/browse/LOG-23571)
+
 ## [1.17.1](https://github.com/mezmo/aura/compare/v1.17.0...v1.17.1) (2026-04-03)
 
 
