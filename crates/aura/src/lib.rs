@@ -19,6 +19,7 @@ pub mod mcp_streamable_http;
 pub mod mcp_tool_execution;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
+pub mod passthrough_tool;
 mod provider_agent; // Private - internal implementation detail
 pub mod rag_tools;
 pub mod request_cancellation;
@@ -40,11 +41,14 @@ pub use config::{
     ReasoningEffort, ToolsConfig, VectorStoreConfig,
 };
 pub use error::{BuilderError, BuilderResult};
+pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
     ToolCall, ToolResult,
 };
 pub use rig::completion::Message;
+pub use rig::message::{AssistantContent, ToolCall as RigToolCall, ToolResultContent, UserContent};
+pub use rig::one_or_many::OneOrMany;
 pub use streaming::StreamingAgent;
 
 // Legacy aliases (deprecated)
