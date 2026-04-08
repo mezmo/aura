@@ -21,6 +21,16 @@ This project depends on a fork of rig-core with streaming and observability fixe
 - `request_cancellation.rs` - Per-request lifecycle and disconnect detection
 - `tool_event_broker.rs` - Tool call/result correlation via FIFO queue
 
+## Commit and Contribution Rules
+
+- **No AI co-authorship**: Never add `Co-Authored-By` lines for Claude or any AI assistant. Claude cannot accept the CLA.
+- **Sign-off commits as the user**: Always sign off commits as the human user, not as Claude.
+- **Commit message format**: [Conventional Commits](https://www.conventionalcommits.org/). First line must be entirely lowercase, no trailing period, under 72 characters. Use the body to explain **what** and **why**.
+  Format: `<type>(<optional scope>): <description>`
+  Types: `feat`, `fix`, `doc`, `style`, `refactor`, `perf`, `test`, `chore`, `ci`
+  Breaking changes: add `!` after type/scope and include a `BREAKING CHANGE:` footer.
+  If fixing an issue, include `Fixes: #<issue number>` in the footer.
+
 ## Documentation
 
 - `README.md` - Setup, configuration, and usage
