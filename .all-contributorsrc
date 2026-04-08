@@ -1,0 +1,26 @@
+{
+  "files": [
+    "README.md"
+  ],
+  "imageSize": 100,
+  "commit": false,
+  "commitType": "docs",
+  "commitConvention": "angular",
+  "contributors": [
+    {
+      "login": "charlesjohnson",
+      "name": "Chip Johnson",
+      "avatar_url": "https://avatars.githubusercontent.com/u/541978?v=4",
+      "profile": "http://blog.chipjohnson.net",
+      "contributions": [
+        "doc"
+      ]
+    }
+  ],
+  "contributorsPerLine": 7,
+  "skipCi": true,
+  "repoType": "github",
+  "repoHost": "https://github.com",
+  "projectName": "aura",
+  "projectOwner": "mezmo"
+}
