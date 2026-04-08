@@ -314,7 +314,7 @@ and optional footer can use lower and upper casing.
 | ---------- | ------------------------------------------------------- |
 | `feat`     | A new feature                                           |
 | `fix`      | A bug fix                                               |
-| `docs`     | Documentation only changes                              |
+| `doc`      | Documentation only changes                              |
 | `style`    | Formatting, missing semicolons, etc. (no code change)   |
 | `refactor` | Code change that neither fixes a bug nor adds a feature |
 | `perf`     | Performance improvement                                 |
@@ -329,7 +329,7 @@ feat(config): add support for gemini provider
 
 fix(streaming): correct sse event ordering on disconnect
 
-docs: add ollama troubleshooting guide
+doc: add ollama troubleshooting guide
 
 test(mcp): add header forwarding integration tests
 
