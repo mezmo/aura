@@ -25,16 +25,17 @@ This project depends on a fork of rig-core with streaming and observability fixe
 
 - **No AI co-authorship**: Never add `Co-Authored-By` lines for Claude or any AI assistant. Claude cannot accept the CLA, so contributions will be rejected if Claude is listed as a contributor.
 - **Sign-off commits as the user**: Always sign off commits as the human user who is running you, not as Claude.
-- **Commit message format**:
+- **Commit message format**: Follow the [Conventional Commit Standard](https://www.conventionalcommits.org/en/v1.0.0/). Write in imperative form. Break lines at 72 columns.
   ```
-  type: title
+  type: summarize what was done
 
-  body
+  Explain WHY the change was made in addition to what changed.
+  A blank line should start and end the commit body.
 
-  Ref: <JIRA Ref, if applicable, e.g. LOG-12345>
+  BREAKING CHANGE: describe if this is a major change
+  Fixes: #<issue number>
   ```
-  Where `type` is one of: `feat`, `fix`, `chore`, `docs`, `refactor`,
-  `test`, etc.
+  Where `type` is one of: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, etc.
 
 ## Documentation
 
