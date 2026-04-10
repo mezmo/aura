@@ -124,15 +124,17 @@ config:
   #   api_key: "{{ env.OPENAI_API_KEY }}"
   #   model: gpt-4o
   #   base_url: ""               # optional
+  #   temperature: 0.7
+  #   max_tokens: 2000
   #   region: ""                  # bedrock only
   #   profile: ""                 # bedrock only
-  #   num_ctx: 0                  # ollama only
-  #   num_predict: 0              # ollama only
   #   fallback_tool_parsing: false  # ollama only
   #   additional_params:           # → [llm.additional_params]
   #     seed: 42
   #     top_k: 40
   #     top_p: 0.9
+  #     num_ctx: 0                  # ollama only
+  #     num_predict: 0              # ollama only
 
   # -- Agent configuration → [agent]
   agent: {}
@@ -140,8 +142,6 @@ config:
   #   system_prompt: "You are a helpful assistant."
   #   context: []
   #   turn_depth: 6
-  #   temperature: 0.7
-  #   max_tokens: 2000
 
   # -- Vector stores → [[vector_stores]]
   vector_stores: []

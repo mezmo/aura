@@ -21,6 +21,7 @@
 provider = "anthropic"
 api_key = "{{ env.ANTHROPIC_API_KEY }}"
 model = "claude-sonnet-4-5-20250929"
+temperature = 0.3
 
 [agent]
 name = "Math Orchestrator"
@@ -33,7 +34,6 @@ ROUTING GUIDANCE:
 - Multi-step calculations or mixed domains: create a plan with workers
 - Vague or ambiguous requests: ask for clarification
 """
-temperature = 0.3
 
 [mcp]
 sanitize_schemas = false

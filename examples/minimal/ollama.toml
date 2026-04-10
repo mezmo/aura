@@ -15,6 +15,7 @@
 provider = "ollama"
 model = "qwen3:30b-a3b"
 # base_url = "http://localhost:11434"  # default; uncomment to override
+temperature = 0.7
 
 # Enable fallback parsing for models that emit tool calls as text
 # instead of structured function-calling format.
@@ -33,5 +34,4 @@ num_ctx = 32000
 [agent]
 name = "Local Assistant"
 system_prompt = "You are a helpful assistant."
-temperature = 0.7
 turn_depth = 5

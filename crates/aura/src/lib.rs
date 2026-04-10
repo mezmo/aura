@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
+pub mod lenient_int;
 pub mod logging;
 pub mod mcp;
 pub mod mcp_dynamic;

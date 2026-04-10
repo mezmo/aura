@@ -26,46 +26,6 @@ use tokio::sync::watch;
 /// before tool calls, so 12 gives adequate headroom.
 pub const DEFAULT_MAX_DEPTH: usize = 12;
 
-/// Check if model supports reasoning_effort parameter
-pub(crate) fn is_reasoning_model(model: &str) -> bool {
-    model.starts_with("o1")
-        || model.starts_with("o3")
-        || model.starts_with("o4")
-        || model.starts_with("gpt-5")
-}
-
-/// Build Ollama-specific parameters for the agent builder.
-///
-/// Combines `num_ctx`, `num_predict`, and any `additional_params` into a single
-/// JSON object that gets passed to Rig's `additional_params()` method.
-///
-/// Returns `None` if no parameters are set.
-pub(crate) fn build_ollama_params(
-    num_ctx: Option<u32>,
-    num_predict: Option<u32>,
-    additional_params: Option<std::collections::HashMap<String, serde_json::Value>>,
-) -> Option<serde_json::Value> {
-    let mut params = serde_json::Map::new();
-
-    if let Some(ctx) = num_ctx {
-        params.insert("num_ctx".to_string(), serde_json::json!(ctx));
-    }
-    if let Some(predict) = num_predict {
-        params.insert("num_predict".to_string(), serde_json::json!(predict));
-    }
-    if let Some(additional) = additional_params {
-        for (key, value) in additional {
-            params.insert(key, value);
-        }
-    }
-
-    if params.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(params))
-    }
-}
-
 /// Shallow-merge two JSON values at the top level.
 ///
 /// If both are objects, keys from `b` are inserted into `a` (overwriting on conflict).
@@ -141,9 +101,9 @@ pub struct Agent {
     /// Cached tool names for fallback parsing (avoids recomputing on each stream).
     /// Only populated when `fallback_tool_parsing` is enabled.
     pub(crate) fallback_tool_names: Vec<String>,
-    /// Configured context window size in tokens (from TOML config).
+    /// Configured context window size in tokens (from LLM TOML config).
     /// Used for usage percentage reporting in streaming events.
-    pub(crate) context_window: Option<u32>,
+    pub(crate) context_window: Option<u64>,
 }
 
 impl Agent {
@@ -208,6 +168,9 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing OpenAI provider");
@@ -232,29 +195,17 @@ impl Agent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder.preamble(config.effective_preamble());
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                // Build combined additional_params: reasoning_effort + agent-level params
+                // Build combined additional_params: reasoning_effort
                 // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
                 let mut combined_params: Option<serde_json::Value> = None;
-                if let Some(effort) = config.agent.reasoning_effort {
-                    if is_reasoning_model(model) {
-                        let effort_str = match effort {
-                            crate::config::ReasoningEffort::Minimal => "minimal",
-                            crate::config::ReasoningEffort::Low => "low",
-                            crate::config::ReasoningEffort::Medium => "medium",
-                            crate::config::ReasoningEffort::High => "high",
-                        };
-                        combined_params = Some(serde_json::json!({"reasoning_effort": effort_str}));
-                    } else {
-                        tracing::warn!(
-                            "reasoning_effort ignored for model '{}' (only supported on o1/o3/o4/gpt-5+)",
-                            model
-                        );
-                    }
+                if let Some(effort) = *reasoning_effort {
+                    combined_params =
+                        Some(serde_json::json!({"reasoning_effort": effort.to_string()}));
                 }
-                if let Some(ref params) = config.agent.additional_params {
+                if let Some(params) = additional_params {
                     combined_params = Some(match combined_params {
                         Some(existing) => merge_json(existing, params.clone()),
                         None => params.clone(),
@@ -263,7 +214,8 @@ impl Agent {
                 if let Some(params) = combined_params {
                     agent_builder = agent_builder.additional_params(params);
                 }
-                if let Some(max) = config.agent.max_tokens {
+
+                if let Some(max) = config.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
 
@@ -279,6 +231,8 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing Anthropic provider");
@@ -301,13 +255,13 @@ impl Agent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder.preamble(config.effective_preamble());
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.agent.max_tokens {
+                if let Some(max) = config.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
-                if let Some(ref params) = config.agent.additional_params {
+                if let Some(params) = additional_params {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
@@ -322,6 +276,8 @@ impl Agent {
                 model,
                 region,
                 profile,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing AWS Bedrock provider");
@@ -358,13 +314,13 @@ impl Agent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder.preamble(config.effective_preamble());
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(max) = config.agent.max_tokens {
+                if let Some(max) = config.llm.max_tokens() {
                     agent_builder = agent_builder.max_tokens(max);
                 }
-                if let Some(ref params) = config.agent.additional_params {
+                if let Some(params) = additional_params {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
@@ -379,6 +335,8 @@ impl Agent {
                 api_key,
                 model,
                 base_url,
+                temperature,
+                additional_params,
                 ..
             } => {
                 tracing::info!("Initializing Gemini provider");
@@ -399,10 +357,10 @@ impl Agent {
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder.preamble(config.effective_preamble());
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
-                if let Some(ref params) = config.agent.additional_params {
+                if let Some(params) = additional_params {
                     agent_builder = agent_builder.additional_params(params.clone());
                 }
 
@@ -416,8 +374,7 @@ impl Agent {
             LlmConfig::Ollama {
                 model,
                 base_url,
-                num_ctx,
-                num_predict,
+                temperature,
                 additional_params,
                 ..
             } => {
@@ -438,25 +395,12 @@ impl Agent {
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
                 agent_builder = agent_builder.preamble(config.effective_preamble());
-                if let Some(temp) = config.agent.temperature {
-                    agent_builder = agent_builder.temperature(temp);
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
                 }
 
-                // Build combined params: Ollama-specific (num_ctx, num_predict) + agent-level
-                // Must be a single call — AgentBuilder::additional_params() replaces, not merges.
-                {
-                    let mut combined =
-                        build_ollama_params(*num_ctx, *num_predict, additional_params.clone());
-                    if let Some(ref params) = config.agent.additional_params {
-                        combined = Some(match combined {
-                            Some(existing) => merge_json(existing, params.clone()),
-                            None => params.clone(),
-                        });
-                    }
-                    if let Some(params) = combined {
-                        tracing::info!("  Ollama+agent params: {}", params);
-                        agent_builder = agent_builder.additional_params(params);
-                    }
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
@@ -475,7 +419,7 @@ impl Agent {
             mcp_manager,
             fallback_tool_parsing,
             fallback_tool_names,
-            context_window: config.agent.context_window,
+            context_window: config.llm.context_window(),
         })
     }
 
@@ -1000,11 +944,6 @@ impl Agent {
     pub fn mcp_manager(&self) -> Option<&McpManager> {
         self.mcp_manager.as_deref()
     }
-
-    /// Get the configured context window size in tokens.
-    pub fn context_window(&self) -> Option<u32> {
-        self.context_window
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,7 +1069,7 @@ impl StreamingAgent for Agent {
         Agent::clear_mcp_request_id(self).await
     }
 
-    fn context_window(&self) -> Option<u32> {
+    fn context_window(&self) -> Option<u64> {
         self.context_window
     }
 }
