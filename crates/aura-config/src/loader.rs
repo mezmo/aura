@@ -190,9 +190,6 @@ fn merge_configs(base_config: Config, override_config: Config) -> Result<Config,
     if !override_config.agent.context.is_empty() {
         result.agent.context = override_config.agent.context;
     }
-    if override_config.agent.temperature.is_some() {
-        result.agent.temperature = override_config.agent.temperature;
-    }
 
     Ok(result)
 }

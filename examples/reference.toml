@@ -22,8 +22,14 @@
 provider = "openai"
 api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.2"
+# temperature = 0.7
+# reasoning_effort = "medium"  # minimal, low, medium, high (provider support varies)
 # max_tokens = 8192
 # base_url = "https://api.openai.com/v1"  # custom endpoint
+# Context window size in tokens. Used for usage percentage reporting
+# in aura.session_info streaming events. Set this to your model's
+# actual context window.
+# context_window = 200000
 
 # Anthropic alternative:
 # provider = "anthropic"
@@ -135,12 +141,6 @@ Workflow:
 #                              # Used in /v1/models response. Defaults to current time.
 # model_owner = "mezmo"        # override `owned_by` in /v1/models responses.
 #                              # Defaults to the LLM provider (e.g. "openai", "anthropic").
-# reasoning_effort = "medium"  # minimal, low, medium, high (provider support varies)
-# temperature = 0.7
 # Maximum tool-calling rounds per user turn. Higher values allow
 # deeper multi-step workflows but consume more tokens.
 turn_depth = 5
-# Context window size in tokens. Used for usage percentage reporting
-# in aura.session_info streaming events. Set this to your model's
-# actual context window.
-# context_window = 200000

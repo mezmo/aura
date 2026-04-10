@@ -3,59 +3,9 @@
 use crate::orchestration::OrchestrationConfig;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
-/// Serde helpers for accepting whole-number floats (e.g. `8000.0`) as integers.
-///
-/// Helm's YAML parser represents all numbers as Go float64, so `toToml`
-/// renders `max_tokens = 8000.0` instead of `8000`. Rather than fixing this
-/// in Helm templates, we accept both forms on the Rust side.
-pub mod lenient_int {
-    use serde::{Deserialize, Deserializer};
-
-    /// Deserialize a value that may be either an integer or a whole-number float.
-    pub fn deserialize_option_u32<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<u32>, D::Error> {
-        Option::<f64>::deserialize(deserializer)?
-            .map(|f| float_to_int(f, "u32"))
-            .transpose()
-    }
-
-    pub fn deserialize_option_u64<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<u64>, D::Error> {
-        Option::<f64>::deserialize(deserializer)?
-            .map(|f| float_to_int(f, "u64"))
-            .transpose()
-    }
-
-    pub fn deserialize_option_usize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<usize>, D::Error> {
-        Option::<f64>::deserialize(deserializer)?
-            .map(|f| float_to_int(f, "usize"))
-            .transpose()
-    }
-
-    fn float_to_int<T, E>(f: f64, type_name: &str) -> Result<T, E>
-    where
-        T: TryFrom<u64>,
-        E: serde::de::Error,
-    {
-        if f < 0.0 {
-            return Err(E::custom(format!(
-                "expected non-negative number for {type_name}, got {f}"
-            )));
-        }
-        if f.fract() != 0.0 {
-            return Err(E::custom(format!(
-                "expected whole number for {type_name}, got {f}"
-            )));
-        }
-        let n = f as u64;
-        T::try_from(n).map_err(|_| E::custom(format!("{f} out of range for {type_name}")))
-    }
-}
+use crate::lenient_int;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -72,8 +22,21 @@ pub enum ReasoningEffort {
     High,
 }
 
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Complete configuration for building an agent
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub llm: LlmConfig,
     pub agent: AgentSettings,
@@ -199,22 +162,47 @@ impl std::fmt::Debug for AgentConfig {
 /// LLM provider configuration with strong typing per provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
 pub enum LlmConfig {
     OpenAI {
         api_key: String,
         model: String,
         #[serde(default)]
         base_url: Option<String>,
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        max_tokens: Option<u32>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        max_tokens: Option<u64>,
+        /// Context window size in tokens.
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        context_window: Option<u64>,
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
+        /// Controls the randomness and creativity of the llm
+        #[serde(default)]
+        temperature: Option<f64>,
+        /// Additional provider-specific parameters merged into the API request.
+        /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+        /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
+        #[serde(default)]
+        additional_params: Option<serde_json::Value>,
     },
     Anthropic {
         api_key: String,
         model: String,
         #[serde(default)]
         base_url: Option<String>,
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        max_tokens: Option<u32>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        max_tokens: Option<u64>,
+        /// Context window size in tokens.
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        context_window: Option<u64>,
+        /// Controls the randomness and creativity of the llm
+        #[serde(default)]
+        temperature: Option<f64>,
+        /// Additional provider-specific parameters merged into the API request.
+        /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+        /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
+        #[serde(default)]
+        additional_params: Option<serde_json::Value>,
     },
     Bedrock {
         model: String,
@@ -222,23 +210,50 @@ pub enum LlmConfig {
         /// AWS profile name (optional, uses default credentials if not specified)
         #[serde(default)]
         profile: Option<String>,
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        max_tokens: Option<u32>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        max_tokens: Option<u64>,
+        /// Context window size in tokens.
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        context_window: Option<u64>,
+        #[serde(default)]
+        temperature: Option<f64>,
+        /// Additional provider-specific parameters merged into the API request.
+        /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+        /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
+        #[serde(default)]
+        additional_params: Option<serde_json::Value>,
     },
     Gemini {
         api_key: String,
         model: String,
         #[serde(default)]
         base_url: Option<String>,
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        max_tokens: Option<u32>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        max_tokens: Option<u64>,
+        /// Context window size in tokens.
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        context_window: Option<u64>,
+        /// Controls the randomness and creativity of the llm
+        #[serde(default)]
+        temperature: Option<f64>,
+        /// Additional provider-specific parameters merged into the API request.
+        /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
+        /// Example: `{ thinking = { type = "adaptive", budget_tokens = 8000 } }`
+        #[serde(default)]
+        additional_params: Option<serde_json::Value>,
     },
     Ollama {
         model: String,
-        #[serde(default)]
+        #[serde(default = "default_ollama_base_url")]
         base_url: Option<String>,
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        max_tokens: Option<u32>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        max_tokens: Option<u64>,
+        /// Context window size in tokens.
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        context_window: Option<u64>,
+        /// Controls the randomness and creativity of the llm
+        #[serde(default)]
+        temperature: Option<f64>,
         /// Parse tool calls from text output (Ollama-specific workaround).
         ///
         /// Some Ollama models (especially qwen3-coder) output tool calls as text
@@ -252,16 +267,31 @@ pub enum LlmConfig {
         /// See: `fallback_tool_parser` module for supported formats.
         #[serde(default)]
         fallback_tool_parsing: bool,
-        /// Context window size (number of tokens). Maps to Ollama's `num_ctx` option.
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        num_ctx: Option<u32>,
-        /// Maximum number of tokens to predict. Maps to Ollama's `num_predict` option.
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        num_predict: Option<u32>,
         /// Additional Ollama-specific parameters passed directly to the API.
+        /// Examples: seed, top_k, top_p, mirostat, etc.
+        /// See: https://github.com/ollama/ollama/blob/main/docs/modelfile.mdx#valid-parameters-and-values
         #[serde(default)]
-        additional_params: Option<HashMap<String, serde_json::Value>>,
+        additional_params: Option<serde_json::Value>,
     },
+}
+
+fn default_ollama_base_url() -> Option<String> {
+    Some("http://localhost:11434".to_string())
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        LlmConfig::OpenAI {
+            api_key: String::new(),
+            model: "gpt-4o".to_string(),
+            base_url: None,
+            reasoning_effort: None,
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            additional_params: None,
+        }
+    }
 }
 
 impl LlmConfig {
@@ -277,6 +307,49 @@ impl LlmConfig {
                 ..
             }
         )
+    }
+
+    /// Get max_tokens regardless of provider.
+    pub fn max_tokens(&self) -> Option<u64> {
+        match self {
+            LlmConfig::OpenAI { max_tokens, .. }
+            | LlmConfig::Anthropic { max_tokens, .. }
+            | LlmConfig::Bedrock { max_tokens, .. }
+            | LlmConfig::Gemini { max_tokens, .. }
+            | LlmConfig::Ollama { max_tokens, .. } => *max_tokens,
+        }
+    }
+
+    /// Get context_window regardless of provider.
+    pub fn context_window(&self) -> Option<u64> {
+        match self {
+            LlmConfig::OpenAI { context_window, .. }
+            | LlmConfig::Anthropic { context_window, .. }
+            | LlmConfig::Bedrock { context_window, .. }
+            | LlmConfig::Gemini { context_window, .. }
+            | LlmConfig::Ollama { context_window, .. } => *context_window,
+        }
+    }
+
+    /// Get additional_params regardless of provider.
+    pub fn additional_params(&self) -> Option<serde_json::Value> {
+        match self {
+            LlmConfig::OpenAI {
+                additional_params, ..
+            }
+            | LlmConfig::Anthropic {
+                additional_params, ..
+            }
+            | LlmConfig::Bedrock {
+                additional_params, ..
+            }
+            | LlmConfig::Gemini {
+                additional_params, ..
+            }
+            | LlmConfig::Ollama {
+                additional_params, ..
+            } => additional_params.clone(),
+        }
     }
 
     /// Get the model name regardless of provider.
@@ -300,6 +373,17 @@ impl LlmConfig {
             LlmConfig::Ollama { model, .. } => ("ollama", model),
         }
     }
+
+    /// Accessor for temperature regardless of provider.
+    pub fn temperature(&self) -> Option<f64> {
+        match self {
+            LlmConfig::OpenAI { temperature, .. }
+            | LlmConfig::Anthropic { temperature, .. }
+            | LlmConfig::Bedrock { temperature, .. }
+            | LlmConfig::Gemini { temperature, .. }
+            | LlmConfig::Ollama { temperature, .. } => *temperature,
+        }
+    }
 }
 
 /// Agent behavior settings
@@ -308,18 +392,8 @@ pub struct AgentSettings {
     pub name: String,
     pub system_prompt: String,
     pub context: Vec<String>,
-    pub temperature: Option<f64>,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
-    pub max_tokens: Option<u64>,
     #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
     pub turn_depth: Option<usize>,
-    /// Context window size in tokens. Used for usage percentage reporting.
-    #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-    pub context_window: Option<u32>,
-    /// Additional provider-specific parameters merged into the API request.
-    /// Provider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.
-    pub additional_params: Option<serde_json::Value>,
     /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added.
     /// Supports glob syntax: `*` (any chars), `?` (single char).
@@ -393,17 +467,16 @@ impl Default for AgentConfig {
                 model: "gpt-4o-mini".to_string(),
                 base_url: None,
                 max_tokens: None,
+                context_window: None,
+                temperature: None,
+                reasoning_effort: None,
+                additional_params: None,
             },
             agent: AgentSettings {
                 name: "Assistant".to_string(),
                 system_prompt: "You are a helpful assistant.".to_string(),
                 context: vec![],
-                temperature: Some(0.7),
-                reasoning_effort: None,
-                max_tokens: None,
                 turn_depth: Some(5),
-                context_window: None,
-                additional_params: None,
                 mcp_filter: None,
             },
             vector_stores: Vec::new(),
@@ -581,155 +654,5 @@ mod tests {
         assert!(config.tool_matches_filter("mezmo_pipelines"));
         assert!(config.tool_matches_filter("QueryKnowledgeBases"));
         assert!(!config.tool_matches_filter("other_tool"));
-    }
-
-    // --- lenient_int tests (from helm YAML config rendering) ---
-    use super::lenient_int;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TestU32 {
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        val: Option<u32>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TestU64 {
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
-        val: Option<u64>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TestUsize {
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
-        val: Option<usize>,
-    }
-
-    fn from_json<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-
-    #[test]
-    fn accepts_integer() {
-        let t: TestU32 = from_json(r#"{"val": 8000}"#).unwrap();
-        assert_eq!(t.val, Some(8000));
-    }
-
-    #[test]
-    fn accepts_whole_float() {
-        let t: TestU32 = from_json(r#"{"val": 8000.0}"#).unwrap();
-        assert_eq!(t.val, Some(8000));
-    }
-
-    #[test]
-    fn accepts_zero_float() {
-        let t: TestU32 = from_json(r#"{"val": 0.0}"#).unwrap();
-        assert_eq!(t.val, Some(0));
-    }
-
-    #[test]
-    fn rejects_fractional_float() {
-        let result = from_json::<TestU32>(r#"{"val": 3.14}"#);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn accepts_none() {
-        let t: TestU32 = from_json(r#"{}"#).unwrap();
-        assert_eq!(t.val, None);
-    }
-
-    #[test]
-    fn u64_whole_float() {
-        let t: TestU64 = from_json(r#"{"val": 100000.0}"#).unwrap();
-        assert_eq!(t.val, Some(100000));
-    }
-
-    #[test]
-    fn usize_whole_float() {
-        let t: TestUsize = from_json(r#"{"val": 5.0}"#).unwrap();
-        assert_eq!(t.val, Some(5));
-    }
-
-    #[test]
-    fn rejects_negative() {
-        let result = from_json::<TestU32>(r#"{"val": -1.0}"#);
-        assert!(result.is_err());
-    }
-}
-
-#[cfg(test)]
-mod lenient_int_tests {
-    use super::lenient_int;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TestU32 {
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u32")]
-        val: Option<u32>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TestU64 {
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
-        val: Option<u64>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TestUsize {
-        #[serde(default, deserialize_with = "lenient_int::deserialize_option_usize")]
-        val: Option<usize>,
-    }
-
-    fn from_json<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-
-    #[test]
-    fn accepts_integer() {
-        let t: TestU32 = from_json(r#"{"val": 8000}"#).unwrap();
-        assert_eq!(t.val, Some(8000));
-    }
-
-    #[test]
-    fn accepts_whole_float() {
-        let t: TestU32 = from_json(r#"{"val": 8000.0}"#).unwrap();
-        assert_eq!(t.val, Some(8000));
-    }
-
-    #[test]
-    fn accepts_zero_float() {
-        let t: TestU32 = from_json(r#"{"val": 0.0}"#).unwrap();
-        assert_eq!(t.val, Some(0));
-    }
-
-    #[test]
-    fn rejects_fractional_float() {
-        let result = from_json::<TestU32>(r#"{"val": 3.14}"#);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn accepts_none() {
-        let t: TestU32 = from_json(r#"{}"#).unwrap();
-        assert_eq!(t.val, None);
-    }
-
-    #[test]
-    fn u64_whole_float() {
-        let t: TestU64 = from_json(r#"{"val": 100000.0}"#).unwrap();
-        assert_eq!(t.val, Some(100000));
-    }
-
-    #[test]
-    fn usize_whole_float() {
-        let t: TestUsize = from_json(r#"{"val": 5.0}"#).unwrap();
-        assert_eq!(t.val, Some(5));
-    }
-
-    #[test]
-    fn rejects_negative() {
-        let result = from_json::<TestU32>(r#"{"val": -1.0}"#);
-        assert!(result.is_err());
     }
 }

@@ -1,3 +1,4 @@
+---
 apiVersion: "deploy.razee.io/v1alpha2"
 kind: MustacheTemplate
 metadata:
@@ -13,6 +14,7 @@ metadata:
     razee.io/branch: "${GIT_BRANCH}"
 spec:
   env:
+
   - name: command
     optional: true
     default: '["./aura-web-server"]'

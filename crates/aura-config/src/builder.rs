@@ -1,8 +1,8 @@
 use crate::{Config, ConfigError};
 use aura::{
-    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
-    McpServerConfig, OrchestrationConfig, ReasoningEffort, StreamingAgent, ToolsConfig,
-    VectorStoreConfig, orchestration::ToolVisibility as AuraToolVisibility,
+    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, McpConfig,
+    McpServerConfig, OrchestrationConfig, StreamingAgent, ToolsConfig, VectorStoreConfig,
+    orchestration::ToolVisibility as AuraToolVisibility,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,82 +22,13 @@ impl RigBuilder {
     }
 
     fn to_agent_config(&self) -> Result<AgentConfig, ConfigError> {
-        let llm = match &self.config.llm {
-            crate::config::LlmConfig::OpenAI {
-                api_key,
-                model,
-                base_url,
-            } => LlmConfig::OpenAI {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Anthropic {
-                api_key,
-                model,
-                base_url,
-            } => LlmConfig::Anthropic {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Bedrock {
-                model,
-                region,
-                profile,
-            } => LlmConfig::Bedrock {
-                model: model.clone(),
-                region: region.clone(),
-                profile: profile.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Gemini {
-                api_key,
-                model,
-                base_url,
-            } => LlmConfig::Gemini {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Ollama {
-                model,
-                base_url,
-                fallback_tool_parsing,
-                num_ctx,
-                num_predict,
-                additional_params,
-            } => LlmConfig::Ollama {
-                model: model.clone(),
-                base_url: Some(base_url.clone()),
-                max_tokens: None,
-                fallback_tool_parsing: *fallback_tool_parsing,
-                num_ctx: *num_ctx,
-                num_predict: *num_predict,
-                additional_params: additional_params.clone(),
-            },
-        };
-
-        let reasoning_effort = self.config.agent.reasoning_effort.map(|r| match r {
-            crate::config::ReasoningEffort::Minimal => ReasoningEffort::Minimal,
-            crate::config::ReasoningEffort::Low => ReasoningEffort::Low,
-            crate::config::ReasoningEffort::Medium => ReasoningEffort::Medium,
-            crate::config::ReasoningEffort::High => ReasoningEffort::High,
-        });
+        let llm = self.config.llm.clone();
 
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
             context: self.config.agent.context.clone(),
-            temperature: self.config.agent.temperature,
-            reasoning_effort,
-            max_tokens: self.config.agent.max_tokens,
             turn_depth: self.config.agent.turn_depth,
-            context_window: self.config.agent.context_window,
-            additional_params: self.config.agent.additional_params.clone(),
             mcp_filter: self.config.agent.mcp_filter.clone(),
         };
 

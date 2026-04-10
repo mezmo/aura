@@ -6,6 +6,7 @@
 provider = "openai"
 api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.1"
+temperature = 0.0
 
 # MCP Configuration - Mock MCP server for tool execution tests
 # URLs use environment variables with defaults for local development.
@@ -81,5 +82,4 @@ EXAMPLES:
 - "Call slow_task with task_id='test1' and duration_seconds=5" → slow_task(task_id="test1", duration_seconds=5)
 - "Say hello" → Respond with text (no tool needed)
 """
-temperature = 0.0
 turn_depth = 3 # Lower depth for faster tests

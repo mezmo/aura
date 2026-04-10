@@ -153,6 +153,8 @@ For LibreChat/OpenWebUI integration, see [development/README.md](development/REA
 
 ## Configuration
 
+> **Breaking changes (10 April 2026)**: Several fields have moved from `[agent]` to `[llm]` and Ollama-specific fields have been consolidated under `[llm.additional_params]`. Configs that have not been updated will fail to parse. See [./docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md) for migration details.
+
 `CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
 ### Multiple Agents
@@ -222,6 +224,7 @@ Minimal example:
 provider = "openai"
 api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.2"
+context_window = 128000
 
 [mcp.servers.my_server]
 transport = "http_streamable"
@@ -409,6 +412,7 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
 - [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
+- [20260410-configuration-breaking-changes.md](20260410-configuration-breaking-changes.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
 ## Architecture
 
