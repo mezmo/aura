@@ -84,7 +84,7 @@ pub struct AgentConfig {
     pub orchestration_chat_history: Option<Arc<Vec<rig::completion::Message>>>,
 
     /// Session ID for grouping orchestration runs under a shared namespace (not serialized).
-    /// When set, persistence paths become `{memory_dir}/{session_id}/{run_id}/...`.
+    /// When set, persistence paths become `{execution_memory_base_path}/{session_id}/{run_id}/...`.
     /// Threaded from the web server's `chat_session_id`.
     #[serde(skip)]
     pub session_id: Option<String>,

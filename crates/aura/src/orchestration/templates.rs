@@ -579,7 +579,7 @@ TOOL USAGE:
             allow_clarification: true,
             workers,
             artifacts: ArtifactsConfig {
-                memory_dir: Some("/tmp/aura-math-orchestration".to_string()),
+                execution_memory_base_path: Some("/tmp/aura-math-orchestration".to_string()),
                 ..Default::default()
             },
             ..Default::default()

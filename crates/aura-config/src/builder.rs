@@ -139,7 +139,7 @@ impl RigBuilder {
                     per_call_timeout_secs: orch.timeouts.per_call_timeout_secs,
                 },
                 artifacts: aura::orchestration::ArtifactsConfig {
-                    memory_dir: orch.artifacts.memory_dir.clone(),
+                    execution_memory_base_path: orch.artifacts.execution_memory_base_path.clone(),
                     result_artifact_threshold: orch.artifacts.result_artifact_threshold,
                     result_summary_length: orch.artifacts.result_summary_length,
                     session_history_turns: orch.artifacts.session_history_turns,

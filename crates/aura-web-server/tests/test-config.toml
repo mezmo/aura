@@ -53,6 +53,7 @@ api_key = "{{ env.OPENAI_API_KEY }}"
 [agent]
 name = "Test Assistant"
 alias = "test-assistant"
+execution_memory_base_path = "/tmp"
 system_prompt = """
 You are a test assistant. Call tools immediately when requested.
 

@@ -48,7 +48,7 @@ tools_in_planning = "summary"
 per_call_timeout_secs = 120
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-math-qwen35"
+execution_memory_base_path = "/tmp/aura-math-qwen35"
 
 # Arithmetic worker: basic operations
 [orchestration.worker.arithmetic]

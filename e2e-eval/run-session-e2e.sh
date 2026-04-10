@@ -182,8 +182,8 @@ print(text[:500])
   fi
 
   # Check persistence directory for planning prompt containing session history
-  local memory_dir
-  memory_dir=$(grep -o 'memory_dir = "[^"]*"' "$RESULTS_DIR/$model_name/config-info.txt" 2>/dev/null | cut -d'"' -f2 || echo "")
+  local execution_memory_base_path
+  execution_memory_base_path=$(grep -o 'execution_memory_base_path = "[^"]*"' "$RESULTS_DIR/$model_name/config-info.txt" 2>/dev/null | cut -d'"' -f2 || echo "")
 
   printf "  %-25s %6dms  tools=%-2s %-4s" "$label" "$elapsed_ms" "$tool_calls" "$status"
   if [[ "$completed" == "yes" ]]; then
@@ -231,7 +231,7 @@ for idx in "${!CONFIGS[@]}"; do
   echo "--- $model ($config) ---"
 
   # Save config info
-  grep -E "memory_dir|session_history_turns|model" "$config" > "$outdir/config-info.txt" 2>/dev/null || true
+  grep -E "execution_memory_base_path|session_history_turns|model" "$config" > "$outdir/config-info.txt" 2>/dev/null || true
 
   # Start server
   CONFIG_PATH="$config" AURA_CUSTOM_EVENTS=true AURA_EMIT_REASONING=true AURA_PROMPT_JOURNAL=true \
@@ -273,11 +273,11 @@ print(json.dumps(history))
   echo ""
 
   # ── Analyze session artifacts ──────────────────────────────────
-  memory_dir=$(grep -o 'memory_dir *= *"[^"]*"' "$config" | head -1 | cut -d'"' -f2 || echo "")
-  if [[ -n "$memory_dir" ]]; then
-    echo "  Session artifacts ($memory_dir):"
+  execution_memory_base_path=$(grep -o 'execution_memory_base_path *= *"[^"]*"' "$config" | head -1 | cut -d'"' -f2 || echo "")
+  if [[ -n "$execution_memory_base_path" ]]; then
+    echo "  Session artifacts ($execution_memory_base_path):"
 
-    session_dir="$memory_dir/$SESSION_ID"
+    session_dir="$execution_memory_base_path/$SESSION_ID"
     if [[ -d "$session_dir" ]]; then
       manifest_count=$(find "$session_dir" -maxdepth 2 -name "manifest.json" ! -path "*/latest/*" 2>/dev/null | wc -l | tr -d ' ')
       echo "    Session dir: $session_dir"

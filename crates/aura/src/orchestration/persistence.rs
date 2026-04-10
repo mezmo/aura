@@ -8,25 +8,37 @@
 //!
 //! With session_id (web server path):
 //! ```text
-//! {base_path}/{session_id}/
-//! ├── latest -> {run_id}/              # Symlink to most recent run in session
+//! {execution_memory_base_path}/{session_id}/
+//! ├── latest -> {run_id}/                   # Symlink to most recent run in session
 //! └── {run_id}/
-//!     ├── manifest.json                # Typed run manifest (RunManifest)
-//!     ├── artifacts/                   # Run-level result artifacts
-//!     │   └── task-0-result.txt
-//!     └── iteration-{n}/              # One flat dir per iteration
+//!     ├── manifest.json                     # Typed run manifest (RunManifest)
+//!     ├── artifacts/                        # Run-level result artifacts
+//!     │   └── task-{number}-result.txt
+//!     └── iteration-{number}/               # One flat dir per iteration
+//!         ├── evaluation.prompt.txt
+//!         ├── evaluation.response.txt
+//!         ├── evaluation.result.json
 //!         ├── plan.json
-//!         ├── ...
+//!         ├── planning.prompt.txt
+//!         ├── planning.response.txt
+//!         ├── summary.json
+//!         ├── synthesis.prompt.txt
+//!         ├── synthesis.response.txt
+//!         ├── task-{number}.attempt-{number}.prompt.txt
+//!         ├── task-{number}.attempt-{number}.response.txt
+//!         ├── task-{number}.attempt-{number}.result.json
+//!         └── task-{number}.attempt-{number}.tool-calls.json
 //! ```
 //!
 //! Without session_id (CLI/test path):
 //! ```text
-//! {base_path}/
+//! {execution_memory_base_path}/
 //! ├── latest -> {run_id}/
 //! └── {run_id}/
 //!     ├── manifest.json
 //!     ├── artifacts/
-//!     └── iteration-{n}/
+//!     └── iteration-{number}/
+//!         ├── * (see above)
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -143,10 +155,15 @@ pub struct TaskExecutionRecord {
 /// Manages execution artifact persistence (async).
 #[derive(Clone)]
 pub struct ExecutionPersistence {
+    /// Base directory for this run's artifacts (e.g. `{base_path}/{session_id}/{run_id}/`).
     base_path: PathBuf,
+    /// Unique identifier for this run (UUID).
     run_id: String,
+    /// Session ID for this run (if any, used for grouping runs in web server).
     session_id: Option<String>,
+    /// Current iteration number (starts at 0, increments on replan).
     current_iteration: usize,
+    /// Whether persistence is enabled (if false, all methods are no-ops).
     enabled: bool,
 }
 
@@ -245,10 +262,13 @@ impl ExecutionPersistence {
         self.current_iteration
     }
 
-    /// Get iteration directory path (flat, directly under run dir).
-    fn iteration_path(&self) -> PathBuf {
-        self.base_path
-            .join(format!("iteration-{}", self.current_iteration))
+    /// Get iteration directory path (flat, directly under run dir), creating it if needed.
+    async fn create_or_get_iteration_path(&self) -> io::Result<PathBuf> {
+        let iter_path = self
+            .base_path
+            .join(format!("iteration-{}", self.current_iteration));
+        fs::create_dir_all(&iter_path).await?;
+        Ok(iter_path)
     }
 
     /// Build a dot-namespaced filename for a task attempt artifact.
@@ -262,8 +282,7 @@ impl ExecutionPersistence {
             return Ok(PathBuf::new());
         }
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
+        let iter_path = self.create_or_get_iteration_path().await?;
 
         let plan_path = iter_path.join("plan.json");
         let json = serde_json::to_string_pretty(plan)
@@ -280,8 +299,7 @@ impl ExecutionPersistence {
             return Ok(PathBuf::new());
         }
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
+        let iter_path = self.create_or_get_iteration_path().await?;
 
         fs::write(iter_path.join("planning.prompt.txt"), prompt).await?;
         fs::write(iter_path.join("planning.response.txt"), response).await?;
@@ -302,8 +320,7 @@ impl ExecutionPersistence {
             return Ok(PathBuf::new());
         }
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
+        let iter_path = self.create_or_get_iteration_path().await?;
 
         // Write prompt and response with namespaced filenames
         let prompt_file = self.task_attempt_filename(task_id, attempt, "prompt.txt");
@@ -339,8 +356,7 @@ impl ExecutionPersistence {
             return Ok(PathBuf::new());
         }
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
+        let iter_path = self.create_or_get_iteration_path().await?;
 
         fs::write(iter_path.join("synthesis.prompt.txt"), prompt).await?;
         fs::write(iter_path.join("synthesis.response.txt"), response).await?;
@@ -361,8 +377,7 @@ impl ExecutionPersistence {
             return Ok(PathBuf::new());
         }
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
+        let iter_path = self.create_or_get_iteration_path().await?;
 
         fs::write(iter_path.join("evaluation.prompt.txt"), prompt).await?;
         fs::write(iter_path.join("evaluation.response.txt"), response).await?;
@@ -395,8 +410,7 @@ impl ExecutionPersistence {
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
+        let iter_path = self.create_or_get_iteration_path().await?;
 
         let summary_path = iter_path.join("summary.json");
         let json = serde_json::to_string_pretty(&summary)
@@ -534,9 +548,7 @@ impl ExecutionPersistence {
             return Ok(());
         }
 
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
-
+        let iter_path = self.create_or_get_iteration_path().await?;
         let tool_file = self.task_attempt_filename(task_id, attempt, "tool-calls.json");
         let tool_calls_path = iter_path.join(&tool_file);
 

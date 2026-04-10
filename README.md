@@ -256,7 +256,7 @@ max_planning_cycles = 3
 tools_in_planning = "summary"
 allow_direct_answers = true
 allow_clarification = true
-memory_dir = "/tmp/orchestration-memory"
+execution_memory_base_path = "/tmp/orchestration-memory"
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
@@ -297,7 +297,7 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `max_tools_per_worker` | int | `10` | Cap on MCP tools exposed to each worker |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
-| `memory_dir` | string | — | Directory for cross-iteration artifact persistence |
+| `execution_memory_base_path` | string | — | File based directory for cross-iteration artifact persistence. Artifacts allow for continuation of previous processing as well as debugging potential failed workflows. Note: no automatic cleanup of artifacts occurs. |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |

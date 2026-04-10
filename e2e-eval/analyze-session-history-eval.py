@@ -8,7 +8,7 @@ tool-calls.json). No SSE regex.
 
 Usage:
   python3 e2e-eval/analyze-session-history-eval.py \
-    --memory-dir /tmp/aura-math-opus-bedrock \
+    --execution-persistence-base-path /tmp/aura-math-opus-bedrock \
     --session-id session_e2e_<ts>_opus-bedrock \
     [--independent-session-ids id1,id2,id3,id4,id5]
 """
@@ -61,9 +61,9 @@ def load_json(path):
         return None
 
 
-def find_run_dirs(memory_dir, session_id):
+def find_run_dirs(execution_memory_base_path, session_id):
     """Find all run directories under a session, excluding 'latest' symlink."""
-    session_dir = os.path.join(memory_dir, session_id)
+    session_dir = os.path.join(execution_memory_base_path, session_id)
     if not os.path.isdir(session_dir):
         return []
     runs = []
@@ -198,11 +198,11 @@ def check_redundant_tools(turn_key, tool_names):
 
 # ── Main Analysis ─────────────────────────────────────────────────────
 
-def analyze_session(memory_dir, session_id):
+def analyze_session(execution_memory_base_path, session_id):
     """Analyze a session run and return per-turn metrics."""
-    run_dirs = find_run_dirs(memory_dir, session_id)
+    run_dirs = find_run_dirs(execution_memory_base_path, session_id)
     if not run_dirs:
-        print(f"ERROR: No run directories found in {memory_dir}/{session_id}", file=sys.stderr)
+        print(f"ERROR: No run directories found in {execution_memory_base_path}/{session_id}", file=sys.stderr)
         return None
 
     # Extract metrics from all runs
@@ -328,17 +328,17 @@ def print_scorecard(turn_metrics):
     print(f"  Total tools:      {total_tools} (session)")
 
 
-def find_independent_run_dirs(memory_dir):
+def find_independent_run_dirs(execution_memory_base_path):
     """Find run directories for independent mode (no session grouping).
 
     Independent runs from run-model-comparison.sh don't use session IDs,
-    so run dirs (UUIDs with manifest.json) are directly under memory_dir.
+    so run dirs (UUIDs with manifest.json) are directly under execution_memory_base_path.
     """
-    if not os.path.isdir(memory_dir):
+    if not os.path.isdir(execution_memory_base_path):
         return []
     runs = []
-    for entry in os.listdir(memory_dir):
-        run_path = os.path.join(memory_dir, entry)
+    for entry in os.listdir(execution_memory_base_path):
+        run_path = os.path.join(execution_memory_base_path, entry)
         if entry == "latest" or not os.path.isdir(run_path):
             continue
         # Skip session directories (session_e2e_* contain nested run dirs)
@@ -350,26 +350,26 @@ def find_independent_run_dirs(memory_dir):
     return sorted(runs)
 
 
-def analyze_independent(memory_dir, run_ids=None):
+def analyze_independent(execution_memory_base_path, run_ids=None):
     """Analyze independent runs for tool count comparison.
 
-    If run_ids provided, looks for those specific run dirs under memory_dir.
+    If run_ids provided, looks for those specific run dirs under execution_memory_base_path.
     Otherwise, finds all non-session run dirs with manifests.
     """
     total_tools = 0
     if run_ids:
         for rid in run_ids:
             # Try as session_id first, then as direct run_id
-            run_dirs = find_run_dirs(memory_dir, rid)
+            run_dirs = find_run_dirs(execution_memory_base_path, rid)
             if not run_dirs:
-                rd = os.path.join(memory_dir, rid)
+                rd = os.path.join(execution_memory_base_path, rid)
                 if os.path.isdir(rd):
                     run_dirs = [rd]
             for rd in run_dirs:
                 m = extract_turn_metrics(rd)
                 total_tools += m["tool_call_count"]
     else:
-        for rd in find_independent_run_dirs(memory_dir):
+        for rd in find_independent_run_dirs(execution_memory_base_path):
             m = extract_turn_metrics(rd)
             total_tools += m["tool_call_count"]
     return total_tools
@@ -405,7 +405,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyze session history eval — measures coordinator use of session history"
     )
-    parser.add_argument("--memory-dir", required=True, help="Persistence base directory (e.g. /tmp/aura-math-opus-bedrock)")
+    parser.add_argument("--execution-persistence-base-path", required=True, help="Persistence base directory (e.g. /tmp/aura-math-opus-bedrock)")
     parser.add_argument("--session-id", required=True, help="Session ID for the dependent-prompt session run")
     parser.add_argument("--independent-session-ids", help="Comma-separated session IDs for independent baseline runs")
     parser.add_argument("--json-export", help="Path to export metrics as JSON")
@@ -414,11 +414,11 @@ def main():
     print("=" * 72)
     print("  Session History Eval — Artifact Analysis")
     print("=" * 72)
-    print(f"  Memory dir:  {args.memory_dir}")
+    print(f"  Persistence base path:  {args.execution_memory_base_path}")
     print(f"  Session ID:  {args.session_id}")
     print()
 
-    result = analyze_session(args.memory_dir, args.session_id)
+    result = analyze_session(args.execution_memory_base_path, args.session_id)
     if result is None:
         sys.exit(1)
 
@@ -444,7 +444,7 @@ def main():
     # Comparison mode
     if args.independent_session_ids:
         indep_ids = [s.strip() for s in args.independent_session_ids.split(",")]
-        indep_tools = analyze_independent(args.memory_dir, indep_ids)
+        indep_tools = analyze_independent(args.execution_memory_base_path, indep_ids)
         session_tools = sum(
             m["tool_call_count"]
             for m in turn_metrics.values()

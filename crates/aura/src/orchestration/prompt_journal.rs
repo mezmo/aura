@@ -4,8 +4,8 @@
 //! showing every prompt sent to the LLM across the full orchestration lifecycle.
 //! Each entry is labeled by phase and iteration.
 //!
-//! The journal is written to `{memory_dir}/{run_id}/prompt-journal.md` and is
-//! accessible via the `latest` symlink at `{memory_dir}/latest/prompt-journal.md`.
+//! The journal is written to `{execution_memory_base_path}/{run_id}/prompt-journal.md` and is
+//! accessible via the `latest` symlink at `{execution_memory_base_path}/latest/prompt-journal.md`.
 
 use std::fmt;
 use std::io::{self, Write};

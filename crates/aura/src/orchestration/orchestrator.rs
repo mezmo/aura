@@ -376,18 +376,18 @@ impl Orchestrator {
         let (tool_call_observer, _rx) = ToolCallObserver::new(32);
 
         // Initialize execution persistence for debugging and retry intelligence
-        let persistence = if let Some(memory_dir) = orchestration_config.memory_dir() {
+        let persistence = if let Some(base_path) = orchestration_config.execution_memory_base_path() {
             tracing::info!(
                 "Orchestrator: Initializing execution persistence at: {}",
-                memory_dir
+                base_path
             );
             Arc::new(Mutex::new(
-                ExecutionPersistence::new(memory_dir, agent_config.session_id.clone())
+                ExecutionPersistence::new(base_path, agent_config.session_id.clone())
                     .await
                     .map_err(|e| format!("Failed to initialize persistence: {}", e))?,
             ))
         } else {
-            tracing::info!("Orchestrator: Persistence disabled (no memory_dir configured)");
+            tracing::info!("Orchestrator: Persistence disabled (no execution_memory_base_path configured)");
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
         };
 
@@ -397,7 +397,7 @@ impl Orchestrator {
         let journal_enabled = std::env::var("AURA_PROMPT_JOURNAL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let prompt_journal = if orchestration_config.memory_dir().is_some() {
+        let prompt_journal = if orchestration_config.execution_memory_base_path().is_some() {
             let guard = persistence.lock().await;
             let run_id = guard.run_id().to_string();
             let run_path = guard.run_path().to_path_buf();
@@ -1763,12 +1763,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Load and inject session history from prior runs
         if self.config.session_history_turns() > 0
-            && let Some(memory_dir) = self.config.memory_dir()
+            && let Some(base_path) = self.config.execution_memory_base_path()
         {
             let persistence = self.persistence.lock().await;
             if let Some(session_id) = persistence.session_id() {
                 let manifests = super::persistence::load_session_manifests(
-                    std::path::Path::new(memory_dir),
+                    std::path::Path::new(base_path),
                     session_id,
                     persistence.run_id(),
                     self.config.session_history_turns(),

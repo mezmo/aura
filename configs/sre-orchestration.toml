@@ -67,7 +67,7 @@ tools_in_planning = "summary"
 per_call_timeout_secs = 180
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-sre-orchestration"
+execution_memory_base_path = "/tmp/aura-sre-orchestration"
 
 # Kubernetes discovery worker
 [orchestration.worker.k8s-discovery]

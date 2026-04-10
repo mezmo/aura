@@ -239,7 +239,7 @@ impl Default for TimeoutsConfig {
 ///
 /// ```toml
 /// [orchestration.artifacts]
-/// memory_dir = "/tmp/aura-orchestration"
+/// execution_memory_base_path = "/tmp/aura-orchestration"
 /// result_artifact_threshold = 4000
 /// result_summary_length = 2000
 /// ```
@@ -254,12 +254,12 @@ pub struct ArtifactsConfig {
     /// - Tool call records with reasoning
     /// - Synthesis and result artifacts
     ///
-    /// Structure: `<memory_dir>/<run_id>/iteration-{n}/...`
+    /// Structure: `<execution_memory_base_path>/<run_id>/iteration-{n}/...`
     /// A `latest` symlink points to the most recent run.
     ///
     /// If not set, execution persistence is disabled.
-    #[serde(default, alias = "memory_path")]
-    pub memory_dir: Option<String>,
+    #[serde(default, alias = "memory_dir", alias = "memory_path")]
+    pub execution_memory_base_path: Option<String>,
 
     /// Character threshold for writing large results to artifact files.
     /// Results exceeding this length are written to disk with an inline summary.
@@ -286,7 +286,7 @@ fn default_session_history_turns() -> usize {
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
-            memory_dir: None,
+            execution_memory_base_path: None,
             result_artifact_threshold: default_result_artifact_threshold(),
             result_summary_length: default_result_summary_length(),
             session_history_turns: default_session_history_turns(),
@@ -323,14 +323,14 @@ impl Default for ArtifactsConfig {
 /// per_call_timeout_secs = 120
 ///
 /// [orchestration.artifacts]
-/// memory_dir = "/tmp/aura-orchestration"
+/// execution_memory_base_path = "/tmp/aura-orchestration"
 /// ```
 ///
 /// # Backward Compatibility
 ///
 /// The following flat fields are still accepted at the `[orchestration]` level
 /// and mapped into their sub-tables during deserialization:
-/// - `memory_dir` / `memory_path` → `artifacts.memory_dir`
+/// - `execution_memory_base_path` / `memory_dir` / `memory_path` → `artifacts.execution_memory_base_path`
 /// - `result_artifact_threshold` → `artifacts.result_artifact_threshold`
 /// - `result_summary_length` → `artifacts.result_summary_length`
 #[derive(Debug, Clone, Serialize)]
@@ -406,9 +406,9 @@ impl OrchestrationConfig {
         self.timeouts.per_call_timeout_secs
     }
 
-    /// Optional memory/persistence directory.
-    pub fn memory_dir(&self) -> Option<&str> {
-        self.artifacts.memory_dir.as_deref()
+    /// Optional base path for execution persistence.
+    pub fn execution_memory_base_path(&self) -> Option<&str> {
+        self.artifacts.execution_memory_base_path.as_deref()
     }
 
     /// Character threshold for artifact extraction.
@@ -578,8 +578,8 @@ impl Default for OrchestrationConfig {
 ///
 /// Accepts:
 /// - New format: `[orchestration.timeouts]` and `[orchestration.artifacts]` sub-tables
-/// - Old format: `memory_dir`, `memory_path`, `result_artifact_threshold`,
-///   `result_summary_length` at root level
+/// - Old format: `execution_memory_base_path`, `memory_dir`, `memory_path`,
+///   `result_artifact_threshold`, `result_summary_length` at root level
 ///
 /// Flat fields take precedence over sub-table values when both are present
 /// (shouldn't happen in practice, but provides predictable behavior).
@@ -619,8 +619,8 @@ struct RawOrchestrationConfig {
     artifacts: Option<ArtifactsConfig>,
 
     // --- Flat artifact fields (backward compat) ---
-    #[serde(default, alias = "memory_path")]
-    memory_dir: Option<String>,
+    #[serde(default, alias = "memory_dir", alias = "memory_path")]
+    execution_memory_base_path: Option<String>,
     #[serde(default)]
     result_artifact_threshold: Option<usize>,
     #[serde(default)]
@@ -640,8 +640,8 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
 
         // Build artifacts: flat fields override sub-table defaults
         let mut artifacts = raw.artifacts.unwrap_or_default();
-        if let Some(v) = raw.memory_dir {
-            artifacts.memory_dir = Some(v);
+        if let Some(v) = raw.execution_memory_base_path {
+            artifacts.execution_memory_base_path = Some(v);
         }
         if let Some(v) = raw.result_artifact_threshold {
             artifacts.result_artifact_threshold = v;
@@ -697,7 +697,7 @@ mod tests {
         // Artifact threshold defaults (sub-table)
         assert_eq!(config.result_artifact_threshold(), 4000);
         assert_eq!(config.result_summary_length(), 2000);
-        assert!(config.memory_dir().is_none());
+        assert!(config.execution_memory_base_path().is_none());
         assert_eq!(config.session_history_turns(), 3);
     }
 
@@ -1210,7 +1210,7 @@ mod tests {
             result_summary_length = 3000
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.memory_dir(), Some("/tmp/test"));
+        assert_eq!(config.execution_memory_base_path(), Some("/tmp/test"));
         assert_eq!(config.result_artifact_threshold(), 5000);
         assert_eq!(config.result_summary_length(), 3000);
     }
@@ -1224,13 +1224,13 @@ mod tests {
             per_call_timeout_secs = 45
 
             [artifacts]
-            memory_dir = "/tmp/new-style"
+            execution_memory_base_path = "/tmp/new-style"
             result_artifact_threshold = 8000
             result_summary_length = 1500
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.per_call_timeout_secs(), 45);
-        assert_eq!(config.memory_dir(), Some("/tmp/new-style"));
+        assert_eq!(config.execution_memory_base_path(), Some("/tmp/new-style"));
         assert_eq!(config.result_artifact_threshold(), 8000);
         assert_eq!(config.result_summary_length(), 1500);
     }
@@ -1252,7 +1252,7 @@ mod tests {
             memory_path = "/tmp/alias-test"
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.memory_dir(), Some("/tmp/alias-test"));
+        assert_eq!(config.execution_memory_base_path(), Some("/tmp/alias-test"));
     }
 
     #[test]
@@ -1262,7 +1262,7 @@ mod tests {
             memory_path = "/tmp/flat-alias"
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.memory_dir(), Some("/tmp/flat-alias"));
+        assert_eq!(config.execution_memory_base_path(), Some("/tmp/flat-alias"));
     }
 
     // ========================================================================
@@ -1281,7 +1281,7 @@ mod tests {
             enabled = true
 
             [artifacts]
-            memory_dir = "/tmp/test"
+            execution_memory_base_path = "/tmp/test"
             session_history_turns = 5
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();

@@ -53,8 +53,8 @@ impl Default for TimeoutsConfig {
 /// Artifact configuration for orchestration (aura-config side).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactsConfig {
-    #[serde(default, alias = "memory_path")]
-    pub memory_dir: Option<String>,
+    #[serde(default, alias = "memory_dir", alias = "memory_path")]
+    pub execution_memory_base_path: Option<String>,
     #[serde(default = "default_result_artifact_threshold")]
     pub result_artifact_threshold: usize,
     #[serde(default = "default_result_summary_length")]
@@ -70,7 +70,7 @@ fn default_session_history_turns() -> usize {
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
-            memory_dir: None,
+            execution_memory_base_path: None,
             result_artifact_threshold: default_result_artifact_threshold(),
             result_summary_length: default_result_summary_length(),
             session_history_turns: default_session_history_turns(),
@@ -157,8 +157,8 @@ struct RawOrchestrationConfig {
     #[serde(default)]
     artifacts: Option<ArtifactsConfig>,
     // Flat artifact fields (backward compat)
-    #[serde(default, alias = "memory_path")]
-    memory_dir: Option<String>,
+    #[serde(default, alias = "memory_dir", alias = "memory_path")]
+    execution_memory_base_path: Option<String>,
     #[serde(default)]
     result_artifact_threshold: Option<usize>,
     #[serde(default)]
@@ -177,8 +177,8 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         let timeouts = raw.timeouts.unwrap_or_default();
 
         let mut artifacts = raw.artifacts.unwrap_or_default();
-        if let Some(v) = raw.memory_dir {
-            artifacts.memory_dir = Some(v);
+        if let Some(v) = raw.execution_memory_base_path {
+            artifacts.execution_memory_base_path = Some(v);
         }
         if let Some(v) = raw.result_artifact_threshold {
             artifacts.result_artifact_threshold = v;

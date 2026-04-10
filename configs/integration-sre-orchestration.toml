@@ -45,7 +45,7 @@ tools_in_planning = "full"
 per_call_timeout_secs = 90
 
 [orchestration.artifacts]
-memory_dir = "/tmp/aura-sre-orchestration-test"
+execution_memory_base_path = "/tmp/aura-sre-orchestration-test"
 
 [orchestration.worker.k8s-discovery]
 description = "Kubernetes workload and service discovery: list namespaces, workloads, services, and inspect details"
