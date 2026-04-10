@@ -327,6 +327,42 @@ def parse_sse_file(path: Path) -> dict:
     worker_ids = _extract_worker_ids(event_data_pairs)
     tasks = _extract_tasks(event_data_pairs)
 
+    # Scratchpad metrics
+    scratchpad_tokens_intercepted = 0
+    scratchpad_tokens_extracted = 0
+    for event_name, data in event_data_pairs:
+        if event_name == "aura.orchestrator.scratchpad_usage" and data:
+            try:
+                payload = json.loads(data)
+                scratchpad_tokens_intercepted = payload.get("tokens_intercepted", 0)
+                scratchpad_tokens_extracted = payload.get("tokens_extracted", 0)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            break
+    scratchpad_savings_pct = (
+        round(100.0 * (1.0 - scratchpad_tokens_extracted / scratchpad_tokens_intercepted), 1)
+        if scratchpad_tokens_intercepted > 0 else 0.0
+    )
+
+    # Scratchpad exploration tool usage
+    exploration_tool_names = {"schema", "item_schema", "head", "slice", "grep",
+                              "get_in", "iterate_over", "read"}
+    scratchpad_exploration_tools = []
+    for name in tool_names:
+        if name in exploration_tool_names and name not in scratchpad_exploration_tools:
+            scratchpad_exploration_tools.append(name)
+
+    # Context window from session_info
+    context_window = None
+    for event_name, data in event_data_pairs:
+        if event_name == "aura.session_info" and data:
+            try:
+                payload = json.loads(data)
+                context_window = payload.get("model_context_limit")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            break
+
     return {
         "tool_calls": tool_calls,
         "orch_tools": orch_tools,
@@ -354,6 +390,12 @@ def parse_sse_file(path: Path) -> dict:
         "tool_names": tool_names,
         "worker_ids": worker_ids,
         "tasks": tasks,
+        "scratchpad_tokens_intercepted": scratchpad_tokens_intercepted,
+        "scratchpad_tokens_extracted": scratchpad_tokens_extracted,
+        "scratchpad_savings_pct": scratchpad_savings_pct,
+        "scratchpad_exploration_tools": scratchpad_exploration_tools,
+        "scratchpad_exploration_count": len(scratchpad_exploration_tools),
+        "context_window": context_window,
     }
 
 

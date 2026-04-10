@@ -1,0 +1,70 @@
+# Scratchpad E2E — GPT 5.1 (OpenAI, 128K context)
+#
+# Tests scratchpad interception and exploration tool usage against cloud models.
+# Start scratchpad-test-mcp first:
+#   docker compose -f compose/base.yml -f compose/scratchpad-e2e.yml up scratchpad-test-mcp -d
+#
+# Then run:
+#   CONFIG_PATH=configs/scratchpad-gpt5.toml AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
+
+[llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+
+[agent]
+name = "Scratchpad E2E Orchestrator"
+context_window = 128000
+system_prompt = """
+You are a data exploration coordinator. You decompose data retrieval and
+analysis tasks into worker assignments. Always delegate to the data-explorer
+worker — do not answer questions directly.
+"""
+
+[mcp]
+sanitize_schemas = false
+
+[mcp.servers.scratchpad-test]
+transport = "http_streamable"
+url = "http://{{ env.SCRATCHPAD_MCP_HOST | default: '127.0.0.1' }}:8083/mcp"
+headers = {}
+description = "Scratchpad test MCP server with configurable-size data tools"
+
+[mcp.servers.scratchpad-test.scratchpad]
+"sp_inventory_report" = { min_tokens = 500 }
+"sp_log_analysis" = { min_tokens = 500 }
+"sp_cluster_status" = { min_tokens = 500 }
+"sp_get_large_*" = { min_tokens = 500 }
+"sp_get_small_*" = { min_tokens = 99999 }
+
+[orchestration]
+enabled = true
+max_planning_cycles = 1
+quality_threshold = 0.5
+
+allow_direct_answers = false
+allow_clarification = false
+
+tools_in_planning = "summary"
+
+[orchestration.scratchpad]
+enabled = true
+context_safety_margin = 0.20
+
+[orchestration.timeouts]
+per_call_timeout_secs = 120
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-scratchpad-gpt5"
+
+[orchestration.worker.data-explorer]
+description = "Data retrieval and exploration using scratchpad tools"
+turn_depth = 8
+mcp_filter = ["sp_*"]
+preamble = """
+You are a Data Explorer completing one assigned task.
+Use the tools provided to retrieve data and answer questions.
+When tool output is intercepted by the scratchpad, use the exploration
+tools (schema, get_in, grep, iterate_over, etc.) to find the answer.
+Report the specific value requested and stop.
+"""

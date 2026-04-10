@@ -111,6 +111,46 @@ BUILTIN_ASSERTIONS_DEPENDENT = {
 }
 
 
+# ── Built-in Assertions for Scratchpad E2E ─────────────────────
+
+BUILTIN_ASSERTIONS_SCRATCHPAD = {
+    "sp-item-price": {
+        "workers": ["data-explorer"],
+        "tool_names": ["sp_inventory_report"],
+        "answer_contains": ["42.99"],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1,
+    },
+    "sp-out-of-stock": {
+        "workers": ["data-explorer"],
+        "tool_names": ["sp_inventory_report"],
+        "answer_contains": [],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1,
+    },
+    "sp-log-error": {
+        "workers": ["data-explorer"],
+        "tool_names": ["sp_log_analysis"],
+        "answer_contains": ["AUTH-4091"],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1,
+    },
+    "sp-node-cpu": {
+        "workers": ["data-explorer"],
+        "tool_names": ["sp_cluster_status"],
+        "answer_contains": ["98.7"],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1,
+    },
+    "sp-passthrough": {
+        "workers": ["data-explorer"],
+        "tool_names": ["sp_get_small_json"],
+        "answer_contains": ["3"],
+        "scratchpad_intercepted": False,
+    },
+}
+
+
 @dataclass
 class AssertionResult:
     """Result of a single assertion check."""
@@ -227,6 +267,50 @@ def check_answer_contains(prompt: str, parsed: dict, expected: list[str]) -> lis
     return results
 
 
+def check_scratchpad_intercepted(
+    prompt: str, parsed: dict, expected: bool,
+) -> AssertionResult:
+    """Assert that scratchpad interception occurred (or did not)."""
+    actual = parsed.get("scratchpad_tokens_intercepted", 0) > 0
+    passed = actual == expected
+    tokens = parsed.get("scratchpad_tokens_intercepted", 0)
+    if expected:
+        detail = f"intercepted={tokens} tokens" if passed else "expected interception but tokens_intercepted=0"
+    else:
+        detail = "not intercepted (correct)" if passed else f"unexpectedly intercepted {tokens} tokens"
+    return AssertionResult(prompt, "scratchpad_intercepted", passed, detail)
+
+
+def check_scratchpad_exploration_min(
+    prompt: str, parsed: dict, min_count: int,
+) -> AssertionResult:
+    """Assert that at least N scratchpad exploration tools were used."""
+    actual = parsed.get("scratchpad_exploration_count", 0)
+    tools = parsed.get("scratchpad_exploration_tools", [])
+    passed = actual >= min_count
+    detail = f"used {actual} exploration tools: {', '.join(tools) if tools else '(none)'}"
+    if not passed:
+        detail += f" (expected >= {min_count})"
+    return AssertionResult(prompt, "scratchpad_exploration_min", passed, detail)
+
+
+def check_scratchpad_extracted_min(
+    prompt: str, parsed: dict, min_tokens: int,
+) -> AssertionResult:
+    """Assert that at least N tokens were extracted from scratchpad.
+
+    This validates that exploration tools were actually used, even when
+    individual tool call events aren't visible in SSE (Rig native tools
+    don't emit aura.orchestrator.tool_call_* events).
+    """
+    actual = parsed.get("scratchpad_tokens_extracted", 0)
+    passed = actual >= min_tokens
+    detail = f"extracted {actual} tokens"
+    if not passed:
+        detail += f" (expected >= {min_tokens})"
+    return AssertionResult(prompt, "scratchpad_extracted_min", passed, detail)
+
+
 def check_completed(prompt: str, parsed: dict) -> AssertionResult:
     """Assert that the response completed (finish_reason: stop)."""
     passed = parsed.get("completed", False)
@@ -260,6 +344,24 @@ def run_assertions(
     # Answer contains
     if "answer_contains" in assertion_spec:
         results.extend(check_answer_contains(prompt, parsed, assertion_spec["answer_contains"]))
+
+    # Scratchpad interception
+    if "scratchpad_intercepted" in assertion_spec:
+        results.append(check_scratchpad_intercepted(
+            prompt, parsed, assertion_spec["scratchpad_intercepted"],
+        ))
+
+    # Scratchpad exploration tool count
+    if "scratchpad_exploration_min" in assertion_spec:
+        results.append(check_scratchpad_exploration_min(
+            prompt, parsed, assertion_spec["scratchpad_exploration_min"],
+        ))
+
+    # Scratchpad tokens extracted (proxy for exploration tool usage)
+    if "scratchpad_extracted_min" in assertion_spec:
+        results.append(check_scratchpad_extracted_min(
+            prompt, parsed, assertion_spec["scratchpad_extracted_min"],
+        ))
 
     return results
 
@@ -315,6 +417,9 @@ def collect_sse_files(results_dir: Path) -> dict[str, list[tuple[str, int, Path]
 
 def detect_prompt_set(prompt_labels: set[str]) -> str:
     """Detect which prompt set was used based on prompt labels found."""
+    if any(label.startswith("sp-") for label in prompt_labels):
+        return "scratchpad"
+
     independent_labels = set(BUILTIN_ASSERTIONS.keys())
     dependent_labels = set(BUILTIN_ASSERTIONS_DEPENDENT.keys())
 
@@ -347,7 +452,7 @@ def main():
         help="Output results as JSON",
     )
     parser.add_argument(
-        "--prompt-set", choices=["independent", "dependent", "auto"],
+        "--prompt-set", choices=["independent", "dependent", "scratchpad", "auto"],
         default="auto",
         help="Which built-in assertion set to use (default: auto-detect)",
     )
@@ -372,7 +477,9 @@ def main():
         if prompt_set == "auto":
             prompt_set = detect_prompt_set(set(files_by_prompt.keys()))
 
-        if prompt_set == "dependent":
+        if prompt_set == "scratchpad":
+            assertions = BUILTIN_ASSERTIONS_SCRATCHPAD
+        elif prompt_set == "dependent":
             assertions = BUILTIN_ASSERTIONS_DEPENDENT
         else:
             assertions = BUILTIN_ASSERTIONS
