@@ -133,7 +133,7 @@ pub trait StreamingAgent: Send + Sync {
 
     /// Return the configured context window size in tokens (from TOML config).
     /// Returns `None` if not configured (e.g., Orchestrator).
-    fn context_window(&self) -> Option<u32> {
+    fn context_window(&self) -> Option<u64> {
         None
     }
 }

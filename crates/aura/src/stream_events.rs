@@ -132,7 +132,7 @@ pub enum AuraStreamEvent {
         model: String,
         /// Context limit for this model (in tokens), if known
         #[serde(skip_serializing_if = "Option::is_none")]
-        model_context_limit: Option<u32>,
+        model_context_limit: Option<u64>,
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
@@ -381,7 +381,7 @@ impl AuraStreamEvent {
     /// Contains model name and context limit for UI context window calculation.
     pub fn session_info(
         model: impl Into<String>,
-        model_context_limit: Option<u32>,
+        model_context_limit: Option<u64>,
         correlation: CorrelationContext,
     ) -> Self {
         Self::SessionInfo {

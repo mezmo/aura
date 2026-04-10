@@ -146,7 +146,7 @@ event: aura.session_info
 data: {"model":"gpt-5.2","model_context_limit":200000,"agent_id":"main","session_id":"sess_xyz"}
 ```
 
-Note: `model_context_limit` comes from the `context_window` field in the `[agent]` TOML config section. If `context_window` is not set, `model_context_limit` is omitted from the event.
+Note: `model_context_limit` comes from the `context_window` field in the `[llm]` TOML config section. If `context_window` is not set, `model_context_limit` is omitted from the event.
 
 ### Client Handling
 

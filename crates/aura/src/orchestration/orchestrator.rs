@@ -1723,7 +1723,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             self.agent_config.effective_preamble(),
             include_recon_tools,
         );
-        let temperature = self.agent_config.agent.temperature;
+        let temperature = self.agent_config.llm.temperature();
 
         // Filter vector stores for coordinator (if any configured)
         let coordinator_stores: Vec<_> = if !self.config.coordinator_vector_stores.is_empty() {
@@ -1809,7 +1809,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .build_provider_agent_with_tools(
                 &preamble,
                 temperature,
-                self.agent_config.agent.additional_params.clone(),
+                self.agent_config.llm.additional_params(),
                 coordinator_tools,
             )
             .await?;
@@ -1844,7 +1844,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let preamble = self
             .config
             .build_coordinator_preamble(self.agent_config.effective_preamble(), false);
-        let temperature = self.agent_config.agent.temperature;
+        let temperature = self.agent_config.llm.temperature();
 
         let coordinator_tools = CoordinatorTools {
             list_tools: None,
@@ -1859,7 +1859,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .build_provider_agent_with_tools(
                 &preamble,
                 temperature,
-                self.agent_config.agent.additional_params.clone(),
+                self.agent_config.llm.additional_params(),
                 coordinator_tools,
             )
             .await?;
@@ -1891,7 +1891,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let preamble = self
             .config
             .build_coordinator_preamble(self.agent_config.effective_preamble(), false);
-        let temperature = self.agent_config.agent.temperature;
+        let temperature = self.agent_config.llm.temperature();
 
         let coordinator_tools = CoordinatorTools {
             list_tools: None,
@@ -1906,7 +1906,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .build_provider_agent_with_tools(
                 &preamble,
                 temperature,
-                self.agent_config.agent.additional_params.clone(),
+                self.agent_config.llm.additional_params(),
                 coordinator_tools,
             )
             .await?;
@@ -1939,7 +1939,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         evaluation_tool: SubmitEvaluationTool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         let preamble = include_str!("../prompts/evaluation_preamble.md").to_string();
-        let temperature = self.agent_config.agent.temperature;
+        let temperature = self.agent_config.llm.temperature();
 
         let coordinator_tools = CoordinatorTools {
             list_tools: None,
@@ -1954,7 +1954,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .build_provider_agent_with_tools(
                 &preamble,
                 temperature,
-                self.agent_config.agent.additional_params.clone(),
+                self.agent_config.llm.additional_params(),
                 coordinator_tools,
             )
             .await?;
@@ -2121,7 +2121,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         worker_config: &AgentConfig,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
-        let temperature = worker_config.agent.temperature;
+        let temperature = worker_config.llm.temperature();
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
         match &worker_config.llm {
@@ -2129,6 +2129,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
+                additional_params,
                 ..
             } => {
                 let mut cb =
@@ -2146,20 +2148,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                // Build combined additional_params: reasoning_effort + agent-level
+                // Build combined additional_params: reasoning_effort
                 let mut combined_params: Option<serde_json::Value> = None;
-                if let Some(effort) = worker_config.agent.reasoning_effort
-                    && crate::builder::is_reasoning_model(model)
-                {
-                    let effort_str = match effort {
-                        crate::config::ReasoningEffort::Minimal => "minimal",
-                        crate::config::ReasoningEffort::Low => "low",
-                        crate::config::ReasoningEffort::Medium => "medium",
-                        crate::config::ReasoningEffort::High => "high",
-                    };
-                    combined_params = Some(serde_json::json!({"reasoning_effort": effort_str}));
+                if let Some(effort) = reasoning_effort {
+                    combined_params =
+                        Some(serde_json::json!({"reasoning_effort": effort.to_string()}));
                 }
-                if let Some(ref params) = worker_config.agent.additional_params {
+                if let Some(params) = additional_params {
                     combined_params = Some(match combined_params {
                         Some(existing) => crate::builder::merge_json(existing, params.clone()),
                         None => params.clone(),
@@ -2168,7 +2163,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(params) = combined_params {
                     builder = builder.additional_params(params);
                 }
-                if let Some(max) = worker_config.agent.max_tokens {
+                if let Some(max) = worker_config.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
@@ -2179,6 +2174,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                additional_params,
                 ..
             } => {
                 let mut cb = rig::providers::anthropic::Client::<reqwest::Client>::builder()
@@ -2195,10 +2191,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(max) = worker_config.agent.max_tokens {
+                if let Some(max) = worker_config.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
-                if let Some(ref params) = worker_config.agent.additional_params {
+                if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
@@ -2209,6 +2205,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 model,
                 region,
                 profile,
+                additional_params,
                 ..
             } => {
                 use aws_config::{BehaviorVersion, Region};
@@ -2233,10 +2230,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(max) = worker_config.agent.max_tokens {
+                if let Some(max) = worker_config.llm.max_tokens() {
                     builder = builder.max_tokens(max);
                 }
-                if let Some(ref params) = worker_config.agent.additional_params {
+                if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
@@ -2247,6 +2244,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                additional_params,
                 ..
             } => {
                 let mut cb =
@@ -2263,7 +2261,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                if let Some(ref params) = worker_config.agent.additional_params {
+                if let Some(params) = additional_params {
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
@@ -2273,8 +2271,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             LlmConfig::Ollama {
                 model,
                 base_url,
-                num_ctx,
-                num_predict,
                 additional_params,
                 ..
             } => {
@@ -2290,23 +2286,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(temp) = temperature {
                     builder = builder.temperature(temp);
                 }
-                // Build combined params: Ollama-specific + agent-level (single call)
-                {
-                    let mut combined = crate::builder::build_ollama_params(
-                        *num_ctx,
-                        *num_predict,
-                        additional_params.clone(),
-                    );
-                    if let Some(ref params) = worker_config.agent.additional_params {
-                        combined = Some(match combined {
-                            Some(existing) => crate::builder::merge_json(existing, params.clone()),
-                            None => params.clone(),
-                        });
-                    }
-                    if let Some(params) = combined {
-                        builder = builder.additional_params(params);
-                    }
+
+                if let Some(params) = additional_params {
+                    builder = builder.additional_params(params.clone());
                 }
+
                 let state = BuilderState::Initial(builder);
                 let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))

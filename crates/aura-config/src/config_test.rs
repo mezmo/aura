@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{config::McpServerConfig, load_config_from_str};
+    use aura::ReasoningEffort;
 
     const TEST_CONFIG: &str = r#"
 [llm]
@@ -8,6 +9,14 @@ provider = "openai"
 api_key = "test_openai_key"
 model = "gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
+reasoning_effort = "medium"
+max_tokens = 1000
+context_window = 200000
+temperature = 0.5
+
+[llm.additional_params.thinking]
+type = "enabled"
+budget_tokens = 8000
 
 [[vector_stores]]
 name = "default"
@@ -50,7 +59,6 @@ custom_tools = ["calculator", "web_search"]
 name = "Test Assistant"
 system_prompt = "You are a test assistant."
 context = ["Context line 1", "Context line 2"]
-temperature = 0.5
 "#;
 
     #[test]
@@ -64,14 +72,37 @@ temperature = 0.5
         // Test LLM config
         println!("\n✅ Testing LLM config...");
         match &config.llm {
-            crate::config::LlmConfig::OpenAI {
+            aura::config::LlmConfig::OpenAI {
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
+                max_tokens,
+                context_window,
+                temperature,
+                additional_params,
             } => {
                 assert_eq!(api_key, "test_openai_key");
                 assert_eq!(model, "gpt-4o-mini");
                 assert_eq!(base_url, &Some("https://api.openai.com/v1".to_string()));
+                assert_eq!(reasoning_effort, &Some(ReasoningEffort::Medium));
+                assert_eq!(max_tokens, &Some(1000));
+                assert_eq!(context_window, &Some(200_000));
+                assert_eq!(temperature, &Some(0.5));
+
+                assert!(
+                    additional_params.is_some(),
+                    "additional_params should be present"
+                );
+                let params = additional_params.as_ref().unwrap();
+                let thinking = params
+                    .get("thinking")
+                    .expect("thinking params should be present");
+                assert_eq!(thinking.get("type"), Some(&serde_json::json!("enabled")));
+                assert_eq!(
+                    thinking.get("budget_tokens"),
+                    Some(&serde_json::json!(8000))
+                );
             }
             _ => panic!("Expected OpenAI LLM config"),
         }
@@ -187,7 +218,6 @@ temperature = 0.5
             config.agent.context,
             vec!["Context line 1", "Context line 2"]
         );
-        assert_eq!(config.agent.temperature, Some(0.5));
     }
 
     #[test]
@@ -220,15 +250,17 @@ system_prompt = "Basic prompt"
 
         println!("\n✅ Testing minimal config assertions...");
         match &config.llm {
-            crate::config::LlmConfig::Anthropic { model, .. } => {
+            aura::config::LlmConfig::Anthropic {
+                model, temperature, ..
+            } => {
                 assert_eq!(model, "claude-3-sonnet-20240229");
+                assert!(temperature.is_none());
             }
             _ => panic!("Expected Anthropic LLM config"),
         }
         assert!(config.mcp.is_none());
         assert!(config.tools.is_none());
         assert_eq!(config.agent.context.len(), 0);
-        assert_eq!(config.agent.temperature, None);
     }
 
     #[test]
@@ -332,7 +364,7 @@ system_prompt = "Test with env vars"
 
         println!("\n✅ Testing environment variable resolution...");
         match &config.llm {
-            crate::config::LlmConfig::OpenAI { api_key, .. } => {
+            aura::config::LlmConfig::OpenAI { api_key, .. } => {
                 assert_eq!(api_key, "mock_openai_key");
             }
             _ => panic!("Expected OpenAI LLM config"),
@@ -395,11 +427,11 @@ system_prompt = "You are a helpful assistant."
 
         println!("\n✅ Testing Ollama config assertions...");
         match &config.llm {
-            crate::config::LlmConfig::Ollama {
+            aura::config::LlmConfig::Ollama {
                 model, base_url, ..
             } => {
                 assert_eq!(model, "llama3.2");
-                assert_eq!(base_url, "http://localhost:11434"); // default value
+                assert_eq!(base_url, &Some("http://localhost:11434".into())); // default value
             }
             _ => panic!("Expected Ollama LLM config"),
         }
@@ -417,6 +449,7 @@ system_prompt = "You are a helpful assistant."
 provider = "ollama"
 model = "mistral"
 base_url = "http://my-ollama-server:11434"
+temperature = 0.8
 
 [[vector_stores]]
 name = "default"
@@ -430,7 +463,6 @@ api_key = "test_key"
 [agent]
 name = "Remote Ollama Agent"
 system_prompt = "You are a remote assistant."
-temperature = 0.8
 "#;
 
         let config =
@@ -441,66 +473,17 @@ temperature = 0.8
 
         println!("\n✅ Testing Ollama custom URL config assertions...");
         match &config.llm {
-            crate::config::LlmConfig::Ollama {
-                model, base_url, ..
+            aura::config::LlmConfig::Ollama {
+                model,
+                base_url,
+                temperature,
+                ..
             } => {
                 assert_eq!(model, "mistral");
-                assert_eq!(base_url, "http://my-ollama-server:11434");
+                assert_eq!(base_url, &Some("http://my-ollama-server:11434".into()));
+                assert_eq!(temperature, &Some(0.8));
             }
             _ => panic!("Expected Ollama LLM config"),
-        }
-        assert_eq!(config.agent.temperature, Some(0.8));
-    }
-
-    #[test]
-    fn test_ollama_config_with_num_ctx() {
-        println!("\n=== TEST_OLLAMA_CONFIG_WITH_NUM_CTX ===");
-        let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-num_ctx = 8192
-
-[agent]
-name = "Test"
-system_prompt = "Test"
-"#;
-        let config = load_config_from_str(config_str).expect("Failed to parse config");
-
-        println!("\n🔍 Ollama Config with num_ctx:");
-        println!("{config:#?}");
-
-        match &config.llm {
-            crate::config::LlmConfig::Ollama { num_ctx, .. } => {
-                assert_eq!(*num_ctx, Some(8192));
-            }
-            _ => panic!("Expected Ollama config"),
-        }
-    }
-
-    #[test]
-    fn test_ollama_config_with_num_predict() {
-        println!("\n=== TEST_OLLAMA_CONFIG_WITH_NUM_PREDICT ===");
-        let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-num_predict = 2048
-
-[agent]
-name = "Test"
-system_prompt = "Test"
-"#;
-        let config = load_config_from_str(config_str).expect("Failed to parse config");
-
-        println!("\n🔍 Ollama Config with num_predict:");
-        println!("{config:#?}");
-
-        match &config.llm {
-            crate::config::LlmConfig::Ollama { num_predict, .. } => {
-                assert_eq!(*num_predict, Some(2048));
-            }
-            _ => panic!("Expected Ollama config"),
         }
     }
 
@@ -528,7 +511,7 @@ system_prompt = "Test"
         println!("{config:#?}");
 
         match &config.llm {
-            crate::config::LlmConfig::Ollama {
+            aura::config::LlmConfig::Ollama {
                 additional_params, ..
             } => {
                 let params = additional_params
@@ -576,7 +559,7 @@ system_prompt = "Test"
         println!("{config:#?}");
 
         match &config.llm {
-            crate::config::LlmConfig::Ollama {
+            aura::config::LlmConfig::Ollama {
                 additional_params, ..
             } => {
                 let params = additional_params
@@ -613,16 +596,12 @@ system_prompt = "Test"
         println!("{config:#?}");
 
         match &config.llm {
-            crate::config::LlmConfig::Ollama {
+            aura::config::LlmConfig::Ollama {
                 model,
-                num_ctx,
-                num_predict,
                 additional_params,
                 ..
             } => {
                 assert_eq!(model, "llama3.2");
-                assert_eq!(*num_ctx, None);
-                assert_eq!(*num_predict, None);
                 assert!(additional_params.is_none());
             }
             _ => panic!("Expected Ollama config"),
@@ -864,13 +843,13 @@ model_owner = "mezmo"
 provider = "ollama"
 model = "llama3.2"
 base_url = "http://localhost:11434"
-num_ctx = 4096
-num_predict = 1024
 fallback_tool_parsing = true
+temperature = 0.7
 
 [llm.additional_params]
+num_ctx = 4096
+num_predict = 1024
 seed = 42
-temperature = 0.7
 
 [agent]
 name = "Full Ollama Agent"
@@ -882,25 +861,28 @@ system_prompt = "You are helpful."
         println!("{config:#?}");
 
         match &config.llm {
-            crate::config::LlmConfig::Ollama {
+            aura::config::LlmConfig::Ollama {
                 model,
                 base_url,
-                num_ctx,
-                num_predict,
                 fallback_tool_parsing,
                 additional_params,
+                max_tokens,
+                context_window,
+                temperature,
             } => {
                 assert_eq!(model, "llama3.2");
-                assert_eq!(base_url, "http://localhost:11434");
-                assert_eq!(*num_ctx, Some(4096));
-                assert_eq!(*num_predict, Some(1024));
+                assert_eq!(base_url, &Some("http://localhost:11434".into()));
+                assert_eq!(*max_tokens, None);
+                assert_eq!(*context_window, None);
+                assert_eq!(temperature, &Some(0.7));
                 assert!(*fallback_tool_parsing);
 
                 let params = additional_params
                     .as_ref()
                     .expect("additional_params should be set");
+                assert_eq!(params.get("num_ctx"), Some(&serde_json::json!(4096)));
+                assert_eq!(params.get("num_predict"), Some(&serde_json::json!(1024)));
                 assert_eq!(params.get("seed"), Some(&serde_json::json!(42)));
-                assert_eq!(params.get("temperature"), Some(&serde_json::json!(0.7)));
             }
             _ => panic!("Expected Ollama config"),
         }
@@ -913,14 +895,14 @@ system_prompt = "You are helpful."
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4o"
+context_window = 200000
 
 [agent]
 name = "Test"
 system_prompt = "Test"
-context_window = 200000
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
-        assert_eq!(config.agent.context_window, Some(200_000));
+        assert_eq!(config.llm.context_window(), Some(200_000));
     }
 
     #[test]
@@ -936,7 +918,7 @@ name = "Test"
 system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
-        assert_eq!(config.agent.context_window, None);
+        assert_eq!(config.llm.context_window(), None);
     }
 
     #[test]
@@ -947,13 +929,81 @@ system_prompt = "Test"
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4o"
+context_window = 200000.0
 
 [agent]
 name = "Test"
 system_prompt = "Test"
-context_window = 200000.0
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
-        assert_eq!(config.agent.context_window, Some(200_000));
+        assert_eq!(config.llm.context_window(), Some(200_000));
+    }
+
+    #[test]
+    fn test_removed_agent_configs_caught() {
+        // The old agent-level fields should now cause the parsing to fail
+        // so the user is aware of the breaking changes
+        let valid_config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+
+        let test_cases = [
+            ("temperature", "temperature = 0.5"),
+            ("max_tokens", "max_tokens = 1000"),
+            ("reasoning_effect", "reasoning_effect = \"medium\""),
+            ("context_window", "context_window = 200000.0"),
+            (
+                "additional_params",
+                "additional_params = { thinking = { type = \"enabled\", budget_tokens = 8000 } }",
+            ),
+        ];
+
+        for (removed_field, definition) in test_cases {
+            let expected_error = format!("unknown field `{removed_field}`");
+            let config_str = String::from(valid_config_str) + "\n" + definition;
+
+            let config = load_config_from_str(&config_str);
+            assert!(
+                config.is_err(),
+                "config parsing should fail due to removed agent-level field"
+            );
+            assert!(
+                config
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected_error.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_additional_properties_on_llm() {
+        let config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+random_field = "should not be accepted"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+
+        let config = load_config_from_str(&config_str);
+        assert!(config.is_err(), "no additional fields allowed");
+        assert!(
+            config
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field `random_field`")
+        );
     }
 }

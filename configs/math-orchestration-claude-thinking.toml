@@ -19,6 +19,8 @@
 provider = "anthropic"
 api_key = "{{ env.ANTHROPIC_API_KEY }}"
 model = "claude-sonnet-4-5-20250929"
+temperature = 1.0
+additional_params = { thinking = { type = "enabled", budget_tokens = 8000 } }
 
 [agent]
 name = "Math Orchestrator (Thinking)"
@@ -31,8 +33,6 @@ ROUTING GUIDANCE:
 - Multi-step calculations or mixed domains: create a plan with workers
 - Vague or ambiguous requests: ask for clarification
 """
-temperature = 1.0
-additional_params = { thinking = { type = "enabled", budget_tokens = 8000 } }
 
 [mcp]
 sanitize_schemas = false
