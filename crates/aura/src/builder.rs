@@ -1000,12 +1000,10 @@ impl StreamingAgent for Agent {
         _cancel_token: CancellationToken,
         request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
-        // Set MCP request ID for tool call tracking and progress routing
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager.set_current_request(request_id).await;
         }
 
-        // Use the appropriate method based on whether we have chat history
         let stream = if chat_history.is_empty() {
             self.stream_prompt(query).await
         } else {
@@ -1026,14 +1024,11 @@ impl StreamingAgent for Agent {
         watch::Sender<bool>,
         crate::UsageState,
     ) {
-        // Set MCP request ID for tool call tracking and progress routing.
-        // This must happen here (not in stream()) because stream_with_timeout
-        // delegates to stream_*_with_timeout which bypass stream().
+        // Production entry point — set MCP request ID before delegating
         if let Some(mcp_manager) = &self.mcp_manager {
             mcp_manager.set_current_request(request_id).await;
         }
 
-        // Use the appropriate method based on whether we have chat history
         let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, timeout, request_id)
                 .await
@@ -1046,7 +1041,6 @@ impl StreamingAgent for Agent {
     }
 
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
-        // Delegate to the existing Agent method
         Agent::cancel_and_close_mcp(self, request_id, reason).await
     }
 
@@ -1057,20 +1051,14 @@ impl StreamingAgent for Agent {
 
 /// Build the appropriate streaming agent based on configuration.
 ///
-/// This factory function examines the `orchestration.enabled` flag in the config
-/// and returns either:
-/// - An `Orchestrator` if orchestration is enabled
-/// - A standard `Agent` if orchestration is disabled (default)
-///
-/// Both implement `StreamingAgent`, so the caller can use them interchangeably.
+/// Returns either an orchestrated multi-agent workflow or a standard single
+/// agent, depending on `orchestration.enabled`. Both implement `StreamingAgent`.
 pub async fn build_streaming_agent(
     config: &crate::config::AgentConfig,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
     if config.orchestration_enabled() {
-        // OrchestratorFactory is lightweight — the real Orchestrator is created
-        // lazily inside stream() to avoid duplicate MCP connections and persistence.
         tracing::info!("Building OrchestratorFactory (orchestration.enabled = true)");
         let factory = OrchestratorFactory::new(config.clone());
         Ok(Arc::new(factory))

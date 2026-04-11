@@ -38,8 +38,6 @@ impl Drop for ActiveRequestGuard {
 }
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
-/// Manages: cancellation, subscriptions (progress, tool events, tool usage).
-/// MCP request_id is set inside stream() and cleaned up when the agent is dropped.
 struct RequestResourceGuard {
     request_id: String,
 }
@@ -366,8 +364,6 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
     let _cancellation = RequestCancellation::register(config.request_id.clone());
 
-    // RAII guard ensures cleanup of subscriptions even on panic.
-    // MCP request_id is set inside stream() — no pre-stream setup needed.
     let _resource_guard = RequestResourceGuard::new(config.request_id.clone());
 
     // Destructure to move chat_history instead of cloning

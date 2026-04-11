@@ -23,10 +23,8 @@ use super::orchestrator::{
 
 /// Zero-state wrapper that implements `StreamingAgent` for orchestration mode.
 ///
-/// Instead of constructing a full `Orchestrator` (with MCP connections, persistence)
-/// at build time, this factory defers construction to `stream()`. The real
-/// `Orchestrator` is created inside a `tokio::spawn`, and `request_id` flows
-/// directly as a parameter — no shared mutable state needed.
+/// Defers `Orchestrator` construction to `stream()` to avoid duplicate resource
+/// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
     agent_config: AgentConfig,
 }
@@ -58,11 +56,11 @@ impl StreamingAgent for OrchestratorFactory {
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
 
-        // Inject conversation history for worker access via get_conversation_context tool
+        // Inject conversation history for worker access
         agent_config.orchestration_chat_history = Some(Arc::new(chat_history.clone()));
 
         let cancel_token_clone = cancel_token.clone();
-        // Capture the current span (agent.stream root) so child spans nest correctly in Phoenix.
+        // Capture parent span so child spans nest correctly in tracing.
         let parent_span = tracing::Span::current();
         tokio::spawn(tracing::Instrument::instrument(
             async move {
@@ -74,8 +72,7 @@ impl StreamingAgent for OrchestratorFactory {
                     }
                 };
 
-                // Set MCP request ID on the inner orchestrator so progress
-                // notifications route to the correct SSE subscriber.
+                // Set MCP request ID for progress notification routing
                 if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                     mcp_manager.set_current_request(&request_id).await;
                 }

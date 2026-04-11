@@ -1,8 +1,9 @@
 //! Orchestrator agent for multi-agent workflows.
 //!
-//! The orchestrator implements the `StreamingAgent` trait, enabling drop-in
-//! replacement for single-agent mode. It decomposes queries into tasks,
-//! executes them (potentially in parallel), and synthesizes results.
+//! The orchestrator decomposes queries into tasks, executes them (potentially
+//! in parallel), and synthesizes results. `StreamingAgent` is implemented by
+//! `OrchestratorFactory` (see `factory.rs`), which creates an `Orchestrator`
+//! lazily inside `stream()`.
 //!
 //! # Architecture
 //!
@@ -309,9 +310,8 @@ pub(super) fn spawn_tool_event_forwarder(
 
 /// Orchestrator for multi-agent workflows.
 ///
-/// When orchestration mode is enabled via config, the web server uses this
-/// instead of a plain `Agent`. The orchestrator coordinates multiple agents
-/// to handle complex queries through a plan-execute-synthesize loop.
+/// Created lazily by `OrchestratorFactory::stream()` to coordinate multiple
+/// agents through a plan-execute-synthesize loop.
 pub struct Orchestrator {
     /// ID for the orchestrator
     orchestrator_id: String,
@@ -368,8 +368,8 @@ impl Orchestrator {
             None
         };
 
-        // Tool call observer for real-time SSE streaming
-        // We subscribe to tool_call_observer when we call spawn_tool_event_forwarder in fn stream hence _rx
+        // Tool call observer for real-time streaming. The _rx receiver is consumed
+        // by spawn_tool_event_forwarder in factory.rs when the stream starts.
         let (tool_call_observer, _rx) = ToolCallObserver::new(32);
 
         // Initialize execution persistence for debugging and retry intelligence
