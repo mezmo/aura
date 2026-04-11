@@ -51,8 +51,8 @@ pub use orchestration::tools::{
 };
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorEvent, Plan, PlanAttemptFailure, PlanningResponse, RoutingMode, Task, TaskJson,
-    TaskStatus, TimeoutsConfig,
+    OrchestratorEvent, OrchestratorFactory, Plan, PlanAttemptFailure, PlanningResponse,
+    RoutingMode, Task, TaskJson, TaskStatus, TimeoutsConfig,
 };
 pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
