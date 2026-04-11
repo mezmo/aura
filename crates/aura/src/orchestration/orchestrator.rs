@@ -972,22 +972,37 @@ impl Orchestrator {
             };
 
             // Build the tool-calling planning prompt
-            let planning_prompt = format!(
-                "Analyze this user query and decide on the best approach.\n\n\
-                 USER QUERY: {query}{worker_section}{reflection_section}{error_section}\n\n\
-                 You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
+            // Routing tool descriptions differ between initial routing and iteration 2+:
+            // - Initial: bias toward create_plan (don't skip tools for data queries)
+            // - Iteration 2+: neutral (coordinator has worker results, can answer directly)
+            let routing_guidance = if previous.is_some() {
+                "You have three routing tools. Call EXACTLY ONE:\n\n\
+                 1. **respond_directly** — The completed tasks and findings above provide sufficient information to answer the user.\n\n\
+                 2. **create_plan** — The results reveal gaps, failures, or new questions that require additional worker tasks. Create only the tasks needed for remaining work.\n\n\
+                 3. **request_clarification** — You need additional information from the user to proceed, including narrowing scope based on what workers discovered.\n\
+                    e.g., \"I found errors across 12 services — which service should I focus on?\" or \"The data spans 6 months — what time window matters?\"\n\n\
+                 Base your decision on the task results above, not on the original query complexity."
+            } else {
+                "You have three routing tools. Call EXACTLY ONE:\n\n\
                  1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
                     NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
                  2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
                     When uncertain between respond_directly and create_plan, always choose create_plan.\n\n\
-                 3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
-                    Use sparingly — prefer create_plan when a reasonable interpretation exists.\n\n\
+                 3. **request_clarification** — The query is genuinely ambiguous or you need more information from the user to proceed.\n\
+                    Use sparingly — prefer create_plan when a reasonable interpretation exists."
+            };
+
+            let planning_prompt = format!(
+                "Analyze this user query and decide on the best approach.\n\n\
+                 USER QUERY: {query}{worker_section}{reflection_section}{error_section}\n\n\
+                 {routing_guidance}\n\n\
                  {worker_guidelines}\n\n\
                  Call the appropriate routing tool now.",
                 query = query,
                 worker_section = worker_section,
                 reflection_section = reflection_section,
                 error_section = error_section,
+                routing_guidance = routing_guidance,
                 worker_guidelines = worker_guidelines,
             );
 

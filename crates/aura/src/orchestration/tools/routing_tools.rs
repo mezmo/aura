@@ -91,9 +91,8 @@ impl Tool for RespondDirectlyTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Answer the user's query directly from general knowledge. \
-                Use this ONLY for simple factual questions that do NOT require any tool \
-                execution, data retrieval, system inspection, or multi-step analysis."
+            description: "Provide a complete answer to the user's query with the \
+                information available to you."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -239,9 +238,7 @@ impl Tool for CreatePlanTool {
             name: Self::NAME.to_string(),
             description: "Decompose the user's query into an ordered sequence of steps for \
                 orchestrated execution. Steps run sequentially by default. Use \
-                {\"parallel\": [...]} when tasks are independent. Use this for queries \
-                requiring tool execution, data gathering, system inspection, or multi-step \
-                analysis."
+                {\"parallel\": [...]} when tasks are independent."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -346,9 +343,8 @@ impl Tool for RequestClarificationTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Request clarification from the user when the query is genuinely \
-                ambiguous. Use sparingly — prefer create_plan when a reasonable interpretation \
-                exists."
+            description: "Ask the user a question when you need additional information \
+                or narrower scope to proceed effectively."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -555,7 +551,7 @@ mod tests {
 
         let def = toolset.respond_directly.definition("".to_string()).await;
         assert_eq!(def.name, "respond_directly");
-        assert!(def.description.contains("directly"));
+        assert!(def.description.contains("complete answer"));
 
         let def = toolset.create_plan.definition("".to_string()).await;
         assert_eq!(def.name, "create_plan");
@@ -566,6 +562,6 @@ mod tests {
             .definition("".to_string())
             .await;
         assert_eq!(def.name, "request_clarification");
-        assert!(def.description.contains("clarification"));
+        assert!(def.description.contains("additional information"));
     }
 }
