@@ -1088,14 +1088,14 @@ impl StreamingAgent for Agent {
 pub async fn build_streaming_agent(
     config: &crate::config::AgentConfig,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
-    // Import Orchestrator only when needed (keeps orchestration coupling minimal)
-    use crate::orchestration::Orchestrator;
+    use crate::orchestration::OrchestratorFactory;
 
     if config.orchestration_enabled() {
-        // Use multi-agent orchestrator: plan -> execute (workers) -> synthesize
-        tracing::info!("Building Orchestrator (orchestration.enabled = true)");
-        let orchestrator = Orchestrator::new(config.clone()).await?;
-        Ok(Arc::new(orchestrator))
+        // OrchestratorFactory is lightweight — the real Orchestrator is created
+        // lazily inside stream() to avoid duplicate MCP connections and persistence.
+        tracing::info!("Building OrchestratorFactory (orchestration.enabled = true)");
+        let factory = OrchestratorFactory::new(config.clone());
+        Ok(Arc::new(factory))
     } else {
         // Standard single-agent mode
         tracing::info!("Building Agent (orchestration.enabled = false)");
