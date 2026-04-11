@@ -11,5 +11,4 @@ GAPS TO ADDRESS:
 %%GAPS%%
 %%FAILURE_HISTORY%%
 YOUR TASK:
-Create a new plan replacing ONLY the tasks listed under TASKS TO REDESIGN.%%REUSE_GUIDANCE%%
-Do not include completed or blocked tasks in your new plan.
+Create a new plan addressing the tasks listed under TASKS TO REDESIGN.%%REUSE_GUIDANCE%%

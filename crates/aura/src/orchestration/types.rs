@@ -935,9 +935,15 @@ impl IterationContext {
         for t in &self.previous_plan.tasks {
             match t.status {
                 TaskStatus::Complete => {
+                    let result_text = t.result.as_deref().unwrap_or("(no result)");
+
+                    // Check worker self-assessment for non-achieved objectives
+                    let has_negative_assessment =
+                        result_text.contains("Objective: not achieved")
+                            || result_text.contains("Objective: partial");
+
                     let detail = if enrich {
-                        let result = t.result.as_deref().unwrap_or("(no result)");
-                        let (truncated, was_truncated) = safe_truncate(result, 500);
+                        let (truncated, was_truncated) = safe_truncate(result_text, 500);
                         if was_truncated {
                             format!("{truncated}...")
                         } else {
@@ -947,8 +953,17 @@ impl IterationContext {
                         let len = t.result.as_ref().map(|r| r.len()).unwrap_or(0);
                         format!("({len} chars)")
                     };
-                    completed_lines
-                        .push(format!("- Task {}: {} → {}", t.id, t.description, detail));
+
+                    if has_negative_assessment {
+                        // Worker self-reported failure — move to redesign
+                        redesign_lines.push(format!(
+                            "- Task {}: {} → self-assessed incomplete: {}",
+                            t.id, t.description, detail
+                        ));
+                    } else {
+                        completed_lines
+                            .push(format!("- Task {}: {} → {}", t.id, t.description, detail));
+                    }
                 }
                 TaskStatus::Failed => {
                     let err = t.error.as_deref().unwrap_or("unknown");
@@ -970,10 +985,7 @@ impl IterationContext {
         let completed_section = if completed_lines.is_empty() {
             String::new()
         } else {
-            format!(
-                "COMPLETED TASKS (do not re-plan these):\n{}\n\n",
-                completed_lines.join("\n")
-            )
+            format!("COMPLETED TASKS:\n{}\n\n", completed_lines.join("\n"))
         };
 
         let blocked_section = if blocked_lines.is_empty() {
@@ -1048,7 +1060,7 @@ impl IterationContext {
 
         // Add reuse guidance when there are completed tasks
         let reuse_guidance = if succeeded > 0 {
-            "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID."
+            "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID. Only reuse tasks reporting Objective: achieved — if a task self-assessed as not achieved or partial, redesign it with a different approach instead of reusing.\nCompleted tasks with actionable results should be carried forward using reuse_result_from, not re-planned from scratch."
         } else {
             ""
         };
@@ -1526,6 +1538,49 @@ mod tests {
         let prompt = ctx.build_reflection_prompt(3);
 
         assert!(!prompt.contains("reuse_result_from"));
+    }
+
+    #[test]
+    fn test_reflection_prompt_self_assessment_categorization() {
+        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
+
+        let mut plan = Plan::new("Analyze data");
+
+        // Task with positive self-assessment → COMPLETED
+        let mut achieved = Task::new(0, "Fetch data", "Get data");
+        achieved.complete("Objective: achieved\nResult: Got 100 rows\nProcess: Used query tool");
+        plan.add_task(achieved);
+
+        // Task with negative self-assessment → REDESIGN
+        let mut not_achieved = Task::new(1, "Transform data", "Process data");
+        not_achieved.complete(
+            "Objective: not achieved\nResult: Could not parse format\nProcess: Attempted CSV parse",
+        );
+        plan.add_task(not_achieved);
+
+        // Task with partial self-assessment → REDESIGN
+        let mut partial = Task::new(2, "Summarize findings", "Summarize");
+        partial.complete(
+            "Objective: partial\nResult: Only 2 of 5 metrics computed\nProcess: Missing source data",
+        );
+        plan.add_task(partial);
+
+        let eval = EvaluationResult::new(0.4, "Incomplete");
+        let ctx = IterationContext::new(1, plan, eval, vec![]);
+        let prompt = ctx.build_reflection_prompt(3);
+
+        // Task 0 should be in COMPLETED (achieved)
+        assert!(prompt.contains("COMPLETED TASKS"));
+        assert!(prompt.contains("Task 0: Fetch data"));
+
+        // Tasks 1 and 2 should be in TASKS TO REDESIGN (not achieved / partial)
+        assert!(prompt.contains("TASKS TO REDESIGN"));
+        assert!(prompt.contains("Task 1: Transform data"));
+        assert!(prompt.contains("self-assessed incomplete"));
+        assert!(prompt.contains("Task 2: Summarize findings"));
+
+        // Reuse guidance should mention Objective: achieved
+        assert!(prompt.contains("Objective: achieved"));
     }
 
     #[test]
