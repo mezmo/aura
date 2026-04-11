@@ -949,9 +949,8 @@ impl IterationContext {
                     let result_text = t.result.as_deref().unwrap_or("(no result)");
 
                     // Check worker self-assessment for non-achieved objectives
-                    let has_negative_assessment =
-                        result_text.contains("Objective: not achieved")
-                            || result_text.contains("Objective: partial");
+                    let has_negative_assessment = result_text.contains("Objective: not achieved")
+                        || result_text.contains("Objective: partial");
 
                     let detail = if enrich {
                         let (truncated, was_truncated) = safe_truncate(result_text, 500);
@@ -1081,10 +1080,7 @@ impl IterationContext {
             Some(summary) => {
                 let (truncated, was_truncated) = safe_truncate(summary, 1000);
                 let suffix = if was_truncated { "..." } else { "" };
-                format!(
-                    "PREVIOUS ITERATION FINDINGS:\n{}{}\n\n",
-                    truncated, suffix
-                )
+                format!("PREVIOUS ITERATION FINDINGS:\n{}{}\n\n", truncated, suffix)
             }
             None => String::new(),
         };

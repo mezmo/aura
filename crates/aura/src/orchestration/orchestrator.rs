@@ -4358,18 +4358,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // SYNTHESIZE: Combine task results into coherent response
             // ----------------------------------------------------------------
             let is_single_task = plan.tasks.len() == 1;
+            let iterations_remaining = iteration < self.config.max_planning_cycles;
 
-            let evaluation = if is_single_task && plan.completed_count() == 1 {
-                // Single-task (routed) plan: skip synthesis LLM call, use worker result directly.
-                // The coordinator will frame the final response when it sees the result.
+            if is_single_task && plan.completed_count() == 1 {
+                // Single-task (routed) plan: pass worker result directly.
                 let worker_result = plan.tasks[0]
                     .result
                     .as_deref()
                     .unwrap_or("(no result)")
                     .to_string();
-                tracing::info!(
-                    "Single-task plan: skipping synthesis + evaluation, using worker result directly"
-                );
+                tracing::info!("Single-task plan: using worker result directly (no synthesis)");
 
                 // Persist the pass-through as synthesis artifact for observability
                 {
@@ -4383,7 +4381,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 final_result = worker_result;
-                super::types::EvaluationResult::new(1.0, "Single-task plan completed successfully")
             } else {
                 // Multi-task plan: full synthesis
                 Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
@@ -4395,31 +4392,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         return Err(e);
                     }
                 };
-                self.evaluate(&plan, query, &final_result).await
-            };
-            let quality_score = evaluation.score;
-            last_quality_score = Some(quality_score);
+            }
 
-            let quality_met = quality_score >= self.config.quality_threshold;
-            let iterations_remaining = iteration < self.config.max_planning_cycles;
-            let will_replan = !quality_met && iterations_remaining;
+            // Record iteration on the span
+            iter_span.record("orchestration.will_replan", iterations_remaining);
 
-            // Record evaluation results on the iteration span
-            iter_span.record(
-                "orchestration.quality_score",
-                format!("{:.2}", quality_score).as_str(),
-            );
-            iter_span.record("orchestration.will_replan", will_replan);
-
-            // Persist iteration summary
+            // Persist iteration summary (evaluation_skipped=true in coordinator-driven mode)
             {
                 let persistence = self.persistence.lock().await;
                 if let Err(e) = persistence
                     .write_iteration_summary(
                         iteration,
-                        quality_score,
+                        // No evaluator score — coordinator decides via routing
+                        1.0,
                         self.config.quality_threshold,
-                        will_replan,
+                        iterations_remaining,
                     )
                     .await
                 {
@@ -4431,58 +4418,47 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &event_tx,
                 OrchestratorEvent::IterationComplete {
                     iteration,
-                    quality_score,
+                    quality_score: 0.0,
                     quality_threshold: self.config.quality_threshold,
-                    will_replan,
-                    evaluation_skipped: is_single_task && plan.completed_count() == 1,
-                    reasoning: evaluation.reasoning.clone(),
-                    gaps: evaluation.gaps.clone(),
+                    will_replan: iterations_remaining,
+                    evaluation_skipped: true,
+                    reasoning:
+                        "Coordinator-driven loop: evaluation deferred to coordinator routing"
+                            .to_string(),
+                    gaps: vec![],
                 },
             )
             .await;
 
             tracing::info!(
-                "Iteration {} complete: quality={:.2}, threshold={:.2}, elapsed={:.1}s",
+                "Iteration {} complete: {}/{} tasks, elapsed={:.1}s, will_return_to_coordinator={}",
                 iteration,
-                quality_score,
-                self.config.quality_threshold,
+                plan.completed_count(),
+                plan.tasks.len(),
                 orchestration_start.elapsed().as_secs_f64(),
+                iterations_remaining,
             );
 
             // ----------------------------------------------------------------
-            // DECIDE: Continue or terminate?
+            // DECIDE: Return to coordinator or terminate at budget limit
             // ----------------------------------------------------------------
-            if quality_met {
-                tracing::info!(
-                    "Quality threshold met ({:.2} >= {:.2})",
-                    quality_score,
-                    self.config.quality_threshold
-                );
-                break;
-            }
-
             if !iterations_remaining {
-                tracing::warn!(
-                    "Max iterations reached ({}) without meeting quality threshold ({:.2} < {:.2}). Returning best available result.",
+                tracing::info!(
+                    "Max iterations reached ({}). Returning best available result.",
                     self.config.max_planning_cycles,
-                    quality_score,
-                    self.config.quality_threshold,
                 );
                 break;
             }
 
             // ----------------------------------------------------------------
-            // REFLECT: Capture context for next iteration
+            // RETURN TO COORDINATOR: Build context and loop back
             // ----------------------------------------------------------------
             tracing::info!(
-                "Re-planning: quality {:.2} < threshold {:.2} (iteration {}/{}, {}/{} tasks completed, {} failed)",
-                quality_score,
-                self.config.quality_threshold,
+                "Returning to coordinator (iteration {}/{}, {}/{} tasks completed)",
                 iteration,
                 self.config.max_planning_cycles,
                 plan.completed_count(),
                 plan.tasks.len(),
-                plan.failed_count(),
             );
 
             // Thread synthesis result into iteration context for coordinator visibility
@@ -4492,12 +4468,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 None
             };
 
+            // Build a placeholder evaluation for IterationContext (coordinator decides, not eval)
+            let coordinator_eval = EvaluationResult::new(
+                0.0,
+                "Coordinator-driven: returning to coordinator for next decision",
+            );
+
             (previous_context, plan) = Self::trigger_replan(
                 &event_tx,
                 iteration,
-                "quality",
+                "coordinator",
                 plan,
-                evaluation,
+                coordinator_eval,
                 &failure_history,
                 synthesis_for_context,
             )

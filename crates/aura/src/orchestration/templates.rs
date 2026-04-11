@@ -96,7 +96,8 @@ pub struct SynthesisIterationVars<'a> {
 }
 
 impl TemplateVars for SynthesisIterationVars<'_> {
-    const VARS: &'static [&'static str] = &["GOAL", "QUERY", "ITERATION", "MAX_ITERATIONS", "RESULTS"];
+    const VARS: &'static [&'static str] =
+        &["GOAL", "QUERY", "ITERATION", "MAX_ITERATIONS", "RESULTS"];
 
     fn render(&self, template: &str) -> String {
         template
