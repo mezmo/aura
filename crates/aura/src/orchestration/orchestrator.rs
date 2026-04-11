@@ -74,7 +74,7 @@ use super::types::{
 // ============================================================================
 
 /// Number of characters per chunk when streaming the final orchestration response.
-const STREAM_CHUNK_SIZE: usize = 50;
+pub(super) const STREAM_CHUNK_SIZE: usize = 50;
 
 /// Maximum ReAct depth for the planning coordinator.
 /// Defense-in-depth alongside stream_and_collect's early exit.
@@ -127,7 +127,7 @@ struct CoordinatorTools {
 /// returns `Err`, the `select!` resolves, and the sleep future is dropped
 /// (cancelling the timer via tokio's standard drop semantics).
 #[must_use = "task runs independently; bind with `let _handle =` to document fire-and-forget intent"]
-fn spawn_cancellation_watcher(
+pub(super) fn spawn_cancellation_watcher(
     cancel_rx: watch::Receiver<bool>,
     timeout: Duration,
     cancel_token: CancellationToken,
@@ -274,7 +274,7 @@ fn tool_event_to_orchestrator_event(
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
 /// to `OrchestratorEvent`s, sending them through the event channel.
-fn spawn_tool_event_forwarder(
+pub(super) fn spawn_tool_event_forwarder(
     observer: &ToolCallObserver,
     event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     cancel_token: CancellationToken,
@@ -327,11 +327,11 @@ pub struct Orchestrator {
 
     /// Tool call observer for coordinator visibility into worker tool execution.
     /// Wired to emit OrchestratorEvent for real-time SSE streaming via spawn_tool_event_forwarder.
-    tool_call_observer: ToolCallObserver,
+    pub(super) tool_call_observer: ToolCallObserver,
 
     /// Shared MCP manager for tool discovery and cancellation.
     /// Arc-wrapped so workers can share the same connections.
-    mcp_manager: Option<Arc<McpManager>>,
+    pub(super) mcp_manager: Option<Arc<McpManager>>,
 
     /// Execution persistence for debugging and retry intelligence
     persistence: Arc<Mutex<ExecutionPersistence>>,
@@ -3754,7 +3754,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             orchestration.routing = tracing::field::Empty,
         )
     )]
-    async fn run_orchestration(
+    pub(super) async fn run_orchestration(
         &self,
         query: &str,
         chat_history: Vec<rig::completion::Message>,
@@ -4522,146 +4522,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 }
 
-#[async_trait]
-impl StreamingAgent for Orchestrator {
-    fn get_provider_info(&self) -> (&str, &str) {
-        self.agent_config.llm.model_info()
-    }
-
-    async fn stream(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        cancel_token: CancellationToken,
-        _request_id: &str,
-    ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
-        let query = query.to_string();
-        let chat_history = chat_history.clone();
-
-        // Create channel for orchestrator events
-        let (event_tx, event_rx) =
-            tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
-
-        // Clone self fields for the spawned task
-        let mut agent_config = self.agent_config.clone();
-        // Inject conversation history for worker access via get_conversation_context tool
-        agent_config.orchestration_chat_history = Some(Arc::new(chat_history.clone()));
-
-        // Spawn orchestration in background task
-        // Note: Creates a fresh Orchestrator with its own MCP connections and persistence run.
-        // The factory instance (self) only exists to satisfy the StreamingAgent trait.
-        let cancel_token_clone = cancel_token.clone();
-        // Capture the current span (agent.stream root) so child spans nest correctly in Phoenix.
-        let parent_span = tracing::Span::current();
-        tokio::spawn(tracing::Instrument::instrument(
-            async move {
-                let orchestrator = match Orchestrator::new(agent_config).await {
-                    Ok(o) => o,
-                    Err(e) => {
-                        let _ = event_tx.send(Err(e)).await;
-                        return;
-                    }
-                };
-
-                // Forward tool call events from workers to SSE stream
-                spawn_tool_event_forwarder(
-                    &orchestrator.tool_call_observer,
-                    event_tx.clone(),
-                    cancel_token_clone.clone(),
-                );
-
-                tokio::select! {
-                    result = orchestrator.run_orchestration(&query, chat_history, event_tx.clone()) => {
-                        match result {
-                            Ok(final_result) => {
-                                // Emit final response as text chunks
-                                // Split into chunks to simulate streaming
-                                for chunk in final_result.chars().collect::<Vec<_>>().chunks(STREAM_CHUNK_SIZE) {
-                                    let text: String = chunk.iter().collect();
-                                    let _ = event_tx.send(Ok(StreamItem::StreamAssistantItem(
-                                        crate::provider_agent::StreamedAssistantContent::Text(text)
-                                    ))).await;
-                                }
-
-                                // Emit Final marker
-                                let _ = event_tx.send(Ok(StreamItem::Final(
-                                    crate::provider_agent::FinalResponseInfo {
-                                        content: final_result,
-                                        usage: Default::default(),
-                                    }
-                                ))).await;
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(Err(e)).await;
-                            }
-                        }
-                    }
-                    _ = cancel_token_clone.cancelled() => {
-                        tracing::info!("Orchestration cancelled");
-                        // Best-effort: send notifications/cancelled to the inner orchestrator's
-                        // MCP connections (coordinator tools like list_tools, inspect_tool_params).
-                        // Note: Worker-level MCP connections are handled via drop when the spawned
-                        // task returns, since workers create independent Agent instances. Clean
-                        // protocol-level cancellation for worker MCP calls would require propagating
-                        // CancellationToken through Rig's tool execution layer.
-                        let cancelled = orchestrator
-                            .cancel_and_close_mcp("orchestration", "Client disconnected or timeout")
-                            .await;
-                        if cancelled > 0 {
-                            tracing::info!("Cancelled {} MCP request(s) during orchestration shutdown", cancelled);
-                        }
-                    }
-                }
-            },
-            parent_span,
-        ));
-
-        // Convert receiver to stream
-        let stream = stream::unfold(event_rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-
-        Ok(Box::pin(stream))
-    }
-
-    async fn stream_with_timeout(
-        &self,
-        query: &str,
-        chat_history: Vec<rig::completion::Message>,
-        timeout: Duration,
-        request_id: &str,
-    ) -> (
-        BoxStream<'static, Result<StreamItem, StreamError>>,
-        watch::Sender<bool>,
-        crate::UsageState,
-    ) {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let cancel_token = CancellationToken::new();
-        let watcher_cancel_token = cancel_token.clone();
-        let request_id_owned = request_id.to_string();
-
-        // Fire-and-forget: task self-terminates when cancel_tx is dropped or timeout fires.
-        let _watcher_handle =
-            spawn_cancellation_watcher(cancel_rx, timeout, watcher_cancel_token, request_id_owned);
-
-        // Get the stream — returned directly, no wrapper needed
-        let stream = match self.stream(query, chat_history, cancel_token, request_id).await {
-            Ok(s) => s,
-            Err(e) => Box::pin(stream::once(async move { Err(e) })),
-        };
-
-        // Orchestration has its own usage tracking; return a fresh state for the handler.
-        (stream, cancel_tx, crate::UsageState::new())
-    }
-
-    async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
-        if let Some(ref mcp_manager) = self.mcp_manager {
-            mcp_manager.cancel_and_close_all(request_id, reason).await
-        } else {
-            0
-        }
-    }
-}
+// StreamingAgent is implemented by OrchestratorFactory (see factory.rs),
+// which creates an Orchestrator lazily inside stream() to avoid duplicate
+// MCP connections and persistence directories.
 
 /// Truncate a query string for logging.
 fn truncate_query(query: &str, max_len: usize) -> String {
