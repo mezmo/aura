@@ -18,7 +18,7 @@
 //!
 //! async fn handle_request(agent: impl StreamingAgent, query: &str) {
 //!     let cancel_token = CancellationToken::new();
-//!     let stream = agent.stream(query, vec![], cancel_token).await?;
+//!     let stream = agent.stream(query, vec![], cancel_token, "req_123").await?;
 //!
 //!     // Process stream items (convert to SSE, etc.)
 //!     while let Some(item) = stream.next().await {
@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 /// # Implementors
 ///
 /// - `Agent` - Single-agent streaming (default implementation)
-/// - Future: `Orchestrator` - Multi-agent deep research mode
+/// - `OrchestratorFactory` - Multi-agent orchestration mode
 ///
 /// # Design Notes
 ///
@@ -76,6 +76,7 @@ pub trait StreamingAgent: Send + Sync {
     /// * `query` - The user's query/message
     /// * `chat_history` - Previous messages in the conversation
     /// * `cancel_token` - Token for cancellation (e.g., on client disconnect)
+    /// * `request_id` - HTTP request ID for MCP progress routing and tool correlation
     ///
     /// # Returns
     ///
@@ -85,6 +86,7 @@ pub trait StreamingAgent: Send + Sync {
         query: &str,
         chat_history: Vec<Message>,
         cancel_token: CancellationToken,
+        request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError>;
 
     /// Stream with timeout support.
@@ -121,15 +123,6 @@ pub trait StreamingAgent: Send + Sync {
     /// Called on client disconnect or timeout to propagate `notifications/cancelled`
     /// to MCP servers. Returns the number of cancelled requests.
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize;
-
-    /// Set the current HTTP request ID for MCP request tracking.
-    ///
-    /// Must be called before creating the stream so that `call_tool_tracked()`
-    /// can associate tool calls with this request.
-    async fn set_mcp_request_id(&self, request_id: &str);
-
-    /// Clear the MCP request ID after streaming completes.
-    async fn clear_mcp_request_id(&self);
 
     /// Return the configured context window size in tokens (from TOML config).
     /// Returns `None` if not configured (e.g., Orchestrator).
