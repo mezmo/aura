@@ -4533,6 +4533,7 @@ impl StreamingAgent for Orchestrator {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         cancel_token: CancellationToken,
+        _request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
         let query = query.to_string();
         let chat_history = chat_history.clone();
@@ -4644,7 +4645,7 @@ impl StreamingAgent for Orchestrator {
             spawn_cancellation_watcher(cancel_rx, timeout, watcher_cancel_token, request_id_owned);
 
         // Get the stream — returned directly, no wrapper needed
-        let stream = match self.stream(query, chat_history, cancel_token).await {
+        let stream = match self.stream(query, chat_history, cancel_token, request_id).await {
             Ok(s) => s,
             Err(e) => Box::pin(stream::once(async move { Err(e) })),
         };
@@ -4658,18 +4659,6 @@ impl StreamingAgent for Orchestrator {
             mcp_manager.cancel_and_close_all(request_id, reason).await
         } else {
             0
-        }
-    }
-
-    async fn set_mcp_request_id(&self, request_id: &str) {
-        if let Some(ref mcp_manager) = self.mcp_manager {
-            mcp_manager.set_current_request(request_id).await;
-        }
-    }
-
-    async fn clear_mcp_request_id(&self) {
-        if let Some(ref mcp_manager) = self.mcp_manager {
-            mcp_manager.clear_current_request().await;
         }
     }
 }

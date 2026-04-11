@@ -1020,7 +1020,13 @@ impl StreamingAgent for Agent {
         query: &str,
         chat_history: Vec<rig::completion::Message>,
         _cancel_token: CancellationToken,
+        request_id: &str,
     ) -> Result<BoxStream<'static, Result<StreamItem, StreamError>>, StreamError> {
+        // Set MCP request ID for tool call tracking and progress routing
+        if let Some(mcp_manager) = &self.mcp_manager {
+            mcp_manager.set_current_request(request_id).await;
+        }
+
         // Use the appropriate method based on whether we have chat history
         let stream = if chat_history.is_empty() {
             self.stream_prompt(query).await
@@ -1042,6 +1048,13 @@ impl StreamingAgent for Agent {
         watch::Sender<bool>,
         crate::UsageState,
     ) {
+        // Set MCP request ID for tool call tracking and progress routing.
+        // This must happen here (not in stream()) because stream_with_timeout
+        // delegates to stream_*_with_timeout which bypass stream().
+        if let Some(mcp_manager) = &self.mcp_manager {
+            mcp_manager.set_current_request(request_id).await;
+        }
+
         // Use the appropriate method based on whether we have chat history
         let (stream, cancel_tx, usage_state) = if chat_history.is_empty() {
             self.stream_prompt_with_timeout(query, timeout, request_id)
@@ -1057,16 +1070,6 @@ impl StreamingAgent for Agent {
     async fn cancel_and_close_mcp(&self, request_id: &str, reason: &str) -> usize {
         // Delegate to the existing Agent method
         Agent::cancel_and_close_mcp(self, request_id, reason).await
-    }
-
-    async fn set_mcp_request_id(&self, request_id: &str) {
-        // Delegate to the existing Agent method
-        Agent::set_mcp_request_id(self, request_id).await
-    }
-
-    async fn clear_mcp_request_id(&self) {
-        // Delegate to the existing Agent method
-        Agent::clear_mcp_request_id(self).await
     }
 
     fn context_window(&self) -> Option<u64> {
