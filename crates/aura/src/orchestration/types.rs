@@ -1055,7 +1055,8 @@ impl IterationContext {
 
         // Urgency header
         let urgency = if self.iteration + 1 >= max_iterations {
-            " (FINAL ATTEMPT)".to_string()
+            " — FINAL ITERATION: you must call respond_directly or request_clarification"
+                .to_string()
         } else {
             String::new()
         };
@@ -1066,11 +1067,10 @@ impl IterationContext {
         let max_iter_str = max_iterations.to_string();
         let succeeded_str = succeeded.to_string();
         let total_str = total.to_string();
-        let score_str = format!("{:.2}", self.evaluation.score);
 
-        // Add reuse guidance when there are completed tasks
-        let reuse_guidance = if succeeded > 0 {
-            "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID. Only reuse tasks reporting Objective: achieved — if a task self-assessed as not achieved or partial, redesign it with a different approach instead of reusing.\nCompleted tasks with actionable results should be carried forward using reuse_result_from, not re-planned from scratch."
+        // Add reuse guidance only when there are completed tasks to carry forward
+        let reuse_guidance = if succeeded > 0 && !redesign_lines.is_empty() {
+            "\nTo carry forward a completed task's result, set \"reuse_result_from\" to the original task ID. Only reuse tasks reporting Objective: achieved."
         } else {
             ""
         };
@@ -1085,6 +1085,13 @@ impl IterationContext {
             None => String::new(),
         };
 
+        // Conditional status hint — only when all tasks achieved
+        let status_hint = if redesign_lines.is_empty() && blocked_lines.is_empty() {
+            "All tasks completed successfully.\n"
+        } else {
+            ""
+        };
+
         render_reflection_prompt(&ReflectionVars {
             iteration: &iteration_str,
             max_iterations: &max_iter_str,
@@ -1092,13 +1099,11 @@ impl IterationContext {
             succeeded: &succeeded_str,
             total: &total_str,
             goal: &self.previous_plan.goal,
-            score: &score_str,
             completed_section: &completed_section,
             blocked_section: &blocked_section,
             redesign_section: &redesign_section,
             synthesis_section: &synthesis_section,
-            reasoning: &self.evaluation.reasoning,
-            gaps: &self.evaluation.gaps_as_bullets(),
+            status_hint,
             failure_history: &failure_history,
             reuse_guidance,
         })
@@ -1364,19 +1369,18 @@ mod tests {
         let prompt = ctx.build_reflection_prompt(3);
 
         // Verify key sections are present
-        assert!(prompt.contains("REPLAN CYCLE 1 of 3"));
+        assert!(prompt.contains("ITERATION 1 of 3"));
         assert!(prompt.contains("Goal: Investigate the issue"));
-        assert!(prompt.contains("Quality Score: 0.30"));
         assert!(prompt.contains("COMPLETED TASKS"));
         assert!(prompt.contains("Task 0: Gather logs"));
         // Default enriched mode includes truncated results
         assert!(prompt.contains("Here are the logs..."));
-        assert!(prompt.contains("EVALUATION:"));
-        assert!(prompt.contains("Response lacks detail"));
-        assert!(prompt.contains("GAPS TO ADDRESS:"));
-        assert!(prompt.contains("- Missing root cause"));
-        assert!(prompt.contains("- No remediation steps"));
-        assert!(prompt.contains("TASKS TO REDESIGN"));
+        // Score/reasoning/gaps removed — coordinator forms own judgment
+        assert!(!prompt.contains("Quality Score"));
+        assert!(!prompt.contains("EVALUATION:"));
+        assert!(!prompt.contains("GAPS TO ADDRESS"));
+        // All tasks completed, no redesign section
+        assert!(prompt.contains("All tasks completed successfully"));
     }
 
     #[test]
@@ -1391,10 +1395,10 @@ mod tests {
         let ctx = IterationContext::new(2, plan, eval, vec![]);
         let prompt = ctx.build_reflection_prompt(3);
 
-        // Should show "No specific gaps identified" when gaps is empty
-        assert!(prompt.contains("- No specific gaps identified"));
-        assert!(prompt.contains("REPLAN CYCLE 2 of 3"));
+        assert!(prompt.contains("ITERATION 2 of 3"));
         assert!(prompt.contains("COMPLETED TASKS"));
+        // All tasks completed, no redesign → status hint
+        assert!(prompt.contains("All tasks completed successfully"));
     }
 
     #[test]
@@ -1516,7 +1520,8 @@ mod tests {
         let ctx = IterationContext::new(2, plan, eval, vec![]);
         let prompt = ctx.build_reflection_prompt(3);
 
-        assert!(prompt.contains("(FINAL ATTEMPT)"));
+        assert!(prompt.contains("FINAL ITERATION"));
+        assert!(prompt.contains("respond_directly"));
     }
 
     #[test]
@@ -1530,21 +1535,42 @@ mod tests {
         let ctx = IterationContext::new(1, plan, eval, vec![]);
         let prompt = ctx.build_reflection_prompt(3);
 
-        assert!(!prompt.contains("FINAL ATTEMPT"));
+        assert!(!prompt.contains("FINAL ITERATION"));
     }
 
     #[test]
     fn test_reflection_prompt_includes_reuse_guidance() {
         let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Completed task", "Done");
-        task.complete("Some result");
-        plan.add_task(task);
+        let mut completed = Task::new(0, "Completed task", "Done");
+        completed.complete("Some result");
+        plan.add_task(completed);
+        // Reuse guidance only shows when there are tasks to redesign
+        let mut failed = Task::new(1, "Failed task", "Broke");
+        failed.fail("error");
+        plan.add_task(failed);
 
         let eval = EvaluationResult::new(0.4, "Needs improvement");
         let ctx = IterationContext::new(1, plan, eval, vec![]);
         let prompt = ctx.build_reflection_prompt(3);
 
         assert!(prompt.contains("reuse_result_from"));
+    }
+
+    #[test]
+    fn test_reflection_prompt_no_reuse_when_all_succeeded() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Completed task", "Done");
+        task.complete("Some result");
+        plan.add_task(task);
+
+        let eval = EvaluationResult::new(1.0, "All good");
+        let ctx = IterationContext::new(1, plan, eval, vec![]);
+        let prompt = ctx.build_reflection_prompt(3);
+
+        // No redesign tasks → no reuse guidance needed
+        assert!(!prompt.contains("reuse_result_from"));
+        // Should have status hint instead
+        assert!(prompt.contains("All tasks completed successfully"));
     }
 
     #[test]

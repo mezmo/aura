@@ -167,7 +167,7 @@ impl TemplateVars for PhaseContinuationVars<'_> {
     }
 }
 
-/// Variables for the reflection prompt (replan cycle).
+/// Variables for the reflection prompt (iteration context for coordinator).
 #[derive(Debug, Clone)]
 pub struct ReflectionVars<'a> {
     pub iteration: &'a str,
@@ -176,13 +176,11 @@ pub struct ReflectionVars<'a> {
     pub succeeded: &'a str,
     pub total: &'a str,
     pub goal: &'a str,
-    pub score: &'a str,
     pub completed_section: &'a str,
     pub blocked_section: &'a str,
     pub redesign_section: &'a str,
     pub synthesis_section: &'a str,
-    pub reasoning: &'a str,
-    pub gaps: &'a str,
+    pub status_hint: &'a str,
     pub failure_history: &'a str,
     pub reuse_guidance: &'a str,
 }
@@ -195,13 +193,11 @@ impl TemplateVars for ReflectionVars<'_> {
         "SUCCEEDED",
         "TOTAL",
         "GOAL",
-        "SCORE",
         "COMPLETED_SECTION",
         "BLOCKED_SECTION",
         "REDESIGN_SECTION",
         "SYNTHESIS_SECTION",
-        "REASONING",
-        "GAPS",
+        "STATUS_HINT",
         "FAILURE_HISTORY",
         "REUSE_GUIDANCE",
     ];
@@ -214,13 +210,11 @@ impl TemplateVars for ReflectionVars<'_> {
             .replace("%%SUCCEEDED%%", self.succeeded)
             .replace("%%TOTAL%%", self.total)
             .replace("%%GOAL%%", self.goal)
-            .replace("%%SCORE%%", self.score)
             .replace("%%COMPLETED_SECTION%%", self.completed_section)
             .replace("%%BLOCKED_SECTION%%", self.blocked_section)
             .replace("%%REDESIGN_SECTION%%", self.redesign_section)
             .replace("%%SYNTHESIS_SECTION%%", self.synthesis_section)
-            .replace("%%REASONING%%", self.reasoning)
-            .replace("%%GAPS%%", self.gaps)
+            .replace("%%STATUS_HINT%%", self.status_hint)
             .replace("%%FAILURE_HISTORY%%", self.failure_history)
             .replace("%%REUSE_GUIDANCE%%", self.reuse_guidance)
     }
@@ -824,13 +818,11 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             succeeded: "1",
             total: "2",
             goal: "Calculate (3+7)*2 and find files in /data",
-            score: "0.45",
             completed_section: "COMPLETED TASKS:\n- Task 0: Calculate (3+7)*2 using mock_tool → (3+7)*2 = 20\n\n",
             blocked_section: "",
             redesign_section: "TASKS TO REDESIGN:\n- Task 1: List files in /data using list_files → failed: Connection refused\n\n",
             synthesis_section: "PREVIOUS ITERATION FINDINGS:\nArithmetic computation succeeded: (3+7)*2 = 20. File listing failed due to connection error — data worker could not reach the filesystem service.\n\n",
-            reasoning: "Arithmetic task completed correctly, but file listing failed due to connection error.",
-            gaps: "- File listing task needs retry or alternative approach",
+            status_hint: "",
             failure_history: "\nFAILURE HISTORY:\n- Iteration 1: \"List files in /data using list_files\" (worker: data) — Connection refused\n",
             reuse_guidance: "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID.",
         });
