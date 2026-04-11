@@ -31,6 +31,12 @@ url = "http://math-mcp:8081/mcp"
 headers = {}
 description = "Math MCP server providing arithmetic, statistics, and trigonometry tools"
 
+[mcp.servers.mock]
+transport = "http_streamable"
+url = "http://mock-mcp:9999/mcp"
+headers = {}
+description = "Mock MCP server with progress-reporting tasks"
+
 [orchestration]
 enabled = true
 max_planning_cycles = 2
@@ -102,4 +108,14 @@ Task: Compute sin(45°)
 → Result: 0.7071067811865476
 
 Do the same for your assigned task.
+"""
+
+[orchestration.worker.progress_task]
+description = "Long-running tasks that report progress notifications"
+turn_depth = 3
+mcp_filter = ["task_with_progress"]
+preamble = """
+You execute long-running tasks that report progress.
+Call task_with_progress with the requested duration and steps.
+Report the result when complete.
 """
