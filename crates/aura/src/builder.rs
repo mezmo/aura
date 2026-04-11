@@ -908,28 +908,6 @@ impl Agent {
         }
     }
 
-    /// Set the current HTTP request ID on all MCP clients.
-    ///
-    /// Call this before starting a streaming request. All subsequent tool calls
-    /// will automatically be tracked under this request ID for cancellation support.
-    ///
-    /// This is more reliable than thread-local storage because Rig spawns tool
-    /// execution in separate tasks where thread-local doesn't propagate.
-    pub async fn set_mcp_request_id(&self, http_request_id: &str) {
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.set_current_request(http_request_id).await;
-        }
-    }
-
-    /// Clear the current HTTP request ID on all MCP clients.
-    ///
-    /// Call this after a streaming request completes (successfully or otherwise).
-    pub async fn clear_mcp_request_id(&self) {
-        if let Some(mcp_manager) = &self.mcp_manager {
-            mcp_manager.clear_current_request().await;
-        }
-    }
-
     /// Get all available tool names from MCP servers.
     ///
     /// Returns a list of tool names that can be used for fallback tool execution.
