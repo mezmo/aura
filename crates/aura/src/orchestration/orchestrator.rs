@@ -42,8 +42,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
 use rig::client::CompletionClient;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
@@ -52,7 +50,6 @@ use crate::Agent;
 use crate::config::{AgentConfig, LlmConfig};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
-use crate::streaming::StreamingAgent;
 use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
 
