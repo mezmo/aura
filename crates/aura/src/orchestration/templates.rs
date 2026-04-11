@@ -30,6 +30,8 @@ pub const EVALUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/evaluation
 pub const PHASE_CONTINUATION_PROMPT_TEMPLATE: &str =
     include_str!("../prompts/phase_continuation.md");
 pub const REFLECTION_PROMPT_TEMPLATE: &str = include_str!("../prompts/reflection_prompt.md");
+pub const SYNTHESIS_ITERATION_PROMPT_TEMPLATE: &str =
+    include_str!("../prompts/synthesis_iteration_prompt.md");
 
 /// Trait for template variable providers.
 ///
@@ -79,6 +81,29 @@ impl TemplateVars for SynthesisVars<'_> {
         template
             .replace("%%GOAL%%", self.goal)
             .replace("%%QUERY%%", self.query)
+            .replace("%%RESULTS%%", self.results)
+    }
+}
+
+/// Variables for the iteration synthesis prompt (learnings summary, not final answer).
+#[derive(Debug, Clone)]
+pub struct SynthesisIterationVars<'a> {
+    pub goal: &'a str,
+    pub query: &'a str,
+    pub iteration: &'a str,
+    pub max_iterations: &'a str,
+    pub results: &'a str,
+}
+
+impl TemplateVars for SynthesisIterationVars<'_> {
+    const VARS: &'static [&'static str] = &["GOAL", "QUERY", "ITERATION", "MAX_ITERATIONS", "RESULTS"];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%GOAL%%", self.goal)
+            .replace("%%QUERY%%", self.query)
+            .replace("%%ITERATION%%", self.iteration)
+            .replace("%%MAX_ITERATIONS%%", self.max_iterations)
             .replace("%%RESULTS%%", self.results)
     }
 }
@@ -154,6 +179,7 @@ pub struct ReflectionVars<'a> {
     pub completed_section: &'a str,
     pub blocked_section: &'a str,
     pub redesign_section: &'a str,
+    pub synthesis_section: &'a str,
     pub reasoning: &'a str,
     pub gaps: &'a str,
     pub failure_history: &'a str,
@@ -172,6 +198,7 @@ impl TemplateVars for ReflectionVars<'_> {
         "COMPLETED_SECTION",
         "BLOCKED_SECTION",
         "REDESIGN_SECTION",
+        "SYNTHESIS_SECTION",
         "REASONING",
         "GAPS",
         "FAILURE_HISTORY",
@@ -190,6 +217,7 @@ impl TemplateVars for ReflectionVars<'_> {
             .replace("%%COMPLETED_SECTION%%", self.completed_section)
             .replace("%%BLOCKED_SECTION%%", self.blocked_section)
             .replace("%%REDESIGN_SECTION%%", self.redesign_section)
+            .replace("%%SYNTHESIS_SECTION%%", self.synthesis_section)
             .replace("%%REASONING%%", self.reasoning)
             .replace("%%GAPS%%", self.gaps)
             .replace("%%FAILURE_HISTORY%%", self.failure_history)
@@ -215,6 +243,11 @@ pub fn render_synthesis_prompt(vars: &SynthesisVars<'_>) -> String {
 /// Render the evaluation prompt with the given variables.
 pub fn render_evaluation_prompt(vars: &EvaluationVars<'_>) -> String {
     vars.render(EVALUATION_PROMPT_TEMPLATE)
+}
+
+/// Render the iteration synthesis prompt with the given variables.
+pub fn render_synthesis_iteration_prompt(vars: &SynthesisIterationVars<'_>) -> String {
+    vars.render(SYNTHESIS_ITERATION_PROMPT_TEMPLATE)
 }
 
 /// Render the reflection prompt with the given variables.
@@ -396,6 +429,12 @@ mod tests {
             .expect("Reflection template should match ReflectionVars");
     }
 
+    #[test]
+    fn test_synthesis_iteration_template_matches_context() {
+        validate_template::<SynthesisIterationVars>(SYNTHESIS_ITERATION_PROMPT_TEMPLATE)
+            .expect("Synthesis iteration template should match SynthesisIterationVars");
+    }
+
     // =========================================================================
     // Validation function tests
     // =========================================================================
@@ -483,6 +522,22 @@ mod tests {
         assert!(
             PHASE_CONTINUATION_PROMPT_TEMPLATE.contains("%%REMAINING_PHASES%%"),
             "Phase continuation template should contain REMAINING_PHASES placeholder"
+        );
+    }
+
+    #[test]
+    fn test_synthesis_iteration_template_loaded() {
+        assert!(
+            !SYNTHESIS_ITERATION_PROMPT_TEMPLATE.is_empty(),
+            "Synthesis iteration template should be loaded"
+        );
+        assert!(
+            SYNTHESIS_ITERATION_PROMPT_TEMPLATE.contains("%%RESULTS%%"),
+            "Synthesis iteration template should contain RESULTS placeholder"
+        );
+        assert!(
+            SYNTHESIS_ITERATION_PROMPT_TEMPLATE.contains("%%ITERATION%%"),
+            "Synthesis iteration template should contain ITERATION placeholder"
         );
     }
 
@@ -769,9 +824,10 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             total: "2",
             goal: "Calculate (3+7)*2 and find files in /data",
             score: "0.45",
-            completed_section: "COMPLETED TASKS (do not re-plan these):\n- Task 0: Calculate (3+7)*2 using mock_tool → (3+7)*2 = 20\n\n",
+            completed_section: "COMPLETED TASKS:\n- Task 0: Calculate (3+7)*2 using mock_tool → (3+7)*2 = 20\n\n",
             blocked_section: "",
             redesign_section: "TASKS TO REDESIGN:\n- Task 1: List files in /data using list_files → failed: Connection refused\n\n",
+            synthesis_section: "PREVIOUS ITERATION FINDINGS:\nArithmetic computation succeeded: (3+7)*2 = 20. File listing failed due to connection error — data worker could not reach the filesystem service.\n\n",
             reasoning: "Arithmetic task completed correctly, but file listing failed due to connection error.",
             gaps: "- File listing task needs retry or alternative approach",
             failure_history: "\nFAILURE HISTORY:\n- Iteration 1: \"List files in /data using list_files\" (worker: data) — Connection refused\n",

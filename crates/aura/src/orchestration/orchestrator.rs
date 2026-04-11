@@ -3697,6 +3697,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan: Plan,
         evaluation: EvaluationResult,
         failure_history: &[FailedTaskRecord],
+        synthesis_summary: Option<String>,
     ) -> (Option<IterationContext>, Plan) {
         Self::emit_event(
             event_tx,
@@ -3707,7 +3708,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
         )
         .await;
 
-        let context = IterationContext::new(iteration, plan, evaluation, failure_history.to_vec());
+        let mut context =
+            IterationContext::new(iteration, plan, evaluation, failure_history.to_vec());
+        if let Some(summary) = synthesis_summary {
+            context = context.with_synthesis_summary(summary);
+        }
         (Some(context), Plan::new(""))
     }
 
@@ -4201,6 +4206,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan,
                     replan_evaluation,
                     &failure_history,
+                    None, // No synthesis on phase-replan path
                 )
                 .await;
                 continue;
@@ -4342,6 +4348,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan,
                     failure_evaluation,
                     &failure_history,
+                    None, // No synthesis on failure path
                 )
                 .await;
                 continue;
@@ -4478,6 +4485,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 plan.failed_count(),
             );
 
+            // Thread synthesis result into iteration context for coordinator visibility
+            let synthesis_for_context = if !is_single_task {
+                Some(final_result.clone())
+            } else {
+                None
+            };
+
             (previous_context, plan) = Self::trigger_replan(
                 &event_tx,
                 iteration,
@@ -4485,6 +4499,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 plan,
                 evaluation,
                 &failure_history,
+                synthesis_for_context,
             )
             .await;
         }

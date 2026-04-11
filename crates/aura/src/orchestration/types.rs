@@ -893,6 +893,10 @@ pub struct IterationContext {
     pub evaluation: EvaluationResult,
     /// Accumulated failure history across all iterations.
     pub failure_history: Vec<FailedTaskRecord>,
+    /// Synthesis summary from the previous iteration (learnings, not final answer).
+    /// Present for multi-task iterations; absent for single-task or failure paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_summary: Option<String>,
 }
 
 impl IterationContext {
@@ -908,7 +912,14 @@ impl IterationContext {
             previous_plan,
             evaluation,
             failure_history,
+            synthesis_summary: None,
         }
+    }
+
+    /// Set the synthesis summary from the previous iteration.
+    pub fn with_synthesis_summary(mut self, summary: String) -> Self {
+        self.synthesis_summary = Some(summary);
+        self
     }
 
     /// Build the reflection section for the planning prompt.
@@ -1065,6 +1076,19 @@ impl IterationContext {
             ""
         };
 
+        // Build synthesis section from previous iteration summary
+        let synthesis_section = match &self.synthesis_summary {
+            Some(summary) => {
+                let (truncated, was_truncated) = safe_truncate(summary, 1000);
+                let suffix = if was_truncated { "..." } else { "" };
+                format!(
+                    "PREVIOUS ITERATION FINDINGS:\n{}{}\n\n",
+                    truncated, suffix
+                )
+            }
+            None => String::new(),
+        };
+
         render_reflection_prompt(&ReflectionVars {
             iteration: &iteration_str,
             max_iterations: &max_iter_str,
@@ -1076,6 +1100,7 @@ impl IterationContext {
             completed_section: &completed_section,
             blocked_section: &blocked_section,
             redesign_section: &redesign_section,
+            synthesis_section: &synthesis_section,
             reasoning: &self.evaluation.reasoning,
             gaps: &self.evaluation.gaps_as_bullets(),
             failure_history: &failure_history,
