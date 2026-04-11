@@ -4394,17 +4394,32 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 };
             }
 
+            // ----------------------------------------------------------------
+            // EVALUATE (passive): Score for observability, does NOT gate loop
+            // ----------------------------------------------------------------
+            let evaluation = if is_single_task && plan.completed_count() == 1 {
+                tracing::info!("Single-task plan: skipping passive evaluation");
+                EvaluationResult::new(1.0, "Single-task plan completed successfully")
+            } else {
+                self.evaluate(&plan, query, &final_result).await
+            };
+            let quality_score = evaluation.score;
+            last_quality_score = Some(quality_score);
+
             // Record iteration on the span
+            iter_span.record(
+                "orchestration.quality_score",
+                format!("{:.2}", quality_score).as_str(),
+            );
             iter_span.record("orchestration.will_replan", iterations_remaining);
 
-            // Persist iteration summary (evaluation_skipped=true in coordinator-driven mode)
+            // Persist iteration summary
             {
                 let persistence = self.persistence.lock().await;
                 if let Err(e) = persistence
                     .write_iteration_summary(
                         iteration,
-                        // No evaluator score — coordinator decides via routing
-                        1.0,
+                        quality_score,
                         self.config.quality_threshold,
                         iterations_remaining,
                     )
@@ -4418,21 +4433,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &event_tx,
                 OrchestratorEvent::IterationComplete {
                     iteration,
-                    quality_score: 0.0,
+                    quality_score,
                     quality_threshold: self.config.quality_threshold,
                     will_replan: iterations_remaining,
-                    evaluation_skipped: true,
-                    reasoning:
-                        "Coordinator-driven loop: evaluation deferred to coordinator routing"
-                            .to_string(),
-                    gaps: vec![],
+                    // Eval ran but is passive — does not gate the loop
+                    evaluation_skipped: is_single_task && plan.completed_count() == 1,
+                    reasoning: evaluation.reasoning.clone(),
+                    gaps: evaluation.gaps.clone(),
                 },
             )
             .await;
 
             tracing::info!(
-                "Iteration {} complete: {}/{} tasks, elapsed={:.1}s, will_return_to_coordinator={}",
+                "Iteration {} complete: quality={:.2} (passive), {}/{} tasks, elapsed={:.1}s, will_return_to_coordinator={}",
                 iteration,
+                quality_score,
                 plan.completed_count(),
                 plan.tasks.len(),
                 orchestration_start.elapsed().as_secs_f64(),
@@ -4468,18 +4483,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 None
             };
 
-            // Build a placeholder evaluation for IterationContext (coordinator decides, not eval)
-            let coordinator_eval = EvaluationResult::new(
-                0.0,
-                "Coordinator-driven: returning to coordinator for next decision",
-            );
-
             (previous_context, plan) = Self::trigger_replan(
                 &event_tx,
                 iteration,
                 "coordinator",
                 plan,
-                coordinator_eval,
+                evaluation,
                 &failure_history,
                 synthesis_for_context,
             )

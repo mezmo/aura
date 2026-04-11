@@ -1,4 +1,4 @@
-Evaluate how well this response answers the user's question.
+Evaluate the quality of task execution and synthesized response.
 
 ORIGINAL USER QUERY: %%QUERY%%
 
@@ -9,10 +9,12 @@ SYNTHESIZED RESPONSE:
 %%RESULT%%
 
 EVALUATION CRITERIA:
-1. **Completeness**: Does it fully address the query?
-2. **Accuracy**: Is the information correct? Cross-reference the TASK EXECUTION EVIDENCE above — data that matches task results is verified, not hallucinated.
-3. **Coherence**: Is the response well-organized and clear?
-4. **Actionability**: If the user asked for help, can they act on this?
+1. **Task Execution Quality**: Did workers complete their assigned tasks? Check self-assessments (Objective: achieved/not achieved/partial) in task evidence.
+2. **Accuracy**: Is the synthesized information correct? Cross-reference the TASK EXECUTION EVIDENCE — data that matches task results is verified, not hallucinated.
+3. **Coverage**: Are there gaps between what was asked and what was accomplished?
+4. **Coherence**: Is the synthesized response well-organized and clear?
+
+NOTE: This evaluation is for observability and context — it does NOT control whether the orchestrator iterates. The coordinator makes loop decisions independently.
 
 IMPORTANT: If the user asked about this system's capabilities or workers, verify the response matches the SYSTEM CONTEXT above. Generic or hallucinated answers about unrelated "workers" should score low on Accuracy.
 
