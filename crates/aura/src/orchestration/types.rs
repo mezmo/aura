@@ -880,9 +880,9 @@ impl std::fmt::Display for PlanAttemptFailure {
 
 /// Context from a previous iteration, used for informed reflection.
 ///
-/// When an iteration fails to meet the quality threshold, this context
-/// is passed to the next planning phase so the coordinator can learn
-/// from what went wrong and adjust the plan accordingly.
+/// When the coordinator chooses to replan, this context is passed to the
+/// next planning phase so the coordinator can learn from what went wrong
+/// and adjust the plan accordingly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationContext {
     /// Which iteration just completed (1-indexed).

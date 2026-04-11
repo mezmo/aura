@@ -86,7 +86,7 @@ fn default_max_planning_cycles() -> usize {
     3
 }
 
-/// Default quality threshold (0.0-1.0) for iteration termination.
+/// Default quality threshold (0.0-1.0) for passive evaluation scoring (observability only, does not gate iteration).
 fn default_quality_threshold() -> f32 {
     0.8
 }
@@ -344,7 +344,7 @@ pub struct OrchestrationConfig {
     /// Maximum number of plan-execute-synthesize cycles.
     pub max_planning_cycles: usize,
 
-    /// Quality threshold (0.0-1.0) for early termination.
+    /// Quality threshold (0.0-1.0) for passive evaluation scoring (observability only, does not gate iteration).
     pub quality_threshold: f32,
 
     /// Maximum number of plan parse retries before falling back to single-task.

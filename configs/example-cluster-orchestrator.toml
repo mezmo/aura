@@ -1,0 +1,166 @@
+# Example: Kubernetes Cluster Orchestrator
+#
+# An orchestration config for Kubernetes incident investigation and remediation.
+# Workers are scoped by description and mcp_filter to give the coordinator
+# clear routing signals and prevent tool bleed across roles.
+#
+# Before deploying:
+#   1. Uncomment mcp_filter patterns on each worker
+#   2. Replace patterns with actual tool names from each MCP server
+#      (run with RUST_LOG=debug to see discovered tool names)
+
+[llm]
+provider = "openai"
+model = "gpt-5.4-mini"
+api_key = "{{ env.OPENAI_API_KEY }}"
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://kubernetes-mcp-server.kubernetes-mcp-server:8080/mcp"
+description = "Kubernetes cluster management tools"
+
+[mcp.servers.memory]
+transport = "http_streamable"
+url = "http://basic-memory.aura:8000/mcp"
+description = "Persistent memory and knowledge base"
+
+[mcp.servers.hitl]
+transport = "http_streamable"
+url = "http://hitl-mcp-server.aura:8080/mcp"
+description = "Human-in-the-loop approval tools"
+
+[mcp.servers.clickhouse]
+transport = "http_streamable"
+url = "http://clickhouse-mcp.aura:8080/mcp"
+description = "ClickHouse investigation tools for querying AX signup evidence"
+
+[mcp.servers.director]
+transport = "http_streamable"
+url = "http://director-mcp-server.aura:8080/mcp"
+description = "Demo Director tools for publishing run outcomes and presentation state"
+
+[agent]
+name = "Aura Orchestrator"
+alias = "cluster-orchestrator"
+max_tokens = 2000
+turn_depth = 60
+system_prompt = """
+You are Aura Orchestrator, a coordinator for Kubernetes incident and operations work.
+
+When runtime context includes an alert payload or alert-like context, extract the alert scope \
+first — treat the named namespace, workload, service, and incident identifiers as the starting \
+scope for investigation.
+
+Incident workflow:
+1. Gather current evidence from the affected scope
+2. Determine whether remediation is warranted based on evidence
+3. If a mutating action is needed, identify the exact target and have it approved via HITL
+4. After approval, execute and verify the outcome
+5. Submit a final verdict via Director before closing
+
+Rules:
+- Use current cluster evidence over historical memory when they conflict
+- Identify exact workload and action before requesting HITL approval
+- Do not close after diagnosis alone when evidence supports a bounded next action
+- A pending HITL request is a valid stopping point — do not narrate past it
+- If a Director run id is in runtime context, submit the verdict with that id
+- Do not end with conversational filler or optional offers
+"""
+
+[orchestration]
+enabled = true
+max_planning_cycles = 3
+max_phases = 3
+max_plan_parse_retries = 3
+max_tools_per_worker = 8
+quality_threshold = 0.7
+allow_direct_answers = true
+allow_clarification = true
+tools_in_planning = "summary"
+result_artifact_threshold = 1600
+result_summary_length = 400
+coordinator_vector_stores = []
+
+[orchestration.timeouts]
+per_call_timeout_secs = 120
+orchestration_timeout_secs = 0
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-orchestration"
+
+# --- Workers ---
+#
+# Each worker's `description` is the primary routing signal — the coordinator sees
+# these in the planning context alongside tool lists. Write them to clearly convey
+# what the worker can do and when to use it.
+#
+# `mcp_filter` restricts which MCP tools a worker receives. Without it, every worker
+# gets ALL tools from ALL MCP servers, making the coordinator's tool list identical
+# across workers and defeating the purpose of specialization.
+#
+# TODO: Uncomment mcp_filter lines after checking actual tool names from each MCP server.
+
+[orchestration.worker.diagnostics]
+description = """Read-only Kubernetes investigation and evidence gathering. \
+Has access to Kubernetes read tools, ClickHouse query tools, and Director verdict tools. \
+Use for: inspecting pods, deployments, events, logs, node status, \
+querying ClickHouse for signup evidence, and publishing final run verdicts."""
+turn_depth = 15
+vector_stores = []
+# mcp_filter = ["get_*", "list_*", "describe_*", "query_*", "read_*", "search_*", "submit_verdict*", "update_run*"]
+preamble = """
+You are a Kubernetes Diagnostics Specialist.
+
+Gather evidence and report facts using your tools. Do not guess — use tool results.
+
+When alert context is provided, start with the named namespace, workload, service, \
+or resource before broadening scope.
+
+Report concise factual findings with resource names, namespaces, statuses, and timestamps.
+If evidence is incomplete or a tool fails, say so clearly.
+Do not perform mutations.
+"""
+
+[orchestration.worker.remediation]
+description = """Mutating Kubernetes actions that require human approval first. \
+Has access to Kubernetes mutation tools and HITL approval tools. \
+Use for: scaling deployments, restarting pods, patching resources, rolling back, \
+and any other cluster state changes. Always requires HITL approval before executing."""
+turn_depth = 15
+vector_stores = []
+# mcp_filter = ["scale_*", "restart_*", "patch_*", "delete_*", "rollback_*", "apply_*", "create_*", "request_approval*", "approve_*", "get_*", "list_*", "describe_*"]
+preamble = """
+You are a Kubernetes Remediation Specialist.
+
+Execute approved Kubernetes mutations and verify the result.
+
+Rules:
+- Never mutate before HITL approval
+- Identify the exact target (namespace, resource, action) before requesting approval
+- After approval, perform the mutation immediately and verify the outcome
+- If approval is denied or times out, stop and report that no mutation was performed
+- Do not mutate kube-system or Aura infrastructure unless explicitly directed
+"""
+
+[orchestration.worker.memory]
+description = """Persistent memory lookup and note management. \
+Has access to the memory/knowledge base tools only. \
+Use for: searching prior incident context, reading historical notes, \
+creating or updating notes with findings, actions, and outcomes."""
+turn_depth = 15
+vector_stores = []
+# mcp_filter = ["search_notes*", "read_note*", "create_note*", "update_note*", "delete_note*", "list_*"]
+preamble = """
+You are a Memory Specialist.
+
+Search, read, and update persistent notes to maintain context across runs.
+
+Rules:
+- Always use project `main`
+- Prefer incident-scoped or run-scoped notes over generic profile-wide notes
+- If incident id, run id, or workload identifiers are available, search those first
+- If memory is missing or inconclusive, say so plainly
+"""

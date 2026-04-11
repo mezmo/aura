@@ -101,8 +101,9 @@ pub enum OrchestratorEvent {
     },
     /// An iteration of the plan-execute-synthesize loop has completed.
     ///
-    /// Emitted after synthesis and evaluation. The quality score determines
-    /// whether the orchestrator will replan or accept the result.
+    /// Emitted after synthesis and evaluation. The coordinator decides whether
+    /// to continue via its routing decision (respond_directly / create_plan /
+    /// request_clarification), not the quality score.
     IterationComplete {
         /// Which iteration just completed (1-indexed)
         iteration: usize,
@@ -110,7 +111,7 @@ pub enum OrchestratorEvent {
         quality_score: f32,
         /// The configured quality threshold
         quality_threshold: f32,
-        /// Whether the orchestrator will replan after this iteration
+        /// Whether iteration budget allows another cycle
         will_replan: bool,
         /// Whether evaluation was skipped (single-task plans)
         evaluation_skipped: bool,

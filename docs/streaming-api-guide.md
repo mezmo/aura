@@ -283,21 +283,21 @@ data: {"task_id":0,"worker_id":"arithmetic","content":"I need to add 15 and 27..
 
 Worker reasoning is also emitted as `aura.reasoning` with `agent_id` set to the worker name (e.g., `"arithmetic"`) and `parent_agent_id: "coordinator"` for backward-compatible aggregation.
 
-**Iteration complete** (quality evaluation with replan decision):
+**Iteration complete** (passive quality evaluation; coordinator decides continuation):
 ```
 event: aura.orchestrator.iteration_complete
 data: {"iteration":1,"quality_score":0.85,"quality_threshold":0.7,"will_replan":false,"evaluation_skipped":false,"reasoning":"Response is complete and accurate","gaps":[],"agent_id":"coordinator","session_id":"sess_xyz"}
 ```
 
-The `evaluation_skipped` field is `true` when a single-task plan completes successfully — the quality evaluation LLM call is skipped and `quality_score` defaults to `1.0`.
+The `evaluation_skipped` field is `true` when a single-task plan completes successfully — the quality evaluation LLM call is skipped and `quality_score` defaults to `1.0`. Quality evaluation is passive (observability only); the coordinator decides whether to continue via its routing decision (`respond_directly`, `create_plan`, or `request_clarification`), not the quality score. `will_replan` reflects whether the iteration budget allows another cycle.
 
 **Replan started** (new planning cycle triggered):
 ```
 event: aura.orchestrator.replan_started
-data: {"iteration":2,"trigger":"quality","agent_id":"coordinator","session_id":"sess_xyz"}
+data: {"iteration":2,"trigger":"coordinator","agent_id":"coordinator","session_id":"sess_xyz"}
 ```
 
-Triggers: `"quality"` (score below threshold), `"failure"` (worker task failures), `"phase_continuation"` (coordinator decided to replan between phases).
+Triggers: `"coordinator"` (coordinator routed to create_plan), `"failure"` (worker task failures), `"phase_continuation"` (coordinator decided to replan between phases).
 
 **Synthesizing** (combining worker results):
 ```

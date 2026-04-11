@@ -3890,15 +3890,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         result
     }
 
-    /// The plan-execute-synthesize-evaluate loop.
+    /// The coordinator-driven plan-execute-synthesize loop.
     ///
-    /// Takes an initial plan and iterates until quality threshold is met or
-    /// max iterations are reached. On re-plan, uses `plan_with_routing()` and
-    /// expects an `Orchestrated` response (falls back to single-task if not).
-    ///
-    /// Budget enforcement: at each iteration boundary, checks whether remaining
-    /// wall-clock time is less than `per_call_timeout_secs`. If so, returns the
-    /// best available result instead of starting a new iteration.
+    /// Each iteration executes the current plan and presents synthesis results
+    /// back to the coordinator via `plan_with_routing()`. The coordinator then
+    /// routes to `respond_directly` (done), `create_plan` (replan), or
+    /// `request_clarification`. Iteration continues until the coordinator
+    /// chooses to respond directly or `max_planning_cycles` is exhausted.
     async fn run_orchestration_loop(
         &self,
         query: &str,
