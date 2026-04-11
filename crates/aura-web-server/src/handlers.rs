@@ -37,16 +37,16 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
-/// RAII guard for all request-scoped resources. Ensures cleanup even on panic.
-/// Manages: cancellation, subscriptions (progress, tool events, tool usage), MCP state.
+/// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
+/// Manages: cancellation, subscriptions (progress, tool events, tool usage).
+/// MCP request_id is set inside stream() and cleaned up when the agent is dropped.
 struct RequestResourceGuard {
     request_id: String,
-    agent: Arc<dyn StreamingAgent>,
 }
 
 impl RequestResourceGuard {
-    fn new(request_id: String, agent: Arc<dyn StreamingAgent>) -> Self {
-        Self { request_id, agent }
+    fn new(request_id: String) -> Self {
+        Self { request_id }
     }
 }
 
@@ -57,10 +57,7 @@ impl Drop for RequestResourceGuard {
         // Use try_current to avoid panic during runtime shutdown
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let id = self.request_id.clone();
-            let agent = self.agent.clone();
             handle.spawn(async move {
-                // Cleanup all request-scoped resources
-                agent.clear_mcp_request_id().await;
                 RequestCancellation::unregister(&id);
                 request_progress_unsubscribe(&id).await;
                 tool_event_unsubscribe(&id).await;
@@ -368,14 +365,10 @@ fn build_completion_config(
 async fn execute_completion(setup: RequestSetup, config: CompletionConfig, delivery: DeliveryMode) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
     let _cancellation = RequestCancellation::register(config.request_id.clone());
-    setup
-        .streaming_agent
-        .set_mcp_request_id(&config.request_id)
-        .await;
 
-    // RAII guard ensures cleanup of all request resources even on panic
-    let _resource_guard =
-        RequestResourceGuard::new(config.request_id.clone(), setup.streaming_agent.clone());
+    // RAII guard ensures cleanup of subscriptions even on panic.
+    // MCP request_id is set inside stream() — no pre-stream setup needed.
+    let _resource_guard = RequestResourceGuard::new(config.request_id.clone());
 
     // Destructure to move chat_history instead of cloning
     let RequestSetup {
