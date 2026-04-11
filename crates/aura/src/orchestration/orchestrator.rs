@@ -4351,24 +4351,43 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // SYNTHESIZE: Combine task results into coherent response
             // ----------------------------------------------------------------
             let is_single_task = plan.tasks.len() == 1;
-            Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
-            final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
-                Ok(r) => r,
-                Err(e) => {
-                    self.write_run_manifest(&plan, iteration, last_quality_score)
-                        .await;
-                    return Err(e);
-                }
-            };
 
-            // ----------------------------------------------------------------
-            // EVALUATE: Assess quality of synthesized response
-            // ----------------------------------------------------------------
             let evaluation = if is_single_task && plan.completed_count() == 1 {
-                // Single-task plan completed successfully — skip evaluation LLM call
-                tracing::info!("Single-task plan: skipping evaluation LLM call");
+                // Single-task (routed) plan: skip synthesis LLM call, use worker result directly.
+                // The coordinator will frame the final response when it sees the result.
+                let worker_result = plan.tasks[0]
+                    .result
+                    .as_deref()
+                    .unwrap_or("(no result)")
+                    .to_string();
+                tracing::info!(
+                    "Single-task plan: skipping synthesis + evaluation, using worker result directly"
+                );
+
+                // Persist the pass-through as synthesis artifact for observability
+                {
+                    let persistence = self.persistence.lock().await;
+                    if let Err(e) = persistence
+                        .write_synthesis("[SINGLE-TASK PASS-THROUGH]", &worker_result)
+                        .await
+                    {
+                        tracing::warn!("Failed to persist synthesis pass-through: {}", e);
+                    }
+                }
+
+                final_result = worker_result;
                 super::types::EvaluationResult::new(1.0, "Single-task plan completed successfully")
             } else {
+                // Multi-task plan: full synthesis
+                Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
+                final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                            .await;
+                        return Err(e);
+                    }
+                };
                 self.evaluate(&plan, query, &final_result).await
             };
             let quality_score = evaluation.score;
