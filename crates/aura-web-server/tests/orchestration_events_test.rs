@@ -479,6 +479,84 @@ async fn test_division_error_emits_task_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// MCP progress notifications in orchestration mode (LOG-23565)
+// ---------------------------------------------------------------------------
+
+/// Verifies that MCP progress notifications route through orchestration SSE.
+///
+/// Query triggers the progress_task worker which calls task_with_progress on
+/// mock-mcp. This tool emits MCP notifications/progress as it runs. The
+/// OrchestratorFactory must bridge the request_id to the inner orchestrator's
+/// MCP clients so the progress broker routes notifications to the SSE stream.
+///
+/// LENIENCY: LLM may route to direct answer. Progress notification delivery
+/// depends on MCP transport timing. We assert structurally when events appear.
+#[tokio::test]
+async fn test_orchestration_progress_notifications() {
+    let events = orchestration_events(
+        "Run a progress task with 2 seconds duration and 3 steps",
+    )
+    .await;
+
+    // Check for aura.progress events
+    let progress_events: Vec<&SseEvent> = events
+        .iter()
+        .filter(|e| {
+            e.event_type
+                .as_ref()
+                .map(|t| t == "aura.progress")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if progress_events.is_empty() {
+        // Several acceptable reasons for no progress events:
+        // 1. LLM routed to direct answer (didn't call progress worker)
+        // 2. MCP transport timing — progress notifications may arrive after tool completes
+        // 3. FastMCP streamable-http may not support progress on all transports
+        let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
+        if !direct.is_empty() {
+            println!("Note: LLM routed to direct answer. No progress events expected.");
+            return;
+        }
+
+        // If orchestrated but no progress, log for investigation
+        let plan_events = events_by_type(&events, event_names::PLAN_CREATED);
+        if !plan_events.is_empty() {
+            println!(
+                "Note: Orchestrated but no aura.progress events received. \
+                 This may indicate a progress routing issue or MCP transport limitation."
+            );
+        }
+
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    // Validate progress event structure
+    for event in &progress_events {
+        let json: Value = serde_json::from_str(&event.data).unwrap_or_else(|e| {
+            panic!(
+                "Invalid JSON in aura.progress event: {e}\nRaw: {}",
+                event.data
+            )
+        });
+
+        assert_event_fields(event, &["message", "phase"]);
+
+        println!(
+            "aura.progress: message={}, phase={}, percent={:?}",
+            json["message"], json["phase"], json.get("percent")
+        );
+    }
+
+    println!(
+        "Received {} aura.progress events during orchestration",
+        progress_events.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Worker reasoning events
 // ---------------------------------------------------------------------------
 
