@@ -129,6 +129,16 @@ make docker-build   # Build Docker image
 make lint           # Run clippy + fmt check
 ```
 
+### Commit Lint
+
+After every commit, validate the message with the project's commitlint config:
+
+```bash
+npx @answerbook/commitlint-config-logdna
+```
+
+Subject line must be <= 72 characters.
+
 ## E2E Eval
 
 The `e2e-eval/` directory contains scripts for running E2E orchestration tests against the math-MCP setup.
