@@ -126,7 +126,9 @@ pub struct TaskExecutionRecord {
     pub attempt: usize,
     /// Worker's approach/reasoning
     pub approach: String,
-    /// Tools called during execution
+    /// Tools called during execution (always empty — tool calls are persisted
+    /// incrementally to separate `*.tool-calls.json` via `append_tool_call()`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallRecord>,
     /// Final result
     pub result: Option<String>,
