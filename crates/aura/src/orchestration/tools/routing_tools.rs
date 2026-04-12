@@ -187,6 +187,10 @@ impl Tool for CreatePlanTool {
                         "worker": {
                             "type": "string",
                             "description": "Name of the specialized worker to assign this task to"
+                        },
+                        "reuse_result_from": {
+                            "type": "integer",
+                            "description": "ID of a completed task from the previous iteration. Skips execution and copies the prior result. Omit for tasks that need fresh execution."
                         }
                     },
                     "required": ["task"]
@@ -204,7 +208,11 @@ impl Tool for CreatePlanTool {
                                         "type": "object",
                                         "properties": {
                                             "task": { "type": "string" },
-                                            "worker": { "type": "string" }
+                                            "worker": { "type": "string" },
+                                            "reuse_result_from": {
+                                                "type": "integer",
+                                                "description": "ID of a completed task from the previous iteration. Skips execution and copies the prior result."
+                                            }
                                         },
                                         "required": ["task"]
                                     },
@@ -218,7 +226,11 @@ impl Tool for CreatePlanTool {
                                                     "type": "object",
                                                     "properties": {
                                                         "task": { "type": "string" },
-                                                        "worker": { "type": "string" }
+                                                        "worker": { "type": "string" },
+                                                        "reuse_result_from": {
+                                                            "type": "integer",
+                                                            "description": "ID of a completed task from the previous iteration. Skips execution and copies the prior result."
+                                                        }
                                                     },
                                                     "required": ["task"]
                                                 }
@@ -435,6 +447,7 @@ mod tests {
                 steps: vec![StepInput::LeafTask {
                     task: "Fetch recent logs".to_string(),
                     worker: Some("operations".to_string()),
+                    reuse_result_from: None,
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),
