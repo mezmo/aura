@@ -393,7 +393,6 @@ mod tests {
             .expect("Reflection template should match ReflectionVars");
     }
 
-    #[test]
     // =========================================================================
     // Validation function tests
     // =========================================================================
