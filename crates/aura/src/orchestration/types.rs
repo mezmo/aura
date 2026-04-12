@@ -33,6 +33,8 @@ pub enum StepInput {
         task: String,
         #[serde(default)]
         worker: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reuse_result_from: Option<usize>,
     },
 }
 
@@ -80,7 +82,11 @@ fn flatten_one(
     depth: usize,
 ) -> Result<Vec<usize>, String> {
     match step {
-        StepInput::LeafTask { task, worker } => {
+        StepInput::LeafTask {
+            task,
+            worker,
+            reuse_result_from,
+        } => {
             let id = *counter;
             *counter += 1;
             let mut t = Task::new(id, task.clone(), String::new());
@@ -88,6 +94,7 @@ fn flatten_one(
             if let Some(w) = worker {
                 t.worker = Some(w.clone());
             }
+            t.reuse_result_from = *reuse_result_from;
             tasks.push(t);
             Ok(vec![id])
         }
@@ -2230,10 +2237,12 @@ mod tests {
             StepInput::LeafTask {
                 task: "Compute mean of [10,20,30]".into(),
                 worker: Some("statistics".into()),
+                reuse_result_from: None,
             },
             StepInput::LeafTask {
                 task: "Multiply the result by 3".into(),
                 worker: Some("arithmetic".into()),
+                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2254,16 +2263,19 @@ mod tests {
                     StepInput::LeafTask {
                         task: "Compute median".into(),
                         worker: Some("statistics".into()),
+                        reuse_result_from: None,
                     },
                     StepInput::LeafTask {
                         task: "Compute sin(45)".into(),
                         worker: Some("trigonometry".into()),
+                        reuse_result_from: None,
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Multiply the two results".into(),
                 worker: Some("arithmetic".into()),
+                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2286,22 +2298,26 @@ mod tests {
                             StepInput::LeafTask {
                                 task: "Get A".into(),
                                 worker: Some("ops".into()),
+                                reuse_result_from: None,
                             },
                             StepInput::LeafTask {
                                 task: "Transform A".into(),
                                 worker: Some("ops".into()),
+                                reuse_result_from: None,
                             },
                         ],
                     },
                     StepInput::LeafTask {
                         task: "Get B".into(),
                         worker: Some("ops".into()),
+                        reuse_result_from: None,
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Combine".into(),
                 worker: Some("ops".into()),
+                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2345,6 +2361,7 @@ mod tests {
                     parallel: vec![StepInput::LeafTask {
                         task: "too deep".into(),
                         worker: None,
+                        reuse_result_from: None,
                     }],
                 }],
             }],
@@ -2359,6 +2376,7 @@ mod tests {
         let steps = vec![StepInput::LeafTask {
             task: "Just one thing".into(),
             worker: None,
+            reuse_result_from: None,
         }];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -2386,7 +2404,7 @@ mod tests {
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         assert_eq!(steps.len(), 2);
         match &steps[0] {
-            StepInput::LeafTask { task, worker } => {
+            StepInput::LeafTask { task, worker, .. } => {
                 assert_eq!(task, "Compute mean");
                 assert_eq!(worker.as_deref(), Some("stats"));
             }
@@ -2439,10 +2457,12 @@ mod tests {
                 StepInput::LeafTask {
                     task: "Step 1".into(),
                     worker: Some("w1".into()),
+                    reuse_result_from: None,
                 },
                 StepInput::LeafTask {
                     task: "Step 2".into(),
                     worker: Some("w2".into()),
+                    reuse_result_from: None,
                 },
             ],
             routing_rationale: "Needs orchestration".into(),
@@ -2561,6 +2581,110 @@ mod tests {
 
         assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
         assert_eq!(plan.tasks[0].result.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn test_flatten_steps_propagates_reuse_result_from() {
+        let steps = vec![
+            StepInput::LeafTask {
+                task: "Reused fetch".into(),
+                worker: Some("ops".into()),
+                reuse_result_from: Some(2),
+            },
+            StepInput::LeafTask {
+                task: "Fresh analysis".into(),
+                worker: Some("analytics".into()),
+                reuse_result_from: None,
+            },
+        ];
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].reuse_result_from, Some(2));
+        assert_eq!(tasks[1].reuse_result_from, None);
+    }
+
+    #[test]
+    fn test_step_input_leaf_task_reuse_result_from_serde_roundtrip() {
+        // With reuse_result_from set
+        let json = r#"{"task": "Carry forward logs", "worker": "ops", "reuse_result_from": 3}"#;
+        let step: StepInput = serde_json::from_str(json).unwrap();
+        match &step {
+            StepInput::LeafTask {
+                task,
+                worker,
+                reuse_result_from,
+            } => {
+                assert_eq!(task, "Carry forward logs");
+                assert_eq!(worker.as_deref(), Some("ops"));
+                assert_eq!(*reuse_result_from, Some(3));
+            }
+            other => panic!("Expected LeafTask, got {:?}", other),
+        }
+        // Round-trip: serialize and deserialize back
+        let serialized = serde_json::to_string(&step).unwrap();
+        let deserialized: StepInput = serde_json::from_str(&serialized).unwrap();
+        match &deserialized {
+            StepInput::LeafTask {
+                reuse_result_from, ..
+            } => {
+                assert_eq!(*reuse_result_from, Some(3));
+            }
+            other => panic!("Expected LeafTask, got {:?}", other),
+        }
+
+        // Without reuse_result_from (omitted defaults to None)
+        let json_no_reuse = r#"{"task": "Fresh task"}"#;
+        let step_no_reuse: StepInput = serde_json::from_str(json_no_reuse).unwrap();
+        match &step_no_reuse {
+            StepInput::LeafTask {
+                reuse_result_from, ..
+            } => {
+                assert_eq!(*reuse_result_from, None);
+            }
+            other => panic!("Expected LeafTask, got {:?}", other),
+        }
+        // Verify None is not serialized
+        let serialized_no_reuse = serde_json::to_string(&step_no_reuse).unwrap();
+        assert!(!serialized_no_reuse.contains("reuse_result_from"));
+    }
+
+    #[test]
+    fn test_steps_plan_reuse_result_from_into_plan_pipeline() {
+        use crate::orchestration::orchestrator::Orchestrator;
+
+        // Build a "previous" plan with a completed task at id=0
+        let mut previous = Plan::new("Previous goal");
+        let mut prev_task = Task::new(0, "Fetch logs", "observability");
+        prev_task.complete("log data here".to_string());
+        previous.add_task(prev_task);
+
+        // Build a new StepsPlan with reuse_result_from on the first task
+        let response = PlanningResponse::StepsPlan {
+            goal: "Analyze logs".into(),
+            steps: vec![
+                StepInput::LeafTask {
+                    task: "Fetch logs".into(),
+                    worker: Some("ops".into()),
+                    reuse_result_from: Some(0),
+                },
+                StepInput::LeafTask {
+                    task: "Analyze fetched logs".into(),
+                    worker: Some("analytics".into()),
+                    reuse_result_from: None,
+                },
+            ],
+            routing_rationale: "replan".into(),
+            planning_summary: "Reuse fetch, fresh analysis".into(),
+        };
+        let mut plan = response.into_plan().unwrap();
+        assert_eq!(plan.tasks[0].reuse_result_from, Some(0));
+        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+
+        Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
+
+        assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(plan.tasks[0].result.as_deref(), Some("log data here"));
+        assert_eq!(plan.tasks[1].status, TaskStatus::Pending);
     }
 
     #[test]
