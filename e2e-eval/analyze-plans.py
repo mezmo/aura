@@ -334,6 +334,11 @@ def print_run_summary(run):
             print(f" (reuse_waste={reuse_ms}ms)", end="")
         print()
 
+        # Warn on text-based reuse in replan iterations (iter > 1)
+        if reuse_t > 0 and n > 1:
+            print(f"         WARNING: {reuse_t} task(s) using text-based reuse — "
+                  f"coordinator not using reuse_result_from field ({reuse_ms}ms wasted)")
+
         # Show gaps if any
         if gaps:
             for gap in gaps[:3]:
@@ -414,7 +419,10 @@ def print_aggregate(runs):
     print(f"  Total tasks (all iterations):")
     print(f"    Fresh executions:  {total_fresh}")
     print(f"    Field reuse:       {total_field_reuse}")
-    print(f"    Text reuse:        {total_text_reuse}")
+    if total_text_reuse > 0:
+        print(f"    Text reuse:        {total_text_reuse}  ** WARNING: not using reuse_result_from field **")
+    else:
+        print(f"    Text reuse:        {total_text_reuse}")
     total_reuse = total_field_reuse + total_text_reuse
     total_tasks = total_fresh + total_reuse
     if total_tasks > 0:
