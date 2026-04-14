@@ -184,16 +184,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("│  │                                                 │    │");
             println!("│  │  ┌─────────────────────────────────────────┐    │    │");
-            println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
-            println!("│  │  │                                         │    │    │");
-            println!(
-                "│  │  │  Provider: {}                │    │    │",
-                store.embedding_model.provider
-            );
-            println!(
-                "│  │  │  Model: {}    │    │    │",
-                store.embedding_model.model
-            );
+            if let Some(em) = &store.embedding_model {
+                println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
+                println!("│  │  │                                         │    │    │");
+                println!(
+                    "│  │  │  Provider: {}                │    │    │",
+                    em.provider()
+                );
+                println!(
+                    "│  │  │  Model: {}    │    │    │",
+                    em.model()
+                );
+            } else {
+                println!("│  │  │        🔤 MANAGED EMBEDDINGS            │    │    │");
+            }
         } else {
             println!("│  │  No vector stores configured.                   │    │");
             println!("│  │                                                 │    │");

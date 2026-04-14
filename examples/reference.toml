@@ -67,7 +67,17 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # collection_name = "documents"
 # context_prefix = "Technical documentation and API references"
 #
-# embedding_model = { provider = "openai", model = "text-embedding-3-small", api_key = "{{ env.OPENAI_API_KEY }}" }
+# [vector_stores.embedding_model]
+# provider = "openai"
+# model = "text-embedding-3-small"
+# api_key = "{{ env.OPENAI_API_KEY }}"
+#
+# AWS Bedrock embeddings (uses AWS credentials, no API key needed):
+# [vector_stores.embedding_model]
+# provider = "bedrock"
+# model = "amazon.titan-embed-text-v2:0"
+# region = "{{ env.AWS_REGION }}"
+# profile = "default"  # optional
 
 # You can add multiple vector stores. Each one becomes a separate
 # search tool the agent can call (e.g., vector_search_docs,
@@ -80,7 +90,20 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # collection_name = "runbooks"
 # context_prefix = "Operational runbooks and troubleshooting guides"
 #
-# embedding_model = { provider = "openai", model = "text-embedding-3-small", api_key = "{{ env.OPENAI_API_KEY }}" }
+# [vector_stores.embedding_model]
+# provider = "openai"
+# model = "text-embedding-3-small"
+# api_key = "{{ env.OPENAI_API_KEY }}"
+
+# AWS Bedrock Knowledge Base (managed RAG - no embedding model needed):
+#
+# [[vector_stores]]
+# name = "company_docs"
+# type = "bedrock_kb"
+# knowledge_base_id = "{{ env.BEDROCK_KB_ID }}"
+# region = "{{ env.AWS_REGION }}"
+# # profile = "default"  # optional
+# context_prefix = "Company documentation"
 
 # ── Tools ───────────────────────────────────────────────────────────
 [tools]

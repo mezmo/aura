@@ -39,16 +39,31 @@ impl RigBuilder {
             .map(|store| VectorStoreConfig {
                 name: store.name.clone(),
                 store_type: store.store_type.clone(),
-                embedding_model: EmbeddingModelConfig {
-                    provider: store.embedding_model.provider.clone(),
-                    model: store.embedding_model.model.clone(),
-                    api_key: store.embedding_model.api_key.clone(),
-                    base_url: None,
-                },
+                embedding_model: store.embedding_model.as_ref().map(|em| match em {
+                    crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
+                        EmbeddingModelConfig::OpenAI {
+                            api_key: api_key.clone(),
+                            model: model.clone(),
+                            base_url: None,
+                        }
+                    }
+                    crate::config::EmbeddingConfig::Bedrock {
+                        model,
+                        region,
+                        profile,
+                    } => EmbeddingModelConfig::Bedrock {
+                        model: model.clone(),
+                        region: region.clone(),
+                        profile: profile.clone(),
+                    },
+                }),
                 connection_string: store.url.clone(),
                 url: store.url.clone(),
                 collection_name: store.collection_name.clone(),
                 context_prefix: store.context_prefix.clone(),
+                knowledge_base_id: store.knowledge_base_id.clone(),
+                region: store.region.clone(),
+                profile: store.profile.clone(),
             })
             .collect();
 
