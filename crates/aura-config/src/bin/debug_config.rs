@@ -137,10 +137,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Vector Stores: {} configured", config.vector_stores.len());
         for (i, store) in config.vector_stores.iter().enumerate() {
             println!("  Store {}: {} ({})", i + 1, store.name, store.store_type);
-            println!(
-                "    Embedding Model: {} {}",
-                store.embedding_model.provider, store.embedding_model.model
-            );
+            if let Some(em) = &store.embedding_model {
+                println!("    Embedding Model: {} {}", em.provider(), em.model());
+            } else {
+                println!("    Type: {} (managed embeddings)", store.store_type);
+            }
         }
     } else {
         println!("Vector Stores: None configured");

@@ -83,9 +83,13 @@ temperature = 0.5
         );
         let vector_store = &config.vector_stores[0];
         assert_eq!(vector_store.store_type, "in_memory");
-        assert_eq!(vector_store.embedding_model.provider, "openai");
-        assert_eq!(vector_store.embedding_model.model, "text-embedding-3-small");
-        assert_eq!(vector_store.embedding_model.api_key, "test_embedding_key");
+        match vector_store.embedding_model.as_ref().unwrap() {
+            crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
+                assert_eq!(model, "text-embedding-3-small");
+                assert_eq!(api_key, "test_embedding_key");
+            }
+            _ => panic!("Expected OpenAI embedding config"),
+        }
 
         // Test MCP servers
         println!("\n✅ Testing MCP servers...");
@@ -337,10 +341,12 @@ system_prompt = "Test with env vars"
             }
             _ => panic!("Expected OpenAI LLM config"),
         }
-        assert_eq!(
-            config.vector_stores[0].embedding_model.api_key,
-            "mock_openai_key"
-        );
+        match config.vector_stores[0].embedding_model.as_ref().unwrap() {
+            crate::config::EmbeddingConfig::OpenAI { api_key, .. } => {
+                assert_eq!(api_key, "mock_openai_key");
+            }
+            _ => panic!("Expected OpenAI embedding config"),
+        }
 
         let mcp_config = config.mcp.expect("MCP config should be present");
         let test_server = mcp_config
@@ -904,6 +910,227 @@ system_prompt = "You are helpful."
             }
             _ => panic!("Expected Ollama config"),
         }
+    }
+
+    #[test]
+    fn test_bedrock_embedding_config_parsing() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "docs"
+type = "qdrant"
+url = "http://localhost:6334"
+collection_name = "documents"
+
+[vector_stores.embedding_model]
+provider = "bedrock"
+model = "amazon.titan-embed-text-v2:0"
+region = "us-west-2"
+profile = "my-profile"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        let vector_store = &config.vector_stores[0];
+        match vector_store.embedding_model.as_ref().unwrap() {
+            crate::config::EmbeddingConfig::Bedrock {
+                model,
+                region,
+                profile,
+            } => {
+                assert_eq!(model, "amazon.titan-embed-text-v2:0");
+                assert_eq!(region, "us-west-2");
+                assert_eq!(profile, &Some("my-profile".to_string()));
+            }
+            _ => panic!("Expected Bedrock embedding config"),
+        }
+    }
+
+    #[test]
+    fn test_bedrock_embedding_without_profile() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "docs"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "bedrock"
+model = "amazon.titan-embed-text-v2:0"
+region = "us-east-1"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+
+        let vector_store = &config.vector_stores[0];
+        match vector_store.embedding_model.as_ref().unwrap() {
+            crate::config::EmbeddingConfig::Bedrock {
+                region, profile, ..
+            } => {
+                assert_eq!(region, "us-east-1");
+                assert_eq!(profile, &None);
+            }
+            _ => panic!("Expected Bedrock embedding config"),
+        }
+    }
+
+    #[test]
+    fn test_bedrock_embedding_missing_region_fails_validation() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "docs"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "bedrock"
+model = "amazon.titan-embed-text-v2:0"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let result = load_config_from_str(config_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("region"),
+            "Error should mention missing region: {err}"
+        );
+    }
+
+    #[test]
+    fn test_openai_embedding_still_requires_api_key() {
+        // Ensure existing OpenAI validation still works after Bedrock changes
+        let config_str = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4"
+
+[[vector_stores]]
+name = "default"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "openai"
+model = "text-embedding-3-small"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let result = load_config_from_str(config_str);
+        assert!(result.is_err(), "OpenAI embedding without api_key should fail validation");
+    }
+
+    #[test]
+    fn test_bedrock_kb_config_parsing() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "company_docs"
+type = "bedrock_kb"
+knowledge_base_id = "KB12345"
+region = "us-west-2"
+profile = "my-profile"
+context_prefix = "Company documentation"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(config_str)
+            .expect("Failed to parse bedrock_kb config");
+
+        let store = &config.vector_stores[0];
+        assert_eq!(store.store_type, "bedrock_kb");
+        assert_eq!(store.name, "company_docs");
+        assert_eq!(
+            store.knowledge_base_id,
+            Some("KB12345".to_string())
+        );
+        assert_eq!(store.region, Some("us-west-2".to_string()));
+        assert_eq!(store.profile, Some("my-profile".to_string()));
+        assert!(store.embedding_model.is_none());
+        assert_eq!(
+            store.context_prefix,
+            Some("Company documentation".to_string())
+        );
+    }
+
+    #[test]
+    fn test_bedrock_kb_missing_knowledge_base_id_fails() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "kb"
+type = "bedrock_kb"
+region = "us-east-1"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let result = load_config_from_str(config_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("knowledge_base_id"),
+            "Error should mention knowledge_base_id: {err}"
+        );
+    }
+
+    #[test]
+    fn test_bedrock_kb_missing_region_fails() {
+        let config_str = r#"
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "kb"
+type = "bedrock_kb"
+knowledge_base_id = "KB12345"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let result = load_config_from_str(config_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("region"),
+            "Error should mention region: {err}"
+        );
     }
 
     #[test]

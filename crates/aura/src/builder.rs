@@ -1035,11 +1035,13 @@ impl AgentBuilder {
             for vector_store in &config.vector_stores {
                 tracing::info!("Store: {}", vector_store.name);
                 tracing::info!("  Type: {}", vector_store.store_type);
-                tracing::info!(
-                    "  Embedding Provider: {}",
-                    vector_store.embedding_model.provider
-                );
-                tracing::info!("  Embedding Model: {}", vector_store.embedding_model.model);
+                if let Some(em) = &vector_store.embedding_model {
+                    tracing::info!("  Embedding Provider: {}", em.provider());
+                    tracing::info!("  Embedding Model: {}", em.model());
+                }
+                if let Some(kb_id) = &vector_store.knowledge_base_id {
+                    tracing::info!("  Knowledge Base ID: {}", kb_id);
+                }
             }
         }
 

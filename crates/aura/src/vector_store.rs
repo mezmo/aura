@@ -1,4 +1,7 @@
-use crate::{config::VectorStoreConfig, error::BuilderError};
+use crate::{
+    config::{EmbeddingModelConfig, VectorStoreConfig},
+    error::BuilderError,
+};
 use qdrant_client::{Qdrant, qdrant::QueryPoints};
 use rig::{
     OneOrMany,
@@ -9,10 +12,17 @@ use rig::{
         VectorStoreIndex, in_memory_store::InMemoryVectorStore, request::VectorSearchRequest,
     },
 };
+use rig_bedrock::embedding::EmbeddingModel as BedrockEmbeddingModel;
 use rig_qdrant::QdrantVectorStore;
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+/// Qdrant store variant parameterized by embedding model type
+enum QdrantStoreKind {
+    OpenAI(QdrantVectorStore<OpenAIEmbeddingModel>),
+    Bedrock(QdrantVectorStore<BedrockEmbeddingModel>),
+}
 
 /// Vector store manager for handling document retrieval via vector search
 pub struct VectorStoreManager {
@@ -21,9 +31,24 @@ pub struct VectorStoreManager {
     pub qdrant_url: Option<String>,
     pub collection_name: Option<String>,
     pub in_memory_store: Option<Arc<InMemoryVectorStore<String>>>,
-    pub qdrant_store: Option<Arc<QdrantVectorStore<OpenAIEmbeddingModel>>>,
-    pub embedding_model: OpenAIEmbeddingModel,
+    qdrant_store: Option<Arc<QdrantStoreKind>>,
+    bedrock_kb_client: Option<Arc<aws_sdk_bedrockagentruntime::Client>>,
+    bedrock_kb_id: Option<String>,
+    embedding_provider: String,
+    embedding_model_name: String,
     pub context_prefix: Option<String>,
+}
+
+/// Helper to get the required embedding model config or return an error
+fn require_embedding_model(
+    config: &VectorStoreConfig,
+) -> Result<&EmbeddingModelConfig, BuilderError> {
+    config.embedding_model.as_ref().ok_or_else(|| {
+        BuilderError::VectorStoreError(format!(
+            "embedding_model is required for '{}' vector store '{}'",
+            config.store_type, config.name
+        ))
+    })
 }
 
 impl VectorStoreManager {
@@ -34,31 +59,103 @@ impl VectorStoreManager {
         match config.store_type.as_str() {
             "in_memory" => Self::create_in_memory_store(config).await,
             "qdrant" => Self::create_qdrant_store(config).await,
+            "bedrock_kb" => Self::create_bedrock_kb_store(config).await,
             store_type => Err(BuilderError::VectorStoreError(format!(
                 "Unsupported vector store type: {store_type}"
             ))),
         }
     }
 
+    fn create_openai_embedding_model(
+        api_key: &str,
+        model: &str,
+    ) -> Result<OpenAIEmbeddingModel, BuilderError> {
+        let client = Client::new(api_key).map_err(|e| {
+            BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
+        })?;
+        Ok(client.embedding_model(model))
+    }
+
+    async fn create_bedrock_embedding_model(
+        model: &str,
+        region: &str,
+        profile: Option<&str>,
+    ) -> Result<BedrockEmbeddingModel, BuilderError> {
+        use aws_config::{BehaviorVersion, Region};
+
+        let sdk_config = if let Some(profile_name) = profile {
+            info!(
+                "Loading AWS config with profile '{}' for Bedrock embeddings",
+                profile_name
+            );
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region.to_string()))
+                .profile_name(profile_name)
+                .load()
+                .await
+        } else {
+            info!("Loading AWS config from environment for Bedrock embeddings");
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region.to_string()))
+                .load()
+                .await
+        };
+
+        let aws_client = aws_sdk_bedrockruntime::Client::new(&sdk_config);
+        let bedrock_client = rig_bedrock::client::Client::from(aws_client);
+        info!("Bedrock embedding client initialized successfully");
+
+        Ok(bedrock_client.embedding_model(model))
+    }
+
+    /// Load AWS SDK config with optional region and profile
+    async fn load_aws_config(
+        region: &str,
+        profile: Option<&str>,
+    ) -> aws_config::SdkConfig {
+        use aws_config::{BehaviorVersion, Region};
+
+        if let Some(profile_name) = profile {
+            info!(
+                "Loading AWS config with profile '{}'",
+                profile_name
+            );
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region.to_string()))
+                .profile_name(profile_name)
+                .load()
+                .await
+        } else {
+            info!("Loading AWS config from environment");
+            aws_config::defaults(BehaviorVersion::latest())
+                .region(Region::new(region.to_string()))
+                .load()
+                .await
+        }
+    }
+
     /// Create an in-memory vector store
     async fn create_in_memory_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
+        let embedding = require_embedding_model(config)?;
+
         info!(
             "Creating in-memory vector store with {} embeddings",
-            config.embedding_model.model
+            embedding.model()
         );
 
-        // Create OpenAI embedding model
-        let embedding_model = if config.embedding_model.provider == "openai" {
-            let client = Client::new(&config.embedding_model.api_key).map_err(|e| {
-                BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
-            })?;
-            client.embedding_model(&config.embedding_model.model)
-        } else {
-            return Err(BuilderError::VectorStoreError(format!(
-                "Unsupported embedding provider: {}. Only 'openai' is supported for now.",
-                config.embedding_model.provider
-            )));
-        };
+        // Validate the embedding provider can be initialized
+        match embedding {
+            EmbeddingModelConfig::OpenAI { api_key, model, .. } => {
+                Self::create_openai_embedding_model(api_key, model)?;
+            }
+            EmbeddingModelConfig::Bedrock {
+                model,
+                region,
+                profile,
+            } => {
+                Self::create_bedrock_embedding_model(model, region, profile.as_deref()).await?;
+            }
+        }
 
         // Create an empty in-memory vector store for now
         let store = InMemoryVectorStore::from_documents(std::iter::empty::<(
@@ -75,16 +172,21 @@ impl VectorStoreManager {
             collection_name: None,
             qdrant_store: None,
             in_memory_store: Some(Arc::new(store)),
-            embedding_model,
+            bedrock_kb_client: None,
+            bedrock_kb_id: None,
+            embedding_provider: embedding.provider().to_string(),
+            embedding_model_name: embedding.model().to_string(),
             context_prefix: config.context_prefix.clone(),
         })
     }
 
     /// Create a Qdrant vector store
     async fn create_qdrant_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
+        let embedding = require_embedding_model(config)?;
+
         info!(
             "Creating Qdrant vector store with {} embeddings",
-            config.embedding_model.model
+            embedding.model()
         );
 
         let url = config.url.as_ref().ok_or_else(|| {
@@ -108,19 +210,6 @@ impl VectorStoreManager {
             }
         };
 
-        // Create OpenAI embedding model
-        let embedding_model = if config.embedding_model.provider == "openai" {
-            let client = Client::new(&config.embedding_model.api_key).map_err(|e| {
-                BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
-            })?;
-            client.embedding_model(&config.embedding_model.model)
-        } else {
-            return Err(BuilderError::VectorStoreError(format!(
-                "Unsupported embedding provider: {}. Only 'openai' is supported for now.",
-                config.embedding_model.provider
-            )));
-        };
-
         // Create default query parameters for the collection
         let query_params = QueryPoints {
             collection_name: collection_name.clone(),
@@ -133,9 +222,27 @@ impl VectorStoreManager {
             ..Default::default()
         };
 
-        // Create the Qdrant vector store using rig-qdrant
-        let qdrant_store =
-            QdrantVectorStore::new(qdrant_client, embedding_model.clone(), query_params);
+        // Create embedding model and Qdrant store based on provider
+        let qdrant_store = match embedding {
+            EmbeddingModelConfig::OpenAI { api_key, model, .. } => {
+                let embedding_model = Self::create_openai_embedding_model(api_key, model)?;
+                let store =
+                    QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
+                QdrantStoreKind::OpenAI(store)
+            }
+            EmbeddingModelConfig::Bedrock {
+                model,
+                region,
+                profile,
+            } => {
+                let embedding_model =
+                    Self::create_bedrock_embedding_model(model, region, profile.as_deref())
+                        .await?;
+                let store =
+                    QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
+                QdrantStoreKind::Bedrock(store)
+            }
+        };
 
         info!("Qdrant vector store initialized successfully");
 
@@ -146,13 +253,68 @@ impl VectorStoreManager {
             collection_name: Some(collection_name.clone()),
             qdrant_store: Some(Arc::new(qdrant_store)),
             in_memory_store: None,
-            embedding_model,
+            bedrock_kb_client: None,
+            bedrock_kb_id: None,
+            embedding_provider: embedding.provider().to_string(),
+            embedding_model_name: embedding.model().to_string(),
+            context_prefix: config.context_prefix.clone(),
+        })
+    }
+
+    /// Create a Bedrock Knowledge Base vector store
+    async fn create_bedrock_kb_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
+        let kb_id = config
+            .knowledge_base_id
+            .as_ref()
+            .ok_or_else(|| {
+                BuilderError::VectorStoreError(
+                    "knowledge_base_id is required for bedrock_kb".to_string(),
+                )
+            })?
+            .clone();
+
+        let region = config.region.as_ref().ok_or_else(|| {
+            BuilderError::VectorStoreError(
+                "region is required for bedrock_kb".to_string(),
+            )
+        })?;
+
+        info!("Creating Bedrock Knowledge Base store");
+        info!("  Knowledge Base ID: {}", kb_id);
+        info!("  Region: {}", region);
+
+        let sdk_config = Self::load_aws_config(
+            region,
+            config.profile.as_deref(),
+        )
+        .await;
+
+        let client = aws_sdk_bedrockagentruntime::Client::new(&sdk_config);
+        info!("Bedrock Knowledge Base client initialized");
+
+        Ok(Self {
+            store_name: config.name.clone(),
+            store_type: "bedrock_kb".to_string(),
+            qdrant_url: None,
+            collection_name: None,
+            qdrant_store: None,
+            in_memory_store: None,
+            bedrock_kb_client: Some(Arc::new(client)),
+            bedrock_kb_id: Some(kb_id),
+            embedding_provider: "bedrock_kb".to_string(),
+            embedding_model_name: "managed".to_string(),
             context_prefix: config.context_prefix.clone(),
         })
     }
 
     /// Add documents to the vector store
     pub async fn add_documents(&self, documents: Vec<String>) -> Result<(), BuilderError> {
+        if self.store_type == "bedrock_kb" {
+            return Err(BuilderError::VectorStoreError(
+                "Bedrock Knowledge Base is read-only; manage documents via the AWS console".to_string(),
+            ));
+        }
+
         info!("Adding {} documents to vector store", documents.len());
 
         // TODO: Implement document addition
@@ -189,12 +351,17 @@ impl VectorStoreManager {
 
                     // Perform vector search using the VectorStoreIndex trait
                     debug!("Performing vector search in Qdrant for: '{}'", query);
-                    let search_results = qdrant_store
-                        .top_n::<serde_json::Value>(search_request)
-                        .await
-                        .map_err(|e| {
-                            BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
-                        })?;
+                    let search_results = match qdrant_store.as_ref() {
+                        QdrantStoreKind::OpenAI(store) => {
+                            store.top_n::<serde_json::Value>(search_request).await
+                        }
+                        QdrantStoreKind::Bedrock(store) => {
+                            store.top_n::<serde_json::Value>(search_request).await
+                        }
+                    }
+                    .map_err(|e| {
+                        BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
+                    })?;
 
                     // Convert results to our SearchResult format
                     let results: Vec<SearchResult> = search_results
@@ -214,6 +381,7 @@ impl VectorStoreManager {
                     ))
                 }
             }
+            "bedrock_kb" => self.search_bedrock_kb(query, limit).await,
             "in_memory" => {
                 // For in-memory, we still need to implement search
                 debug!("In-memory search not yet implemented, returning empty results");
@@ -226,14 +394,83 @@ impl VectorStoreManager {
         }
     }
 
+    /// Search Bedrock Knowledge Base using the Retrieve API
+    async fn search_bedrock_kb(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, BuilderError> {
+        let client = self.bedrock_kb_client.as_ref().ok_or_else(|| {
+            BuilderError::VectorStoreError(
+                "Bedrock KB client not initialized".to_string(),
+            )
+        })?;
+        let kb_id = self.bedrock_kb_id.as_ref().ok_or_else(|| {
+            BuilderError::VectorStoreError(
+                "Bedrock KB ID not set".to_string(),
+            )
+        })?;
+
+        debug!("Performing Bedrock KB retrieve for: '{}'", query);
+
+        let retrieval_query =
+            aws_sdk_bedrockagentruntime::types::KnowledgeBaseQuery::builder()
+                .text(query)
+                .build();
+
+        let retrieval_config =
+            aws_sdk_bedrockagentruntime::types::KnowledgeBaseRetrievalConfiguration::builder()
+                .vector_search_configuration(
+                    aws_sdk_bedrockagentruntime::types::KnowledgeBaseVectorSearchConfiguration::builder()
+                        .number_of_results(limit as i32)
+                        .build(),
+                )
+                .build();
+
+        let response = client
+            .retrieve()
+            .knowledge_base_id(kb_id)
+            .retrieval_query(retrieval_query)
+            .retrieval_configuration(retrieval_config)
+            .send()
+            .await
+            .map_err(|e| {
+                BuilderError::VectorStoreError(format!(
+                    "Bedrock KB retrieve failed: {e}"
+                ))
+            })?;
+
+        let results: Vec<SearchResult> = response
+            .retrieval_results
+            .into_iter()
+            .filter_map(|r| {
+                let content = r.content?.text;
+                let score = r.score.unwrap_or(0.0) as f32;
+                let metadata = r.location.map(|loc| {
+                    serde_json::json!({
+                        "type": format!("{:?}", loc.r#type),
+                    })
+                });
+                Some(SearchResult {
+                    content,
+                    score,
+                    metadata,
+                })
+            })
+            .collect();
+
+        info!("Found {} results from Bedrock KB", results.len());
+        Ok(results)
+    }
+
     /// Get vector store statistics
     pub fn get_stats(&self) -> VectorStoreStats {
         VectorStoreStats {
             store_type: self.store_type.clone(),
-            embedding_provider: "openai".to_string(), // Only OpenAI supported for now
-            embedding_model: "text-embedding-3-small".to_string(), // From config
-            document_count: 0,                        // TODO: Get actual count from store
-            index_size: 0,                            // TODO: Get actual size from store
+            embedding_provider: self.embedding_provider.clone(),
+            embedding_model: self.embedding_model_name.clone(),
+            document_count: 0, // TODO: Get actual count from store
+            index_size: 0,     // TODO: Get actual size from store
         }
     }
 
@@ -269,13 +506,17 @@ impl VectorStoreManager {
                         ))
                     })?;
 
-                let mut candidates =
-                    qdrant_store
-                        .top_n::<Value>(search_request)
-                        .await
-                        .map_err(|e| {
-                            BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
-                        })?;
+                let mut candidates = match qdrant_store.as_ref() {
+                    QdrantStoreKind::OpenAI(store) => {
+                        store.top_n::<Value>(search_request).await
+                    }
+                    QdrantStoreKind::Bedrock(store) => {
+                        store.top_n::<Value>(search_request).await
+                    }
+                }
+                .map_err(|e| {
+                    BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))
+                })?;
 
                 // Client-side filter by payload equality
                 candidates.retain(|(_score, _id, payload)| {
@@ -294,8 +535,8 @@ impl VectorStoreManager {
                     })
                     .collect())
             }
-            "in_memory" => {
-                // No filter support for in-memory; fall back to unfiltered search
+            "bedrock_kb" | "in_memory" => {
+                // No filter support; fall back to unfiltered search
                 self.search(query, limit).await
             }
             _ => Err(BuilderError::VectorStoreError(format!(

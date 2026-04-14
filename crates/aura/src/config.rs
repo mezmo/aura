@@ -193,21 +193,56 @@ pub struct AgentSettings {
 pub struct VectorStoreConfig {
     pub name: String,
     pub store_type: String,
-    pub embedding_model: EmbeddingModelConfig,
+    /// Embedding model (required for in_memory/qdrant, None for bedrock_kb)
+    pub embedding_model: Option<EmbeddingModelConfig>,
     pub connection_string: Option<String>,
     pub url: Option<String>,
     pub collection_name: Option<String>,
     /// Optional context string to prepend to search results for better RAG integration
     pub context_prefix: Option<String>,
+    /// Knowledge base ID (required for bedrock_kb)
+    pub knowledge_base_id: Option<String>,
+    /// AWS region (required for bedrock_kb)
+    pub region: Option<String>,
+    /// AWS profile name (optional, for bedrock_kb)
+    pub profile: Option<String>,
 }
 
-/// Embedding model configuration
+/// Embedding model configuration with strong typing per provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingModelConfig {
-    pub provider: String,
-    pub model: String,
-    pub api_key: String,
-    pub base_url: Option<String>,
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum EmbeddingModelConfig {
+    OpenAI {
+        api_key: String,
+        model: String,
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    Bedrock {
+        model: String,
+        region: String,
+        /// AWS profile name (optional, uses default credentials if not specified)
+        #[serde(default)]
+        profile: Option<String>,
+    },
+}
+
+impl EmbeddingModelConfig {
+    /// Get the provider name
+    pub fn provider(&self) -> &str {
+        match self {
+            EmbeddingModelConfig::OpenAI { .. } => "openai",
+            EmbeddingModelConfig::Bedrock { .. } => "bedrock",
+        }
+    }
+
+    /// Get the model name
+    pub fn model(&self) -> &str {
+        match self {
+            EmbeddingModelConfig::OpenAI { model, .. }
+            | EmbeddingModelConfig::Bedrock { model, .. } => model,
+        }
+    }
 }
 
 /// MCP (Model Context Protocol) configuration
