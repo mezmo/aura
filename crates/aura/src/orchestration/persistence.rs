@@ -126,10 +126,6 @@ pub struct TaskExecutionRecord {
     pub attempt: usize,
     /// Worker's approach/reasoning
     pub approach: String,
-    /// Tools called during execution (always empty — tool calls are persisted
-    /// incrementally to separate `*.tool-calls.json` via `append_tool_call()`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolCallRecord>,
     /// Final result
     pub result: Option<String>,
     /// Error if task failed
@@ -307,19 +303,13 @@ impl ExecutionPersistence {
         let iter_path = self.iteration_path();
         fs::create_dir_all(&iter_path).await?;
 
-        // Write prompt and response with namespaced filenames
+        // Write prompt and response with namespaced filenames.
+        // Tool calls are persisted incrementally via `append_tool_call()` to
+        // separate `*.tool-calls.json` files; nothing to write here.
         let prompt_file = self.task_attempt_filename(task_id, attempt, "prompt.txt");
         let response_file = self.task_attempt_filename(task_id, attempt, "response.txt");
         fs::write(iter_path.join(&prompt_file), prompt).await?;
         fs::write(iter_path.join(&response_file), response).await?;
-
-        // Write tool calls separately for easy inspection
-        if !record.tool_calls.is_empty() {
-            let tool_json = serde_json::to_string_pretty(&record.tool_calls)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let tool_file = self.task_attempt_filename(task_id, attempt, "tool-calls.json");
-            fs::write(iter_path.join(&tool_file), tool_json).await?;
-        }
 
         // Write full execution record
         let record_json = serde_json::to_string_pretty(record)
