@@ -1,4 +1,5 @@
 use crate::{
+    bedrock_embedding::AuraBedrockEmbeddingModel as BedrockEmbeddingModel,
     config::{EmbeddingModelConfig, VectorStoreConfig},
     error::BuilderError,
 };
@@ -12,7 +13,6 @@ use rig::{
         VectorStoreIndex, in_memory_store::InMemoryVectorStore, request::VectorSearchRequest,
     },
 };
-use rig_bedrock::embedding::EmbeddingModel as BedrockEmbeddingModel;
 use rig_qdrant::QdrantVectorStore;
 use serde_json::Value;
 use std::sync::Arc;
@@ -102,10 +102,9 @@ impl VectorStoreManager {
         };
 
         let aws_client = aws_sdk_bedrockruntime::Client::new(&sdk_config);
-        let bedrock_client = rig_bedrock::client::Client::from(aws_client);
         info!("Bedrock embedding client initialized successfully");
 
-        Ok(bedrock_client.embedding_model(model))
+        Ok(BedrockEmbeddingModel::new(aws_client, model, None))
     }
 
     /// Load AWS SDK config with optional region and profile
