@@ -1495,7 +1495,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_planning_response_clarification_serde() {
         let response = PlanningResponse::Clarification {
@@ -1537,7 +1536,6 @@ mod tests {
             other => panic!("Expected Clarification, got {:?}", other),
         }
     }
-
 
     #[test]
     fn test_into_plan_from_direct_returns_none() {
@@ -1684,13 +1682,6 @@ mod tests {
         }
     }
 
-
-
-
-
-
-
-
     #[test]
     fn test_flat_plan_parsing_unchanged() {
         let response = PlanningResponse::StepsPlan {
@@ -1708,12 +1699,6 @@ mod tests {
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].description, "Do thing");
     }
-
-
-
-
-
-
 
     // ========================================================================
     // StepInput / flatten_steps tests
