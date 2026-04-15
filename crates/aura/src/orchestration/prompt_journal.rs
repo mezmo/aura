@@ -35,9 +35,6 @@ pub(crate) enum JournalPhase<'a> {
     },
     Synthesis,
     Evaluation,
-    PhaseContinuation {
-        phase_id: usize,
-    },
 }
 
 impl<'a> JournalPhase<'a> {
@@ -66,12 +63,6 @@ impl<'a> JournalPhase<'a> {
             } => format!("Worker (Iteration {}, Task {})", iteration, task_id),
             JournalPhase::Synthesis => format!("Synthesis (Iteration {})", iteration),
             JournalPhase::Evaluation => format!("Evaluation (Iteration {})", iteration),
-            JournalPhase::PhaseContinuation { phase_id } => {
-                format!(
-                    "PhaseContinuation (Iteration {}, Phase {})",
-                    iteration, phase_id
-                )
-            }
         }
     }
 
@@ -86,9 +77,6 @@ impl<'a> JournalPhase<'a> {
             }
             JournalPhase::Synthesis => "synthesis/response.txt".to_string(),
             JournalPhase::Evaluation => "evaluation/response.txt".to_string(),
-            JournalPhase::PhaseContinuation { phase_id } => {
-                format!("phase-continuation/phase-{}/response.txt", phase_id)
-            }
         }
     }
 }
