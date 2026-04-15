@@ -292,7 +292,6 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `allow_direct_answers` | bool | `true` | Allow coordinator to answer simple queries directly |
 | `allow_clarification` | bool | `true` | Allow coordinator to ask for clarification |
 | `tools_in_planning` | string | `"summary"` | Tool visibility for coordinator: `"none"`, `"summary"` (names only), `"full"` (with descriptions) |
-| `max_phases` | int | `5` | Maximum dependency waves per execution cycle |
 | `max_plan_parse_retries` | int | `3` | Retries if coordinator produces unparseable plan JSON |
 | `max_tools_per_worker` | int | `10` | Cap on MCP tools exposed to each worker |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |

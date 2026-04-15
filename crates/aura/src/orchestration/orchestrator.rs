@@ -1098,9 +1098,14 @@ impl Orchestrator {
                 );
 
                 // Enforce config flags
-                let planning_response = self.enforce_routing_config(planning_response, query);
+                let planning_response = Self::enforce_routing_config(
+                    planning_response,
+                    query,
+                    self.config.allow_direct_answers,
+                    self.config.allow_clarification,
+                );
 
-                // Persist plan for Orchestrated variant
+                // Persist plan for plan-bearing routing decisions
                 if matches!(
                     &planning_response,
                     PlanningResponse::StepsPlan { .. }
@@ -1243,13 +1248,21 @@ impl Orchestrator {
     /// Enforce config flags on a routing decision.
     ///
     /// When `allow_direct_answers` or `allow_clarification` is false,
-    /// converts the response to a single-task Orchestrated plan.
-    fn enforce_routing_config(&self, response: PlanningResponse, query: &str) -> PlanningResponse {
+    /// converts the response to a single-task `StepsPlan`.
+    ///
+    /// Takes flags as arguments (rather than reading `self.config`) so the
+    /// transformation is unit-testable without an `Orchestrator` instance.
+    fn enforce_routing_config(
+        response: PlanningResponse,
+        query: &str,
+        allow_direct_answers: bool,
+        allow_clarification: bool,
+    ) -> PlanningResponse {
         match &response {
             PlanningResponse::Direct {
                 response: answer,
                 routing_rationale,
-            } if !self.config.allow_direct_answers => {
+            } if !allow_direct_answers => {
                 tracing::info!(
                     "Config override: converting direct answer to orchestrated plan (allow_direct_answers=false)"
                 );
@@ -1275,7 +1288,7 @@ impl Orchestrator {
                 question,
                 routing_rationale,
                 ..
-            } if !self.config.allow_clarification => {
+            } if !allow_clarification => {
                 tracing::info!(
                     "Config override: converting clarification to orchestrated plan (allow_clarification=false)"
                 );
@@ -3304,8 +3317,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Emit a ReplanStarted event and build the iteration context for the next cycle.
     ///
-    /// Consolidates the common tail of all three replan paths (phase_continuation,
-    /// failure, quality). Callers handle path-specific pre-work (e.g. IterationComplete
+    /// Consolidates the common tail of the replan paths (coordinator-routed,
+    /// failure-driven). Callers handle path-specific pre-work (e.g. IterationComplete
     /// events, persistence writes) before calling this.
     async fn trigger_replan(
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
@@ -3377,7 +3390,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// dispatches based on the `PlanningResponse` variant:
     /// - `Direct` → emit event, return response
     /// - `Clarification` → emit event, return question
-    /// - `Orchestrated` → delegate to `run_orchestration_loop()`
+    /// - `StepsPlan` → delegate to `run_orchestration_loop()`
     #[tracing::instrument(
         name = "orchestration",
         skip_all,
@@ -3639,7 +3652,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 // so into_plan() will always return Some here.
                 plan = response
                     .into_plan()
-                    .expect("Orchestrated/StepsPlan always converts to plan");
+                    .expect("StepsPlan always converts to plan");
 
                 // Carry forward results from previous iteration where coordinator requested reuse
                 Self::apply_result_reuse(
