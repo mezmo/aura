@@ -136,9 +136,9 @@ fn flatten_one(
 pub struct Plan {
     /// The original goal/query being addressed.
     pub goal: String,
-    /// Original step structure from the coordinator (when using steps format).
-    /// Present for `StepsPlan` responses, absent for legacy `Orchestrated` fallbacks.
-    /// This is purely for persistence/observability — execution uses `tasks`.
+    /// Original step structure from the coordinator. Always present for plans
+    /// constructed from a `PlanningResponse::StepsPlan`; populated for persistence
+    /// and observability — execution uses `tasks`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steps: Option<Vec<StepInput>>,
     /// Ordered list of tasks to accomplish the goal.

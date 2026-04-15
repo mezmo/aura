@@ -210,12 +210,10 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 | `aura.orchestrator.task_completed` | Worker finished task (success/failure with duration) |
 | `aura.orchestrator.worker_reasoning` | Worker reasoning content with task/worker attribution |
 | `aura.orchestrator.iteration_complete` | Iteration finished with quality score, threshold, replan decision |
-| `aura.orchestrator.replan_started` | Replan cycle triggered (quality, failure, or phase_continuation) |
+| `aura.orchestrator.replan_started` | Replan cycle triggered (coordinator-routed or task failures) |
 | `aura.orchestrator.synthesizing` | Coordinator merging worker results (includes iteration number) |
 | `aura.orchestrator.tool_call_started` | Tool execution began within a worker task |
 | `aura.orchestrator.tool_call_completed` | Tool execution finished within a worker task |
-| `aura.orchestrator.phase_started` | Dependency wave began execution |
-| `aura.orchestrator.phase_completed` | Dependency wave finished (continuation: "continue" or "replan") |
 
 ### Orchestration Event Flow
 
@@ -223,8 +221,6 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 User query received
        ↓
 plan_created          ← goal, task_count, routing_mode, routing_rationale
-       ↓
-phase_started         ← Dependency wave begins (phase_id, label)
        ↓
 task_started          ← Worker assigned (task_id, worker_id, orchestrator_id)
        ↓
@@ -236,15 +232,13 @@ tool_call_completed   ← Tool result (duration_ms, success)
        ↓
 task_completed        ← Worker finished (duration_ms, success, result)
        ↓
-phase_completed       ← Wave done (continuation: "continue" or "replan")
-       ↓
 synthesizing          ← Coordinator merging results (iteration)
        ↓
 iteration_complete    ← Quality scored (quality_score, quality_threshold,
                          will_replan, evaluation_skipped, reasoning, gaps)
        ↓
 If will_replan:
-  replan_started      ← trigger: "quality" | "failure" | "phase_continuation"
+  replan_started      ← trigger: "coordinator" | "failure"
        ↓
   → loop back to plan_created
 ```
@@ -297,7 +291,7 @@ event: aura.orchestrator.replan_started
 data: {"iteration":2,"trigger":"quality","agent_id":"coordinator","session_id":"sess_xyz"}
 ```
 
-Triggers: `"quality"` (score below threshold), `"failure"` (worker task failures), `"phase_continuation"` (coordinator decided to replan between phases).
+Triggers: `"quality"` (score below threshold) or `"failure"` (worker task failures forced a replan).
 
 **Synthesizing** (combining worker results):
 ```
