@@ -95,7 +95,6 @@ pub struct OrchestrationConfig {
     pub max_planning_cycles: usize,
     pub quality_threshold: f32,
     pub max_plan_parse_retries: usize,
-    pub max_phases: usize,
     pub worker_system_prompt: Option<String>,
     pub workers: HashMap<String, WorkerConfig>,
     pub coordinator_vector_stores: Vec<String>,
@@ -115,7 +114,6 @@ impl Default for OrchestrationConfig {
             max_planning_cycles: default_max_planning_cycles(),
             quality_threshold: default_quality_threshold(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
-            max_phases: default_max_phases(),
             worker_system_prompt: None,
             workers: HashMap::new(),
             coordinator_vector_stores: Vec::new(),
@@ -141,8 +139,6 @@ struct RawOrchestrationConfig {
     quality_threshold: f32,
     #[serde(default = "default_max_plan_parse_retries")]
     max_plan_parse_retries: usize,
-    #[serde(default = "default_max_phases")]
-    max_phases: usize,
     #[serde(default)]
     worker_system_prompt: Option<String>,
     #[serde(default, rename = "worker")]
@@ -203,7 +199,6 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_planning_cycles: raw.max_planning_cycles,
             quality_threshold: raw.quality_threshold,
             max_plan_parse_retries: raw.max_plan_parse_retries,
-            max_phases: raw.max_phases,
             worker_system_prompt: raw.worker_system_prompt,
             workers: raw.workers,
             coordinator_vector_stores: raw.coordinator_vector_stores,
@@ -250,10 +245,6 @@ fn default_per_call_timeout_secs() -> u64 {
 
 fn default_max_plan_parse_retries() -> usize {
     3
-}
-
-fn default_max_phases() -> usize {
-    5
 }
 
 fn default_result_artifact_threshold() -> usize {
