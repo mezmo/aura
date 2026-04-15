@@ -428,7 +428,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_reflection_template_loaded() {
         assert!(
