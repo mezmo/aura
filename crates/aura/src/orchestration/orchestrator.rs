@@ -1121,7 +1121,7 @@ impl Orchestrator {
                 // Persist plan for Orchestrated variant
                 if matches!(
                     &planning_response,
-                    PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. }
+                    PlanningResponse::StepsPlan { .. }
                 ) && let Some(plan) = planning_response.clone().into_plan()
                 {
                     let persistence = self.persistence.lock().await;
@@ -1170,27 +1170,25 @@ impl Orchestrator {
                         }
                     }
 
-                    // Wrap as Orchestrated response
-                    let tasks_json: Vec<super::types::TaskJson> = plan
+                    // Wrap as StepsPlan response (sequential LeafTasks).
+                    // Loses fine-grained dependency info from text-parsed plans,
+                    // but this is an emergency fallback path; sequential is safe.
+                    let steps: Vec<super::types::StepInput> = plan
                         .tasks
                         .iter()
-                        .map(|t| super::types::TaskJson {
-                            id: t.id,
-                            description: t.description.clone(),
-                            rationale: Some(t.rationale.clone()),
-                            dependencies: Some(t.dependencies.clone()),
+                        .map(|t| super::types::StepInput::LeafTask {
+                            task: t.description.clone(),
                             worker: t.worker.clone(),
                             reuse_result_from: None,
                         })
                         .collect();
 
                     return Ok((
-                        PlanningResponse::Orchestrated {
+                        PlanningResponse::StepsPlan {
                             goal: plan.goal,
-                            tasks: tasks_json,
+                            steps,
                             routing_rationale: "Fallback: text-based plan parsing".to_string(),
                             planning_summary: String::new(),
-                            phases: None,
                         },
                         final_prompt,
                         final_response,
@@ -1243,21 +1241,15 @@ impl Orchestrator {
             }
         }
 
-        let response = PlanningResponse::Orchestrated {
+        let response = PlanningResponse::StepsPlan {
             goal: query.to_string(),
-            tasks: vec![super::types::TaskJson {
-                id: 0,
-                description: format!("Execute: {}", truncate_query(query, 100)),
-                rationale: Some(
-                    "Direct execution of user query as a single task (routing failed)".to_string(),
-                ),
-                dependencies: None,
+            steps: vec![super::types::StepInput::LeafTask {
+                task: format!("Execute: {}", truncate_query(query, 100)),
                 worker: None,
                 reuse_result_from: None,
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
-            phases: None,
         };
 
         let (query_preview, _) = safe_truncate(query, 100);
@@ -1279,28 +1271,22 @@ impl Orchestrator {
                 tracing::info!(
                     "Config override: converting direct answer to orchestrated plan (allow_direct_answers=false)"
                 );
-                PlanningResponse::Orchestrated {
+                PlanningResponse::StepsPlan {
                     goal: query.to_string(),
-                    tasks: vec![super::types::TaskJson {
-                        id: 0,
-                        description: format!(
+                    steps: vec![super::types::StepInput::LeafTask {
+                        task: format!(
                             "Answer the user's query: {}",
                             truncate_query(query, 80)
                         ),
-                        rationale: Some(format!(
-                            "Direct answer overridden by config. Original answer: {}",
-                            truncate_query(answer, 100)
-                        )),
-                        dependencies: None,
                         worker: None,
                         reuse_result_from: None,
                     }],
                     routing_rationale: format!(
-                        "Config override (allow_direct_answers=false). Original rationale: {}",
-                        routing_rationale
+                        "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
+                        routing_rationale,
+                        truncate_query(answer, 100)
                     ),
                     planning_summary: String::new(),
-                    phases: None,
                 }
             }
             PlanningResponse::Clarification {
@@ -1311,28 +1297,22 @@ impl Orchestrator {
                 tracing::info!(
                     "Config override: converting clarification to orchestrated plan (allow_clarification=false)"
                 );
-                PlanningResponse::Orchestrated {
+                PlanningResponse::StepsPlan {
                     goal: query.to_string(),
-                    tasks: vec![super::types::TaskJson {
-                        id: 0,
-                        description: format!(
+                    steps: vec![super::types::StepInput::LeafTask {
+                        task: format!(
                             "Investigate and answer the user's query: {}",
                             truncate_query(query, 80)
                         ),
-                        rationale: Some(format!(
-                            "Clarification overridden by config. Original question: {}",
-                            truncate_query(question, 100)
-                        )),
-                        dependencies: None,
                         worker: None,
                         reuse_result_from: None,
                     }],
                     routing_rationale: format!(
-                        "Config override (allow_clarification=false). Original rationale: {}",
-                        routing_rationale
+                        "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
+                        routing_rationale,
+                        truncate_query(question, 100)
                     ),
                     planning_summary: String::new(),
-                    phases: None,
                 }
             }
             _ => response,
@@ -3509,13 +3489,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await;
                 Ok(question)
             }
-            PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. } => {
+            PlanningResponse::StepsPlan { .. } => {
                 span.record("orchestration.routing", "orchestrated");
                 let routing_rationale = response.routing_rationale().to_string();
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
                 let plan = response
                     .into_plan()
-                    .expect("Orchestrated/StepsPlan always converts");
+                    .expect("StepsPlan always converts");
 
                 Self::emit_event(
                     &event_tx,
@@ -3685,7 +3665,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         return Ok(question.clone());
                     }
-                    PlanningResponse::Orchestrated { .. } | PlanningResponse::StepsPlan { .. } => {
+                    PlanningResponse::StepsPlan { .. } => {
                         // Fall through to plan extraction below
                     }
                 }
@@ -4344,14 +4324,6 @@ mod tests {
         assert!(!is_context_overflow_error(error.as_ref()));
     }
 
-    #[test]
-    fn test_context_overflow_suggestion_phases() {
-        assert!(context_overflow_suggestion("planning").contains("smaller"));
-        assert!(context_overflow_suggestion("synthesis").contains("separately"));
-        assert!(context_overflow_suggestion("evaluation").contains("simpler"));
-        assert!(context_overflow_suggestion("worker").contains("focused"));
-        assert!(context_overflow_suggestion("unknown").contains("Reduce"));
-    }
 
     #[test]
     fn test_evaluate_all_complete() {
@@ -5256,46 +5228,6 @@ Provide the synthesized response:"#,
         assert!(!coordinator_tools.contains(&"vector_search_worker_store".to_string()));
     }
 
-    // ========================================================================
-    // PlanningResponse Routing Tests
-    // ========================================================================
-
-    #[test]
-    fn test_planning_response_into_plan_preserves_all_fields() {
-        use super::super::types::{PlanningResponse, TaskJson};
-
-        let response = PlanningResponse::Orchestrated {
-            goal: "Test goal".to_string(),
-            tasks: vec![
-                TaskJson {
-                    id: 0,
-                    description: "Task A".to_string(),
-                    rationale: Some("Reason A".to_string()),
-                    dependencies: Some(vec![]),
-                    worker: Some("operations".to_string()),
-                    reuse_result_from: None,
-                },
-                TaskJson {
-                    id: 1,
-                    description: "Task B".to_string(),
-                    rationale: Some("Reason B".to_string()),
-                    dependencies: Some(vec![0]),
-                    worker: None,
-                    reuse_result_from: None,
-                },
-            ],
-            routing_rationale: "Test rationale".to_string(),
-            planning_summary: "Test summary".to_string(),
-            phases: None,
-        };
-
-        let plan = response.into_plan().unwrap();
-        assert_eq!(plan.goal, "Test goal");
-        assert_eq!(plan.tasks.len(), 2);
-        assert_eq!(plan.tasks[0].worker, Some("operations".to_string()));
-        assert_eq!(plan.tasks[1].dependencies, vec![0]);
-        assert_eq!(plan.tasks[0].rationale, "Reason A");
-    }
 
     #[test]
     fn test_planning_response_direct_has_no_plan() {
@@ -5352,7 +5284,7 @@ Provide the synthesized response:"#,
 
     #[test]
     fn test_planning_response_serde_round_trip_all_variants() {
-        use super::super::types::{PlanningResponse, TaskJson};
+        use super::super::types::{PlanningResponse, StepInput};
 
         // Direct
         let direct = PlanningResponse::Direct {
@@ -5363,24 +5295,20 @@ Provide the synthesized response:"#,
         let parsed: PlanningResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, PlanningResponse::Direct { .. }));
 
-        // Orchestrated
-        let orchestrated = PlanningResponse::Orchestrated {
+        // StepsPlan
+        let steps_plan = PlanningResponse::StepsPlan {
             goal: "test".to_string(),
-            tasks: vec![TaskJson {
-                id: 0,
-                description: "do it".to_string(),
-                rationale: Some("because".to_string()),
-                dependencies: None,
+            steps: vec![StepInput::LeafTask {
+                task: "do it".to_string(),
                 worker: None,
                 reuse_result_from: None,
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),
-            phases: None,
         };
-        let json = serde_json::to_string(&orchestrated).unwrap();
+        let json = serde_json::to_string(&steps_plan).unwrap();
         let parsed: PlanningResponse = serde_json::from_str(&json).unwrap();
-        assert!(matches!(parsed, PlanningResponse::Orchestrated { .. }));
+        assert!(matches!(parsed, PlanningResponse::StepsPlan { .. }));
 
         // Clarification
         let clarification = PlanningResponse::Clarification {

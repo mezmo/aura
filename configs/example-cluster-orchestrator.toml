@@ -73,7 +73,6 @@ Rules:
 [orchestration]
 enabled = true
 max_planning_cycles = 3
-max_phases = 3
 max_plan_parse_retries = 3
 max_tools_per_worker = 8
 quality_threshold = 0.7

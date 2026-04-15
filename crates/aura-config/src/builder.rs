@@ -195,7 +195,6 @@ impl RigBuilder {
                 max_planning_cycles: orch.max_planning_cycles,
                 quality_threshold: orch.quality_threshold,
                 max_plan_parse_retries: orch.max_plan_parse_retries,
-                max_phases: orch.max_phases,
                 worker_system_prompt: orch.worker_system_prompt.clone(),
                 workers,
                 coordinator_vector_stores: orch.coordinator_vector_stores.clone(),
