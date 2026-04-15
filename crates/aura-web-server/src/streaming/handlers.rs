@@ -1135,34 +1135,6 @@ fn handle_orchestrator_event(
                 ectx,
             )
         }
-        OrchestratorEvent::PhaseStarted {
-            phase_id,
-            label,
-            orchestrator_id,
-        } => {
-            tracing::info!("Orchestrator: phase {} started - '{}'", phase_id, label);
-            OrchestrationStreamEvent::phase_started(*phase_id, label, orchestrator_id, ectx)
-        }
-        OrchestratorEvent::PhaseCompleted {
-            phase_id,
-            label,
-            continuation,
-            orchestrator_id,
-        } => {
-            tracing::info!(
-                "Orchestrator: phase {} completed - '{}' (continuation={})",
-                phase_id,
-                label,
-                continuation
-            );
-            OrchestrationStreamEvent::phase_completed(
-                *phase_id,
-                label,
-                *continuation,
-                orchestrator_id,
-                ectx,
-            )
-        }
     };
 
     vec![Bytes::from(sse_event.format_sse())]
