@@ -5090,6 +5090,141 @@ Provide the synthesized response:"#,
         assert!(config.allow_clarification);
     }
 
+    // ========================================================================
+    // enforce_routing_config tests — guard the StepsPlan fallback rewrite
+    // ========================================================================
+
+    #[test]
+    fn test_enforce_routing_passes_through_when_allowed() {
+        use super::super::types::PlanningResponse;
+
+        let direct = PlanningResponse::Direct {
+            response: "42".to_string(),
+            routing_rationale: "trivial".to_string(),
+        };
+        let out = Orchestrator::enforce_routing_config(direct, "what is 6*7?", true, true);
+        assert!(matches!(out, PlanningResponse::Direct { .. }));
+
+        let clar = PlanningResponse::Clarification {
+            question: "which?".to_string(),
+            options: None,
+            routing_rationale: "ambiguous".to_string(),
+        };
+        let out = Orchestrator::enforce_routing_config(clar, "do the thing", true, true);
+        assert!(matches!(out, PlanningResponse::Clarification { .. }));
+    }
+
+    #[test]
+    fn test_enforce_routing_direct_blocked_converts_to_steps_plan() {
+        use super::super::types::{PlanningResponse, StepInput};
+
+        let direct = PlanningResponse::Direct {
+            response: "the meaning of life is 42".to_string(),
+            routing_rationale: "trivial answer".to_string(),
+        };
+        let out =
+            Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
+
+        match out {
+            PlanningResponse::StepsPlan {
+                goal,
+                steps,
+                routing_rationale,
+                planning_summary,
+            } => {
+                assert_eq!(goal, "what is the meaning?");
+                assert_eq!(steps.len(), 1);
+                match &steps[0] {
+                    StepInput::LeafTask {
+                        task,
+                        worker,
+                        reuse_result_from,
+                    } => {
+                        assert!(task.starts_with("Answer the user's query:"));
+                        assert!(task.contains("what is the meaning?"));
+                        assert!(worker.is_none());
+                        assert!(reuse_result_from.is_none());
+                    }
+                    _ => panic!("expected single LeafTask step"),
+                }
+                assert!(routing_rationale.contains("allow_direct_answers=false"));
+                assert!(routing_rationale.contains("trivial answer"));
+                assert!(routing_rationale.contains("the meaning of life is 42"));
+                assert!(planning_summary.is_empty());
+            }
+            other => panic!("expected StepsPlan, got {:?}", other.variant_name()),
+        }
+    }
+
+    #[test]
+    fn test_enforce_routing_clarification_blocked_converts_to_steps_plan() {
+        use super::super::types::{PlanningResponse, StepInput};
+
+        let clar = PlanningResponse::Clarification {
+            question: "which environment did you mean?".to_string(),
+            options: Some(vec!["prod".to_string(), "stage".to_string()]),
+            routing_rationale: "ambiguous env".to_string(),
+        };
+        let out =
+            Orchestrator::enforce_routing_config(clar, "check service health", true, false);
+
+        match out {
+            PlanningResponse::StepsPlan {
+                goal,
+                steps,
+                routing_rationale,
+                ..
+            } => {
+                assert_eq!(goal, "check service health");
+                assert_eq!(steps.len(), 1);
+                match &steps[0] {
+                    StepInput::LeafTask { task, .. } => {
+                        assert!(task.starts_with("Investigate and answer the user's query:"));
+                        assert!(task.contains("check service health"));
+                    }
+                    _ => panic!("expected single LeafTask step"),
+                }
+                assert!(routing_rationale.contains("allow_clarification=false"));
+                assert!(routing_rationale.contains("ambiguous env"));
+                assert!(routing_rationale.contains("which environment did you mean?"));
+            }
+            other => panic!("expected StepsPlan, got {:?}", other.variant_name()),
+        }
+    }
+
+    #[test]
+    fn test_enforce_routing_steps_plan_passes_through_unchanged() {
+        use super::super::types::{PlanningResponse, StepInput};
+
+        let original = PlanningResponse::StepsPlan {
+            goal: "compute mean".to_string(),
+            steps: vec![StepInput::LeafTask {
+                task: "compute mean of 1,2,3".to_string(),
+                worker: Some("statistics".to_string()),
+                reuse_result_from: None,
+            }],
+            routing_rationale: "needs tool".to_string(),
+            planning_summary: "single step".to_string(),
+        };
+
+        // Both flags off — should still pass through, since the response is
+        // already a StepsPlan and the override only converts Direct/Clarification.
+        let out = Orchestrator::enforce_routing_config(original, "compute mean", false, false);
+        match out {
+            PlanningResponse::StepsPlan {
+                goal,
+                steps,
+                planning_summary,
+                ..
+            } => {
+                assert_eq!(goal, "compute mean");
+                assert_eq!(steps.len(), 1);
+                assert_eq!(planning_summary, "single step");
+            }
+            _ => panic!("expected StepsPlan passthrough"),
+        }
+    }
+
     #[test]
     fn test_planning_response_serde_round_trip_all_variants() {
         use super::super::types::{PlanningResponse, StepInput};
