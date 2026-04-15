@@ -122,11 +122,12 @@ pub enum OrchestratorEvent {
     /// The orchestrator is starting a replan cycle.
     ///
     /// Emitted when the orchestrator decides to create a new plan,
-    /// either due to quality evaluation, task failures, or phase continuation.
+    /// either because the coordinator routed back to `create_plan` or because
+    /// task failures forced a replan.
     ReplanStarted {
         /// Which iteration is about to start (1-indexed)
         iteration: usize,
-        /// What triggered the replan: "quality", "failure", or "phase_continuation"
+        /// What triggered the replan: "coordinator" or "failure"
         trigger: String,
     },
     /// The orchestrator is synthesizing results from completed tasks.
