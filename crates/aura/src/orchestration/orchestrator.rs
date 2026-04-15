@@ -1106,10 +1106,8 @@ impl Orchestrator {
                 );
 
                 // Persist plan for plan-bearing routing decisions
-                if matches!(
-                    &planning_response,
-                    PlanningResponse::StepsPlan { .. }
-                ) && let Some(plan) = planning_response.clone().into_plan()
+                if matches!(&planning_response, PlanningResponse::StepsPlan { .. })
+                    && let Some(plan) = planning_response.clone().into_plan()
                 {
                     let persistence = self.persistence.lock().await;
                     if let Err(e) = persistence.write_plan(&plan).await {
@@ -1269,10 +1267,7 @@ impl Orchestrator {
                 PlanningResponse::StepsPlan {
                     goal: query.to_string(),
                     steps: vec![super::types::StepInput::LeafTask {
-                        task: format!(
-                            "Answer the user's query: {}",
-                            truncate_query(query, 80)
-                        ),
+                        task: format!("Answer the user's query: {}", truncate_query(query, 80)),
                         worker: None,
                         reuse_result_from: None,
                     }],
@@ -2596,7 +2591,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         Ok(())
     }
 
-
     /// Collect failed tasks from this iteration into failure records.
     fn collect_iteration_failures(
         plan: &Plan,
@@ -3466,9 +3460,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 span.record("orchestration.routing", "orchestrated");
                 let routing_rationale = response.routing_rationale().to_string();
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
-                let plan = response
-                    .into_plan()
-                    .expect("StepsPlan always converts");
+                let plan = response.into_plan().expect("StepsPlan always converts");
 
                 Self::emit_event(
                     &event_tx,
@@ -4131,7 +4123,6 @@ mod tests {
         let error: Box<dyn std::error::Error + Send + Sync> = "network timeout".into();
         assert!(!is_context_overflow_error(error.as_ref()));
     }
-
 
     #[test]
     fn test_evaluate_all_complete() {
@@ -5036,7 +5027,6 @@ Provide the synthesized response:"#,
         assert!(!coordinator_tools.contains(&"vector_search_worker_store".to_string()));
     }
 
-
     #[test]
     fn test_planning_response_direct_has_no_plan() {
         use super::super::types::PlanningResponse;
@@ -5122,8 +5112,7 @@ Provide the synthesized response:"#,
             response: "the meaning of life is 42".to_string(),
             routing_rationale: "trivial answer".to_string(),
         };
-        let out =
-            Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
+        let out = Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
 
         match out {
             PlanningResponse::StepsPlan {
@@ -5165,8 +5154,7 @@ Provide the synthesized response:"#,
             options: Some(vec!["prod".to_string(), "stage".to_string()]),
             routing_rationale: "ambiguous env".to_string(),
         };
-        let out =
-            Orchestrator::enforce_routing_config(clar, "check service health", true, false);
+        let out = Orchestrator::enforce_routing_config(clar, "check service health", true, false);
 
         match out {
             PlanningResponse::StepsPlan {
