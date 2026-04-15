@@ -101,11 +101,6 @@ fn default_result_summary_length() -> usize {
     2000
 }
 
-/// Default maximum number of phases in a phased plan.
-fn default_max_phases() -> usize {
-    5
-}
-
 /// Default per-call timeout for coordinator/worker LLM calls (seconds).
 /// Default: 0 (disabled). Opt-in by setting a positive value.
 fn default_per_call_timeout_secs() -> u64 {
@@ -358,11 +353,6 @@ pub struct OrchestrationConfig {
     /// Maximum number of plan parse retries before falling back to single-task.
     pub max_plan_parse_retries: usize,
 
-    /// Maximum number of phases allowed in a phased plan.
-    /// Plans with more phases than this will have excess phases truncated.
-    /// Default: 5.
-    pub max_phases: usize,
-
     // --- Routing ---
     /// Allow the coordinator to answer simple queries directly without orchestration.
     pub allow_direct_answers: bool,
@@ -563,7 +553,6 @@ impl Default for OrchestrationConfig {
             max_planning_cycles: default_max_planning_cycles(),
             quality_threshold: default_quality_threshold(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
-            max_phases: default_max_phases(),
             allow_direct_answers: true,
             allow_clarification: true,
             tools_in_planning: default_tools_in_planning(),
@@ -601,8 +590,6 @@ struct RawOrchestrationConfig {
     quality_threshold: f32,
     #[serde(default = "default_max_plan_parse_retries")]
     max_plan_parse_retries: usize,
-    #[serde(default = "default_max_phases")]
-    max_phases: usize,
     #[serde(default = "default_true")]
     allow_direct_answers: bool,
     #[serde(default = "default_true")]
@@ -666,7 +653,6 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_planning_cycles: raw.max_planning_cycles,
             quality_threshold: raw.quality_threshold,
             max_plan_parse_retries: raw.max_plan_parse_retries,
-            max_phases: raw.max_phases,
             allow_direct_answers: raw.allow_direct_answers,
             allow_clarification: raw.allow_clarification,
             tools_in_planning: raw.tools_in_planning,
