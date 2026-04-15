@@ -2812,7 +2812,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 description: task_description.to_string(),
                 attempt,
                 approach: "Direct task execution via worker agent".to_string(),
-                tool_calls: vec![], // Tool calls are captured by PersistenceToolWrapper
                 result: result_str.clone(),
                 error: error_str,
                 duration_ms,
