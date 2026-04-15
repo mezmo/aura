@@ -378,7 +378,6 @@ impl OrchestrationStreamEvent {
             context,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -558,5 +557,4 @@ mod tests {
         assert!(sse.contains("\"result\":\"30.0\""));
         assert!(sse.contains("\"success\":true"));
     }
-
 }
