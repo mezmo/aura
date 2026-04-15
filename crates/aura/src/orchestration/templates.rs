@@ -27,8 +27,6 @@ use std::collections::HashSet;
 pub const WORKER_TASK_PROMPT_TEMPLATE: &str = include_str!("../prompts/worker_task_prompt.md");
 pub const SYNTHESIS_PROMPT_TEMPLATE: &str = include_str!("../prompts/synthesis_prompt.md");
 pub const EVALUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/evaluation_prompt.md");
-pub const PHASE_CONTINUATION_PROMPT_TEMPLATE: &str =
-    include_str!("../prompts/phase_continuation.md");
 pub const REFLECTION_PROMPT_TEMPLATE: &str = include_str!("../prompts/reflection_prompt.md");
 
 /// Trait for template variable providers.
@@ -112,35 +110,6 @@ impl TemplateVars for EvaluationVars<'_> {
     }
 }
 
-/// Variables for the phase continuation prompt.
-#[derive(Debug, Clone)]
-pub struct PhaseContinuationVars<'a> {
-    pub completed_phase_label: &'a str,
-    pub completed_phase_id: &'a str,
-    pub goal: &'a str,
-    pub completed_phase_results: &'a str,
-    pub remaining_phases: &'a str,
-}
-
-impl TemplateVars for PhaseContinuationVars<'_> {
-    const VARS: &'static [&'static str] = &[
-        "COMPLETED_PHASE_LABEL",
-        "COMPLETED_PHASE_ID",
-        "GOAL",
-        "COMPLETED_PHASE_RESULTS",
-        "REMAINING_PHASES",
-    ];
-
-    fn render(&self, template: &str) -> String {
-        template
-            .replace("%%COMPLETED_PHASE_LABEL%%", self.completed_phase_label)
-            .replace("%%COMPLETED_PHASE_ID%%", self.completed_phase_id)
-            .replace("%%GOAL%%", self.goal)
-            .replace("%%COMPLETED_PHASE_RESULTS%%", self.completed_phase_results)
-            .replace("%%REMAINING_PHASES%%", self.remaining_phases)
-    }
-}
-
 /// Variables for the reflection prompt (replan cycle).
 #[derive(Debug, Clone)]
 pub struct ReflectionVars<'a> {
@@ -195,11 +164,6 @@ impl TemplateVars for ReflectionVars<'_> {
             .replace("%%FAILURE_HISTORY%%", self.failure_history)
             .replace("%%REUSE_GUIDANCE%%", self.reuse_guidance)
     }
-}
-
-/// Render the phase continuation prompt with the given variables.
-pub fn render_phase_continuation_prompt(vars: &PhaseContinuationVars<'_>) -> String {
-    vars.render(PHASE_CONTINUATION_PROMPT_TEMPLATE)
 }
 
 /// Render the worker task prompt with the given variables.
@@ -385,12 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_continuation_template_matches_context() {
-        validate_template::<PhaseContinuationVars>(PHASE_CONTINUATION_PROMPT_TEMPLATE)
-            .expect("Phase continuation template should match PhaseContinuationVars");
-    }
-
-    #[test]
     fn test_reflection_template_matches_context() {
         validate_template::<ReflectionVars>(REFLECTION_PROMPT_TEMPLATE)
             .expect("Reflection template should match ReflectionVars");
@@ -470,21 +428,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_phase_continuation_template_loaded() {
-        assert!(
-            !PHASE_CONTINUATION_PROMPT_TEMPLATE.is_empty(),
-            "Phase continuation template should be loaded"
-        );
-        assert!(
-            PHASE_CONTINUATION_PROMPT_TEMPLATE.contains("%%COMPLETED_PHASE_LABEL%%"),
-            "Phase continuation template should contain COMPLETED_PHASE_LABEL placeholder"
-        );
-        assert!(
-            PHASE_CONTINUATION_PROMPT_TEMPLATE.contains("%%REMAINING_PHASES%%"),
-            "Phase continuation template should contain REMAINING_PHASES placeholder"
-        );
-    }
 
     #[test]
     fn test_reflection_template_loaded() {

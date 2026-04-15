@@ -175,24 +175,4 @@ pub enum OrchestratorEvent {
         /// The tool result (output string or error message; truncated to Option in SSE)
         result: String,
     },
-    /// A phase has started execution.
-    PhaseStarted {
-        /// Phase identifier
-        phase_id: usize,
-        /// Human-readable phase label
-        label: String,
-        /// The ID of the orchestrator
-        orchestrator_id: String,
-    },
-    /// A phase has completed execution.
-    PhaseCompleted {
-        /// Phase identifier
-        phase_id: usize,
-        /// Human-readable phase label
-        label: String,
-        /// The continuation decision
-        continuation: super::types::PhaseContinuation,
-        /// The ID of the orchestrator
-        orchestrator_id: String,
-    },
 }

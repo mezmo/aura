@@ -12,8 +12,6 @@
 //! - `aura.orchestrator.synthesizing` - Combining results into final response
 //! - `aura.orchestrator.tool_call_started` - Worker tool execution began
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
-//! - `aura.orchestrator.phase_started` - Phase execution began
-//! - `aura.orchestrator.phase_completed` - Phase execution finished
 //!
 //! # Separation from Base Events
 //!
@@ -22,7 +20,6 @@
 //! 2. Allow different serialization or handling if needed
 
 use crate::orchestration::events::RoutingMode;
-use crate::orchestration::types::PhaseContinuation;
 use crate::stream_events::{AgentContext, CorrelationContext};
 use serde::Serialize;
 
@@ -57,8 +54,6 @@ pub mod event_names {
     pub const WORKER_REASONING: &str = "aura.orchestrator.worker_reasoning";
     pub const TOOL_CALL_STARTED: &str = "aura.orchestrator.tool_call_started";
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
-    pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
-    pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
 }
 
 /// SSE events specific to orchestration mode.
@@ -175,23 +170,6 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
-    /// Emitted when a phase starts execution.
-    PhaseStarted {
-        phase_id: usize,
-        label: String,
-        orchestrator_id: String,
-        #[serde(flatten)]
-        context: EventContext,
-    },
-    /// Emitted when a phase completes execution.
-    PhaseCompleted {
-        phase_id: usize,
-        label: String,
-        continuation: PhaseContinuation,
-        orchestrator_id: String,
-        #[serde(flatten)]
-        context: EventContext,
-    },
 }
 
 impl OrchestrationStreamEvent {
@@ -209,8 +187,6 @@ impl OrchestrationStreamEvent {
             Self::WorkerReasoning { .. } => event_names::WORKER_REASONING,
             Self::ToolCallStarted { .. } => event_names::TOOL_CALL_STARTED,
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
-            Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
-            Self::PhaseCompleted { .. } => event_names::PHASE_COMPLETED,
         }
     }
 
@@ -403,37 +379,6 @@ impl OrchestrationStreamEvent {
         }
     }
 
-    /// Create a PhaseStarted event.
-    pub fn phase_started(
-        phase_id: usize,
-        label: impl Into<String>,
-        orchestrator_id: impl Into<String>,
-        context: EventContext,
-    ) -> Self {
-        Self::PhaseStarted {
-            phase_id,
-            label: label.into(),
-            orchestrator_id: orchestrator_id.into(),
-            context,
-        }
-    }
-
-    /// Create a PhaseCompleted event.
-    pub fn phase_completed(
-        phase_id: usize,
-        label: impl Into<String>,
-        continuation: PhaseContinuation,
-        orchestrator_id: impl Into<String>,
-        context: EventContext,
-    ) -> Self {
-        Self::PhaseCompleted {
-            phase_id,
-            label: label.into(),
-            continuation,
-            orchestrator_id: orchestrator_id.into(),
-            context,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -614,67 +559,4 @@ mod tests {
         assert!(sse.contains("\"success\":true"));
     }
 
-    #[test]
-    fn test_phase_started_event_name() {
-        let event = OrchestrationStreamEvent::phase_started(0, "Gather data", "orch-1", test_ctx());
-
-        assert_eq!(event.event_name(), event_names::PHASE_STARTED);
-    }
-
-    #[test]
-    fn test_phase_completed_event_name() {
-        let event = OrchestrationStreamEvent::phase_completed(
-            0,
-            "Gather data",
-            PhaseContinuation::Continue,
-            "orch-1",
-            test_ctx(),
-        );
-
-        assert_eq!(event.event_name(), event_names::PHASE_COMPLETED);
-    }
-
-    #[test]
-    fn test_format_sse_phase_started() {
-        let event =
-            OrchestrationStreamEvent::phase_started(1, "Analyze findings", "orch-42", test_ctx());
-        let sse = event.format_sse();
-
-        assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_STARTED)));
-        assert!(sse.contains("\"phase_id\":1"));
-        assert!(sse.contains("\"label\":\"Analyze findings\""));
-        assert!(sse.contains("\"orchestrator_id\":\"orch-42\""));
-    }
-
-    #[test]
-    fn test_format_sse_phase_completed_continue() {
-        let event = OrchestrationStreamEvent::phase_completed(
-            0,
-            "Gather data",
-            PhaseContinuation::Continue,
-            "orch-1",
-            test_ctx(),
-        );
-        let sse = event.format_sse();
-
-        assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_COMPLETED)));
-        assert!(sse.contains("\"phase_id\":0"));
-        assert!(sse.contains("\"label\":\"Gather data\""));
-        assert!(sse.contains("\"continuation\":\"continue\""));
-    }
-
-    #[test]
-    fn test_format_sse_phase_completed_replan() {
-        let event = OrchestrationStreamEvent::phase_completed(
-            1,
-            "Analyze findings",
-            PhaseContinuation::Replan,
-            "orch-1",
-            test_ctx(),
-        );
-        let sse = event.format_sse();
-
-        assert!(sse.starts_with(&format!("event: {}\n", event_names::PHASE_COMPLETED)));
-        assert!(sse.contains("\"continuation\":\"replan\""));
-    }
 }
