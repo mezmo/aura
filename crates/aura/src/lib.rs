@@ -38,7 +38,7 @@ pub mod vector_store;
 pub use builder::{Agent, AgentBuilder, FilesystemTools};
 pub use config::{
     AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, ToolsConfig, VectorStoreConfig,
+    ReasoningEffort, ToolsConfig, VectorStoreConfig, VectorStoreType,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use provider_agent::{
