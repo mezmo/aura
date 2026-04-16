@@ -1,6 +1,6 @@
 use crate::{
     bedrock_embedding::AuraBedrockEmbeddingModel as BedrockEmbeddingModel,
-    config::{EmbeddingModelConfig, VectorStoreConfig},
+    config::{EmbeddingModelConfig, VectorStoreConfig, VectorStoreType},
     error::BuilderError,
 };
 use qdrant_client::{Qdrant, qdrant::QueryPoints};
@@ -39,30 +39,31 @@ pub struct VectorStoreManager {
     pub context_prefix: Option<String>,
 }
 
-/// Helper to get the required embedding model config or return an error
-fn require_embedding_model(
-    config: &VectorStoreConfig,
-) -> Result<&EmbeddingModelConfig, BuilderError> {
-    config.embedding_model.as_ref().ok_or_else(|| {
-        BuilderError::VectorStoreError(format!(
-            "embedding_model is required for '{}' vector store '{}'",
-            config.store_type, config.name
-        ))
-    })
-}
-
 impl VectorStoreManager {
     /// Create a new vector store from configuration
     pub async fn from_config(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
-        info!("Initializing vector store: {}", config.store_type);
-
-        match config.store_type.as_str() {
-            "in_memory" => Self::create_in_memory_store(config).await,
-            "qdrant" => Self::create_qdrant_store(config).await,
-            "bedrock_kb" => Self::create_bedrock_kb_store(config).await,
-            store_type => Err(BuilderError::VectorStoreError(format!(
-                "Unsupported vector store type: {store_type}"
-            ))),
+        match &config.store {
+            VectorStoreType::InMemory { embedding_model } => {
+                info!("Initializing vector store: in_memory");
+                Self::create_in_memory_store(config, embedding_model).await
+            }
+            VectorStoreType::Qdrant {
+                embedding_model,
+                url,
+                collection_name,
+            } => {
+                info!("Initializing vector store: qdrant");
+                Self::create_qdrant_store(config, embedding_model, url, collection_name).await
+            }
+            VectorStoreType::BedrockKb {
+                knowledge_base_id,
+                region,
+                profile,
+            } => {
+                info!("Initializing vector store: bedrock_kb");
+                Self::create_bedrock_kb_store(config, knowledge_base_id, region, profile.as_deref())
+                    .await
+            }
         }
     }
 
@@ -134,9 +135,10 @@ impl VectorStoreManager {
     }
 
     /// Create an in-memory vector store
-    async fn create_in_memory_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
-        let embedding = require_embedding_model(config)?;
-
+    async fn create_in_memory_store(
+        config: &VectorStoreConfig,
+        embedding: &EmbeddingModelConfig,
+    ) -> Result<Self, BuilderError> {
         info!(
             "Creating in-memory vector store with {} embeddings",
             embedding.model()
@@ -180,21 +182,16 @@ impl VectorStoreManager {
     }
 
     /// Create a Qdrant vector store
-    async fn create_qdrant_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
-        let embedding = require_embedding_model(config)?;
-
+    async fn create_qdrant_store(
+        config: &VectorStoreConfig,
+        embedding: &EmbeddingModelConfig,
+        url: &str,
+        collection_name: &str,
+    ) -> Result<Self, BuilderError> {
         info!(
             "Creating Qdrant vector store with {} embeddings",
             embedding.model()
         );
-
-        let url = config.url.as_ref().ok_or_else(|| {
-            BuilderError::VectorStoreError("URL is required for Qdrant".to_string())
-        })?;
-
-        let collection_name = config.collection_name.as_ref().ok_or_else(|| {
-            BuilderError::VectorStoreError("Collection name is required for Qdrant".to_string())
-        })?;
 
         info!("Connecting to Qdrant at: {}", url);
         info!("Using collection: {}", collection_name);
@@ -211,7 +208,7 @@ impl VectorStoreManager {
 
         // Create default query parameters for the collection
         let query_params = QueryPoints {
-            collection_name: collection_name.clone(),
+            collection_name: collection_name.to_string(),
             query: None,
             limit: Some(5),
             offset: None,
@@ -248,8 +245,8 @@ impl VectorStoreManager {
         Ok(Self {
             store_name: config.name.clone(),
             store_type: "qdrant".to_string(),
-            qdrant_url: Some(url.clone()),
-            collection_name: Some(collection_name.clone()),
+            qdrant_url: Some(url.to_string()),
+            collection_name: Some(collection_name.to_string()),
             qdrant_store: Some(Arc::new(qdrant_store)),
             in_memory_store: None,
             bedrock_kb_client: None,
@@ -261,30 +258,19 @@ impl VectorStoreManager {
     }
 
     /// Create a Bedrock Knowledge Base vector store
-    async fn create_bedrock_kb_store(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
-        let kb_id = config
-            .knowledge_base_id
-            .as_ref()
-            .ok_or_else(|| {
-                BuilderError::VectorStoreError(
-                    "knowledge_base_id is required for bedrock_kb".to_string(),
-                )
-            })?
-            .clone();
-
-        let region = config.region.as_ref().ok_or_else(|| {
-            BuilderError::VectorStoreError(
-                "region is required for bedrock_kb".to_string(),
-            )
-        })?;
-
+    async fn create_bedrock_kb_store(
+        config: &VectorStoreConfig,
+        knowledge_base_id: &str,
+        region: &str,
+        profile: Option<&str>,
+    ) -> Result<Self, BuilderError> {
         info!("Creating Bedrock Knowledge Base store");
-        info!("  Knowledge Base ID: {}", kb_id);
+        info!("  Knowledge Base ID: {}", knowledge_base_id);
         info!("  Region: {}", region);
 
         let sdk_config = Self::load_aws_config(
             region,
-            config.profile.as_deref(),
+            profile,
         )
         .await;
 
@@ -299,7 +285,7 @@ impl VectorStoreManager {
             qdrant_store: None,
             in_memory_store: None,
             bedrock_kb_client: Some(Arc::new(client)),
-            bedrock_kb_id: Some(kb_id),
+            bedrock_kb_id: Some(knowledge_base_id.to_string()),
             embedding_provider: "bedrock_kb".to_string(),
             embedding_model_name: "managed".to_string(),
             context_prefix: config.context_prefix.clone(),

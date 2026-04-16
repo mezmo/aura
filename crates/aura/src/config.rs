@@ -192,20 +192,31 @@ pub struct AgentSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStoreConfig {
     pub name: String,
-    pub store_type: String,
-    /// Embedding model (required for in_memory/qdrant, None for bedrock_kb)
-    pub embedding_model: Option<EmbeddingModelConfig>,
-    pub connection_string: Option<String>,
-    pub url: Option<String>,
-    pub collection_name: Option<String>,
     /// Optional context string to prepend to search results for better RAG integration
     pub context_prefix: Option<String>,
-    /// Knowledge base ID (required for bedrock_kb)
-    pub knowledge_base_id: Option<String>,
-    /// AWS region (required for bedrock_kb)
-    pub region: Option<String>,
-    /// AWS profile name (optional, for bedrock_kb)
-    pub profile: Option<String>,
+    /// Store-type-specific configuration
+    #[serde(flatten)]
+    pub store: VectorStoreType,
+}
+
+/// Type-specific vector store configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VectorStoreType {
+    InMemory {
+        embedding_model: EmbeddingModelConfig,
+    },
+    Qdrant {
+        embedding_model: EmbeddingModelConfig,
+        url: String,
+        collection_name: String,
+    },
+    BedrockKb {
+        knowledge_base_id: String,
+        region: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
 }
 
 /// Embedding model configuration with strong typing per provider

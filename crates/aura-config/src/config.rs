@@ -195,43 +195,42 @@ pub enum McpServerConfig {
 pub struct VectorStoreConfig {
     /// Unique name to identify this vector store
     pub name: String,
-    #[serde(rename = "type")]
-    pub store_type: String, // "in_memory", "qdrant", or "bedrock_kb"
-    /// Embedding model (required for in_memory and qdrant, not used for bedrock_kb)
-    #[serde(default)]
-    pub embedding_model: Option<EmbeddingConfig>,
-    /// URL for external vector stores like Qdrant (optional)
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Collection name for vector stores like Qdrant (optional)
-    #[serde(default)]
-    pub collection_name: Option<String>,
     /// Optional context string describing what the vector store contains (for better LLM guidance)
     #[serde(default)]
     pub context_prefix: Option<String>,
-    /// Knowledge base ID (required for bedrock_kb)
-    #[serde(default)]
-    pub knowledge_base_id: Option<String>,
-    /// AWS region (required for bedrock_kb)
-    #[serde(default)]
-    pub region: Option<String>,
-    /// AWS profile name (optional, for bedrock_kb)
-    #[serde(default)]
-    pub profile: Option<String>,
+    /// Store-type-specific configuration
+    #[serde(flatten)]
+    pub store: VectorStoreType,
+}
+
+/// Type-specific vector store configuration, tagged by `type` field
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VectorStoreType {
+    InMemory {
+        embedding_model: EmbeddingConfig,
+    },
+    Qdrant {
+        embedding_model: EmbeddingConfig,
+        url: String,
+        collection_name: String,
+    },
+    BedrockKb {
+        knowledge_base_id: String,
+        region: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
 }
 
 impl Default for VectorStoreConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            store_type: "in_memory".to_string(),
-            embedding_model: Some(EmbeddingConfig::default()),
-            url: None,
-            collection_name: None,
             context_prefix: None,
-            knowledge_base_id: None,
-            region: None,
-            profile: None,
+            store: VectorStoreType::InMemory {
+                embedding_model: EmbeddingConfig::default(),
+            },
         }
     }
 }
@@ -380,29 +379,9 @@ impl Config {
 
         // Validate each vector store
         for store in &self.vector_stores {
-            match store.store_type.as_str() {
-                "bedrock_kb" => {
-                    if store.knowledge_base_id.as_ref().map_or(true, |id| id.is_empty()) {
-                        return Err(crate::ConfigError::Validation(format!(
-                            "knowledge_base_id is required for bedrock_kb vector store '{}'",
-                            store.name
-                        )));
-                    }
-                    if store.region.as_ref().map_or(true, |r| r.is_empty()) {
-                        return Err(crate::ConfigError::Validation(format!(
-                            "region is required for bedrock_kb vector store '{}'",
-                            store.name
-                        )));
-                    }
-                }
-                _ => {
-                    let embedding = store.embedding_model.as_ref().ok_or_else(|| {
-                        crate::ConfigError::Validation(format!(
-                            "embedding_model is required for '{}' vector store '{}'",
-                            store.store_type, store.name
-                        ))
-                    })?;
-                    match embedding {
+            match &store.store {
+                VectorStoreType::InMemory { embedding_model } | VectorStoreType::Qdrant { embedding_model, .. } => {
+                    match embedding_model {
                         EmbeddingConfig::OpenAI { api_key, .. } => {
                             if api_key.is_empty() {
                                 return Err(crate::ConfigError::Validation(format!(
@@ -420,6 +399,9 @@ impl Config {
                             }
                         }
                     }
+                }
+                VectorStoreType::BedrockKb { .. } => {
+                    // All required fields are enforced by the enum structure
                 }
             }
         }
