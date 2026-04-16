@@ -2,10 +2,32 @@ use crate::{Config, ConfigError};
 use aura::{
     Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, McpConfig,
     McpServerConfig, OrchestrationConfig, StreamingAgent, ToolsConfig, VectorStoreConfig,
-    orchestration::ToolVisibility as AuraToolVisibility,
+    VectorStoreType, orchestration::ToolVisibility as AuraToolVisibility,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Convert TOML-layer EmbeddingConfig to runtime EmbeddingModelConfig
+fn convert_embedding(em: &crate::config::EmbeddingConfig) -> EmbeddingModelConfig {
+    match em {
+        crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
+            EmbeddingModelConfig::OpenAI {
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: None,
+            }
+        }
+        crate::config::EmbeddingConfig::Bedrock {
+            model,
+            region,
+            profile,
+        } => EmbeddingModelConfig::Bedrock {
+            model: model.clone(),
+            region: region.clone(),
+            profile: profile.clone(),
+        },
+    }
+}
 
 pub struct RigBuilder {
     config: Config,
@@ -36,34 +58,37 @@ impl RigBuilder {
             .config
             .vector_stores
             .iter()
-            .map(|store| VectorStoreConfig {
-                name: store.name.clone(),
-                store_type: store.store_type.clone(),
-                embedding_model: store.embedding_model.as_ref().map(|em| match em {
-                    crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
-                        EmbeddingModelConfig::OpenAI {
-                            api_key: api_key.clone(),
-                            model: model.clone(),
-                            base_url: None,
+            .map(|store| {
+                let store_type = match &store.store {
+                    crate::config::VectorStoreType::InMemory { embedding_model } => {
+                        VectorStoreType::InMemory {
+                            embedding_model: convert_embedding(embedding_model),
                         }
                     }
-                    crate::config::EmbeddingConfig::Bedrock {
-                        model,
+                    crate::config::VectorStoreType::Qdrant {
+                        embedding_model,
+                        url,
+                        collection_name,
+                    } => VectorStoreType::Qdrant {
+                        embedding_model: convert_embedding(embedding_model),
+                        url: url.clone(),
+                        collection_name: collection_name.clone(),
+                    },
+                    crate::config::VectorStoreType::BedrockKb {
+                        knowledge_base_id,
                         region,
                         profile,
-                    } => EmbeddingModelConfig::Bedrock {
-                        model: model.clone(),
+                    } => VectorStoreType::BedrockKb {
+                        knowledge_base_id: knowledge_base_id.clone(),
                         region: region.clone(),
                         profile: profile.clone(),
                     },
-                }),
-                connection_string: store.url.clone(),
-                url: store.url.clone(),
-                collection_name: store.collection_name.clone(),
-                context_prefix: store.context_prefix.clone(),
-                knowledge_base_id: store.knowledge_base_id.clone(),
-                region: store.region.clone(),
-                profile: store.profile.clone(),
+                };
+                VectorStoreConfig {
+                    name: store.name.clone(),
+                    context_prefix: store.context_prefix.clone(),
+                    store: store_type,
+                }
             })
             .collect();
 
