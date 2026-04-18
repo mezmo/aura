@@ -30,12 +30,8 @@ impl AuraBedrockEmbeddingModel {
 }
 
 fn default_ndims(model: &str) -> usize {
-    if model.starts_with("amazon.titan-embed-text-v2") {
-        1024
-    } else if model.starts_with("amazon.titan-embed-text-v1") {
+    if model.starts_with("amazon.titan-embed-text-v1") {
         1536
-    } else if model.starts_with("cohere.embed-") {
-        1024
     } else {
         1024
     }
