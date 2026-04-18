@@ -96,6 +96,9 @@ TODO.md
 # Test config files
 config-*-test.toml
 
+# Accidentally-committed testing cluster config (belongs on test cluster only)
+configs/example-cluster-orchestrator.toml
+
 # E2E eval output (keep scripts, ignore results)
 e2e-eval/results-*/
 e2e-eval/session-results-*/
