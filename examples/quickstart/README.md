@@ -83,7 +83,12 @@ Use `host.docker.internal` to reach services running on your host machine.
 
 ### Add RAG (vector search)
 
-Uncomment the `[[vector_stores]]` section in `config.toml`. You'll need a Qdrant instance — you can add one to the compose file or point at an external one.
+Uncomment the `[[vector_stores]]` section in `config.toml`. Options:
+
+- **Qdrant** (self-hosted): add a Qdrant instance to the compose file or point at an external one. Embeddings can be generated via OpenAI or AWS Bedrock.
+- **AWS Bedrock Knowledge Base** (managed): set `type = "bedrock_kb"` with a `knowledge_base_id` and `region`. No embedding model needed — the KB manages embeddings internally.
+
+See [`examples/reference.toml`](../reference.toml) for both.
 
 ### Serve multiple agents
 
