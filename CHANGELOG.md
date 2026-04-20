@@ -1,3 +1,26 @@
+# [1.18.0](https://github.com/mezmo/aura/compare/v1.17.3...v1.18.0) (2026-04-20)
+
+
+### Bug Fixes
+
+* **bedrock**: collapse redundant default_ndims branches [01835b3](https://github.com/mezmo/aura/commit/01835b3896477221de204683045a1140a6f52ace) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Code Refactoring
+
+* **config**: replace VectorStoreConfig flat struct with tagged enum [6ff3894](https://github.com/mezmo/aura/commit/6ff3894c3316a96786a4ca86b084681ac27218f6) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Documentation
+
+* document Bedrock embedding and Knowledge Base support [22ad872](https://github.com/mezmo/aura/commit/22ad872947944cbebeb95b700d5b2fcfc7112528) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Features
+
+* add Bedrock embeddings and Knowledge Base support [9ddcb0c](https://github.com/mezmo/aura/commit/9ddcb0c4e5840ebf12ac416fb30966e4373a30f4) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+* **bedrock**: native embedding path bypassing rig-bedrock [bf3bfcc](https://github.com/mezmo/aura/commit/bf3bfcc2259a25861e6e28c7cdeec05cc1ede8df) - Mike Shearer [LOG-23628](https://logdna.atlassian.net/browse/LOG-23628)
+
 ## [1.17.3](https://github.com/mezmo/aura/compare/v1.17.2...v1.17.3) (2026-04-07)
 
 
