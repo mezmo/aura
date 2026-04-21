@@ -55,7 +55,6 @@ use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
 
 use super::tools::RoutingToolSet;
-use super::tools::SubmitEvaluationTool;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
@@ -111,7 +110,6 @@ struct CoordinatorTools {
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
     routing_tools: Option<RoutingToolSet>,
     read_artifact: Option<ReadArtifactTool>,
-    evaluation_tool: Option<SubmitEvaluationTool>,
 }
 
 // ============================================================================
@@ -1695,9 +1693,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
-        if let Some(eval_tool) = tools.evaluation_tool {
-            state = state.add_tool(eval_tool);
-        }
         state.build()
     }
 
@@ -1818,7 +1813,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             vector_tools,
             routing_tools,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
-            evaluation_tool: None,
         };
 
         let provider_agent = self
@@ -1869,7 +1863,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             vector_tools: vec![],
             routing_tools: None,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
-            evaluation_tool: None,
         };
 
         let provider_agent = self
@@ -1884,55 +1877,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let model_name = self.agent_config.llm.model_name().to_string();
         // Synthesis only needs 1-2 turns (read_artifact + response)
         let max_depth = 4;
-
-        Ok(AgentWithPreamble {
-            agent: Agent {
-                inner: provider_agent,
-                model: model_name,
-                max_depth,
-                mcp_manager: None,
-                fallback_tool_parsing: false,
-                fallback_tool_names: vec![],
-                context_window: None,
-            },
-            preamble,
-            escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        })
-    }
-
-    /// Create a coordinator agent for evaluation (with `submit_evaluation` tool).
-    ///
-    /// The evaluation coordinator calls `submit_evaluation` to record its
-    /// structured quality assessment. Uses the same `build_provider_agent_with_tools`
-    /// path as all other coordinator phases.
-    async fn create_evaluation_coordinator(
-        &self,
-        evaluation_tool: SubmitEvaluationTool,
-    ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
-        let preamble = include_str!("../prompts/evaluation_preamble.md").to_string();
-        let temperature = self.agent_config.llm.temperature();
-
-        let coordinator_tools = CoordinatorTools {
-            list_tools: None,
-            inspect_tool_params: None,
-            vector_tools: vec![],
-            routing_tools: None,
-            read_artifact: None,
-            evaluation_tool: Some(evaluation_tool),
-        };
-
-        let provider_agent = self
-            .build_provider_agent_with_tools(
-                &preamble,
-                temperature,
-                self.agent_config.llm.additional_params(),
-                coordinator_tools,
-            )
-            .await?;
-
-        let model_name = self.agent_config.llm.model_name().to_string();
-        // Evaluation needs 2 turns: tool call + ack
-        let max_depth = 2;
 
         Ok(AgentWithPreamble {
             agent: Agent {
@@ -2293,87 +2237,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: &plan.goal,
             query,
             results: &results_section,
-        })
-    }
-
-    /// Build the evaluation prompt for semantic quality assessment.
-    ///
-    /// The prompt provides context about the query, goal, and synthesized
-    /// response, asking the LLM to evaluate completeness, accuracy, and coherence.
-    /// When `AURA_ENRICH_EVALUATION` is enabled (default: true), includes truncated
-    /// task execution evidence so the evaluator can verify data in the synthesis
-    /// against actual tool results rather than assuming hallucination.
-    fn build_evaluation_prompt(&self, plan: &Plan, query: &str, result: &str) -> String {
-        // Include worker context so eval can detect factually wrong answers
-        // (e.g., user asks "what workers do you have?" and response doesn't match)
-        let workers_context = if self.config.has_workers() {
-            format!(
-                "\nSYSTEM CONTEXT - AVAILABLE WORKERS:\n{}\n",
-                self.config.format_workers_for_prompt()
-            )
-        } else {
-            String::new()
-        };
-
-        // Build task evidence when enrichment is enabled
-        let enrich = std::env::var("AURA_ENRICH_EVALUATION")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-
-        let task_evidence = if enrich && !plan.tasks.is_empty() {
-            let task_lines: Vec<String> = plan
-                .tasks
-                .iter()
-                .map(|t| {
-                    let worker_label = t
-                        .worker
-                        .as_deref()
-                        .map(|w| format!(" [{}]", w))
-                        .unwrap_or_default();
-                    match t.status {
-                        TaskStatus::Complete => {
-                            let result_text = t.result.as_deref().unwrap_or("(no result)");
-                            let (truncated, was_truncated) = safe_truncate(result_text, 500);
-                            let suffix = if was_truncated { "..." } else { "" };
-                            format!(
-                                "- Task {}{} (Complete): {} → {}{}",
-                                t.id, worker_label, t.description, truncated, suffix
-                            )
-                        }
-                        TaskStatus::Failed => {
-                            let err = t.error.as_deref().unwrap_or("unknown");
-                            format!(
-                                "- Task {}{} (Failed): {} → Error: {}",
-                                t.id, worker_label, t.description, err
-                            )
-                        }
-                        _ => {
-                            format!(
-                                "- Task {}{} ({:?}): {}",
-                                t.id, worker_label, t.status, t.description
-                            )
-                        }
-                    }
-                })
-                .collect();
-
-            format!(
-                "\nTASK EXECUTION EVIDENCE:\n{}\nSummary: {}/{} tasks completed, {} failed\n",
-                task_lines.join("\n"),
-                plan.completed_count(),
-                plan.tasks.len(),
-                plan.failed_count()
-            )
-        } else {
-            String::new()
-        };
-
-        super::templates::render_evaluation_prompt(&super::templates::EvaluationVars {
-            query,
-            goal: &plan.goal,
-            workers_context: &workers_context,
-            task_evidence: &task_evidence,
-            result,
         })
     }
 
@@ -3191,172 +3054,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         Ok(synthesized)
     }
 
-    /// Evaluate the quality of synthesized results using semantic analysis.
-    ///
-    /// Uses the coordinator LLM with the `submit_evaluation` tool to produce
-    /// a structured quality assessment. Falls back to simple heuristics if
-    /// the LLM fails or doesn't call the tool.
-    ///
-    /// Returns an `EvaluationResult` containing the score, reasoning, and gaps.
-    #[tracing::instrument(
-        name = "orchestration.evaluation",
-        skip_all,
-        fields(
-            orchestration.phase = "evaluation",
-            orchestration.quality_score = tracing::field::Empty,
-        )
-    )]
-    async fn evaluate(
-        &self,
-        plan: &Plan,
-        query: &str,
-        result: &str,
-    ) -> super::types::EvaluationResult {
-        use super::types::EvaluationResult;
-
-        // Quick heuristics first (fail-fast for obviously bad results)
-        if plan.failed_count() == plan.tasks.len() {
-            tracing::debug!("Evaluation: All tasks failed, returning 0.0");
-            return EvaluationResult::new(0.0, "All tasks failed")
-                .with_gaps(vec!["No successful task completions".to_string()]);
-        }
-
-        // Build evaluation prompt
-        let eval_prompt = self.build_evaluation_prompt(plan, query, result);
-
-        // Create the evaluation tool and capture the decision arc
-        let eval_tool = SubmitEvaluationTool::new();
-        let decision = eval_tool.decision();
-
-        // Call coordinator LLM for semantic evaluation via tool calling
-        let (eval_response, eval_result) = match self.create_evaluation_coordinator(eval_tool).await
-        {
-            Ok(AgentWithPreamble {
-                agent: coordinator,
-                preamble: eval_preamble,
-                ..
-            }) => {
-                // Record in prompt journal
-                self.journal_record(JournalPhase::Evaluation, &eval_preamble, &eval_prompt);
-
-                let d = decision.clone();
-                match self
-                    .stream_and_collect(
-                        &coordinator,
-                        &eval_prompt,
-                        vec![],
-                        "Evaluation",
-                        None, // No reasoning forwarding for eval
-                        || {
-                            let d = d.clone();
-                            Box::pin(async move { d.lock().await.is_some() })
-                        },
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        crate::logging::set_token_usage(
-                            &tracing::Span::current(),
-                            response.usage.input_tokens,
-                            response.usage.output_tokens,
-                            response.usage.total_tokens,
-                            0,
-                        );
-                        self.usage_state.accumulate_usage(
-                            response.usage.input_tokens,
-                            response.usage.output_tokens,
-                        );
-                        // Read the evaluation from the tool's shared state
-                        let eval = decision.lock().await.take();
-                        match eval {
-                            Some(result) => {
-                                tracing::debug!("Evaluation received via submit_evaluation tool");
-                                (response.content, result)
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "Evaluation coordinator did not call submit_evaluation, \
-                                         falling back to heuristic"
-                                );
-                                let fallback = EvaluationResult::fallback(
-                                    plan.completed_count(),
-                                    plan.tasks.len(),
-                                );
-                                (response.content, fallback)
-                            }
-                        }
-                    }
-                    Err(e) if is_context_overflow_error(e.as_ref()) => {
-                        tracing::warn!(
-                            "Context limit exceeded during evaluation, using heuristic score. {}",
-                            context_overflow_suggestion("evaluation")
-                        );
-                        let fallback =
-                            EvaluationResult::fallback(plan.completed_count(), plan.tasks.len())
-                                .with_gaps(vec![
-                                    "Evaluation skipped due to context limit".to_string(),
-                                ]);
-                        (
-                            "[CONTEXT OVERFLOW - heuristic fallback]".to_string(),
-                            fallback,
-                        )
-                    }
-                    Err(e) if e.to_string().contains("timed out") => {
-                        tracing::warn!(
-                            "Evaluation timed out (per_call_timeout={}s), falling back to heuristic",
-                            self.config.per_call_timeout_secs()
-                        );
-                        let fallback =
-                            EvaluationResult::fallback(plan.completed_count(), plan.tasks.len())
-                                .with_gaps(vec!["Evaluation skipped due to timeout".to_string()]);
-                        (
-                            format!("[TIMEOUT after {}s]", self.config.per_call_timeout_secs()),
-                            fallback,
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!("LLM evaluation failed, falling back to heuristic: {}", e);
-                        let fallback =
-                            EvaluationResult::fallback(plan.completed_count(), plan.tasks.len());
-                        (format!("[LLM ERROR: {}]", e), fallback)
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to create coordinator for evaluation, falling back to heuristic: {}",
-                    e
-                );
-                let fallback = EvaluationResult::fallback(plan.completed_count(), plan.tasks.len());
-                (format!("[COORDINATOR ERROR: {}]", e), fallback)
-            }
-        };
-
-        // Persist evaluation artifacts
-        {
-            let persistence = self.persistence.lock().await;
-            if let Err(e) = persistence
-                .write_evaluation(&eval_prompt, &eval_response, &eval_result)
-                .await
-            {
-                tracing::warn!("Failed to persist evaluation: {}", e);
-            }
-        }
-
-        tracing::Span::current().record(
-            "orchestration.quality_score",
-            format!("{:.2}", eval_result.score).as_str(),
-        );
-
-        tracing::info!(
-            "Evaluation: score={:.2}, reasoning={}",
-            eval_result.score,
-            truncate_query(&eval_result.reasoning, 100)
-        );
-
-        eval_result
-    }
-
     /// Send an orchestrator event through the stream channel.
     async fn emit_event(
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
@@ -3568,11 +3265,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         orchestration_start: Instant,
     ) -> Result<String, StreamError> {
         let mut iteration = 0;
-        let mut final_result: String;
+        let final_result: String;
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
         let mut failure_history: Vec<super::types::FailedTaskRecord> = Vec::new();
-        let mut last_quality_score: Option<f32> = None;
 
         loop {
             iteration += 1;
@@ -3580,14 +3276,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let elapsed = orchestration_start.elapsed().as_secs_f64();
 
             // Create a span for this iteration. Child spans (planning, worker,
-            // synthesis, evaluation) inherit this as parent via Span::current().
+            // synthesis) inherit this as parent via Span::current().
             // Using enter() rather than instrument() because the loop body has
             // break/continue control flow that can't cross async block boundaries.
             let iter_span = tracing::info_span!(
                 "orchestration.iteration",
                 orchestration.iteration = iteration,
                 orchestration.task_count = tracing::field::Empty,
-                orchestration.quality_score = tracing::field::Empty,
                 orchestration.will_replan = tracing::field::Empty,
             );
             let _iter_guard = iter_span.enter();
@@ -3619,7 +3314,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                        self.write_run_manifest(&plan, iteration)
                             .await;
                         return Err(e);
                     }
@@ -3644,17 +3339,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             &event_tx,
                             OrchestratorEvent::IterationComplete {
                                 iteration,
-                                quality_score: 0.0,
-                                quality_threshold: self.config.quality_threshold,
                                 will_replan: false,
-                                evaluation_skipped: true,
-                                reasoning: "Coordinator provided direct answer during replan"
-                                    .to_string(),
+                                reasoning: String::new(),
                                 gaps: vec![],
                             },
                         )
                         .await;
-                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                        self.write_run_manifest(&plan, iteration)
                             .await;
                         return Ok(direct_response.clone());
                     }
@@ -3676,17 +3367,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             &event_tx,
                             OrchestratorEvent::IterationComplete {
                                 iteration,
-                                quality_score: 0.0,
-                                quality_threshold: self.config.quality_threshold,
                                 will_replan: false,
-                                evaluation_skipped: true,
-                                reasoning: "Coordinator requested clarification during replan"
-                                    .to_string(),
+                                reasoning: String::new(),
                                 gaps: vec![],
                             },
                         )
                         .await;
-                        self.write_run_manifest(&plan, iteration, last_quality_score)
+                        self.write_run_manifest(&plan, iteration)
                             .await;
                         return Ok(question.clone());
                     }
@@ -3730,7 +3417,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // EXECUTE: Run workers on tasks (parallel when possible)
             // ----------------------------------------------------------------
             if let Err(e) = self.execute(&mut plan, &event_tx).await {
-                self.write_run_manifest(&plan, iteration, last_quality_score)
+                self.write_run_manifest(&plan, iteration)
                     .await;
                 return Err(e);
             }
@@ -3803,7 +3490,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         break;
                     }
                     let summary = self.build_execution_summary(&plan);
-                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                    self.write_run_manifest(&plan, iteration)
                         .await;
                     return Err(format!(
                         "Plan execution failed after {} iterations:\n{}",
@@ -3824,7 +3511,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         this_iteration_failures.len(),
                         summary
                     );
-                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                    self.write_run_manifest(&plan, iteration)
                         .await;
                     return Err(format!(
                         "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
@@ -3834,7 +3521,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 let execution_summary = self.build_execution_summary(&plan);
                 tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
-                last_quality_score = Some(0.0);
 
                 let failure_evaluation = EvaluationResult {
                     score: 0.0,
@@ -3848,19 +3534,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     ],
                 };
 
-                // Record failure on the iteration span
-                iter_span.record("orchestration.quality_score", "0.00");
+                // Record replan decision on the iteration span
                 iter_span.record("orchestration.will_replan", true);
 
-                // Emit IterationComplete on failure path (was previously skipped)
+                // Emit IterationComplete on failure path
                 Self::emit_event(
                     &event_tx,
                     OrchestratorEvent::IterationComplete {
                         iteration,
-                        quality_score: 0.0,
-                        quality_threshold: self.config.quality_threshold,
                         will_replan: true,
-                        evaluation_skipped: false,
                         reasoning: failure_evaluation.reasoning.clone(),
                         gaps: failure_evaluation.gaps.clone(),
                     },
@@ -3890,128 +3572,41 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // ----------------------------------------------------------------
             // SYNTHESIZE: Combine task results into coherent response
             // ----------------------------------------------------------------
-            let is_single_task = plan.tasks.len() == 1;
             Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
             final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
                 Ok(r) => r,
                 Err(e) => {
-                    self.write_run_manifest(&plan, iteration, last_quality_score)
+                    self.write_run_manifest(&plan, iteration)
                         .await;
                     return Err(e);
                 }
             };
 
             // ----------------------------------------------------------------
-            // EVALUATE: Assess quality of synthesized response
+            // DECIDE: synthesis succeeded — break (C3 will add post-execute
+            // coordinator call here; for now the loop always breaks after synthesis)
             // ----------------------------------------------------------------
-            let evaluation = if is_single_task && plan.completed_count() == 1 {
-                // Single-task plan completed successfully — skip evaluation LLM call
-                tracing::info!("Single-task plan: skipping evaluation LLM call");
-                super::types::EvaluationResult::new(1.0, "Single-task plan completed successfully")
-            } else {
-                self.evaluate(&plan, query, &final_result).await
-            };
-            let quality_score = evaluation.score;
-            last_quality_score = Some(quality_score);
-
-            let quality_met = quality_score >= self.config.quality_threshold;
-            let iterations_remaining = iteration < self.config.max_planning_cycles;
-            let will_replan = !quality_met && iterations_remaining;
-
-            // Record evaluation results on the iteration span
-            iter_span.record(
-                "orchestration.quality_score",
-                format!("{:.2}", quality_score).as_str(),
-            );
-            iter_span.record("orchestration.will_replan", will_replan);
-
-            // Persist iteration summary
-            {
-                let persistence = self.persistence.lock().await;
-                if let Err(e) = persistence
-                    .write_iteration_summary(
-                        iteration,
-                        quality_score,
-                        self.config.quality_threshold,
-                        will_replan,
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to persist iteration summary: {}", e);
-                }
-            }
-
+            iter_span.record("orchestration.will_replan", false);
             Self::emit_event(
                 &event_tx,
                 OrchestratorEvent::IterationComplete {
                     iteration,
-                    quality_score,
-                    quality_threshold: self.config.quality_threshold,
-                    will_replan,
-                    evaluation_skipped: is_single_task && plan.completed_count() == 1,
-                    reasoning: evaluation.reasoning.clone(),
-                    gaps: evaluation.gaps.clone(),
+                    will_replan: false,
+                    reasoning: String::new(),
+                    gaps: vec![],
                 },
             )
             .await;
-
             tracing::info!(
-                "Iteration {} complete: quality={:.2}, threshold={:.2}, elapsed={:.1}s",
+                "Iteration {} complete: elapsed={:.1}s",
                 iteration,
-                quality_score,
-                self.config.quality_threshold,
                 orchestration_start.elapsed().as_secs_f64(),
             );
-
-            // ----------------------------------------------------------------
-            // DECIDE: Continue or terminate?
-            // ----------------------------------------------------------------
-            if quality_met {
-                tracing::info!(
-                    "Quality threshold met ({:.2} >= {:.2})",
-                    quality_score,
-                    self.config.quality_threshold
-                );
-                break;
-            }
-
-            if !iterations_remaining {
-                tracing::warn!(
-                    "Max iterations reached ({}) without meeting quality threshold ({:.2} < {:.2}). Returning best available result.",
-                    self.config.max_planning_cycles,
-                    quality_score,
-                    self.config.quality_threshold,
-                );
-                break;
-            }
-
-            // ----------------------------------------------------------------
-            // REFLECT: Capture context for next iteration
-            // ----------------------------------------------------------------
-            tracing::info!(
-                "Re-planning: quality {:.2} < threshold {:.2} (iteration {}/{}, {}/{} tasks completed, {} failed)",
-                quality_score,
-                self.config.quality_threshold,
-                iteration,
-                self.config.max_planning_cycles,
-                plan.completed_count(),
-                plan.tasks.len(),
-                plan.failed_count(),
-            );
-
-            (previous_context, plan) = Self::trigger_replan(
-                &event_tx,
-                iteration,
-                "quality",
-                plan,
-                evaluation,
-                &failure_history,
-            )
-            .await;
+            break;
         }
 
         // Write run manifest on completion (best-effort)
-        self.write_run_manifest(&plan, iteration, last_quality_score)
+        self.write_run_manifest(&plan, iteration)
             .await;
 
         Ok(final_result)
@@ -4021,7 +3616,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
-    async fn write_run_manifest(&self, plan: &Plan, iterations: usize, quality_score: Option<f32>) {
+    async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
         use super::persistence::{RunManifest, RunStatus, TaskSummary};
         use crate::string_utils::safe_truncate;
 
@@ -4066,7 +3661,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: plan.goal.clone(),
             status,
             iterations,
-            quality_score,
             routing_mode: Some(super::events::RoutingMode::for_plan(plan.tasks.len())),
             task_summaries,
             artifact_paths,
@@ -4183,38 +3777,6 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_all_complete() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "task 0", "test rationale 0"));
-        plan.add_task(Task::new(1, "task 1", "test rationale 1"));
-        plan.get_task_mut(0).unwrap().complete("done");
-        plan.get_task_mut(1).unwrap().complete("done");
-
-        let score = evaluate_plan(&plan);
-        assert!((score - 1.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_evaluate_half_complete() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "task 0", "test rationale 0"));
-        plan.add_task(Task::new(1, "task 1", "test rationale 1"));
-        plan.get_task_mut(0).unwrap().complete("done");
-        plan.get_task_mut(1).unwrap().fail("error");
-
-        let score = evaluate_plan(&plan);
-        assert!((score - 0.5).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_evaluate_empty_plan() {
-        let plan = Plan::new("test");
-
-        let score = evaluate_plan(&plan);
-        assert!((score - 0.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
     fn test_synthesize_single_result() {
         let mut plan = Plan::new("test");
         plan.add_task(Task::new(0, "task", "single task rationale"));
@@ -4249,12 +3811,6 @@ mod tests {
         let result = synthesize_results(&plan);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("All tasks failed"));
-    }
-
-    fn evaluate_plan(plan: &Plan) -> f32 {
-        let total = plan.tasks.len() as f32;
-        let completed = plan.completed_count() as f32;
-        if total == 0.0 { 0.0 } else { completed / total }
     }
 
     fn synthesize_results(plan: &Plan) -> Result<String, String> {
@@ -4720,7 +4276,7 @@ Provide the synthesized response:"#,
     }
 
     // ========================================================================
-    // Evaluation Tests (tool-based evaluation — unit tests in evaluation_tool.rs)
+    // JSON Extraction Tests
     // ========================================================================
 
     #[test]
@@ -4762,50 +4318,6 @@ Provide the synthesized response:"#,
     fn test_extract_json_objects_empty() {
         assert!(extract_json_objects("no json here").is_empty());
         assert!(extract_json_objects("").is_empty());
-    }
-
-    #[test]
-    fn test_evaluation_result_new() {
-        use super::super::types::EvaluationResult;
-
-        let result = EvaluationResult::new(0.75, "Test reasoning");
-        assert!((result.score - 0.75).abs() < f32::EPSILON);
-        assert_eq!(result.reasoning, "Test reasoning");
-        assert!(result.gaps.is_empty());
-    }
-
-    #[test]
-    fn test_evaluation_result_with_gaps() {
-        use super::super::types::EvaluationResult;
-
-        let result = EvaluationResult::new(0.5, "Partial")
-            .with_gaps(vec!["Gap 1".to_string(), "Gap 2".to_string()]);
-
-        assert_eq!(result.gaps.len(), 2);
-        assert!(result.gaps.contains(&"Gap 1".to_string()));
-    }
-
-    #[test]
-    fn test_evaluation_result_fallback() {
-        use super::super::types::EvaluationResult;
-
-        let result = EvaluationResult::fallback(3, 4);
-        assert!((result.score - 0.75).abs() < f32::EPSILON);
-        assert!(result.reasoning.contains("3 of 4 tasks completed"));
-
-        let result = EvaluationResult::fallback(0, 0);
-        assert!(result.score.abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_evaluation_result_clamps_on_create() {
-        use super::super::types::EvaluationResult;
-
-        let result = EvaluationResult::new(1.5, "Too high");
-        assert!((result.score - 1.0).abs() < f32::EPSILON);
-
-        let result = EvaluationResult::new(-0.5, "Too low");
-        assert!(result.score.abs() < f32::EPSILON);
     }
 
     // ========================================================================

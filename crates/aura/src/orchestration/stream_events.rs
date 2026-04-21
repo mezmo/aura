@@ -127,10 +127,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator completes an iteration.
     IterationComplete {
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -302,23 +299,16 @@ impl OrchestrationStreamEvent {
     }
 
     /// Create an IterationComplete event.
-    #[allow(clippy::too_many_arguments)]
     pub fn iteration_complete(
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
         context: EventContext,
     ) -> Self {
         Self::IterationComplete {
             iteration,
-            quality_score,
-            quality_threshold,
             will_replan,
-            evaluation_skipped,
             reasoning,
             gaps,
             context,
@@ -515,21 +505,18 @@ mod tests {
     }
 
     #[test]
-    fn test_format_sse_iteration_complete_with_evaluation_skipped() {
+    fn test_format_sse_iteration_complete() {
         let event = OrchestrationStreamEvent::iteration_complete(
             1,
-            1.0,
-            0.7,
             false,
-            true,
             Some("Single-task plan completed successfully".to_string()),
             vec![],
             test_ctx(),
         );
         let sse = event.format_sse();
 
-        assert!(sse.contains("\"evaluation_skipped\":true"));
-        assert!(sse.contains("\"quality_score\":1.0"));
+        assert!(sse.contains("\"will_replan\":false"));
+        assert!(sse.contains("\"iteration\":1"));
     }
 
     #[test]

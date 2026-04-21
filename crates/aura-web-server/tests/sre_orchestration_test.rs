@@ -333,21 +333,14 @@ async fn test_sre_multi_domain_emits_synthesis() {
 
     for event in &iteration_complete {
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        assert_event_fields(event, &["iteration", "quality_score"]);
+        assert_event_fields(event, &["iteration", "will_replan"]);
 
         let iteration = json["iteration"]
             .as_u64()
             .expect("iteration must be a number");
-        let quality_score = json["quality_score"]
-            .as_f64()
-            .expect("quality_score must be a number");
 
         assert!(iteration >= 1, "iteration should be >= 1");
-        assert!(
-            (0.0..=1.0).contains(&quality_score),
-            "quality_score should be 0.0-1.0, got {quality_score}"
-        );
 
-        println!("iteration_complete: iteration={iteration}, quality_score={quality_score:.2}");
+        println!("iteration_complete: iteration={iteration}");
     }
 }

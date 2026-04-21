@@ -26,7 +26,6 @@ use std::collections::HashSet;
 // Template constants loaded at compile time
 pub const WORKER_TASK_PROMPT_TEMPLATE: &str = include_str!("../prompts/worker_task_prompt.md");
 pub const SYNTHESIS_PROMPT_TEMPLATE: &str = include_str!("../prompts/synthesis_prompt.md");
-pub const EVALUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/evaluation_prompt.md");
 pub const REFLECTION_PROMPT_TEMPLATE: &str = include_str!("../prompts/reflection_prompt.md");
 
 /// Trait for template variable providers.
@@ -78,35 +77,6 @@ impl TemplateVars for SynthesisVars<'_> {
             .replace("%%GOAL%%", self.goal)
             .replace("%%QUERY%%", self.query)
             .replace("%%RESULTS%%", self.results)
-    }
-}
-
-/// Variables for the evaluation prompt.
-#[derive(Debug, Clone)]
-pub struct EvaluationVars<'a> {
-    pub query: &'a str,
-    pub goal: &'a str,
-    pub workers_context: &'a str,
-    pub task_evidence: &'a str,
-    pub result: &'a str,
-}
-
-impl TemplateVars for EvaluationVars<'_> {
-    const VARS: &'static [&'static str] = &[
-        "QUERY",
-        "GOAL",
-        "WORKERS_CONTEXT",
-        "TASK_EVIDENCE",
-        "RESULT",
-    ];
-
-    fn render(&self, template: &str) -> String {
-        template
-            .replace("%%QUERY%%", self.query)
-            .replace("%%GOAL%%", self.goal)
-            .replace("%%WORKERS_CONTEXT%%", self.workers_context)
-            .replace("%%TASK_EVIDENCE%%", self.task_evidence)
-            .replace("%%RESULT%%", self.result)
     }
 }
 
@@ -174,11 +144,6 @@ pub fn render_worker_task_prompt(vars: &WorkerTaskVars<'_>) -> String {
 /// Render the synthesis prompt with the given variables.
 pub fn render_synthesis_prompt(vars: &SynthesisVars<'_>) -> String {
     vars.render(SYNTHESIS_PROMPT_TEMPLATE)
-}
-
-/// Render the evaluation prompt with the given variables.
-pub fn render_evaluation_prompt(vars: &EvaluationVars<'_>) -> String {
-    vars.render(EVALUATION_PROMPT_TEMPLATE)
 }
 
 /// Render the reflection prompt with the given variables.
@@ -343,12 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluation_template_matches_context() {
-        validate_template::<EvaluationVars>(EVALUATION_PROMPT_TEMPLATE)
-            .expect("Evaluation template should match EvaluationVars");
-    }
-
-    #[test]
     fn test_reflection_template_matches_context() {
         validate_template::<ReflectionVars>(REFLECTION_PROMPT_TEMPLATE)
             .expect("Reflection template should match ReflectionVars");
@@ -413,18 +372,6 @@ mod tests {
         assert!(
             SYNTHESIS_PROMPT_TEMPLATE.contains("%%RESULTS%%"),
             "Synthesis template should contain RESULTS placeholder"
-        );
-    }
-
-    #[test]
-    fn test_evaluation_template_loaded() {
-        assert!(
-            !EVALUATION_PROMPT_TEMPLATE.is_empty(),
-            "Evaluation template should be loaded"
-        );
-        assert!(
-            EVALUATION_PROMPT_TEMPLATE.contains("%%RESULT%%"),
-            "Evaluation template should contain RESULT placeholder"
         );
     }
 
@@ -682,22 +629,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         let _ = writeln!(out, "{synthesis}");
 
         // ================================================================
-        // 7. Evaluation user message
-        // ================================================================
-        let _ = writeln!(out, "\n{separator}");
-        let _ = writeln!(out, "PHASE: EVALUATION USER MESSAGE");
-        let _ = writeln!(out, "{separator}\n");
-        let evaluation = render_evaluation_prompt(&EvaluationVars {
-            query,
-            goal: "Calculate (3+7)*2 and find files in /data",
-            workers_context: "\nSYSTEM CONTEXT:\nConfigured workers:\n- arithmetic: Arithmetic operations: addition, subtraction, multiplication, division\n- data: Data operations: listing files, multi-step data processing chains\n\n",
-            task_evidence: "\nTASK EXECUTION EVIDENCE:\n- Task 0 [arithmetic] (Complete): Calculate (3+7)*2 → (3+7)*2 = 20\n- Task 1 [data] (Complete): List files in /data → /data contains file1.txt, file2.txt\nSummary: 2/2 tasks completed, 0 failed\n",
-            result: "(3+7)*2 equals 20. The /data directory contains file1.txt and file2.txt.",
-        });
-        let _ = writeln!(out, "{evaluation}");
-
-        // ================================================================
-        // 8. Reflection prompt (replan cycle)
+        // 7. Reflection prompt (replan cycle)
         // ================================================================
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(

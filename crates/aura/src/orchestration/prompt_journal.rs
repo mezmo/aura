@@ -34,7 +34,6 @@ pub(crate) enum JournalPhase<'a> {
         attempt: usize,
     },
     Synthesis,
-    Evaluation,
 }
 
 impl<'a> JournalPhase<'a> {
@@ -62,7 +61,6 @@ impl<'a> JournalPhase<'a> {
                 ..
             } => format!("Worker (Iteration {}, Task {})", iteration, task_id),
             JournalPhase::Synthesis => format!("Synthesis (Iteration {})", iteration),
-            JournalPhase::Evaluation => format!("Evaluation (Iteration {})", iteration),
         }
     }
 
@@ -76,7 +74,6 @@ impl<'a> JournalPhase<'a> {
                 format!("tasks/task-{}/attempt-{}/response.txt", task_id, attempt)
             }
             JournalPhase::Synthesis => "synthesis/response.txt".to_string(),
-            JournalPhase::Evaluation => "evaluation/response.txt".to_string(),
         }
     }
 }
@@ -308,20 +305,17 @@ mod tests {
     }
 
     #[test]
-    fn journal_records_synthesis_and_evaluation() {
+    fn journal_records_synthesis() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("prompt-journal.md");
 
         let journal = PromptJournal::new(path.clone(), "run-1", "orch-1").unwrap();
 
         journal.record(JournalPhase::Synthesis, 1, "synth system", "synth user");
-        journal.record(JournalPhase::Evaluation, 1, "eval system", "eval user");
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Synthesis (Iteration 1)"));
         assert!(content.contains("synthesis/response.txt"));
-        assert!(content.contains("Evaluation (Iteration 1)"));
-        assert!(content.contains("evaluation/response.txt"));
     }
 
     #[test]
@@ -377,23 +371,17 @@ mod tests {
             "worker-usr",
         );
         journal.record(JournalPhase::Synthesis, 1, "synth-sys", "synth-usr");
-        journal.record(JournalPhase::Evaluation, 1, "eval-sys", "eval-usr");
 
         let content = std::fs::read_to_string(&path).unwrap();
 
         let plan_pos = content.find("Planning").unwrap();
         let worker_pos = content.find("Worker: w1").unwrap();
         let synth_pos = content.find("Synthesis").unwrap();
-        let eval_pos = content.find("Evaluation").unwrap();
 
         assert!(plan_pos < worker_pos, "Planning should come before Worker");
         assert!(
             worker_pos < synth_pos,
             "Worker should come before Synthesis"
-        );
-        assert!(
-            synth_pos < eval_pos,
-            "Synthesis should come before Evaluation"
         );
     }
 

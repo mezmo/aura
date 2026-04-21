@@ -511,6 +511,10 @@ pub struct EvaluationResult {
 
 impl EvaluationResult {
     /// Create a new evaluation result.
+    ///
+    /// Used in tests and in the failure-replan path; will be used by the
+    /// post-execute coordinator call in C3.
+    #[allow(dead_code)]
     pub fn new(score: f32, reasoning: impl Into<String>) -> Self {
         Self {
             score: score.clamp(0.0, 1.0),
@@ -533,6 +537,7 @@ impl EvaluationResult {
     }
 
     /// Add identified gaps.
+    #[allow(dead_code)]
     pub fn with_gaps(mut self, gaps: Vec<String>) -> Self {
         self.gaps = gaps;
         self
@@ -541,6 +546,7 @@ impl EvaluationResult {
     /// Create a fallback evaluation when LLM fails.
     ///
     /// Uses the simple heuristic of completed/total task ratio.
+    #[allow(dead_code)]
     pub fn fallback(completed: usize, total: usize) -> Self {
         let score = if total == 0 {
             0.0

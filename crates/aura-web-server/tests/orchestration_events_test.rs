@@ -260,10 +260,10 @@ async fn test_arithmetic_emits_tool_call_events() {
     }
 }
 
-/// Verifies that multi-worker execution produces synthesis + quality evaluation.
+/// Verifies that multi-worker execution produces synthesis + an iteration_complete event.
 ///
 /// Query: "First compute the mean of [2, 4, 6], then compute sin(0.5)"
-/// Expected: synthesizing event + iteration_complete with quality_score in 0.0-1.0.
+/// Expected: synthesizing event + iteration_complete with iteration and will_replan fields.
 #[tokio::test]
 async fn test_multi_domain_emits_synthesis_events() {
     let events =
@@ -294,22 +294,15 @@ async fn test_multi_domain_emits_synthesis_events() {
 
     for event in &iteration_complete {
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        assert_event_fields(event, &["iteration", "quality_score"]);
+        assert_event_fields(event, &["iteration", "will_replan"]);
 
         let iteration = json["iteration"]
             .as_u64()
             .expect("iteration must be a number");
-        let quality_score = json["quality_score"]
-            .as_f64()
-            .expect("quality_score must be a number");
 
         assert!(iteration >= 1, "iteration should be >= 1");
-        assert!(
-            (0.0..=1.0).contains(&quality_score),
-            "quality_score should be 0.0-1.0, got {quality_score}"
-        );
 
-        println!("iteration_complete: iteration={iteration}, quality_score={quality_score:.2}");
+        println!("iteration_complete: iteration={iteration}");
     }
 }
 
@@ -665,14 +658,14 @@ async fn test_tool_call_events_include_worker_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Iteration complete replan fields
+// Iteration complete event shape
 // ---------------------------------------------------------------------------
 
-/// Verifies that iteration_complete events include quality_threshold and will_replan fields.
+/// Verifies that iteration_complete events include iteration and will_replan fields.
 ///
 /// LENIENCY: LLM may route to direct answer (no iteration events).
 #[tokio::test]
-async fn test_iteration_complete_includes_replan_fields() {
+async fn test_iteration_complete_event_shape() {
     let events = orchestration_events(
         "First compute the mean of [1, 2, 3], then compute the factorial of 5",
     )
@@ -687,22 +680,11 @@ async fn test_iteration_complete_includes_replan_fields() {
     }
 
     for event in &iteration_complete {
-        assert_event_fields(
-            event,
-            &[
-                "iteration",
-                "quality_score",
-                "quality_threshold",
-                "will_replan",
-            ],
-        );
+        assert_event_fields(event, &["iteration", "will_replan", "agent_id", "session_id"]);
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let threshold = json["quality_threshold"]
-            .as_f64()
-            .expect("quality_threshold must be a number");
         let will_replan = json["will_replan"]
             .as_bool()
             .expect("will_replan must be a bool");
-        println!("iteration_complete: quality_threshold={threshold:.2}, will_replan={will_replan}");
+        println!("iteration_complete: will_replan={will_replan}");
     }
 }

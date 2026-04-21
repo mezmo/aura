@@ -21,9 +21,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
     /// Coordinator classified query to a single worker.
-    /// Evaluation is skipped.
     Routed,
-    /// Full orchestration — multi-task DAG with synthesis + evaluation.
+    /// Full orchestration — multi-task DAG execution.
     Orchestrated,
 }
 
@@ -99,24 +98,18 @@ pub enum OrchestratorEvent {
         /// The task result (output string or error message; truncated to Option in SSE)
         result: String,
     },
-    /// An iteration of the plan-execute-synthesize loop has completed.
+    /// An iteration of the plan-execute loop has completed.
     ///
-    /// Emitted after synthesis and evaluation. The quality score determines
-    /// whether the orchestrator will replan or accept the result.
+    /// Emitted after execution completes. Indicates whether the orchestrator
+    /// will replan based on task failures.
     IterationComplete {
         /// Which iteration just completed (1-indexed)
         iteration: usize,
-        /// Quality score from evaluation (0.0-1.0)
-        quality_score: f32,
-        /// The configured quality threshold
-        quality_threshold: f32,
         /// Whether the orchestrator will replan after this iteration
         will_replan: bool,
-        /// Whether evaluation was skipped (single-task plans)
-        evaluation_skipped: bool,
-        /// Evaluator's reasoning about quality
+        /// Reasoning about why replan was triggered (empty if not replanning)
         reasoning: String,
-        /// Identified gaps or missing elements
+        /// Identified gaps or issues (empty if not replanning)
         gaps: Vec<String>,
     },
     /// The orchestrator is starting a replan cycle.
