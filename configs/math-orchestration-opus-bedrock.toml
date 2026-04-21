@@ -7,13 +7,6 @@
 #   export AWS_REGION="us-east-1"
 #   export AWS_PROFILE="your-profile"  # or use env creds
 
-[llm]
-provider = "bedrock"
-model = "global.anthropic.claude-opus-4-5-20251101-v1:0"
-region = "{{ env.AWS_REGION | default: 'us-east-1' }}"
-temperature = 1.0
-additional_params = { thinking = { type = "enabled", budget_tokens = 8000 } }
-
 [agent]
 name = "Math Orchestrator (Opus Bedrock)"
 system_prompt = """
@@ -26,6 +19,13 @@ ROUTING GUIDANCE:
 - Vague or ambiguous requests: ask for clarification
 """
 
+
+[agent.llm]
+provider = "bedrock"
+model = "global.anthropic.claude-opus-4-5-20251101-v1:0"
+region = "{{ env.AWS_REGION | default: 'us-east-1' }}"
+temperature = 1.0
+additional_params = { thinking = { type = "enabled", budget_tokens = 8000 } }
 
 [mcp]
 sanitize_schemas = false

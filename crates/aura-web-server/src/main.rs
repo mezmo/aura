@@ -140,7 +140,7 @@ async fn run() -> std::io::Result<()> {
 
     for config in &configs {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
-        let (provider, model) = config.llm.model_info();
+        let (provider, model) = config.agent.llm.model_info();
         info!("Loaded agent '{}' ({}/{})", id, provider, model);
     }
 

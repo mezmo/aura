@@ -10,11 +10,6 @@
 # Usage:
 #   CONFIG_PATH=examples/complete/incident-response-datadog.toml cargo run --bin aura-web-server
 
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.2"
-
 [mcp]
 sanitize_schemas = true
 
@@ -52,3 +47,9 @@ Datadog. Follow this triage workflow:
 Always include timestamps and link back to source data.
 """
 turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"
+

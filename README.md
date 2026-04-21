@@ -26,7 +26,11 @@ Key capabilities:
   - [Usage](#usage)
     - [Web API Server](#web-api-server)
   - [Configuration](#configuration)
+    - [Multiple Agents](#multiple-agents)
+    - [Configuration Sections](#configuration-sections)
     - [Orchestration](#orchestration)
+      - [Orchestration fields](#orchestration-fields)
+      - [Worker fields (`[orchestration.worker.<name>]`)](#worker-fields-orchestrationworkername)
     - [Ollama](#ollama)
     - [Observability](#observability)
   - [Docker Deployment](#docker-deployment)
@@ -53,7 +57,6 @@ aura/
 ├── examples/                # Example and reference configurations
 └── scripts/                 # CI and utility scripts
 ```
-
 
 ## Setup
 
@@ -153,7 +156,9 @@ For LibreChat/OpenWebUI integration, see [development/README.md](development/REA
 
 ## Configuration
 
-> **Breaking changes (10 April 2026)**: Several fields have moved from `[agent]` to `[llm]` and Ollama-specific fields have been consolidated under `[llm.additional_params]`. Configs that have not been updated will fail to parse. See [./docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md) for migration details.
+> **Breaking changes (21 April 2026)**: `[llm]` has moved under `[agent.llm]` and workers may now override the LLM via `[orchestration.worker.<name>.llm]`. See [./docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md).
+>
+> **Breaking changes (10 April 2026)**: Several fields moved from `[agent]` to `[llm]` and Ollama-specific fields have been consolidated under `[llm.additional_params]`. See [./docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md).
 
 `CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
@@ -190,8 +195,8 @@ Aliases must be unique across all loaded configs. If two configs share the same 
 
 Configuration sections:
 
-- `[llm]`: provider and model configuration.
 - `[agent]`: identity, system prompt, and runtime behavior.
+- `[agent.llm]`: provider and model configuration for the agent.
 - `[[vector_stores]]`: optional RAG/vector store configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
@@ -220,7 +225,13 @@ The complete starter configuration is in [examples/reference.toml](examples/refe
 Minimal example:
 
 ```toml
-[llm]
+[agent]
+name = "Assistant"
+alias = "my-assistant"       # optional: stable client-facing identifier
+system_prompt = "You are a helpful assistant."
+turn_depth = 2
+
+[agent.llm]
 provider = "openai"
 api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.2"
@@ -230,12 +241,6 @@ context_window = 128000
 transport = "http_streamable"
 url = "http://localhost:8081/mcp"
 headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
-
-[agent]
-name = "Assistant"
-alias = "my-assistant"       # optional: stable client-facing identifier
-system_prompt = "You are a helpful assistant."
-turn_depth = 2
 ```
 
 Validate config parsing quickly:
@@ -270,6 +275,18 @@ preamble = "You are a knowledge specialist."
 mcp_filter = []
 vector_stores = ["docs"]
 ```
+
+Each worker inherits `[agent.llm]` by default. To run a worker against a different model (cheaper, faster, bigger context, different provider), add a _complete_ LLM configuration at `[orchestration.worker.<name>.llm]` - this must be a complete LLM configuration not just the individual LLM fields you want to "override":
+
+```toml
+[orchestration.worker.formatting.llm]
+provider = "anthropic"
+api_key = "{{ env.ANTHROPIC_API_KEY }}"
+model = "claude-haiku-4-5-20251001"
+context_window = 200000
+```
+
+The worker's resolved `context_window` is what gets reported in per-worker `aura.session_info` events.
 
 Execution loop:
 
@@ -402,7 +419,6 @@ Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 
 Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web-server/tests/README.md).
 
-
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
@@ -412,7 +428,8 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
 - [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
-- [20260410-configuration-breaking-changes.md](20260410-configuration-breaking-changes.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
+- [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
+- [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
 ## Architecture
 

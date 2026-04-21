@@ -1,6 +1,6 @@
 //! Configuration types for orchestration mode.
 
-use crate::config::VectorStoreConfig;
+use crate::config::{LlmConfig, VectorStoreConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -194,6 +194,14 @@ pub struct WorkerConfig {
     /// per task execution. Overrides `[agent].turn_depth`. Falls back to
     /// `[agent].turn_depth` → `DEFAULT_MAX_DEPTH` (8) if not set.
     pub turn_depth: Option<usize>,
+
+    /// Optional per-worker LLM override.
+    ///
+    /// When `Some`, the worker runs with this LLM config instead of inheriting
+    /// `[agent.llm]`. The resolved `context_window` drives per-worker budget
+    /// math (e.g. scratchpad sizing, LOG-23439).
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
 }
 
 // ============================================================================

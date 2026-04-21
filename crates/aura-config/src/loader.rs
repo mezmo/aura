@@ -160,7 +160,7 @@ fn merge_configs(base_config: Config, override_config: Config) -> Result<Config,
 
     // Override LLM config if provided - with enum, we replace the entire config
     // TODO: More granular overrides would require matching variants
-    result.llm = override_config.llm;
+    result.agent.llm = override_config.agent.llm;
 
     // Override MCP config if provided
     if override_config.mcp.is_some() {

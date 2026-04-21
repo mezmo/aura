@@ -667,7 +667,7 @@ pub async fn list_models(data: web::Data<AppState>) -> HttpResponse {
             let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
             let created = config.agent.created_at / 1000;
             let owned_by = config.agent.model_owner.clone().unwrap_or_else(|| {
-                let (provider, _) = config.llm.model_info();
+                let (provider, _) = config.agent.llm.model_info();
                 provider.to_string()
             });
             serde_json::json!({

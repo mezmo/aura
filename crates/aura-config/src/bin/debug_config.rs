@@ -2,12 +2,6 @@ use aura_config::load_config_from_str;
 
 const TEST_CONFIG: &str = r#"
 # Test configuration with environment variables set to test values
-[llm]
-provider = "openai"
-api_key = "test_openai_key"
-model = "gpt-4o-mini"
-temperature = 0.7
-
 [vector_store]
 type = "in_memory"
 
@@ -51,6 +45,12 @@ context = [
     "You can use tools to help answer questions.",
     "Be concise but thorough in your responses."
 ]
+
+[agent.llm]
+provider = "openai"
+api_key = "test_openai_key"
+model = "gpt-4o-mini"
+temperature = 0.7
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test specific parts
     println!("\n🔍 Specific sections:");
-    let (provider, model) = match &config.llm {
+    let (provider, model) = match &config.agent.llm {
         aura::config::LlmConfig::OpenAI { model, .. } => ("openai", model.as_str()),
         aura::config::LlmConfig::Anthropic { model, .. } => ("anthropic", model.as_str()),
         aura::config::LlmConfig::Bedrock { model, .. } => ("bedrock", model.as_str()),

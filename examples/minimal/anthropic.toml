@@ -4,11 +4,12 @@
 #   export ANTHROPIC_API_KEY="sk-ant-..."
 #   CONFIG_PATH=examples/minimal/anthropic.toml cargo run --bin aura-web-server
 
-[llm]
+[agent]
+name = "Claude Assistant"
+system_prompt = "You are a helpful assistant."
+
+[agent.llm]
 provider = "anthropic"
 api_key = "{{ env.ANTHROPIC_API_KEY }}"
 model = "claude-sonnet-4-20250514"
 
-[agent]
-name = "Claude Assistant"
-system_prompt = "You are a helpful assistant."

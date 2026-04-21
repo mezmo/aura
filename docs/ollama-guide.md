@@ -5,20 +5,24 @@ Aura supports running local models through [Ollama](https://ollama.ai), includin
 ## Basic Configuration
 
 ```toml
-[llm]
+[agent]
+name = "Local Assistant"
+system_prompt = "You are a helpful assistant."
+
+[agent.llm]
 provider = "ollama"
 model = "qwen3:30b-a3b"
 # base_url = "http://localhost:11434" # optional; this default is used automatically
 fallback_tool_parsing = true
 
-[llm.additional_params]
+[agent.llm.additional_params]
 num_ctx = 32000
 think   = true
 ```
 
 `base_url` defaults to `http://localhost:11434` when omitted. Use `http://host.docker.internal:11434` when Aura runs inside a container and Ollama runs on the host.
 
-All Ollama-specific parameters (`num_ctx`, `num_predict`, `think`, `seed`, `top_k`, `top_p`, etc.) go under `[llm.additional_params]`. See [Ollama model parameters](https://github.com/ollama/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values) for the full list.
+All Ollama-specific parameters (`num_ctx`, `num_predict`, `think`, `seed`, `top_k`, `top_p`, etc.) go under `[agent.llm.additional_params]`. See [Ollama model parameters](https://github.com/ollama/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values) for the full list.
 
 ## Fallback Tool Parsing
 

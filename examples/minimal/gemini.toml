@@ -4,11 +4,12 @@
 #   export GOOGLE_API_KEY="..."
 #   CONFIG_PATH=examples/minimal/gemini.toml cargo run --bin aura-web-server
 
-[llm]
+[agent]
+name = "Gemini Assistant"
+system_prompt = "You are a helpful assistant."
+
+[agent.llm]
 provider = "gemini"
 api_key = "{{ env.GOOGLE_API_KEY }}"
 model = "gemini-2.0-flash"
 
-[agent]
-name = "Gemini Assistant"
-system_prompt = "You are a helpful assistant."

@@ -21,9 +21,33 @@ use std::path::Path;
 fn load_single_config<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let contents = fs::read_to_string(path)?;
     let resolved = resolve_env_vars(&contents)?;
+    check_legacy_top_level_llm(&resolved)?;
     let config: Config = toml::from_str(&resolved)?;
     config.validate()?;
     Ok(config)
+}
+
+/// Detect the legacy top-level `[llm]` table shape and emit a migration error.
+///
+/// As of 2026-04-21, `[llm]` lives under `[agent.llm]`. Without this check, a
+/// stale top-level `[llm]` table is silently ignored (Config does not use
+/// `deny_unknown_fields`) and the user gets a confusing downstream error.
+fn check_legacy_top_level_llm(toml_str: &str) -> Result<(), ConfigError> {
+    // Best-effort parse — if this fails, let the main deserialization surface
+    // the real parse error rather than masking it.
+    let Ok(value) = toml::from_str::<toml::Value>(toml_str) else {
+        return Ok(());
+    };
+    if value.get("llm").is_some() {
+        return Err(ConfigError::Validation(
+            "Configuration uses the legacy top-level [llm] table. \
+             Move it under [agent.llm] (and any [llm.additional_params] \
+             under [agent.llm.additional_params]). Workers may optionally \
+             override the LLM via [orchestration.worker.<name>.llm]."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Load and parse TOML configuration(s) from a file or directory.
@@ -93,6 +117,7 @@ pub fn validate_unique_identifiers(configs: &[Config]) -> Result<(), ConfigError
 /// Load config from a string (useful for testing)
 pub fn load_config_from_str(contents: &str) -> Result<Config, ConfigError> {
     let resolved = resolve_env_vars(contents)?;
+    check_legacy_top_level_llm(&resolved)?;
     let config: Config = toml::from_str(&resolved)?;
     config.validate()?;
     Ok(config)

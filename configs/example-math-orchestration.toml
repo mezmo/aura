@@ -24,11 +24,6 @@
 #   Orchestrated:  "Calculate (3 + 7) * 2 and also find the files in /data"
 #   Clarification: "Compute the thing"
 
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-4o-mini"
-
 [agent]
 name = "Math Orchestrator"
 # In orchestration mode, [agent].system_prompt serves as the coordinator prompt.
@@ -46,6 +41,11 @@ IMPORTANT: Always use the appropriate worker's tools for calculations.
 Do not try to compute results yourself — delegate to workers.
 """
 turn_depth = 5
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o-mini"
 
 # Mock MCP server (use compose service name or localhost)
 [mcp]
