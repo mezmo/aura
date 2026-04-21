@@ -62,7 +62,7 @@ use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    EvaluationResult, FailedTaskRecord, IterationContext, Plan, PlanAttemptFailure,
+    EvaluationResult, FailedTaskRecord, IterationContext, IterationOutcome, Plan, PlanAttemptFailure,
     PlanningResponse, Task, TaskStatus,
 };
 
@@ -3265,315 +3265,89 @@ Assign tasks to the worker whose tools best match the required operations."#,
         orchestration_start: Instant,
     ) -> Result<String, StreamError> {
         let mut iteration = 0;
-        let final_result: String;
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
-        let mut failure_history: Vec<super::types::FailedTaskRecord> = Vec::new();
+        let mut failure_history: Vec<FailedTaskRecord> = Vec::new();
 
-        loop {
+        let final_result = loop {
             iteration += 1;
             self.current_iteration.store(iteration, Ordering::Relaxed);
-            let elapsed = orchestration_start.elapsed().as_secs_f64();
-
-            // Create a span for this iteration. Child spans (planning, worker,
-            // synthesis) inherit this as parent via Span::current().
-            // Using enter() rather than instrument() because the loop body has
-            // break/continue control flow that can't cross async block boundaries.
-            let iter_span = tracing::info_span!(
-                "orchestration.iteration",
-                orchestration.iteration = iteration,
-                orchestration.task_count = tracing::field::Empty,
-                orchestration.will_replan = tracing::field::Empty,
-            );
-            let _iter_guard = iter_span.enter();
-
-            tracing::info!(
-                "Starting iteration {}/{} (elapsed={:.1}s, per_call_timeout={}s)",
-                iteration,
-                self.config.max_planning_cycles,
-                elapsed,
-                self.config.per_call_timeout_secs(),
-            );
-
-            // On re-plan (iteration > 1), advance persistence iteration so
-            // the new plan and its execution share a single directory.
-            // Iteration 1 is already set by persistence initialization.
-            if iteration > 1 {
-                {
-                    let mut persistence = self.persistence.lock().await;
-                    persistence.start_new_iteration();
-                }
-                let (response, _prompt, _coordinator_text) = match self
-                    .plan_with_routing(
-                        query,
-                        &chat_history,
-                        previous_context.as_ref(),
-                        Some(&event_tx),
-                    )
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        self.write_run_manifest(&plan, iteration)
-                            .await;
-                        return Err(e);
-                    }
-                };
-
-                // Handle non-plan responses during replan: Direct/Clarification
-                // short-circuit the loop, mirroring the initial routing in run_orchestration().
-                match &response {
-                    PlanningResponse::Direct {
-                        response: direct_response,
-                        routing_rationale,
-                    } => {
-                        Self::emit_event(
-                            &event_tx,
-                            OrchestratorEvent::DirectAnswer {
-                                response: direct_response.clone(),
-                                routing_rationale: routing_rationale.clone(),
-                            },
-                        )
-                        .await;
-                        Self::emit_event(
-                            &event_tx,
-                            OrchestratorEvent::IterationComplete {
-                                iteration,
-                                will_replan: false,
-                                reasoning: String::new(),
-                                gaps: vec![],
-                            },
-                        )
-                        .await;
-                        self.write_run_manifest(&plan, iteration)
-                            .await;
-                        return Ok(direct_response.clone());
-                    }
-                    PlanningResponse::Clarification {
-                        question,
-                        options,
-                        routing_rationale,
-                    } => {
-                        Self::emit_event(
-                            &event_tx,
-                            OrchestratorEvent::ClarificationNeeded {
-                                question: question.clone(),
-                                options: options.clone(),
-                                routing_rationale: routing_rationale.clone(),
-                            },
-                        )
-                        .await;
-                        Self::emit_event(
-                            &event_tx,
-                            OrchestratorEvent::IterationComplete {
-                                iteration,
-                                will_replan: false,
-                                reasoning: String::new(),
-                                gaps: vec![],
-                            },
-                        )
-                        .await;
-                        self.write_run_manifest(&plan, iteration)
-                            .await;
-                        return Ok(question.clone());
-                    }
-                    PlanningResponse::StepsPlan { .. } => {
-                        // Fall through to plan extraction below
-                    }
-                }
-
-                let routing_rationale = response.routing_rationale().to_string();
-                let planning_summary = response.planning_summary().unwrap_or_default().to_string();
-
-                // Extract plan from response — Direct/Clarification handled above,
-                // so into_plan() will always return Some here.
-                plan = response
-                    .into_plan()
-                    .expect("StepsPlan always converts to plan");
-
-                // Carry forward results from previous iteration where coordinator requested reuse
-                Self::apply_result_reuse(
-                    &mut plan,
-                    previous_context.as_ref().map(|ctx| &ctx.previous_plan),
-                );
-
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::PlanCreated {
-                        goal: plan.goal.clone(),
-                        tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
-                        routing_rationale,
-                        planning_response: planning_summary,
-                    },
-                )
-                .await;
-            }
-
-            // Record task count on the iteration span now that the plan is finalized
-            iter_span.record("orchestration.task_count", plan.tasks.len() as i64);
-
-            // ----------------------------------------------------------------
-            // EXECUTE: Run workers on tasks (parallel when possible)
-            // ----------------------------------------------------------------
-            if let Err(e) = self.execute(&mut plan, &event_tx).await {
-                self.write_run_manifest(&plan, iteration)
-                    .await;
-                return Err(e);
-            }
-            let new_failure_start = failure_history.len();
-            failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
-            let this_iteration_failures = &failure_history[new_failure_start..];
-
-            // Persistence fix: write plan after execute to capture task statuses
-            {
-                let persistence = self.persistence.lock().await;
-                if let Err(e) = persistence.write_plan(&plan).await {
-                    tracing::warn!("Failed to persist plan after execution: {}", e);
-                }
-            }
-
-            // ----------------------------------------------------------------
-            // CHECK FOR FAILURES: Skip synthesis if tasks failed/blocked
-            // ----------------------------------------------------------------
-            let failed_count = plan.failed_count();
-            let blocked_count = plan.blocked_tasks().len();
-            let has_failures = failed_count > 0 || blocked_count > 0;
-
-            if has_failures {
-                let failure_detail = if !this_iteration_failures.is_empty() {
-                    let mut category_counts: std::collections::HashMap<&str, usize> =
-                        std::collections::HashMap::new();
-                    for f in this_iteration_failures {
-                        *category_counts
-                            .entry(Self::categorize_failure_error(&f.error))
-                            .or_insert(0) += 1;
-                    }
-                    let mut categories: Vec<_> = category_counts.into_iter().collect();
-                    categories.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-                    let summary = categories
-                        .iter()
-                        .map(|(cat, count)| {
-                            if *count == 1 {
-                                format!("1 {}", cat)
-                            } else {
-                                format!("{} {}s", count, cat)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(" ({})", summary)
-                } else {
-                    String::new()
-                };
-                tracing::warn!(
-                    "Execution had failures: {} failed{}, {} blocked",
-                    failed_count,
-                    failure_detail,
-                    blocked_count
-                );
-
-                let iterations_remaining = iteration < self.config.max_planning_cycles;
-
-                if !iterations_remaining {
-                    if let Some(partial) = self
-                        .try_partial_synthesis(
-                            &plan,
-                            query,
-                            &event_tx,
-                            iteration,
-                            "Task failures detected",
-                        )
-                        .await
-                    {
-                        final_result = partial;
-                        break;
-                    }
-                    let summary = self.build_execution_summary(&plan);
-                    self.write_run_manifest(&plan, iteration)
-                        .await;
-                    return Err(format!(
-                        "Plan execution failed after {} iterations:\n{}",
-                        iteration, summary
-                    )
-                    .into());
-                }
-
-                // Provider error short-circuit: if ALL failures are provider errors,
-                // don't waste an iteration asking the coordinator to fix what it can't.
-                if Self::should_short_circuit_provider_errors(
-                    this_iteration_failures,
-                    plan.completed_count(),
-                ) {
-                    let summary = self.build_execution_summary(&plan);
-                    tracing::error!(
-                        "All {} failures are provider errors — skipping replan:\n{}",
-                        this_iteration_failures.len(),
-                        summary
-                    );
-                    self.write_run_manifest(&plan, iteration)
-                        .await;
-                    return Err(format!(
-                        "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
-                        summary
-                    ).into());
-                }
-
-                let execution_summary = self.build_execution_summary(&plan);
-                tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
-
-                let failure_evaluation = EvaluationResult {
-                    score: 0.0,
-                    reasoning: format!(
-                        "Execution failed: {} task(s) failed, {} task(s) blocked by dependencies.",
-                        failed_count, blocked_count
-                    ),
-                    gaps: vec![
-                        "Some tasks could not complete due to errors".to_string(),
-                        format!("Execution summary:\n{}", execution_summary),
-                    ],
-                };
-
-                // Record replan decision on the iteration span
-                iter_span.record("orchestration.will_replan", true);
-
-                // Emit IterationComplete on failure path
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::IterationComplete {
-                        iteration,
-                        will_replan: true,
-                        reasoning: failure_evaluation.reasoning.clone(),
-                        gaps: failure_evaluation.gaps.clone(),
-                    },
-                )
-                .await;
-
-                // Persist plan state before replan
-                {
-                    let persistence = self.persistence.lock().await;
-                    if let Err(e) = persistence.write_plan(&plan).await {
-                        tracing::warn!("Failed to persist plan before replan: {}", e);
-                    }
-                }
-
-                (previous_context, plan) = Self::trigger_replan(
-                    &event_tx,
+            match self
+                .run_iteration(
                     iteration,
-                    "failure",
+                    query,
                     plan,
-                    failure_evaluation,
-                    &failure_history,
+                    &chat_history,
+                    previous_context.as_ref(),
+                    &event_tx,
+                    orchestration_start,
+                    &mut failure_history,
                 )
-                .await;
-                continue;
+                .await?
+            {
+                IterationOutcome::FinalResult(s) => break s,
+                IterationOutcome::Continue {
+                    new_plan,
+                    previous_context: pc,
+                } => {
+                    plan = new_plan;
+                    previous_context = pc;
+                }
             }
+        };
 
-            // ----------------------------------------------------------------
-            // SYNTHESIZE: Combine task results into coherent response
-            // ----------------------------------------------------------------
-            Self::emit_event(&event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
-            final_result = match self.synthesize(&plan, query, Some(&event_tx)).await {
+        Ok(final_result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "orchestration.iteration",
+        skip_all,
+        fields(
+            orchestration.iteration = iteration,
+            orchestration.task_count = tracing::field::Empty,
+            orchestration.post_execute_decision = tracing::field::Empty,
+            orchestration.decision_latency_seconds = tracing::field::Empty,
+        )
+    )]
+    async fn run_iteration(
+        &self,
+        iteration: usize,
+        query: &str,
+        mut plan: Plan,
+        chat_history: &[rig::completion::Message],
+        previous_context: Option<&IterationContext>,
+        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        orchestration_start: Instant,
+        failure_history: &mut Vec<FailedTaskRecord>,
+    ) -> Result<IterationOutcome, StreamError> {
+        let elapsed = orchestration_start.elapsed().as_secs_f64();
+
+        tracing::info!(
+            "Starting iteration {}/{} (elapsed={:.1}s, per_call_timeout={}s)",
+            iteration,
+            self.config.max_planning_cycles,
+            elapsed,
+            self.config.per_call_timeout_secs(),
+        );
+
+        // On re-plan (iteration > 1), advance persistence iteration so
+        // the new plan and its execution share a single directory.
+        // Iteration 1 is already set by persistence initialization.
+        if iteration > 1 {
+            {
+                let mut persistence = self.persistence.lock().await;
+                persistence.start_new_iteration();
+            }
+            let (response, _prompt, _coordinator_text) = match self
+                .plan_with_routing(
+                    query,
+                    chat_history,
+                    previous_context,
+                    Some(event_tx),
+                )
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     self.write_run_manifest(&plan, iteration)
@@ -3582,34 +3356,292 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             };
 
-            // ----------------------------------------------------------------
-            // DECIDE: synthesis succeeded — break (C3 will add post-execute
-            // coordinator call here; for now the loop always breaks after synthesis)
-            // ----------------------------------------------------------------
-            iter_span.record("orchestration.will_replan", false);
+            // Handle non-plan responses during replan: Direct/Clarification
+            // short-circuit the loop, mirroring the initial routing in run_orchestration().
+            match &response {
+                PlanningResponse::Direct {
+                    response: direct_response,
+                    routing_rationale,
+                } => {
+                    Self::emit_event(
+                        event_tx,
+                        OrchestratorEvent::DirectAnswer {
+                            response: direct_response.clone(),
+                            routing_rationale: routing_rationale.clone(),
+                        },
+                    )
+                    .await;
+                    Self::emit_event(
+                        event_tx,
+                        OrchestratorEvent::IterationComplete {
+                            iteration,
+                            will_replan: false,
+                            reasoning: String::new(),
+                            gaps: vec![],
+                        },
+                    )
+                    .await;
+                    self.write_run_manifest(&plan, iteration)
+                        .await;
+                    return Ok(IterationOutcome::FinalResult(direct_response.clone()));
+                }
+                PlanningResponse::Clarification {
+                    question,
+                    options,
+                    routing_rationale,
+                } => {
+                    Self::emit_event(
+                        event_tx,
+                        OrchestratorEvent::ClarificationNeeded {
+                            question: question.clone(),
+                            options: options.clone(),
+                            routing_rationale: routing_rationale.clone(),
+                        },
+                    )
+                    .await;
+                    Self::emit_event(
+                        event_tx,
+                        OrchestratorEvent::IterationComplete {
+                            iteration,
+                            will_replan: false,
+                            reasoning: String::new(),
+                            gaps: vec![],
+                        },
+                    )
+                    .await;
+                    self.write_run_manifest(&plan, iteration)
+                        .await;
+                    return Ok(IterationOutcome::FinalResult(question.clone()));
+                }
+                PlanningResponse::StepsPlan { .. } => {
+                    // Fall through to plan extraction below
+                }
+            }
+
+            let routing_rationale = response.routing_rationale().to_string();
+            let planning_summary = response.planning_summary().unwrap_or_default().to_string();
+
+            // Extract plan from response — Direct/Clarification handled above,
+            // so into_plan() will always return Some here.
+            plan = response
+                .into_plan()
+                .expect("StepsPlan always converts to plan");
+
+            // Carry forward results from previous iteration where coordinator requested reuse
+            Self::apply_result_reuse(
+                &mut plan,
+                previous_context.map(|ctx| &ctx.previous_plan),
+            );
+
             Self::emit_event(
-                &event_tx,
-                OrchestratorEvent::IterationComplete {
-                    iteration,
-                    will_replan: false,
-                    reasoning: String::new(),
-                    gaps: vec![],
+                event_tx,
+                OrchestratorEvent::PlanCreated {
+                    goal: plan.goal.clone(),
+                    task_count: plan.tasks.len(),
+                    routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
+                    routing_rationale,
+                    planning_response: planning_summary,
                 },
             )
             .await;
-            tracing::info!(
-                "Iteration {} complete: elapsed={:.1}s",
-                iteration,
-                orchestration_start.elapsed().as_secs_f64(),
-            );
-            break;
         }
 
-        // Write run manifest on completion (best-effort)
-        self.write_run_manifest(&plan, iteration)
+        // Record task count on the iteration span now that the plan is finalized
+        tracing::Span::current().record("orchestration.task_count", plan.tasks.len() as i64);
+
+        // ----------------------------------------------------------------
+        // EXECUTE: Run workers on tasks (parallel when possible)
+        // ----------------------------------------------------------------
+        if let Err(e) = self.execute(&mut plan, event_tx).await {
+            self.write_run_manifest(&plan, iteration)
+                .await;
+            return Err(e);
+        }
+        let new_failure_start = failure_history.len();
+        failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
+        let this_iteration_failures = &failure_history[new_failure_start..];
+
+        // Persistence fix: write plan after execute to capture task statuses
+        {
+            let persistence = self.persistence.lock().await;
+            if let Err(e) = persistence.write_plan(&plan).await {
+                tracing::warn!("Failed to persist plan after execution: {}", e);
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // CHECK FOR FAILURES: Skip synthesis if tasks failed/blocked
+        // ----------------------------------------------------------------
+        let failed_count = plan.failed_count();
+        let blocked_count = plan.blocked_tasks().len();
+        let has_failures = failed_count > 0 || blocked_count > 0;
+
+        if has_failures {
+            let failure_detail = if !this_iteration_failures.is_empty() {
+                let mut category_counts: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for f in this_iteration_failures {
+                    *category_counts
+                        .entry(Self::categorize_failure_error(&f.error))
+                        .or_insert(0) += 1;
+                }
+                let mut categories: Vec<_> = category_counts.into_iter().collect();
+                categories.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                let summary = categories
+                    .iter()
+                    .map(|(cat, count)| {
+                        if *count == 1 {
+                            format!("1 {}", cat)
+                        } else {
+                            format!("{} {}s", count, cat)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" ({})", summary)
+            } else {
+                String::new()
+            };
+            tracing::warn!(
+                "Execution had failures: {} failed{}, {} blocked",
+                failed_count,
+                failure_detail,
+                blocked_count
+            );
+
+            let iterations_remaining = iteration < self.config.max_planning_cycles;
+
+            if !iterations_remaining {
+                if let Some(partial) = self
+                    .try_partial_synthesis(
+                        &plan,
+                        query,
+                        event_tx,
+                        iteration,
+                        "Task failures detected",
+                    )
+                    .await
+                {
+                    self.write_run_manifest(&plan, iteration).await;
+                    return Ok(IterationOutcome::FinalResult(partial));
+                }
+                let summary = self.build_execution_summary(&plan);
+                self.write_run_manifest(&plan, iteration)
+                    .await;
+                return Err(format!(
+                    "Plan execution failed after {} iterations:\n{}",
+                    iteration, summary
+                )
+                .into());
+            }
+
+            // Provider error short-circuit: if ALL failures are provider errors,
+            // don't waste an iteration asking the coordinator to fix what it can't.
+            if Self::should_short_circuit_provider_errors(
+                this_iteration_failures,
+                plan.completed_count(),
+            ) {
+                let summary = self.build_execution_summary(&plan);
+                tracing::error!(
+                    "All {} failures are provider errors — skipping replan:\n{}",
+                    this_iteration_failures.len(),
+                    summary
+                );
+                self.write_run_manifest(&plan, iteration)
+                    .await;
+                return Err(format!(
+                    "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
+                    summary
+                ).into());
+            }
+
+            let execution_summary = self.build_execution_summary(&plan);
+            tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
+
+            let failure_evaluation = EvaluationResult {
+                score: 0.0,
+                reasoning: format!(
+                    "Execution failed: {} task(s) failed, {} task(s) blocked by dependencies.",
+                    failed_count, blocked_count
+                ),
+                gaps: vec![
+                    "Some tasks could not complete due to errors".to_string(),
+                    format!("Execution summary:\n{}", execution_summary),
+                ],
+            };
+
+            // Emit IterationComplete on failure path
+            Self::emit_event(
+                event_tx,
+                OrchestratorEvent::IterationComplete {
+                    iteration,
+                    will_replan: true,
+                    reasoning: failure_evaluation.reasoning.clone(),
+                    gaps: failure_evaluation.gaps.clone(),
+                },
+            )
             .await;
 
-        Ok(final_result)
+            // Persist plan state before replan
+            {
+                let persistence = self.persistence.lock().await;
+                if let Err(e) = persistence.write_plan(&plan).await {
+                    tracing::warn!("Failed to persist plan before replan: {}", e);
+                }
+            }
+
+            let (new_previous_context, new_plan) = Self::trigger_replan(
+                event_tx,
+                iteration,
+                "failure",
+                plan,
+                failure_evaluation,
+                failure_history,
+            )
+            .await;
+            return Ok(IterationOutcome::Continue {
+                new_plan,
+                previous_context: new_previous_context,
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // SYNTHESIZE: Combine task results into coherent response
+        // ----------------------------------------------------------------
+        Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
+        let final_result = match self.synthesize(&plan, query, Some(event_tx)).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.write_run_manifest(&plan, iteration)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        // ----------------------------------------------------------------
+        // DECIDE: synthesis succeeded — break (C3 will add post-execute
+        // coordinator call here; for now the loop always breaks after synthesis)
+        // ----------------------------------------------------------------
+        Self::emit_event(
+            event_tx,
+            OrchestratorEvent::IterationComplete {
+                iteration,
+                will_replan: false,
+                reasoning: String::new(),
+                gaps: vec![],
+            },
+        )
+        .await;
+        tracing::info!(
+            "Iteration {} complete: elapsed={:.1}s",
+            iteration,
+            orchestration_start.elapsed().as_secs_f64(),
+        );
+
+        // Write run manifest on completion (best-effort)
+        self.write_run_manifest(&plan, iteration).await;
+
+        Ok(IterationOutcome::FinalResult(final_result))
     }
 
     /// Write a typed `RunManifest` summarizing this orchestration run.

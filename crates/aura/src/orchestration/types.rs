@@ -882,6 +882,20 @@ impl IterationContext {
     }
 }
 
+/// Outcome returned by `run_iteration` to drive the orchestration loop.
+///
+/// Errors bubble via `Result` — this enum carries only the success variants.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum IterationOutcome {
+    /// The iteration produced a final answer; the loop should break.
+    FinalResult(String),
+    /// The iteration requires another pass; swap in the new plan and continue.
+    Continue {
+        new_plan: Plan,
+        previous_context: Option<IterationContext>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
