@@ -1,3 +1,10 @@
+## [1.18.1](https://github.com/mezmo/aura/compare/v1.18.0...v1.18.1) (2026-04-21)
+
+
+### Documentation
+
+* add commit and contribution rules to claude.md [94e52ad](https://github.com/mezmo/aura/commit/94e52adbf2099ce6033e67e3a4288cc8defd3378) - Andre Elizondo [LOG-000000](https://logdna.atlassian.net/browse/LOG-000000)
+
 # [1.18.0](https://github.com/mezmo/aura/compare/v1.17.3...v1.18.0) (2026-04-20)
 
 
