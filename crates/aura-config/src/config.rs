@@ -190,44 +190,92 @@ pub enum McpServerConfig {
     },
 }
 
-/// Vector store configuration (in-memory and Qdrant support)
+/// Vector store configuration (in-memory, Qdrant, and Bedrock KB)
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct VectorStoreConfig {
     /// Unique name to identify this vector store
     pub name: String,
-    #[serde(rename = "type")]
-    pub store_type: String, // "in_memory" or "qdrant"
-    pub embedding_model: EmbeddingConfig,
-    /// URL for external vector stores like Qdrant (optional)
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Collection name for vector stores like Qdrant (optional)
-    #[serde(default)]
-    pub collection_name: Option<String>,
     /// Optional context string describing what the vector store contains (for better LLM guidance)
     #[serde(default)]
     pub context_prefix: Option<String>,
+    /// Store-type-specific configuration
+    #[serde(flatten)]
+    pub store: VectorStoreType,
+}
+
+/// Type-specific vector store configuration, tagged by `type` field
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VectorStoreType {
+    InMemory {
+        embedding_model: EmbeddingConfig,
+    },
+    Qdrant {
+        embedding_model: EmbeddingConfig,
+        url: String,
+        collection_name: String,
+    },
+    BedrockKb {
+        knowledge_base_id: String,
+        region: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
 }
 
 impl Default for VectorStoreConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            store_type: "in_memory".to_string(),
-            embedding_model: EmbeddingConfig::default(),
-            url: None,
-            collection_name: None,
             context_prefix: None,
+            store: VectorStoreType::InMemory {
+                embedding_model: EmbeddingConfig::default(),
+            },
         }
     }
 }
 
-/// Embedding model configuration
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-pub struct EmbeddingConfig {
-    pub provider: String, // "openai"
-    pub model: String,    // "text-embedding-3-small"
-    pub api_key: String,
+/// Embedding model configuration with strong typing per provider
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum EmbeddingConfig {
+    OpenAI {
+        api_key: String,
+        model: String,
+    },
+    Bedrock {
+        model: String,
+        region: String,
+        /// AWS profile name (optional, uses default credentials if not specified)
+        #[serde(default)]
+        profile: Option<String>,
+    },
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        EmbeddingConfig::OpenAI {
+            api_key: String::new(),
+            model: "text-embedding-3-small".to_string(),
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Get the provider name
+    pub fn provider(&self) -> &str {
+        match self {
+            EmbeddingConfig::OpenAI { .. } => "openai",
+            EmbeddingConfig::Bedrock { .. } => "bedrock",
+        }
+    }
+
+    /// Get the model name
+    pub fn model(&self) -> &str {
+        match self {
+            EmbeddingConfig::OpenAI { model, .. } | EmbeddingConfig::Bedrock { model, .. } => model,
+        }
+    }
 }
 
 /// Tools configuration
@@ -331,11 +379,30 @@ impl Config {
 
         // Validate each vector store
         for store in &self.vector_stores {
-            if store.embedding_model.api_key.is_empty() {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Embedding model API key is required for vector store '{}'",
-                    store.name
-                )));
+            match &store.store {
+                VectorStoreType::InMemory { embedding_model } | VectorStoreType::Qdrant { embedding_model, .. } => {
+                    match embedding_model {
+                        EmbeddingConfig::OpenAI { api_key, .. } => {
+                            if api_key.is_empty() {
+                                return Err(crate::ConfigError::Validation(format!(
+                                    "Embedding model API key is required for vector store '{}'",
+                                    store.name
+                                )));
+                            }
+                        }
+                        EmbeddingConfig::Bedrock { region, .. } => {
+                            if region.is_empty() {
+                                return Err(crate::ConfigError::Validation(format!(
+                                    "Embedding model region is required for Bedrock provider in vector store '{}'",
+                                    store.name
+                                )));
+                            }
+                        }
+                    }
+                }
+                VectorStoreType::BedrockKb { .. } => {
+                    // All required fields are enforced by the enum structure
+                }
             }
         }
 

@@ -136,11 +136,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.vector_stores.is_empty() {
         println!("Vector Stores: {} configured", config.vector_stores.len());
         for (i, store) in config.vector_stores.iter().enumerate() {
-            println!("  Store {}: {} ({})", i + 1, store.name, store.store_type);
-            println!(
-                "    Embedding Model: {} {}",
-                store.embedding_model.provider, store.embedding_model.model
-            );
+            match &store.store {
+                aura_config::VectorStoreType::InMemory { embedding_model } => {
+                    println!("  Store {}: {} (in_memory)", i + 1, store.name);
+                    println!("    Embedding Model: {} {}", embedding_model.provider(), embedding_model.model());
+                }
+                aura_config::VectorStoreType::Qdrant { embedding_model, .. } => {
+                    println!("  Store {}: {} (qdrant)", i + 1, store.name);
+                    println!("    Embedding Model: {} {}", embedding_model.provider(), embedding_model.model());
+                }
+                aura_config::VectorStoreType::BedrockKb { .. } => {
+                    println!("  Store {}: {} (bedrock_kb, managed embeddings)", i + 1, store.name);
+                }
+            }
         }
     } else {
         println!("Vector Stores: None configured");

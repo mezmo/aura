@@ -7,7 +7,7 @@ Key capabilities:
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
 - Dynamic [MCP](https://modelcontextprotocol.io) tool discovery across HTTP, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
-- RAG pipeline integration with in-memory and external vector stores
+- RAG pipeline integration with in-memory, Qdrant, and AWS Bedrock Knowledge Base vector stores, using OpenAI or AWS Bedrock embeddings
 - Embeddable Rust core independent from configuration layer
 
 > **Looking for orchestration mode?** Multi-agent orchestration is available
@@ -196,7 +196,9 @@ Configuration sections:
 - `[[vector_stores]]`: optional RAG/vector store configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
-Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
+Supported LLM providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
+
+Supported vector stores: `in_memory`, `qdrant`, and `bedrock_kb` (AWS Bedrock Knowledge Bases — managed RAG, no embedding model required). For `in_memory` and `qdrant`, supported embedding providers are OpenAI and AWS Bedrock. See the `[[vector_stores]]` examples in [examples/reference.toml](examples/reference.toml).
 
 Supported MCP transports:
 
