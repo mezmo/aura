@@ -79,9 +79,7 @@ fn infer_span_kind(name: &str) -> &'static str {
         | "streaming_completion"
         | "orchestration"
         | "orchestration.planning"
-        | "orchestration.iteration"
-        | "orchestration.synthesis"
-        | "orchestration.evaluation" => "CHAIN",
+        | "orchestration.iteration" => "CHAIN",
         // Safe default
         _ => "CHAIN",
     }

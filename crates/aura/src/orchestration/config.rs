@@ -84,14 +84,9 @@ fn default_true() -> bool {
     true
 }
 
-/// Default maximum planning cycles for the plan-execute-synthesize loop.
+/// Default maximum planning cycles for the plan-execute-continue loop.
 fn default_max_planning_cycles() -> usize {
     3
-}
-
-/// Default quality threshold (0.0-1.0) for iteration termination.
-fn default_quality_threshold() -> f32 {
-    0.8
 }
 
 /// Default character threshold for artifact extraction.
@@ -231,7 +226,7 @@ pub struct WorkerConfig {
 pub struct TimeoutsConfig {
     /// Per-call timeout (seconds) for coordinator and worker LLM calls.
     ///
-    /// Each individual `.chat()` call (planning, synthesis, evaluation, worker task)
+    /// Each individual `.chat()` call (planning, continuation, worker task)
     /// is wrapped with this timeout. Prevents a single hung LLM call from blocking
     /// the request.
     ///
@@ -271,7 +266,7 @@ pub struct ArtifactsConfig {
     /// - Planning prompts and responses
     /// - Worker task prompts and responses
     /// - Tool call records with reasoning
-    /// - Synthesis and result artifacts
+    /// - Result artifacts
     ///
     /// Structure: `<memory_dir>/<run_id>/iteration-{n}/...`
     /// A `latest` symlink points to the most recent run.
@@ -327,7 +322,7 @@ impl Default for ArtifactsConfig {
 ///
 /// Coordinator and worker turn depths are derived from `[agent].turn_depth`
 /// (the universal default). Per-worker overrides via `[orchestration.worker.<name>].turn_depth`
-/// take precedence. Synthesis (4) and evaluation (1) depths are hardcoded.
+/// take precedence.
 ///
 /// # Example
 ///
@@ -335,7 +330,6 @@ impl Default for ArtifactsConfig {
 /// [orchestration]
 /// enabled = true
 /// max_planning_cycles = 3
-/// quality_threshold = 0.8
 /// max_plan_parse_retries = 3
 ///
 /// [orchestration.timeouts]
@@ -360,11 +354,8 @@ pub struct OrchestrationConfig {
     pub enabled: bool,
 
     // --- Planning loop ---
-    /// Maximum number of plan-execute-synthesize cycles.
+    /// Maximum number of plan-execute-continue cycles.
     pub max_planning_cycles: usize,
-
-    /// Quality threshold (0.0-1.0) for early termination.
-    pub quality_threshold: f32,
 
     /// Maximum number of plan parse retries before falling back to single-task.
     pub max_plan_parse_retries: usize,
@@ -490,7 +481,7 @@ impl OrchestrationConfig {
         if !crate::env_flags::bool_env("AURA_ESCAPE_HATCH", true) {
             tracing::info!("AURA_ESCAPE_HATCH=false — stripping escape hatch directive");
             preamble = preamble.replace(
-                "5. **Resolve tool gaps pragmatically**: If a user requests an operation with no matching tool, create a plan using the available tools and note the gap in `planning_summary`. Do NOT deliberate at length about missing capabilities — route what you can, report what you cannot.\n",
+                "6. **Resolve tool gaps pragmatically**: If a user requests an operation with no matching tool, create a plan using the available tools and note the gap in `planning_summary`. Do NOT deliberate at length about missing capabilities — route what you can, report what you cannot.\n",
                 "",
             );
         }
@@ -560,7 +551,6 @@ impl Default for OrchestrationConfig {
         Self {
             enabled: false,
             max_planning_cycles: default_max_planning_cycles(),
-            quality_threshold: default_quality_threshold(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
             allow_direct_answers: true,
             allow_clarification: true,
@@ -596,8 +586,6 @@ struct RawOrchestrationConfig {
     enabled: bool,
     #[serde(default = "default_max_planning_cycles")]
     max_planning_cycles: usize,
-    #[serde(default = "default_quality_threshold")]
-    quality_threshold: f32,
     #[serde(default = "default_max_plan_parse_retries")]
     max_plan_parse_retries: usize,
     #[serde(default = "default_true")]
@@ -663,7 +651,6 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         Ok(OrchestrationConfig {
             enabled: raw.enabled,
             max_planning_cycles: raw.max_planning_cycles,
-            quality_threshold: raw.quality_threshold,
             max_plan_parse_retries: raw.max_plan_parse_retries,
             allow_direct_answers: raw.allow_direct_answers,
             allow_clarification: raw.allow_clarification,
@@ -689,7 +676,6 @@ mod tests {
         let config = OrchestrationConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.max_planning_cycles, 3);
-        assert!((config.quality_threshold - 0.8).abs() < f32::EPSILON);
         assert_eq!(config.max_plan_parse_retries, 3);
         assert!(config.worker_system_prompt.is_none());
         assert!(config.workers.is_empty());
@@ -716,7 +702,6 @@ mod tests {
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.max_planning_cycles, 3);
-        assert!((config.quality_threshold - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -724,12 +709,10 @@ mod tests {
         let toml = r#"
             enabled = true
             max_planning_cycles = 5
-            quality_threshold = 0.9
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.max_planning_cycles, 5);
-        assert!((config.quality_threshold - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1033,7 +1016,6 @@ mod tests {
         let toml = r#"
             enabled = true
             max_planning_cycles = 5
-            quality_threshold = 0.9
 
             [worker.operations]
             description = "For logs"

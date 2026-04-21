@@ -1101,27 +1101,18 @@ fn handle_orchestrator_event(
         }
         OrchestratorEvent::IterationComplete {
             iteration,
-            quality_score,
-            quality_threshold,
             will_replan,
-            evaluation_skipped,
             reasoning,
             gaps,
         } => {
             tracing::debug!(
-                "Orchestrator: iteration {} complete (quality={:.2}, threshold={:.2}, will_replan={}, eval_skipped={})",
+                "Orchestrator: iteration {} complete (will_replan={})",
                 iteration,
-                quality_score,
-                quality_threshold,
-                will_replan,
-                evaluation_skipped
+                will_replan
             );
             OrchestrationStreamEvent::iteration_complete(
                 *iteration,
-                *quality_score,
-                *quality_threshold,
                 *will_replan,
-                *evaluation_skipped,
                 if reasoning.is_empty() {
                     None
                 } else {
@@ -1141,7 +1132,7 @@ fn handle_orchestrator_event(
         }
         OrchestratorEvent::Synthesizing { iteration } => {
             tracing::debug!(
-                "Orchestrator: synthesizing results (iteration={})",
+                "Orchestrator: consolidating results for coordinator (iteration={})",
                 iteration
             );
             OrchestrationStreamEvent::synthesizing(*iteration, event_context)

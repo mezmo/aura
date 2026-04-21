@@ -11,7 +11,6 @@
 //! [orchestration]
 //! enabled = true
 //! max_planning_cycles = 3
-//! quality_threshold = 0.8
 //! ```
 //!
 //! When disabled (default), the standard single-agent streaming is used.
@@ -22,9 +21,8 @@
 //! drop-in replacement for the standard `Agent`. It creates the real `Orchestrator`
 //! lazily inside `stream()` to avoid duplicate resource allocation. It coordinates:
 //!
-//! 1. **Coordinator** - decomposes queries into plans
+//! 1. **Coordinator** - decomposes queries into plans, consolidates results
 //! 2. **Workers** - execute individual tasks
-//! 3. **Synthesizer** - combines results into final response
 //!
 //! # Example Usage
 //!
