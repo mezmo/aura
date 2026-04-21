@@ -37,6 +37,7 @@ use crate::tool_event_broker::{
 };
 use rig::agent::{CancelSignal, StreamingPromptHook};
 use rig::completion::{CompletionModel, GetTokenUsage, Message};
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -281,6 +282,13 @@ pub struct StreamingRequestHook {
     /// LLM-reported per-turn input/output tokens into the budget as ground
     /// truth so `remaining()` reflects actual context pressure.
     scratchpad_budget: Option<ContextBudget>,
+    /// Names of client-side (passthrough) tools registered for this request.
+    /// When the LLM calls one, the stream is terminated before the next LLM
+    /// turn so the client can execute the tool locally and submit results back.
+    client_tool_names: HashSet<String>,
+    /// Set when a client-side tool has been called in this request. Read by
+    /// `on_completion_call` to bail out before the next LLM turn.
+    client_tool_called: Arc<AtomicBool>,
 }
 
 impl StreamingRequestHook {
@@ -315,8 +323,19 @@ impl StreamingRequestHook {
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
             scratchpad_budget,
+            client_tool_names: HashSet::new(),
+            client_tool_called: Arc::new(AtomicBool::new(false)),
         };
         (hook, tx, usage_state)
+    }
+
+    /// Register the names of client-side (passthrough) tools for this request.
+    ///
+    /// When any of these tools are called, the hook ends the stream before the
+    /// next LLM turn so the client can execute the tool and submit results.
+    pub fn with_client_tool_names(mut self, names: HashSet<String>) -> Self {
+        self.client_tool_names = names;
+        self
     }
 
     /// Check if the request should be cancelled (timeout or external signal).
@@ -377,7 +396,21 @@ where
         _history: &[Message],
         cancel_sig: CancelSignal,
     ) -> impl Future<Output = ()> + Send {
+        let has_client_tools = !self.client_tool_names.is_empty();
+        let client_tool_called = self.client_tool_called.clone();
         async move {
+            // If a passthrough tool was called this turn, do not initiate
+            // another LLM completion. Cancel here so the stream terminates
+            // and the streaming layer can emit `finish_reason: "tool_calls"`
+            // — the client will execute the tool and resume in a follow-up
+            // request.
+            if has_client_tools && client_tool_called.load(Ordering::Acquire) {
+                tracing::info!(
+                    "Client tool was called — cancelling before next LLM completion call"
+                );
+                cancel_sig.cancel();
+                return;
+            }
             self.check_and_cancel(cancel_sig, "completion call");
         }
     }
@@ -428,7 +461,18 @@ where
         // makes the matching skip so push/pop stay symmetric. Cancellation
         // is still checked.
         let publish_event = Self::should_publish_tool_event(&tool_name);
+        let is_client_tool = self.client_tool_names.contains(&tool_name);
+        let client_tool_called = self.client_tool_called.clone();
         async move {
+            if is_client_tool {
+                tracing::info!(
+                    "Client tool '{}' called for request '{}' — marking for passthrough",
+                    tool_name,
+                    request_id
+                );
+                client_tool_called.store(true, Ordering::Release);
+            }
+
             if publish_event {
                 // Parse args as JSON (fallback to empty object if invalid)
                 let arguments: serde_json::Value =

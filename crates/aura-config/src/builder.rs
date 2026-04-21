@@ -1,7 +1,7 @@
 use crate::{Config, ConfigError};
 use aura::{
-    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, McpConfig,
-    McpServerConfig, OrchestrationConfig, StreamingAgent, ToolsConfig, VectorStoreConfig,
+    Agent, AgentConfig, AgentSettings, EmbeddingModelConfig, McpConfig, McpServerConfig,
+    OrchestrationConfig, StreamingAgent, ToolsConfig, VectorStoreConfig,
     orchestration::ToolVisibility as AuraToolVisibility,
 };
 use std::collections::HashMap;
@@ -31,6 +31,8 @@ impl RigBuilder {
             turn_depth: self.config.agent.turn_depth,
             mcp_filter: self.config.agent.mcp_filter.clone(),
             scratchpad: self.config.agent.scratchpad.clone(),
+            enable_client_tools: self.config.agent.enable_client_tools,
+            client_tool_filter: self.config.agent.client_tool_filter.clone(),
         };
 
         let vector_stores: Vec<VectorStoreConfig> = self
@@ -174,42 +176,45 @@ impl RigBuilder {
         })
     }
 
-    pub async fn build_agent(&self) -> Result<Agent, ConfigError> {
-        let agent_config = self.to_agent_config()?;
-        self.build_from_config(agent_config).await
-    }
-
-    pub async fn build_agent_with_headers(
+    /// Build an agent with optional request headers, additional tools, and client-side tools.
+    ///
+    /// - `req_headers`: HTTP headers for MCP `headers_from_request` resolution. Pass `None` when not in an HTTP context.
+    /// - `additional_tools`: Extra rig tools the agent will execute itself (e.g. CLI/library-supplied tools). Pass `vec![]` when none needed.
+    /// - `client_tools`: Passthrough tools the LLM may call but the *client* executes. Pass `None` when client-side tools are not in use.
+    pub async fn build_agent(
         &self,
         req_headers: Option<&HashMap<String, String>>,
+        additional_tools: Vec<Box<dyn aura::ToolDyn>>,
+        client_tools: Option<Vec<aura::builder::ClientTool>>,
     ) -> Result<Agent, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
-        self.build_from_config(agent_config).await
-    }
-
-    async fn build_from_config(&self, agent_config: AgentConfig) -> Result<Agent, ConfigError> {
-        AgentBuilder::new(agent_config)
-            .build_agent()
+        Agent::new(&agent_config, additional_tools, client_tools)
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build agent: {e}")))
     }
 
-    /// Build a streaming agent with optional dynamic MCP headers.
+    /// Build a streaming agent with optional dynamic MCP headers and client-side tools.
     ///
     /// Returns either:
     /// - An `Orchestrator` wrapped as `Arc<dyn StreamingAgent>` if `orchestration.enabled = true`
     /// - A standard `Agent` wrapped as `Arc<dyn StreamingAgent>` otherwise
+    ///
+    /// `client_tools` is the request-supplied passthrough tool definitions. The orchestrator
+    /// attaches them only to the coordinator / workers whose TOML config sets
+    /// `enable_client_tools = true`, filtered by `client_tool_filter`. In single-agent mode,
+    /// callers should attach client tools via `build_agent` instead.
     pub async fn build_streaming_agent_with_headers(
         &self,
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
+        client_tools: Option<Vec<aura::builder::ClientTool>>,
     ) -> Result<Arc<dyn StreamingAgent>, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
 
-        aura::build_streaming_agent(&agent_config)
+        aura::build_streaming_agent(&agent_config, client_tools)
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build streaming agent: {e}")))
     }

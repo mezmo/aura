@@ -419,6 +419,15 @@ pub struct AgentSettings {
     /// workers that don't provide an override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratchpad: Option<ScratchpadConfig>,
+    /// Whether this agent (single-agent or orchestration coordinator) may
+    /// invoke client-side tools advertised on the request.
+    #[serde(default)]
+    pub enable_client_tools: bool,
+    /// Glob patterns selecting which client-side tools this agent can call.
+    /// `None` or empty means all client tools are available when
+    /// `enable_client_tools = true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tool_filter: Option<Vec<String>>,
 }
 
 /// Vector store configuration
@@ -514,6 +523,8 @@ impl Default for AgentConfig {
                 turn_depth: Some(5),
                 mcp_filter: None,
                 scratchpad: None,
+                enable_client_tools: false,
+                client_tool_filter: None,
             },
             vector_stores: Vec::new(),
             mcp: None,
@@ -569,6 +580,23 @@ impl AgentConfig {
     pub fn tool_matches_filter(&self, tool_name: &str) -> bool {
         let effective = self.mcp_filter.as_ref().or(self.agent.mcp_filter.as_ref());
         match effective {
+            None => true,
+            Some(patterns) if patterns.is_empty() => true,
+            Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
+        }
+    }
+
+    /// Check if a client-side tool name matches the configured filter.
+    ///
+    /// Returns true if:
+    /// - No filter is set (None) - all client tools pass
+    /// - Filter is empty - all client tools pass
+    /// - Tool name matches at least one pattern
+    ///
+    /// Reads `[agent].client_tool_filter` from the TOML config. Client-side
+    /// tools are only supported in single-agent mode.
+    pub fn client_tool_matches_filter(&self, tool_name: &str) -> bool {
+        match self.agent.client_tool_filter.as_ref() {
             None => true,
             Some(patterns) if patterns.is_empty() => true,
             Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
@@ -700,5 +728,37 @@ mod tests {
         assert!(config.tool_matches_filter("mezmo_pipelines"));
         assert!(config.tool_matches_filter("QueryKnowledgeBases"));
         assert!(!config.tool_matches_filter("other_tool"));
+    }
+
+    #[test]
+    fn test_client_tool_matches_filter_none() {
+        let config = AgentConfig::default();
+        assert!(config.client_tool_matches_filter("Read"));
+    }
+
+    #[test]
+    fn test_client_tool_matches_filter_empty() {
+        let config = AgentConfig {
+            agent: AgentSettings {
+                client_tool_filter: Some(vec![]),
+                ..AgentConfig::default().agent
+            },
+            ..Default::default()
+        };
+        assert!(config.client_tool_matches_filter("Read"));
+    }
+
+    #[test]
+    fn test_client_tool_matches_filter_patterns() {
+        let config = AgentConfig {
+            agent: AgentSettings {
+                client_tool_filter: Some(vec!["Read".to_string(), "Find*".to_string()]),
+                ..AgentConfig::default().agent
+            },
+            ..Default::default()
+        };
+        assert!(config.client_tool_matches_filter("Read"));
+        assert!(config.client_tool_matches_filter("FindFiles"));
+        assert!(!config.client_tool_matches_filter("Shell"));
     }
 }

@@ -66,42 +66,91 @@ impl Drop for RequestResourceGuard {
     }
 }
 
+/// Framework-agnostic error returned by `prepare_request` and `build_agent_for_request`.
+/// The actix handler layer converts this to an `HttpResponse`; other consumers (e.g. the CLI)
+/// can convert it to their own error type without depending on actix-web.
+#[derive(Debug)]
+pub enum PrepareError {
+    BadRequest(String),
+    NotFound(String),
+    Internal(String),
+}
+
+impl PrepareError {
+    /// The human-readable error message.
+    pub fn message(&self) -> &str {
+        match self {
+            PrepareError::BadRequest(msg) => msg,
+            PrepareError::NotFound(msg) => msg,
+            PrepareError::Internal(msg) => msg,
+        }
+    }
+
+    /// Convert to an actix-web `HttpResponse` for the HTTP layer.
+    pub fn into_http_response(self) -> HttpResponse {
+        match self {
+            PrepareError::BadRequest(msg) => HttpResponse::BadRequest().json(ErrorResponse {
+                error: ErrorDetail {
+                    message: msg,
+                    error_type: "invalid_request_error".to_string(),
+                },
+            }),
+            PrepareError::NotFound(model_name) => HttpResponse::NotFound()
+                .json(ChatCompletionErrorResponse::ModelNotFound(model_name)),
+            PrepareError::Internal(msg) => {
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: ErrorDetail {
+                        message: msg,
+                        error_type: "internal_error".to_string(),
+                    },
+                })
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message())
+    }
+}
+
 /// Used by completion logic to determine how output should be delivered to the client.
 /// Both streaming and non-streaming handlers delegate to the same core logic with different
 /// delivery modes but the same observability instrumentation and stream processing.
-struct CompletionConfig {
-    request_id: String,
-    timeout_duration: std::time::Duration,
-    first_chunk_timeout: Option<std::time::Duration>,
-    stream_config: StreamConfig,
-    turn_context: TurnContext,
-    stream_shutdown_token: tokio_util::sync::CancellationToken,
-    active_requests: Arc<ActiveRequestTracker>,
+pub struct CompletionConfig {
+    pub request_id: String,
+    pub timeout_duration: std::time::Duration,
+    pub first_chunk_timeout: Option<std::time::Duration>,
+    pub stream_config: StreamConfig,
+    pub turn_context: TurnContext,
+    pub stream_shutdown_token: tokio_util::sync::CancellationToken,
+    pub active_requests: Arc<ActiveRequestTracker>,
     // OTel values
-    provider: String,
-    model: String,
-    query_for_otel: String,
-    message_count: usize,
-    response_content: ResponseContent,
+    pub provider: String,
+    pub model: String,
+    pub query_for_otel: String,
+    pub message_count: usize,
+    pub response_content: ResponseContent,
 }
 
 /// Determines how stream output reaches the client.
-enum DeliveryMode {
+pub enum DeliveryMode {
     /// Non-streaming: collect everything, send back via oneshot.
     Collect {
         result_tx: oneshot::Sender<CollectedResult>,
     },
     /// Streaming SSE: send chunks via mpsc.
     Sse {
-        chunk_tx: mpsc::Sender<Result<actix_web::web::Bytes, String>>,
+        chunk_tx: mpsc::Sender<Result<bytes::Bytes, String>>,
         heartbeat_interval: std::time::Duration,
     },
 }
 
 /// Result sent back via oneshot for the non-streaming path.
-struct CollectedResult {
-    outcome: StreamOutcome,
-    usage_state: UsageState,
+pub struct CollectedResult {
+    pub outcome: StreamOutcome,
+    pub usage_state: UsageState,
 }
 
 /// Values needed to build the final JSON response (cloned before spawn).
@@ -112,71 +161,66 @@ struct ResponseContext {
     chat_session_id: String,
 }
 
-/// Build a fresh agent for a request, applying headers_from_request mappings.
+/// Build a fresh agent for a request, applying headers_from_request mappings
+/// and optionally registering additional tools (e.g., CLI tools in standalone mode)
+/// or client-side passthrough tools.
 async fn build_agent_for_request(
     config: &aura_config::Config,
     req_headers: &HashMap<String, String>,
-) -> Result<Arc<aura::Agent>, HttpResponse> {
+    additional_tools: Vec<Box<dyn aura::ToolDyn>>,
+    client_tools: Option<&[ClientToolDefinition]>,
+) -> Result<Arc<aura::Agent>, PrepareError> {
+    let client_tool_defs =
+        client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
     let builder = RigBuilder::new(config.clone());
     let agent = builder
-        .build_agent_with_headers(Some(req_headers))
+        .build_agent(Some(req_headers), additional_tools, client_tool_defs)
         .await
         .map_err(|e| {
             error!("Failed to build agent: {}", e);
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Failed to build agent: {e}"),
-                    error_type: "internal_error".to_string(),
-                },
-            })
+            PrepareError::Internal(format!("Failed to build agent: {e}"))
         })?;
     Ok(Arc::new(agent))
 }
 
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
-struct RequestSetup {
-    query: String,
-    chat_history: Vec<aura::Message>,
-    streaming_agent: Arc<dyn StreamingAgent>,
-    config: aura_config::Config,
-    completion_id: String,
-    model_str: String,
-    created_timestamp: u64,
-    chat_session_id: String,
+pub struct RequestSetup {
+    pub query: String,
+    pub chat_history: Vec<aura::Message>,
+    pub streaming_agent: Arc<dyn StreamingAgent>,
+    pub config: aura_config::Config,
+    pub completion_id: String,
+    pub model_str: String,
+    pub created_timestamp: u64,
+    pub chat_session_id: String,
+    /// Whether the request includes client-side tool definitions and the
+    /// server is configured to honor them. The streaming layer uses this to
+    /// emit `finish_reason: "tool_calls"` instead of `"stop"` when the LLM
+    /// invokes a passthrough tool.
+    pub has_client_tools: bool,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
-async fn prepare_request(
-    data: &web::Data<AppState>,
+pub async fn prepare_request(
+    data: &AppState,
     req: &mut ChatCompletionRequest,
     chat_session_id: &str,
     req_headers_map: &HashMap<String, String>,
-) -> Result<RequestSetup, HttpResponse> {
-    // Pop the last message as the query — the remainder becomes chat history
-    let query = match req.messages.pop() {
-        Some(msg) if msg.role == Role::User => msg.content,
-        Some(msg) => {
-            return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Last message must be from user, got: {}", msg.role),
-                    error_type: "invalid_request_error".to_string(),
-                },
-            }));
-        }
-        None => {
-            return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "messages array is empty".to_string(),
-                    error_type: "invalid_request_error".to_string(),
-                },
-            }));
-        }
-    };
+) -> Result<RequestSetup, PrepareError> {
+    // Client-side tools are gated per-agent by `[agent].enable_client_tools`
+    // (single-agent configs only — orchestrated configs drop client tools with a
+    // warning in `build_streaming_agent`). The handler always honors `req.tools`
+    // if supplied; the agent builder filters and only attaches them to agents
+    // that opted in. `has_client_tools` here is a *transport* flag — it tells
+    // the streaming layer to keep assistant tool_calls in chat history and emit
+    // `finish_reason: "tool_calls"` when one fires.
+    let has_client_tools = req.tools.is_some();
 
-    // Convert remaining OpenAI messages to Rig messages,
-    // dropping system role messages and filtering empty content.
-    let chat_history = convert_chat_messages(&req.messages);
+    // Single pass: pull the user query out of `messages` and convert the rest
+    // into Aura/Rig history, with optional client-tool support (preserves
+    // assistant `tool_calls` and `role: "tool"` follow-up results).
+    let (query, chat_history) = convert_chat_messages(&req.messages, has_client_tools)?;
 
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
@@ -188,37 +232,48 @@ async fn prepare_request(
             .iter()
             .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
             .cloned()
-            .ok_or_else(|| {
-                HttpResponse::NotFound().json(ChatCompletionErrorResponse::ModelNotFound(
-                    model_name.to_string(),
-                ))
-            })?
+            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))?
     } else {
-        return Err(HttpResponse::BadRequest().json(ChatCompletionErrorResponse::ModelNotProvided));
+        return Err(PrepareError::BadRequest(
+            "you must provide a model parameter".to_string(),
+        ));
     };
+
+    // Get additional tools from the factory (e.g., CLI tools in standalone mode)
+    let additional_tools = (data.additional_tools)();
+
+    // Convert request-supplied client tool definitions once; both paths use them.
+    let client_tools_vec: Option<Vec<aura::builder::ClientTool>> = req
+        .tools
+        .as_deref()
+        .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
 
     // Build the appropriate agent type based on orchestration config
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
-        // Orchestration path: build via streaming agent builder (returns Orchestrator)
+        // Orchestration path: build via streaming agent builder (returns Orchestrator).
+        // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
         let builder = RigBuilder::new(config.clone());
         builder
             .build_streaming_agent_with_headers(
                 Some(req_headers_map),
                 Some(chat_session_id.to_string()),
+                client_tools_vec.clone(),
             )
             .await
             .map_err(|e| {
                 error!("Failed to build streaming agent: {}", e);
-                HttpResponse::InternalServerError().json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: format!("Failed to build streaming agent: {e}"),
-                        error_type: "internal_error".to_string(),
-                    },
-                })
+                PrepareError::Internal(format!("Failed to build streaming agent: {e}"))
             })?
     } else {
-        // Standard path: build Agent, coerce to Arc<dyn StreamingAgent>
-        build_agent_for_request(&config, req_headers_map).await? as Arc<dyn StreamingAgent>
+        // Standard path: build Agent with optional additional tools and client tools.
+        // Only attach client tools if the agent opted in via [agent].enable_client_tools.
+        let client_tools = if config.agent.enable_client_tools {
+            req.tools.as_deref()
+        } else {
+            None
+        };
+        build_agent_for_request(&config, req_headers_map, additional_tools, client_tools).await?
+            as Arc<dyn StreamingAgent>
     };
 
     let (provider, model) = streaming_agent.get_provider_info();
@@ -235,6 +290,7 @@ async fn prepare_request(
         model_str,
         created_timestamp,
         chat_session_id: chat_session_id.to_string(),
+        has_client_tools,
     })
 }
 
@@ -282,7 +338,7 @@ pub async fn chat_completions(
     let mut req = req.into_inner();
     let setup = match prepare_request(&data, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
-        Err(response) => return response,
+        Err(e) => return e.into_http_response(),
     };
 
     if req.stream == Some(true) {
@@ -293,8 +349,8 @@ pub async fn chat_completions(
 }
 
 /// Build configuration for the spawned completion task from AppState and RequestSetup.
-fn build_completion_config(
-    data: &web::Data<AppState>,
+pub fn build_completion_config(
+    data: &AppState,
     setup: &RequestSetup,
     max_tokens: Option<u32>,
     emit_custom_events: bool,
@@ -317,7 +373,8 @@ fn build_completion_config(
         data.tool_result_mode,
         data.tool_result_max_length,
     )
-    .with_fallback_tool_parsing(fallback_tool_parsing);
+    .with_fallback_tool_parsing(fallback_tool_parsing)
+    .with_client_tools(setup.has_client_tools);
 
     let turn_context = {
         let ctx = TurnContext::new(
@@ -360,7 +417,11 @@ fn build_completion_config(
 /// Both streaming and non-streaming handlers delegate here. The `delivery` parameter
 /// determines whether output is collected into a oneshot (non-streaming) or streamed
 /// via mpsc (SSE).
-async fn execute_completion(setup: RequestSetup, config: CompletionConfig, delivery: DeliveryMode) {
+pub async fn execute_completion(
+    setup: RequestSetup,
+    config: CompletionConfig,
+    delivery: DeliveryMode,
+) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
     let _cancellation = RequestCancellation::register(config.request_id.clone());
 
@@ -376,6 +437,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
         model_str,
         created_timestamp: _,
         chat_session_id,
+        has_client_tools: _,
     } = setup;
 
     // Create stream with timeout — single path for both Agent and Orchestrator
@@ -516,7 +578,10 @@ fn build_json_response(
             index: 0,
             message: ChatMessage {
                 role: Role::Assistant,
-                content: collected.outcome.content,
+                content: Some(collected.outcome.content),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
             },
             finish_reason: finish_reason.to_string(),
         }],
@@ -594,8 +659,7 @@ async fn handle_streaming_completion(
 
     let chat_session_id = setup.chat_session_id.clone();
 
-    let (chunk_tx, rx) =
-        mpsc::channel::<Result<actix_web::web::Bytes, String>>(data.streaming_buffer_size);
+    let (chunk_tx, rx) = mpsc::channel::<Result<bytes::Bytes, String>>(data.streaming_buffer_size);
 
     let heartbeat_interval = std::time::Duration::from_secs(15);
 
@@ -627,28 +691,182 @@ async fn handle_streaming_completion(
 /// - Drops `system` role messages (Aura's preamble is the authoritative system prompt)
 /// - Filters messages with empty/whitespace-only content
 /// - Maps `user` and `assistant` roles; skips unknown roles
-fn convert_chat_messages(messages: &[ChatMessage]) -> Vec<aura::Message> {
-    use aura::Message;
+/// - When `client_tools_enabled`, also handles `Role::Tool` follow-ups and preserves
+///   `tool_calls` on assistant messages (so the LLM can correlate the prior call with
+///   the result the client just submitted)
+///
+/// Returns `(query, chat_history)`. The query is extracted from the trailing user
+/// message — or from the user message preceding a `Role::Tool` follow-up when
+/// client tools are enabled — and removed from the history.
+fn convert_chat_messages(
+    messages: &[ChatMessage],
+    client_tools_enabled: bool,
+) -> Result<(String, Vec<aura::Message>), PrepareError> {
+    let (query, history_msgs) = extract_query_and_history(messages, client_tools_enabled)?;
+    let chat_history = history_msgs
+        .into_iter()
+        .filter_map(|msg| convert_message(msg, client_tools_enabled))
+        .collect();
+    Ok((query, chat_history))
+}
 
-    messages
-        .iter()
-        .filter_map(|msg| match msg.role {
-            Role::System => {
-                tracing::warn!("Dropping system role message from chat history — Aura's preamble is authoritative");
-                None
-            }
-            _ if msg.content.trim().is_empty() => {
-                tracing::warn!(role = %msg.role, "Dropping empty message from chat history");
-                None
-            }
-            Role::User => Some(Message::user(&msg.content)),
-            Role::Assistant => Some(Message::assistant(&msg.content)),
-            Role::Unknown => {
-                tracing::warn!(role = %msg.role, "Skipping message with unknown role");
-                None
-            }
-        })
-        .collect()
+/// Separate the query string from the history messages.
+///
+/// - **Tool follow-up** (last msg is `Role::Tool` && `client_tools_enabled`): finds
+///   the most recent `Role::User` message, uses its content as the query, and
+///   returns the remaining messages (including the assistant tool-call and the
+///   tool result) as history.
+/// - **Normal** (last msg is `Role::User`): query is the last message's content,
+///   history is everything before it.
+/// - **Empty input or other terminal role**: returns an error.
+fn extract_query_and_history(
+    messages: &[ChatMessage],
+    client_tools_enabled: bool,
+) -> Result<(String, Vec<&ChatMessage>), PrepareError> {
+    let last_msg = messages
+        .last()
+        .ok_or_else(|| PrepareError::BadRequest("messages array is empty".to_string()))?;
+
+    if last_msg.role == Role::Tool && client_tools_enabled {
+        let last_user_idx = messages
+            .iter()
+            .rposition(|m| m.role == Role::User)
+            .ok_or_else(|| {
+                PrepareError::BadRequest(
+                    "tool result messages require a preceding user message".to_string(),
+                )
+            })?;
+        let query = messages[last_user_idx].content.clone().unwrap_or_default();
+        let history = messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != last_user_idx)
+            .map(|(_, m)| m)
+            .collect();
+        Ok((query, history))
+    } else if last_msg.role == Role::User {
+        let query = last_msg.content.clone().unwrap_or_default();
+        let history = messages[..messages.len() - 1].iter().collect();
+        Ok((query, history))
+    } else {
+        Err(PrepareError::BadRequest(format!(
+            "Last message must be from user{}, got: {}",
+            if client_tools_enabled { " or tool" } else { "" },
+            last_msg.role
+        )))
+    }
+}
+
+/// Dispatch a single `ChatMessage` to the appropriate role-specific converter.
+fn convert_message(msg: &ChatMessage, client_tools_enabled: bool) -> Option<aura::Message> {
+    match msg.role {
+        Role::System => {
+            tracing::warn!(
+                "Dropping system role message from chat history — Aura's preamble is authoritative"
+            );
+            None
+        }
+        Role::User => convert_user_message(msg),
+        Role::Assistant => convert_assistant_message(msg, client_tools_enabled),
+        Role::Tool => convert_tool_message(msg, client_tools_enabled),
+        Role::Unknown => {
+            tracing::warn!(role = %msg.role, "Skipping message with unknown role");
+            None
+        }
+    }
+}
+
+/// Convert a `Role::User` message, dropping it if the content is empty/whitespace.
+fn convert_user_message(msg: &ChatMessage) -> Option<aura::Message> {
+    let content = msg.content.as_deref().unwrap_or("");
+    if content.trim().is_empty() {
+        tracing::warn!(role = %msg.role, "Dropping empty message from chat history");
+        return None;
+    }
+    Some(aura::Message::user(content))
+}
+
+/// Convert a `Role::Assistant` message.
+///
+/// When `client_tools_enabled` and the message carries `tool_calls`, builds a
+/// rig assistant message that combines optional text content with the tool
+/// calls so the LLM sees its own prior call when handling the follow-up tool
+/// result. Otherwise treats the message as plain text.
+fn convert_assistant_message(
+    msg: &ChatMessage,
+    client_tools_enabled: bool,
+) -> Option<aura::Message> {
+    if client_tools_enabled && let Some(tool_calls) = &msg.tool_calls {
+        return convert_assistant_with_tool_calls(msg, tool_calls);
+    }
+
+    let content = msg.content.as_deref().unwrap_or("");
+    if content.trim().is_empty() {
+        tracing::warn!(role = %msg.role, "Dropping empty message from chat history");
+        return None;
+    }
+    Some(aura::Message::assistant(content))
+}
+
+/// Build an assistant message containing optional text plus one or more tool calls.
+fn convert_assistant_with_tool_calls(
+    msg: &ChatMessage,
+    tool_calls: &[ChatMessageToolCall],
+) -> Option<aura::Message> {
+    use aura::{AssistantContent, OneOrMany};
+
+    let mut contents: Vec<AssistantContent> = Vec::new();
+
+    if let Some(text) = &msg.content
+        && !text.is_empty()
+    {
+        contents.push(AssistantContent::text(text));
+    }
+
+    for tc in tool_calls {
+        // `arguments` is a JSON-encoded string per OpenAI spec; if it's not
+        // valid JSON we pass it through as a string value rather than failing.
+        let args_value: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+            .unwrap_or(serde_json::Value::String(tc.function.arguments.clone()));
+        contents.push(AssistantContent::tool_call(
+            tc.id.clone(),
+            tc.function.name.clone(),
+            args_value,
+        ));
+    }
+
+    if contents.is_empty() {
+        return None;
+    }
+    Some(aura::Message::Assistant {
+        id: None,
+        content: OneOrMany::many(contents).expect("non-empty assistant content"),
+    })
+}
+
+/// Convert a `Role::Tool` message into a rig user-content tool result.
+///
+/// Skips (with a warning) when client tools are disabled or the required
+/// `tool_call_id`/`content` fields are missing.
+fn convert_tool_message(msg: &ChatMessage, client_tools_enabled: bool) -> Option<aura::Message> {
+    use aura::{OneOrMany, UserContent};
+
+    if client_tools_enabled
+        && let (Some(tool_call_id), Some(content)) = (&msg.tool_call_id, &msg.content)
+    {
+        let tool_result = UserContent::tool_result(
+            tool_call_id.clone(),
+            OneOrMany::one(aura::ToolResultContent::text(content)),
+        );
+        return Some(aura::Message::User {
+            content: OneOrMany::one(tool_result),
+        });
+    }
+    tracing::warn!(
+        role = %msg.role,
+        "Skipping tool message (client tools disabled or missing tool_call_id/content)"
+    );
+    None
 }
 
 /// Health check endpoint
@@ -694,12 +912,15 @@ fn generate_chat_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatMessage, Role};
+    use crate::types::{ChatMessage, ChatMessageFunctionCall, ChatMessageToolCall, Role};
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
             role,
-            content: content.to_string(),
+            content: Some(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
         }
     }
 
@@ -709,8 +930,9 @@ mod tests {
             msg(Role::System, "You are a helpful assistant"),
             msg(Role::User, "Hello"),
         ];
-        let result = convert_chat_messages(&messages);
-        assert_eq!(result.len(), 1);
+        let (_query, history) = convert_chat_messages(&messages, false).unwrap();
+        // System dropped; last User extracted as query → 0 history messages
+        assert_eq!(history.len(), 0);
     }
 
     #[test]
@@ -721,8 +943,9 @@ mod tests {
             msg(Role::Assistant, "   "),
             msg(Role::User, "How are you?"),
         ];
-        let result = convert_chat_messages(&messages);
-        assert_eq!(result.len(), 2);
+        let (_query, history) = convert_chat_messages(&messages, false).unwrap();
+        // "Hello" in history, two empty assistants filtered, last User is query
+        assert_eq!(history.len(), 1);
     }
 
     #[test]
@@ -732,8 +955,9 @@ mod tests {
             msg(Role::Assistant, "Hi there"),
             msg(Role::User, "How are you?"),
         ];
-        let result = convert_chat_messages(&messages);
-        assert_eq!(result.len(), 3);
+        let (query, history) = convert_chat_messages(&messages, false).unwrap();
+        assert_eq!(query, "How are you?");
+        assert_eq!(history.len(), 2); // "Hello" + "Hi there"
     }
 
     #[test]
@@ -746,8 +970,10 @@ mod tests {
             msg(Role::Assistant, "Rust is a systems programming language."),
             msg(Role::User, "Tell me more"),
         ];
-        let result = convert_chat_messages(&messages);
-        assert_eq!(result.len(), 3); // user, assistant(non-empty), user
+        let (query, history) = convert_chat_messages(&messages, false).unwrap();
+        assert_eq!(query, "Tell me more");
+        // system dropped, empty assistant filtered → user + assistant(non-empty)
+        assert_eq!(history.len(), 2);
     }
 
     #[test]
@@ -756,14 +982,163 @@ mod tests {
             msg(Role::Unknown, "some tool output"),
             msg(Role::User, "Hello"),
         ];
-        let result = convert_chat_messages(&messages);
-        assert_eq!(result.len(), 1);
+        let (_query, history) = convert_chat_messages(&messages, false).unwrap();
+        // Unknown filtered, last User is query → 0 history
+        assert_eq!(history.len(), 0);
     }
 
     #[test]
     fn test_empty_input() {
-        let result = convert_chat_messages(&[]);
-        assert!(result.is_empty());
+        let result = convert_chat_messages(&[], false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_last_role_returns_error() {
+        let messages = vec![msg(Role::Assistant, "unexpected")];
+        let result = convert_chat_messages(&messages, false);
+        assert!(result.is_err());
+    }
+
+    // --- client tools enabled tests ---
+
+    fn tool_msg(tool_call_id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::Tool,
+            content: Some(content.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.to_string()),
+            name: None,
+        }
+    }
+
+    fn assistant_with_tool_calls(
+        content: Option<&str>,
+        tool_calls: Vec<(&str, &str, &str)>,
+    ) -> ChatMessage {
+        ChatMessage {
+            role: Role::Assistant,
+            content: content.map(|s| s.to_string()),
+            tool_calls: Some(
+                tool_calls
+                    .into_iter()
+                    .map(|(id, name, args)| ChatMessageToolCall {
+                        id: id.to_string(),
+                        call_type: "function".to_string(),
+                        function: ChatMessageFunctionCall {
+                            name: name.to_string(),
+                            arguments: args.to_string(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn test_tool_followup_happy_path() {
+        let messages = vec![
+            msg(Role::User, "What is the weather?"),
+            assistant_with_tool_calls(None, vec![("tc_1", "get_weather", r#"{"city":"NYC"}"#)]),
+            tool_msg("tc_1", r#"{"temp": 72}"#),
+        ];
+        let (query, history) = convert_chat_messages(&messages, true).unwrap();
+        assert_eq!(query, "What is the weather?");
+        // History: assistant with tool_calls + tool result; user message extracted as query
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_followup_no_preceding_user_returns_error() {
+        let messages = vec![
+            assistant_with_tool_calls(None, vec![("tc_1", "get_weather", r#"{}"#)]),
+            tool_msg("tc_1", "result"),
+        ];
+        let result = convert_chat_messages(&messages, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_assistant_tool_calls_enabled_preserves_calls() {
+        let messages = vec![
+            assistant_with_tool_calls(
+                Some("Let me check"),
+                vec![("tc_1", "search", r#"{"q":"rust"}"#)],
+            ),
+            msg(Role::User, "Thanks"),
+        ];
+        let (query, history) = convert_chat_messages(&messages, true).unwrap();
+        assert_eq!(query, "Thanks");
+        assert_eq!(history.len(), 1);
+        // The assistant message should be the multi-content variant
+        match &history[0] {
+            aura::Message::Assistant { content, .. } => {
+                // text + tool_call = 2 content items
+                assert_eq!(content.len(), 2);
+            }
+            other => panic!("Expected Assistant message, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_assistant_tool_calls_disabled_falls_back_to_text() {
+        // With client_tools_enabled=false, tool_calls are ignored and the
+        // message is treated as plain text.
+        let messages = vec![
+            assistant_with_tool_calls(
+                Some("Let me check"),
+                vec![("tc_1", "search", r#"{"q":"rust"}"#)],
+            ),
+            msg(Role::User, "Thanks"),
+        ];
+        let (_, history) = convert_chat_messages(&messages, false).unwrap();
+        assert_eq!(history.len(), 1);
+        match &history[0] {
+            aura::Message::Assistant { content, .. } => {
+                assert_eq!(content.len(), 1);
+            }
+            other => panic!("Expected Assistant message, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tool_message_missing_tool_call_id_skipped() {
+        let bad_tool = ChatMessage {
+            role: Role::Tool,
+            content: Some("result".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        };
+        let messages = vec![
+            msg(Role::User, "First"),
+            bad_tool,
+            msg(Role::User, "Second"),
+        ];
+        let (query, history) = convert_chat_messages(&messages, true).unwrap();
+        assert_eq!(query, "Second");
+        // bad_tool skipped, "First" is the only history entry
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn test_tool_message_missing_content_skipped() {
+        let bad_tool = ChatMessage {
+            role: Role::Tool,
+            content: None,
+            tool_calls: None,
+            tool_call_id: Some("tc_1".to_string()),
+            name: None,
+        };
+        let messages = vec![
+            msg(Role::User, "First"),
+            bad_tool,
+            msg(Role::User, "Second"),
+        ];
+        let (_, history) = convert_chat_messages(&messages, true).unwrap();
+        assert_eq!(history.len(), 1);
     }
 
     // --- streaming / response builder tests ---

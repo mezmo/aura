@@ -46,6 +46,9 @@ pub use otel::StreamOtelContext;
 // Streaming configuration and context
 pub use types::{StreamConfig, ToolResultMode, TurnContext};
 
+// Types for consumers of CollectedResult
+pub use types::openai::UsageInfo;
+
 // Types exported for tests
 #[cfg(test)]
-pub use types::{ChatCompletionChunkDelta, MessageRole, UsageInfo, truncate_result};
+pub use types::{ChatCompletionChunkDelta, MessageRole, truncate_result};

@@ -22,18 +22,18 @@ use crate::streaming::types::openai::UsageInfo;
 
 use super::types::{
     CHUNK_OBJECT, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta,
-    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, FunctionCallChunk, MessageRole,
-    StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus, TurnContext, TurnState,
-    detect_tool_error, format_sse_chunk, truncate_result,
+    FINISH_REASON_LENGTH, FINISH_REASON_STOP, FINISH_REASON_TOOL_CALLS, FUNCTION_TYPE,
+    FunctionCallChunk, MessageRole, StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus,
+    TurnContext, TurnState, detect_tool_error, format_sse_chunk, truncate_result,
 };
-use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    EventContext, OrchestrationStreamEvent, OrchestratorEvent, ProgressNotification,
-    RequestCancellation, ResponseContent, StreamError, StreamItem, StreamedAssistantContent,
-    StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent, ToolResult, ToolUsageEvent,
-    UsageState,
+    EventContext, OrchestrationStreamEvent, OrchestratorEvent, PASSTHROUGH_MARKER,
+    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
+    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent,
+    ToolResult, ToolUsageEvent, UsageState,
 };
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -518,6 +518,19 @@ fn process_stream_next(
         }
         Some(Err(e)) => {
             let error_str = e.to_string();
+
+            // Client-tool passthrough path: when the LLM invokes a passthrough
+            // tool, the streaming hook cancels the stream before the next LLM
+            // turn so the client can execute the tool. That cancellation
+            // surfaces here as an error — treat it as normal end-of-stream.
+            if config.has_client_tools && state.has_passthrough_tool_calls {
+                tracing::info!(
+                    "Stream cancelled after client tool call (expected): {}",
+                    error_str
+                );
+                return NextItemResult::End(vec![]);
+            }
+
             tracing::error!("Stream error: {}", error_str);
 
             // Capture for OTel span recording after loop ends
@@ -795,6 +808,19 @@ fn handle_tool_result(
         tool_result.id,
         tool_result.call_id
     );
+
+    // Passthrough (client-side) tool: the result is a synthetic marker, not
+    // real output. Suppress it from the stream and flag the turn so the final
+    // chunk uses `finish_reason: "tool_calls"` and the cancellation that
+    // follows (via the streaming hook) is treated as normal termination.
+    if tool_result.result.contains(PASSTHROUGH_MARKER) {
+        tracing::info!(
+            "Passthrough tool result detected for call {} — suppressing from stream",
+            tool_result.id
+        );
+        state.has_passthrough_tool_calls = true;
+        return vec![];
+    }
 
     // Mirror the suppression in `handle_tool_call`: scratchpad exploration
     // tools are absorbed end-to-end so single-agent matches orchestration.
@@ -1236,7 +1262,12 @@ fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCom
 
 /// Build the final chunk with finish_reason.
 fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
-    let finish_reason = if let (Some(max), Some(usage)) = (ctx.max_tokens, &state.usage_stats) {
+    let finish_reason = if state.has_passthrough_tool_calls {
+        // The LLM invoked a client-side tool — tell the client to execute it
+        // and follow up. Takes precedence over `length` because the request
+        // is logically incomplete: the client owes us a tool result.
+        FINISH_REASON_TOOL_CALLS
+    } else if let (Some(max), Some(usage)) = (ctx.max_tokens, &state.usage_stats) {
         if usage.completion_tokens >= max as u64 {
             FINISH_REASON_LENGTH
         } else {
@@ -1288,6 +1319,7 @@ mod tests {
             tool_result_mode: ToolResultMode::None,
             tool_result_max_length: 1000,
             fallback_tool_parsing: false,
+            has_client_tools: false,
         };
 
         let ctx = TurnContext {
