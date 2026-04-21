@@ -2,6 +2,7 @@ use crate::{
     config::{AgentConfig, LlmConfig, McpServerConfig},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
+    passthrough_tool::PassthroughTool,
     provider_agent::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
@@ -15,10 +16,24 @@ use crate::{
 use futures::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::Usage;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// A client-side tool definition supplied with a request.
+///
+/// Used to register passthrough tools on the agent — the LLM sees them as
+/// callable, but `call()` returns `PASSTHROUGH_MARKER` and the streaming layer
+/// terminates the stream with `finish_reason: "tool_calls"` so the client can
+/// execute the tool locally and submit results back in a follow-up request.
+#[derive(Debug, Clone)]
+pub struct ClientTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
 
 /// Default maximum depth for multi-turn conversations.
 ///
@@ -125,6 +140,11 @@ pub struct Agent {
     /// Set by orchestration workers (from resolved worker LLM + scratchpad config);
     /// `None` for coordinator agents and non-scratchpad use.
     pub(crate) scratchpad_budget: Option<scratchpad::ContextBudget>,
+    /// Names of client-side (passthrough) tools registered for this agent.
+    /// When the LLM calls one of these, the streaming layer terminates the
+    /// stream with `finish_reason: "tool_calls"` so the caller can execute
+    /// the tool and resume in a follow-up request.
+    pub(crate) client_tool_names: HashSet<String>,
 }
 
 impl Agent {
@@ -255,9 +275,19 @@ impl Agent {
         Ok(Some(build.budget))
     }
 
-    /// Create a new agent from configuration.
+    /// Create a new agent from configuration with optional additional tools.
+    ///
+    /// `additional_tools` registers extra rig tools the agent will execute itself
+    /// (e.g. tools other applications using Aura as a library want to expose).
+    /// Pass `vec![]` when no extra tools are needed.
+    ///
+    /// `client_tools` registers passthrough tools — the LLM sees them as callable,
+    /// but the streaming layer terminates the stream when one is invoked so the
+    /// client can execute the tool locally. Pass `None` to disable.
     pub async fn new(
         config: &AgentConfig,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+        client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &config.mcp {
@@ -393,8 +423,14 @@ impl Agent {
 
                 // Add tools using the BuilderState helper
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::OpenAI(agent)
@@ -438,8 +474,14 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Anthropic(agent)
@@ -497,8 +539,14 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Bedrock(agent)
@@ -537,8 +585,14 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Gemini(agent)
@@ -576,13 +630,24 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Ollama(agent)
             }
         };
+
+        let client_tool_names = client_tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
 
         Ok(Agent {
             inner: provider_agent,
@@ -593,7 +658,34 @@ impl Agent {
             fallback_tool_names,
             context_window: config.llm.context_window(),
             scratchpad_budget: agent_scratchpad_budget,
+            client_tool_names,
         })
+    }
+
+    /// Register passthrough tools so the LLM can request them, but execution
+    /// is deferred to the client.
+    ///
+    /// Each tool is wrapped in a `PassthroughTool` that returns
+    /// `PASSTHROUGH_MARKER` from `call()`; the streaming layer detects the
+    /// marker, suppresses the result, and emits `finish_reason: "tool_calls"`.
+    fn add_passthrough_tools<M>(
+        builder_state: BuilderState<M>,
+        client_tools: &[ClientTool],
+    ) -> BuilderState<M>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+    {
+        let mut state = builder_state;
+        for tool in client_tools {
+            tracing::info!("  Adding passthrough tool: {}", tool.name);
+            let passthrough = PassthroughTool::new(
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.parameters.clone(),
+            );
+            state = state.add_tool(passthrough);
+        }
+        state
     }
 
     /// Add all tools to a builder state (shared across all providers)
@@ -605,6 +697,7 @@ impl Agent {
         mut builder_state: BuilderState<M>,
         config: &AgentConfig,
         mcp_manager: &Option<Arc<McpManager>>,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
     where
         M: rig::completion::CompletionModel + Send + Sync,
@@ -768,6 +861,12 @@ impl Agent {
             let context_tool =
                 crate::orchestration::GetConversationContextTool::new(history.clone());
             builder_state = builder_state.add_tool(context_tool);
+        }
+
+        // Add additional custom tools (e.g., CLI local tools in standalone mode)
+        if !additional_tools.is_empty() {
+            tracing::info!("Adding {} additional custom tools", additional_tools.len());
+            builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
         Ok(builder_state)
@@ -1028,6 +1127,7 @@ impl Agent {
                 timeout,
                 request_id,
                 self.scratchpad_budget.clone(),
+                self.client_tool_names.clone(),
             )
             .await;
         (
@@ -1073,6 +1173,7 @@ impl Agent {
                 timeout,
                 request_id,
                 self.scratchpad_budget.clone(),
+                self.client_tool_names.clone(),
             )
             .await;
         (
@@ -1303,19 +1404,44 @@ impl StreamingAgent for Agent {
 ///
 /// Returns either an orchestrated multi-agent workflow or a standard single
 /// agent, depending on `orchestration.enabled`. Both implement `StreamingAgent`.
+///
+/// `client_tools` is the request-supplied passthrough tool definitions.
+/// **Client-side tools are only supported in single-agent mode** — when
+/// `orchestration.enabled = true`, any supplied `client_tools` are dropped
+/// with a warning. In single-agent mode, they are attached to the agent only
+/// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
 pub async fn build_streaming_agent(
     config: &crate::config::AgentConfig,
+    client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
 
     if config.orchestration_enabled() {
         tracing::info!("Building OrchestratorFactory (orchestration.enabled = true)");
+        if client_tools.as_ref().is_some_and(|t| !t.is_empty()) {
+            tracing::warn!(
+                "Client-side tools were supplied but orchestration is enabled — \
+                 client tools are only supported in single-agent configurations and \
+                 will be ignored. Use a non-orchestrated agent config to enable them."
+            );
+        }
         let factory = OrchestratorFactory::new(config.clone());
         Ok(Arc::new(factory))
     } else {
-        // Standard single-agent mode
+        // Standard single-agent mode: gate client tools on the agent's TOML opt-in
+        // and apply its client_tool_filter.
         tracing::info!("Building Agent (orchestration.enabled = false)");
-        let agent = Agent::new(config).await?;
+        let attached = if config.agent.enable_client_tools {
+            client_tools.map(|tools| {
+                tools
+                    .into_iter()
+                    .filter(|t| config.client_tool_matches_filter(&t.name))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            None
+        };
+        let agent = Agent::new(config, vec![], attached).await?;
         Ok(Arc::new(agent))
     }
 }
@@ -1439,7 +1565,7 @@ impl AgentBuilder {
     pub async fn build_agent(&self) -> BuilderResult<Agent> {
         tracing::info!("=== Building Agent ===");
 
-        let agent = Agent::new(&self.config)
+        let agent = Agent::new(&self.config, vec![], None)
             .await
             .map_err(|e| BuilderError::AgentError(e.to_string()))?;
 

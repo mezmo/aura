@@ -406,6 +406,17 @@ pub struct AgentConfig {
     /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
     #[serde(default)]
     pub mcp_filter: Option<Vec<String>>,
+    /// Whether this agent (single-agent or orchestration coordinator) may
+    /// invoke client-side tools advertised on the request. When false
+    /// (default), client tools are not attached even if the request
+    /// supplied them.
+    #[serde(default)]
+    pub enable_client_tools: bool,
+    /// Glob patterns selecting which client-side tools this agent can call.
+    /// `None` or empty means all client tools are available when
+    /// `enable_client_tools = true`.
+    #[serde(default)]
+    pub client_tool_filter: Option<Vec<String>>,
     /// LLM configuration for this agent.
     ///
     /// Parsed from the `[agent.llm]` TOML table. Workers inherit this config
@@ -440,6 +451,8 @@ impl Default for AgentConfig {
             created_at: default_created_at(),
             model_owner: None,
             mcp_filter: None,
+            enable_client_tools: false,
+            client_tool_filter: None,
             llm: LlmConfig::default(),
             scratchpad: None,
         }
