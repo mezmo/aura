@@ -139,6 +139,7 @@ pub mod context {
     //! Per-request turn context and mutable state.
 
     use super::openai::UsageInfo;
+    use aura::CorrelationContextExt;
     use aura::stream_events::{AgentContext, CorrelationContext};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -229,10 +230,6 @@ pub use openai::{
     MessageRole, ToolCallChunk,
 };
 
-// Re-export UsageInfo for tests (construct StreamOutcome fixtures)
-#[cfg(test)]
-pub use openai::UsageInfo;
-
 /// Error prefix patterns from Rig's tool error handling.
 const ERROR_PREFIXES: &[(&str, &str)] = &[
     ("Tool returned error: ", "ToolError"),
@@ -257,15 +254,13 @@ pub fn truncate_result(result: &str, max_length: usize) -> String {
 }
 
 /// Format as SSE message: `data: {json}\n\n`
-pub fn format_sse_chunk<T: serde::Serialize>(
-    value: &T,
-) -> Result<actix_web::web::Bytes, serde_json::Error> {
+pub fn format_sse_chunk<T: serde::Serialize>(value: &T) -> Result<bytes::Bytes, serde_json::Error> {
     let json = serde_json::to_string(value)?;
     let mut buffer = String::with_capacity(json.len() + 10);
     buffer.push_str("data: ");
     buffer.push_str(&json);
     buffer.push_str("\n\n");
-    Ok(actix_web::web::Bytes::from(buffer))
+    Ok(bytes::Bytes::from(buffer))
 }
 
 #[derive(Debug)]

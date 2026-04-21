@@ -19,6 +19,9 @@ futures = "0.3"
 sse-stream = "0.2"
 reqwest = { version = "0.12", features = ["stream", "json"] }
 
+# Shared event types (lightweight, no agent/MCP deps)
+aura-events = { path = "../aura-events", features = ["rmcp-types"] }
+
 # Serialization (for tool schemas)
 serde = { workspace = true }
 serde_json = { workspace = true }

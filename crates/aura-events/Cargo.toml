@@ -1,0 +1,22 @@
+[package]
+name = "aura-events"
+version.workspace = true
+edition = "2021"
+description = "Shared SSE event types for aura — lightweight, no agent/MCP dependencies"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Optional: re-export rmcp's ProgressToken for interop with the aura crate.
+# When rmcp is not available, we define compatible local types.
+[features]
+default = []
+rmcp-types = ["dep:rmcp"]
+
+[dependencies.rmcp]
+workspace = true
+optional = true

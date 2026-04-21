@@ -56,7 +56,8 @@ pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
     ToolCall, ToolResult,
 };
-pub use rig::completion::Message;
+pub use rig::completion::{Message, ToolDefinition as RigToolDefinition};
+pub use rig::tool::{Tool as RigTool, ToolDyn};
 pub use streaming::StreamingAgent;
 
 // Legacy aliases (deprecated)
@@ -80,7 +81,8 @@ pub use request_progress::{
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use stream_events::{
-    AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase, format_named_sse,
+    AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
+    format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};

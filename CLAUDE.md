@@ -29,6 +29,12 @@ cargo run --bin aura-web-server
 # Start with orchestration config
 CONFIG_PATH=configs/example-math-orchestration.toml AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 
+# Build and run CLI (HTTP mode — connects to aura-web-server)
+cargo run -p aura-cli -- --api-url http://localhost:8080
+
+# Build and run CLI (standalone mode — no server needed)
+cargo run -p aura-cli --features standalone-cli -- --standalone --config configs/my-agent.toml
+
 # Run integration tests (local, requires Docker)
 make test-integration-local                        # base integration
 make test-integration-orchestration-local          # orchestration integration
@@ -41,7 +47,9 @@ make test-integration-sre-orchestration-local      # SRE orchestration integrati
 aura/
 ├── crates/
 │   ├── aura/                 # Core library (agent builder + orchestration)
+│   ├── aura-cli/             # Interactive terminal client (HTTP + standalone modes)
 │   ├── aura-config/          # TOML parsing and configuration
+│   ├── aura-events/          # Shared SSE event types (lightweight, no agent deps)
 │   ├── aura-web-server/      # OpenAI-compatible API
 │   └── aura-test-utils/      # Shared testing utilities
 ├── compose/                  # Docker Compose (integration + orchestration overlays)
@@ -82,6 +90,26 @@ aura/
 - Iterative re-planning loops (`quality_threshold`, `max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
 - 11 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
+
+### CLI (`aura-cli`)
+- Interactive terminal client with REPL, one-shot mode, and conversation persistence
+- **Two backends:** HTTP mode (default) and standalone mode (`--standalone --config`, builds agents in-process)
+- Standalone mode requires `--features standalone-cli` at build time and explicit `--standalone` flag at runtime
+- `--model` works in both modes: HTTP passes it as starting model; standalone matches against agent.name/agent.alias in configs
+- `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for Aura vs OpenAI-compatible service
+- `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
+- Local tool execution: Shell, Read, ListFiles, Update, SearchFiles, FindFiles, FileInfo
+- Permission system (`.aura/settings.json`) with allow/deny glob rules
+- `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
+- Env vars: `AURA_API_URL`, `AURA_API_KEY`, `AURA_MODEL`, `AURA_EXTRA_HEADERS`
+- SSE event parsing uses shared types from `aura-events` crate (not in `default-members`, build explicitly with `cargo build -p aura-cli`)
+- See `crates/aura-cli/README.md` for full documentation
+
+### Shared Event Types (`aura-events`)
+- Lightweight crate defining `AuraStreamEvent` and `OrchestrationStreamEvent` enums
+- Both `Serialize + Deserialize` — used by the web server (producer) and CLI (consumer)
+- No agent, MCP, or provider dependencies — only `serde` and `serde_json`
+- `ProgressToken` type uses a local wire-compatible definition by default; enables `rmcp-types` feature for direct rmcp interop (used by the `aura` crate)
 
 ## Environment Setup
 
@@ -162,6 +190,7 @@ Per-model configs live in `configs/math-orchestration-*.toml`. Local llama-serve
 ## Documentation
 
 - `README.md` - User-facing documentation
+- `crates/aura-cli/README.md` - CLI usage, backends, features, and build instructions
 - `CHANGELOG.md` - Auto-generated version history
 - `docs/streaming-api-guide.md` - SSE streaming, custom events, and orchestration events
 - `docs/ollama-guide.md` - Ollama configuration, fallback tool parsing, and local model guidance

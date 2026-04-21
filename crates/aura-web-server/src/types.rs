@@ -13,6 +13,12 @@ pub struct ActiveRequestTracker {
     drained: Notify,
 }
 
+impl Default for ActiveRequestTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ActiveRequestTracker {
     pub fn new() -> Self {
         Self {
@@ -69,6 +75,9 @@ pub struct AppState {
     pub active_requests: Arc<ActiveRequestTracker>,
     /// Default agent name or alias, used when `model` is omitted from the request
     pub default_agent: Option<String>,
+    /// Factory for additional tools to register on every agent (e.g., CLI tools in standalone mode).
+    /// Called once per request to produce fresh tool instances. Returns empty vec for the web server.
+    pub additional_tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
 }
 
 /// OpenAI-compatible message role

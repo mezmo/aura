@@ -2172,7 +2172,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -2202,7 +2202,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -2240,7 +2240,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -2267,7 +2267,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -2308,7 +2308,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
         }

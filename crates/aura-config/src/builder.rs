@@ -1,8 +1,8 @@
 use crate::{Config, ConfigError};
 use aura::{
-    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
-    McpServerConfig, OrchestrationConfig, ReasoningEffort, StreamingAgent, ToolsConfig,
-    VectorStoreConfig, orchestration::ToolVisibility as AuraToolVisibility,
+    Agent, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
+    OrchestrationConfig, ReasoningEffort, StreamingAgent, ToolsConfig, VectorStoreConfig,
+    orchestration::ToolVisibility as AuraToolVisibility,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -234,23 +234,18 @@ impl RigBuilder {
         })
     }
 
-    pub async fn build_agent(&self) -> Result<Agent, ConfigError> {
-        let agent_config = self.to_agent_config()?;
-        self.build_from_config(agent_config).await
-    }
-
-    pub async fn build_agent_with_headers(
+    /// Build an agent with optional request headers and additional tools.
+    ///
+    /// - `req_headers`: HTTP headers for MCP `headers_from_request` resolution. Pass `None` when not in an HTTP context.
+    /// - `additional_tools`: Extra tools to register (e.g., CLI local tools in app/binary using aura crates). Pass `vec![]` when none needed.
+    pub async fn build_agent(
         &self,
         req_headers: Option<&HashMap<String, String>>,
+        additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     ) -> Result<Agent, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
-        self.build_from_config(agent_config).await
-    }
-
-    async fn build_from_config(&self, agent_config: AgentConfig) -> Result<Agent, ConfigError> {
-        AgentBuilder::new(agent_config)
-            .build_agent()
+        Agent::new(&agent_config, additional_tools)
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build agent: {e}")))
     }

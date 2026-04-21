@@ -71,42 +71,91 @@ impl Drop for RequestResourceGuard {
     }
 }
 
+/// Framework-agnostic error returned by `prepare_request` and `build_agent_for_request`.
+/// The actix handler layer converts this to an `HttpResponse`; other consumers (e.g. the CLI)
+/// can convert it to their own error type without depending on actix-web.
+#[derive(Debug)]
+pub enum PrepareError {
+    BadRequest(String),
+    NotFound(String),
+    Internal(String),
+}
+
+impl PrepareError {
+    /// The human-readable error message.
+    pub fn message(&self) -> &str {
+        match self {
+            PrepareError::BadRequest(msg) => msg,
+            PrepareError::NotFound(msg) => msg,
+            PrepareError::Internal(msg) => msg,
+        }
+    }
+
+    /// Convert to an actix-web `HttpResponse` for the HTTP layer.
+    pub fn into_http_response(self) -> HttpResponse {
+        match self {
+            PrepareError::BadRequest(msg) => HttpResponse::BadRequest().json(ErrorResponse {
+                error: ErrorDetail {
+                    message: msg,
+                    error_type: "invalid_request_error".to_string(),
+                },
+            }),
+            PrepareError::NotFound(model_name) => HttpResponse::NotFound()
+                .json(ChatCompletionErrorResponse::ModelNotFound(model_name)),
+            PrepareError::Internal(msg) => {
+                HttpResponse::InternalServerError().json(ErrorResponse {
+                    error: ErrorDetail {
+                        message: msg,
+                        error_type: "internal_error".to_string(),
+                    },
+                })
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message())
+    }
+}
+
 /// Used by completion logic to determine how output should be delivered to the client.
 /// Both streaming and non-streaming handlers delegate to the same core logic with different
 /// delivery modes but the same observability instrumentation and stream processing.
-struct CompletionConfig {
-    request_id: String,
-    timeout_duration: std::time::Duration,
-    first_chunk_timeout: Option<std::time::Duration>,
-    stream_config: StreamConfig,
-    turn_context: TurnContext,
-    stream_shutdown_token: tokio_util::sync::CancellationToken,
-    active_requests: Arc<ActiveRequestTracker>,
+pub struct CompletionConfig {
+    pub request_id: String,
+    pub timeout_duration: std::time::Duration,
+    pub first_chunk_timeout: Option<std::time::Duration>,
+    pub stream_config: StreamConfig,
+    pub turn_context: TurnContext,
+    pub stream_shutdown_token: tokio_util::sync::CancellationToken,
+    pub active_requests: Arc<ActiveRequestTracker>,
     // OTel values
-    provider: String,
-    model: String,
-    query_for_otel: String,
-    message_count: usize,
-    response_content: ResponseContent,
+    pub provider: String,
+    pub model: String,
+    pub query_for_otel: String,
+    pub message_count: usize,
+    pub response_content: ResponseContent,
 }
 
 /// Determines how stream output reaches the client.
-enum DeliveryMode {
+pub enum DeliveryMode {
     /// Non-streaming: collect everything, send back via oneshot.
     Collect {
         result_tx: oneshot::Sender<CollectedResult>,
     },
     /// Streaming SSE: send chunks via mpsc.
     Sse {
-        chunk_tx: mpsc::Sender<Result<actix_web::web::Bytes, String>>,
+        chunk_tx: mpsc::Sender<Result<bytes::Bytes, String>>,
         heartbeat_interval: std::time::Duration,
     },
 }
 
 /// Result sent back via oneshot for the non-streaming path.
-struct CollectedResult {
-    outcome: StreamOutcome,
-    usage_state: UsageState,
+pub struct CollectedResult {
+    pub outcome: StreamOutcome,
+    pub usage_state: UsageState,
 }
 
 /// Values needed to build the final JSON response (cloned before spawn).
@@ -117,65 +166,57 @@ struct ResponseContext {
     chat_session_id: String,
 }
 
-/// Build a fresh agent for a request, applying headers_from_request mappings.
+/// Build a fresh agent for a request, applying headers_from_request mappings
+/// and optionally registering additional tools (e.g., CLI tools in standalone mode).
 async fn build_agent_for_request(
     config: &aura_config::Config,
     req_headers: &HashMap<String, String>,
-) -> Result<Arc<aura::Agent>, HttpResponse> {
+    additional_tools: Vec<Box<dyn aura::ToolDyn>>,
+) -> Result<Arc<aura::Agent>, PrepareError> {
     let builder = RigBuilder::new(config.clone());
     let agent = builder
-        .build_agent_with_headers(Some(req_headers))
+        .build_agent(Some(req_headers), additional_tools)
         .await
         .map_err(|e| {
             error!("Failed to build agent: {}", e);
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Failed to build agent: {e}"),
-                    error_type: "internal_error".to_string(),
-                },
-            })
+            PrepareError::Internal(format!("Failed to build agent: {e}"))
         })?;
     Ok(Arc::new(agent))
 }
 
 /// Shared request setup extracted from the incoming ChatCompletionRequest.
 /// Used by both streaming and non-streaming handlers.
-struct RequestSetup {
-    query: String,
-    chat_history: Vec<aura::Message>,
-    streaming_agent: Arc<dyn StreamingAgent>,
-    config: aura_config::Config,
-    completion_id: String,
-    model_str: String,
-    created_timestamp: u64,
-    chat_session_id: String,
+pub struct RequestSetup {
+    pub query: String,
+    pub chat_history: Vec<aura::Message>,
+    pub streaming_agent: Arc<dyn StreamingAgent>,
+    pub config: aura_config::Config,
+    pub completion_id: String,
+    pub model_str: String,
+    pub created_timestamp: u64,
+    pub chat_session_id: String,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
-async fn prepare_request(
-    data: &web::Data<AppState>,
+pub async fn prepare_request(
+    data: &AppState,
     req: &mut ChatCompletionRequest,
     chat_session_id: &str,
     req_headers_map: &HashMap<String, String>,
-) -> Result<RequestSetup, HttpResponse> {
+) -> Result<RequestSetup, PrepareError> {
     // Pop the last message as the query — the remainder becomes chat history
     let query = match req.messages.pop() {
         Some(msg) if msg.role == Role::User => msg.content,
         Some(msg) => {
-            return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Last message must be from user, got: {}", msg.role),
-                    error_type: "invalid_request_error".to_string(),
-                },
-            }));
+            return Err(PrepareError::BadRequest(format!(
+                "Last message must be from user, got: {}",
+                msg.role
+            )));
         }
         None => {
-            return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "messages array is empty".to_string(),
-                    error_type: "invalid_request_error".to_string(),
-                },
-            }));
+            return Err(PrepareError::BadRequest(
+                "messages array is empty".to_string(),
+            ));
         }
     };
 
@@ -193,14 +234,15 @@ async fn prepare_request(
             .iter()
             .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
             .cloned()
-            .ok_or_else(|| {
-                HttpResponse::NotFound().json(ChatCompletionErrorResponse::ModelNotFound(
-                    model_name.to_string(),
-                ))
-            })?
+            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))?
     } else {
-        return Err(HttpResponse::BadRequest().json(ChatCompletionErrorResponse::ModelNotProvided));
+        return Err(PrepareError::BadRequest(
+            "you must provide a model parameter".to_string(),
+        ));
     };
+
+    // Get additional tools from the factory (e.g., CLI tools in standalone mode)
+    let additional_tools = (data.additional_tools)();
 
     // Build the appropriate agent type based on orchestration config
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
@@ -214,16 +256,12 @@ async fn prepare_request(
             .await
             .map_err(|e| {
                 error!("Failed to build streaming agent: {}", e);
-                HttpResponse::InternalServerError().json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: format!("Failed to build streaming agent: {e}"),
-                        error_type: "internal_error".to_string(),
-                    },
-                })
+                PrepareError::Internal(format!("Failed to build streaming agent: {e}"))
             })?
     } else {
-        // Standard path: build Agent, coerce to Arc<dyn StreamingAgent>
-        build_agent_for_request(&config, req_headers_map).await? as Arc<dyn StreamingAgent>
+        // Standard path: build Agent with optional additional tools
+        build_agent_for_request(&config, req_headers_map, additional_tools).await?
+            as Arc<dyn StreamingAgent>
     };
 
     let (provider, model) = streaming_agent.get_provider_info();
@@ -287,7 +325,7 @@ pub async fn chat_completions(
     let mut req = req.into_inner();
     let setup = match prepare_request(&data, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
-        Err(response) => return response,
+        Err(e) => return e.into_http_response(),
     };
 
     if req.stream == Some(true) {
@@ -298,8 +336,8 @@ pub async fn chat_completions(
 }
 
 /// Build configuration for the spawned completion task from AppState and RequestSetup.
-fn build_completion_config(
-    data: &web::Data<AppState>,
+pub fn build_completion_config(
+    data: &AppState,
     setup: &RequestSetup,
     max_tokens: Option<u32>,
     emit_custom_events: bool,
@@ -365,7 +403,11 @@ fn build_completion_config(
 /// Both streaming and non-streaming handlers delegate here. The `delivery` parameter
 /// determines whether output is collected into a oneshot (non-streaming) or streamed
 /// via mpsc (SSE).
-async fn execute_completion(setup: RequestSetup, config: CompletionConfig, delivery: DeliveryMode) {
+pub async fn execute_completion(
+    setup: RequestSetup,
+    config: CompletionConfig,
+    delivery: DeliveryMode,
+) {
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
     let _cancellation = RequestCancellation::register(config.request_id.clone());
     setup
@@ -604,8 +646,7 @@ async fn handle_streaming_completion(
 
     let chat_session_id = setup.chat_session_id.clone();
 
-    let (chunk_tx, rx) =
-        mpsc::channel::<Result<actix_web::web::Bytes, String>>(data.streaming_buffer_size);
+    let (chunk_tx, rx) = mpsc::channel::<Result<bytes::Bytes, String>>(data.streaming_buffer_size);
 
     let heartbeat_interval = std::time::Duration::from_secs(15);
 

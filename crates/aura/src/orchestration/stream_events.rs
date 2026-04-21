@@ -24,13 +24,13 @@
 use crate::orchestration::events::RoutingMode;
 use crate::orchestration::types::PhaseContinuation;
 use crate::stream_events::{AgentContext, CorrelationContext};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Shared context included in every orchestration SSE event.
 ///
 /// Bundles agent identity and correlation IDs (session, trace) to avoid
 /// repeating the same two `#[serde(flatten)]` fields on every variant.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventContext {
     #[serde(flatten)]
     pub agent: AgentContext,
@@ -65,7 +65,7 @@ pub mod event_names {
 ///
 /// These events provide real-time visibility into multi-agent execution
 /// and are emitted alongside standard `AuraStreamEvent`s.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator creates a plan from user query.

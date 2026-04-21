@@ -147,9 +147,14 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Create a new agent from configuration.
+    /// Create a new agent from configuration with optional additional tools.
+    ///
+    /// Pass `vec![]` for `additional_tools` when no extra tools are needed.
+    /// The CLI standalone mode passes local tools (Shell, Read, etc.) here.
+    /// Other applications using Aura as a library can also use this to register custom tools.
     pub async fn new(
         config: &AgentConfig,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &config.mcp {
@@ -270,7 +275,8 @@ impl Agent {
                 // Add tools using the BuilderState helper
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::OpenAI(agent)
@@ -313,7 +319,8 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Anthropic(agent)
@@ -370,7 +377,8 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Bedrock(agent)
@@ -408,7 +416,8 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Gemini(agent)
@@ -461,7 +470,8 @@ impl Agent {
 
                 let builder_state = BuilderState::Initial(agent_builder);
                 let builder_state =
-                    Self::add_all_tools(builder_state, config, &mcp_manager).await?;
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
                 let agent = builder_state.build();
 
                 ProviderAgent::Ollama(agent)
@@ -488,6 +498,7 @@ impl Agent {
         mut builder_state: BuilderState<M>,
         config: &AgentConfig,
         mcp_manager: &Option<Arc<McpManager>>,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
     where
         M: rig::completion::CompletionModel + Send + Sync,
@@ -630,6 +641,12 @@ impl Agent {
             let context_tool =
                 crate::orchestration::GetConversationContextTool::new(history.clone());
             builder_state = builder_state.add_tool(context_tool);
+        }
+
+        // Add additional custom tools (e.g., CLI local tools in standalone mode)
+        if !additional_tools.is_empty() {
+            tracing::info!("Adding {} additional custom tools", additional_tools.len());
+            builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
         Ok(builder_state)
@@ -1157,7 +1174,7 @@ pub async fn build_streaming_agent(
     } else {
         // Standard single-agent mode
         tracing::info!("Building Agent (orchestration.enabled = false)");
-        let agent = Agent::new(config).await?;
+        let agent = Agent::new(config, vec![]).await?;
         Ok(Arc::new(agent))
     }
 }
@@ -1279,7 +1296,7 @@ impl AgentBuilder {
     pub async fn build_agent(&self) -> BuilderResult<Agent> {
         tracing::info!("=== Building Agent ===");
 
-        let agent = Agent::new(&self.config)
+        let agent = Agent::new(&self.config, vec![])
             .await
             .map_err(|e| BuilderError::AgentError(e.to_string()))?;
 

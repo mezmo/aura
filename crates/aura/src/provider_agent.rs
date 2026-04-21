@@ -521,6 +521,20 @@ where
         }
     }
 
+    /// Add multiple dynamic tools to the agent builder.
+    ///
+    /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding
+    /// tools from external crates that implement `rig::tool::Tool`.
+    pub fn add_tools_dyn(self, tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> BuilderState<M> {
+        if tools.is_empty() {
+            return self;
+        }
+        match self {
+            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tools(tools)),
+            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tools(tools)),
+        }
+    }
+
     /// Build the final agent.
     pub fn build(self) -> rig::agent::Agent<M> {
         match self {
