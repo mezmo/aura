@@ -17,12 +17,6 @@
 #   Orchestrated:  "Calculate the mean of [10, 20, 30] then multiply the result by 3"
 #   Clarification: "Compute the thing"
 
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.1"
-reasoning_effort = "medium"
-
 [agent]
 name = "Math Orchestrator"
 system_prompt = """
@@ -34,6 +28,12 @@ ROUTING GUIDANCE:
 - Multi-step calculations or mixed domains: create a plan with workers
 - Vague or ambiguous requests: ask for clarification
 """
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+reasoning_effort = "medium"
 
 [mcp]
 sanitize_schemas = false

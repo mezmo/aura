@@ -18,18 +18,6 @@
 #   Orchestrated:  "Calculate the mean of [10, 20, 30] then multiply the result by 3"
 #   Clarification: "Compute the thing"
 
-[llm]
-provider = "openai"
-api_key = "no-key-needed"
-base_url = "http://localhost:11435/v1"
-# model = "gpt-5.1"
-model = "qwen3-coder-64k-p2"
-# model = "deepseek-r1:32b"
-temperature = 0.3
-
-# [llm.additional_params]
-# think = true  # only works in streaming mode; breaks worker (non-streaming) calls
-
 [agent]
 name = "Math Orchestrator"
 system_prompt = """
@@ -41,6 +29,18 @@ ROUTING GUIDANCE:
 - Multi-step calculations or mixed domains: create a plan with workers
 - Vague or ambiguous requests: ask for clarification
 """
+
+[agent.llm]
+provider = "openai"
+api_key = "no-key-needed"
+base_url = "http://localhost:11435/v1"
+# model = "gpt-5.1"
+model = "qwen3-coder-64k-p2"
+# model = "deepseek-r1:32b"
+temperature = 0.3
+
+# [agent.llm.additional_params]
+# think = true  # only works in streaming mode; breaks worker (non-streaming) calls
 
 [mcp]
 sanitize_schemas = false

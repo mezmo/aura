@@ -17,12 +17,6 @@
 #   Orchestrated:  "Calculate the mean of [10, 20, 30] then multiply the result by 3"
 #   Clarification: "Compute the thing"
 
-[llm]
-provider = "anthropic"
-api_key = "{{ env.ANTHROPIC_API_KEY }}"
-model = "claude-sonnet-4-5-20250929"
-temperature = 0.3
-
 [agent]
 name = "Math Orchestrator"
 system_prompt = """
@@ -34,6 +28,12 @@ ROUTING GUIDANCE:
 - Multi-step calculations or mixed domains: create a plan with workers
 - Vague or ambiguous requests: ask for clarification
 """
+
+[agent.llm]
+provider = "anthropic"
+api_key = "{{ env.ANTHROPIC_API_KEY }}"
+model = "claude-sonnet-4-5-20250929"
+temperature = 0.3
 
 [mcp]
 sanitize_schemas = false

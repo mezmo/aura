@@ -487,6 +487,14 @@ impl Orchestrator {
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
 
+        // Resolve per-worker LLM override (falls back to [agent.llm] when absent)
+        if let Some(override_llm) = worker_name
+            .and_then(|name| self.config.workers.get(name))
+            .and_then(|w| w.llm.as_ref())
+        {
+            worker_config.llm = override_llm.clone();
+        }
+
         // Configure worker based on assignment
         if let Some(name) = worker_name {
             let worker = self.config.get_worker(name).ok_or_else(|| {
@@ -603,7 +611,7 @@ impl Orchestrator {
             mcp_manager: self.mcp_manager.clone(),
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
-            context_window: None,
+            context_window: worker_config.llm.context_window(),
         };
 
         Ok(AgentWithPreamble { agent, preamble })
@@ -5100,6 +5108,7 @@ mod tests {
                 mcp_filter: vec!["mezmo_*".to_string()],
                 vector_stores: vec![],
                 turn_depth: None,
+                llm: None,
             },
         );
         workers.insert(
@@ -5110,6 +5119,7 @@ mod tests {
                 mcp_filter: vec![],
                 vector_stores: vec![],
                 turn_depth: None,
+                llm: None,
             },
         );
 
@@ -5424,6 +5434,7 @@ Provide the synthesized response:"#,
                 mcp_filter: vec!["mezmo_*".to_string()],
                 vector_stores: vec![], // No RAG for operations
                 turn_depth: None,
+                llm: None,
             },
         );
         workers.insert(
@@ -5434,6 +5445,7 @@ Provide the synthesized response:"#,
                 mcp_filter: vec![],                            // No MCP tools
                 vector_stores: vec!["mezmo_docs".to_string()], // RAG access
                 turn_depth: None,
+                llm: None,
             },
         );
 
@@ -5496,6 +5508,7 @@ Provide the synthesized response:"#,
                 mcp_filter: vec![],
                 vector_stores: vec!["docs".to_string()],
                 turn_depth: None,
+                llm: None,
             },
         );
 
@@ -5508,6 +5521,7 @@ Provide the synthesized response:"#,
                 mcp_filter: vec![],
                 vector_stores: vec!["kb".to_string(), "runbooks".to_string()],
                 turn_depth: None,
+                llm: None,
             },
         );
 
@@ -5520,6 +5534,7 @@ Provide the synthesized response:"#,
                 mcp_filter: vec!["mezmo_*".to_string()],
                 vector_stores: vec![], // Explicitly no RAG access
                 turn_depth: None,
+                llm: None,
             },
         );
 
@@ -5651,6 +5666,7 @@ Provide the synthesized response:"#,
                 mcp_filter: vec![],
                 vector_stores: vec!["worker_store".to_string()],
                 turn_depth: None,
+                llm: None,
             },
         );
 

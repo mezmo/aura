@@ -18,18 +18,6 @@
 #   Orchestrated:  "Discover workloads in production, check Prometheus targets, create ServiceMonitors for unmonitored services"
 #   Clarification: "Fix the monitoring"
 
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.1"
-temperature = 0.3
-
-# --- ollama config (commented out) ---
-# provider = "ollama"
-# model = "qwen3-coder:30b"
-# [llm.additional_params]
-# num_ctx = 262144
-
 [agent]
 name = "SRE Orchestrator"
 system_prompt = """
@@ -43,6 +31,18 @@ ROUTING GUIDANCE:
 - Multi-domain tasks (e.g., discover then monitor): create a plan with multiple workers
 - Simple factual questions about the cluster: answer directly if possible
 """
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+temperature = 0.3
+
+# --- ollama config (commented out) ---
+# provider = "ollama"
+# model = "qwen3-coder:30b"
+# [agent.llm.additional_params]
+# num_ctx = 262144
 
 [mcp]
 sanitize_schemas = false

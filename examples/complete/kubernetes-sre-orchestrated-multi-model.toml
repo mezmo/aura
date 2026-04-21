@@ -1,0 +1,134 @@
+# Orchestrated Kubernetes SRE agent — K8s cluster operations + Prometheus monitoring.
+# Inspects workloads, queries metrics, and assists with cluster troubleshooting.
+# Uses different models for the workers than the main agent uses!
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   Kubernetes context configured (kubectl access)
+#   Start the K8s MCP server:
+#     npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+#   export PROMETHEUS_URL="http://localhost:9090"
+#   Start the Prometheus MCP server:
+#     docker run -i --rm -e PROMETHEUS_URL -e PROMETHEUS_MCP_SERVER_TRANSPORT=http \
+#       -e PROMETHEUS_MCP_BIND_PORT=8082 -p 8082:8082 ghcr.io/pab1it0/prometheus-mcp-server:latest
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/kubernetes-sre-orchestrated-multi-model.toml cargo run --bin aura-web-server
+
+[agent]
+name = "Kubernetes SRE Agent (Orchestrated)"
+system_prompt = """
+You are an SRE assistant coordinator. You decompose Kubernetes observability
+tasks into specialized sub-tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Workload discovery, health checks, namespace listing, service inspection: delegate to k8s-discovery
+- Prometheus queries, target health, metrics, metric metadata: delegate to prometheus-analyst
+- Simple factual questions about the cluster: answer directly if possible
+"""
+
+[agent.llm]
+provider = "openai"
+context_window = 200_000
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.4"
+
+# --- ollama config (commented out) ---
+# provider = "ollama"
+# model = "qwen3-coder:30b"
+# [agent.llm.additional_params]
+# num_ctx = 262144
+
+[mcp]
+sanitize_schemas = false
+
+# Kubernetes — cluster inspection and management
+# https://github.com/containers/kubernetes-mcp-server
+# Start with: npx -y kubernetes-mcp-server@latest --port 8081 --read-only
+[mcp.servers.kubernetes]
+transport = "http_streamable"
+url = "http://localhost:8081/mcp"
+description = "Kubernetes SRE tools: cluster discovery, Prometheus metrics, Alertmanager rules, and ServiceMonitor management"
+
+# Prometheus — metrics and alerting
+# https://github.com/pab1it0/prometheus-mcp-server
+# Start with the docker command in the Prerequisites above.
+[mcp.servers.prometheus]
+transport = "http_streamable"
+url = "http://localhost:8082/mcp"
+description = "Prometheus metrics queries and alert status"
+
+# Tools Configuration - minimal filesystem access
+[tools]
+filesystem = true
+custom_tools = []
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+quality_threshold = 0.7
+memory_dir = "/tmp/aura-multi-model-observability-orchestration"
+
+allow_direct_answers = true
+allow_clarification = true
+
+tools_in_planning = "full"
+
+[orchestration.timeouts]
+per_call_timeout_secs = 180
+
+# Kubernetes worker
+[orchestration.worker.k8s-discovery]
+description = "Kubernetes workload and service discovery: list namespaces, workloads, services, and inspect details"
+turn_depth = 8
+mcp_filter = [
+  "configuration_contexts_list",
+  "configuration_view",
+  "events_list",
+  "namespaces_list",
+  "nodes_log",
+  "nodes_stats_summary",
+  "nodes_top",
+  "pods_get",
+  "pods_list",
+  "pods_list_in_namespace",
+  "pods_log",
+  "pods_top",
+  "resources_get",
+  "resources_list",
+]
+preamble = """
+You are a Kubernetes Discovery Specialist. Use your tools to explore the cluster.
+Always use tools — do not guess or fabricate cluster state.
+Report workload names, kinds, replicas, labels, ports, and annotations.
+"""
+
+[orchestration.worker.k8s-discovery.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+context_window = 128_000
+
+# Prometheus analysis worker
+[orchestration.worker.prometheus-analyst]
+description = "Prometheus metrics analysis: query metrics, check targets, inspect metadata and labels"
+turn_depth = 8
+mcp_filter = [
+  "health_check",
+  "execute_query",
+  "execute_range_query",
+  "list_metrics",
+  "get_metric_metadata",
+  "get_targets",
+]
+preamble = """
+You are a Prometheus Analyst. Use your tools to query and analyze metrics.
+Always call the appropriate tool — do not fabricate metric values.
+Report query results clearly with metric names, labels, and values.
+"""
+
+[orchestration.worker.prometheus-analyst.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4o"
+context_window = 128_000

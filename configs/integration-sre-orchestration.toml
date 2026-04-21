@@ -3,12 +3,6 @@
 # Exercises multi-worker Kubernetes observability workflow:
 # discover workloads → detect metrics → configure ServiceMonitors → query Prometheus → alert
 
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.1"
-temperature = 0.3
-
 [agent]
 name = "SRE Orchestrator Test"
 system_prompt = """
@@ -23,6 +17,12 @@ ROUTING GUIDANCE:
 - Simple factual questions about the cluster: answer directly if possible
 """
 turn_depth = 8
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+temperature = 0.3
 
 [mcp]
 sanitize_schemas = true

@@ -12,12 +12,13 @@
 #   export AWS_REGION="us-east-1"
 #   CONFIG_PATH=examples/minimal/bedrock.toml cargo run --bin aura-web-server
 
-[llm]
+[agent]
+name = "Bedrock Assistant"
+system_prompt = "You are a helpful assistant."
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "{{ env.AWS_REGION }}"
 # profile = "default"  # optional AWS profile name
 
-[agent]
-name = "Bedrock Assistant"
-system_prompt = "You are a helpful assistant."

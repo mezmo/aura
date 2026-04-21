@@ -545,6 +545,7 @@ Always verify your calculations before reporting results."
                 mcp_filter: vec!["mock_tool".to_string()],
                 vector_stores: vec![],
                 turn_depth: None,
+                llm: None,
             },
         );
         workers.insert(
@@ -568,6 +569,7 @@ TOOL USAGE:
                 mcp_filter: vec!["list_files".to_string(), "chain_tool".to_string()],
                 vector_stores: vec![],
                 turn_depth: None,
+                llm: None,
             },
         );
 

@@ -1,13 +1,6 @@
 # Minimal Test Configuration for CI/CD
 # This config uses only publicly available services and minimal dependencies
 
-# LLM Configuration
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.1"
-temperature = 0.0
-
 # MCP Configuration - Mock MCP server for tool execution tests
 # URLs use environment variables with defaults for local development.
 # In containers, set MCP_MOCK_HOST=mock-mcp to use Docker service names.
@@ -83,3 +76,11 @@ EXAMPLES:
 - "Say hello" → Respond with text (no tool needed)
 """
 turn_depth = 3 # Lower depth for faster tests
+
+# LLM Configuration
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+temperature = 0.0
+

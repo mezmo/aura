@@ -4,20 +4,6 @@ mod tests {
     use aura::ReasoningEffort;
 
     const TEST_CONFIG: &str = r#"
-[llm]
-provider = "openai"
-api_key = "test_openai_key"
-model = "gpt-4o-mini"
-base_url = "https://api.openai.com/v1"
-reasoning_effort = "medium"
-max_tokens = 1000
-context_window = 200000
-temperature = 0.5
-
-[llm.additional_params.thinking]
-type = "enabled"
-budget_tokens = 8000
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -59,6 +45,21 @@ custom_tools = ["calculator", "web_search"]
 name = "Test Assistant"
 system_prompt = "You are a test assistant."
 context = ["Context line 1", "Context line 2"]
+
+[agent.llm]
+provider = "openai"
+api_key = "test_openai_key"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+reasoning_effort = "medium"
+max_tokens = 1000
+context_window = 200000
+temperature = 0.5
+
+[agent.llm.additional_params.thinking]
+type = "enabled"
+budget_tokens = 8000
+
 "#;
 
     #[test]
@@ -71,7 +72,7 @@ context = ["Context line 1", "Context line 2"]
 
         // Test LLM config
         println!("\n✅ Testing LLM config...");
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::OpenAI {
                 api_key,
                 model,
@@ -224,11 +225,6 @@ context = ["Context line 1", "Context line 2"]
     fn test_minimal_config() {
         println!("\n=== TEST_MINIMAL_CONFIG ===");
         let minimal_config = r#"
-[llm]
-provider = "anthropic"
-api_key = "test_key"
-model = "claude-3-sonnet-20240229"
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -241,6 +237,12 @@ api_key = "embed_key"
 [agent]
 name = "Minimal Agent"
 system_prompt = "Basic prompt"
+
+[agent.llm]
+provider = "anthropic"
+api_key = "test_key"
+model = "claude-3-sonnet-20240229"
+
 "#;
 
         let config = load_config_from_str(minimal_config).expect("Failed to parse minimal config");
@@ -249,7 +251,7 @@ system_prompt = "Basic prompt"
         println!("{config:#?}");
 
         println!("\n✅ Testing minimal config assertions...");
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Anthropic {
                 model, temperature, ..
             } => {
@@ -267,11 +269,6 @@ system_prompt = "Basic prompt"
     fn test_config_validation() {
         // Test config with missing API key (should fail validation)
         let invalid_config = r#"
-[llm]
-provider = "openai"
-api_key = ""
-model = "gpt-4"
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -284,6 +281,12 @@ api_key = "valid_key"
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = ""
+model = "gpt-4"
+
 "#;
 
         let result = load_config_from_str(invalid_config);
@@ -291,11 +294,6 @@ system_prompt = "Test"
 
         // Test config with missing embedding API key (should fail validation)
         let invalid_config2 = r#"
-[llm]
-provider = "openai"
-api_key = "valid_key"
-model = "gpt-4"
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -308,6 +306,12 @@ api_key = ""
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "valid_key"
+model = "gpt-4"
+
 "#;
 
         let result2 = load_config_from_str(invalid_config2);
@@ -318,11 +322,6 @@ system_prompt = "Test"
     fn test_environment_variable_placeholders() {
         println!("\n=== TEST_ENVIRONMENT_VARIABLE_PLACEHOLDERS ===");
         let env_config = r#"
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-4"
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -340,6 +339,12 @@ headers = { Authorization = "Bearer {{ env.TEST_API_KEY }}" }
 [agent]
 name = "Env Test"
 system_prompt = "Test with env vars"
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-4"
+
 "#;
 
         // This should work with environment variable resolution
@@ -363,7 +368,7 @@ system_prompt = "Test with env vars"
         println!("{config:#?}");
 
         println!("\n✅ Testing environment variable resolution...");
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::OpenAI { api_key, .. } => {
                 assert_eq!(api_key, "mock_openai_key");
             }
@@ -402,10 +407,6 @@ system_prompt = "Test with env vars"
         // Ollama with default base_url (localhost:11434)
         // Note: Ollama doesn't require an API key
         let ollama_config = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -418,6 +419,11 @@ api_key = "test_key"
 [agent]
 name = "Ollama Agent"
 system_prompt = "You are a helpful assistant."
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
 
         let config = load_config_from_str(ollama_config).expect("Failed to parse Ollama config");
@@ -426,7 +432,7 @@ system_prompt = "You are a helpful assistant."
         println!("{config:#?}");
 
         println!("\n✅ Testing Ollama config assertions...");
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Ollama {
                 model, base_url, ..
             } => {
@@ -445,12 +451,6 @@ system_prompt = "You are a helpful assistant."
         println!("\n=== TEST_OLLAMA_CONFIG_CUSTOM_URL ===");
         // Ollama with custom base_url
         let ollama_config = r#"
-[llm]
-provider = "ollama"
-model = "mistral"
-base_url = "http://my-ollama-server:11434"
-temperature = 0.8
-
 [[vector_stores]]
 name = "default"
 type = "in_memory"
@@ -463,6 +463,13 @@ api_key = "test_key"
 [agent]
 name = "Remote Ollama Agent"
 system_prompt = "You are a remote assistant."
+
+[agent.llm]
+provider = "ollama"
+model = "mistral"
+base_url = "http://my-ollama-server:11434"
+temperature = 0.8
+
 "#;
 
         let config =
@@ -472,7 +479,7 @@ system_prompt = "You are a remote assistant."
         println!("{config:#?}");
 
         println!("\n✅ Testing Ollama custom URL config assertions...");
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Ollama {
                 model,
                 base_url,
@@ -491,26 +498,27 @@ system_prompt = "You are a remote assistant."
     fn test_ollama_config_with_additional_params() {
         println!("\n=== TEST_OLLAMA_CONFIG_WITH_ADDITIONAL_PARAMS ===");
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "ollama"
 model = "llama3.2"
 
-[llm.additional_params]
+[agent.llm.additional_params]
 mirostat = 1
 seed = 42
 top_k = 40
 top_p = 0.9
 
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
 
         println!("\n🔍 Ollama Config with additional_params:");
         println!("{config:#?}");
 
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Ollama {
                 additional_params, ..
             } => {
@@ -535,16 +543,17 @@ system_prompt = "Test"
         }
 
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
-[llm.additional_params]
-seed = "{{ env.TEST_SEED }}"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
+[agent.llm.additional_params]
+seed = "{{ env.TEST_SEED }}"
+
 "#;
 
         use crate::resolve_env_vars;
@@ -558,7 +567,7 @@ system_prompt = "Test"
         println!("\n🔍 Config after env var resolution:");
         println!("{config:#?}");
 
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Ollama {
                 additional_params, ..
             } => {
@@ -582,20 +591,21 @@ system_prompt = "Test"
         println!("\n=== TEST_OLLAMA_CONFIG_BACKWARDS_COMPATIBLE ===");
         // Minimal Ollama config without any new fields - should still work
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
 
         println!("\n🔍 Backwards compatible Ollama Config:");
         println!("{config:#?}");
 
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Ollama {
                 model,
                 additional_params,
@@ -611,14 +621,15 @@ system_prompt = "Test"
     #[test]
     fn test_alias_field_parsing() {
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 alias = "my-alias"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
         assert_eq!(config.agent.alias, Some("my-alias".to_string()));
@@ -627,13 +638,14 @@ system_prompt = "Test"
     #[test]
     fn test_alias_field_defaults_to_none() {
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
         assert_eq!(config.agent.alias, None);
@@ -648,13 +660,14 @@ system_prompt = "Test"
         write!(
             f,
             r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Agent1"
 system_prompt = "Hello"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#
         )
         .unwrap();
@@ -674,13 +687,14 @@ system_prompt = "Hello"
             write!(
                 f,
                 r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "{agent_name}"
 system_prompt = "Hello"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#
             )
             .unwrap();
@@ -764,13 +778,14 @@ system_prompt = "Hello"
     #[test]
     fn test_created_at_defaults_to_current_time() {
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -791,14 +806,15 @@ system_prompt = "Test"
     #[test]
     fn test_created_at_explicit_value() {
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
 created_at = 1677649963000
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
         assert_eq!(config.agent.created_at, 1677649963000);
@@ -807,13 +823,14 @@ created_at = 1677649963000
     #[test]
     fn test_model_owner_defaults_to_none() {
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
         assert_eq!(config.agent.model_owner, None);
@@ -822,14 +839,15 @@ system_prompt = "Test"
     #[test]
     fn test_model_owner_explicit_value() {
         let config_str = r#"
-[llm]
-provider = "ollama"
-model = "llama3.2"
-
 [agent]
 name = "Test"
 system_prompt = "Test"
 model_owner = "mezmo"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
         assert_eq!(config.agent.model_owner, Some("mezmo".to_string()));
@@ -839,28 +857,29 @@ model_owner = "mezmo"
     fn test_ollama_config_all_params() {
         println!("\n=== TEST_OLLAMA_CONFIG_ALL_PARAMS ===");
         let config_str = r#"
-[llm]
+[agent]
+name = "Full Ollama Agent"
+system_prompt = "You are helpful."
+
+[agent.llm]
 provider = "ollama"
 model = "llama3.2"
 base_url = "http://localhost:11434"
 fallback_tool_parsing = true
 temperature = 0.7
 
-[llm.additional_params]
+[agent.llm.additional_params]
 num_ctx = 4096
 num_predict = 1024
 seed = 42
 
-[agent]
-name = "Full Ollama Agent"
-system_prompt = "You are helpful."
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
 
         println!("\n🔍 Ollama Config with all params:");
         println!("{config:#?}");
 
-        match &config.llm {
+        match &config.agent.llm {
             aura::config::LlmConfig::Ollama {
                 model,
                 base_url,
@@ -891,69 +910,61 @@ system_prompt = "You are helpful."
     #[test]
     fn test_context_window_deserializes_from_toml() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4o"
 context_window = 200000
 
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
-        assert_eq!(config.llm.context_window(), Some(200_000));
+        assert_eq!(config.agent.llm.context_window(), Some(200_000));
     }
 
     #[test]
     fn test_context_window_defaults_to_none() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4o"
 
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
-        assert_eq!(config.llm.context_window(), None);
+        assert_eq!(config.agent.llm.context_window(), None);
     }
 
     #[test]
     fn test_context_window_accepts_float() {
         // Helm renders integers as floats (e.g. 200000.0)
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4o"
 context_window = 200000.0
 
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
-        assert_eq!(config.llm.context_window(), Some(200_000));
+        assert_eq!(config.agent.llm.context_window(), Some(200_000));
     }
 
     #[test]
     fn test_removed_agent_configs_caught() {
         // The old agent-level fields should now cause the parsing to fail
-        // so the user is aware of the breaking changes
-        let valid_config_str = r#"
-[llm]
-provider = "openai"
-api_key = "test_key"
-model = "gpt-4o"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
-"#;
-
+        // so the user is aware of the breaking changes.
         let test_cases = [
             ("temperature", "temperature = 0.5"),
             ("max_tokens", "max_tokens = 1000"),
@@ -967,18 +978,20 @@ system_prompt = "Test"
 
         for (removed_field, definition) in test_cases {
             let expected_error = format!("unknown field `{removed_field}`");
-            let config_str = String::from(valid_config_str) + "\n" + definition;
-
-            let config = load_config_from_str(&config_str);
-            assert!(
-                config.is_err(),
-                "config parsing should fail due to removed agent-level field"
+            // Inject the removed field inline in [agent], with [agent.llm] after it.
+            let config_str = format!(
+                "\n[agent]\nname = \"Test\"\nsystem_prompt = \"Test\"\n{definition}\n\n\
+                 [agent.llm]\nprovider = \"openai\"\napi_key = \"test_key\"\nmodel = \"gpt-4o\"\n"
             );
+            let err_str = match load_config_from_str(&config_str) {
+                Ok(_) => panic!(
+                    "config parsing should fail due to removed agent-level field: {removed_field}"
+                ),
+                Err(e) => e.to_string(),
+            };
             assert!(
-                config
-                    .unwrap_err()
-                    .to_string()
-                    .contains(expected_error.as_str())
+                err_str.contains(expected_error.as_str()),
+                "expected error about `{removed_field}`, got: {err_str}"
             );
         }
     }
@@ -986,24 +999,192 @@ system_prompt = "Test"
     #[test]
     fn test_no_additional_properties_on_llm() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4o"
 random_field = "should not be accepted"
 
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
 
-        let config = load_config_from_str(&config_str);
+        let config = load_config_from_str(config_str);
         assert!(config.is_err(), "no additional fields allowed");
         assert!(
             config
                 .unwrap_err()
                 .to_string()
                 .contains("unknown field `random_field`")
+        );
+    }
+
+    #[test]
+    fn test_worker_without_llm_inherits_from_agent() {
+        let config_str = r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "coordinator_key"
+model = "gpt-5.1"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.math]
+description = "Does math"
+preamble = "You do math."
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        let orch = config.orchestration.expect("orchestration should be set");
+        let worker = orch.workers.get("math").expect("math worker should exist");
+        assert!(
+            worker.llm.is_none(),
+            "worker without [llm] override should have llm = None"
+        );
+    }
+
+    #[test]
+    fn test_worker_with_explicit_llm_override() {
+        let config_str = r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "coordinator_key"
+model = "gpt-5.1"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.formatter]
+description = "Formats output"
+preamble = "You format."
+
+[orchestration.worker.formatter.llm]
+provider = "anthropic"
+api_key = "worker_key"
+model = "claude-haiku-4-5-20251001"
+context_window = 200000
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        let orch = config.orchestration.expect("orchestration should be set");
+        let worker = orch
+            .workers
+            .get("formatter")
+            .expect("formatter worker should exist");
+        let worker_llm = worker
+            .llm
+            .as_ref()
+            .expect("worker should have explicit llm override");
+        match worker_llm {
+            aura::config::LlmConfig::Anthropic {
+                model,
+                context_window,
+                ..
+            } => {
+                assert_eq!(model, "claude-haiku-4-5-20251001");
+                assert_eq!(*context_window, Some(200_000));
+            }
+            _ => panic!("expected Anthropic worker override"),
+        }
+    }
+
+    #[test]
+    fn test_all_shipped_configs_parse() {
+        // Set env vars every shipped config expects so env resolution succeeds.
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test-openai");
+            std::env::set_var("ANTHROPIC_API_KEY", "test-anthropic");
+            std::env::set_var("GOOGLE_API_KEY", "test-google");
+            std::env::set_var("MEZMO_API_KEY", "test-mezmo");
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_PROFILE", "default");
+            std::env::set_var("LLM_PROVIDER", "openai");
+            std::env::set_var("LLM_API_KEY", "test-key");
+            std::env::set_var("LLM_MODEL", "gpt-4o");
+            std::env::set_var("DD_API_KEY", "test-dd-api");
+            std::env::set_var("DD_APPLICATION_KEY", "test-dd-app");
+            std::env::set_var("PAGERDUTY_API_TOKEN", "test-pagerduty");
+            std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", "test-github");
+            std::env::set_var("MCP_TOKEN", "test-mcp");
+        }
+
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+
+        let dirs = [
+            repo_root.join("configs"),
+            repo_root.join("examples/minimal"),
+            repo_root.join("examples/complete"),
+            repo_root.join("examples/quickstart"),
+        ];
+        let single_files = [
+            repo_root.join("examples/reference.toml"),
+            repo_root.join("crates/aura-web-server/tests/test-config.toml"),
+        ];
+
+        let mut failures = Vec::new();
+
+        for dir in &dirs {
+            for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}")) {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                if let Err(e) = crate::load_config(&path) {
+                    failures.push(format!("{}: {e}", path.display()));
+                }
+            }
+        }
+        for path in &single_files {
+            if let Err(e) = crate::load_config(path) {
+                failures.push(format!("{}: {e}", path.display()));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Some shipped configs failed to parse:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_legacy_top_level_llm_produces_migration_error() {
+        let legacy_config = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let err = load_config_from_str(legacy_config)
+            .expect_err("legacy top-level [llm] should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy top-level [llm]"),
+            "error should mention legacy top-level [llm]: {msg}"
+        );
+        assert!(
+            msg.contains("[agent.llm]"),
+            "error should tell the user to move it under [agent.llm]: {msg}"
         );
     }
 }

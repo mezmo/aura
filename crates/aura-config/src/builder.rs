@@ -22,7 +22,7 @@ impl RigBuilder {
     }
 
     fn to_agent_config(&self) -> Result<AgentConfig, ConfigError> {
-        let llm = self.config.llm.clone();
+        let llm = self.config.agent.llm.clone();
 
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
@@ -110,6 +110,7 @@ impl RigBuilder {
                             mcp_filter: worker.mcp_filter.clone(),
                             vector_stores: worker.vector_stores.clone(),
                             turn_depth: worker.turn_depth,
+                            llm: worker.llm.clone(),
                         },
                     )
                 })

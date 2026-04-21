@@ -11,7 +11,12 @@
 #
 # See docs/ollama-guide.md for model recommendations and caveats.
 
-[llm]
+[agent]
+name = "Local Assistant"
+system_prompt = "You are a helpful assistant."
+turn_depth = 5
+
+[agent.llm]
 provider = "ollama"
 model = "qwen3:30b-a3b"
 # base_url = "http://localhost:11434"  # default; uncomment to override
@@ -24,14 +29,10 @@ fallback_tool_parsing = true
 
 # Optional Ollama-specific parameters.
 # See: https://github.com/ollama/ollama/blob/main/docs/modelfile.md
-[llm.additional_params]
+[agent.llm.additional_params]
 # Context window size in tokens. Set this to match your model's
 # capacity and available VRAM. Larger values use more memory.
 num_ctx = 32000
 # seed = 42
 # top_p = 0.95
 
-[agent]
-name = "Local Assistant"
-system_prompt = "You are a helpful assistant."
-turn_depth = 5

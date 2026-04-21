@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("│                    🤖 SIMPLE AGENT                      │");
         println!("│                                                         │");
 
-        let (provider, model) = match &config.llm {
+        let (provider, model) = match &config.agent.llm {
             aura::config::LlmConfig::OpenAI { model, .. } => ("openai", model.clone()),
             aura::config::LlmConfig::Anthropic { model, .. } => ("anthropic", model.clone()),
             aura::config::LlmConfig::Bedrock { model, .. } => ("bedrock", model.clone()),

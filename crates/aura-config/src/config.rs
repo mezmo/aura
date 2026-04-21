@@ -5,7 +5,6 @@ use std::collections::HashMap;
 /// Root configuration structure for our POC
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Config {
-    pub llm: LlmConfig,
     pub mcp: Option<McpConfig>,
     /// Vector stores for RAG - optional, defaults to empty
     #[serde(default)]
@@ -33,6 +32,15 @@ pub struct WorkerConfig {
     /// Per-worker turn depth limit (overrides [agent].turn_depth).
     #[serde(default)]
     pub turn_depth: Option<usize>,
+    /// Optional per-worker LLM override.
+    ///
+    /// When set, the worker uses this LLM configuration instead of inheriting
+    /// `[agent.llm]`. This enables mixed-model orchestration — e.g. using a
+    /// cheaper model for simple tasks and a stronger one for complex analysis.
+    /// `context_window` comes from the resolved LLM, so worker budget math is
+    /// scoped to whichever model the worker actually runs.
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
 }
 
 /// Timeout configuration for orchestration (aura-config side).
@@ -261,7 +269,7 @@ impl Config {
     ///
     /// This is only supported for Ollama models.
     pub fn is_fallback_tool_parsing_enabled(&self) -> bool {
-        self.llm.is_fallback_tool_parsing_enabled()
+        self.agent.llm.is_fallback_tool_parsing_enabled()
     }
 }
 /// MCP servers configuration
@@ -378,6 +386,12 @@ pub struct AgentConfig {
     /// Example: `mcp_filter = ["sin", "cos", "degreesToRadians"]`
     #[serde(default)]
     pub mcp_filter: Option<Vec<String>>,
+    /// LLM configuration for this agent.
+    ///
+    /// Parsed from the `[agent.llm]` TOML table. Workers inherit this config
+    /// when no `[orchestration.worker.<name>.llm]` is provided.
+    #[serde(default)]
+    pub llm: LlmConfig,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -402,6 +416,7 @@ impl Default for AgentConfig {
             created_at: default_created_at(),
             model_owner: None,
             mcp_filter: None,
+            llm: LlmConfig::default(),
         }
     }
 }
@@ -416,7 +431,7 @@ impl Config {
 
     /// Get provider name and model for response formatting.
     pub fn get_provider_info(&self) -> (&str, &str) {
-        match &self.llm {
+        match &self.agent.llm {
             LlmConfig::OpenAI { model, .. } => ("openai", model),
             LlmConfig::Anthropic { model, .. } => ("anthropic", model),
             LlmConfig::Bedrock { model, .. } => ("bedrock", model),
@@ -432,22 +447,13 @@ impl Config {
 
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
-        // Basic validation - check API key for OpenAI/Anthropic, skip for Bedrock
-        match &self.llm {
-            LlmConfig::OpenAI { api_key, .. }
-            | LlmConfig::Anthropic { api_key, .. }
-            | LlmConfig::Gemini { api_key, .. } => {
-                if api_key.is_empty() {
-                    return Err(crate::ConfigError::Validation(
-                        "LLM API key is required".to_string(),
-                    ));
+        validate_llm_api_key(&self.agent.llm, "agent.llm")?;
+
+        if let Some(orch) = &self.orchestration {
+            for (name, worker) in &orch.workers {
+                if let Some(worker_llm) = &worker.llm {
+                    validate_llm_api_key(worker_llm, &format!("orchestration.worker.{name}.llm"))?;
                 }
-            }
-            LlmConfig::Bedrock { .. } => {
-                // Bedrock uses AWS credentials, no API key needed
-            }
-            LlmConfig::Ollama { .. } => {
-                // Ollama runs locally, no API key needed
             }
         }
 
@@ -463,4 +469,20 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
+    match llm {
+        LlmConfig::OpenAI { api_key, .. }
+        | LlmConfig::Anthropic { api_key, .. }
+        | LlmConfig::Gemini { api_key, .. } => {
+            if api_key.is_empty() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "LLM API key is required for [{location}]"
+                )));
+            }
+        }
+        LlmConfig::Bedrock { .. } | LlmConfig::Ollama { .. } => {}
+    }
+    Ok(())
 }

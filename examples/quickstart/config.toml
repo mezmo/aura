@@ -8,15 +8,6 @@
 # ── LLM Provider ────────────────────────────────────────────────────
 # Provider, model, and API key are set in .env — no changes needed here.
 
-[llm]
-provider = "{{ env.LLM_PROVIDER }}"
-api_key = "{{ env.LLM_API_KEY }}"
-model = "{{ env.LLM_MODEL }}"
-# base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama
-# fallback_tool_parsing = true            # Uncomment for Ollama
-
-# ── Agent ───────────────────────────────────────────────────────────
-
 [agent]
 name = "Aura Assistant"
 # alias = "aura"  # optional: stable identifier for model selection by clients
@@ -52,3 +43,13 @@ turn_depth = 5
 # provider = "openai"
 # model = "text-embedding-3-small"
 # api_key = "{{ env.OPENAI_API_KEY }}"
+
+[agent.llm]
+provider = "{{ env.LLM_PROVIDER }}"
+api_key = "{{ env.LLM_API_KEY }}"
+model = "{{ env.LLM_MODEL }}"
+# base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama
+# fallback_tool_parsing = true            # Uncomment for Ollama
+
+# ── Agent ───────────────────────────────────────────────────────────
+
