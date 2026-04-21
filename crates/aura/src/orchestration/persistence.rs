@@ -58,10 +58,8 @@ pub struct RunManifest {
     pub goal: String,
     /// Overall run outcome.
     pub status: RunStatus,
-    /// Number of plan-execute-evaluate cycles.
+    /// Number of plan-execute cycles.
     pub iterations: usize,
-    /// Final quality evaluation score (if evaluation ran).
-    pub quality_score: Option<f32>,
     /// How the coordinator routed this query.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<RoutingMode>,
@@ -340,63 +338,6 @@ impl ExecutionPersistence {
         Ok(iter_path)
     }
 
-    /// Write evaluation phase artifacts.
-    ///
-    /// Persists the evaluation prompt, raw LLM response, and parsed result.
-    pub async fn write_evaluation(
-        &self,
-        prompt: &str,
-        response: &str,
-        result: &super::types::EvaluationResult,
-    ) -> io::Result<PathBuf> {
-        if !self.enabled {
-            return Ok(PathBuf::new());
-        }
-
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
-
-        fs::write(iter_path.join("evaluation.prompt.txt"), prompt).await?;
-        fs::write(iter_path.join("evaluation.response.txt"), response).await?;
-
-        let result_json = serde_json::to_string_pretty(result)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(iter_path.join("evaluation.result.json"), result_json).await?;
-
-        tracing::debug!("Written evaluation to: {}", iter_path.display());
-        Ok(iter_path)
-    }
-
-    /// Write iteration summary (quality score, replan decision, etc.).
-    pub async fn write_iteration_summary(
-        &self,
-        iteration: usize,
-        quality_score: f32,
-        threshold: f32,
-        will_replan: bool,
-    ) -> io::Result<PathBuf> {
-        if !self.enabled {
-            return Ok(PathBuf::new());
-        }
-
-        let summary = serde_json::json!({
-            "iteration": iteration,
-            "quality_score": quality_score,
-            "threshold": threshold,
-            "will_replan": will_replan,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        });
-
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
-
-        let summary_path = iter_path.join("summary.json");
-        let json = serde_json::to_string_pretty(&summary)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(&summary_path, json).await?;
-
-        Ok(summary_path)
-    }
 
     /// Get relative path for logging.
     pub fn relative_path(&self, task_id: usize, attempt: usize) -> String {
@@ -647,14 +588,10 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
     for (i, manifest) in manifests.iter().rev().enumerate() {
         let turn_num = i + 1;
         let status = format!("{:?}", manifest.status);
-        let score = manifest
-            .quality_score
-            .map(|s| format!("{:.2}", s))
-            .unwrap_or_else(|| "N/A".to_string());
 
         turn_entries.push_str(&format!(
-            "### Turn {} ({}) — {} (quality: {})\n",
-            turn_num, manifest.timestamp, status, score
+            "### Turn {} ({}) — {}\n",
+            turn_num, manifest.timestamp, status
         ));
         turn_entries.push_str(&format!("Goal: \"{}\"\n", manifest.goal));
 
@@ -881,7 +818,6 @@ mod tests {
             goal: "Test the system".to_string(),
             status: RunStatus::Success,
             iterations: 2,
-            quality_score: Some(0.95),
             routing_mode: Some(RoutingMode::Orchestrated),
             task_summaries: vec![
                 TaskSummary {
@@ -909,7 +845,6 @@ mod tests {
         assert_eq!(deserialized.session_id, Some("cs_abc".to_string()));
         assert_eq!(deserialized.status, RunStatus::Success);
         assert_eq!(deserialized.iterations, 2);
-        assert_eq!(deserialized.quality_score, Some(0.95));
         assert_eq!(deserialized.task_summaries.len(), 2);
         assert_eq!(deserialized.task_summaries[0].status, TaskStatus::Complete);
         assert_eq!(deserialized.task_summaries[1].status, TaskStatus::Failed);
@@ -930,7 +865,6 @@ mod tests {
             goal: "Test goal".to_string(),
             status: RunStatus::PartialSuccess,
             iterations: 1,
-            quality_score: Some(0.6),
             routing_mode: Some(RoutingMode::Routed),
             task_summaries: vec![],
             artifact_paths: vec![],
@@ -956,7 +890,6 @@ mod tests {
             goal: String::new(),
             status: RunStatus::Failed,
             iterations: 0,
-            quality_score: None,
             routing_mode: None,
             task_summaries: vec![],
             artifact_paths: vec![],
@@ -990,7 +923,6 @@ mod tests {
             goal: goal.to_string(),
             status: RunStatus::Success,
             iterations: 1,
-            quality_score: Some(0.95),
             routing_mode: Some(RoutingMode::Routed),
             task_summaries: vec![TaskSummary {
                 task_id: 0,
@@ -1157,7 +1089,6 @@ mod tests {
         assert!(result.contains("1 previous orchestration run(s)"));
         assert!(result.contains("### Turn 1 (2026-03-20T01:57:24Z)"));
         assert!(result.contains("Success"));
-        assert!(result.contains("quality: 0.95"));
         assert!(result.contains("Compute mean of [10,20,30]"));
         assert!(result.contains("Task 0 [statistics]: Compute mean"));
         assert!(result.contains("Result: 20"));
@@ -1194,7 +1125,6 @@ mod tests {
             goal: "Failing query".to_string(),
             status: RunStatus::Failed,
             iterations: 1,
-            quality_score: Some(0.3),
             routing_mode: Some(RoutingMode::Orchestrated),
             task_summaries: vec![TaskSummary {
                 task_id: 0,
