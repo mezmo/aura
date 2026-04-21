@@ -17,23 +17,6 @@ Templates use `%%VARIABLE_NAME%%` for substitution. This syntax avoids conflicts
 
 ---
 
-## Planning Prompt (`planning_prompt.md`)
-
-Used by the coordinator to decompose user queries into execution plans.
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `%%QUERY%%` | Yes | The user's original query |
-| `%%WORKER_SECTION%%` | No | Formatted worker descriptions, or empty if no workers configured |
-| `%%REFLECTION_SECTION%%` | No | Previous iteration context for replanning (iterations 2+) |
-| `%%ERROR_SECTION%%` | No | Previous JSON parsing error for retry attempts |
-| `%%WORKER_FIELD%%` | No | JSON field template showing worker assignment syntax |
-| `%%WORKER_GUIDELINES%%` | No | Guidelines for worker assignment |
-
-**Context struct**: `PlanningVars` in `templates.rs`
-
----
-
 ## Worker Task Prompt (`worker_task_prompt.md`)
 
 Sent to worker agents when executing individual tasks.
@@ -45,35 +28,6 @@ Sent to worker agents when executing individual tasks.
 | `%%ORCHESTRATION_GOAL%%` | Yes | The overall plan goal (context only — demoted to end) |
 
 **Context struct**: `WorkerTaskVars` in `templates.rs`
-
----
-
-## Synthesis Prompt (`synthesis_prompt.md`)
-
-Used to combine results from multiple tasks into a coherent response.
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `%%GOAL%%` | Yes | The orchestration goal |
-| `%%QUERY%%` | Yes | The user's original query |
-| `%%RESULTS%%` | Yes | Formatted task results (markdown sections) |
-
-**Context struct**: `SynthesisVars` in `templates.rs`
-
----
-
-## Evaluation Prompt (`evaluation_prompt.md`)
-
-Used for semantic quality assessment of synthesized responses.
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `%%QUERY%%` | Yes | The user's original query |
-| `%%GOAL%%` | Yes | The orchestration goal |
-| `%%WORKERS_CONTEXT%%` | No | System context about available workers (for fact-checking) |
-| `%%RESULT%%` | Yes | The synthesized response to evaluate |
-
-**Context struct**: `EvaluationVars` in `templates.rs`
 
 ---
 

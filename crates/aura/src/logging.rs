@@ -45,13 +45,9 @@
 //!   └── orchestration (CHAIN)                   <- full orchestration lifecycle
 //!         ├── orchestration.planning (CHAIN)     <- coordinator routing/planning
 //!         │   └── agent.turn (LLM) → ...
-//!         └── orchestration.iteration (CHAIN)    <- per plan-execute-synth-eval cycle
-//!             ├── orchestration.worker (AGENT)   <- per worker task
-//!             │   └── agent.turn (LLM) → execute_tool → mcp.tool_call
-//!             ├── orchestration.synthesis (CHAIN)
-//!             │   └── agent.turn (LLM) → ...
-//!             └── orchestration.evaluation (CHAIN)
-//!                 └── agent.turn (LLM) → ...
+//!         └── orchestration.iteration (CHAIN)    <- per plan-execute-continue cycle
+//!             └── orchestration.worker (AGENT)   <- per worker task
+//!                 └── agent.turn (LLM) → execute_tool → mcp.tool_call
 //! ```
 //!
 //! ```text
