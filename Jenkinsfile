@@ -188,7 +188,7 @@ pipeline {
     stage('Feature Build') {
       when {
         expression {
-          CURRENT_BRANCH ==~ /feature\/(([A-Z]{2,5}-\d+.*)|aura-next(-.*)?)/
+          CURRENT_BRANCH ==~ /feature\/(([A-Z]{2,5}-\d+.*)|aura-next(-.*)?|orchestration-mode)/
         }
       }
 
