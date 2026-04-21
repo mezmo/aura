@@ -261,56 +261,101 @@ async fn test_arithmetic_emits_tool_call_events() {
     }
 }
 
-/// Verifies that multi-worker execution produces synthesis + quality evaluation.
+/// Verifies that multi-worker execution emits iteration_complete plus a
+/// terminal routing event from the post-execute continuation coordinator.
 ///
 /// Query: "First compute the mean of [2, 4, 6], then compute sin(0.5)"
-/// Expected: synthesizing event + iteration_complete with quality_score in 0.0-1.0.
+/// Expected: plan_created + iteration_complete + a terminal routing event
+/// (direct_answer on the happy path; clarification_needed is also valid).
 #[tokio::test]
-async fn test_multi_domain_emits_synthesis_events() {
+async fn test_multi_domain_emits_iteration_and_terminal_events() {
     let events =
         orchestration_events("First compute the mean of [2, 4, 6], then compute sin(0.5)").await;
 
-    let synthesizing = events_by_type(&events, event_names::SYNTHESIZING);
+    let plan_created = events_by_type(&events, event_names::PLAN_CREATED);
     let iteration_complete = events_by_type(&events, event_names::ITERATION_COMPLETE);
+    let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
+    let clarification = events_by_type(&events, event_names::CLARIFICATION_NEEDED);
 
-    // LLM may route to direct answer for this query
-    if synthesizing.is_empty() && iteration_complete.is_empty() {
-        let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
-        if !direct.is_empty() {
-            println!("Note: LLM routed to direct answer. No synthesis events expected.");
-            return;
-        }
-        assert_any_routing_event(&events);
+    // The coordinator may route directly on iter-1 (no orchestration).
+    if plan_created.is_empty() {
+        assert!(
+            !direct.is_empty() || !clarification.is_empty(),
+            "Expected a terminal routing event (direct_answer or clarification_needed)"
+        );
+        println!("Note: coordinator routed without orchestration.");
         return;
     }
 
+    // Orchestration actually ran: a plan fired and tasks executed.
+    let task_started = events_by_type(&events, event_names::TASK_STARTED);
+    assert!(
+        !task_started.is_empty(),
+        "plan_created fired but no task_started events — orchestration should actually execute tasks"
+    );
+
+    // Multi-domain query should decompose into more than one task.
+    for event in &plan_created {
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        let tasks = json["tasks"]
+            .as_array()
+            .expect("tasks must be an array on plan_created");
+        assert!(
+            tasks.len() >= 2,
+            "Expected tasks.len() >= 2 for multi-domain query, got {}",
+            tasks.len()
+        );
+    }
+
+    // Synthesizing fires before the post-execute coordinator call.
+    let synthesizing = events_by_type(&events, event_names::SYNTHESIZING);
     assert!(
         !synthesizing.is_empty(),
-        "Expected synthesizing event but found none"
+        "Expected synthesizing event before iteration_complete"
     );
+    for event in &synthesizing {
+        assert_event_fields(event, &["iteration"]);
+    }
+
+    // Synthesizing must precede iteration_complete in the event stream.
+    let orch_events = get_orchestrator_events(&events);
+    let synth_pos = orch_events
+        .iter()
+        .position(|e| e.event_type.as_deref() == Some(event_names::SYNTHESIZING));
+    let iter_pos = orch_events
+        .iter()
+        .position(|e| e.event_type.as_deref() == Some(event_names::ITERATION_COMPLETE));
+    if let (Some(s), Some(i)) = (synth_pos, iter_pos) {
+        assert!(
+            s < i,
+            "synthesizing (pos {s}) must fire before iteration_complete (pos {i})"
+        );
+    }
+
     assert!(
         !iteration_complete.is_empty(),
         "Expected iteration_complete event but found none"
     );
+    // Post-execute continuation coordinator picks a routing tool. On the
+    // happy path for a 2-task math query, that's respond_directly →
+    // direct_answer. request_clarification is also valid if the coordinator
+    // finds an ambiguity in the results it cannot resolve.
+    assert!(
+        !direct.is_empty() || !clarification.is_empty(),
+        "Expected direct_answer or clarification_needed from post-execute continuation"
+    );
 
     for event in &iteration_complete {
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        assert_event_fields(event, &["iteration", "quality_score"]);
+        assert_event_fields(event, &["iteration", "will_replan"]);
 
         let iteration = json["iteration"]
             .as_u64()
             .expect("iteration must be a number");
-        let quality_score = json["quality_score"]
-            .as_f64()
-            .expect("quality_score must be a number");
 
         assert!(iteration >= 1, "iteration should be >= 1");
-        assert!(
-            (0.0..=1.0).contains(&quality_score),
-            "quality_score should be 0.0-1.0, got {quality_score}"
-        );
 
-        println!("iteration_complete: iteration={iteration}, quality_score={quality_score:.2}");
+        println!("iteration_complete: iteration={iteration}");
     }
 }
 
@@ -666,14 +711,14 @@ async fn test_tool_call_events_include_worker_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Iteration complete replan fields
+// Iteration complete event shape
 // ---------------------------------------------------------------------------
 
-/// Verifies that iteration_complete events include quality_threshold and will_replan fields.
+/// Verifies that iteration_complete events include iteration and will_replan fields.
 ///
 /// LENIENCY: LLM may route to direct answer (no iteration events).
 #[tokio::test]
-async fn test_iteration_complete_includes_replan_fields() {
+async fn test_iteration_complete_event_shape() {
     let events = orchestration_events(
         "First compute the mean of [1, 2, 3], then compute the factorial of 5",
     )
@@ -690,20 +735,12 @@ async fn test_iteration_complete_includes_replan_fields() {
     for event in &iteration_complete {
         assert_event_fields(
             event,
-            &[
-                "iteration",
-                "quality_score",
-                "quality_threshold",
-                "will_replan",
-            ],
+            &["iteration", "will_replan", "agent_id", "session_id"],
         );
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let threshold = json["quality_threshold"]
-            .as_f64()
-            .expect("quality_threshold must be a number");
         let will_replan = json["will_replan"]
             .as_bool()
             .expect("will_replan must be a bool");
-        println!("iteration_complete: quality_threshold={threshold:.2}, will_replan={will_replan}");
+        println!("iteration_complete: will_replan={will_replan}");
     }
 }

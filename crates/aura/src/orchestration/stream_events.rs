@@ -1,15 +1,15 @@
 //! Orchestration-specific SSE streaming events.
 //!
 //! These events are emitted during orchestrated multi-agent execution to provide
-//! visibility into plan creation, task execution, and synthesis phases.
+//! visibility into plan creation, task execution, and continuation phases.
 //!
 //! # Event Types
 //!
 //! - `aura.orchestrator.plan_created` - Plan decomposed from user query
 //! - `aura.orchestrator.task_started` - Worker began task execution
 //! - `aura.orchestrator.task_completed` - Worker finished task (success/failure)
-//! - `aura.orchestrator.iteration_complete` - Plan-execute-synthesize cycle done
-//! - `aura.orchestrator.synthesizing` - Combining results into final response
+//! - `aura.orchestrator.iteration_complete` - Plan-execute-continue cycle done
+//! - `aura.orchestrator.synthesizing` - Consolidating task results for coordinator decision
 //! - `aura.orchestrator.tool_call_started` - Worker tool execution began
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
 //!
@@ -131,10 +131,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator completes an iteration.
     IterationComplete {
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -149,7 +146,7 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
-    /// Emitted when orchestrator starts synthesizing results.
+    /// Emitted when task results are being consolidated for the coordinator.
     Synthesizing {
         iteration: usize,
         #[serde(flatten)]
@@ -306,23 +303,16 @@ impl OrchestrationStreamEvent {
     }
 
     /// Create an IterationComplete event.
-    #[allow(clippy::too_many_arguments)]
     pub fn iteration_complete(
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
         context: EventContext,
     ) -> Self {
         Self::IterationComplete {
             iteration,
-            quality_score,
-            quality_threshold,
             will_replan,
-            evaluation_skipped,
             reasoning,
             gaps,
             context,
@@ -519,21 +509,18 @@ mod tests {
     }
 
     #[test]
-    fn test_format_sse_iteration_complete_with_evaluation_skipped() {
+    fn test_format_sse_iteration_complete() {
         let event = OrchestrationStreamEvent::iteration_complete(
             1,
-            1.0,
-            0.7,
             false,
-            true,
             Some("Single-task plan completed successfully".to_string()),
             vec![],
             test_ctx(),
         );
         let sse = event.format_sse();
 
-        assert!(sse.contains("\"evaluation_skipped\":true"));
-        assert!(sse.contains("\"quality_score\":1.0"));
+        assert!(sse.contains("\"will_replan\":false"));
+        assert!(sse.contains("\"iteration\":1"));
     }
 
     #[test]
