@@ -192,22 +192,68 @@ pub struct AgentSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStoreConfig {
     pub name: String,
-    pub store_type: String,
-    pub embedding_model: EmbeddingModelConfig,
-    pub connection_string: Option<String>,
-    pub url: Option<String>,
-    pub collection_name: Option<String>,
     /// Optional context string to prepend to search results for better RAG integration
     pub context_prefix: Option<String>,
+    /// Store-type-specific configuration
+    #[serde(flatten)]
+    pub store: VectorStoreType,
 }
 
-/// Embedding model configuration
+/// Type-specific vector store configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingModelConfig {
-    pub provider: String,
-    pub model: String,
-    pub api_key: String,
-    pub base_url: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VectorStoreType {
+    InMemory {
+        embedding_model: EmbeddingModelConfig,
+    },
+    Qdrant {
+        embedding_model: EmbeddingModelConfig,
+        url: String,
+        collection_name: String,
+    },
+    BedrockKb {
+        knowledge_base_id: String,
+        region: String,
+        #[serde(default)]
+        profile: Option<String>,
+    },
+}
+
+/// Embedding model configuration with strong typing per provider
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum EmbeddingModelConfig {
+    OpenAI {
+        api_key: String,
+        model: String,
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    Bedrock {
+        model: String,
+        region: String,
+        /// AWS profile name (optional, uses default credentials if not specified)
+        #[serde(default)]
+        profile: Option<String>,
+    },
+}
+
+impl EmbeddingModelConfig {
+    /// Get the provider name
+    pub fn provider(&self) -> &str {
+        match self {
+            EmbeddingModelConfig::OpenAI { .. } => "openai",
+            EmbeddingModelConfig::Bedrock { .. } => "bedrock",
+        }
+    }
+
+    /// Get the model name
+    pub fn model(&self) -> &str {
+        match self {
+            EmbeddingModelConfig::OpenAI { model, .. }
+            | EmbeddingModelConfig::Bedrock { model, .. } => model,
+        }
+    }
 }
 
 /// MCP (Model Context Protocol) configuration

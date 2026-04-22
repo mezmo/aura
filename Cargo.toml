@@ -8,7 +8,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.17.2"
+version = "1.18.1"
 edition = "2024"
 authors = ["Mezmo <support@mezmo.com>"]
 license = "Apache-2.0"
@@ -62,6 +62,7 @@ uuid = { version = "1.0", features = ["v4"] }
 # AWS Bedrock dependencies
 aws-config = "1.8.0"
 aws-sdk-bedrockruntime = "1.95.0"
+aws-sdk-bedrockagentruntime = "1.125.0"
 aws-smithy-types = "1.3.2"
 base64 = "0.22.1"
 async-stream = "0.3.6"

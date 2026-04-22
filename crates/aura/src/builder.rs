@@ -1,5 +1,5 @@
 use crate::{
-    config::{AgentConfig, LlmConfig, McpServerConfig},
+    config::{AgentConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
     provider_agent::{
@@ -1034,12 +1034,25 @@ impl AgentBuilder {
             tracing::info!("=== Vector Stores Configuration ===");
             for vector_store in &config.vector_stores {
                 tracing::info!("Store: {}", vector_store.name);
-                tracing::info!("  Type: {}", vector_store.store_type);
-                tracing::info!(
-                    "  Embedding Provider: {}",
-                    vector_store.embedding_model.provider
-                );
-                tracing::info!("  Embedding Model: {}", vector_store.embedding_model.model);
+                match &vector_store.store {
+                    VectorStoreType::InMemory { embedding_model } => {
+                        tracing::info!("  Type: in_memory");
+                        tracing::info!("  Embedding Provider: {}", embedding_model.provider());
+                        tracing::info!("  Embedding Model: {}", embedding_model.model());
+                    }
+                    VectorStoreType::Qdrant { embedding_model, url, collection_name } => {
+                        tracing::info!("  Type: qdrant");
+                        tracing::info!("  URL: {}", url);
+                        tracing::info!("  Collection: {}", collection_name);
+                        tracing::info!("  Embedding Provider: {}", embedding_model.provider());
+                        tracing::info!("  Embedding Model: {}", embedding_model.model());
+                    }
+                    VectorStoreType::BedrockKb { knowledge_base_id, region, .. } => {
+                        tracing::info!("  Type: bedrock_kb");
+                        tracing::info!("  Knowledge Base ID: {}", knowledge_base_id);
+                        tracing::info!("  Region: {}", region);
+                    }
+                }
             }
         }
 

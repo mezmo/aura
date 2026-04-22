@@ -27,6 +27,7 @@ mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibili
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
+pub mod bedrock_embedding;
 pub(crate) mod string_utils;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
@@ -37,7 +38,7 @@ pub mod vector_store;
 pub use builder::{Agent, AgentBuilder, FilesystemTools};
 pub use config::{
     AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, ToolsConfig, VectorStoreConfig,
+    ReasoningEffort, ToolsConfig, VectorStoreConfig, VectorStoreType,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use provider_agent::{

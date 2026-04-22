@@ -1,3 +1,40 @@
+## [1.18.1](https://github.com/mezmo/aura/compare/v1.18.0...v1.18.1) (2026-04-21)
+
+
+### Documentation
+
+* add commit and contribution rules to claude.md [94e52ad](https://github.com/mezmo/aura/commit/94e52adbf2099ce6033e67e3a4288cc8defd3378) - Andre Elizondo [LOG-000000](https://logdna.atlassian.net/browse/LOG-000000)
+
+# [1.18.0](https://github.com/mezmo/aura/compare/v1.17.3...v1.18.0) (2026-04-20)
+
+
+### Bug Fixes
+
+* **bedrock**: collapse redundant default_ndims branches [01835b3](https://github.com/mezmo/aura/commit/01835b3896477221de204683045a1140a6f52ace) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Code Refactoring
+
+* **config**: replace VectorStoreConfig flat struct with tagged enum [6ff3894](https://github.com/mezmo/aura/commit/6ff3894c3316a96786a4ca86b084681ac27218f6) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Documentation
+
+* document Bedrock embedding and Knowledge Base support [22ad872](https://github.com/mezmo/aura/commit/22ad872947944cbebeb95b700d5b2fcfc7112528) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Features
+
+* add Bedrock embeddings and Knowledge Base support [9ddcb0c](https://github.com/mezmo/aura/commit/9ddcb0c4e5840ebf12ac416fb30966e4373a30f4) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+* **bedrock**: native embedding path bypassing rig-bedrock [bf3bfcc](https://github.com/mezmo/aura/commit/bf3bfcc2259a25861e6e28c7cdeec05cc1ede8df) - Mike Shearer [LOG-23628](https://logdna.atlassian.net/browse/LOG-23628)
+
+## [1.17.3](https://github.com/mezmo/aura/compare/v1.17.2...v1.17.3) (2026-04-07)
+
+
+### Chores
+
+* **build**: Create custom check [3540da3](https://github.com/mezmo/aura/commit/3540da329e770588eb921bbebedd971812bafeb9) - Gregory Janco [LOG-23558](https://logdna.atlassian.net/browse/LOG-23558)
+
 ## [1.17.2](https://github.com/mezmo/aura/compare/v1.17.1...v1.17.2) (2026-04-06)
 
 

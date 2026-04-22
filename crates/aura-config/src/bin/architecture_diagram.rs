@@ -179,23 +179,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("│  │                                                 │    │");
         if !config.vector_stores.is_empty() {
             let store = &config.vector_stores[0]; // Show first store
+            let store_type_name = match &store.store {
+                aura_config::VectorStoreType::InMemory { .. } => "in_memory",
+                aura_config::VectorStoreType::Qdrant { .. } => "qdrant",
+                aura_config::VectorStoreType::BedrockKb { .. } => "bedrock_kb",
+            };
             println!(
                 "│  │  Type: {} ({} stores)              │    │",
-                store.store_type,
+                store_type_name,
                 config.vector_stores.len()
             );
             println!("│  │                                                 │    │");
             println!("│  │  ┌─────────────────────────────────────────┐    │    │");
-            println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
-            println!("│  │  │                                         │    │    │");
-            println!(
-                "│  │  │  Provider: {}                │    │    │",
-                store.embedding_model.provider
-            );
-            println!(
-                "│  │  │  Model: {}    │    │    │",
-                store.embedding_model.model
-            );
+            match &store.store {
+                aura_config::VectorStoreType::InMemory { embedding_model }
+                | aura_config::VectorStoreType::Qdrant { embedding_model, .. } => {
+                    println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
+                    println!("│  │  │                                         │    │    │");
+                    println!(
+                        "│  │  │  Provider: {}                │    │    │",
+                        embedding_model.provider()
+                    );
+                    println!(
+                        "│  │  │  Model: {}    │    │    │",
+                        embedding_model.model()
+                    );
+                }
+                aura_config::VectorStoreType::BedrockKb { .. } => {
+                    println!("│  │  │        🔤 MANAGED EMBEDDINGS            │    │    │");
+                }
+            }
         } else {
             println!("│  │  No vector stores configured               │    │");
             println!("│  │                                                 │    │");
