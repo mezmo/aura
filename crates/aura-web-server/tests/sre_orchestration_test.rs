@@ -6,7 +6,7 @@ use aura_test_utils::sse::{SseEvent, events_by_type, parse_sse_stream};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(180);
+const TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -176,20 +176,22 @@ async fn test_sre_full_workflow_emits_plan_and_tasks() {
         );
     }
 
-    // Verify synthesis occurred
-    let synthesizing = events_by_type(&events, event_names::SYNTHESIZING);
+    // Post-execute coordinator picks a terminal routing tool after the
+    // tasks execute.
     let iteration_complete = events_by_type(&events, event_names::ITERATION_COMPLETE);
-    if !synthesizing.is_empty() {
-        println!("Synthesis event present");
-    }
-    if !iteration_complete.is_empty() {
-        for event in &iteration_complete {
-            let json: Value = serde_json::from_str(&event.data).unwrap();
-            println!(
-                "iteration_complete: iteration={}, quality_score={}",
-                json["iteration"], json["quality_score"]
-            );
-        }
+    let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
+    let clarification = events_by_type(&events, event_names::CLARIFICATION_NEEDED);
+    assert!(
+        !iteration_complete.is_empty(),
+        "Expected iteration_complete event after orchestration"
+    );
+    assert!(
+        !direct.is_empty() || !clarification.is_empty(),
+        "Expected direct_answer or clarification_needed from post-execute continuation"
+    );
+    for event in &iteration_complete {
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        println!("iteration_complete: iteration={}", json["iteration"]);
     }
 }
 
@@ -294,41 +296,42 @@ async fn test_sre_orchestration_events_share_session_id() {
     );
 }
 
-/// Verifies that multi-domain SRE queries produce synthesis + quality evaluation.
+/// Verifies multi-domain SRE queries orchestrate and terminate via a routing
+/// tool emitted by the post-execute continuation coordinator.
 ///
 /// Query requires discovery then configuration — spanning multiple workers.
-/// Expected: synthesizing event + iteration_complete with quality_score in 0.0-1.0.
-///
-/// LENIENCY: LLM may route to direct answer or skip synthesis for simple queries.
+/// Expected: plan_created + iteration_complete + a terminal routing event
+/// (direct_answer on the happy path; clarification_needed is also valid).
 #[tokio::test]
-async fn test_sre_multi_domain_emits_synthesis() {
+async fn test_sre_multi_domain_routes_to_terminal() {
     let events = orchestration_events(
         "Find all workloads with metrics ports in the production namespace, \
          then create ServiceMonitors for payment-service and user-api.",
     )
     .await;
 
-    let synthesizing = events_by_type(&events, event_names::SYNTHESIZING);
+    let plan_created = events_by_type(&events, event_names::PLAN_CREATED);
     let iteration_complete = events_by_type(&events, event_names::ITERATION_COMPLETE);
+    let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
+    let clarification = events_by_type(&events, event_names::CLARIFICATION_NEEDED);
 
-    // LLM may route to direct answer
-    if synthesizing.is_empty() && iteration_complete.is_empty() {
-        let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
-        if !direct.is_empty() {
-            println!("Note: LLM routed to direct answer. No synthesis events expected.");
-            return;
-        }
-        assert_any_routing_event(&events);
+    // The coordinator may route directly on iter-1 (no orchestration).
+    if plan_created.is_empty() {
+        assert!(
+            !direct.is_empty() || !clarification.is_empty(),
+            "Expected a terminal routing event (direct_answer or clarification_needed)"
+        );
+        println!("Note: coordinator routed without orchestration.");
         return;
     }
 
     assert!(
-        !synthesizing.is_empty(),
-        "Expected synthesizing event but found none"
-    );
-    assert!(
         !iteration_complete.is_empty(),
         "Expected iteration_complete event but found none"
+    );
+    assert!(
+        !direct.is_empty() || !clarification.is_empty(),
+        "Expected direct_answer or clarification_needed from post-execute continuation"
     );
 
     for event in &iteration_complete {

@@ -260,36 +260,62 @@ async fn test_arithmetic_emits_tool_call_events() {
     }
 }
 
-/// Verifies that multi-worker execution produces synthesis + an iteration_complete event.
+/// Verifies that multi-worker execution emits iteration_complete plus a
+/// terminal routing event from the post-execute continuation coordinator.
 ///
 /// Query: "First compute the mean of [2, 4, 6], then compute sin(0.5)"
-/// Expected: synthesizing event + iteration_complete with iteration and will_replan fields.
+/// Expected: plan_created + iteration_complete + a terminal routing event
+/// (direct_answer on the happy path; clarification_needed is also valid).
 #[tokio::test]
-async fn test_multi_domain_emits_synthesis_events() {
+async fn test_multi_domain_emits_iteration_and_terminal_events() {
     let events =
         orchestration_events("First compute the mean of [2, 4, 6], then compute sin(0.5)").await;
 
-    let synthesizing = events_by_type(&events, event_names::SYNTHESIZING);
+    let plan_created = events_by_type(&events, event_names::PLAN_CREATED);
     let iteration_complete = events_by_type(&events, event_names::ITERATION_COMPLETE);
+    let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
+    let clarification = events_by_type(&events, event_names::CLARIFICATION_NEEDED);
 
-    // LLM may route to direct answer for this query
-    if synthesizing.is_empty() && iteration_complete.is_empty() {
-        let direct = events_by_type(&events, event_names::DIRECT_ANSWER);
-        if !direct.is_empty() {
-            println!("Note: LLM routed to direct answer. No synthesis events expected.");
-            return;
-        }
-        assert_any_routing_event(&events);
+    // The coordinator may route directly on iter-1 (no orchestration).
+    if plan_created.is_empty() {
+        assert!(
+            !direct.is_empty() || !clarification.is_empty(),
+            "Expected a terminal routing event (direct_answer or clarification_needed)"
+        );
+        println!("Note: coordinator routed without orchestration.");
         return;
     }
 
+    // Orchestration actually ran: a plan fired and tasks executed.
+    let task_started = events_by_type(&events, event_names::TASK_STARTED);
     assert!(
-        !synthesizing.is_empty(),
-        "Expected synthesizing event but found none"
+        !task_started.is_empty(),
+        "plan_created fired but no task_started events — orchestration should actually execute tasks"
     );
+
+    // Multi-domain query should decompose into more than one task.
+    for event in &plan_created {
+        let json: Value = serde_json::from_str(&event.data).unwrap();
+        let task_count = json["task_count"]
+            .as_u64()
+            .expect("task_count must be a number on plan_created");
+        assert!(
+            task_count >= 2,
+            "Expected task_count >= 2 for multi-domain query, got {task_count}"
+        );
+    }
+
     assert!(
         !iteration_complete.is_empty(),
         "Expected iteration_complete event but found none"
+    );
+    // Post-execute continuation coordinator picks a routing tool. On the
+    // happy path for a 2-task math query, that's respond_directly →
+    // direct_answer. request_clarification is also valid if the coordinator
+    // finds an ambiguity in the results it cannot resolve.
+    assert!(
+        !direct.is_empty() || !clarification.is_empty(),
+        "Expected direct_answer or clarification_needed from post-execute continuation"
     );
 
     for event in &iteration_complete {
@@ -680,7 +706,10 @@ async fn test_iteration_complete_event_shape() {
     }
 
     for event in &iteration_complete {
-        assert_event_fields(event, &["iteration", "will_replan", "agent_id", "session_id"]);
+        assert_event_fields(
+            event,
+            &["iteration", "will_replan", "agent_id", "session_id"],
+        );
         let json: Value = serde_json::from_str(&event.data).unwrap();
         let will_replan = json["will_replan"]
             .as_bool()

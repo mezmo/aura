@@ -485,7 +485,7 @@ impl OrchestrationConfig {
         {
             tracing::info!("AURA_ESCAPE_HATCH=false — stripping escape hatch directive");
             preamble = preamble.replace(
-                "5. **Resolve tool gaps pragmatically**: If a user requests an operation with no matching tool, create a plan using the available tools and note the gap in `planning_summary`. Do NOT deliberate at length about missing capabilities — route what you can, report what you cannot.\n",
+                "6. **Resolve tool gaps pragmatically**: If a user requests an operation with no matching tool, create a plan using the available tools and note the gap in `planning_summary`. Do NOT deliberate at length about missing capabilities — route what you can, report what you cannot.\n",
                 "",
             );
         }

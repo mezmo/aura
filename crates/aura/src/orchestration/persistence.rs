@@ -338,7 +338,6 @@ impl ExecutionPersistence {
         Ok(iter_path)
     }
 
-
     /// Get relative path for logging.
     pub fn relative_path(&self, task_id: usize, attempt: usize) -> String {
         self.task_attempt_filename(task_id, attempt, "*")
