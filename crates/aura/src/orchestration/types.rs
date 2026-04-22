@@ -494,36 +494,23 @@ pub struct TaskJson {
     pub reuse_result_from: Option<usize>,
 }
 
-/// Result of semantic evaluation by the coordinator LLM.
+/// Summary of task failures during an iteration.
 ///
-/// The evaluation assesses how well the synthesized response
-/// answers the user's original query.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvaluationResult {
-    /// Quality score between 0.0 and 1.0.
-    pub score: f32,
-    /// Brief explanation of the evaluation.
+/// Populated on the failure-replan path so the coordinator can see what
+/// went wrong when it renders the continuation prompt. Intentionally
+/// smaller than the deleted `EvaluationResult` — no score, no evaluator
+/// vocabulary; just a reasoning string and a list of specific gaps.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FailureSummary {
+    /// Short explanation of the failure state for this iteration.
     pub reasoning: String,
-    /// Identified gaps or missing elements in the response.
+    /// Specific areas needing attention (e.g., failed task descriptions).
     #[serde(default)]
     pub gaps: Vec<String>,
 }
 
-impl EvaluationResult {
-    /// Create a new evaluation result.
-    ///
-    /// Used in tests and in the failure-replan path; will be used by the
-    /// post-execute coordinator call in C3.
-    #[allow(dead_code)]
-    pub fn new(score: f32, reasoning: impl Into<String>) -> Self {
-        Self {
-            score: score.clamp(0.0, 1.0),
-            reasoning: reasoning.into(),
-            gaps: Vec::new(),
-        }
-    }
-
-    /// Format gaps as bullet points for reflection prompts.
+impl FailureSummary {
+    /// Format gaps as bullet points for the continuation prompt.
     pub fn gaps_as_bullets(&self) -> String {
         if self.gaps.is_empty() {
             "- No specific gaps identified".to_string()
@@ -533,33 +520,6 @@ impl EvaluationResult {
                 .map(|g| format!("- {}", g))
                 .collect::<Vec<_>>()
                 .join("\n")
-        }
-    }
-
-    /// Add identified gaps.
-    #[allow(dead_code)]
-    pub fn with_gaps(mut self, gaps: Vec<String>) -> Self {
-        self.gaps = gaps;
-        self
-    }
-
-    /// Create a fallback evaluation when LLM fails.
-    ///
-    /// Uses the simple heuristic of completed/total task ratio.
-    #[allow(dead_code)]
-    pub fn fallback(completed: usize, total: usize) -> Self {
-        let score = if total == 0 {
-            0.0
-        } else {
-            completed as f32 / total as f32
-        };
-        Self {
-            score,
-            reasoning: format!(
-                "Fallback heuristic: {} of {} tasks completed",
-                completed, total
-            ),
-            gaps: Vec::new(),
         }
     }
 }
@@ -688,19 +648,21 @@ impl std::fmt::Display for PlanAttemptFailure {
     }
 }
 
-/// Context from a previous iteration, used for informed reflection.
+/// Context from a previous iteration, used for the post-execute
+/// coordinator decision (continuation prompt).
 ///
-/// When an iteration fails to meet the quality threshold, this context
-/// is passed to the next planning phase so the coordinator can learn
-/// from what went wrong and adjust the plan accordingly.
+/// Every iteration's end-of-execute state is rendered via this context
+/// — clean success (`failure_summary = None`), failure, partial, or
+/// dependency-blocked cases all share the same template.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IterationContext {
     /// Which iteration just completed (1-indexed).
     pub iteration: usize,
     /// The plan from the previous iteration.
     pub previous_plan: Plan,
-    /// The evaluation of the previous iteration.
-    pub evaluation: EvaluationResult,
+    /// Failure summary populated only when the iteration had failures or
+    /// blocked tasks. `None` on the clean-success path.
+    pub failure_summary: Option<FailureSummary>,
     /// Accumulated failure history across all iterations.
     pub failure_history: Vec<FailedTaskRecord>,
 }
@@ -710,55 +672,49 @@ impl IterationContext {
     pub fn new(
         iteration: usize,
         previous_plan: Plan,
-        evaluation: EvaluationResult,
+        failure_summary: Option<FailureSummary>,
         failure_history: Vec<FailedTaskRecord>,
     ) -> Self {
         Self {
             iteration,
             previous_plan,
-            evaluation,
+            failure_summary,
             failure_history,
         }
     }
 
-    /// Build the reflection section for the planning prompt.
+    /// Build the continuation section for the post-execute coordinator call.
     ///
-    /// Formats the previous iteration's results categorized into completed,
-    /// blocked, and redesign sections. Uses the `.md` template in
-    /// `crates/aura/src/prompts/reflection_prompt.md`.
+    /// Renders the previous iteration's per-task state (completed, failed,
+    /// blocked), optional failure summary, accumulated failure history with
+    /// repeated-failure detection, and a conditional reuse hint. Uses the
+    /// `.md` template in `crates/aura/src/prompts/continuation_prompt.md`.
     ///
-    /// By default, completed task results are included inline (truncated to 500 bytes)
-    /// so the coordinator can replan with full context. Gate: `AURA_ENRICH_REPLAN`
-    /// env var (default=true).
-    pub fn build_reflection_prompt(&self, max_iterations: usize) -> String {
-        use super::templates::{ReflectionVars, render_reflection_prompt};
-
-        let enrich = crate::env_flags::bool_env("AURA_ENRICH_REPLAN", true);
+    /// Per-task completed results are included inline, truncated to 500 bytes
+    /// so the coordinator can route with full context. When a completed result
+    /// was spilled to an artifact, the
+    /// `[Full result (N chars) saved to artifact: task-N-result.txt]` footer
+    /// is re-appended after truncation so the coordinator can discover the
+    /// artifact via `read_artifact`.
+    pub fn build_continuation_prompt(&self, max_iterations: usize) -> String {
+        use super::templates::{ContinuationVars, render_continuation_prompt};
 
         // Categorize tasks
         let mut completed_lines = Vec::new();
         let mut blocked_lines = Vec::new();
         let mut redesign_lines = Vec::new();
+        let mut has_failed_tasks = false;
 
         for t in &self.previous_plan.tasks {
             match t.status {
                 TaskStatus::Complete => {
-                    let detail = if enrich {
-                        let result = t.result.as_deref().unwrap_or("(no result)");
-                        let (truncated, was_truncated) = safe_truncate(result, 500);
-                        if was_truncated {
-                            format!("{truncated}...")
-                        } else {
-                            truncated.to_string()
-                        }
-                    } else {
-                        let len = t.result.as_ref().map(|r| r.len()).unwrap_or(0);
-                        format!("({len} chars)")
-                    };
+                    let result = t.result.as_deref().unwrap_or("(no result)");
+                    let detail = preserve_artifact_footer(result, 500);
                     completed_lines
                         .push(format!("- Task {}: {} → {}", t.id, t.description, detail));
                 }
                 TaskStatus::Failed => {
+                    has_failed_tasks = true;
                     let err = t.error.as_deref().unwrap_or("unknown");
                     redesign_lines.push(format!(
                         "- Task {}: {} → failed: {}",
@@ -778,10 +734,7 @@ impl IterationContext {
         let completed_section = if completed_lines.is_empty() {
             String::new()
         } else {
-            format!(
-                "COMPLETED TASKS (do not re-plan these):\n{}\n\n",
-                completed_lines.join("\n")
-            )
+            format!("COMPLETED TASKS:\n{}\n\n", completed_lines.join("\n"))
         };
 
         let blocked_section = if blocked_lines.is_empty() {
@@ -796,14 +749,24 @@ impl IterationContext {
         let redesign_section = if redesign_lines.is_empty() {
             String::new()
         } else {
-            format!("TASKS TO REDESIGN:\n{}\n\n", redesign_lines.join("\n"))
+            format!("FAILED TASKS:\n{}\n\n", redesign_lines.join("\n"))
+        };
+
+        // Failure summary — only when there were failures in this iteration.
+        let failure_section = match &self.failure_summary {
+            Some(fs) => format!(
+                "FAILURE SUMMARY:\n{}\n\nAREAS NEEDING ATTENTION:\n{}\n\n",
+                fs.reasoning,
+                fs.gaps_as_bullets(),
+            ),
+            None => String::new(),
         };
 
         // Build failure history
         let failure_history = if self.failure_history.is_empty() {
             String::new()
         } else {
-            let mut fh = String::from("\nFAILURE HISTORY:");
+            let mut fh = String::from("FAILURE HISTORY:");
             for record in &self.failure_history {
                 let worker_info = record
                     .worker
@@ -827,7 +790,7 @@ impl IterationContext {
                 .filter(|(_, count)| *count > 1)
                 .collect();
             if !repeated.is_empty() {
-                fh.push_str("\n\nREPEATED FAILURES:");
+                fh.push_str("\n\nOBSERVED PATTERNS:");
                 for (desc, count) in &repeated {
                     fh.push_str(&format!(
                         "\n- \"{}\" has failed {} times — consider a fundamentally different approach",
@@ -835,7 +798,7 @@ impl IterationContext {
                     ));
                 }
             }
-            fh.push('\n');
+            fh.push_str("\n\n");
             fh
         };
 
@@ -852,31 +815,70 @@ impl IterationContext {
         let max_iter_str = max_iterations.to_string();
         let succeeded_str = succeeded.to_string();
         let total_str = total.to_string();
-        let score_str = format!("{:.2}", self.evaluation.score);
 
-        // Add reuse guidance when there are completed tasks
-        let reuse_guidance = if succeeded > 0 {
-            "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID."
+        // Only surface reuse guidance when there are failed tasks to
+        // selectively retry; surfacing on clean success teaches the model
+        // the no-op reuse-only plan pattern.
+        let reuse_guidance = if has_failed_tasks && succeeded > 0 {
+            "To carry forward a completed task's result when retrying failed tasks, set \"reuse_result_from\" to the original task ID.\n\n"
         } else {
             ""
         };
 
-        render_reflection_prompt(&ReflectionVars {
+        render_continuation_prompt(&ContinuationVars {
             iteration: &iteration_str,
             max_iterations: &max_iter_str,
             urgency: &urgency,
             succeeded: &succeeded_str,
             total: &total_str,
             goal: &self.previous_plan.goal,
-            score: &score_str,
             completed_section: &completed_section,
             blocked_section: &blocked_section,
             redesign_section: &redesign_section,
-            reasoning: &self.evaluation.reasoning,
-            gaps: &self.evaluation.gaps_as_bullets(),
+            failure_section: &failure_section,
             failure_history: &failure_history,
             reuse_guidance,
         })
+    }
+}
+
+/// Truncate `result` to `budget` bytes while preserving any trailing
+/// artifact footer (`[Full result (N chars) saved to artifact: FILE]`)
+/// that `maybe_create_artifact` appended past the budget. Without this,
+/// a naive truncation would slice off the artifact pointer and the
+/// coordinator would lose the ability to `read_artifact` the full content.
+fn preserve_artifact_footer(result: &str, budget: usize) -> String {
+    // Detect the artifact-footer marker appended by maybe_create_artifact.
+    const FOOTER_PREFIX: &str = "[Full result (";
+    let footer_start = result.rfind(FOOTER_PREFIX);
+
+    match footer_start {
+        Some(idx) => {
+            // Everything before the footer is the body; footer keeps its full text.
+            let body = &result[..idx];
+            let footer = &result[idx..];
+            let (truncated_body, was_truncated) = safe_truncate(body, budget);
+            let body_str = if was_truncated {
+                format!("{truncated_body}...")
+            } else {
+                truncated_body.to_string()
+            };
+            // Re-join truncated body with full footer. Artifact footer is
+            // what lets the coordinator discover the artifact via read_artifact.
+            if body_str.is_empty() {
+                footer.to_string()
+            } else {
+                format!("{body_str} {footer}")
+            }
+        }
+        None => {
+            let (truncated, was_truncated) = safe_truncate(result, budget);
+            if was_truncated {
+                format!("{truncated}...")
+            } else {
+                truncated.to_string()
+            }
+        }
     }
 }
 
@@ -1086,32 +1088,25 @@ mod tests {
     }
 
     // ========================================================================
-    // EvaluationResult tests
+    // FailureSummary tests
     // ========================================================================
 
     #[test]
-    fn test_evaluation_gaps_as_bullets_empty() {
-        let eval = EvaluationResult::new(0.8, "Good response");
-        assert_eq!(eval.gaps_as_bullets(), "- No specific gaps identified");
+    fn test_failure_summary_gaps_as_bullets_empty() {
+        let fs = FailureSummary::default();
+        assert_eq!(fs.gaps_as_bullets(), "- No specific gaps identified");
     }
 
     #[test]
-    fn test_evaluation_gaps_as_bullets_with_gaps() {
-        let eval = EvaluationResult::new(0.5, "Missing details").with_gaps(vec![
-            "Missing API details".into(),
-            "No error handling".into(),
-        ]);
+    fn test_failure_summary_gaps_as_bullets_with_gaps() {
+        let fs = FailureSummary {
+            reasoning: "Missing details".into(),
+            gaps: vec!["Missing API details".into(), "No error handling".into()],
+        };
 
-        let bullets = eval.gaps_as_bullets();
+        let bullets = fs.gaps_as_bullets();
         assert!(bullets.contains("- Missing API details"));
         assert!(bullets.contains("- No error handling"));
-    }
-
-    #[test]
-    fn test_evaluation_fallback() {
-        let eval = EvaluationResult::fallback(2, 4);
-        assert!((eval.score - 0.5).abs() < 0.001);
-        assert!(eval.reasoning.contains("2 of 4 tasks completed"));
     }
 
     // ========================================================================
@@ -1123,77 +1118,89 @@ mod tests {
         let mut plan = Plan::new("Test goal");
         plan.add_task(Task::new(0, "Task 1", "First task"));
 
-        let eval = EvaluationResult::new(0.4, "Incomplete response")
-            .with_gaps(vec!["Missing context".into()]);
+        let fs = FailureSummary {
+            reasoning: "Incomplete response".into(),
+            gaps: vec!["Missing context".into()],
+        };
 
-        let ctx = IterationContext::new(1, plan.clone(), eval, vec![]);
+        let ctx = IterationContext::new(1, plan.clone(), Some(fs), vec![]);
 
         assert_eq!(ctx.iteration, 1);
         assert_eq!(ctx.previous_plan.goal, "Test goal");
-        assert!((ctx.evaluation.score - 0.4).abs() < 0.001);
+        assert_eq!(
+            ctx.failure_summary.as_ref().unwrap().reasoning,
+            "Incomplete response"
+        );
         assert!(ctx.failure_history.is_empty());
     }
 
     #[test]
-    fn test_iteration_context_reflection_prompt() {
-        // Ensure enriched mode is active (env may leak from other tests in parallel)
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
-
+    fn test_iteration_context_continuation_prompt() {
         let mut plan = Plan::new("Investigate the issue");
         let mut task = Task::new(0, "Gather logs", "Get system logs");
         task.complete("Here are the logs...".to_string());
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.3, "Response lacks detail").with_gaps(vec![
-            "Missing root cause".into(),
-            "No remediation steps".into(),
-        ]);
+        let fs = FailureSummary {
+            reasoning: "Response lacks detail".into(),
+            gaps: vec!["Missing root cause".into(), "No remediation steps".into()],
+        };
 
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
         // Verify key sections are present
-        assert!(prompt.contains("REPLAN CYCLE 1 of 3"));
+        assert!(prompt.contains("ITERATION 1 of 3"));
         assert!(prompt.contains("Goal: Investigate the issue"));
-        assert!(prompt.contains("Quality Score: 0.30"));
+        // No evaluator vocabulary — no "Quality Score"
+        assert!(!prompt.contains("Quality Score"));
         assert!(prompt.contains("COMPLETED TASKS"));
         assert!(prompt.contains("Task 0: Gather logs"));
-        // Default enriched mode includes truncated results
+        // Completed task results appear inline, truncated to the inline budget
         assert!(prompt.contains("Here are the logs..."));
-        assert!(prompt.contains("EVALUATION:"));
+        assert!(prompt.contains("FAILURE SUMMARY:"));
         assert!(prompt.contains("Response lacks detail"));
-        assert!(prompt.contains("GAPS TO ADDRESS:"));
+        assert!(prompt.contains("AREAS NEEDING ATTENTION:"));
         assert!(prompt.contains("- Missing root cause"));
         assert!(prompt.contains("- No remediation steps"));
-        assert!(prompt.contains("TASKS TO REDESIGN"));
+        // Routing tool block must be present
+        assert!(prompt.contains("respond_directly"));
+        assert!(prompt.contains("create_plan"));
+        assert!(prompt.contains("request_clarification"));
+        // The artifact-read directive is integral to the template
+        assert!(prompt.contains("read_artifact"));
     }
 
     #[test]
-    fn test_iteration_context_reflection_prompt_no_gaps() {
+    fn test_iteration_context_continuation_prompt_clean_success() {
+        // Clean-success path: failure_summary = None means no FAILURE SUMMARY
+        // section is rendered.
         let mut plan = Plan::new("Simple query");
         let mut task = Task::new(0, "Execute", "Run query");
         task.complete("Done".to_string());
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.6, "Partially complete");
+        let ctx = IterationContext::new(2, plan, None, vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
-        let ctx = IterationContext::new(2, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
-
-        // Should show "No specific gaps identified" when gaps is empty
-        assert!(prompt.contains("- No specific gaps identified"));
-        assert!(prompt.contains("REPLAN CYCLE 2 of 3"));
+        assert!(prompt.contains("ITERATION 2 of 3"));
         assert!(prompt.contains("COMPLETED TASKS"));
+        // No failure section on the success path
+        assert!(!prompt.contains("FAILURE SUMMARY:"));
+        assert!(!prompt.contains("AREAS NEEDING ATTENTION:"));
     }
 
     #[test]
-    fn test_reflection_prompt_with_failure_history() {
+    fn test_continuation_prompt_with_failure_history() {
         let mut plan = Plan::new("Debug the issue");
         let mut task = Task::new(0, "Gather logs", "Collect logs");
         task.fail("Timeout contacting service");
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.0, "Task failed");
+        let fs = FailureSummary {
+            reasoning: "Task failed".into(),
+            gaps: vec![],
+        };
         let failures = vec![FailedTaskRecord {
             description: "Gather logs".to_string(),
             error: "Timeout contacting service".to_string(),
@@ -1201,25 +1208,28 @@ mod tests {
             worker: Some("operations".to_string()),
         }];
 
-        let ctx = IterationContext::new(1, plan, eval, failures);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(1, plan, Some(fs), failures);
+        let prompt = ctx.build_continuation_prompt(3);
 
         assert!(prompt.contains("FAILURE HISTORY:"));
         assert!(prompt.contains("Iteration 1: \"Gather logs\""));
         assert!(prompt.contains("(worker: operations)"));
         assert!(prompt.contains("Timeout contacting service"));
-        // No repeated failures section (only 1 occurrence)
-        assert!(!prompt.contains("REPEATED FAILURES:"));
+        // Single occurrence — no observed-patterns block
+        assert!(!prompt.contains("OBSERVED PATTERNS:"));
     }
 
     #[test]
-    fn test_reflection_prompt_with_repeated_failures() {
+    fn test_continuation_prompt_with_repeated_failures() {
         let mut plan = Plan::new("Debug the issue");
         let mut task = Task::new(0, "Fetch data", "Get data");
         task.fail("Connection refused");
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.0, "Tasks failed");
+        let fs = FailureSummary {
+            reasoning: "Tasks failed".into(),
+            gaps: vec![],
+        };
         let failures = vec![
             FailedTaskRecord {
                 description: "Fetch data".to_string(),
@@ -1235,20 +1245,17 @@ mod tests {
             },
         ];
 
-        let ctx = IterationContext::new(2, plan, eval, failures);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(2, plan, Some(fs), failures);
+        let prompt = ctx.build_continuation_prompt(3);
 
         assert!(prompt.contains("FAILURE HISTORY:"));
-        assert!(prompt.contains("REPEATED FAILURES:"));
+        assert!(prompt.contains("OBSERVED PATTERNS:"));
         assert!(prompt.contains("\"Fetch data\" has failed 2 times"));
         assert!(prompt.contains("fundamentally different approach"));
     }
 
     #[test]
-    fn test_reflection_prompt_enriched_truncation() {
-        // Ensure enriched mode is active (env may leak from other tests in parallel)
-        unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "true") };
-
+    fn test_continuation_prompt_truncation() {
         let mut plan = Plan::new("Test truncation");
         let mut task = Task::new(0, "Big result", "Produce output");
         // 600-char result exceeds 500-byte truncation limit
@@ -1256,9 +1263,8 @@ mod tests {
         task.complete(long_result);
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.5, "Needs work");
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(1, plan, None, vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
         // Should contain truncated result with "..." suffix
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1267,93 +1273,128 @@ mod tests {
         assert!(!prompt.contains(&"x".repeat(600)));
         // But should contain 500 chars worth
         assert!(prompt.contains(&"x".repeat(500)));
-
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
     }
 
     #[test]
-    fn test_reflection_prompt_legacy_mode() {
-        // SAFETY: tests run with --test-threads=1 per project convention
-        unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "false") };
-
-        let mut plan = Plan::new("Test legacy");
-        let mut task = Task::new(0, "Some task", "Do something");
-        task.complete("Result content here".to_string());
+    fn test_continuation_prompt_preserves_artifact_footer() {
+        // Regression guard: when a result contains the artifact footer
+        // appended by maybe_create_artifact, the truncation must preserve
+        // the footer so the coordinator can call read_artifact.
+        let mut plan = Plan::new("Test artifact footer");
+        let mut task = Task::new(0, "Big result", "Produce output");
+        // 600 'x' chars + the artifact footer (past 500-byte budget)
+        let body = "x".repeat(600);
+        let long_result =
+            format!("{body}\n\n[Full result (12345 chars) saved to artifact: task-0-result.txt]");
+        task.complete(long_result);
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.5, "OK");
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(1, plan, None, vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
-        // Legacy mode shows char count, not content
-        assert!(prompt.contains("(19 chars)"));
-        assert!(!prompt.contains("Result content here"));
-
-        // Clean up
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
+        // The body is truncated but the artifact footer survives.
+        assert!(prompt.contains("COMPLETED TASKS"));
+        assert!(prompt.contains("saved to artifact: task-0-result.txt"));
+        assert!(prompt.contains("12345 chars"));
     }
 
     #[test]
-    fn test_reflection_prompt_urgency_final_attempt() {
+    fn test_continuation_prompt_urgency_final_attempt() {
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
         task.fail("error");
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.0, "Failed");
+        let fs = FailureSummary {
+            reasoning: "Failed".into(),
+            gaps: vec![],
+        };
         // iteration=2, max=3 → next would be iteration 3 = max, so FINAL ATTEMPT
-        let ctx = IterationContext::new(2, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(2, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
         assert!(prompt.contains("(FINAL ATTEMPT)"));
     }
 
     #[test]
-    fn test_reflection_prompt_no_urgency_early_iteration() {
+    fn test_continuation_prompt_no_urgency_early_iteration() {
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
         task.fail("error");
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.0, "Failed");
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let fs = FailureSummary {
+            reasoning: "Failed".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
         assert!(!prompt.contains("FINAL ATTEMPT"));
     }
 
     #[test]
-    fn test_reflection_prompt_includes_reuse_guidance() {
+    fn test_continuation_prompt_reuse_guidance_only_with_failed_tasks() {
+        // Reuse guidance must only appear when there are failed tasks to
+        // selectively retry. Surfacing on succeeded > 0 alone teaches the
+        // model the no-op reuse-only plan pattern.
+        //
+        // This test exercises the "completed tasks but no failures" path:
+        // reuse_guidance must NOT appear.
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Completed task", "Done");
         task.complete("Some result");
         plan.add_task(task);
 
-        let eval = EvaluationResult::new(0.4, "Needs improvement");
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
-
-        assert!(prompt.contains("reuse_result_from"));
-    }
-
-    #[test]
-    fn test_reflection_prompt_no_reuse_guidance_when_all_failed() {
-        let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Failed task", "Tried");
-        task.fail("error");
-        plan.add_task(task);
-
-        let eval = EvaluationResult::new(0.0, "All failed");
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let ctx = IterationContext::new(1, plan, None, vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
         assert!(!prompt.contains("reuse_result_from"));
     }
 
     #[test]
-    fn test_reflection_prompt_mixed_categories() {
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
+    fn test_continuation_prompt_reuse_guidance_when_mixed() {
+        // Mixed path: some completed + some failed → reuse guidance present
+        // to let the coordinator retry failures while carrying completed
+        // results forward.
+        let mut plan = Plan::new("Goal");
+        let mut completed = Task::new(0, "Completed task", "Done");
+        completed.complete("Some result");
+        plan.add_task(completed);
 
+        let mut failed = Task::new(1, "Failed task", "Broken");
+        failed.fail("boom");
+        plan.add_task(failed);
+
+        let fs = FailureSummary {
+            reasoning: "Partial".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(prompt.contains("reuse_result_from"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_no_reuse_guidance_when_all_failed() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Failed task", "Tried");
+        task.fail("error");
+        plan.add_task(task);
+
+        let fs = FailureSummary {
+            reasoning: "All failed".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(!prompt.contains("reuse_result_from"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_mixed_categories() {
         let mut plan = Plan::new("Mixed results");
 
         let mut completed = Task::new(0, "Completed task", "Worked");
@@ -1369,23 +1410,25 @@ mod tests {
         blocked.dependencies = vec![1];
         plan.add_task(blocked);
 
-        let eval =
-            EvaluationResult::new(0.3, "Partial success").with_gaps(vec!["Task 1 failed".into()]);
-        let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let fs = FailureSummary {
+            reasoning: "Partial success".into(),
+            gaps: vec!["Task 1 failed".into()],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
 
         // All three sections should be present
         assert!(prompt.contains("COMPLETED TASKS"));
         assert!(prompt.contains("Task 0: Completed task"));
-        assert!(prompt.contains("TASKS TO REDESIGN"));
+        assert!(prompt.contains("FAILED TASKS"));
         assert!(prompt.contains("Task 1: Failed task"));
         assert!(prompt.contains("BLOCKED TASKS"));
         assert!(prompt.contains("Task 2: Blocked task"));
 
-        // Verify ordering: completed before blocked before redesign
+        // Verify ordering: completed before blocked before failed (redesign)
         let completed_pos = prompt.find("COMPLETED TASKS").unwrap();
         let blocked_pos = prompt.find("BLOCKED TASKS").unwrap();
-        let redesign_pos = prompt.find("TASKS TO REDESIGN").unwrap();
+        let redesign_pos = prompt.find("FAILED TASKS").unwrap();
         assert!(completed_pos < blocked_pos);
         assert!(blocked_pos < redesign_pos);
     }
@@ -2051,11 +2094,10 @@ mod tests {
         let ctx = IterationContext::new(
             1,
             plan,
-            EvaluationResult {
-                score: 0.7,
+            Some(FailureSummary {
                 reasoning: "Decent".into(),
                 gaps: vec!["Missing detail".into()],
-            },
+            }),
             vec![FailedTaskRecord {
                 description: "bad task".into(),
                 error: "oops".into(),
@@ -2066,8 +2108,27 @@ mod tests {
         let json = serde_json::to_string(&ctx).unwrap();
         let deserialized: IterationContext = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.iteration, 1);
-        assert_eq!(deserialized.evaluation.score, 0.7);
+        let fs = deserialized
+            .failure_summary
+            .as_ref()
+            .expect("failure_summary present");
+        assert_eq!(fs.reasoning, "Decent");
+        assert_eq!(fs.gaps, vec!["Missing detail".to_string()]);
         assert_eq!(deserialized.previous_plan.tasks.len(), 1);
         assert_eq!(deserialized.failure_history.len(), 1);
+    }
+
+    #[test]
+    fn test_iteration_context_serde_roundtrip_clean_success() {
+        // failure_summary=None on the clean-success path
+        let mut plan = Plan::new("Test");
+        let mut t = Task::new(0, "Task 0", "reason");
+        t.complete("result".to_string());
+        plan.add_task(t);
+
+        let ctx = IterationContext::new(1, plan, None, vec![]);
+        let json = serde_json::to_string(&ctx).unwrap();
+        let deserialized: IterationContext = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.failure_summary.is_none());
     }
 }

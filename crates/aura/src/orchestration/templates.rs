@@ -25,8 +25,9 @@ use std::collections::HashSet;
 
 // Template constants loaded at compile time
 pub const WORKER_TASK_PROMPT_TEMPLATE: &str = include_str!("../prompts/worker_task_prompt.md");
+#[allow(dead_code)]
 pub const SYNTHESIS_PROMPT_TEMPLATE: &str = include_str!("../prompts/synthesis_prompt.md");
-pub const REFLECTION_PROMPT_TEMPLATE: &str = include_str!("../prompts/reflection_prompt.md");
+pub const CONTINUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/continuation_prompt.md");
 
 /// Trait for template variable providers.
 ///
@@ -62,6 +63,7 @@ impl TemplateVars for WorkerTaskVars<'_> {
 }
 
 /// Variables for the synthesis prompt.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SynthesisVars<'a> {
     pub goal: &'a str,
@@ -80,26 +82,28 @@ impl TemplateVars for SynthesisVars<'_> {
     }
 }
 
-/// Variables for the reflection prompt (replan cycle).
+/// Variables for the continuation prompt (post-execute decision point).
+///
+/// Rendered for every post-execute coordinator call — clean success, failure,
+/// partial, and blocked-dependency cases all share this template. The
+/// coordinator chooses one routing tool to continue, conclude, or clarify.
 #[derive(Debug, Clone)]
-pub struct ReflectionVars<'a> {
+pub struct ContinuationVars<'a> {
     pub iteration: &'a str,
     pub max_iterations: &'a str,
     pub urgency: &'a str,
     pub succeeded: &'a str,
     pub total: &'a str,
     pub goal: &'a str,
-    pub score: &'a str,
     pub completed_section: &'a str,
     pub blocked_section: &'a str,
     pub redesign_section: &'a str,
-    pub reasoning: &'a str,
-    pub gaps: &'a str,
+    pub failure_section: &'a str,
     pub failure_history: &'a str,
     pub reuse_guidance: &'a str,
 }
 
-impl TemplateVars for ReflectionVars<'_> {
+impl TemplateVars for ContinuationVars<'_> {
     const VARS: &'static [&'static str] = &[
         "ITERATION",
         "MAX_ITERATIONS",
@@ -107,12 +111,10 @@ impl TemplateVars for ReflectionVars<'_> {
         "SUCCEEDED",
         "TOTAL",
         "GOAL",
-        "SCORE",
         "COMPLETED_SECTION",
         "BLOCKED_SECTION",
         "REDESIGN_SECTION",
-        "REASONING",
-        "GAPS",
+        "FAILURE_SECTION",
         "FAILURE_HISTORY",
         "REUSE_GUIDANCE",
     ];
@@ -125,12 +127,10 @@ impl TemplateVars for ReflectionVars<'_> {
             .replace("%%SUCCEEDED%%", self.succeeded)
             .replace("%%TOTAL%%", self.total)
             .replace("%%GOAL%%", self.goal)
-            .replace("%%SCORE%%", self.score)
             .replace("%%COMPLETED_SECTION%%", self.completed_section)
             .replace("%%BLOCKED_SECTION%%", self.blocked_section)
             .replace("%%REDESIGN_SECTION%%", self.redesign_section)
-            .replace("%%REASONING%%", self.reasoning)
-            .replace("%%GAPS%%", self.gaps)
+            .replace("%%FAILURE_SECTION%%", self.failure_section)
             .replace("%%FAILURE_HISTORY%%", self.failure_history)
             .replace("%%REUSE_GUIDANCE%%", self.reuse_guidance)
     }
@@ -142,13 +142,14 @@ pub fn render_worker_task_prompt(vars: &WorkerTaskVars<'_>) -> String {
 }
 
 /// Render the synthesis prompt with the given variables.
+#[allow(dead_code)]
 pub fn render_synthesis_prompt(vars: &SynthesisVars<'_>) -> String {
     vars.render(SYNTHESIS_PROMPT_TEMPLATE)
 }
 
-/// Render the reflection prompt with the given variables.
-pub fn render_reflection_prompt(vars: &ReflectionVars<'_>) -> String {
-    vars.render(REFLECTION_PROMPT_TEMPLATE)
+/// Render the continuation prompt with the given variables.
+pub fn render_continuation_prompt(vars: &ContinuationVars<'_>) -> String {
+    vars.render(CONTINUATION_PROMPT_TEMPLATE)
 }
 
 /// Extract `%%VAR%%` placeholders from a template string.
@@ -308,9 +309,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reflection_template_matches_context() {
-        validate_template::<ReflectionVars>(REFLECTION_PROMPT_TEMPLATE)
-            .expect("Reflection template should match ReflectionVars");
+    fn test_continuation_template_matches_context() {
+        validate_template::<ContinuationVars>(CONTINUATION_PROMPT_TEMPLATE)
+            .expect("Continuation template should match ContinuationVars");
     }
 
     // =========================================================================
@@ -376,18 +377,18 @@ mod tests {
     }
 
     #[test]
-    fn test_reflection_template_loaded() {
+    fn test_continuation_template_loaded() {
         assert!(
-            !REFLECTION_PROMPT_TEMPLATE.is_empty(),
-            "Reflection template should be loaded"
+            !CONTINUATION_PROMPT_TEMPLATE.is_empty(),
+            "Continuation template should be loaded"
         );
         assert!(
-            REFLECTION_PROMPT_TEMPLATE.contains("%%ITERATION%%"),
-            "Reflection template should contain ITERATION placeholder"
+            CONTINUATION_PROMPT_TEMPLATE.contains("%%ITERATION%%"),
+            "Continuation template should contain ITERATION placeholder"
         );
         assert!(
-            REFLECTION_PROMPT_TEMPLATE.contains("%%REDESIGN_SECTION%%"),
-            "Reflection template should contain REDESIGN_SECTION placeholder"
+            CONTINUATION_PROMPT_TEMPLATE.contains("%%REDESIGN_SECTION%%"),
+            "Continuation template should contain REDESIGN_SECTION placeholder"
         );
     }
 
@@ -534,19 +535,18 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             names_json.join(", ")
         );
 
-        let reflection_section = "";
         let error_section = "";
 
         let planning_prompt = format!(
             "Analyze this user query and decide on the best approach.\n\n\
-             USER QUERY: {query}{worker_section}{reflection_section}{error_section}\n\n\
+             USER QUERY: {query}{worker_section}{error_section}\n\n\
              You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
              1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
                 NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
              2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
-                When uncertain between respond_directly and create_plan, always choose create_plan.\n\n\
+                When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.\n\n\
              3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
-                Use sparingly — prefer create_plan when a reasonable interpretation exists.\n\n\
+                Use sparingly when a reasonable interpretation exists.\n\n\
              {worker_guidelines}\n\n\
              Call the appropriate routing tool now.",
         );
@@ -631,31 +631,29 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         let _ = writeln!(out, "{synthesis}");
 
         // ================================================================
-        // 7. Reflection prompt (replan cycle)
+        // 7. Continuation prompt (end-of-iteration decision point)
         // ================================================================
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(
             out,
-            "PHASE: REFLECTION PROMPT — Replan after quality threshold miss"
+            "PHASE: CONTINUATION PROMPT — Post-execute decision point"
         );
         let _ = writeln!(out, "{separator}\n");
-        let reflection = render_reflection_prompt(&ReflectionVars {
+        let continuation = render_continuation_prompt(&ContinuationVars {
             iteration: "1",
             max_iterations: "2",
             urgency: " (FINAL ATTEMPT)",
             succeeded: "1",
             total: "2",
             goal: "Calculate (3+7)*2 and find files in /data",
-            score: "0.45",
-            completed_section: "COMPLETED TASKS (do not re-plan these):\n- Task 0: Calculate (3+7)*2 using mock_tool → (3+7)*2 = 20\n\n",
+            completed_section: "COMPLETED TASKS:\n- Task 0: Calculate (3+7)*2 using mock_tool → (3+7)*2 = 20\n\n",
             blocked_section: "",
-            redesign_section: "TASKS TO REDESIGN:\n- Task 1: List files in /data using list_files → failed: Connection refused\n\n",
-            reasoning: "Arithmetic task completed correctly, but file listing failed due to connection error.",
-            gaps: "- File listing task needs retry or alternative approach",
-            failure_history: "\nFAILURE HISTORY:\n- Iteration 1: \"List files in /data using list_files\" (worker: data) — Connection refused\n",
-            reuse_guidance: "\nTo carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID.",
+            redesign_section: "FAILED TASKS:\n- Task 1: List files in /data using list_files → failed: Connection refused\n\n",
+            failure_section: "FAILURE SUMMARY:\nArithmetic task completed correctly, but file listing failed due to connection error.\n\nAREAS NEEDING ATTENTION:\n- File listing task needs retry or alternative approach\n\n",
+            failure_history: "FAILURE HISTORY:\n- Iteration 1: \"List files in /data using list_files\" (worker: data) — Connection refused\n\n",
+            reuse_guidance: "To carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID.\n\n",
         });
-        let _ = writeln!(out, "{reflection}");
+        let _ = writeln!(out, "{continuation}");
 
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(out, "END OF PROMPT RENDERING QA");

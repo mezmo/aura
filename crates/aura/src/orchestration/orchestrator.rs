@@ -63,7 +63,7 @@ use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    EvaluationResult, FailedTaskRecord, IterationContext, IterationOutcome, Plan, PlanAttemptFailure,
+    FailedTaskRecord, FailureSummary, IterationContext, IterationOutcome, Plan, PlanAttemptFailure,
     PlanningResponse, Task, TaskStatus,
 };
 
@@ -110,6 +110,11 @@ struct CoordinatorTools {
     inspect_tool_params: Option<InspectToolParamsTool>,
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
     routing_tools: Option<RoutingToolSet>,
+    /// When `false`, the `create_plan` tool is omitted from the coordinator's
+    /// tool set. Used on the final iteration's post-execute call to enforce
+    /// the replan budget structurally — the coordinator must pick
+    /// `respond_directly` or `request_clarification`.
+    allow_create_plan: bool,
     read_artifact: Option<ReadArtifactTool>,
 }
 
@@ -1125,6 +1130,47 @@ impl Orchestrator {
         }
     }
 
+    /// Build the iter-1 planning wrapper (fresh query, no prior iteration).
+    /// Enumerates the three routing tools with neutral bullets.
+    fn build_planning_wrapper(
+        query: &str,
+        worker_section: &str,
+        worker_guidelines: &str,
+        error_section: &str,
+    ) -> String {
+        format!(
+            "Analyze this user query and decide on the best approach.\n\n\
+             USER QUERY: {query}{worker_section}{error_section}\n\n\
+             You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
+             1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
+                NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
+             2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
+                When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.\n\n\
+             3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
+                Use sparingly when a reasonable interpretation exists.\n\n\
+             {worker_guidelines}\n\n\
+             Call the appropriate routing tool now.",
+        )
+    }
+
+    /// Build the post-execute continuation wrapper (end-of-iteration decision
+    /// point). Renders the continuation prompt from the iteration context and
+    /// deliberately does NOT re-enumerate the three routing tools — the
+    /// coordinator already has them in its preamble, and re-listing them here
+    /// would layer additional tool-choice bias into the user message.
+    fn build_continuation_wrapper(
+        ctx: &IterationContext,
+        max_iterations: usize,
+        error_section: &str,
+    ) -> String {
+        let base = ctx.build_continuation_prompt(max_iterations);
+        if error_section.is_empty() {
+            base
+        } else {
+            format!("{base}{error_section}")
+        }
+    }
+
     /// Plan with routing tool support.
     ///
     /// Creates a coordinator with routing tools (`respond_directly`, `create_plan`,
@@ -1154,20 +1200,31 @@ impl Orchestrator {
         let routing_toolset = RoutingToolSet::new();
         let routing_decision: RoutingDecision = routing_toolset.decision.clone();
 
-        // Create coordinator with routing tools
+        // Post-execute continuation calls zero the recon tools — execute has
+        // already happened, so list_tools / inspect_tool_params have no
+        // legitimate use at the decision point.
+        let include_recon = previous.is_none();
+        // On the final iteration's post-execute call, omit `create_plan` from
+        // the tool set: the replan budget is exhausted, so the coordinator
+        // must pick `respond_directly` or `request_clarification`. The
+        // `(FINAL ATTEMPT)` urgency in the continuation prompt signals intent;
+        // stripping the tool makes it structural.
+        let allow_create_plan = match previous {
+            None => true,
+            Some(ctx) => ctx.iteration < self.config.max_planning_cycles,
+        };
         let AgentWithPreamble {
             agent: coordinator,
             preamble: coordinator_preamble,
             ..
-        } = self.create_coordinator(Some(routing_toolset)).await?;
+        } = self
+            .create_coordinator(Some(routing_toolset), include_recon, allow_create_plan)
+            .await?;
 
-        // Build prompt components
+        // Build prompt components (planning phase only; continuation phase
+        // renders its own complete user message).
         let (worker_section, _worker_field, worker_guidelines) =
             self.build_worker_prompt_sections();
-
-        let reflection_section = previous
-            .map(|ctx| ctx.build_reflection_prompt(self.config.max_planning_cycles))
-            .unwrap_or_default();
 
         let mut plan_errors: Vec<PlanAttemptFailure> = Vec::new();
         let mut final_prompt = String::new();
@@ -1199,25 +1256,24 @@ impl Orchestrator {
                 String::new()
             };
 
-            // Build the tool-calling planning prompt
-            let planning_prompt = format!(
-                "Analyze this user query and decide on the best approach.\n\n\
-                 USER QUERY: {query}{worker_section}{reflection_section}{error_section}\n\n\
-                 You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
-                 1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
-                    NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
-                 2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
-                    When uncertain between respond_directly and create_plan, always choose create_plan.\n\n\
-                 3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
-                    Use sparingly — prefer create_plan when a reasonable interpretation exists.\n\n\
-                 {worker_guidelines}\n\n\
-                 Call the appropriate routing tool now.",
-                query = query,
-                worker_section = worker_section,
-                reflection_section = reflection_section,
-                error_section = error_section,
-                worker_guidelines = worker_guidelines,
-            );
+            // Build the user message based on call phase. The iter-1 planning
+            // wrapper enumerates the routing tools; the post-execute
+            // continuation wrapper renders the continuation prompt from the
+            // iteration context and does NOT re-enumerate the routing tools
+            // (the coordinator already has them in its preamble).
+            let planning_prompt = match previous {
+                None => Self::build_planning_wrapper(
+                    query,
+                    &worker_section,
+                    &worker_guidelines,
+                    &error_section,
+                ),
+                Some(ctx) => Self::build_continuation_wrapper(
+                    ctx,
+                    self.config.max_planning_cycles,
+                    &error_section,
+                ),
+            };
 
             // Record in prompt journal
             self.journal_record(
@@ -1887,7 +1943,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
         if let Some(routing) = tools.routing_tools {
             state = state.add_tool(routing.respond_directly);
-            state = state.add_tool(routing.create_plan);
+            if tools.allow_create_plan {
+                state = state.add_tool(routing.create_plan);
+            }
             state = state.add_tool(routing.request_clarification);
         }
         if let Some(artifact_tool) = tools.read_artifact {
@@ -1910,6 +1968,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn create_coordinator(
         &self,
         routing_tools: Option<RoutingToolSet>,
+        allow_recon_tools: bool,
+        allow_create_plan: bool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use crate::vector_dynamic::DynamicVectorSearchTool;
         use crate::vector_store::VectorStoreManager;
@@ -1922,12 +1982,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let list_tool = ListToolsTool::new(tool_names);
         let inspect_tool = InspectToolParamsTool::new(tool_schemas);
 
-        // Omit recon tools when tools_in_planning is Summary or Full
-        // (tool names are already in the planning prompt via worker sections)
-        let include_recon_tools = matches!(
-            self.config.tools_in_planning,
-            super::config::ToolVisibility::None
-        );
+        // Recon tools are gated by two conditions:
+        //   - `allow_recon_tools`: callers pass false for post-execute calls,
+        //     where execute is already done and recon has no legitimate use.
+        //   - `tools_in_planning == None`: when worker tool inventories are
+        //     already inlined into the planning prompt, recon is redundant.
+        let include_recon_tools = allow_recon_tools
+            && matches!(
+                self.config.tools_in_planning,
+                super::config::ToolVisibility::None
+            );
 
         // Build coordinator preamble: orchestration framework template + user system prompt
         let mut preamble = self.config.build_coordinator_preamble(
@@ -2012,6 +2076,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             vector_tools,
             routing_tools,
+            allow_create_plan,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
         };
 
@@ -2048,8 +2113,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Create a coordinator agent for synthesis (only `read_artifact` tool).
     ///
-    /// Synthesis needs access to artifacts but should not have recon or routing tools,
-    /// preventing models from wasting turns on `list_tools`/`inspect_tool_params` calls.
+    /// Synthesis needs access to artifacts but should not have recon or routing
+    /// tools, preventing models from wasting turns on `list_tools`/
+    /// `inspect_tool_params` calls.
+    #[allow(dead_code)]
     async fn create_synthesis_coordinator(
         &self,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
@@ -2063,6 +2130,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             inspect_tool_params: None,
             vector_tools: vec![],
             routing_tools: None,
+            allow_create_plan: false,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
         };
 
@@ -2420,6 +2488,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// The prompt provides context about the orchestration goal, the original
     /// user query, and each task's description, rationale, and result.
+    #[allow(dead_code)]
     fn build_synthesis_prompt(&self, plan: &Plan, query: &str, tasks: &[&Task]) -> String {
         let results_section = tasks
             .iter()
@@ -3024,6 +3093,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Returns `Ok(Some(result))` if partial synthesis succeeded,
     /// `Ok(None)` if no completed tasks or synthesis failed,
     /// allowing the caller to decide whether to break or return an error.
+    #[allow(dead_code)]
     async fn try_partial_synthesis(
         &self,
         plan: &Plan,
@@ -3097,6 +3167,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// combine results into a coherent response.
     ///
     /// Also persists the synthesis artifacts via ExecutionPersistence.
+    #[allow(dead_code)]
     #[tracing::instrument(
         name = "orchestration.synthesis",
         skip_all,
@@ -3298,7 +3369,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         iteration: usize,
         trigger: &str,
         plan: Plan,
-        evaluation: EvaluationResult,
+        failure_summary: Option<FailureSummary>,
         failure_history: &[FailedTaskRecord],
     ) -> (Option<IterationContext>, Plan) {
         Self::emit_event(
@@ -3310,7 +3381,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         )
         .await;
 
-        let context = IterationContext::new(iteration, plan, evaluation, failure_history.to_vec());
+        let context =
+            IterationContext::new(iteration, plan, failure_summary, failure_history.to_vec());
         (Some(context), Plan::new(""))
     }
 
@@ -3555,119 +3627,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             self.config.per_call_timeout_secs(),
         );
 
-        // On re-plan (iteration > 1), advance persistence iteration so
-        // the new plan and its execution share a single directory.
-        // Iteration 1 is already set by persistence initialization.
+        // `previous_context` is unused under the unified continuation design —
+        // the prior iteration's post-execute coordinator call already
+        // produced the plan we receive here (or we received an empty
+        // carry-over plan from the failure-replan path's `trigger_replan`).
+        // Kept in the signature for future artifact-reachability wiring.
+        let _ = previous_context;
+
+        // On re-plan (iteration > 1), advance persistence so the new plan
+        // and its execution share a single directory.
         if iteration > 1 {
-            {
-                let mut persistence = self.persistence.lock().await;
-                persistence.start_new_iteration();
-            }
-            let (response, _prompt, _coordinator_text) = match self
-                .plan_with_routing(
-                    query,
-                    chat_history,
-                    previous_context,
-                    Some(event_tx),
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    self.write_run_manifest(&plan, iteration)
-                        .await;
-                    return Err(e);
-                }
-            };
-
-            // Handle non-plan responses during replan: Direct/Clarification
-            // short-circuit the loop, mirroring the initial routing in run_orchestration().
-            match &response {
-                PlanningResponse::Direct {
-                    response: direct_response,
-                    routing_rationale,
-                } => {
-                    Self::emit_event(
-                        event_tx,
-                        OrchestratorEvent::DirectAnswer {
-                            response: direct_response.clone(),
-                            routing_rationale: routing_rationale.clone(),
-                        },
-                    )
-                    .await;
-                    Self::emit_event(
-                        event_tx,
-                        OrchestratorEvent::IterationComplete {
-                            iteration,
-                            will_replan: false,
-                            reasoning: String::new(),
-                            gaps: vec![],
-                        },
-                    )
-                    .await;
-                    self.write_run_manifest(&plan, iteration)
-                        .await;
-                    return Ok(IterationOutcome::FinalResult(direct_response.clone()));
-                }
-                PlanningResponse::Clarification {
-                    question,
-                    options,
-                    routing_rationale,
-                } => {
-                    Self::emit_event(
-                        event_tx,
-                        OrchestratorEvent::ClarificationNeeded {
-                            question: question.clone(),
-                            options: options.clone(),
-                            routing_rationale: routing_rationale.clone(),
-                        },
-                    )
-                    .await;
-                    Self::emit_event(
-                        event_tx,
-                        OrchestratorEvent::IterationComplete {
-                            iteration,
-                            will_replan: false,
-                            reasoning: String::new(),
-                            gaps: vec![],
-                        },
-                    )
-                    .await;
-                    self.write_run_manifest(&plan, iteration)
-                        .await;
-                    return Ok(IterationOutcome::FinalResult(question.clone()));
-                }
-                PlanningResponse::StepsPlan { .. } => {
-                    // Fall through to plan extraction below
-                }
-            }
-
-            let routing_rationale = response.routing_rationale().to_string();
-            let planning_summary = response.planning_summary().unwrap_or_default().to_string();
-
-            // Extract plan from response — Direct/Clarification handled above,
-            // so into_plan() will always return Some here.
-            plan = response
-                .into_plan()
-                .expect("StepsPlan always converts to plan");
-
-            // Carry forward results from previous iteration where coordinator requested reuse
-            Self::apply_result_reuse(
-                &mut plan,
-                previous_context.map(|ctx| &ctx.previous_plan),
-            );
-
-            Self::emit_event(
-                event_tx,
-                OrchestratorEvent::PlanCreated {
-                    goal: plan.goal.clone(),
-                    task_count: plan.tasks.len(),
-                    routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
-                    routing_rationale,
-                    planning_response: planning_summary,
-                },
-            )
-            .await;
+            let mut persistence = self.persistence.lock().await;
+            persistence.start_new_iteration();
         }
 
         // Record task count on the iteration span now that the plan is finalized
@@ -3677,8 +3648,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
         if let Err(e) = self.execute(&mut plan, event_tx).await {
-            self.write_run_manifest(&plan, iteration)
-                .await;
+            self.write_run_manifest(&plan, iteration).await;
             return Err(e);
         }
         let new_failure_start = failure_history.len();
@@ -3694,13 +3664,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         // ----------------------------------------------------------------
-        // CHECK FOR FAILURES: Skip synthesis if tasks failed/blocked
+        // SUMMARIZE FAILURES (if any): builds the optional failure_summary
+        // for the continuation prompt; no control-flow branching yet.
         // ----------------------------------------------------------------
         let failed_count = plan.failed_count();
         let blocked_count = plan.blocked_tasks().len();
         let has_failures = failed_count > 0 || blocked_count > 0;
 
-        if has_failures {
+        let failure_summary = if has_failures {
             let failure_detail = if !this_iteration_failures.is_empty() {
                 let mut category_counts: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
@@ -3733,34 +3704,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 blocked_count
             );
 
-            let iterations_remaining = iteration < self.config.max_planning_cycles;
-
-            if !iterations_remaining {
-                if let Some(partial) = self
-                    .try_partial_synthesis(
-                        &plan,
-                        query,
-                        event_tx,
-                        iteration,
-                        "Task failures detected",
-                    )
-                    .await
-                {
-                    self.write_run_manifest(&plan, iteration).await;
-                    return Ok(IterationOutcome::FinalResult(partial));
-                }
-                let summary = self.build_execution_summary(&plan);
-                self.write_run_manifest(&plan, iteration)
-                    .await;
-                return Err(format!(
-                    "Plan execution failed after {} iterations:\n{}",
-                    iteration, summary
-                )
-                .into());
-            }
-
-            // Provider error short-circuit: if ALL failures are provider errors,
-            // don't waste an iteration asking the coordinator to fix what it can't.
+            // Provider error short-circuit: if ALL failures are provider
+            // errors, replanning can't fix them. Emit raw results rather
+            // than burn a coordinator turn asking the LLM to retry.
             if Self::should_short_circuit_provider_errors(
                 this_iteration_failures,
                 plan.completed_count(),
@@ -3771,8 +3717,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     this_iteration_failures.len(),
                     summary
                 );
-                self.write_run_manifest(&plan, iteration)
-                    .await;
+                self.write_run_manifest(&plan, iteration).await;
                 return Err(format!(
                     "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
                     summary
@@ -3780,10 +3725,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             let execution_summary = self.build_execution_summary(&plan);
-            tracing::info!("Triggering replan due to failures:\n{}", execution_summary);
-
-            let failure_evaluation = EvaluationResult {
-                score: 0.0,
+            Some(FailureSummary {
                 reasoning: format!(
                     "Execution failed: {} task(s) failed, {} task(s) blocked by dependencies.",
                     failed_count, blocked_count
@@ -3792,80 +3734,257 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     "Some tasks could not complete due to errors".to_string(),
                     format!("Execution summary:\n{}", execution_summary),
                 ],
-            };
-
-            // Emit IterationComplete on failure path
-            Self::emit_event(
-                event_tx,
-                OrchestratorEvent::IterationComplete {
-                    iteration,
-                    will_replan: true,
-                    reasoning: failure_evaluation.reasoning.clone(),
-                    gaps: failure_evaluation.gaps.clone(),
-                },
-            )
-            .await;
-
-            // Persist plan state before replan
-            {
-                let persistence = self.persistence.lock().await;
-                if let Err(e) = persistence.write_plan(&plan).await {
-                    tracing::warn!("Failed to persist plan before replan: {}", e);
-                }
-            }
-
-            let (new_previous_context, new_plan) = Self::trigger_replan(
-                event_tx,
-                iteration,
-                "failure",
-                plan,
-                failure_evaluation,
-                failure_history,
-            )
-            .await;
-            return Ok(IterationOutcome::Continue {
-                new_plan,
-                previous_context: new_previous_context,
-            });
-        }
-
-        // ----------------------------------------------------------------
-        // SYNTHESIZE: Combine task results into coherent response
-        // ----------------------------------------------------------------
-        Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
-        let final_result = match self.synthesize(&plan, query, Some(event_tx)).await {
-            Ok(r) => r,
-            Err(e) => {
-                self.write_run_manifest(&plan, iteration)
-                    .await;
-                return Err(e);
-            }
+            })
+        } else {
+            None
         };
 
         // ----------------------------------------------------------------
-        // DECIDE: synthesis succeeded — break (C3 will add post-execute
-        // coordinator call here; for now the loop always breaks after synthesis)
+        // POST-EXECUTE DECISION: unified continuation coordinator call for
+        // BOTH clean-success and failure paths. The coordinator sees the
+        // iteration's per-task state via the continuation prompt and chooses
+        // one routing tool:
+        //   - respond_directly → use its response as the final answer
+        //   - create_plan      → carry the new plan into the next iteration
+        //   - request_clarification → return the question to the user
+        //
+        // If the coordinator call itself errors (timeout, depth, upstream),
+        // build_raw_task_results ships the worker output the user already
+        // paid for instead of an empty response.
         // ----------------------------------------------------------------
-        Self::emit_event(
-            event_tx,
-            OrchestratorEvent::IterationComplete {
-                iteration,
-                will_replan: false,
-                reasoning: String::new(),
-                gaps: vec![],
-            },
-        )
-        .await;
-        tracing::info!(
-            "Iteration {} complete: elapsed={:.1}s",
+        let post_execute_ctx = IterationContext::new(
             iteration,
-            orchestration_start.elapsed().as_secs_f64(),
+            plan.clone(),
+            failure_summary,
+            failure_history.clone(),
         );
+        let decision_start = Instant::now();
+        let routing = self
+            .plan_with_routing(query, chat_history, Some(&post_execute_ctx), Some(event_tx))
+            .await;
 
-        // Write run manifest on completion (best-effort)
-        self.write_run_manifest(&plan, iteration).await;
+        let decision_latency = decision_start.elapsed().as_secs_f64();
+        tracing::Span::current().record("orchestration.decision_latency_seconds", decision_latency);
 
-        Ok(IterationOutcome::FinalResult(final_result))
+        match routing {
+            Ok((
+                PlanningResponse::Direct {
+                    response,
+                    routing_rationale,
+                },
+                _,
+                _,
+            )) => {
+                tracing::Span::current()
+                    .record("orchestration.post_execute_decision", "respond_directly");
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::DirectAnswer {
+                        response: response.clone(),
+                        routing_rationale,
+                    },
+                )
+                .await;
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::IterationComplete {
+                        iteration,
+                        will_replan: false,
+                        reasoning: String::new(),
+                        gaps: vec![],
+                    },
+                )
+                .await;
+                tracing::info!(
+                    "Iteration {} complete: elapsed={:.1}s (decision: respond_directly, {:.1}s)",
+                    iteration,
+                    orchestration_start.elapsed().as_secs_f64(),
+                    decision_latency,
+                );
+                self.write_run_manifest(&plan, iteration).await;
+                Ok(IterationOutcome::FinalResult(response))
+            }
+            Ok((
+                PlanningResponse::Clarification {
+                    question,
+                    options,
+                    routing_rationale,
+                },
+                _,
+                _,
+            )) => {
+                tracing::Span::current().record(
+                    "orchestration.post_execute_decision",
+                    "request_clarification",
+                );
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::ClarificationNeeded {
+                        question: question.clone(),
+                        options,
+                        routing_rationale,
+                    },
+                )
+                .await;
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::IterationComplete {
+                        iteration,
+                        will_replan: false,
+                        reasoning: String::new(),
+                        gaps: vec![],
+                    },
+                )
+                .await;
+                tracing::info!(
+                    "Iteration {} complete: elapsed={:.1}s (decision: request_clarification, {:.1}s)",
+                    iteration,
+                    orchestration_start.elapsed().as_secs_f64(),
+                    decision_latency,
+                );
+                self.write_run_manifest(&plan, iteration).await;
+                Ok(IterationOutcome::FinalResult(question))
+            }
+            Ok((resp @ PlanningResponse::StepsPlan { .. }, _, _)) => {
+                tracing::Span::current()
+                    .record("orchestration.post_execute_decision", "create_plan");
+                // Budget is enforced structurally: `plan_with_routing` strips
+                // `create_plan` from the tool set on the final iteration, so
+                // reaching this arm means the budget still permits another
+                // iteration.
+
+                let routing_rationale = resp.routing_rationale().to_string();
+                let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
+                let mut new_plan = resp.into_plan().expect("StepsPlan always converts to plan");
+                Self::apply_result_reuse(&mut new_plan, Some(&plan));
+
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::PlanCreated {
+                        goal: new_plan.goal.clone(),
+                        task_count: new_plan.tasks.len(),
+                        routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
+                        routing_rationale,
+                        planning_response: planning_summary,
+                    },
+                )
+                .await;
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::IterationComplete {
+                        iteration,
+                        will_replan: true,
+                        reasoning: String::new(),
+                        gaps: vec![],
+                    },
+                )
+                .await;
+
+                // Persist plan state before replan
+                {
+                    let persistence = self.persistence.lock().await;
+                    if let Err(e) = persistence.write_plan(&plan).await {
+                        tracing::warn!("Failed to persist plan before replan: {}", e);
+                    }
+                }
+
+                let (new_previous_context, _) = Self::trigger_replan(
+                    event_tx,
+                    iteration,
+                    "post_execute_create_plan",
+                    plan,
+                    None,
+                    failure_history,
+                )
+                .await;
+                tracing::info!(
+                    "Iteration {} complete: elapsed={:.1}s (decision: create_plan, {:.1}s)",
+                    iteration,
+                    orchestration_start.elapsed().as_secs_f64(),
+                    decision_latency,
+                );
+                // The coordinator already produced new_plan; we discard the
+                // empty plan returned by trigger_replan but keep its
+                // IterationContext so the next iteration can persist
+                // previous_plan cleanly (reuse_result_from resolution, etc.)
+                Ok(IterationOutcome::Continue {
+                    new_plan,
+                    previous_context: new_previous_context,
+                })
+            }
+            // Post-execute coordinator call errored before routing (timeout,
+            // depth exhaustion, upstream provider error). Ship the worker
+            // output the user already paid for rather than returning an empty
+            // response.
+            Err(e) => {
+                tracing::Span::current()
+                    .record("orchestration.post_execute_decision", "coordinator_error");
+                let err_str = e.to_string();
+                let note = if err_str.contains("timed out") {
+                    format!("Post-execute coordinator call timed out: {}", err_str)
+                } else if err_str.contains("MaxDepthError") || err_str.contains("reached limit") {
+                    format!(
+                        "Post-execute coordinator exhausted its turn budget without routing: {}",
+                        err_str
+                    )
+                } else {
+                    // Plan-parse errors are absorbed upstream in
+                    // plan_with_routing's all-attempts-failed single-task
+                    // path. An Err bubbling up here is an upstream failure
+                    // (provider error, connection drop, etc.).
+                    format!("Post-execute coordinator call failed: {}", err_str)
+                };
+                tracing::warn!("{}", note);
+                let raw = Self::build_raw_task_results(&plan, &note);
+                Self::emit_event(
+                    event_tx,
+                    OrchestratorEvent::IterationComplete {
+                        iteration,
+                        will_replan: false,
+                        reasoning: note,
+                        gaps: vec![],
+                    },
+                )
+                .await;
+                self.write_run_manifest(&plan, iteration).await;
+                Ok(IterationOutcome::FinalResult(raw))
+            }
+        }
+    }
+
+    /// Format the plan's per-task results as a Markdown string prefixed with
+    /// a short context note. Used when the post-execute coordinator call
+    /// errors before it can route, so the user still sees what the workers
+    /// produced instead of an empty response.
+    fn build_raw_task_results(plan: &Plan, failure_note: &str) -> String {
+        let mut out = String::new();
+        out.push_str(failure_note);
+        out.push_str("\n\nRaw task results:\n\n");
+        for t in &plan.tasks {
+            match t.status {
+                TaskStatus::Complete => {
+                    let result = t.result.as_deref().unwrap_or("(no result)");
+                    out.push_str(&format!(
+                        "## Task {}: {}\n\n{}\n\n",
+                        t.id, t.description, result
+                    ));
+                }
+                TaskStatus::Failed => {
+                    let err = t.error.as_deref().unwrap_or("unknown");
+                    out.push_str(&format!(
+                        "## Task {}: {}\n\nFailed: {}\n\n",
+                        t.id, t.description, err
+                    ));
+                }
+                TaskStatus::Pending | TaskStatus::Running => {
+                    out.push_str(&format!(
+                        "## Task {}: {}\n\n(not executed)\n\n",
+                        t.id, t.description
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// Write a typed `RunManifest` summarizing this orchestration run.

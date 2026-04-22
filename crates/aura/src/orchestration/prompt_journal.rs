@@ -33,6 +33,7 @@ pub(crate) enum JournalPhase<'a> {
         worker_name: Option<&'a str>,
         attempt: usize,
     },
+    #[allow(dead_code)]
     Synthesis,
 }
 
