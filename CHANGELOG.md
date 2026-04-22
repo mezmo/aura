@@ -1,3 +1,15 @@
+# [1.19.0](https://github.com/mezmo/aura/compare/v1.18.1...v1.19.0) (2026-04-22)
+
+
+### Bug Fixes
+
+* rewrite metrics_analyst preamble to stop loop [224f79f](https://github.com/mezmo/aura/commit/224f79fba8193522c379d0de35f1ee1be68b256f) - Andre Elizondo [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Features
+
+* add Kubernetes SRE orchestration quickstart [ee0f746](https://github.com/mezmo/aura/commit/ee0f74698aeb32911ef0ca46120cf9d313acc833) - Andre Elizondo [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
 ## [1.18.1](https://github.com/mezmo/aura/compare/v1.18.0...v1.18.1) (2026-04-21)
 
 
