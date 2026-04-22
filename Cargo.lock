@@ -414,7 +414,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "1.17.3"
+version = "1.18.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "1.17.3"
+version = "1.18.1"
 dependencies = [
  "anyhow",
  "aura",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "1.17.3"
+version = "1.18.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "1.17.3"
+version = "1.18.1"
 dependencies = [
  "actix-web",
  "actix-web-lab",
@@ -3367,7 +3367,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.28.0"
-source = "git+https://github.com/mezmo/rig.git?rev=0853ab14#0853ab1487b6cbdc4c8818e9fb8d475b8b59eaf6"
+source = "git+https://github.com/mezmo/rig.git?rev=16864b96#16864b965fbc2d47b34cbe956a6aa8544bd79a74"
 dependencies = [
  "as-any",
  "async-stream",
