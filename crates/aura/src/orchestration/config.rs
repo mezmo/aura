@@ -1149,17 +1149,16 @@ mod tests {
     fn test_build_vector_store_context_single() {
         let stores = vec![VectorStoreConfig {
             name: "mezmo_docs".to_string(),
-            store_type: "qdrant".to_string(),
-            embedding_model: crate::config::EmbeddingModelConfig {
-                provider: "openai".to_string(),
-                model: "text-embedding-3-small".to_string(),
-                api_key: "test".to_string(),
-                base_url: None,
-            },
-            connection_string: None,
-            url: None,
-            collection_name: None,
             context_prefix: Some("Mezmo documentation and procedures".to_string()),
+            store: crate::config::VectorStoreType::Qdrant {
+                embedding_model: crate::config::EmbeddingModelConfig::OpenAI {
+                    api_key: "test".to_string(),
+                    model: "text-embedding-3-small".to_string(),
+                    base_url: None,
+                },
+                url: "http://localhost:6333".to_string(),
+                collection_name: "mezmo_docs".to_string(),
+            },
         }];
 
         let context = build_vector_store_context(&stores);
@@ -1173,17 +1172,16 @@ mod tests {
     fn test_build_vector_store_context_no_description() {
         let stores = vec![VectorStoreConfig {
             name: "test_kb".to_string(),
-            store_type: "qdrant".to_string(),
-            embedding_model: crate::config::EmbeddingModelConfig {
-                provider: "openai".to_string(),
-                model: "test".to_string(),
-                api_key: "test".to_string(),
-                base_url: None,
-            },
-            connection_string: None,
-            url: None,
-            collection_name: None,
             context_prefix: None, // No description
+            store: crate::config::VectorStoreType::Qdrant {
+                embedding_model: crate::config::EmbeddingModelConfig::OpenAI {
+                    api_key: "test".to_string(),
+                    model: "test".to_string(),
+                    base_url: None,
+                },
+                url: "http://localhost:6333".to_string(),
+                collection_name: "test_kb".to_string(),
+            },
         }];
 
         let context = build_vector_store_context(&stores);
