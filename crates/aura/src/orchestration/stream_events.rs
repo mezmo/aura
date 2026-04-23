@@ -41,6 +41,23 @@ impl EventContext {
     }
 }
 
+/// Shared identity fields for task events (TaskStarted, TaskCompleted).
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskContext {
+    pub task_id: usize,
+    pub orchestrator_id: String,
+    pub worker_id: String,
+}
+
+/// Outcome fields shared by completion events (TaskCompleted, ToolCallCompleted).
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionOutcome {
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
 /// Constants for SSE event names. Import in tests for compile-time linkage.
 pub mod event_names {
     pub const PLAN_CREATED: &str = "aura.orchestrator.plan_created";
@@ -66,7 +83,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator creates a plan from user query.
     PlanCreated {
         goal: String,
-        task_count: usize,
+        tasks: Vec<String>,
         routing_mode: RoutingMode,
         routing_rationale: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,22 +109,18 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when orchestrator starts a task.
     TaskStarted {
-        task_id: usize,
         description: String,
-        worker_id: String,
-        orchestrator_id: String,
+        #[serde(flatten)]
+        task: TaskContext,
         #[serde(flatten)]
         context: EventContext,
     },
     /// Emitted when orchestrator completes a task.
     TaskCompleted {
-        task_id: usize,
-        success: bool,
-        duration_ms: u64,
-        orchestrator_id: String,
-        worker_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
+        #[serde(flatten)]
+        task: TaskContext,
+        #[serde(flatten)]
+        outcome: CompletionOutcome,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -163,10 +176,8 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
-        success: bool,
-        duration_ms: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
+        #[serde(flatten)]
+        outcome: CompletionOutcome,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -202,7 +213,7 @@ impl OrchestrationStreamEvent {
     /// Create a PlanCreated event.
     pub fn plan_created(
         goal: impl Into<String>,
-        task_count: usize,
+        tasks: Vec<String>,
         routing_mode: RoutingMode,
         routing_rationale: impl Into<String>,
         planning_response: Option<String>,
@@ -210,7 +221,7 @@ impl OrchestrationStreamEvent {
     ) -> Self {
         Self::PlanCreated {
             goal: goal.into(),
-            task_count,
+            tasks,
             routing_mode,
             routing_rationale: routing_rationale.into(),
             planning_response,
@@ -255,10 +266,12 @@ impl OrchestrationStreamEvent {
         context: EventContext,
     ) -> Self {
         Self::TaskStarted {
-            task_id,
             description: description.into(),
-            orchestrator_id: orchestrator_id.into(),
-            worker_id: worker_id.into(),
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
+            },
             context,
         }
     }
@@ -274,12 +287,16 @@ impl OrchestrationStreamEvent {
         context: EventContext,
     ) -> Self {
         Self::TaskCompleted {
-            task_id,
-            success,
-            duration_ms,
-            orchestrator_id: orchestrator_id.into(),
-            worker_id: worker_id.into(),
-            result,
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
+            },
+            outcome: CompletionOutcome {
+                success,
+                duration_ms,
+                result,
+            },
             context,
         }
     }
@@ -372,9 +389,11 @@ impl OrchestrationStreamEvent {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
-            success,
-            duration_ms,
-            result,
+            outcome: CompletionOutcome {
+                success,
+                duration_ms,
+                result,
+            },
             context,
         }
     }
@@ -398,7 +417,11 @@ mod tests {
         assert_eq!(
             OrchestrationStreamEvent::plan_created(
                 "goal",
-                3,
+                Vec::from([
+                    "Task 1 description".to_string(),
+                    "Task 2 description".to_string(),
+                    "Task 3 description".to_string(),
+                ]),
                 RoutingMode::Orchestrated,
                 "test rationale",
                 None,
@@ -441,7 +464,10 @@ mod tests {
     fn test_format_sse() {
         let event = OrchestrationStreamEvent::plan_created(
             "test goal",
-            2,
+            Vec::from([
+                "Task 1 description".to_string(),
+                "Task 2 description".to_string(),
+            ]),
             RoutingMode::Orchestrated,
             "test rationale",
             Some("coordinator response text".to_string()),
@@ -451,7 +477,7 @@ mod tests {
 
         assert!(sse.starts_with(&format!("event: {}\n", event_names::PLAN_CREATED)));
         assert!(sse.contains("\"goal\":\"test goal\""));
-        assert!(sse.contains("\"task_count\":2"));
+        assert!(sse.contains("\"tasks\":[\"Task 1 description\",\"Task 2 description\"]"));
         assert!(sse.contains("\"routing_mode\":\"orchestrated\""));
         assert!(sse.contains("\"routing_rationale\":\"test rationale\""));
         assert!(sse.contains("\"planning_response\":\"coordinator response text\""));
@@ -461,7 +487,7 @@ mod tests {
     fn test_format_sse_plan_created_routed() {
         let event = OrchestrationStreamEvent::plan_created(
             "simple math",
-            1,
+            Vec::from(["Calculate the mean of [10, 20, 30]".to_string()]),
             RoutingMode::Routed,
             "single worker",
             None,
@@ -477,7 +503,7 @@ mod tests {
     fn test_format_sse_plan_created_without_response() {
         let event = OrchestrationStreamEvent::plan_created(
             "goal",
-            1,
+            Vec::from(["Task 1".to_string()]),
             RoutingMode::Routed,
             "rationale",
             None,

@@ -917,26 +917,26 @@ fn handle_orchestrator_event(
         return vec![];
     }
 
-    let ectx = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
+    let event_context = EventContext::new(ctx.agent_context.clone(), ctx.correlation.clone());
 
     let sse_event: OrchestrationStreamEvent = match event {
         OrchestratorEvent::PlanCreated {
             goal,
-            task_count,
+            tasks,
             routing_mode,
             routing_rationale,
             planning_response,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: plan created with {} tasks for goal: {} (routing={:?}, rationale: {})",
-                task_count,
+                tasks.len(),
                 goal,
                 routing_mode,
                 routing_rationale
             );
             OrchestrationStreamEvent::plan_created(
                 goal,
-                *task_count,
+                tasks.clone(),
                 routing_mode.clone(),
                 routing_rationale,
                 if planning_response.is_empty() {
@@ -944,25 +944,25 @@ fn handle_orchestrator_event(
                 } else {
                     Some(planning_response.to_string())
                 },
-                ectx,
+                event_context,
             )
         }
         OrchestratorEvent::DirectAnswer {
             response,
             routing_rationale,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: direct answer (rationale: {})",
                 routing_rationale
             );
-            OrchestrationStreamEvent::direct_answer(response, routing_rationale, ectx)
+            OrchestrationStreamEvent::direct_answer(response, routing_rationale, event_context)
         }
         OrchestratorEvent::ClarificationNeeded {
             question,
             options,
             routing_rationale,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: clarification needed - {} (rationale: {})",
                 question,
                 routing_rationale
@@ -971,7 +971,7 @@ fn handle_orchestrator_event(
                 question,
                 options.clone(),
                 routing_rationale,
-                ectx,
+                event_context,
             )
         }
         OrchestratorEvent::TaskStarted {
@@ -980,13 +980,13 @@ fn handle_orchestrator_event(
             orchestrator_id,
             worker_id,
         } => {
-            tracing::info!("Orchestrator: task {} started - {}", task_id, description);
+            tracing::debug!("Orchestrator: task {} started - {}", task_id, description);
             OrchestrationStreamEvent::task_started(
                 *task_id,
                 description,
                 orchestrator_id,
                 worker_id,
-                ectx,
+                event_context,
             )
         }
         OrchestratorEvent::TaskCompleted {
@@ -997,7 +997,7 @@ fn handle_orchestrator_event(
             worker_id,
             result,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: task {} completed (success={}) in {}ms",
                 task_id,
                 success,
@@ -1010,7 +1010,7 @@ fn handle_orchestrator_event(
                 orchestrator_id,
                 worker_id,
                 maybe_truncate(result, config.tool_result_max_length),
-                ectx,
+                event_context,
             )
         }
         OrchestratorEvent::IterationComplete {
@@ -1022,7 +1022,7 @@ fn handle_orchestrator_event(
             reasoning,
             gaps,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: iteration {} complete (quality={:.2}, threshold={:.2}, will_replan={}, eval_skipped={})",
                 iteration,
                 quality_score,
@@ -1042,23 +1042,23 @@ fn handle_orchestrator_event(
                     Some(reasoning.to_string())
                 },
                 gaps.clone(),
-                ectx,
+                event_context,
             )
         }
         OrchestratorEvent::ReplanStarted { iteration, trigger } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: replan started (iteration={}, trigger={})",
                 iteration,
                 trigger
             );
-            OrchestrationStreamEvent::replan_started(*iteration, trigger, ectx)
+            OrchestrationStreamEvent::replan_started(*iteration, trigger, event_context)
         }
         OrchestratorEvent::Synthesizing { iteration } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: synthesizing results (iteration={})",
                 iteration
             );
-            OrchestrationStreamEvent::synthesizing(*iteration, ectx)
+            OrchestrationStreamEvent::synthesizing(*iteration, event_context)
         }
         OrchestratorEvent::WorkerReasoning {
             task_id,
@@ -1078,7 +1078,7 @@ fn handle_orchestrator_event(
                 *task_id,
                 worker_id,
                 content,
-                ectx.clone(),
+                event_context.clone(),
             );
             let mut bytes = vec![Bytes::from(orch_event.format_sse())];
             // Also emit as aura.reasoning with agent_id set to the worker name
@@ -1097,7 +1097,7 @@ fn handle_orchestrator_event(
             worker_id,
             arguments,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: task {:?} tool call started - {} ({})",
                 task_id,
                 tool_name,
@@ -1109,7 +1109,7 @@ fn handle_orchestrator_event(
                 tool_name,
                 worker_id,
                 Some(arguments.clone()),
-                ectx,
+                event_context,
             )
         }
         OrchestratorEvent::ToolCallCompleted {
@@ -1119,7 +1119,7 @@ fn handle_orchestrator_event(
             duration_ms,
             result,
         } => {
-            tracing::info!(
+            tracing::debug!(
                 "Orchestrator: task {:?} tool call completed - {} (success={}) in {}ms",
                 task_id,
                 tool_call_id,
@@ -1132,7 +1132,7 @@ fn handle_orchestrator_event(
                 *success,
                 *duration_ms,
                 maybe_truncate(result, config.tool_result_max_length),
-                ectx,
+                event_context,
             )
         }
     };
