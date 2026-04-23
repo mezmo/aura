@@ -925,7 +925,11 @@ seed = 42
     #[test]
     fn test_bedrock_embedding_config_parsing() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -941,10 +945,6 @@ provider = "bedrock"
 model = "amazon.titan-embed-text-v2:0"
 region = "us-west-2"
 profile = "my-profile"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
 
@@ -971,7 +971,11 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_embedding_without_profile() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -984,10 +988,6 @@ type = "in_memory"
 provider = "bedrock"
 model = "amazon.titan-embed-text-v2:0"
 region = "us-east-1"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str).expect("Failed to parse config");
 
@@ -1011,7 +1011,11 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_embedding_missing_region_fails_validation() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1023,10 +1027,6 @@ type = "in_memory"
 [vector_stores.embedding_model]
 provider = "bedrock"
 model = "amazon.titan-embed-text-v2:0"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let result = load_config_from_str(config_str);
         assert!(result.is_err());
@@ -1065,7 +1065,11 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_kb_config_parsing() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1077,10 +1081,6 @@ knowledge_base_id = "KB12345"
 region = "us-west-2"
 profile = "my-profile"
 context_prefix = "Company documentation"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let config = load_config_from_str(config_str)
             .expect("Failed to parse bedrock_kb config");
@@ -1108,7 +1108,11 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_kb_missing_knowledge_base_id_fails() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1117,10 +1121,6 @@ region = "us-east-1"
 name = "kb"
 type = "bedrock_kb"
 region = "us-east-1"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let result = load_config_from_str(config_str);
         assert!(result.is_err());
@@ -1134,7 +1134,11 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_kb_missing_region_fails() {
         let config_str = r#"
-[llm]
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1143,10 +1147,6 @@ region = "us-east-1"
 name = "kb"
 type = "bedrock_kb"
 knowledge_base_id = "KB12345"
-
-[agent]
-name = "Test"
-system_prompt = "Test"
 "#;
         let result = load_config_from_str(config_str);
         assert!(result.is_err());
