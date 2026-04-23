@@ -15,6 +15,20 @@ use crate::tools;
 use crate::ui::markdown::render_markdown;
 use crate::ui::prompt::{random_bullet_color, set_selected_model};
 
+/// Write one aura.* SSE event to stderr as a JSONL record:
+/// `{"event":"<name>","data":<parsed-json-payload>}`.
+///
+/// If the payload is not parseable JSON, the raw string is used as the data value.
+fn emit_event_line(event_name: &str, event_data: &str) {
+    let data_val: serde_json::Value = serde_json::from_str(event_data)
+        .unwrap_or_else(|_| serde_json::Value::String(event_data.to_string()));
+    let record = serde_json::json!({
+        "event": event_name,
+        "data": data_val,
+    });
+    eprintln!("{record}");
+}
+
 pub fn run_oneshot(
     config: AppConfig,
     mut permissions: crate::permissions::PermissionChecker,
@@ -120,11 +134,18 @@ pub fn run_oneshot(
                         );
                         println!();
                     },
-                    // on_usage — no-op in oneshot mode
+                    // on_usage — no-op (usage is also emitted via on_raw_event below)
                     |_prompt_tokens, _completion_tokens| {},
-                    // on_raw_event — no-op in oneshot mode
-                    |_event_name, _event_data| {},
-                    // on_orchestrator_event — no-op in oneshot mode
+                    // on_raw_event — optionally dump aura.* events to stderr as JSONL.
+                    // Standard OpenAI chat chunks arrive here too in standalone mode
+                    // (with event name "message"); skip those to keep output tight.
+                    |event_name, event_data| {
+                        if config.emit_events && event_name.starts_with("aura.") {
+                            emit_event_line(event_name, event_data);
+                        }
+                    },
+                    // on_orchestrator_event — no-op (orchestrator events also flow
+                    // through on_raw_event above)
                     |_event_name, _val| {},
                 )
                 .await

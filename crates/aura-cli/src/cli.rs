@@ -32,6 +32,11 @@ pub struct Args {
     #[arg(long)]
     pub force: bool,
 
+    /// Emit aura.* SSE events (tool calls, usage, etc.) as JSONL to stderr while
+    /// keeping the rendered answer on stdout. Intended for scripting and benchmarking.
+    #[arg(long)]
+    pub emit_events: bool,
+
     /// Run in standalone mode (requires --config). Builds agents in-process from TOML config.
     #[cfg(feature = "standalone-cli")]
     #[arg(long)]

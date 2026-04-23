@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub resume: Option<String>,
     pub extra_headers: Vec<(String, String)>,
     pub force: bool,
+    pub emit_events: bool,
 }
 
 impl AppConfig {
@@ -66,6 +67,7 @@ impl AppConfig {
             resume,
             extra_headers,
             force: args.force,
+            emit_events: args.emit_events,
         })
     }
 
@@ -106,6 +108,7 @@ mod tests {
             query: None,
             resume: None,
             force: false,
+            emit_events: false,
             #[cfg(feature = "standalone-cli")]
             standalone: false,
             #[cfg(feature = "standalone-cli")]
@@ -135,6 +138,7 @@ mod tests {
             query: Some("hello".to_string()),
             resume: None,
             force: false,
+            emit_events: false,
             #[cfg(feature = "standalone-cli")]
             standalone: false,
             #[cfg(feature = "standalone-cli")]
@@ -159,6 +163,7 @@ mod tests {
             resume: None,
             extra_headers: vec![],
             force: false,
+            emit_events: false,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -177,6 +182,7 @@ mod tests {
             resume: None,
             extra_headers: vec![],
             force: false,
+            emit_events: false,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -195,6 +201,7 @@ mod tests {
             resume: None,
             extra_headers: vec![],
             force: false,
+            emit_events: false,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
@@ -210,6 +217,7 @@ mod tests {
             resume: None,
             extra_headers: vec![],
             force: false,
+            emit_events: false,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
