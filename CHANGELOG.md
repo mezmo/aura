@@ -1,3 +1,10 @@
+## [1.19.1](https://github.com/mezmo/aura/compare/v1.19.0...v1.19.1) (2026-04-23)
+
+
+### Chores
+
+* **deps**: bump rig-core to d7e9d92 [8fc66e7](https://github.com/mezmo/aura/commit/8fc66e7f1e5de9954e2ee839b3a6849de679f38e) - Mike Shearer [LOG-23732](https://logdna.atlassian.net/browse/LOG-23732)
+
 # [1.19.0](https://github.com/mezmo/aura/compare/v1.18.1...v1.19.0) (2026-04-22)
 
 
