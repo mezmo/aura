@@ -45,7 +45,7 @@ struct Args {
 
     /// Maximum length for tool results in streaming (0 = no truncation)
     /// Results exceeding this will be truncated with "... [truncated]" suffix
-    #[arg(long, env = "TOOL_RESULT_MAX_LENGTH", default_value = "100")]
+    #[arg(long, env = "TOOL_RESULT_MAX_LENGTH", default_value = "1000")]
     tool_result_max_length: usize,
 
     /// Streaming buffer size - number of chunks to buffer before backpressure

@@ -49,7 +49,7 @@ pub enum OrchestratorEvent {
         /// The goal being addressed
         goal: String,
         /// Number of tasks in the plan
-        task_count: usize,
+        tasks: Vec<String>,
         /// How the coordinator routed this query
         routing_mode: RoutingMode,
         /// Why the coordinator chose orchestration

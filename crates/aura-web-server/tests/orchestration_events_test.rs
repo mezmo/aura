@@ -493,10 +493,8 @@ async fn test_division_error_emits_task_failure() {
 /// depends on MCP transport timing. We assert structurally when events appear.
 #[tokio::test]
 async fn test_orchestration_progress_notifications() {
-    let events = orchestration_events(
-        "Run a progress task with 2 seconds duration and 3 steps",
-    )
-    .await;
+    let events =
+        orchestration_events("Run a progress task with 2 seconds duration and 3 steps").await;
 
     // Check for aura.progress events
     let progress_events: Vec<&SseEvent> = events
@@ -546,7 +544,9 @@ async fn test_orchestration_progress_notifications() {
 
         println!(
             "aura.progress: message={}, phase={}, percent={:?}",
-            json["message"], json["phase"], json.get("percent")
+            json["message"],
+            json["phase"],
+            json.get("percent")
         );
     }
 

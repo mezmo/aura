@@ -18,7 +18,7 @@ use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
 use super::orchestrator::{
-    spawn_cancellation_watcher, spawn_tool_event_forwarder, Orchestrator, STREAM_CHUNK_SIZE,
+    Orchestrator, STREAM_CHUNK_SIZE, spawn_cancellation_watcher, spawn_tool_event_forwarder,
 };
 
 /// Zero-state wrapper that implements `StreamingAgent` for orchestration mode.
@@ -151,7 +151,10 @@ impl StreamingAgent for OrchestratorFactory {
         let _watcher_handle =
             spawn_cancellation_watcher(cancel_rx, timeout, watcher_cancel_token, request_id_owned);
 
-        let stream = match self.stream(query, chat_history, cancel_token, request_id).await {
+        let stream = match self
+            .stream(query, chat_history, cancel_token, request_id)
+            .await
+        {
             Ok(s) => s,
             Err(e) => Box::pin(stream::once(async move { Err(e) })),
         };
