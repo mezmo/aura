@@ -18,9 +18,13 @@
 //! ## Span hierarchy (streaming)
 //!
 //! `agent.stream` is created as a **root span** (`parent: None`) so that
-//! Phoenix sees it as the trace root.  All LLM I/O attributes (`input.value`,
-//! `output.value`, token counts, `user.id`, `session.id`, `metadata`) live on
-//! this span.
+//! Phoenix sees it as the trace root.  I/O attributes (`input.value`,
+//! `output.value`, `user.id`, `session.id`, `metadata`) always live on this
+//! span. Token counts live here in **single-agent mode only**; in
+//! **orchestration mode** they live on the per-phase child spans
+//! (`orchestration.planning`, `orchestration.worker`,
+//! `orchestration.synthesis`, `orchestration.evaluation`) so Phoenix's
+//! rollup shows the accurate aggregate without double-counting the parent.
 //!
 //! ### Single-agent mode
 //!
