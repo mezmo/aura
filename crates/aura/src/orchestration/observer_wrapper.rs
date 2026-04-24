@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::mcp_response::CallOutcome;
 use crate::tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent};
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
@@ -75,10 +76,10 @@ impl ToolWrapper for ObserverWrapper {
     fn transform_output(
         &self,
         output: String,
+        _outcome: &CallOutcome,
         _ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {
-        // Output passes through unchanged
         TransformOutputResult::new(output)
     }
 
