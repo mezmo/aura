@@ -238,8 +238,7 @@ impl StreamableHttpMcpClient {
         match self.client.call_tool(request_param).await {
             Ok(result) => {
                 debug!("Tool '{}' executed successfully", tool_name);
-                // Use shared response handler (supports both structured_content and text)
-                extract_tool_result(result, tool_name)
+                extract_tool_result(result, tool_name).map(|outcome| outcome.into_prefixed_string())
             }
             Err(err) => {
                 error!("Failed to execute tool '{}': {}", tool_name, err);
@@ -315,7 +314,7 @@ impl StreamableHttpMcpClient {
         match response {
             rmcp::model::ServerResult::CallToolResult(result) => {
                 debug!("Tool '{}' completed with progress tracking", tool_name);
-                let extracted = extract_tool_result(result, tool_name)?;
+                let extracted = extract_tool_result(result, tool_name)?.into_prefixed_string();
                 Ok((extracted, progress_rx))
             }
             _ => Err(anyhow::anyhow!("Unexpected response type for tool call")),
@@ -362,6 +361,7 @@ impl StreamableHttpMcpClient {
                     Ok(rmcp::model::ServerResult::CallToolResult(call_result)) => {
                         debug!("Tool '{}' completed successfully", tool_name);
                         extract_tool_result(call_result, tool_name)
+                            .map(|outcome| outcome.into_prefixed_string())
                     }
                     Ok(_) => Err(anyhow::anyhow!("Unexpected response type for tool call")),
                     Err(err) => {
@@ -469,6 +469,7 @@ impl StreamableHttpMcpClient {
             Ok(rmcp::model::ServerResult::CallToolResult(call_result)) => {
                 debug!("Tool '{}' completed successfully", tool_name);
                 extract_tool_result(call_result, tool_name)
+                    .map(|outcome| outcome.into_prefixed_string())
             }
             Ok(_) => Err(anyhow::anyhow!("Unexpected response type for tool call")),
             Err(err) => {

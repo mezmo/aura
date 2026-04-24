@@ -47,6 +47,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::ToolContextFactory;
+use crate::mcp_response::CallOutcome;
 
 /// Context passed to wrapper methods during tool execution.
 ///
@@ -225,6 +226,7 @@ pub trait ToolWrapper: Send + Sync {
     fn transform_output(
         &self,
         output: String,
+        _outcome: &CallOutcome,
         _ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -448,7 +450,9 @@ where
             // Transform result
             match result {
                 Ok(output) => {
-                    let transformed = wrapper.transform_output(output, &ctx, extracted.as_ref());
+                    let outcome = CallOutcome::classify_from_output(&output);
+                    let transformed =
+                        wrapper.transform_output(output, &outcome, &ctx, extracted.as_ref());
 
                     if let Some(warning) = &transformed.warning {
                         tracing::warn!("Tool wrapper warning for {}: {}", tool_name, warning);
@@ -562,12 +566,12 @@ impl ToolWrapper for ComposedWrapper {
     fn transform_output(
         &self,
         mut output: String,
+        outcome: &CallOutcome,
         ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
-        // Apply in reverse order
         for wrapper in self.wrappers.iter().rev() {
-            let result = wrapper.transform_output(output, ctx, extracted);
+            let result = wrapper.transform_output(output, outcome, ctx, extracted);
             output = result.output;
         }
         TransformOutputResult::new(output)
@@ -668,7 +672,8 @@ mod tests {
 
         // Output unchanged
         let output = "test output".to_string();
-        let result = wrapper.transform_output(output.clone(), &ctx, None);
+        let outcome = CallOutcome::Success(output.clone());
+        let result = wrapper.transform_output(output.clone(), &outcome, &ctx, None);
         assert_eq!(result.output, output);
     }
 

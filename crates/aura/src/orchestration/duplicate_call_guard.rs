@@ -21,6 +21,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
+use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
 };
@@ -146,6 +147,7 @@ impl ToolWrapper for DuplicateCallGuard {
     fn transform_output(
         &self,
         output: String,
+        _outcome: &CallOutcome,
         _ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -233,6 +235,10 @@ fn extract_guard_data(extracted: Option<&Value>) -> Option<(String, u64)> {
 mod tests {
     use super::*;
 
+    fn success(s: &str) -> CallOutcome {
+        CallOutcome::Success(s.to_string())
+    }
+
     #[test]
     fn test_canonicalize_args_strips_aura_reasoning() {
         let a = serde_json::json!({"number": 45, "_aura_reasoning": "Converting 45 degrees"});
@@ -253,7 +259,12 @@ mod tests {
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("0.785".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "0.785".to_string(),
+            &success("0.785"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Call 2 with different reasoning but same functional args
         let args2 = serde_json::json!({"number": 45, "_aura_reasoning": "Need radians for sin"});
@@ -261,7 +272,12 @@ mod tests {
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("0.785".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "0.785".to_string(),
+            &success("0.785"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Call 3 — should be REJECTED
         let args3 = serde_json::json!({"number": 45, "_aura_reasoning": "Yet another reason"});
@@ -302,7 +318,12 @@ mod tests {
         );
 
         // Simulate successful output
-        guard.transform_output("2.0".to_string(), &ctx, result.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            result.extracted.as_ref(),
+        );
     }
 
     #[test]
@@ -318,7 +339,12 @@ mod tests {
                 .validate_args(&r1.args, r1.extracted.as_ref(), &ctx)
                 .is_ok()
         );
-        guard.transform_output("2.0".to_string(), &ctx, r1.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            r1.extracted.as_ref(),
+        );
 
         // Call 2: allowed (count becomes 2 = max_duplicates)
         let r2 = guard.transform_args(args.clone(), &ctx);
@@ -327,7 +353,12 @@ mod tests {
                 .validate_args(&r2.args, r2.extracted.as_ref(), &ctx)
                 .is_ok()
         );
-        guard.transform_output("2.0".to_string(), &ctx, r2.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            r2.extracted.as_ref(),
+        );
 
         // Call 3: REJECTED (count=2 >= max_duplicates=2)
         let r3 = guard.transform_args(args.clone(), &ctx);
@@ -350,13 +381,23 @@ mod tests {
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         let r = guard.transform_args(args1.clone(), &ctx);
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Different args → resets, allowed
         let r = guard.transform_args(args2, &ctx);
@@ -378,21 +419,36 @@ mod tests {
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("12:00".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "12:00".to_string(),
+            &success("12:00"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Call 2: same args, different result → resets
         let r = guard.transform_args(args.clone(), &ctx);
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("12:01".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "12:01".to_string(),
+            &success("12:01"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Call 3: same args, same new result → count=2
         let r = guard.transform_args(args.clone(), &ctx);
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("12:01".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "12:01".to_string(),
+            &success("12:01"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Call 4: REJECTED
         let r = guard.transform_args(args.clone(), &ctx);
@@ -414,13 +470,23 @@ mod tests {
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         let r = guard.transform_args(args.clone(), &ctx);
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx)
             .ok();
-        guard.transform_output("2.0".to_string(), &ctx, r.extracted.as_ref());
+        guard.transform_output(
+            "2.0".to_string(),
+            &success("2.0"),
+            &ctx,
+            r.extracted.as_ref(),
+        );
 
         // Error resets
         guard.handle_error(ToolError::ToolCallError("timeout".into()), &ctx, None);
@@ -447,13 +513,13 @@ mod tests {
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx_a)
             .ok();
-        guard.transform_output("1".to_string(), &ctx_a, r.extracted.as_ref());
+        guard.transform_output("1".to_string(), &success("1"), &ctx_a, r.extracted.as_ref());
 
         let r = guard.transform_args(args.clone(), &ctx_a);
         guard
             .validate_args(&r.args, r.extracted.as_ref(), &ctx_a)
             .ok();
-        guard.transform_output("1".to_string(), &ctx_a, r.extracted.as_ref());
+        guard.transform_output("1".to_string(), &success("1"), &ctx_a, r.extracted.as_ref());
 
         // Different tool → resets
         let r = guard.transform_args(args, &ctx_b);

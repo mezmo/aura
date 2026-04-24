@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::persistence::{ExecutionPersistence, ToolCallRecord};
+use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
 };
@@ -101,10 +102,10 @@ impl ToolWrapper for PersistenceWrapper {
     fn transform_output(
         &self,
         output: String,
+        _outcome: &CallOutcome,
         _ctx: &ToolCallContext,
         _extracted: Option<&Value>,
     ) -> TransformOutputResult {
-        // Output passes through unchanged
         TransformOutputResult::new(output)
     }
 
