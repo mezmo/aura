@@ -1,77 +1,75 @@
-//! Duplicate tool call guard for orchestration workers.
+//! Two-stage duplicate tool call guard for orchestration workers.
 //!
 //! Catches pathological looping behavior where a model calls the same tool
 //! with identical arguments repeatedly despite receiving the same result.
-//! Common with smaller/quantized models (e.g., Qwen 3.5 Q4_K_M) that lack
-//! strong internalized "stop after result" behavior.
 //!
-//! The guard tracks consecutive identical calls per (tool_name, args) pair.
-//! After `max_duplicates` consecutive identical successful results, it rejects
-//! the call with a nudge message directing the model to emit its final answer.
+//! Uses `CallOutcome` for error-kind-aware counting:
+//! - `Success` / `SchemaError` with identical output → counter increments
+//! - `GeneralToolError` → counter unchanged (legitimate retries)
 //!
-//! Resets on:
-//! - Different tool or different args (new work)
-//! - Same args but different result (transient data)
-//! - Tool error (retries after errors are healthy)
+//! Two escalation stages, both via annotation on the real tool output:
+//! - `nudge_threshold` → appends `[DUPLICATE_CALL_GUIDANCE]`
+//! - `block_threshold` → appends `[DUPLICATE_CALL_ABORT]` + sets escalation flag
 
 use async_trait::async_trait;
-use rig::tool::ToolError;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
 };
 
-/// State for tracking consecutive duplicate calls.
+const GUIDANCE_TEMPLATE: &str = include_str!("../prompts/duplicate_call_guidance.md");
+const ABORT_TEMPLATE: &str = include_str!("../prompts/duplicate_call_abort.md");
+
+/// Hash of `(tool_name, canonical_args)` identifying a unique invocation pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CallFingerprint(u64);
+
 #[derive(Debug)]
 struct CallState {
-    /// Number of consecutive times this (tool, args) pair returned the same result.
     consecutive_count: usize,
-    /// The last successful result for comparison.
-    last_result: String,
+    last_output: String,
 }
 
-/// Guards against infinite tool-call loops by rejecting consecutive duplicate calls.
-///
-/// When a model calls the same tool with identical arguments and receives the same
-/// result `max_duplicates` times in a row, subsequent calls are rejected with a
-/// nudge message that directs the model to emit its final answer.
-///
-/// # Design
-///
-/// - Fresh instance per worker (no cross-task state leakage)
-/// - Only tracks the most recent (tool, args) pair — different tool/args resets
-/// - Resets on errors (retries after transient failures are healthy)
-/// - Resets when same args return a different result (transient data changes)
 pub struct DuplicateCallGuard {
-    max_duplicates: usize,
-    // Key: (tool_name, args_hash). Only one entry tracked at a time (last call).
-    state: Mutex<Option<(String, u64, CallState)>>,
+    nudge_threshold: usize,
+    block_threshold: usize,
+    escalation_flag: Arc<AtomicBool>,
+    state: Mutex<HashMap<CallFingerprint, CallState>>,
 }
 
 impl DuplicateCallGuard {
-    /// Create a new guard with the specified duplicate threshold.
-    ///
-    /// `max_duplicates` is the number of consecutive identical successful calls
-    /// allowed before rejection. Default: 2.
-    pub fn new(max_duplicates: usize) -> Self {
+    pub fn new(
+        nudge_threshold: usize,
+        block_threshold: usize,
+        escalation_flag: Arc<AtomicBool>,
+    ) -> Self {
         Self {
-            max_duplicates,
-            state: Mutex::new(None),
+            nudge_threshold,
+            block_threshold,
+            escalation_flag,
+            state: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Compute a deterministic hash for canonical (tool_name, sorted_args).
-    fn hash_call(tool_name: &str, args: &Value) -> u64 {
+    fn fingerprint(tool_name: &str, args: &Value) -> CallFingerprint {
         let canonical = canonicalize_args(args);
         let mut hasher = DefaultHasher::new();
         tool_name.hash(&mut hasher);
         canonical.hash(&mut hasher);
-        hasher.finish()
+        CallFingerprint(hasher.finish())
+    }
+
+    fn render_template(template: &str, tool_name: &str, count: usize) -> String {
+        template
+            .replace("%%TOOL_NAME%%", tool_name)
+            .replace("%%COUNT%%", &count.to_string())
     }
 }
 
@@ -102,52 +100,18 @@ fn canonicalize_args(value: &Value) -> String {
 #[async_trait]
 impl ToolWrapper for DuplicateCallGuard {
     fn transform_args(&self, args: Value, ctx: &ToolCallContext) -> TransformArgsResult {
-        let hash = Self::hash_call(&ctx.tool_name, &args);
-        // Store the hash and tool_name in extracted for validate_args and transform_output
+        let fp = Self::fingerprint(&ctx.tool_name, &args);
         let extracted = serde_json::json!({
             "dup_guard_tool_name": ctx.tool_name,
-            "dup_guard_args_hash": hash,
+            "dup_guard_args_hash": fp.0,
         });
         TransformArgsResult::with_extracted(args, extracted)
-    }
-
-    fn validate_args(
-        &self,
-        _args: &Value,
-        extracted: Option<&Value>,
-        _ctx: &ToolCallContext,
-    ) -> Result<(), ToolError> {
-        let (tool_name, args_hash) = match extract_guard_data(extracted) {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        let state = self.state.lock().unwrap();
-        if let Some((ref tracked_tool, tracked_hash, ref call_state)) = *state
-            && tracked_tool == &tool_name
-            && tracked_hash == args_hash
-            && call_state.consecutive_count >= self.max_duplicates
-        {
-            let cached = &call_state.last_result;
-            let count = call_state.consecutive_count;
-            return Err(ToolError::ToolCallError(
-                format!(
-                    "[DUPLICATE TOOL CALL] You have called '{}' with identical arguments {} times \
-                     and received the same result: {}. \
-                     Write your final answer now. Do not call this tool again with the same arguments.",
-                    tool_name, count, cached
-                )
-                .into(),
-            ));
-        }
-
-        Ok(())
     }
 
     fn transform_output(
         &self,
         output: String,
-        _outcome: &CallOutcome,
+        outcome: &CallOutcome,
         _ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
@@ -156,38 +120,52 @@ impl ToolWrapper for DuplicateCallGuard {
             None => return TransformOutputResult::new(output),
         };
 
+        if matches!(outcome, CallOutcome::GeneralToolError { .. }) {
+            return TransformOutputResult::new(output);
+        }
+
+        let fp = CallFingerprint(args_hash);
         let mut state = self.state.lock().unwrap();
 
-        let is_match = state
-            .as_ref()
-            .is_some_and(|(t, h, _)| t == &tool_name && *h == args_hash);
+        if self.escalation_flag.load(Ordering::SeqCst) {
+            return TransformOutputResult::new(output);
+        }
 
-        if is_match {
-            let (_, _, call_state) = state.as_mut().unwrap();
-            if call_state.last_result == output {
-                // Same tool + same args + same result → increment
-                call_state.consecutive_count += 1;
-                tracing::debug!(
-                    "DuplicateCallGuard: '{}' identical call #{} (hash={})",
-                    tool_name,
-                    call_state.consecutive_count,
-                    args_hash
-                );
-            } else {
-                // Same args but different result → reset (transient data)
-                call_state.consecutive_count = 1;
-                call_state.last_result = output.clone();
-            }
+        let call_state = state.entry(fp).or_insert_with(|| CallState {
+            consecutive_count: 0,
+            last_output: String::new(),
+        });
+
+        if call_state.last_output == output {
+            call_state.consecutive_count += 1;
         } else {
-            // New tool or new args → fresh tracking
-            *state = Some((
+            call_state.consecutive_count = 1;
+            call_state.last_output = output.clone();
+        }
+
+        let count = call_state.consecutive_count;
+
+        if count >= self.block_threshold {
+            self.escalation_flag.store(true, Ordering::SeqCst);
+            tracing::warn!(
+                "DuplicateCallGuard: '{}' hit block threshold ({}/{})",
                 tool_name,
-                args_hash,
-                CallState {
-                    consecutive_count: 1,
-                    last_result: output.clone(),
-                },
-            ));
+                count,
+                self.block_threshold
+            );
+            let annotation = Self::render_template(ABORT_TEMPLATE, &tool_name, count);
+            return TransformOutputResult::new(format!("{output}\n\n{annotation}"));
+        }
+
+        if count >= self.nudge_threshold {
+            tracing::info!(
+                "DuplicateCallGuard: '{}' hit nudge threshold ({}/{})",
+                tool_name,
+                count,
+                self.nudge_threshold
+            );
+            let annotation = Self::render_template(GUIDANCE_TEMPLATE, &tool_name, count);
+            return TransformOutputResult::new(format!("{output}\n\n{annotation}"));
         }
 
         TransformOutputResult::new(output)
@@ -195,17 +173,10 @@ impl ToolWrapper for DuplicateCallGuard {
 
     fn handle_error(
         &self,
-        error: ToolError,
+        error: rig::tool::ToolError,
         _ctx: &ToolCallContext,
         _extracted: Option<&Value>,
-    ) -> ToolError {
-        // Only reset on non-guard errors — retries after transient failures are healthy,
-        // but we must not reset when our own rejection is routed back through handle_error
-        let error_msg = error.to_string();
-        if !error_msg.contains("[DUPLICATE TOOL CALL]") {
-            let mut state = self.state.lock().unwrap();
-            *state = None;
-        }
+    ) -> rig::tool::ToolError {
         error
     }
 }
@@ -235,58 +206,48 @@ fn extract_guard_data(extracted: Option<&Value>) -> Option<(String, u64)> {
 mod tests {
     use super::*;
 
+    fn make_guard(nudge: usize, block: usize) -> (DuplicateCallGuard, Arc<AtomicBool>) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = DuplicateCallGuard::new(nudge, block, flag.clone());
+        (guard, flag)
+    }
+
+    fn call(
+        guard: &DuplicateCallGuard,
+        ctx: &ToolCallContext,
+        args: &Value,
+        output: &str,
+        outcome: &CallOutcome,
+    ) -> TransformOutputResult {
+        let r = guard.transform_args(args.clone(), ctx);
+        guard.transform_output(output.to_string(), outcome, ctx, r.extracted.as_ref())
+    }
+
     fn success(s: &str) -> CallOutcome {
         CallOutcome::Success(s.to_string())
     }
 
-    #[test]
-    fn test_canonicalize_args_strips_aura_reasoning() {
-        let a = serde_json::json!({"number": 45, "_aura_reasoning": "Converting 45 degrees"});
-        let b = serde_json::json!({"number": 45, "_aura_reasoning": "Different reasoning text"});
-        let c = serde_json::json!({"number": 45});
-        assert_eq!(canonicalize_args(&a), canonicalize_args(&b));
-        assert_eq!(canonicalize_args(&a), canonicalize_args(&c));
+    fn general_error(s: &str) -> CallOutcome {
+        CallOutcome::GeneralToolError {
+            content: s.to_string(),
+            code: None,
+        }
+    }
+
+    fn schema_error(s: &str) -> CallOutcome {
+        CallOutcome::SchemaError {
+            content: s.to_string(),
+            code: -32602,
+        }
     }
 
     #[test]
-    fn test_guard_treats_different_reasoning_as_same_call() {
-        let guard = DuplicateCallGuard::new(2);
-        let ctx = ToolCallContext::new("degreesToRadians");
-
-        // Call 1 with reasoning A
-        let args1 = serde_json::json!({"number": 45, "_aura_reasoning": "Converting 45 degrees"});
-        let r = guard.transform_args(args1, &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "0.785".to_string(),
-            &success("0.785"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        // Call 2 with different reasoning but same functional args
-        let args2 = serde_json::json!({"number": 45, "_aura_reasoning": "Need radians for sin"});
-        let r = guard.transform_args(args2, &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "0.785".to_string(),
-            &success("0.785"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        // Call 3 — should be REJECTED
-        let args3 = serde_json::json!({"number": 45, "_aura_reasoning": "Yet another reason"});
-        let r = guard.transform_args(args3, &ctx);
-        assert!(
-            guard
-                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-                .is_err()
-        );
+    fn test_canonicalize_args_strips_aura_reasoning() {
+        let a = serde_json::json!({"number": 45, "_aura_reasoning": "reason A"});
+        let b = serde_json::json!({"number": 45, "_aura_reasoning": "reason B"});
+        let c = serde_json::json!({"number": 45});
+        assert_eq!(canonicalize_args(&a), canonicalize_args(&b));
+        assert_eq!(canonicalize_args(&a), canonicalize_args(&c));
     }
 
     #[test]
@@ -297,237 +258,198 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalize_args_nested() {
-        let v = serde_json::json!({"z": [1, {"b": 2, "a": 1}], "a": "hello"});
-        let canonical = canonicalize_args(&v);
-        assert!(canonical.contains("a:\"hello\""));
-        assert!(canonical.contains("{a:1,b:2}"));
-    }
-
-    #[test]
-    fn test_guard_allows_first_calls() {
-        let guard = DuplicateCallGuard::new(2);
+    fn test_no_annotation_below_nudge() {
+        let (guard, flag) = make_guard(3, 5);
         let ctx = ToolCallContext::new("mean");
         let args = serde_json::json!({"numbers": [1, 2, 3]});
 
-        let result = guard.transform_args(args, &ctx);
-        assert!(
-            guard
-                .validate_args(&result.args, result.extracted.as_ref(), &ctx)
-                .is_ok()
-        );
-
-        // Simulate successful output
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            result.extracted.as_ref(),
-        );
+        for _ in 0..2 {
+            let r = call(&guard, &ctx, &args, "2.0", &success("2.0"));
+            assert!(!r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+            assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
+        }
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn test_guard_allows_up_to_max_duplicates() {
-        let guard = DuplicateCallGuard::new(2);
+    fn test_nudge_at_threshold() {
+        let (guard, flag) = make_guard(3, 5);
         let ctx = ToolCallContext::new("mean");
         let args = serde_json::json!({"numbers": [1, 2, 3]});
 
-        // Call 1: allowed, output recorded (count=1)
-        let r1 = guard.transform_args(args.clone(), &ctx);
-        assert!(
-            guard
-                .validate_args(&r1.args, r1.extracted.as_ref(), &ctx)
-                .is_ok()
-        );
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            r1.extracted.as_ref(),
-        );
+        for _ in 0..2 {
+            call(&guard, &ctx, &args, "2.0", &success("2.0"));
+        }
 
-        // Call 2: allowed (count becomes 2 = max_duplicates)
-        let r2 = guard.transform_args(args.clone(), &ctx);
-        assert!(
-            guard
-                .validate_args(&r2.args, r2.extracted.as_ref(), &ctx)
-                .is_ok()
-        );
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            r2.extracted.as_ref(),
-        );
-
-        // Call 3: REJECTED (count=2 >= max_duplicates=2)
-        let r3 = guard.transform_args(args.clone(), &ctx);
-        let result = guard.validate_args(&r3.args, r3.extracted.as_ref(), &ctx);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("DUPLICATE TOOL CALL"));
-        assert!(err_msg.contains("2.0"));
+        let r = call(&guard, &ctx, &args, "2.0", &success("2.0"));
+        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+        assert!(r.output.starts_with("2.0"));
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn test_guard_resets_on_different_args() {
-        let guard = DuplicateCallGuard::new(2);
+    fn test_block_at_threshold_sets_flag() {
+        let (guard, flag) = make_guard(3, 5);
         let ctx = ToolCallContext::new("mean");
-        let args1 = serde_json::json!({"numbers": [1, 2, 3]});
-        let args2 = serde_json::json!({"numbers": [4, 5, 6]});
+        let args = serde_json::json!({"numbers": [1, 2, 3]});
 
-        // Fill up with args1
-        let r = guard.transform_args(args1.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
+        for _ in 0..4 {
+            call(&guard, &ctx, &args, "2.0", &success("2.0"));
+        }
 
-        let r = guard.transform_args(args1.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        // Different args → resets, allowed
-        let r = guard.transform_args(args2, &ctx);
-        assert!(
-            guard
-                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-                .is_ok()
-        );
+        let r = call(&guard, &ctx, &args, "2.0", &success("2.0"));
+        assert!(r.output.contains("[DUPLICATE_CALL_ABORT]"));
+        assert!(r.output.starts_with("2.0"));
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn test_guard_resets_on_different_result() {
-        let guard = DuplicateCallGuard::new(2);
+    fn test_general_error_does_not_increment() {
+        let (guard, flag) = make_guard(2, 4);
+        let ctx = ToolCallContext::new("api");
+        let args = serde_json::json!({"q": "test"});
+
+        call(&guard, &ctx, &args, "timeout", &success("timeout"));
+
+        for _ in 0..5 {
+            let r = call(&guard, &ctx, &args, "timeout", &general_error("timeout"));
+            assert!(!r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+            assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_schema_error_increments() {
+        let (guard, flag) = make_guard(2, 4);
+        let ctx = ToolCallContext::new("api");
+        let args = serde_json::json!({"bad": "field"});
+
+        call(
+            &guard,
+            &ctx,
+            &args,
+            "missing param",
+            &schema_error("missing param"),
+        );
+
+        let r = call(
+            &guard,
+            &ctx,
+            &args,
+            "missing param",
+            &schema_error("missing param"),
+        );
+        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_different_result_resets() {
+        let (guard, _flag) = make_guard(2, 4);
         let ctx = ToolCallContext::new("get_time");
         let args = serde_json::json!({"tz": "UTC"});
 
-        // Call 1: result "12:00"
-        let r = guard.transform_args(args.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "12:00".to_string(),
-            &success("12:00"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
+        call(&guard, &ctx, &args, "12:00", &success("12:00"));
+        call(&guard, &ctx, &args, "12:01", &success("12:01"));
 
-        // Call 2: same args, different result → resets
-        let r = guard.transform_args(args.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "12:01".to_string(),
-            &success("12:01"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        // Call 3: same args, same new result → count=2
-        let r = guard.transform_args(args.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "12:01".to_string(),
-            &success("12:01"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        // Call 4: REJECTED
-        let r = guard.transform_args(args.clone(), &ctx);
-        assert!(
-            guard
-                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-                .is_err()
-        );
+        let r = call(&guard, &ctx, &args, "12:01", &success("12:01"));
+        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
     }
 
     #[test]
-    fn test_guard_resets_on_error() {
-        let guard = DuplicateCallGuard::new(2);
-        let ctx = ToolCallContext::new("mean");
-        let args = serde_json::json!({"numbers": [1, 2, 3]});
-
-        // Fill up
-        let r = guard.transform_args(args.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        let r = guard.transform_args(args.clone(), &ctx);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-            .ok();
-        guard.transform_output(
-            "2.0".to_string(),
-            &success("2.0"),
-            &ctx,
-            r.extracted.as_ref(),
-        );
-
-        // Error resets
-        guard.handle_error(ToolError::ToolCallError("timeout".into()), &ctx, None);
-
-        // Now allowed again
-        let r = guard.transform_args(args, &ctx);
-        assert!(
-            guard
-                .validate_args(&r.args, r.extracted.as_ref(), &ctx)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_guard_resets_on_different_tool() {
-        let guard = DuplicateCallGuard::new(2);
+    fn test_different_tool_resets() {
+        let (guard, _flag) = make_guard(2, 4);
         let args = serde_json::json!({"x": 1});
-
         let ctx_a = ToolCallContext::new("tool_a");
         let ctx_b = ToolCallContext::new("tool_b");
 
-        // Fill up tool_a
-        let r = guard.transform_args(args.clone(), &ctx_a);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx_a)
-            .ok();
-        guard.transform_output("1".to_string(), &success("1"), &ctx_a, r.extracted.as_ref());
+        call(&guard, &ctx_a, &args, "1", &success("1"));
+        call(&guard, &ctx_a, &args, "1", &success("1"));
 
-        let r = guard.transform_args(args.clone(), &ctx_a);
-        guard
-            .validate_args(&r.args, r.extracted.as_ref(), &ctx_a)
-            .ok();
-        guard.transform_output("1".to_string(), &success("1"), &ctx_a, r.extracted.as_ref());
+        let r = call(&guard, &ctx_b, &args, "1", &success("1"));
+        assert!(!r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+    }
 
-        // Different tool → resets
-        let r = guard.transform_args(args, &ctx_b);
-        assert!(
-            guard
-                .validate_args(&r.args, r.extracted.as_ref(), &ctx_b)
-                .is_ok()
-        );
+    #[test]
+    fn test_flag_monotonic_after_block() {
+        let (guard, flag) = make_guard(2, 3);
+        let ctx = ToolCallContext::new("t");
+        let args = serde_json::json!({"x": 1});
+
+        for _ in 0..3 {
+            call(&guard, &ctx, &args, "r", &success("r"));
+        }
+        assert!(flag.load(Ordering::SeqCst));
+
+        let r = call(&guard, &ctx, &args, "r", &success("r"));
+        assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_real_output_preserved() {
+        let (guard, _flag) = make_guard(2, 4);
+        let ctx = ToolCallContext::new("calc");
+        let args = serde_json::json!({"x": 5});
+
+        call(&guard, &ctx, &args, "25", &success("25"));
+        let r = call(&guard, &ctx, &args, "25", &success("25"));
+        assert!(r.output.starts_with("25"));
+        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+    }
+
+    #[test]
+    fn test_nudge_then_block_progression() {
+        let (guard, flag) = make_guard(3, 5);
+        let ctx = ToolCallContext::new("calc");
+        let args = serde_json::json!({"x": 5});
+
+        // Calls 1-2: below nudge_threshold=3
+        for i in 1..=2 {
+            let r = call(&guard, &ctx, &args, "25", &success("25"));
+            assert!(
+                !r.output.contains("[DUPLICATE_CALL"),
+                "unexpected annotation on call {i}"
+            );
+        }
+
+        // Calls 3-4: at/above nudge, below block
+        for _ in 3..=4 {
+            let r = call(&guard, &ctx, &args, "25", &success("25"));
+            assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+            assert!(!r.output.contains("[DUPLICATE_CALL_ABORT]"));
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+
+        // Call 5: block + flag
+        let r = call(&guard, &ctx, &args, "25", &success("25"));
+        assert!(r.output.contains("[DUPLICATE_CALL_ABORT]"));
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_ping_pong_tracked_independently() {
+        let (guard, flag) = make_guard(3, 5);
+        let args_a = serde_json::json!({"x": 1});
+        let args_b = serde_json::json!({"x": 2});
+        let ctx = ToolCallContext::new("calc");
+
+        // Alternate: A, B, A, B — each pair's counter is independent
+        for _ in 0..2 {
+            call(&guard, &ctx, &args_a, "1", &success("1"));
+            call(&guard, &ctx, &args_b, "2", &success("2"));
+        }
+
+        // A at count=3 → nudge
+        let r = call(&guard, &ctx, &args_a, "1", &success("1"));
+        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+
+        // B at count=3 → nudge
+        let r = call(&guard, &ctx, &args_b, "2", &success("2"));
+        assert!(r.output.contains("[DUPLICATE_CALL_GUIDANCE]"));
+
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -538,9 +460,7 @@ mod tests {
             {"persistence_key": "abc"}
         ]);
 
-        let result = extract_guard_data(Some(&extracted));
-        assert!(result.is_some());
-        let (name, hash) = result.unwrap();
+        let (name, hash) = extract_guard_data(Some(&extracted)).unwrap();
         assert_eq!(name, "mean");
         assert_eq!(hash, 12345);
     }
@@ -550,9 +470,7 @@ mod tests {
         let extracted =
             serde_json::json!({"dup_guard_tool_name": "sin", "dup_guard_args_hash": 99});
 
-        let result = extract_guard_data(Some(&extracted));
-        assert!(result.is_some());
-        let (name, hash) = result.unwrap();
+        let (name, hash) = extract_guard_data(Some(&extracted)).unwrap();
         assert_eq!(name, "sin");
         assert_eq!(hash, 99);
     }

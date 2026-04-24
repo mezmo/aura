@@ -134,7 +134,8 @@ impl RigBuilder {
                 max_tools_per_worker: orch.max_tools_per_worker,
                 allow_direct_answers: orch.allow_direct_answers,
                 allow_clarification: orch.allow_clarification,
-                max_consecutive_duplicate_tool_calls: orch.max_consecutive_duplicate_tool_calls,
+                duplicate_call_nudge_threshold: orch.duplicate_call_nudge_threshold,
+                duplicate_call_block_threshold: orch.duplicate_call_block_threshold,
                 timeouts: aura::orchestration::TimeoutsConfig {
                     per_call_timeout_secs: orch.timeouts.per_call_timeout_secs,
                 },

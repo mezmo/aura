@@ -102,7 +102,8 @@ pub struct OrchestrationConfig {
     pub allow_clarification: bool,
     pub tools_in_planning: ToolVisibility,
     pub max_tools_per_worker: usize,
-    pub max_consecutive_duplicate_tool_calls: Option<usize>,
+    pub duplicate_call_nudge_threshold: Option<usize>,
+    pub duplicate_call_block_threshold: Option<usize>,
     pub timeouts: TimeoutsConfig,
     pub artifacts: ArtifactsConfig,
 }
@@ -121,7 +122,8 @@ impl Default for OrchestrationConfig {
             allow_clarification: true,
             tools_in_planning: ToolVisibility::default(),
             max_tools_per_worker: default_max_tools_per_worker(),
-            max_consecutive_duplicate_tool_calls: None,
+            duplicate_call_nudge_threshold: None,
+            duplicate_call_block_threshold: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
         }
@@ -154,7 +156,9 @@ struct RawOrchestrationConfig {
     #[serde(default = "default_max_tools_per_worker")]
     max_tools_per_worker: usize,
     #[serde(default)]
-    max_consecutive_duplicate_tool_calls: Option<usize>,
+    duplicate_call_nudge_threshold: Option<usize>,
+    #[serde(default)]
+    duplicate_call_block_threshold: Option<usize>,
     // Sub-tables
     #[serde(default)]
     timeouts: Option<TimeoutsConfig>,
@@ -206,7 +210,8 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             allow_clarification: raw.allow_clarification,
             tools_in_planning: raw.tools_in_planning,
             max_tools_per_worker: raw.max_tools_per_worker,
-            max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
+            duplicate_call_nudge_threshold: raw.duplicate_call_nudge_threshold,
+            duplicate_call_block_threshold: raw.duplicate_call_block_threshold,
             timeouts,
             artifacts,
         })

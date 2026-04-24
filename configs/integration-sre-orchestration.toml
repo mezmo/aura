@@ -42,7 +42,7 @@ allow_clarification = true
 tools_in_planning = "full"
 
 [orchestration.timeouts]
-per_call_timeout_secs = 90
+per_call_timeout_secs = 60
 
 [orchestration.artifacts]
 memory_dir = "/tmp/aura-sre-orchestration-test"
