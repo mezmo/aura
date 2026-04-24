@@ -3236,11 +3236,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_summary,
             failure_history.clone(),
         );
-        Self::emit_event(
-            event_tx,
-            OrchestratorEvent::Synthesizing { iteration },
-        )
-        .await;
+        Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self
             .plan_with_routing(query, chat_history, Some(&post_execute_ctx), Some(event_tx))
@@ -3345,7 +3341,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     event_tx,
                     OrchestratorEvent::PlanCreated {
                         goal: new_plan.goal.clone(),
-                        tasks: new_plan.tasks.iter().map(|t| t.description.clone()).collect(),
+                        tasks: new_plan
+                            .tasks
+                            .iter()
+                            .map(|t| t.description.clone())
+                            .collect(),
                         routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
                         routing_rationale,
                         planning_response: planning_summary,
