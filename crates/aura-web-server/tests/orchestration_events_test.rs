@@ -105,7 +105,7 @@ fn assert_any_routing_event(events: &[SseEvent]) {
 /// Verifies that a multi-step math query triggers orchestration planning.
 ///
 /// Query: "Calculate the mean of [10, 20, 30] then multiply the result by 3"
-/// Expected: plan_created event with task_count >= 2 (statistics + arithmetic).
+/// Expected: plan_created event with tasks array of length >= 2.
 ///
 /// NOTE: Hits a real LLM. Multi-domain queries should always produce a plan.
 #[tokio::test]
@@ -128,19 +128,19 @@ async fn test_multi_step_math_emits_plan_created() {
     }
 
     for event in &plan_events {
-        assert_event_fields(event, &["goal", "task_count", "agent_id", "session_id"]);
+        assert_event_fields(event, &["goal", "tasks", "agent_id", "session_id"]);
 
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let task_count = json["task_count"]
-            .as_u64()
-            .expect("task_count must be a number");
+        let tasks = json["tasks"]
+            .as_array()
+            .expect("tasks must be an array");
         assert!(
-            task_count >= 1,
-            "task_count should be >= 1, got {task_count}"
+            !tasks.is_empty(),
+            "tasks array should not be empty"
         );
         println!(
             "plan_created: goal={}, task_count={}",
-            json["goal"], task_count
+            json["goal"], tasks.len()
         );
     }
 }
