@@ -98,6 +98,11 @@ struct TaskExecutionParams<'a> {
 struct AgentWithPreamble {
     agent: Agent,
     preamble: String,
+    /// Side-channel for worker→executor escalation. Set by the duplicate-call
+    /// guard when a tool-call loop is terminated; read by `execute_task` after
+    /// the multi_turn loop to convert a false `Ok` into `TaskStatus::Failed`.
+    #[allow(dead_code)]
+    escalation_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Bundled coordinator tools for `build_agent_with_tools`.
@@ -469,11 +474,14 @@ impl Orchestrator {
             self.tool_call_observer.clone(),
             task_id,
         ));
-        let max_dup = self
-            .config
-            .max_consecutive_duplicate_tool_calls
-            .unwrap_or(1);
-        let duplicate_guard = Arc::new(DuplicateCallGuard::new(max_dup));
+        let nudge = self.config.duplicate_call_nudge_threshold.unwrap_or(3);
+        let block = self.config.duplicate_call_block_threshold.unwrap_or(5);
+        let escalation_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let duplicate_guard = Arc::new(DuplicateCallGuard::new(
+            nudge,
+            block,
+            escalation_flag.clone(),
+        ));
         // Observer first (emits start), then duplicate guard, then persistence (captures reasoning)
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(vec![
             observer_wrapper,
@@ -611,7 +619,11 @@ impl Orchestrator {
             context_window: worker_config.llm.context_window(),
         };
 
-        Ok(AgentWithPreamble { agent, preamble })
+        Ok(AgentWithPreamble {
+            agent,
+            preamble,
+            escalation_flag,
+        })
     }
 
     /// Execute a blocking chat call with timeout — for **worker tasks only**.
@@ -936,6 +948,7 @@ impl Orchestrator {
         let AgentWithPreamble {
             agent: coordinator,
             preamble: coordinator_preamble,
+            ..
         } = self.create_coordinator(Some(routing_toolset)).await?;
 
         // Build prompt components
@@ -1824,6 +1837,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 context_window: None,
             },
             preamble,
+            escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1872,6 +1886,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 context_window: None,
             },
             preamble,
+            escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -1920,6 +1935,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 context_window: None,
             },
             preamble,
+            escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -2739,6 +2755,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let AgentWithPreamble {
             agent: worker,
             preamble: worker_preamble,
+            ..
         } = self.create_worker(task_id, attempt, *worker_name).await?;
 
         // Build the worker prompt — task-first, no original query (prevents scope creep)
@@ -3033,6 +3050,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             Ok(AgentWithPreamble {
                 agent: coordinator,
                 preamble: synth_preamble,
+                ..
             }) => {
                 // Record in prompt journal
                 self.journal_record(JournalPhase::Synthesis, &synth_preamble, &synthesis_prompt);
@@ -3189,6 +3207,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             Ok(AgentWithPreamble {
                 agent: coordinator,
                 preamble: eval_preamble,
+                ..
             }) => {
                 // Record in prompt journal
                 self.journal_record(JournalPhase::Evaluation, &eval_preamble, &eval_prompt);

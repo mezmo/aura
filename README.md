@@ -311,6 +311,8 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `tools_in_planning` | string | `"summary"` | Tool visibility for coordinator: `"none"`, `"summary"` (names only), `"full"` (with descriptions) |
 | `max_plan_parse_retries` | int | `3` | Retries if coordinator produces unparseable plan JSON |
 | `max_tools_per_worker` | int | `10` | Cap on MCP tools exposed to each worker |
+| `duplicate_call_nudge_threshold` | int | `3` | Consecutive identical tool calls before appending guidance annotation |
+| `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
 | `memory_dir` | string | — | Directory for cross-iteration artifact persistence |
