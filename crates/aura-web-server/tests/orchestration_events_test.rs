@@ -131,16 +131,12 @@ async fn test_multi_step_math_emits_plan_created() {
         assert_event_fields(event, &["goal", "tasks", "agent_id", "session_id"]);
 
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let tasks = json["tasks"]
-            .as_array()
-            .expect("tasks must be an array");
-        assert!(
-            !tasks.is_empty(),
-            "tasks array should not be empty"
-        );
+        let tasks = json["tasks"].as_array().expect("tasks must be an array");
+        assert!(!tasks.is_empty(), "tasks array should not be empty");
         println!(
             "plan_created: goal={}, task_count={}",
-            json["goal"], tasks.len()
+            json["goal"],
+            tasks.len()
         );
     }
 }

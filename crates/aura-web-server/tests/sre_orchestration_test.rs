@@ -104,7 +104,7 @@ fn assert_any_routing_event(events: &[SseEvent]) {
 /// lifecycle events (plan, tasks, tool calls, synthesis).
 ///
 /// Query asks for multi-step: discover workloads → check monitoring → create alerts.
-/// Expected: plan_created (task_count >= 2), task_started/completed pairs,
+/// Expected: plan_created (tasks array length >= 2), task_started/completed pairs,
 /// tool_call events, synthesizing, iteration_complete.
 ///
 /// LENIENCY: LLM may route to direct answer or use fewer tasks than expected.
@@ -131,19 +131,19 @@ async fn test_sre_full_workflow_emits_plan_and_tasks() {
     }
 
     for event in &plan_events {
-        assert_event_fields(event, &["goal", "task_count", "agent_id", "session_id"]);
+        assert_event_fields(event, &["goal", "tasks", "agent_id", "session_id"]);
 
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let task_count = json["task_count"]
-            .as_u64()
-            .expect("task_count must be a number");
+        let tasks = json["tasks"].as_array().expect("tasks must be an array");
         assert!(
-            task_count >= 2,
-            "Expected task_count >= 2 for SRE workflow, got {task_count}"
+            tasks.len() >= 2,
+            "Expected tasks.len() >= 2 for SRE workflow, got {}",
+            tasks.len()
         );
         println!(
             "plan_created: goal={}, task_count={}",
-            json["goal"], task_count
+            json["goal"],
+            tasks.len()
         );
     }
 

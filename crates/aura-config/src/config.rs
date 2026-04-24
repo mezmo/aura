@@ -102,8 +102,8 @@ pub struct OrchestrationConfig {
     pub allow_clarification: bool,
     pub tools_in_planning: ToolVisibility,
     pub max_tools_per_worker: usize,
-    pub duplicate_call_nudge_threshold: Option<usize>,
-    pub duplicate_call_block_threshold: Option<usize>,
+    pub duplicate_call_nudge_threshold: usize,
+    pub duplicate_call_block_threshold: usize,
     pub timeouts: TimeoutsConfig,
     pub artifacts: ArtifactsConfig,
 }
@@ -122,8 +122,8 @@ impl Default for OrchestrationConfig {
             allow_clarification: true,
             tools_in_planning: ToolVisibility::default(),
             max_tools_per_worker: default_max_tools_per_worker(),
-            duplicate_call_nudge_threshold: None,
-            duplicate_call_block_threshold: None,
+            duplicate_call_nudge_threshold: default_duplicate_call_nudge_threshold(),
+            duplicate_call_block_threshold: default_duplicate_call_block_threshold(),
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
         }
@@ -155,10 +155,10 @@ struct RawOrchestrationConfig {
     tools_in_planning: ToolVisibility,
     #[serde(default = "default_max_tools_per_worker")]
     max_tools_per_worker: usize,
-    #[serde(default)]
-    duplicate_call_nudge_threshold: Option<usize>,
-    #[serde(default)]
-    duplicate_call_block_threshold: Option<usize>,
+    #[serde(default = "default_duplicate_call_nudge_threshold")]
+    duplicate_call_nudge_threshold: usize,
+    #[serde(default = "default_duplicate_call_block_threshold")]
+    duplicate_call_block_threshold: usize,
     // Sub-tables
     #[serde(default)]
     timeouts: Option<TimeoutsConfig>,
@@ -250,6 +250,14 @@ fn default_per_call_timeout_secs() -> u64 {
 
 fn default_max_plan_parse_retries() -> usize {
     3
+}
+
+fn default_duplicate_call_nudge_threshold() -> usize {
+    3
+}
+
+fn default_duplicate_call_block_threshold() -> usize {
+    5
 }
 
 fn default_result_artifact_threshold() -> usize {

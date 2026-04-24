@@ -112,6 +112,14 @@ fn default_max_plan_parse_retries() -> usize {
     3
 }
 
+fn default_duplicate_call_nudge_threshold() -> usize {
+    3
+}
+
+fn default_duplicate_call_block_threshold() -> usize {
+    5
+}
+
 /// Hardcoded orchestrator preamble template loaded at compile time.
 ///
 /// Contains the core orchestrator behavior with a `{{orchestration_system_prompt}}`
@@ -380,12 +388,11 @@ pub struct OrchestrationConfig {
 
     // --- Safety ---
     /// Consecutive identical tool calls before appending guidance annotation.
-    /// Default: 3.
-    pub duplicate_call_nudge_threshold: Option<usize>,
+    pub duplicate_call_nudge_threshold: usize,
 
     /// Consecutive identical tool calls before appending abort annotation
-    /// and setting the escalation flag. Default: 5.
-    pub duplicate_call_block_threshold: Option<usize>,
+    /// and setting the escalation flag.
+    pub duplicate_call_block_threshold: usize,
 
     // --- Sub-configs ---
     /// Timeout settings for LLM calls.
@@ -557,8 +564,8 @@ impl Default for OrchestrationConfig {
             worker_system_prompt: None,
             workers: HashMap::new(),
             coordinator_vector_stores: Vec::new(),
-            duplicate_call_nudge_threshold: None,
-            duplicate_call_block_threshold: None,
+            duplicate_call_nudge_threshold: default_duplicate_call_nudge_threshold(),
+            duplicate_call_block_threshold: default_duplicate_call_block_threshold(),
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
         }
@@ -602,10 +609,10 @@ struct RawOrchestrationConfig {
     workers: HashMap<String, WorkerConfig>,
     #[serde(default)]
     coordinator_vector_stores: Vec<String>,
-    #[serde(default)]
-    duplicate_call_nudge_threshold: Option<usize>,
-    #[serde(default)]
-    duplicate_call_block_threshold: Option<usize>,
+    #[serde(default = "default_duplicate_call_nudge_threshold")]
+    duplicate_call_nudge_threshold: usize,
+    #[serde(default = "default_duplicate_call_block_threshold")]
+    duplicate_call_block_threshold: usize,
 
     // --- Sub-tables ---
     #[serde(default)]
