@@ -25,8 +25,6 @@ use std::collections::HashSet;
 
 // Template constants loaded at compile time
 pub const WORKER_TASK_PROMPT_TEMPLATE: &str = include_str!("../prompts/worker_task_prompt.md");
-#[allow(dead_code)]
-pub const SYNTHESIS_PROMPT_TEMPLATE: &str = include_str!("../prompts/synthesis_prompt.md");
 pub const CONTINUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/continuation_prompt.md");
 
 /// Trait for template variable providers.
@@ -59,26 +57,6 @@ impl TemplateVars for WorkerTaskVars<'_> {
             .replace("%%ORCHESTRATION_GOAL%%", self.orchestration_goal)
             .replace("%%CONTEXT%%", self.context)
             .replace("%%YOUR_TASK%%", self.your_task)
-    }
-}
-
-/// Variables for the synthesis prompt.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct SynthesisVars<'a> {
-    pub goal: &'a str,
-    pub query: &'a str,
-    pub results: &'a str,
-}
-
-impl TemplateVars for SynthesisVars<'_> {
-    const VARS: &'static [&'static str] = &["GOAL", "QUERY", "RESULTS"];
-
-    fn render(&self, template: &str) -> String {
-        template
-            .replace("%%GOAL%%", self.goal)
-            .replace("%%QUERY%%", self.query)
-            .replace("%%RESULTS%%", self.results)
     }
 }
 
@@ -139,12 +117,6 @@ impl TemplateVars for ContinuationVars<'_> {
 /// Render the worker task prompt with the given variables.
 pub fn render_worker_task_prompt(vars: &WorkerTaskVars<'_>) -> String {
     vars.render(WORKER_TASK_PROMPT_TEMPLATE)
-}
-
-/// Render the synthesis prompt with the given variables.
-#[allow(dead_code)]
-pub fn render_synthesis_prompt(vars: &SynthesisVars<'_>) -> String {
-    vars.render(SYNTHESIS_PROMPT_TEMPLATE)
 }
 
 /// Render the continuation prompt with the given variables.
@@ -231,34 +203,34 @@ mod tests {
 
     #[test]
     fn test_render_basic_substitution() {
-        let vars = SynthesisVars {
-            goal: "test goal",
-            query: "test query",
-            results: "test results",
+        let vars = WorkerTaskVars {
+            orchestration_goal: "test goal",
+            context: "test context",
+            your_task: "test task",
         };
-        let rendered = vars.render("Goal: %%GOAL%%, Query: %%QUERY%%");
-        assert_eq!(rendered, "Goal: test goal, Query: test query");
+        let rendered = vars.render("Goal: %%ORCHESTRATION_GOAL%%, Task: %%YOUR_TASK%%");
+        assert_eq!(rendered, "Goal: test goal, Task: test task");
     }
 
     #[test]
     fn test_render_empty_value() {
-        let vars = SynthesisVars {
-            goal: "test",
-            query: "test",
-            results: "",
+        let vars = WorkerTaskVars {
+            orchestration_goal: "test",
+            context: "",
+            your_task: "test",
         };
-        let rendered = vars.render("Start%%RESULTS%%End");
+        let rendered = vars.render("Start%%CONTEXT%%End");
         assert_eq!(rendered, "StartEnd");
     }
 
     #[test]
     fn test_render_preserves_json_braces() {
-        let vars = SynthesisVars {
-            goal: "test",
-            query: "test",
-            results: "test",
+        let vars = WorkerTaskVars {
+            orchestration_goal: "test",
+            context: "test",
+            your_task: "test",
         };
-        let template = r#"{"goal": "%%GOAL%%", "nested": {"key": "value"}}"#;
+        let template = r#"{"goal": "%%ORCHESTRATION_GOAL%%", "nested": {"key": "value"}}"#;
         let rendered = vars.render(template);
         assert_eq!(rendered, r#"{"goal": "test", "nested": {"key": "value"}}"#);
     }
@@ -300,12 +272,6 @@ mod tests {
     fn test_worker_task_template_matches_context() {
         validate_template::<WorkerTaskVars>(WORKER_TASK_PROMPT_TEMPLATE)
             .expect("Worker task template should match WorkerTaskVars");
-    }
-
-    #[test]
-    fn test_synthesis_template_matches_context() {
-        validate_template::<SynthesisVars>(SYNTHESIS_PROMPT_TEMPLATE)
-            .expect("Synthesis template should match SynthesisVars");
     }
 
     #[test]
@@ -361,18 +327,6 @@ mod tests {
         assert!(
             WORKER_TASK_PROMPT_TEMPLATE.contains("%%YOUR_TASK%%"),
             "Worker task template should contain YOUR_TASK placeholder"
-        );
-    }
-
-    #[test]
-    fn test_synthesis_template_loaded() {
-        assert!(
-            !SYNTHESIS_PROMPT_TEMPLATE.is_empty(),
-            "Synthesis template should be loaded"
-        );
-        assert!(
-            SYNTHESIS_PROMPT_TEMPLATE.contains("%%RESULTS%%"),
-            "Synthesis template should contain RESULTS placeholder"
         );
     }
 
@@ -499,7 +453,7 @@ Do not try to compute results yourself — delegate to workers.";
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(
             out,
-            "PHASE: COORDINATOR SYSTEM PROMPT (routing / synthesis / evaluation)"
+            "PHASE: COORDINATOR SYSTEM PROMPT (routing / continuation)"
         );
         let _ = writeln!(out, "{separator}\n");
         let coordinator_preamble = config.build_coordinator_preamble(agent_system_prompt, true);
@@ -618,20 +572,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         let _ = writeln!(out, "{task1}");
 
         // ================================================================
-        // 6. Synthesis user message
-        // ================================================================
-        let _ = writeln!(out, "\n{separator}");
-        let _ = writeln!(out, "PHASE: SYNTHESIS USER MESSAGE");
-        let _ = writeln!(out, "{separator}\n");
-        let synthesis = render_synthesis_prompt(&SynthesisVars {
-            goal: "Calculate (3+7)*2 and find files in /data",
-            query,
-            results: "Task 0 (arithmetic):\n  Result: (3+7)*2 = 20\n\nTask 1 (data):\n  Result: /data contains file1.txt, file2.txt",
-        });
-        let _ = writeln!(out, "{synthesis}");
-
-        // ================================================================
-        // 7. Continuation prompt (end-of-iteration decision point)
+        // 6. Continuation prompt (end-of-iteration decision point)
         // ================================================================
         let _ = writeln!(out, "\n{separator}");
         let _ = writeln!(

@@ -319,7 +319,7 @@ flowchart TD
 
 ## Orchestration Events
 
-When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server emits orchestration-specific events covering the Plan/Execute/Synthesize/Evaluate lifecycle. These events are emitted alongside the standard `aura.*` events above.
+When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server emits orchestration-specific events covering the Plan/Execute/Continue lifecycle. These events are emitted alongside the standard `aura.*` events above.
 
 ### Orchestration Event Types
 
@@ -378,8 +378,8 @@ data:
 ```
 
 The `routing_mode` field indicates how the coordinator routed the query:
-- `"routed"` — classified to a single worker (evaluation skipped, synthesis still runs)
-- `"orchestrated"` — multi-task DAG with synthesis + evaluation
+- `"routed"` — classified to a single worker
+- `"orchestrated"` — multi-task DAG with continuation
 
 The optional `planning_response` field contains the coordinator's raw planning text and is omitted when empty.
 
@@ -539,7 +539,7 @@ data:
 
 Triggers: `"quality"` (score below threshold) or `"failure"` (worker task failures forced a replan).
 
-**Synthesizing** (combining worker results):
+**Synthesizing** (consolidating task results for coordinator decision):
 ```
 event: aura.orchestrator.synthesizing
 data:
@@ -551,6 +551,8 @@ data:
   "session_id": "sess_xyz"
 }
 ```
+
+Fires before the post-execute coordinator call. Bookends with `iteration_complete`, which fires after the coordinator's routing decision.
 
 Note: Workers that use scratchpad emit `aura.scratchpad_usage` when they finish — see the [Custom Events](#event-types) section above. This is a base `aura.*` event (not orchestration-specific) so the same event fires for single-agent deployments and workers alike.
 

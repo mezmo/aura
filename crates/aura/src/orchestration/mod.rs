@@ -22,9 +22,8 @@
 //! drop-in replacement for the standard `Agent`. It creates the real `Orchestrator`
 //! lazily inside `stream()` to avoid duplicate resource allocation. It coordinates:
 //!
-//! 1. **Coordinator** - decomposes queries into plans
+//! 1. **Coordinator** - decomposes queries into plans, consolidates results
 //! 2. **Workers** - execute individual tasks
-//! 3. **Synthesizer** - combines results into final response
 //!
 //! # Example Usage
 //!

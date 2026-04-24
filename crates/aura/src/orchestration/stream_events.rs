@@ -1,15 +1,15 @@
 //! Orchestration-specific SSE streaming events.
 //!
 //! These events are emitted during orchestrated multi-agent execution to provide
-//! visibility into plan creation, task execution, and synthesis phases.
+//! visibility into plan creation, task execution, and continuation phases.
 //!
 //! # Event Types
 //!
 //! - `aura.orchestrator.plan_created` - Plan decomposed from user query
 //! - `aura.orchestrator.task_started` - Worker began task execution
 //! - `aura.orchestrator.task_completed` - Worker finished task (success/failure)
-//! - `aura.orchestrator.iteration_complete` - Plan-execute-synthesize cycle done
-//! - `aura.orchestrator.synthesizing` - Combining results into final response
+//! - `aura.orchestrator.iteration_complete` - Plan-execute-continue cycle done
+//! - `aura.orchestrator.synthesizing` - Consolidating task results for coordinator decision
 //! - `aura.orchestrator.tool_call_started` - Worker tool execution began
 //! - `aura.orchestrator.tool_call_completed` - Worker tool execution finished
 //!
@@ -146,7 +146,7 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
-    /// Emitted when orchestrator starts synthesizing results.
+    /// Emitted when task results are being consolidated for the coordinator.
     Synthesizing {
         iteration: usize,
         #[serde(flatten)]

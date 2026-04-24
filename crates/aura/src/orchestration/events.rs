@@ -123,12 +123,13 @@ pub enum OrchestratorEvent {
         /// What triggered the replan: "coordinator" or "failure"
         trigger: String,
     },
-    /// The orchestrator is synthesizing results from completed tasks.
+    /// Task results are being consolidated for the coordinator.
     ///
-    /// Emitted before the synthesizer LLM call that combines worker
-    /// outputs into a coherent final response.
+    /// Emitted before the post-execute coordinator call that presents
+    /// worker outputs and chooses a routing decision (respond, replan,
+    /// or clarify).
     Synthesizing {
-        /// Which iteration is being synthesized (1-indexed)
+        /// Which iteration's results are being consolidated (1-indexed)
         iteration: usize,
     },
     /// Reasoning content from a worker agent.

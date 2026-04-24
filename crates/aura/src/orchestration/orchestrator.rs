@@ -1,7 +1,7 @@
 //! Orchestrator agent for multi-agent workflows.
 //!
 //! The orchestrator decomposes queries into tasks, executes them (potentially
-//! in parallel), and synthesizes results. `StreamingAgent` is implemented by
+//! in parallel), and consolidates results. `StreamingAgent` is implemented by
 //! `OrchestratorFactory` (see `factory.rs`), which creates an `Orchestrator`
 //! lazily inside `stream()`.
 //!
@@ -22,9 +22,9 @@
 //!     │                     │
 //!     └──────────┬──────────┘
 //!                ▼
-//! ┌─────────────────────────┐
-//! │      SYNTHESIZER        │  ── combine results
-//! └─────────────────────────┘
+//!     ┌─────────────────────┐
+//!     │  COORDINATOR CONT.  │  ── consolidate + route
+//!     └─────────────────────┘
 //!                │
 //!                ▼
 //!          Final Response
@@ -36,8 +36,8 @@
 //! - `PlanCreated` - when the coordinator produces a plan
 //! - `TaskStarted` - when a worker begins a task
 //! - `TaskCompleted` - when a worker finishes a task
-//! - `IterationComplete` - when a plan-execute-synthesize cycle completes
-//! - `Synthesizing` - when the synthesizer is combining results
+//! - `IterationComplete` - when the post-execute coordinator decision completes
+//! - `Synthesizing` - when task results are being consolidated for the coordinator
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -319,7 +319,7 @@ pub(super) fn spawn_tool_event_forwarder(
 /// Orchestrator for multi-agent workflows.
 ///
 /// Created lazily by `OrchestratorFactory::stream()` to coordinate multiple
-/// agents through a plan-execute-synthesize loop.
+/// agents through a plan-execute-continue loop.
 pub struct Orchestrator {
     /// ID for the orchestrator
     orchestrator_id: String,
@@ -810,7 +810,7 @@ impl Orchestrator {
     ///
     /// Unlike `stream_and_collect` (which uses `max_depth=1` and early-exit for coordinator
     /// one-shot tool phases), this uses the agent's configured `max_depth` and runs the
-    /// full multi-turn tool loop. Used for workers, synthesis, and phase continuation.
+    /// full multi-turn tool loop. Used for workers and phase continuation.
     ///
     /// Key behaviors:
     /// - Uses `agent.stream_chat()` which respects the agent's configured `max_depth`
@@ -2111,62 +2111,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         })
     }
 
-    /// Create a coordinator agent for synthesis (only `read_artifact` tool).
-    ///
-    /// Synthesis needs access to artifacts but should not have recon or routing
-    /// tools, preventing models from wasting turns on `list_tools`/
-    /// `inspect_tool_params` calls.
-    #[allow(dead_code)]
-    async fn create_synthesis_coordinator(
-        &self,
-    ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
-        let preamble = self
-            .config
-            .build_coordinator_preamble(self.agent_config.effective_preamble(), false);
-        let temperature = self.agent_config.llm.temperature();
-
-        let coordinator_tools = CoordinatorTools {
-            list_tools: None,
-            inspect_tool_params: None,
-            vector_tools: vec![],
-            routing_tools: None,
-            allow_create_plan: false,
-            read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
-        };
-
-        let provider_agent = self
-            .build_provider_agent_with_tools(
-                &preamble,
-                temperature,
-                self.agent_config.llm.additional_params(),
-                coordinator_tools,
-            )
-            .await?;
-
-        let model_name = self.agent_config.llm.model_name().to_string();
-        // Synthesis only needs 1-2 turns (read_artifact + response)
-        let max_depth = 4;
-
-        Ok(AgentWithPreamble {
-            agent: Agent {
-                inner: provider_agent,
-                model: model_name,
-                max_depth,
-                mcp_manager: None,
-                fallback_tool_parsing: false,
-                fallback_tool_names: vec![],
-                context_window: None,
-                scratchpad_budget: None,
-            },
-            preamble,
-            escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        })
-    }
-
     /// Build a provider-specific agent with coordinator tools.
     ///
     /// Extracted from `create_coordinator` to share provider matching across
-    /// planning, synthesis, and evaluation constructors.
+    /// planning and continuation constructors.
     async fn build_provider_agent_with_tools(
         &self,
         preamble: &str,
@@ -2482,33 +2430,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
         }
-    }
-
-    /// Build the synthesis prompt for combining multiple task results.
-    ///
-    /// The prompt provides context about the orchestration goal, the original
-    /// user query, and each task's description, rationale, and result.
-    #[allow(dead_code)]
-    fn build_synthesis_prompt(&self, plan: &Plan, query: &str, tasks: &[&Task]) -> String {
-        let results_section = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Complete)
-            .filter_map(|t| {
-                t.result.as_ref().map(|r| {
-                    format!(
-                        "### Task {}: {}\n**Rationale**: {}\n**Result**:\n{}\n",
-                        t.id, t.description, t.rationale, r
-                    )
-                })
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        super::templates::render_synthesis_prompt(&super::templates::SynthesisVars {
-            goal: &plan.goal,
-            query,
-            results: &results_section,
-        })
     }
 
     /// Parse the LLM response into a Plan.
@@ -3087,37 +3008,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .join("\n")
     }
 
-    /// Attempt partial synthesis when max iterations are reached.
-    ///
-    /// If completed tasks exist, tries to synthesize a partial result.
-    /// Returns `Ok(Some(result))` if partial synthesis succeeded,
-    /// `Ok(None)` if no completed tasks or synthesis failed,
-    /// allowing the caller to decide whether to break or return an error.
-    #[allow(dead_code)]
-    async fn try_partial_synthesis(
-        &self,
-        plan: &Plan,
-        query: &str,
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-        iteration: usize,
-        reason: &str,
-    ) -> Option<String> {
-        if plan.completed_count() > 0 {
-            tracing::warn!(
-                "{} but max iterations reached ({}). \
-                 Synthesizing partial results from {} completed task(s).",
-                reason,
-                iteration,
-                plan.completed_count()
-            );
-            match self.synthesize(plan, query, Some(event_tx)).await {
-                Ok(partial) => return Some(partial),
-                Err(e) => tracing::error!("Partial synthesis failed: {}", e),
-            }
-        }
-        None
-    }
-
     /// Categorize a task failure error string into a human-readable category.
     fn categorize_failure_error(error: &str) -> &'static str {
         let lower = error.to_lowercase();
@@ -3158,195 +3048,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         failures
             .iter()
             .all(|f| Self::categorize_failure_error(&f.error) == "provider_error")
-    }
-
-    /// Synthesize phase: combine task results into final response.
-    ///
-    /// For single-task plans, just returns the task result.
-    /// For multi-task plans, uses the coordinator agent to intelligently
-    /// combine results into a coherent response.
-    ///
-    /// Also persists the synthesis artifacts via ExecutionPersistence.
-    #[allow(dead_code)]
-    #[tracing::instrument(
-        name = "orchestration.synthesis",
-        skip_all,
-        fields(
-            orchestration.phase = "synthesis",
-            orchestration.completed_tasks = tracing::field::Empty,
-        )
-    )]
-    async fn synthesize(
-        &self,
-        plan: &Plan,
-        query: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<String, StreamError> {
-        // Collect completed tasks with results
-        let completed_tasks: Vec<&Task> = plan
-            .tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Complete && t.result.is_some())
-            .collect();
-
-        tracing::Span::current().record(
-            "orchestration.completed_tasks",
-            completed_tasks.len() as i64,
-        );
-
-        if completed_tasks.is_empty() {
-            // All tasks failed
-            let errors: Vec<&str> = plan
-                .tasks
-                .iter()
-                .filter(|t| t.status == TaskStatus::Failed)
-                .filter_map(|t| t.error.as_deref())
-                .collect();
-
-            let error_msg = format!("All tasks failed: {}", errors.join("; "));
-
-            // Persist the failure synthesis
-            {
-                let persistence = self.persistence.lock().await;
-                let synthesis_prompt = format!(
-                    "[SYNTHESIS FAILED - ALL TASKS FAILED]\n\nTask results:\n- All {} tasks failed\n\nErrors:\n{}",
-                    plan.tasks.len(),
-                    errors.join("\n")
-                );
-                if let Err(e) = persistence
-                    .write_synthesis(&synthesis_prompt, &error_msg)
-                    .await
-                {
-                    tracing::warn!("Failed to persist synthesis: {}", e);
-                }
-            }
-
-            return Err(error_msg.into());
-        }
-
-        // Use LLM to synthesize (even single results get coordinator framing)
-        let synthesis_prompt = self.build_synthesis_prompt(plan, query, &completed_tasks);
-
-        let synthesized = match self.create_synthesis_coordinator().await {
-            Ok(AgentWithPreamble {
-                agent: coordinator,
-                preamble: synth_preamble,
-                ..
-            }) => {
-                // Record in prompt journal
-                self.journal_record(JournalPhase::Synthesis, &synth_preamble, &synthesis_prompt);
-
-                match self
-                    .stream_and_forward(
-                        &coordinator,
-                        &synthesis_prompt,
-                        vec![],
-                        "Synthesis",
-                        event_tx,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        tracing::debug!(
-                            "LLM synthesis successful for {} tasks",
-                            completed_tasks.len()
-                        );
-                        crate::logging::set_token_usage(
-                            &tracing::Span::current(),
-                            response.usage.input_tokens,
-                            response.usage.output_tokens,
-                            response.usage.total_tokens,
-                            0,
-                        );
-                        self.usage_state.accumulate_usage(
-                            response.usage.input_tokens,
-                            response.usage.output_tokens,
-                        );
-                        response.content
-                    }
-                    Err(e) if is_context_overflow_error(e.as_ref()) => {
-                        // Context overflow during synthesis - fail with actionable message
-                        let suggestion = context_overflow_suggestion("synthesis");
-                        return Err(format!(
-                            "Context limit exceeded during synthesis. {}",
-                            suggestion
-                        )
-                        .into());
-                    }
-                    Err(e) if e.to_string().contains("timed out") => {
-                        tracing::warn!(
-                            "Synthesis timed out (per_call_timeout={}s), falling back to result concatenation",
-                            self.config.per_call_timeout_secs()
-                        );
-                        // Fallback to mechanical concatenation for timeout
-                        completed_tasks
-                            .iter()
-                            .enumerate()
-                            .map(|(i, t)| {
-                                format!(
-                                    "## Result {}\n\n{}",
-                                    i + 1,
-                                    t.result.as_deref().unwrap_or("")
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n\n---\n\n")
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Synthesis LLM call failed, falling back to result concatenation: {}",
-                            e
-                        );
-                        // Fallback to mechanical concatenation for non-context errors
-                        completed_tasks
-                            .iter()
-                            .enumerate()
-                            .map(|(i, t)| {
-                                format!(
-                                    "## Result {}\n\n{}",
-                                    i + 1,
-                                    t.result.as_deref().unwrap_or("")
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n\n---\n\n")
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Synthesis coordinator creation failed, falling back to result concatenation: {}",
-                    e
-                );
-                // Fallback to mechanical concatenation
-                completed_tasks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        format!(
-                            "## Result {}\n\n{}",
-                            i + 1,
-                            t.result.as_deref().unwrap_or("")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n---\n\n")
-            }
-        };
-
-        // Persist the synthesis
-        {
-            let persistence = self.persistence.lock().await;
-            if let Err(e) = persistence
-                .write_synthesis(&synthesis_prompt, &synthesized)
-                .await
-            {
-                tracing::warn!("Failed to persist synthesis: {}", e);
-            }
-        }
-
-        Ok(synthesized)
     }
 
     /// Send an orchestrator event through the stream channel.
@@ -3543,7 +3244,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         result
     }
 
-    /// The plan-execute-synthesize-evaluate loop.
+    /// The plan-execute-continue loop.
     ///
     /// Takes an initial plan and iterates until quality threshold is met or
     /// max iterations are reached. On re-plan, uses `plan_with_routing()` and
@@ -3758,6 +3459,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_summary,
             failure_history.clone(),
         );
+        Self::emit_event(
+            event_tx,
+            OrchestratorEvent::Synthesizing { iteration },
+        )
+        .await;
         let decision_start = Instant::now();
         let routing = self
             .plan_with_routing(query, chat_history, Some(&post_execute_ctx), Some(event_tx))
@@ -3862,7 +3568,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     event_tx,
                     OrchestratorEvent::PlanCreated {
                         goal: new_plan.goal.clone(),
-                        task_count: new_plan.tasks.len(),
+                        tasks: new_plan.tasks.iter().map(|t| t.description.clone()).collect(),
                         routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
                         routing_rationale,
                         planning_response: planning_summary,
@@ -4091,11 +3797,6 @@ fn context_overflow_suggestion(phase: &str) -> String {
         "planning" => {
             "Query too complex. Consider breaking into smaller, focused questions.".to_string()
         }
-        "synthesis" => {
-            "Task results too large to synthesize. Ask about specific aspects separately."
-                .to_string()
-        }
-        "evaluation" => "Response too large to evaluate. Consider simpler queries.".to_string(),
         "worker" => {
             "Task context too large. The plan may need smaller, more focused tasks.".to_string()
         }
@@ -4149,73 +3850,6 @@ mod tests {
     fn test_is_context_overflow_error_not_context_error() {
         let error: Box<dyn std::error::Error + Send + Sync> = "network timeout".into();
         assert!(!is_context_overflow_error(error.as_ref()));
-    }
-
-    #[test]
-    fn test_synthesize_single_result() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "task", "single task rationale"));
-        plan.get_task_mut(0).unwrap().complete("the answer");
-
-        let result = synthesize_results(&plan);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "the answer");
-    }
-
-    #[test]
-    fn test_synthesize_multiple_results() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "task 0", "first task rationale"));
-        plan.add_task(Task::new(1, "task 1", "second task rationale"));
-        plan.get_task_mut(0).unwrap().complete("first");
-        plan.get_task_mut(1).unwrap().complete("second");
-
-        let result = synthesize_results(&plan);
-        assert!(result.is_ok());
-        let text = result.unwrap();
-        assert!(text.contains("first"));
-        assert!(text.contains("second"));
-    }
-
-    #[test]
-    fn test_synthesize_all_failed() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "task", "test rationale"));
-        plan.get_task_mut(0).unwrap().fail("oops");
-
-        let result = synthesize_results(&plan);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("All tasks failed"));
-    }
-
-    fn synthesize_results(plan: &Plan) -> Result<String, String> {
-        let results: Vec<&str> = plan
-            .tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Complete)
-            .filter_map(|t| t.result.as_deref())
-            .collect();
-
-        if results.is_empty() {
-            let errors: Vec<&str> = plan
-                .tasks
-                .iter()
-                .filter(|t| t.status == TaskStatus::Failed)
-                .filter_map(|t| t.error.as_deref())
-                .collect();
-            return Err(format!("All tasks failed: {}", errors.join("; ")));
-        }
-
-        if results.len() == 1 {
-            return Ok(results[0].to_string());
-        }
-
-        Ok(results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| format!("## Result {}\n\n{}", i + 1, r))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n"))
     }
 
     /// Test helper: Parse plan JSON response without needing an Orchestrator instance.
@@ -4535,121 +4169,6 @@ mod tests {
 
         assert_eq!(task.worker, Some("operations".to_string()));
         assert_eq!(task.dependencies, vec![1]);
-    }
-
-    // ========================================================================
-    // Synthesis Prompt Tests
-    // ========================================================================
-
-    /// Test helper: Build synthesis prompt without needing an Orchestrator instance.
-    fn build_test_synthesis_prompt(plan: &Plan, query: &str, tasks: &[&Task]) -> String {
-        let results_section = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Complete)
-            .filter_map(|t| {
-                t.result.as_ref().map(|r| {
-                    format!(
-                        "### Task {}: {}\n**Rationale**: {}\n**Result**:\n{}\n",
-                        t.id, t.description, t.rationale, r
-                    )
-                })
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        format!(
-            r#"You are synthesizing results from multiple tasks into a coherent response.
-
-ORCHESTRATION GOAL: {goal}
-
-ORIGINAL USER QUERY: {query}
-
-TASK RESULTS:
-{results}
-
-INSTRUCTIONS:
-1. Combine these results into a single, coherent response
-2. Ensure the response directly addresses the original query
-3. Preserve important details from each task
-4. Do NOT just concatenate - synthesize into natural prose
-5. If results conflict, note the discrepancy
-
-Provide the synthesized response:"#,
-            goal = plan.goal,
-            query = query,
-            results = results_section
-        )
-    }
-
-    #[test]
-    fn test_synthesis_prompt_includes_goal_and_query() {
-        let mut plan = Plan::new("Analyze system performance");
-        plan.add_task(Task::new(0, "Check CPU", "Gather CPU metrics"));
-        plan.get_task_mut(0).unwrap().complete("CPU at 50%");
-
-        let tasks: Vec<&Task> = plan.tasks.iter().collect();
-        let prompt = build_test_synthesis_prompt(&plan, "How is my system doing?", &tasks);
-
-        assert!(prompt.contains("ORCHESTRATION GOAL: Analyze system performance"));
-        assert!(prompt.contains("ORIGINAL USER QUERY: How is my system doing?"));
-    }
-
-    #[test]
-    fn test_synthesis_prompt_includes_rationale() {
-        let mut plan = Plan::new("Multi-step analysis");
-        plan.add_task(Task::new(0, "Fetch data", "Initial data collection"));
-        plan.add_task(Task::new(
-            1,
-            "Process data",
-            "Transform raw data into insights",
-        ));
-        plan.get_task_mut(0)
-            .unwrap()
-            .complete("Data fetched successfully");
-        plan.get_task_mut(1).unwrap().complete("Insights generated");
-
-        let tasks: Vec<&Task> = plan.tasks.iter().collect();
-        let prompt = build_test_synthesis_prompt(&plan, "Analyze this", &tasks);
-
-        assert!(prompt.contains("**Rationale**: Initial data collection"));
-        assert!(prompt.contains("**Rationale**: Transform raw data into insights"));
-    }
-
-    #[test]
-    fn test_synthesis_prompt_includes_task_results() {
-        let mut plan = Plan::new("Test goal");
-        plan.add_task(Task::new(0, "Task A", "First rationale"));
-        plan.add_task(Task::new(1, "Task B", "Second rationale"));
-        plan.get_task_mut(0).unwrap().complete("Result Alpha");
-        plan.get_task_mut(1).unwrap().complete("Result Beta");
-
-        let tasks: Vec<&Task> = plan.tasks.iter().collect();
-        let prompt = build_test_synthesis_prompt(&plan, "query", &tasks);
-
-        assert!(prompt.contains("### Task 0: Task A"));
-        assert!(prompt.contains("### Task 1: Task B"));
-        assert!(prompt.contains("Result Alpha"));
-        assert!(prompt.contains("Result Beta"));
-    }
-
-    #[test]
-    fn test_synthesis_prompt_filters_incomplete_tasks() {
-        let mut plan = Plan::new("Partial completion");
-        plan.add_task(Task::new(0, "Completed task", "Has result"));
-        plan.add_task(Task::new(1, "Failed task", "No result"));
-        plan.get_task_mut(0).unwrap().complete("Success");
-        plan.get_task_mut(1).unwrap().fail("Error occurred");
-
-        let tasks: Vec<&Task> = plan.tasks.iter().collect();
-        let prompt = build_test_synthesis_prompt(&plan, "query", &tasks);
-
-        // Only completed task should appear
-        assert!(prompt.contains("### Task 0: Completed task"));
-        assert!(prompt.contains("Success"));
-
-        // Failed task should NOT appear in results section
-        assert!(!prompt.contains("### Task 1: Failed task"));
-        assert!(!prompt.contains("Error occurred"));
     }
 
     // ========================================================================

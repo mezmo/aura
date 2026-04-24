@@ -40,11 +40,7 @@ agent.stream (AGENT, ROOT)
         ├── orchestration.planning (CHAIN)
         │   └── agent.turn (LLM) → execute_tool → mcp.tool_call
         └── orchestration.iteration (CHAIN)
-            ├── orchestration.worker (AGENT)
-            │   └── agent.turn (LLM) → execute_tool → mcp.tool_call
-            ├── orchestration.synthesis (CHAIN)
-            │   └── agent.turn (LLM) → ...
-            └── orchestration.evaluation (CHAIN)
+            └── orchestration.worker (AGENT)
                 └── agent.turn (LLM) → execute_tool → mcp.tool_call
 ```
 
@@ -63,11 +59,9 @@ agent.stream (AGENT, ROOT)
 | `orchestration.planning` | `orchestration.phase` |
 | `orchestration.iteration` | `orchestration.iteration`, `orchestration.task_count`, `orchestration.quality_score`, `orchestration.will_replan` |
 | `orchestration.worker` | `orchestration.task_id`, `orchestration.worker`, `orchestration.task` |
-| `orchestration.synthesis` | `orchestration.phase`, `orchestration.completed_tasks` |
-| `orchestration.evaluation` | `orchestration.phase`, `orchestration.quality_score` |
 
 Token usage (`llm.token_count.*`) is recorded on all orchestration phase
-spans (planning, worker, synthesis, evaluation).
+spans (planning, worker).
 
 ## OpenInference span kinds
 
@@ -79,7 +73,7 @@ Span kind is inferred from the span name by the custom exporter in
 | **LLM** | `chat_streaming`, `agent.turn` |
 | **TOOL** | `execute_tool`, `mcp.tool_call` |
 | **AGENT** | `agent.stream`, `orchestration.worker` |
-| **CHAIN** | `chat_completions`, `streaming_completion`, `orchestration`, `orchestration.planning`, `orchestration.iteration`, `orchestration.synthesis`, `orchestration.evaluation` |
+| **CHAIN** | `chat_completions`, `streaming_completion`, `orchestration`, `orchestration.planning`, `orchestration.iteration` |
 
 ## Span parenting
 

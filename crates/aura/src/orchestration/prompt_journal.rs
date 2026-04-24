@@ -33,8 +33,6 @@ pub(crate) enum JournalPhase<'a> {
         worker_name: Option<&'a str>,
         attempt: usize,
     },
-    #[allow(dead_code)]
-    Synthesis,
 }
 
 impl<'a> JournalPhase<'a> {
@@ -61,7 +59,6 @@ impl<'a> JournalPhase<'a> {
                 worker_name: None,
                 ..
             } => format!("Worker (Iteration {}, Task {})", iteration, task_id),
-            JournalPhase::Synthesis => format!("Synthesis (Iteration {})", iteration),
         }
     }
 
@@ -74,7 +71,6 @@ impl<'a> JournalPhase<'a> {
             } => {
                 format!("tasks/task-{}/attempt-{}/response.txt", task_id, attempt)
             }
-            JournalPhase::Synthesis => "synthesis/response.txt".to_string(),
         }
     }
 }
@@ -306,20 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn journal_records_synthesis() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("prompt-journal.md");
-
-        let journal = PromptJournal::new(path.clone(), "run-1", "orch-1").unwrap();
-
-        journal.record(JournalPhase::Synthesis, 1, "synth system", "synth user");
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("Synthesis (Iteration 1)"));
-        assert!(content.contains("synthesis/response.txt"));
-    }
-
-    #[test]
     fn journal_output_format_has_separators() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("prompt-journal.md");
@@ -371,19 +353,12 @@ mod tests {
             "worker-sys",
             "worker-usr",
         );
-        journal.record(JournalPhase::Synthesis, 1, "synth-sys", "synth-usr");
-
         let content = std::fs::read_to_string(&path).unwrap();
 
         let plan_pos = content.find("Planning").unwrap();
         let worker_pos = content.find("Worker: w1").unwrap();
-        let synth_pos = content.find("Synthesis").unwrap();
 
         assert!(plan_pos < worker_pos, "Planning should come before Worker");
-        assert!(
-            worker_pos < synth_pos,
-            "Worker should come before Synthesis"
-        );
     }
 
     #[test]

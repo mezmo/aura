@@ -101,7 +101,7 @@ fn assert_any_routing_event(events: &[SseEvent]) {
 // ---------------------------------------------------------------------------
 
 /// Verifies that a full SRE workflow triggers orchestration planning with
-/// lifecycle events (plan, tasks, tool calls, synthesis).
+/// lifecycle events (plan, tasks, tool calls, continuation).
 ///
 /// Query asks for multi-step: discover workloads → check monitoring → create alerts.
 /// Expected: plan_created (tasks array length >= 2), task_started/completed pairs,
