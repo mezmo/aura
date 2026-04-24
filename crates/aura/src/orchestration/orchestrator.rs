@@ -1199,7 +1199,6 @@ impl Orchestrator {
                         .map(|t| super::types::StepInput::LeafTask {
                             task: t.description.clone(),
                             worker: t.worker.clone(),
-                            reuse_result_from: None,
                         })
                         .collect();
 
@@ -1266,7 +1265,6 @@ impl Orchestrator {
             steps: vec![super::types::StepInput::LeafTask {
                 task: format!("Execute: {}", truncate_query(query, 100)),
                 worker: None,
-                reuse_result_from: None,
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
@@ -1304,7 +1302,6 @@ impl Orchestrator {
                     steps: vec![super::types::StepInput::LeafTask {
                         task: format!("Answer the user's query: {}", truncate_query(query, 80)),
                         worker: None,
-                        reuse_result_from: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
@@ -1330,7 +1327,6 @@ impl Orchestrator {
                             truncate_query(query, 80)
                         ),
                         worker: None,
-                        reuse_result_from: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
@@ -5194,15 +5190,10 @@ Provide the synthesized response:"#,
                 assert_eq!(goal, "what is the meaning?");
                 assert_eq!(steps.len(), 1);
                 match &steps[0] {
-                    StepInput::LeafTask {
-                        task,
-                        worker,
-                        reuse_result_from,
-                    } => {
+                    StepInput::LeafTask { task, worker } => {
                         assert!(task.starts_with("Answer the user's query:"));
                         assert!(task.contains("what is the meaning?"));
                         assert!(worker.is_none());
-                        assert!(reuse_result_from.is_none());
                     }
                     _ => panic!("expected single LeafTask step"),
                 }
@@ -5259,7 +5250,6 @@ Provide the synthesized response:"#,
             steps: vec![StepInput::LeafTask {
                 task: "compute mean of 1,2,3".to_string(),
                 worker: Some("statistics".to_string()),
-                reuse_result_from: None,
             }],
             routing_rationale: "needs tool".to_string(),
             planning_summary: "single step".to_string(),
@@ -5302,7 +5292,6 @@ Provide the synthesized response:"#,
             steps: vec![StepInput::LeafTask {
                 task: "do it".to_string(),
                 worker: None,
-                reuse_result_from: None,
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),

@@ -170,81 +170,35 @@ impl Tool for CreatePlanTool {
     type Output = CreatePlanOutput;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
-        // Depth-2 inlined schema (no $ref). The "step" object is one of:
-        //   - LeafTask: {"task": "...", "worker": "..."}
-        //   - ParallelGroup: {"parallel": [<step>, ...]}
-        //   - SubChain (inside parallel only): {"steps": [<leaf_or_parallel>, ...]}
+        // Tagged step schema — "type" discriminator helps models declare intent.
         let step_schema = serde_json::json!({
-            "oneOf": [
-                {
-                    "type": "object",
-                    "description": "A single task to execute",
-                    "properties": {
-                        "task": {
-                            "type": "string",
-                            "description": "What this task accomplishes. Fully resolve all references — workers do NOT see conversation history."
-                        },
-                        "worker": {
-                            "type": "string",
-                            "description": "Name of the specialized worker to assign this task to"
-                        },
-                        "reuse_result_from": {
-                            "type": "integer",
-                            "description": "ID of a completed task from the previous iteration. Skips execution and copies the prior result. Omit for tasks that need fresh execution."
-                        }
-                    },
-                    "required": ["task"]
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["task", "parallel", "chain"],
+                    "description": "Step kind: 'task' for a single task, 'parallel' for concurrent steps, 'chain' for a sequential sub-chain inside a parallel group"
                 },
-                {
-                    "type": "object",
-                    "description": "A group of steps that execute in parallel. Use when tasks are independent.",
-                    "properties": {
-                        "parallel": {
-                            "type": "array",
-                            "description": "Steps to run concurrently. Each item is a task or a sub-chain.",
-                            "items": {
-                                "oneOf": [
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "task": { "type": "string" },
-                                            "worker": { "type": "string" },
-                                            "reuse_result_from": {
-                                                "type": "integer",
-                                                "description": "ID of a completed task from the previous iteration. Skips execution and copies the prior result."
-                                            }
-                                        },
-                                        "required": ["task"]
-                                    },
-                                    {
-                                        "type": "object",
-                                        "description": "A sequential sub-chain inside a parallel group",
-                                        "properties": {
-                                            "steps": {
-                                                "type": "array",
-                                                "items": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "task": { "type": "string" },
-                                                        "worker": { "type": "string" },
-                                                        "reuse_result_from": {
-                                                            "type": "integer",
-                                                            "description": "ID of a completed task from the previous iteration. Skips execution and copies the prior result."
-                                                        }
-                                                    },
-                                                    "required": ["task"]
-                                                }
-                                            }
-                                        },
-                                        "required": ["steps"]
-                                    }
-                                ]
-                            }
-                        }
-                    },
-                    "required": ["parallel"]
+                "task": {
+                    "type": "string",
+                    "description": "What this task accomplishes. Fully resolve all references — workers do NOT see conversation history. Required when type=task."
+                },
+                "worker": {
+                    "type": "string",
+                    "description": "Name of the specialized worker to assign this task to. Required when type=task."
+                },
+                "items": {
+                    "type": "array",
+                    "description": "Steps to run concurrently. Required when type=parallel.",
+                    "items": { "type": "object" }
+                },
+                "steps": {
+                    "type": "array",
+                    "description": "Sequential steps in a sub-chain. Required when type=chain.",
+                    "items": { "type": "object" }
                 }
-            ]
+            }
         });
 
         ToolDefinition {
@@ -310,8 +264,8 @@ fn count_leaf_steps(steps: &[StepInput]) -> usize {
 
 fn count_one(step: &StepInput) -> usize {
     match step {
-        StepInput::LeafTask { .. } => 1,
-        StepInput::ParallelGroup { parallel } => count_leaf_steps(parallel),
+        StepInput::LeafTask { .. } | StepInput::ReuseTask { .. } => 1,
+        StepInput::ParallelGroup { items } => count_leaf_steps(items),
         StepInput::SubChain { steps } => count_leaf_steps(steps),
     }
 }
@@ -447,7 +401,6 @@ mod tests {
                 steps: vec![StepInput::LeafTask {
                     task: "Fetch recent logs".to_string(),
                     worker: Some("operations".to_string()),
-                    reuse_result_from: None,
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),

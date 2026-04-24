@@ -44,8 +44,8 @@ When creating plans with `create_plan`, provide an ordered list of **steps**:
 {
   "goal": "Compute the mean of [10,20,30] then multiply by 3",
   "steps": [
-    {"task": "Compute the mean of the numbers 10, 20, 30", "worker": "statistics"},
-    {"task": "Multiply the result by 3", "worker": "arithmetic"}
+    {"type": "task", "task": "Compute the mean of the numbers 10, 20, 30", "worker": "statistics"},
+    {"type": "task", "task": "Multiply the result by 3", "worker": "arithmetic"}
   ],
   "routing_rationale": "Requires two dependent computations",
   "planning_summary": "First compute the mean, then multiply"
@@ -58,17 +58,18 @@ When creating plans with `create_plan`, provide an ordered list of **steps**:
 {
   "goal": "Compute median and sin(45°), then multiply",
   "steps": [
-    {"parallel": [
-      {"task": "Compute the median of 10, 20, 30", "worker": "statistics"},
-      {"task": "Compute the sine of 45 degrees", "worker": "trigonometry"}
+    {"type": "parallel", "items": [
+      {"type": "task", "task": "Compute the median of 10, 20, 30", "worker": "statistics"},
+      {"type": "task", "task": "Compute the sine of 45 degrees", "worker": "trigonometry"}
     ]},
-    {"task": "Multiply the two results together", "worker": "arithmetic"}
+    {"type": "task", "task": "Multiply the two results together", "worker": "arithmetic"}
   ],
   "routing_rationale": "Two independent computations followed by a dependent one",
   "planning_summary": "Compute median and sin(45°) in parallel, then multiply"
 }
 ```
 
+Every step must include a `"type"` field (`"task"`, `"parallel"`, or `"chain"`).
 Do NOT use parallel groups for steps that depend on each other — sequential ordering handles dependencies automatically.
 
 ## Artifacts
