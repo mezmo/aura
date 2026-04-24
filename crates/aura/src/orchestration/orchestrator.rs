@@ -101,7 +101,6 @@ struct AgentWithPreamble {
     /// Side-channel for worker→executor escalation. Set by the duplicate-call
     /// guard when a tool-call loop is terminated; read by `execute_task` after
     /// the multi_turn loop to convert a false `Ok` into `TaskStatus::Failed`.
-    #[allow(dead_code)]
     escalation_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -2755,7 +2754,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let AgentWithPreamble {
             agent: worker,
             preamble: worker_preamble,
-            ..
+            escalation_flag,
         } = self.create_worker(task_id, attempt, *worker_name).await?;
 
         // Build the worker prompt — task-first, no original query (prevents scope creep)
@@ -2821,6 +2820,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .into())
             }
             Err(e) => Err(e),
+        };
+
+        // Check escalation flag: guard detected a duplicate call loop but
+        // rig reported Ok. Convert to Err so the task is marked Failed and
+        // dependents are blocked in the DAG.
+        let result: Result<String, StreamError> = match result {
+            Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
+                let processed = self.maybe_create_artifact(task_id, worker_output).await;
+                Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
+            }
+            other => other,
         };
 
         // Persist the worker execution
