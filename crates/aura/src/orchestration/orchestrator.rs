@@ -343,6 +343,18 @@ pub struct Orchestrator {
     /// Current orchestration iteration, set at the top of `run_orchestration_loop`.
     /// Read by `journal_record` so that iteration doesn't pollute method signatures.
     current_iteration: AtomicUsize,
+
+    /// Accumulated token usage across all LLM calls in this orchestration run
+    /// (planning, workers, synthesis, evaluation).
+    ///
+    /// Cloned from a handle owned by `OrchestratorFactory::stream_with_timeout`
+    /// so the streaming handler can read the final totals and emit `aura.usage`.
+    /// In orchestration mode we aggregate additively via
+    /// [`crate::UsageState::accumulate_usage`] so the reported prompt/completion
+    /// totals reflect *billed* tokens across every internal LLM turn, not just
+    /// the first one. Assigned by the factory after construction; see
+    /// `OrchestratorFactory::spawn_orchestration_stream`.
+    pub(super) usage_state: crate::UsageState,
 }
 
 /// Worker identity for reasoning attribution in `stream_and_forward`.
@@ -432,6 +444,7 @@ impl Orchestrator {
             persistence,
             prompt_journal,
             current_iteration: AtomicUsize::new(0),
+            usage_state: crate::UsageState::new(),
         })
     }
 
@@ -1042,6 +1055,8 @@ impl Orchestrator {
                         r.usage.total_tokens,
                         0,
                     );
+                    self.usage_state
+                        .accumulate_usage(r.usage.input_tokens, r.usage.output_tokens);
                     r
                 }
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
@@ -2806,6 +2821,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 response.usage.total_tokens,
                 0,
             );
+            self.usage_state
+                .accumulate_usage(response.usage.input_tokens, response.usage.output_tokens);
         }
 
         // Detect context overflow in worker and provide actionable message
@@ -3088,6 +3105,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             response.usage.total_tokens,
                             0,
                         );
+                        self.usage_state.accumulate_usage(
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
+                        );
                         response.content
                     }
                     Err(e) if is_context_overflow_error(e.as_ref()) => {
@@ -3244,6 +3265,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             response.usage.output_tokens,
                             response.usage.total_tokens,
                             0,
+                        );
+                        self.usage_state.accumulate_usage(
+                            response.usage.input_tokens,
+                            response.usage.output_tokens,
                         );
                         // Read the evaluation from the tool's shared state
                         let eval = decision.lock().await.take();

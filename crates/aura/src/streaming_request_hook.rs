@@ -137,6 +137,25 @@ impl UsageState {
         }
     }
 
+    /// Accumulate usage additively across multiple LLM calls.
+    ///
+    /// Unlike [`store_usage`](Self::store_usage), which captures only the *first*
+    /// turn's prompt, this adds to both prompt and completion counters. Use when
+    /// the caller already aggregates usage across independent LLM calls (e.g. the
+    /// orchestrator summing planning, workers, synthesis, and evaluation turns)
+    /// and needs the final `aura.usage` event to reflect *total billed* tokens
+    /// rather than a single-turn snapshot.
+    ///
+    /// Marks the state as initialized so the stream handler emits `aura.usage`
+    /// even when prompt was only ever accumulated through this method.
+    pub fn accumulate_usage(&self, prompt: u64, completion: u64) {
+        self.initialized.store(true, Ordering::Release);
+        self.initial_prompt_tokens
+            .fetch_add(prompt, Ordering::AcqRel);
+        self.accumulated_completion_tokens
+            .fetch_add(completion, Ordering::AcqRel);
+    }
+
     /// Add a tool ID to the pending list.
     ///
     /// Called from on_tool_result when a tool completes.
@@ -563,6 +582,32 @@ mod tests {
         assert_eq!(completion, 200);
         assert_eq!(total, 1200);
         assert_eq!(usage_state.get_tool_completion_tokens(), 0);
+    }
+
+    #[test]
+    fn test_usage_state_accumulate_aggregates_prompt_and_completion() {
+        let usage_state = UsageState::new();
+
+        // Multiple calls (as orchestration emits across planning/workers/synthesis)
+        usage_state.accumulate_usage(100, 50);
+        usage_state.accumulate_usage(400, 200);
+        usage_state.accumulate_usage(250, 75);
+
+        let (prompt, completion, total) = usage_state.get_final_usage();
+        assert_eq!(prompt, 750, "prompt should be the sum of all inputs");
+        assert_eq!(completion, 325, "completion should be the sum of all outputs");
+        assert_eq!(total, 1075);
+    }
+
+    #[test]
+    fn test_usage_state_accumulate_marks_initialized() {
+        let usage_state = UsageState::new();
+        // Before any usage, get_final_usage returns 0 — handler would skip aura.usage.
+        assert_eq!(usage_state.get_final_usage(), (0, 0, 0));
+
+        usage_state.accumulate_usage(500, 100);
+        let (prompt, _, _) = usage_state.get_final_usage();
+        assert!(prompt > 0, "handler uses prompt > 0 to gate aura.usage emission");
     }
 
     #[test]
