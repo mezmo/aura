@@ -14,23 +14,27 @@ use crate::string_utils::safe_truncate;
 /// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
 const MAX_STEP_NESTING: usize = 2;
 
-/// A step in a sequential plan. Deserialized via untagged enum — serde tries
-/// variants in declaration order: `ParallelGroup`, `SubChain`, then `LeafTask`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+/// A step in a sequential plan. Tagged enum so models declare intent
+/// explicitly via `"type"` before filling fields.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum StepInput {
     /// A group of steps that execute in parallel.
-    ParallelGroup { parallel: Vec<StepInput> },
+    #[serde(rename = "parallel")]
+    ParallelGroup { items: Vec<StepInput> },
     /// A sequential sub-chain (only valid inside a `ParallelGroup`).
+    #[serde(rename = "chain")]
     SubChain { steps: Vec<StepInput> },
     /// A single task to execute.
+    #[serde(rename = "task")]
     LeafTask {
         task: String,
         #[serde(default)]
         worker: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reuse_result_from: Option<usize>,
     },
+    /// Reuse a result from a previous iteration without re-executing.
+    #[serde(rename = "reuse")]
+    ReuseTask { reuse_result_from: usize },
 }
 
 /// Convert a list of `StepInput` into a flat `Vec<Task>` with auto-assigned IDs
@@ -77,24 +81,26 @@ fn flatten_one(
     depth: usize,
 ) -> Result<Vec<usize>, String> {
     match step {
-        StepInput::LeafTask {
-            task,
-            worker,
-            reuse_result_from,
-        } => {
+        StepInput::LeafTask { task, worker } => {
             let id = *counter;
             *counter += 1;
             let mut t = Task::new(id, task.clone(), String::new());
             t.dependencies = frontier.to_vec();
-            if let Some(w) = worker {
-                t.worker = Some(w.clone());
-            }
-            t.reuse_result_from = *reuse_result_from;
+            t.worker = worker.clone();
             tasks.push(t);
             Ok(vec![id])
         }
-        StepInput::ParallelGroup { parallel } => {
-            if parallel.is_empty() {
+        StepInput::ReuseTask { reuse_result_from } => {
+            let id = *counter;
+            *counter += 1;
+            let mut t = Task::new(id, String::new(), String::new());
+            t.dependencies = frontier.to_vec();
+            t.reuse_result_from = Some(*reuse_result_from);
+            tasks.push(t);
+            Ok(vec![id])
+        }
+        StepInput::ParallelGroup { items } => {
+            if items.is_empty() {
                 return Err("Empty parallel group".to_string());
             }
             if depth >= MAX_STEP_NESTING {
@@ -103,11 +109,11 @@ fn flatten_one(
                     MAX_STEP_NESTING
                 ));
             }
-            if parallel.len() == 1 {
+            if items.len() == 1 {
                 tracing::warn!("Single-item parallel group is redundant, treating as sequential");
             }
             let mut exit_frontier = Vec::new();
-            for branch in parallel {
+            for branch in items {
                 let branch_exit = flatten_one(branch, frontier, counter, tasks, depth + 1)?;
                 exit_frontier.extend(branch_exit);
             }
@@ -1467,7 +1473,6 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "t".to_string(),
                 worker: None,
-                reuse_result_from: None,
             }],
             routing_rationale: "reason_o".to_string(),
             planning_summary: "summary".to_string(),
@@ -1587,7 +1592,6 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "Do thing".to_string(),
                 worker: None,
-                reuse_result_from: None,
             }],
             routing_rationale: "Needs tool".to_string(),
             planning_summary: "Just do it".to_string(),
@@ -1608,12 +1612,10 @@ mod tests {
             StepInput::LeafTask {
                 task: "Compute mean of [10,20,30]".into(),
                 worker: Some("statistics".into()),
-                reuse_result_from: None,
             },
             StepInput::LeafTask {
                 task: "Multiply the result by 3".into(),
                 worker: Some("arithmetic".into()),
-                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -1630,23 +1632,20 @@ mod tests {
     fn test_flatten_parallel_then_sequential() {
         let steps = vec![
             StepInput::ParallelGroup {
-                parallel: vec![
+                items: vec![
                     StepInput::LeafTask {
                         task: "Compute median".into(),
                         worker: Some("statistics".into()),
-                        reuse_result_from: None,
                     },
                     StepInput::LeafTask {
                         task: "Compute sin(45)".into(),
                         worker: Some("trigonometry".into()),
-                        reuse_result_from: None,
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Multiply the two results".into(),
                 worker: Some("arithmetic".into()),
-                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -1663,32 +1662,28 @@ mod tests {
         // parallel { [Get A -> Transform A], Get B } -> Combine
         let steps = vec![
             StepInput::ParallelGroup {
-                parallel: vec![
+                items: vec![
                     StepInput::SubChain {
                         steps: vec![
                             StepInput::LeafTask {
                                 task: "Get A".into(),
                                 worker: Some("ops".into()),
-                                reuse_result_from: None,
                             },
                             StepInput::LeafTask {
                                 task: "Transform A".into(),
                                 worker: Some("ops".into()),
-                                reuse_result_from: None,
                             },
                         ],
                     },
                     StepInput::LeafTask {
                         task: "Get B".into(),
                         worker: Some("ops".into()),
-                        reuse_result_from: None,
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Combine".into(),
                 worker: Some("ops".into()),
-                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -1716,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_flatten_empty_parallel_error() {
-        let steps = vec![StepInput::ParallelGroup { parallel: vec![] }];
+        let steps = vec![StepInput::ParallelGroup { items: vec![] }];
         let result = flatten_steps(&steps);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Empty parallel"));
@@ -1727,12 +1722,11 @@ mod tests {
         // Depth 0: top-level, depth 1: parallel, depth 2: sub-chain,
         // depth 3: nested parallel inside sub-chain -> should fail
         let steps = vec![StepInput::ParallelGroup {
-            parallel: vec![StepInput::SubChain {
+            items: vec![StepInput::SubChain {
                 steps: vec![StepInput::ParallelGroup {
-                    parallel: vec![StepInput::LeafTask {
+                    items: vec![StepInput::LeafTask {
                         task: "too deep".into(),
                         worker: None,
-                        reuse_result_from: None,
                     }],
                 }],
             }],
@@ -1747,7 +1741,6 @@ mod tests {
         let steps = vec![StepInput::LeafTask {
             task: "Just one thing".into(),
             worker: None,
-            reuse_result_from: None,
         }];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -1759,7 +1752,7 @@ mod tests {
     #[test]
     fn test_flatten_empty_subchain_error() {
         let steps = vec![StepInput::ParallelGroup {
-            parallel: vec![StepInput::SubChain { steps: vec![] }],
+            items: vec![StepInput::SubChain { steps: vec![] }],
         }];
         let result = flatten_steps(&steps);
         assert!(result.is_err());
@@ -1769,13 +1762,13 @@ mod tests {
     #[test]
     fn test_step_input_deserialize_sequential() {
         let json = r#"[
-            {"task": "Compute mean", "worker": "stats"},
-            {"task": "Multiply result", "worker": "math"}
+            {"type": "task", "task": "Compute mean", "worker": "stats"},
+            {"type": "task", "task": "Multiply result", "worker": "math"}
         ]"#;
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         assert_eq!(steps.len(), 2);
         match &steps[0] {
-            StepInput::LeafTask { task, worker, .. } => {
+            StepInput::LeafTask { task, worker } => {
                 assert_eq!(task, "Compute mean");
                 assert_eq!(worker.as_deref(), Some("stats"));
             }
@@ -1786,17 +1779,17 @@ mod tests {
     #[test]
     fn test_step_input_deserialize_parallel() {
         let json = r#"[
-            {"parallel": [
-                {"task": "A", "worker": "w1"},
-                {"task": "B", "worker": "w2"}
+            {"type": "parallel", "items": [
+                {"type": "task", "task": "A", "worker": "w1"},
+                {"type": "task", "task": "B", "worker": "w2"}
             ]},
-            {"task": "C"}
+            {"type": "task", "task": "C"}
         ]"#;
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         assert_eq!(steps.len(), 2);
         match &steps[0] {
-            StepInput::ParallelGroup { parallel } => {
-                assert_eq!(parallel.len(), 2);
+            StepInput::ParallelGroup { items } => {
+                assert_eq!(items.len(), 2);
             }
             other => panic!("Expected ParallelGroup, got {:?}", other),
         }
@@ -1805,14 +1798,14 @@ mod tests {
     #[test]
     fn test_step_input_deserialize_recursive() {
         let json = r#"[
-            {"parallel": [
-                {"steps": [
-                    {"task": "Get A"},
-                    {"task": "Transform A"}
+            {"type": "parallel", "items": [
+                {"type": "chain", "steps": [
+                    {"type": "task", "task": "Get A"},
+                    {"type": "task", "task": "Transform A"}
                 ]},
-                {"task": "Get B"}
+                {"type": "task", "task": "Get B"}
             ]},
-            {"task": "Combine"}
+            {"type": "task", "task": "Combine"}
         ]"#;
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         let tasks = flatten_steps(&steps).unwrap();
@@ -1828,12 +1821,10 @@ mod tests {
                 StepInput::LeafTask {
                     task: "Step 1".into(),
                     worker: Some("w1".into()),
-                    reuse_result_from: None,
                 },
                 StepInput::LeafTask {
                     task: "Step 2".into(),
                     worker: Some("w2".into()),
-                    reuse_result_from: None,
                 },
             ],
             routing_rationale: "Needs orchestration".into(),
@@ -1895,12 +1886,9 @@ mod tests {
                 StepInput::LeafTask {
                     task: "Fresh task".into(),
                     worker: None,
-                    reuse_result_from: None,
                 },
-                StepInput::LeafTask {
-                    task: "Reused task".into(),
-                    worker: None,
-                    reuse_result_from: Some(5),
+                StepInput::ReuseTask {
+                    reuse_result_from: 5,
                 },
             ],
             routing_rationale: "test".into(),
@@ -1916,19 +1904,15 @@ mod tests {
     fn test_into_plan_then_apply_reuse_pipeline() {
         use crate::orchestration::orchestrator::Orchestrator;
 
-        // Build a "previous" plan with a completed task at id=0
         let mut previous = Plan::new("Previous goal");
         let mut prev_task = Task::new(0, "Compute mean", "stats");
         prev_task.complete("42".to_string());
         previous.add_task(prev_task);
 
-        // Build a new plan via PlanningResponse with reuse_result_from
         let response = PlanningResponse::StepsPlan {
             goal: "New goal".into(),
-            steps: vec![StepInput::LeafTask {
-                task: "Reuse mean".into(),
-                worker: None,
-                reuse_result_from: Some(0),
+            steps: vec![StepInput::ReuseTask {
+                reuse_result_from: 0,
             }],
             routing_rationale: "test".into(),
             planning_summary: "test".into(),
@@ -1945,15 +1929,12 @@ mod tests {
     #[test]
     fn test_flatten_steps_propagates_reuse_result_from() {
         let steps = vec![
-            StepInput::LeafTask {
-                task: "Reused fetch".into(),
-                worker: Some("ops".into()),
-                reuse_result_from: Some(2),
+            StepInput::ReuseTask {
+                reuse_result_from: 2,
             },
             StepInput::LeafTask {
                 task: "Fresh analysis".into(),
                 worker: Some("analytics".into()),
-                reuse_result_from: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -1963,73 +1944,53 @@ mod tests {
     }
 
     #[test]
-    fn test_step_input_leaf_task_reuse_result_from_serde_roundtrip() {
-        // With reuse_result_from set
-        let json = r#"{"task": "Carry forward logs", "worker": "ops", "reuse_result_from": 3}"#;
+    fn test_reuse_task_serde_roundtrip() {
+        let json = r#"{"type": "reuse", "reuse_result_from": 3}"#;
         let step: StepInput = serde_json::from_str(json).unwrap();
         match &step {
-            StepInput::LeafTask {
-                task,
-                worker,
-                reuse_result_from,
-            } => {
-                assert_eq!(task, "Carry forward logs");
-                assert_eq!(worker.as_deref(), Some("ops"));
-                assert_eq!(*reuse_result_from, Some(3));
+            StepInput::ReuseTask { reuse_result_from } => {
+                assert_eq!(*reuse_result_from, 3);
             }
-            other => panic!("Expected LeafTask, got {:?}", other),
+            other => panic!("Expected ReuseTask, got {:?}", other),
         }
-        // Round-trip: serialize and deserialize back
         let serialized = serde_json::to_string(&step).unwrap();
         let deserialized: StepInput = serde_json::from_str(&serialized).unwrap();
-        match &deserialized {
-            StepInput::LeafTask {
-                reuse_result_from, ..
-            } => {
-                assert_eq!(*reuse_result_from, Some(3));
-            }
-            other => panic!("Expected LeafTask, got {:?}", other),
-        }
-
-        // Without reuse_result_from (omitted defaults to None)
-        let json_no_reuse = r#"{"task": "Fresh task"}"#;
-        let step_no_reuse: StepInput = serde_json::from_str(json_no_reuse).unwrap();
-        match &step_no_reuse {
-            StepInput::LeafTask {
-                reuse_result_from, ..
-            } => {
-                assert_eq!(*reuse_result_from, None);
-            }
-            other => panic!("Expected LeafTask, got {:?}", other),
-        }
-        // Verify None is not serialized
-        let serialized_no_reuse = serde_json::to_string(&step_no_reuse).unwrap();
-        assert!(!serialized_no_reuse.contains("reuse_result_from"));
+        assert_eq!(step, deserialized);
     }
 
     #[test]
-    fn test_steps_plan_reuse_result_from_into_plan_pipeline() {
+    fn test_leaf_task_serde_roundtrip() {
+        let json = r#"{"type": "task", "task": "Fresh work", "worker": "ops"}"#;
+        let step: StepInput = serde_json::from_str(json).unwrap();
+        match &step {
+            StepInput::LeafTask { task, worker } => {
+                assert_eq!(task, "Fresh work");
+                assert_eq!(worker.as_deref(), Some("ops"));
+            }
+            other => panic!("Expected LeafTask, got {:?}", other),
+        }
+        let serialized = serde_json::to_string(&step).unwrap();
+        assert!(!serialized.contains("reuse_result_from"));
+    }
+
+    #[test]
+    fn test_steps_plan_reuse_into_plan_pipeline() {
         use crate::orchestration::orchestrator::Orchestrator;
 
-        // Build a "previous" plan with a completed task at id=0
         let mut previous = Plan::new("Previous goal");
         let mut prev_task = Task::new(0, "Fetch logs", "observability");
         prev_task.complete("log data here".to_string());
         previous.add_task(prev_task);
 
-        // Build a new StepsPlan with reuse_result_from on the first task
         let response = PlanningResponse::StepsPlan {
             goal: "Analyze logs".into(),
             steps: vec![
-                StepInput::LeafTask {
-                    task: "Fetch logs".into(),
-                    worker: Some("ops".into()),
-                    reuse_result_from: Some(0),
+                StepInput::ReuseTask {
+                    reuse_result_from: 0,
                 },
                 StepInput::LeafTask {
                     task: "Analyze fetched logs".into(),
                     worker: Some("analytics".into()),
-                    reuse_result_from: None,
                 },
             ],
             routing_rationale: "replan".into(),
