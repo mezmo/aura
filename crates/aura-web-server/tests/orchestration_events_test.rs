@@ -296,12 +296,38 @@ async fn test_multi_domain_emits_iteration_and_terminal_events() {
     // Multi-domain query should decompose into more than one task.
     for event in &plan_created {
         let json: Value = serde_json::from_str(&event.data).unwrap();
-        let task_count = json["task_count"]
-            .as_u64()
-            .expect("task_count must be a number on plan_created");
+        let tasks = json["tasks"]
+            .as_array()
+            .expect("tasks must be an array on plan_created");
         assert!(
-            task_count >= 2,
-            "Expected task_count >= 2 for multi-domain query, got {task_count}"
+            tasks.len() >= 2,
+            "Expected tasks.len() >= 2 for multi-domain query, got {}",
+            tasks.len()
+        );
+    }
+
+    // Synthesizing fires before the post-execute coordinator call.
+    let synthesizing = events_by_type(&events, event_names::SYNTHESIZING);
+    assert!(
+        !synthesizing.is_empty(),
+        "Expected synthesizing event before iteration_complete"
+    );
+    for event in &synthesizing {
+        assert_event_fields(event, &["iteration"]);
+    }
+
+    // Synthesizing must precede iteration_complete in the event stream.
+    let orch_events = get_orchestrator_events(&events);
+    let synth_pos = orch_events
+        .iter()
+        .position(|e| e.event_type.as_deref() == Some(event_names::SYNTHESIZING));
+    let iter_pos = orch_events
+        .iter()
+        .position(|e| e.event_type.as_deref() == Some(event_names::ITERATION_COMPLETE));
+    if let (Some(s), Some(i)) = (synth_pos, iter_pos) {
+        assert!(
+            s < i,
+            "synthesizing (pos {s}) must fire before iteration_complete (pos {i})"
         );
     }
 

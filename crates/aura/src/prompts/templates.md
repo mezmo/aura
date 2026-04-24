@@ -48,20 +48,6 @@ Sent to worker agents when executing individual tasks.
 
 ---
 
-## Synthesis Prompt (`synthesis_prompt.md`)
-
-Used to combine results from multiple tasks into a coherent response.
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `%%GOAL%%` | Yes | The orchestration goal |
-| `%%QUERY%%` | Yes | The user's original query |
-| `%%RESULTS%%` | Yes | Formatted task results (markdown sections) |
-
-**Context struct**: `SynthesisVars` in `templates.rs`
-
----
-
 ## Evaluation Prompt (`evaluation_prompt.md`)
 
 Used for semantic quality assessment of synthesized responses.

@@ -81,7 +81,7 @@ fn default_true() -> bool {
     true
 }
 
-/// Default maximum planning cycles for the plan-execute-synthesize loop.
+/// Default maximum planning cycles for the plan-execute-continue loop.
 fn default_max_planning_cycles() -> usize {
     3
 }
@@ -223,7 +223,7 @@ pub struct WorkerConfig {
 pub struct TimeoutsConfig {
     /// Per-call timeout (seconds) for coordinator and worker LLM calls.
     ///
-    /// Each individual `.chat()` call (planning, synthesis, evaluation, worker task)
+    /// Each individual `.chat()` call (planning, continuation, worker task)
     /// is wrapped with this timeout. Prevents a single hung LLM call from blocking
     /// the request.
     ///
@@ -263,7 +263,7 @@ pub struct ArtifactsConfig {
     /// - Planning prompts and responses
     /// - Worker task prompts and responses
     /// - Tool call records with reasoning
-    /// - Synthesis and result artifacts
+    /// - Result artifacts
     ///
     /// Structure: `<memory_dir>/<run_id>/iteration-{n}/...`
     /// A `latest` symlink points to the most recent run.
@@ -319,7 +319,7 @@ impl Default for ArtifactsConfig {
 ///
 /// Coordinator and worker turn depths are derived from `[agent].turn_depth`
 /// (the universal default). Per-worker overrides via `[orchestration.worker.<name>].turn_depth`
-/// take precedence. Synthesis (4) and evaluation (1) depths are hardcoded.
+/// take precedence.
 ///
 /// # Example
 ///
@@ -352,7 +352,7 @@ pub struct OrchestrationConfig {
     pub enabled: bool,
 
     // --- Planning loop ---
-    /// Maximum number of plan-execute-synthesize cycles.
+    /// Maximum number of plan-execute-continue cycles.
     pub max_planning_cycles: usize,
 
     /// Quality threshold (0.0-1.0) for early termination.

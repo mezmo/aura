@@ -292,8 +292,7 @@ Execution loop:
 
 - `Plan`: coordinator decomposes the request into a task DAG.
 - `Execute`: dependency-ready tasks run in parallel waves on worker agents.
-- `Synthesize`: coordinator merges worker outputs into a coherent response.
-- `Evaluate`: quality is scored against `quality_threshold`; if needed, the system re-plans until `max_planning_cycles` is reached.
+- `Continue`: coordinator consolidates worker outputs and routes to a final response, replan, or clarification.
 
 Workers run with isolated task context windows and filtered MCP/vector-store access based on each worker block.
 
@@ -304,8 +303,8 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable orchestration mode |
-| `quality_threshold` | float | `0.8` | Minimum quality score before accepting a synthesis |
-| `max_planning_cycles` | int | `3` | Maximum plan→execute→evaluate iterations |
+| `quality_threshold` | float | `0.8` | Minimum quality score (reserved; evaluation removed) |
+| `max_planning_cycles` | int | `3` | Maximum plan→execute→continue iterations |
 | `allow_direct_answers` | bool | `true` | Allow coordinator to answer simple queries directly |
 | `allow_clarification` | bool | `true` | Allow coordinator to ask for clarification |
 | `tools_in_planning` | string | `"summary"` | Tool visibility for coordinator: `"none"`, `"summary"` (names only), `"full"` (with descriptions) |
@@ -462,10 +461,10 @@ Prompt routing and execution model:
 
 Orchestrator components and loop:
 
-- Coordinator agent: plans task DAGs, synthesizes outputs, and evaluates quality.
+- Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
 - Worker agents: per-task instances with filtered MCP tools and vector stores.
 - Persistence/event layers: track plan state, task outcomes, and stream orchestration events.
-- Loop: Plan -> Execute (dependency waves) -> Synthesize -> Evaluate -> optional re-plan.
+- Loop: Plan -> Execute (dependency waves) -> Continue (respond / replan / clarify).
 
 Request execution and cancellation flow are documented in [docs/request-lifecycle.md](docs/request-lifecycle.md).
 

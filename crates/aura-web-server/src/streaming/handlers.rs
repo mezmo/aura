@@ -1046,7 +1046,7 @@ fn handle_orchestrator_event(
         }
         OrchestratorEvent::Synthesizing { iteration } => {
             tracing::debug!(
-                "Orchestrator: synthesizing results (iteration={})",
+                "Orchestrator: consolidating results for coordinator (iteration={})",
                 iteration
             );
             OrchestrationStreamEvent::synthesizing(*iteration, event_context)

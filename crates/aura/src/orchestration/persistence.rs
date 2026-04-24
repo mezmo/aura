@@ -323,21 +323,6 @@ impl ExecutionPersistence {
         Ok(iter_path)
     }
 
-    /// Write synthesis phase artifacts.
-    pub async fn write_synthesis(&self, prompt: &str, response: &str) -> io::Result<PathBuf> {
-        if !self.enabled {
-            return Ok(PathBuf::new());
-        }
-
-        let iter_path = self.iteration_path();
-        fs::create_dir_all(&iter_path).await?;
-
-        fs::write(iter_path.join("synthesis.prompt.txt"), prompt).await?;
-        fs::write(iter_path.join("synthesis.response.txt"), response).await?;
-
-        Ok(iter_path)
-    }
-
     /// Get relative path for logging.
     pub fn relative_path(&self, task_id: usize, attempt: usize) -> String {
         self.task_attempt_filename(task_id, attempt, "*")
