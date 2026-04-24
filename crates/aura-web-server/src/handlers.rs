@@ -399,6 +399,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
         message_count: config.message_count,
         usage_state: usage_state.clone(),
         response_content: config.response_content,
+        is_orchestration: streaming_agent.is_orchestration(),
     };
     otel_ctx.record_input();
 

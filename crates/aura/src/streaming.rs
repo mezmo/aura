@@ -129,4 +129,17 @@ pub trait StreamingAgent: Send + Sync {
     fn context_window(&self) -> Option<u64> {
         None
     }
+
+    /// Whether this agent is an orchestrator (emits per-phase LLM spans).
+    ///
+    /// Returned `true` by the multi-agent `OrchestratorFactory`. The web-server
+    /// streaming handler uses this to suppress the total token write on the
+    /// root `agent.stream` span, because each phase (`orchestration.planning`,
+    /// `orchestration.worker`, `orchestration.synthesis`,
+    /// `orchestration.evaluation`) already carries its own `set_token_usage`
+    /// attributes. Letting Phoenix roll those descendants up is the accurate
+    /// aggregate; also recording the total on the parent double-counts.
+    fn is_orchestration(&self) -> bool {
+        false
+    }
 }
