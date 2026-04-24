@@ -473,8 +473,8 @@ impl Orchestrator {
             self.tool_call_observer.clone(),
             task_id,
         ));
-        let nudge = self.config.duplicate_call_nudge_threshold.unwrap_or(3);
-        let block = self.config.duplicate_call_block_threshold.unwrap_or(5);
+        let nudge = self.config.duplicate_call_nudge_threshold;
+        let block = self.config.duplicate_call_block_threshold;
         let escalation_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let duplicate_guard = Arc::new(DuplicateCallGuard::new(
             nudge,
