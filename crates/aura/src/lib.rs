@@ -48,9 +48,9 @@ pub use orchestration::tools::{
     CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,
 };
 pub use orchestration::{
-    ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorEvent, Plan, PlanAttemptFailure, PlanningResponse, RoutingMode, Task, TaskJson,
-    TaskStatus, TimeoutsConfig,
+    ArtifactsConfig, EventContext, MemoryConfig, OrchestrationConfig, OrchestrationStreamEvent,
+    Orchestrator, OrchestratorEvent, Plan, PlanAttemptFailure, PlanningResponse, RoutingMode, Task,
+    TaskJson, TaskStatus, TimeoutsConfig,
 };
 pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,

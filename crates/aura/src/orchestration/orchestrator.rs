@@ -58,7 +58,10 @@ use crate::tool_call_observer::ToolCallObserver;
 
 use super::tools::RoutingToolSet;
 use super::tools::SubmitEvaluationTool;
-use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
+use super::tools::{
+    InspectToolParamsTool, ListMemoriesTool, ListToolsTool, MemoryShellTool, ReadArtifactTool,
+    ReadMemoryTool, RecentMemoryTool, SearchMemoryTool,
+};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
@@ -106,10 +109,20 @@ struct AgentWithPreamble {
 struct CoordinatorTools {
     list_tools: Option<ListToolsTool>,
     inspect_tool_params: Option<InspectToolParamsTool>,
+    memory_tools: Option<CoordinatorMemoryTools>,
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
     routing_tools: Option<RoutingToolSet>,
     read_artifact: Option<ReadArtifactTool>,
     evaluation_tool: Option<SubmitEvaluationTool>,
+}
+
+/// Read-only durable memory tools, available only to coordinator agents.
+struct CoordinatorMemoryTools {
+    list_memories: ListMemoriesTool,
+    read_memory: ReadMemoryTool,
+    search_memory: SearchMemoryTool,
+    recent_memory: RecentMemoryTool,
+    memory_shell: MemoryShellTool,
 }
 
 // ============================================================================
@@ -360,6 +373,9 @@ impl Orchestrator {
         agent_config: AgentConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
+        if orchestration_config.memory.enabled && orchestration_config.memory_root().is_none() {
+            return Err("orchestration.memory.enabled requires orchestration.memory.root_dir or orchestration.artifacts.memory_dir".into());
+        }
 
         // Initialize MCP manager (shared across coordinator and all workers via Arc)
         let mcp_manager = if let Some(ref mcp_config) = agent_config.mcp {
@@ -970,11 +986,22 @@ impl Orchestrator {
             } else {
                 String::new()
             };
+            let memory_section = if self.config.memory.enabled {
+                "\n\nMEMORY CAPABILITY:\n\
+                 You have read-only memory tools for prior Aura orchestration runs. \
+                 If this query refers to prior work, previous results, earlier decisions, preferences, \
+                 recurring failures, or underspecified context that may already exist in memory, \
+                 call memory tools before routing. Memory tool calls are not routing decisions. \
+                 After any memory lookup, call exactly one routing tool. If recalled facts are used, \
+                 include them in planning_summary and put the concrete recalled facts directly in worker task descriptions."
+            } else {
+                ""
+            };
 
             // Build the tool-calling planning prompt
             let planning_prompt = format!(
                 "Analyze this user query and decide on the best approach.\n\n\
-                 USER QUERY: {query}{worker_section}{reflection_section}{error_section}\n\n\
+                 USER QUERY: {query}{worker_section}{reflection_section}{memory_section}{error_section}\n\n\
                  You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
                  1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
                     NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
@@ -987,6 +1014,7 @@ impl Orchestrator {
                 query = query,
                 worker_section = worker_section,
                 reflection_section = reflection_section,
+                memory_section = memory_section,
                 error_section = error_section,
                 worker_guidelines = worker_guidelines,
             );
@@ -1671,6 +1699,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for tool in tools.vector_tools {
             state = state.add_tool(tool);
         }
+        if let Some(memory_tools) = tools.memory_tools {
+            state = state.add_tool(memory_tools.list_memories);
+            state = state.add_tool(memory_tools.read_memory);
+            state = state.add_tool(memory_tools.search_memory);
+            state = state.add_tool(memory_tools.recent_memory);
+            state = state.add_tool(memory_tools.memory_shell);
+        }
         if let Some(routing) = tools.routing_tools {
             state = state.add_tool(routing.respond_directly);
             state = state.add_tool(routing.create_plan);
@@ -1683,6 +1718,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
             state = state.add_tool(eval_tool);
         }
         state.build()
+    }
+
+    fn coordinator_memory_tools(&self) -> Option<CoordinatorMemoryTools> {
+        if !self.config.memory.enabled {
+            return None;
+        }
+        let root = self.config.memory_root()?;
+        let max_read_bytes = self.config.memory.max_read_bytes;
+        let max_search_results = self.config.memory.max_search_results;
+        Some(CoordinatorMemoryTools {
+            list_memories: ListMemoriesTool::new(root, max_read_bytes, max_search_results),
+            read_memory: ReadMemoryTool::new(root, max_read_bytes, max_search_results),
+            search_memory: SearchMemoryTool::new(root, max_read_bytes, max_search_results),
+            recent_memory: RecentMemoryTool::new(root, max_read_bytes, max_search_results),
+            memory_shell: MemoryShellTool::new(root, max_read_bytes, max_search_results),
+        })
     }
 
     /// Create a coordinator agent for planning tasks.
@@ -1799,6 +1850,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } else {
                 None
             },
+            memory_tools: self.coordinator_memory_tools(),
             vector_tools,
             routing_tools,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
@@ -1816,9 +1868,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let model_name = self.agent_config.llm.model_name().to_string();
 
-        // Planning coordinator uses a tight depth budget: 1 recon + 1 routing + 1 spare.
+        // Planning coordinator uses a tight depth budget. Memory-enabled coordinators get
+        // extra turns so a memory lookup cannot consume the routing-tool budget.
         // stream_and_collect() provides the primary early-exit guard; this is defense-in-depth.
-        let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
+        let max_depth = if self.config.memory.enabled {
+            PLANNING_COORDINATOR_MAX_DEPTH + 3
+        } else {
+            PLANNING_COORDINATOR_MAX_DEPTH
+        };
 
         Ok(AgentWithPreamble {
             agent: Agent {
@@ -1849,6 +1906,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let coordinator_tools = CoordinatorTools {
             list_tools: None,
             inspect_tool_params: None,
+            memory_tools: None,
             vector_tools: vec![],
             routing_tools: None,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
@@ -1896,6 +1954,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let coordinator_tools = CoordinatorTools {
             list_tools: None,
             inspect_tool_params: None,
+            memory_tools: None,
             vector_tools: vec![],
             routing_tools: None,
             read_artifact: None,
@@ -1944,6 +2003,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let coordinator_tools = CoordinatorTools {
             list_tools: None,
             inspect_tool_params: None,
+            memory_tools: None,
             vector_tools: vec![],
             routing_tools: None,
             read_artifact: None,
@@ -4535,6 +4595,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Err(e) = persistence.write_manifest(&manifest).await {
             tracing::warn!("Failed to write run manifest: {}", e);
         }
+        drop(persistence);
+
+        if self.config.memory.enabled
+            && let Some(memory_root) = self.config.memory_root()
+            && let Err(e) = super::memory_writer::MemoryWriter::new(memory_root)
+                .write_run(&manifest)
+                .await
+        {
+            tracing::warn!("Failed to write durable orchestration memory: {}", e);
+        }
     }
 }
 
@@ -5700,6 +5770,30 @@ Provide the synthesized response:"#,
         assert_eq!(coordinator_tools.len(), 1);
         assert!(coordinator_tools.contains(&"vector_search_coordinator_store".to_string()));
         assert!(!coordinator_tools.contains(&"vector_search_worker_store".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_memory_enabled_without_root_fails_setup() {
+        let config = AgentConfig {
+            orchestration: Some(OrchestrationConfig {
+                enabled: true,
+                memory: super::super::config::MemoryConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match Orchestrator::new(config).await {
+            Ok(_) => panic!("expected memory root setup failure"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("orchestration.memory.enabled requires")
+        );
     }
 
     // ========================================================================

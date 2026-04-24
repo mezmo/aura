@@ -232,6 +232,48 @@ system_prompt = "Basic prompt"
     }
 
     #[test]
+    fn test_orchestration_memory_config_parsing() {
+        let config = load_config_from_str(
+            r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o-mini"
+
+[agent]
+name = "Memory Agent"
+system_prompt = "Use memory when relevant."
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-runs"
+
+[orchestration.memory]
+enabled = true
+root_dir = "/mnt/archil/aura-memory"
+max_read_bytes = 32768
+max_search_results = 25
+"#,
+        )
+        .expect("Failed to parse memory config");
+
+        let orchestration = config.orchestration.expect("orchestration should parse");
+        assert!(orchestration.memory.enabled);
+        assert_eq!(
+            orchestration.memory.root_dir.as_deref(),
+            Some("/mnt/archil/aura-memory")
+        );
+        assert_eq!(orchestration.memory.max_read_bytes, 32_768);
+        assert_eq!(orchestration.memory.max_search_results, 25);
+        assert_eq!(
+            orchestration.artifacts.memory_dir.as_deref(),
+            Some("/tmp/aura-runs")
+        );
+    }
+
+    #[test]
     fn test_config_validation() {
         // Test config with missing API key (should fail validation)
         let invalid_config = r#"

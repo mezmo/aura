@@ -8,6 +8,7 @@ pub(crate) mod evaluation_tool;
 pub(crate) mod get_conversation_context;
 mod inspect_tool_params;
 mod list_tools;
+pub(crate) mod memory;
 pub(crate) mod read_artifact;
 pub mod routing_tools;
 
@@ -15,6 +16,9 @@ pub use evaluation_tool::{EvaluationDecision, SubmitEvaluationTool};
 pub use get_conversation_context::GetConversationContextTool;
 pub use inspect_tool_params::InspectToolParamsTool;
 pub use list_tools::ListToolsTool;
+pub use memory::{
+    ListMemoriesTool, MemoryShellTool, ReadMemoryTool, RecentMemoryTool, SearchMemoryTool,
+};
 pub use read_artifact::ReadArtifactTool;
 pub use routing_tools::{
     CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,

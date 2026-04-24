@@ -295,6 +295,53 @@ impl Default for ArtifactsConfig {
 }
 
 // ============================================================================
+// MemoryFS Sub-Config
+// ============================================================================
+
+/// MemoryFS configuration for orchestration.
+///
+/// MemoryFS is a read-optimized virtual filesystem over the configured
+/// persistence root. The root may be local disk, Archil, NFS, a Docker volume,
+/// or any other mounted filesystem path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Enables coordinator memory tools and post-run durable memory writing.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional MemoryFS root. If omitted, falls back to `artifacts.memory_dir`.
+    #[serde(default)]
+    pub root_dir: Option<String>,
+
+    /// Maximum bytes returned by a single read-style memory operation.
+    #[serde(default = "default_memory_max_read_bytes")]
+    pub max_read_bytes: usize,
+
+    /// Maximum search results returned by a single memory search operation.
+    #[serde(default = "default_memory_max_search_results")]
+    pub max_search_results: usize,
+}
+
+fn default_memory_max_read_bytes() -> usize {
+    65_536
+}
+
+fn default_memory_max_search_results() -> usize {
+    50
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root_dir: None,
+            max_read_bytes: default_memory_max_read_bytes(),
+            max_search_results: default_memory_max_search_results(),
+        }
+    }
+}
+
+// ============================================================================
 // Orchestration Config (main)
 // ============================================================================
 
@@ -398,6 +445,9 @@ pub struct OrchestrationConfig {
 
     /// Artifact and persistence settings.
     pub artifacts: ArtifactsConfig,
+
+    /// MemoryFS settings.
+    pub memory: MemoryConfig,
 }
 
 impl OrchestrationConfig {
@@ -409,6 +459,18 @@ impl OrchestrationConfig {
     /// Optional memory/persistence directory.
     pub fn memory_dir(&self) -> Option<&str> {
         self.artifacts.memory_dir.as_deref()
+    }
+
+    /// Optional resolved MemoryFS root directory.
+    ///
+    /// Explicit `memory.root_dir` takes precedence. When omitted, MemoryFS uses
+    /// `artifacts.memory_dir` so existing persistence configuration can become
+    /// the memory root without duplicate config.
+    pub fn memory_root(&self) -> Option<&str> {
+        self.memory
+            .root_dir
+            .as_deref()
+            .or(self.artifacts.memory_dir.as_deref())
     }
 
     /// Character threshold for artifact extraction.
@@ -440,14 +502,21 @@ impl OrchestrationConfig {
         agent_system_prompt: &str,
         include_recon_tools: bool,
     ) -> String {
+        let memory_tools = if self.memory.enabled {
+            " and five **memory tools** (`list_memories`, `read_memory`, `search_memory`, `recent_memory`, `memory_shell`)"
+        } else {
+            ""
+        };
+
         let tools_section = if include_recon_tools {
             "You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`), \
              two **reconnaissance tools** (`list_tools`, `inspect_tool_params`), and one **artifact tool** \
-             (`read_artifact`). Call exactly one routing tool per query."
+             (`read_artifact`){{memory_tools}}. Call exactly one routing tool per query."
         } else {
             "You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`) \
-             and one **artifact tool** (`read_artifact`). Call exactly one routing tool per query."
-        };
+             and one **artifact tool** (`read_artifact`){{memory_tools}}. Call exactly one routing tool per query."
+        }
+        .replace("{{memory_tools}}", memory_tools);
 
         let recon_guidance = if include_recon_tools {
             "## Reconnaissance Guidance\n\n\
@@ -471,10 +540,25 @@ impl OrchestrationConfig {
              that workers can execute."
         };
 
+        let memory_guidance = if self.memory.enabled {
+            "## Memory Guidance\n\n\
+             You have read-only memory tools for prior Aura orchestration runs and durable execution memory.\n\n\
+             Use memory tools before routing when the user:\n\
+             - refers to prior work, previous results, earlier decisions, or “what we did”\n\
+             - asks follow-up questions that may depend on past runs\n\
+             - asks for preferences, known procedures, recurring failures, or previous outcomes\n\
+             - gives underspecified context that may already exist in memory\n\n\
+             Do not search memory for every simple standalone query. When memory is relevant, use memory first, then call exactly one routing tool.\n\n\
+             Workers do not see memory. If worker execution depends on memory, put the recalled concrete facts directly in the task description.\n"
+        } else {
+            ""
+        };
+
         let mut preamble = ORCHESTRATOR_PREAMBLE_TEMPLATE
             .replace("{{orchestration_system_prompt}}", agent_system_prompt)
-            .replace("{{tools_section}}", tools_section)
-            .replace("{{recon_guidance}}", recon_guidance);
+            .replace("{{tools_section}}", &tools_section)
+            .replace("{{recon_guidance}}", recon_guidance)
+            .replace("{{memory_guidance}}", memory_guidance);
 
         // AURA_ESCAPE_HATCH=false strips the "Resolve tool gaps" directive for A/B testing
         if std::env::var("AURA_ESCAPE_HATCH")
@@ -566,6 +650,7 @@ impl Default for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -617,6 +702,8 @@ struct RawOrchestrationConfig {
     timeouts: Option<TimeoutsConfig>,
     #[serde(default)]
     artifacts: Option<ArtifactsConfig>,
+    #[serde(default)]
+    memory: Option<MemoryConfig>,
 
     // --- Flat artifact fields (backward compat) ---
     #[serde(default, alias = "memory_path")]
@@ -637,6 +724,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         let raw = RawOrchestrationConfig::deserialize(deserializer)?;
 
         let timeouts = raw.timeouts.unwrap_or_default();
+        let memory = raw.memory.unwrap_or_default();
 
         // Build artifacts: flat fields override sub-table defaults
         let mut artifacts = raw.artifacts.unwrap_or_default();
@@ -669,6 +757,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
             timeouts,
             artifacts,
+            memory,
         })
     }
 }
@@ -787,6 +876,7 @@ mod tests {
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{orchestration_system_prompt}}"));
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{tools_section}}"));
         assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{recon_guidance}}"));
+        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{memory_guidance}}"));
     }
 
     #[test]
@@ -812,6 +902,23 @@ mod tests {
         assert!(preamble.contains("reconnaissance tools"));
         assert!(preamble.contains("## Reconnaissance Guidance"));
         assert!(preamble.contains("inspect_tool_params"));
+    }
+
+    #[test]
+    fn test_coordinator_preamble_includes_memory_guidance_when_enabled() {
+        let config = OrchestrationConfig {
+            memory: MemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let preamble = config.build_coordinator_preamble("Test prompt.", true);
+
+        assert!(preamble.contains("memory tools"));
+        assert!(preamble.contains("## Memory Guidance"));
+        assert!(preamble.contains("Workers do not see memory"));
+        assert!(!preamble.contains("{{memory_guidance}}"));
     }
 
     // ========================================================================
@@ -1320,5 +1427,52 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.session_history_turns(), 3);
+    }
+
+    // ============================================================================
+    // MemoryFS Config Tests
+    // ============================================================================
+
+    #[test]
+    fn test_memory_config_defaults_disabled() {
+        let config = OrchestrationConfig::default();
+        assert!(!config.memory.enabled);
+        assert!(config.memory.root_dir.is_none());
+        assert_eq!(config.memory_root(), None);
+        assert_eq!(config.memory.max_read_bytes, 65_536);
+        assert_eq!(config.memory.max_search_results, 50);
+    }
+
+    #[test]
+    fn test_memory_config_parses_sub_table() {
+        let toml = r#"
+            enabled = true
+
+            [memory]
+            enabled = true
+            root_dir = "/mnt/archil/aura-memory"
+            max_read_bytes = 32768
+            max_search_results = 25
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert!(config.memory.enabled);
+        assert_eq!(config.memory_root(), Some("/mnt/archil/aura-memory"));
+        assert_eq!(config.memory.max_read_bytes, 32_768);
+        assert_eq!(config.memory.max_search_results, 25);
+    }
+
+    #[test]
+    fn test_memory_root_falls_back_to_artifacts_memory_dir() {
+        let toml = r#"
+            enabled = true
+
+            [artifacts]
+            memory_dir = "/tmp/aura-memory"
+
+            [memory]
+            enabled = true
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.memory_root(), Some("/tmp/aura-memory"));
     }
 }

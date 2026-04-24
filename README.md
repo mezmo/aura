@@ -253,7 +253,18 @@ max_planning_cycles = 3
 tools_in_planning = "summary"
 allow_direct_answers = true
 allow_clarification = true
+
+[orchestration.artifacts]
 memory_dir = "/tmp/orchestration-memory"
+
+[orchestration.memory]
+enabled = true
+# Optional. If omitted, MemoryFS falls back to orchestration.artifacts.memory_dir.
+# This can be any mounted filesystem path, including Archil, NFS, Docker volumes,
+# or Kubernetes PVCs. Aura does not call Archil-specific APIs.
+# root_dir = "/mnt/archil/aura-memory"
+max_read_bytes = 65536
+max_search_results = 50
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
@@ -277,6 +288,8 @@ Execution loop:
 
 Workers run with isolated task context windows and filtered MCP/vector-store access based on each worker block.
 
+When `[orchestration.memory]` is enabled, the coordinator also gets read-only MemoryFS tools for durable Markdown memory from prior Aura runs: `list_memories`, `read_memory`, `search_memory`, `recent_memory`, and `memory_shell`. Workers do not receive these tools. Durable memory is written after orchestration completion under `<memory_root>/memory/`; raw run artifacts remain in the existing session/run layout.
+
 For a fuller multi-worker example, see [configs/example-workers.toml](configs/example-workers.toml).
 
 #### Orchestration fields
@@ -295,6 +308,10 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
 | `memory_dir` | string | — | Directory for cross-iteration artifact persistence |
+| `memory.enabled` | bool | `false` | Enable coordinator-only durable MemoryFS tools and post-run Markdown memory writes |
+| `memory.root_dir` | string | `artifacts.memory_dir` | Optional mounted filesystem root for durable MemoryFS data |
+| `memory.max_read_bytes` | int | `65536` | Maximum bytes returned by one memory read |
+| `memory.max_search_results` | int | `50` | Maximum MemoryFS search results |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |

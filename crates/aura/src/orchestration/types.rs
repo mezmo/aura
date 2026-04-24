@@ -921,11 +921,14 @@ impl IterationContext {
     /// so the coordinator can replan with full context. Gate: `AURA_ENRICH_REPLAN`
     /// env var (default=true).
     pub fn build_reflection_prompt(&self, max_iterations: usize) -> String {
-        use super::templates::{ReflectionVars, render_reflection_prompt};
-
         let enrich = std::env::var("AURA_ENRICH_REPLAN")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
+        self.build_reflection_prompt_with_mode(max_iterations, enrich)
+    }
+
+    fn build_reflection_prompt_with_mode(&self, max_iterations: usize, enrich: bool) -> String {
+        use super::templates::{ReflectionVars, render_reflection_prompt};
 
         // Categorize tasks
         let mut completed_lines = Vec::new();
@@ -1314,9 +1317,6 @@ mod tests {
 
     #[test]
     fn test_iteration_context_reflection_prompt() {
-        // Ensure enriched mode is active (env may leak from other tests in parallel)
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
-
         let mut plan = Plan::new("Investigate the issue");
         let mut task = Task::new(0, "Gather logs", "Get system logs");
         task.complete("Here are the logs...".to_string());
@@ -1328,7 +1328,7 @@ mod tests {
         ]);
 
         let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let prompt = ctx.build_reflection_prompt_with_mode(3, true);
 
         // Verify key sections are present
         assert!(prompt.contains("REPLAN CYCLE 1 of 3"));
@@ -1424,9 +1424,6 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_enriched_truncation() {
-        // Ensure enriched mode is active (env may leak from other tests in parallel)
-        unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "true") };
-
         let mut plan = Plan::new("Test truncation");
         let mut task = Task::new(0, "Big result", "Produce output");
         // 600-char result exceeds 500-byte truncation limit
@@ -1436,7 +1433,7 @@ mod tests {
 
         let eval = EvaluationResult::new(0.5, "Needs work");
         let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let prompt = ctx.build_reflection_prompt_with_mode(3, true);
 
         // Should contain truncated result with "..." suffix
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1445,15 +1442,10 @@ mod tests {
         assert!(!prompt.contains(&"x".repeat(600)));
         // But should contain 500 chars worth
         assert!(prompt.contains(&"x".repeat(500)));
-
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
     }
 
     #[test]
     fn test_reflection_prompt_legacy_mode() {
-        // SAFETY: tests run with --test-threads=1 per project convention
-        unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "false") };
-
         let mut plan = Plan::new("Test legacy");
         let mut task = Task::new(0, "Some task", "Do something");
         task.complete("Result content here".to_string());
@@ -1461,14 +1453,11 @@ mod tests {
 
         let eval = EvaluationResult::new(0.5, "OK");
         let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let prompt = ctx.build_reflection_prompt_with_mode(3, false);
 
         // Legacy mode shows char count, not content
         assert!(prompt.contains("(19 chars)"));
         assert!(!prompt.contains("Result content here"));
-
-        // Clean up
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
     }
 
     #[test]
@@ -1530,8 +1519,6 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_mixed_categories() {
-        unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
-
         let mut plan = Plan::new("Mixed results");
 
         let mut completed = Task::new(0, "Completed task", "Worked");
@@ -1550,7 +1537,7 @@ mod tests {
         let eval =
             EvaluationResult::new(0.3, "Partial success").with_gaps(vec!["Task 1 failed".into()]);
         let ctx = IterationContext::new(1, plan, eval, vec![]);
-        let prompt = ctx.build_reflection_prompt(3);
+        let prompt = ctx.build_reflection_prompt_with_mode(3, true);
 
         // All three sections should be present
         assert!(prompt.contains("COMPLETED TASKS"));
