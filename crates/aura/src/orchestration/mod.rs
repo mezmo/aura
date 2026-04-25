@@ -11,7 +11,6 @@
 //! [orchestration]
 //! enabled = true
 //! max_planning_cycles = 3
-//! quality_threshold = 0.8
 //! ```
 //!
 //! When disabled (default), the standard single-agent streaming is used.

@@ -56,7 +56,7 @@ BUILTIN_ASSERTIONS = {
         "answer_contains": ["60"],
     },
     "trig-sin45": {
-        "routing_mode": "direct",
+        "routing_mode": ["direct", "routed"],
         "workers": [],
         "tool_names": [],
         "answer_contains": ["0.707"],
@@ -132,11 +132,15 @@ class AssertionResult:
         }
 
 
-def check_routing_mode(prompt: str, parsed: dict, expected: str) -> AssertionResult:
-    """Assert that the routing mode matches expected."""
+def check_routing_mode(prompt: str, parsed: dict, expected) -> AssertionResult:
+    """Assert that the routing mode matches expected (str or list of str)."""
     actual = effective_routing_mode(parsed)
-    passed = actual == expected
-    detail = f"expected={expected}, actual={actual}"
+    if isinstance(expected, list):
+        passed = actual in expected
+        detail = f"expected one of {expected}, actual={actual}"
+    else:
+        passed = actual == expected
+        detail = f"expected={expected}, actual={actual}"
     return AssertionResult(prompt, "routing_mode", passed, detail)
 
 

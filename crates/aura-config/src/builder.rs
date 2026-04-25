@@ -125,7 +125,6 @@ impl RigBuilder {
             OrchestrationConfig {
                 enabled: orch.enabled,
                 max_planning_cycles: orch.max_planning_cycles,
-                quality_threshold: orch.quality_threshold,
                 max_plan_parse_retries: orch.max_plan_parse_retries,
                 worker_system_prompt: orch.worker_system_prompt.clone(),
                 workers,

@@ -66,7 +66,6 @@ custom_tools = []
 [orchestration]
 enabled = true
 max_planning_cycles = 2
-quality_threshold = 0.7
 memory_dir = "/tmp/aura-multi-model-observability-orchestration"
 
 allow_direct_answers = true
