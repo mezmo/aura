@@ -422,7 +422,6 @@ TOOL USAGE:
         let config = OrchestrationConfig {
             enabled: true,
             max_planning_cycles: 2,
-            quality_threshold: 0.7,
             allow_direct_answers: true,
             allow_clarification: true,
             workers,

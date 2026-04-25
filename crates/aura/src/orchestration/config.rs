@@ -89,11 +89,6 @@ fn default_max_planning_cycles() -> usize {
     3
 }
 
-/// Default quality threshold (0.0-1.0) for iteration termination.
-fn default_quality_threshold() -> f32 {
-    0.8
-}
-
 /// Default character threshold for artifact extraction.
 fn default_result_artifact_threshold() -> usize {
     4000
@@ -335,7 +330,6 @@ impl Default for ArtifactsConfig {
 /// [orchestration]
 /// enabled = true
 /// max_planning_cycles = 3
-/// quality_threshold = 0.8
 /// max_plan_parse_retries = 3
 ///
 /// [orchestration.timeouts]
@@ -362,9 +356,6 @@ pub struct OrchestrationConfig {
     // --- Planning loop ---
     /// Maximum number of plan-execute-continue cycles.
     pub max_planning_cycles: usize,
-
-    /// Quality threshold (0.0-1.0) for early termination.
-    pub quality_threshold: f32,
 
     /// Maximum number of plan parse retries before falling back to single-task.
     pub max_plan_parse_retries: usize,
@@ -560,7 +551,6 @@ impl Default for OrchestrationConfig {
         Self {
             enabled: false,
             max_planning_cycles: default_max_planning_cycles(),
-            quality_threshold: default_quality_threshold(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
             allow_direct_answers: true,
             allow_clarification: true,
@@ -596,8 +586,6 @@ struct RawOrchestrationConfig {
     enabled: bool,
     #[serde(default = "default_max_planning_cycles")]
     max_planning_cycles: usize,
-    #[serde(default = "default_quality_threshold")]
-    quality_threshold: f32,
     #[serde(default = "default_max_plan_parse_retries")]
     max_plan_parse_retries: usize,
     #[serde(default = "default_true")]
@@ -663,7 +651,6 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         Ok(OrchestrationConfig {
             enabled: raw.enabled,
             max_planning_cycles: raw.max_planning_cycles,
-            quality_threshold: raw.quality_threshold,
             max_plan_parse_retries: raw.max_plan_parse_retries,
             allow_direct_answers: raw.allow_direct_answers,
             allow_clarification: raw.allow_clarification,
@@ -689,7 +676,6 @@ mod tests {
         let config = OrchestrationConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.max_planning_cycles, 3);
-        assert!((config.quality_threshold - 0.8).abs() < f32::EPSILON);
         assert_eq!(config.max_plan_parse_retries, 3);
         assert!(config.worker_system_prompt.is_none());
         assert!(config.workers.is_empty());
@@ -716,7 +702,6 @@ mod tests {
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.max_planning_cycles, 3);
-        assert!((config.quality_threshold - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -724,12 +709,10 @@ mod tests {
         let toml = r#"
             enabled = true
             max_planning_cycles = 5
-            quality_threshold = 0.9
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
         assert_eq!(config.max_planning_cycles, 5);
-        assert!((config.quality_threshold - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1033,7 +1016,6 @@ mod tests {
         let toml = r#"
             enabled = true
             max_planning_cycles = 5
-            quality_threshold = 0.9
 
             [worker.operations]
             description = "For logs"
