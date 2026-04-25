@@ -93,7 +93,6 @@ impl Default for ArtifactsConfig {
 pub struct OrchestrationConfig {
     pub enabled: bool,
     pub max_planning_cycles: usize,
-    pub quality_threshold: f32,
     pub max_plan_parse_retries: usize,
     pub worker_system_prompt: Option<String>,
     pub workers: HashMap<String, WorkerConfig>,
@@ -113,7 +112,6 @@ impl Default for OrchestrationConfig {
         Self {
             enabled: false,
             max_planning_cycles: default_max_planning_cycles(),
-            quality_threshold: default_quality_threshold(),
             max_plan_parse_retries: default_max_plan_parse_retries(),
             worker_system_prompt: None,
             workers: HashMap::new(),
@@ -137,8 +135,6 @@ struct RawOrchestrationConfig {
     enabled: bool,
     #[serde(default = "default_max_planning_cycles")]
     max_planning_cycles: usize,
-    #[serde(default = "default_quality_threshold")]
-    quality_threshold: f32,
     #[serde(default = "default_max_plan_parse_retries")]
     max_plan_parse_retries: usize,
     #[serde(default)]
@@ -201,7 +197,6 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         Ok(OrchestrationConfig {
             enabled: raw.enabled,
             max_planning_cycles: raw.max_planning_cycles,
-            quality_threshold: raw.quality_threshold,
             max_plan_parse_retries: raw.max_plan_parse_retries,
             worker_system_prompt: raw.worker_system_prompt,
             workers: raw.workers,
@@ -238,10 +233,6 @@ fn default_max_planning_cycles() -> usize {
 
 fn default_max_tools_per_worker() -> usize {
     10
-}
-
-fn default_quality_threshold() -> f32 {
-    0.8
 }
 
 fn default_per_call_timeout_secs() -> u64 {

@@ -61,7 +61,6 @@ description = "Mock MCP server providing math and file tools for testing"
 [orchestration]
 enabled = true
 max_planning_cycles = 2
-quality_threshold = 0.7
 memory_dir = "/tmp/aura-math-orchestration"
 
 # Routing behavior
