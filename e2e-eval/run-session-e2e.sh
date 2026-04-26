@@ -10,6 +10,7 @@
 # Environment:
 #   PROMPT_SET=independent (default) — standalone math prompts
 #   PROMPT_SET=dependent — chained prompts where each turn builds on the prior
+#   PHOENIX_OTEL_ENDPOINT — OTLP gRPC endpoint for Phoenix tracing (e.g. http://host:4317)
 #
 # Prerequisites: cargo build --release, llama-server reachable on 11435 (for local models)
 set -euo pipefail
@@ -218,6 +219,9 @@ echo "  Multi-Turn Session E2E"
 echo "  Models: ${MODEL_NAMES[*]}"
 echo "  Prompts: ${#PROMPTS[@]} (sequential, same session)"
 echo "  Results: $RESULTS_DIR"
+if [[ -n "${PHOENIX_OTEL_ENDPOINT:-}" ]]; then
+  echo "  Phoenix: $PHOENIX_OTEL_ENDPOINT"
+fi
 echo "============================================="
 echo ""
 
@@ -234,14 +238,32 @@ for idx in "${!CONFIGS[@]}"; do
   grep -E "memory_dir|session_history_turns|model" "$config" > "$outdir/config-info.txt" 2>/dev/null || true
 
   # Start server
+  otel_env=()
+  if [[ -n "${PHOENIX_OTEL_ENDPOINT:-}" ]]; then
+    otel_env=(
+      OTEL_EXPORTER_OTLP_ENDPOINT="$PHOENIX_OTEL_ENDPOINT"
+      OTEL_RECORD_CONTENT=true
+      OTEL_SERVICE_NAME="aura-e2e-${model}"
+    )
+  fi
   CONFIG_PATH="$config" AURA_CUSTOM_EVENTS=true AURA_EMIT_REASONING=true AURA_PROMPT_JOURNAL=true \
-    PORT="$PORT" "$BINARY" --verbose > "$outdir/server.log" 2>&1 &
+    PORT="$PORT" ${otel_env[@]+"${otel_env[@]}"} "$BINARY" --verbose > "$outdir/server.log" 2>&1 &
   SERVER_PID=$!
 
   if ! wait_for_server; then
     echo "  SKIPPING $model (server failed to start)"
     stop_server
     continue
+  fi
+
+  # Warm up LLM backend (local models need slot initialization)
+  if curl -sf "http://localhost:${PORT}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"_","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+    -o /dev/null --max-time 300 2>/dev/null; then
+    echo "  warmup: ok"
+  else
+    echo "  warmup: skipped (non-fatal)"
   fi
 
   # Generate a stable session ID for this model run

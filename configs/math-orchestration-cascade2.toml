@@ -1,0 +1,111 @@
+# Math Orchestration — Nemotron Cascade 2 30B A3B test config
+#
+# Uses the math-mcp server (21 real math tools) with three specialized workers.
+# Start the math-mcp container first:
+#
+#   cd ~/workspace/aura-math-orchestration && docker compose up -d
+
+[agent]
+name = "Math Orchestrator"
+system_prompt = """
+You are a math assistant coordinator. You decompose math problems into
+specialized tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Simple single-operation arithmetic (e.g., "What is 2+2?"): answer directly
+- Multi-step calculations or mixed domains: create a plan with workers
+- Vague or ambiguous requests: ask for clarification
+"""
+
+[agent.llm]
+provider = "openai"
+api_key = "no-key-needed"
+base_url = "http://localhost:11435/v1"
+model = "cascade2-64k"
+temperature = 0.3
+
+[mcp]
+sanitize_schemas = false
+
+[mcp.servers.math]
+transport = "http_streamable"
+url = "http://{{ env.MATH_MCP_HOST | default: '127.0.0.1' }}:8081/mcp"
+headers = {}
+description = "Math MCP server providing arithmetic, statistics, and trigonometry tools"
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+
+allow_direct_answers = true
+allow_clarification = true
+
+tools_in_planning = "summary"
+
+[orchestration.timeouts]
+per_call_timeout_secs = 60
+
+[orchestration.artifacts]
+memory_dir = "/tmp/aura-math-cascade2"
+
+# Arithmetic worker: basic operations
+[orchestration.worker.arithmetic]
+description = "Basic arithmetic: addition, subtraction, multiplication, division, modulo, rounding"
+turn_depth = 8
+mcp_filter = ["add", "subtract", "multiply", "division", "modulo", "floor", "ceiling", "round", "sum"]
+preamble = """
+You are an Arithmetic Specialist completing one assigned task.
+
+Use your math tools for every calculation — do not compute results in your head.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Multiply 20 by 3
+→ Call multiply(firstNumber=20, secondNumber=3)
+→ Tool returns: 60
+→ Result: 60
+
+Do the same for your assigned task.
+"""
+
+# Statistics worker: aggregation and analysis
+[orchestration.worker.statistics]
+description = "Statistical analysis: mean, median, mode, min, max"
+turn_depth = 8
+mcp_filter = ["mean", "median", "mode", "min", "max"]
+preamble = """
+You are a Statistics Specialist completing one assigned task.
+
+Use your statistical tools for analysis — do not compute statistics manually.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Compute the mean of [1, 2, 3]
+→ Call mean(numbers=[1, 2, 3])
+→ Tool returns: 2.0
+→ Result: 2.0
+
+Do the same for your assigned task.
+"""
+
+# Trigonometry worker: trig functions and conversions
+[orchestration.worker.trigonometry]
+description = "Trigonometric functions and angle conversions: sin, cos, tan, arcsin, arccos, arctan, degree/radian conversion"
+turn_depth = 8
+mcp_filter = ["sin", "cos", "tan", "arcsin", "arccos", "arctan", "radiansToDegrees", "degreesToRadians"]
+preamble = """
+You are a Trigonometry Specialist completing one assigned task.
+
+Use your trig tools for all calculations — do not compute results manually.
+When a tool returns a result, that result is authoritative. Report it as your answer and stop.
+
+Example:
+Task: Compute sin(45°)
+→ Call degreesToRadians(degrees=45)
+→ Tool returns: 0.7853981633974483
+→ Call sin(radians=0.7853981633974483)
+→ Tool returns: 0.7071067811865476
+→ Result: 0.7071067811865476
+
+Do the same for your assigned task.
+"""
