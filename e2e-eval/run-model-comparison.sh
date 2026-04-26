@@ -10,6 +10,7 @@
 # Environment:
 #   PROMPT_SET=independent (default) — standalone math prompts
 #   PROMPT_SET=dependent — chained prompts where each turn builds on the prior
+#   PHOENIX_OTEL_ENDPOINT — OTLP gRPC endpoint for Phoenix tracing (e.g. http://host:4317)
 #
 # Examples:
 #   # Run 3 iterations on two configs (independent prompts)
@@ -193,6 +194,9 @@ echo "  Model Comparison E2E"
 echo "  Iterations: $ITERATIONS"
 echo "  Models: ${MODEL_NAMES[*]}"
 echo "  Results: $RESULTS_DIR"
+if [[ -n "${PHOENIX_OTEL_ENDPOINT:-}" ]]; then
+  echo "  Phoenix: $PHOENIX_OTEL_ENDPOINT"
+fi
 echo "============================================="
 echo ""
 
@@ -204,11 +208,20 @@ for idx in "${!CONFIGS[@]}"; do
 
   stop_server
   mkdir -p "$RESULTS_DIR/$model_name"
+  otel_env=()
+  if [[ -n "${PHOENIX_OTEL_ENDPOINT:-}" ]]; then
+    otel_env=(
+      OTEL_EXPORTER_OTLP_ENDPOINT="$PHOENIX_OTEL_ENDPOINT"
+      OTEL_RECORD_CONTENT=true
+      OTEL_SERVICE_NAME="aura-e2e-${model_name}"
+    )
+  fi
   CONFIG_PATH="$PROJECT_DIR/$config" PORT=$PORT \
     AURA_CUSTOM_EVENTS=true \
     AURA_EMIT_REASONING=true \
     AURA_PROMPT_JOURNAL=1 \
     RUST_LOG=aura=info,aura_web_server=info \
+    ${otel_env[@]+"${otel_env[@]}"} \
     "$BINARY" > "$RESULTS_DIR/$model_name/server.log" 2>&1 &
   SERVER_PID=$!
 
@@ -216,6 +229,16 @@ for idx in "${!CONFIGS[@]}"; do
     echo "  SKIP: server failed to start"
     stop_server
     continue
+  fi
+
+  # Warm up LLM backend (local models need slot initialization)
+  if curl -sf "http://localhost:${PORT}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"_","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' \
+    -o /dev/null --max-time 300 2>/dev/null; then
+    echo "  warmup: ok"
+  else
+    echo "  warmup: skipped (non-fatal)"
   fi
 
   for iter in $(seq 1 "$ITERATIONS"); do

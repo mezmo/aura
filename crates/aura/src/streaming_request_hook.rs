@@ -595,7 +595,10 @@ mod tests {
 
         let (prompt, completion, total) = usage_state.get_final_usage();
         assert_eq!(prompt, 750, "prompt should be the sum of all inputs");
-        assert_eq!(completion, 325, "completion should be the sum of all outputs");
+        assert_eq!(
+            completion, 325,
+            "completion should be the sum of all outputs"
+        );
         assert_eq!(total, 1075);
     }
 
@@ -607,7 +610,10 @@ mod tests {
 
         usage_state.accumulate_usage(500, 100);
         let (prompt, _, _) = usage_state.get_final_usage();
-        assert!(prompt > 0, "handler uses prompt > 0 to gate aura.usage emission");
+        assert!(
+            prompt > 0,
+            "handler uses prompt > 0 to gate aura.usage emission"
+        );
     }
 
     #[test]
