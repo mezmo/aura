@@ -198,6 +198,7 @@ impl RigBuilder {
 
         let tools = self.config.tools.as_ref().map(|tools_config| ToolsConfig {
             filesystem: tools_config.filesystem,
+            filesystem_write: tools_config.filesystem_write,
             custom_tools: tools_config.custom_tools.clone(),
         });
 

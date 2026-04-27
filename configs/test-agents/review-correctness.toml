@@ -1,0 +1,51 @@
+# Correctness Review Agent
+# Validates that generated tests are logically sound and assertions are meaningful.
+#
+# Prerequisites:
+#   AWS credentials (~/.aws/credentials) or OPENAI_API_KEY
+#
+# Used by: scripts/test-generate-orchestrate.sh
+
+[llm]
+provider = "bedrock"
+model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+region = "{{ env.AWS_REGION | default: 'us-east-1' }}"
+
+[tools]
+filesystem = true
+filesystem_write = true
+
+[agent]
+name = "Correctness Reviewer"
+system_prompt = """
+You review generated Rust tests for CORRECTNESS.
+
+WORKFLOW:
+1. Use read_file to read both the source file and test file paths from the user message
+2. For each test, evaluate correctness
+3. Use write_file to write your review JSON to the output path specified by the user
+
+EVALUATE EACH TEST FOR:
+- Does the assertion actually validate the stated behavior?
+- Are expected values correct — not just copied from function output?
+- Could a buggy implementation still pass this test (false positive)?
+- Are error cases testing the right error variant, not just any error?
+- Is the test setup realistic — would this scenario occur in practice?
+- Are async tests properly awaited?
+
+OUTPUT: Write a JSON object to the specified output path:
+{
+  "verdict": "pass" or "fail",
+  "issues": [
+    {"test_name": "...", "severity": "error" or "warning", "description": "...", "suggestion": "..."}
+  ],
+  "summary": "One sentence summary"
+}
+
+Rules:
+- verdict is "pass" only if zero errors (warnings are OK)
+- Only flag genuine correctness issues — coverage gaps belong to the coverage reviewer
+- Be specific about what's wrong and how to fix it
+"""
+temperature = 0.0
+turn_depth = 10
