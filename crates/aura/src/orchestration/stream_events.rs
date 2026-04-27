@@ -18,6 +18,10 @@
 //! These events are intentionally separate from `AuraStreamEvent` to:
 //! 1. Keep orchestration evolution isolated from base aura streaming
 //! 2. Allow different serialization or handling if needed
+//!
+//! Note about Scratchpad usage: usage is emitted as a base `aura.scratchpad_usage` event (see
+//! `stream_events::AuraStreamEvent::ScratchpadUsage`) since it applies to both
+//! single-agent and orchestration modes.
 
 use crate::orchestration::events::RoutingMode;
 use crate::stream_events::{AgentContext, CorrelationContext};

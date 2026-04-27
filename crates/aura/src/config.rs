@@ -43,6 +43,12 @@ pub struct AgentConfig {
     pub vector_stores: Vec<VectorStoreConfig>,
     pub mcp: Option<McpConfig>,
     pub tools: Option<ToolsConfig>,
+    /// Top-level persistence directory shared by scratchpad and orchestration
+    /// artifacts. Scratchpad: `{memory_dir}/scratchpad/` (single-agent) or
+    /// `{memory_dir}/{run_id}/iteration-{n}/scratchpad/` (orchestration).
+    /// `[orchestration.artifacts].memory_dir` is still honored as a legacy fallback.
+    #[serde(default)]
+    pub memory_dir: Option<String>,
     /// Orchestration mode configuration (multi-agent workflows)
     #[serde(default)]
     pub orchestration: Option<OrchestrationConfig>,
@@ -88,6 +94,11 @@ pub struct AgentConfig {
     /// Threaded from the web server's `chat_session_id`.
     #[serde(skip)]
     pub session_id: Option<String>,
+
+    /// Scratchpad storage/budget handed to the 8 exploration tools (not serialized).
+    /// `Some` when scratchpad is wired up for this agent or worker.
+    #[serde(skip)]
+    pub scratchpad_tools_config: Option<crate::scratchpad::ScratchpadToolsConfig>,
 }
 
 /// Configuration for TodoWrite/ReadTodos tool injection.
@@ -107,6 +118,7 @@ impl Clone for AgentConfig {
             vector_stores: self.vector_stores.clone(),
             mcp: self.mcp.clone(),
             tools: self.tools.clone(),
+            memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
@@ -116,6 +128,7 @@ impl Clone for AgentConfig {
             orchestration_persistence: self.orchestration_persistence.clone(),
             orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
+            scratchpad_tools_config: self.scratchpad_tools_config.clone(),
         }
     }
 }
@@ -401,6 +414,10 @@ pub struct AgentSettings {
     /// Can be set via `[agent].mcp_filter` in TOML for single-agent configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_filter: Option<Vec<String>>,
+    /// Agent-level scratchpad configuration (applies to single-agent and to
+    /// workers that don't provide an override).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratchpad: Option<crate::scratchpad::ScratchpadConfig>,
 }
 
 /// Vector store configuration
@@ -442,6 +459,10 @@ pub enum McpServerConfig {
         args: Vec<String>,
         env: HashMap<String, String>,
         description: Option<String>,
+        /// Per-tool scratchpad interception thresholds, keyed by tool-name glob.
+        /// Parsed from `[mcp.servers.<name>.scratchpad]`.
+        #[serde(default)]
+        scratchpad: HashMap<String, crate::scratchpad::ScratchpadToolEntry>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -449,7 +470,20 @@ pub enum McpServerConfig {
         headers: HashMap<String, String>,
         description: Option<String>,
         headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad interception thresholds, keyed by tool-name glob.
+        #[serde(default)]
+        scratchpad: HashMap<String, crate::scratchpad::ScratchpadToolEntry>,
     },
+}
+
+impl McpServerConfig {
+    /// Get the per-tool scratchpad thresholds for this server.
+    pub fn scratchpad(&self) -> &HashMap<String, crate::scratchpad::ScratchpadToolEntry> {
+        match self {
+            McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+            McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
+        }
+    }
 }
 
 /// Tools configuration
@@ -478,10 +512,12 @@ impl Default for AgentConfig {
                 context: vec![],
                 turn_depth: Some(5),
                 mcp_filter: None,
+                scratchpad: None,
             },
             vector_stores: Vec::new(),
             mcp: None,
             tools: None,
+            memory_dir: None,
             orchestration: None,
             // Extension fields default to None
             tool_wrapper: None,
@@ -491,6 +527,7 @@ impl Default for AgentConfig {
             orchestration_persistence: None,
             orchestration_chat_history: None,
             session_id: None,
+            scratchpad_tools_config: None,
         }
     }
 }
@@ -505,6 +542,14 @@ impl AgentConfig {
             .as_ref()
             .map(|o| o.enabled)
             .unwrap_or(false)
+    }
+
+    /// Resolve the effective persistence directory: top-level `memory_dir`,
+    /// or `[orchestration.artifacts].memory_dir` as a legacy fallback.
+    pub fn effective_memory_dir(&self) -> Option<&str> {
+        self.memory_dir
+            .as_deref()
+            .or_else(|| self.orchestration.as_ref().and_then(|o| o.memory_dir()))
     }
 
     /// Check if a tool name matches the mcp_filter patterns.

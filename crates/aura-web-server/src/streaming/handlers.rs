@@ -593,6 +593,30 @@ fn handle_stream_item(
             vec![]
         }
         StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),
+        StreamItem::ScratchpadUsage {
+            agent_id,
+            tokens_intercepted,
+            tokens_extracted,
+        } => {
+            tracing::debug!(
+                "Scratchpad usage for agent {}: intercepted=~{} tokens, extracted=~{} tokens",
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            );
+            let agent_ctx = aura::stream_events::AgentContext {
+                agent_id: agent_id.clone(),
+                agent_name: None,
+                parent_agent_id: None,
+            };
+            let event = AuraStreamEvent::scratchpad_usage(
+                *tokens_intercepted,
+                *tokens_extracted,
+                agent_ctx,
+                ctx.correlation.clone(),
+            );
+            vec![Bytes::from(event.format_sse())]
+        }
     }
 }
 
@@ -1215,7 +1239,7 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura::stream_events::{AgentContext, CorrelationContext, event_names};
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
     /// The aura.tool_requested event is emitted via StreamingRequestHook → tool_event_rx channel
@@ -1258,7 +1282,7 @@ mod tests {
         // Verify NO aura.tool_requested event is emitted
         // (it should come via tool_event_rx channel from StreamingRequestHook, not here)
         assert!(
-            !output_str.contains("aura.tool_requested"),
+            !output_str.contains(event_names::TOOL_REQUESTED),
             "handle_tool_call should NOT emit aura.tool_requested directly - \
              it's emitted via StreamingRequestHook → tool_event_rx channel. Found: {}",
             output_str

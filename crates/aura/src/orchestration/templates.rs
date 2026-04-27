@@ -488,6 +488,7 @@ Always verify your calculations before reporting results."
                 vector_stores: vec![],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
         workers.insert(
@@ -512,6 +513,7 @@ TOOL USAGE:
                 vector_stores: vec![],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 
