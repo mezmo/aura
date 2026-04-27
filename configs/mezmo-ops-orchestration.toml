@@ -132,18 +132,18 @@ context = [
 enabled = true
 max_planning_cycles = 3
 quality_threshold = 0.2
-memory_dir = "/tmp/aura-orchestration-logs"
+# memory_dir = "/tmp/aura-orchestration-logs"
 tools_in_planning = "summary"
 max_tools_per_worker = 10
 
 [orchestration.timeouts]
 per_call_timeout_secs = 120
 
-# [orchestration.artifacts]
-# memory_dir = "/Volumes/aura"
+[orchestration.artifacts]
+memory_dir = "/Volumes/aura"
 
-# [orchestration.memory]
-# enabled = true
+[orchestration.memory]
+enabled = true
 
 # ── Workers ───────────────────────────────────────────────────────────────────
 
