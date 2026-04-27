@@ -144,6 +144,14 @@ test-integration-local::  ## Start local aura infra, run integration tests, then
 	$(MAKE) test-integration-local-down; \
 	exit $$test_exit
 
+.PHONY:test-generate
+test-generate::           ## Generate + review tests using Aura AI agents
+	@if ! command -v jq >/dev/null 2>&1; then \
+		echo "Error: jq is required. Install with: brew install jq"; \
+		exit 1; \
+	fi
+	@bash scripts/test-generate-orchestrate.sh $(if $(FILES),--files "$(FILES)",)
+
 .PHONY:fmt
 fmt::                 ## Format code with rustfmt
 	cargo fmt --all

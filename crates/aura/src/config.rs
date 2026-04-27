@@ -287,6 +287,7 @@ pub enum McpServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolsConfig {
     pub filesystem: bool,
+    pub filesystem_write: bool,
     pub custom_tools: Vec<String>,
 }
 

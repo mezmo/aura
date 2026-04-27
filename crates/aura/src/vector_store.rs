@@ -40,6 +40,23 @@ pub struct VectorStoreManager {
 }
 
 impl VectorStoreManager {
+    #[cfg(test)]
+    pub(crate) fn new_stub(store_name: &str, context_prefix: Option<String>) -> Self {
+        Self {
+            store_name: store_name.to_string(),
+            store_type: "in_memory".to_string(),
+            qdrant_url: None,
+            collection_name: None,
+            in_memory_store: None,
+            qdrant_store: None,
+            bedrock_kb_client: None,
+            bedrock_kb_id: None,
+            embedding_provider: "stub".to_string(),
+            embedding_model_name: "stub".to_string(),
+            context_prefix,
+        }
+    }
+
     /// Create a new vector store from configuration
     pub async fn from_config(config: &VectorStoreConfig) -> Result<Self, BuilderError> {
         match &config.store {
