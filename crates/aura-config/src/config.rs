@@ -1,3 +1,4 @@
+use aura::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 use aura::{LlmConfig, lenient_int};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -5,6 +6,11 @@ use std::collections::HashMap;
 /// Root configuration structure for our POC
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Config {
+    /// Top-level persistence directory shared by scratchpad and orchestration
+    /// artifacts. `[orchestration.artifacts].memory_dir` is honored as a
+    /// legacy fallback.
+    #[serde(default)]
+    pub memory_dir: Option<String>,
     pub mcp: Option<McpConfig>,
     /// Vector stores for RAG - optional, defaults to empty
     #[serde(default)]
@@ -41,6 +47,10 @@ pub struct WorkerConfig {
     /// scoped to whichever model the worker actually runs.
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+    /// Per-worker override of `[agent.scratchpad]`. Parsed from
+    /// `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
 }
 
 /// Timeout configuration for orchestration (aura-config side).
@@ -302,6 +312,9 @@ pub enum McpServerConfig {
         env: HashMap<String, String>,
         #[serde(default)]
         description: Option<String>,
+        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
     #[serde(rename = "http_streamable")]
     HttpStreamable {
@@ -312,6 +325,9 @@ pub enum McpServerConfig {
         description: Option<String>,
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
 }
 
@@ -396,6 +412,10 @@ pub struct AgentConfig {
     /// when no `[orchestration.worker.<name>.llm]` is provided.
     #[serde(default)]
     pub llm: LlmConfig,
+    /// Agent-level scratchpad config. Workers inherit this unless they
+    /// provide `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -421,6 +441,7 @@ impl Default for AgentConfig {
             model_owner: None,
             mcp_filter: None,
             llm: LlmConfig::default(),
+            scratchpad: None,
         }
     }
 }
@@ -468,6 +489,63 @@ impl Config {
                     "Embedding model API key is required for vector store '{}'",
                     store.name
                 )));
+            }
+        }
+
+        // Scratchpad validation
+        self.validate_scratchpad()?;
+
+        Ok(())
+    }
+
+    /// When scratchpad is enabled on the agent or any worker, require a
+    /// `memory_dir` (top-level, with legacy fallback to
+    /// `[orchestration.artifacts].memory_dir`) and a `context_window` on each
+    /// scratchpad-enabled agent's effective LLM.
+    fn validate_scratchpad(&self) -> Result<(), crate::ConfigError> {
+        let agent_sp_enabled = self.agent.scratchpad.as_ref().is_some_and(|sp| sp.enabled);
+        let orch = self.orchestration.as_ref().filter(|o| o.enabled);
+
+        let worker_sp_enabled = |w: &WorkerConfig| {
+            w.scratchpad
+                .as_ref()
+                .map(|sp| sp.enabled)
+                .unwrap_or(agent_sp_enabled)
+        };
+        let any_worker_enabled = orch
+            .map(|o| o.workers.values().any(worker_sp_enabled))
+            .unwrap_or(false);
+
+        if !agent_sp_enabled && !any_worker_enabled {
+            return Ok(());
+        }
+
+        let effective_memory_dir = self.memory_dir.as_deref().or_else(|| {
+            self.orchestration
+                .as_ref()
+                .and_then(|o| o.artifacts.memory_dir.as_deref())
+        });
+        if effective_memory_dir.is_none() {
+            return Err(crate::ConfigError::Validation(
+                "Scratchpad enabled but top-level `memory_dir` is not set".to_string(),
+            ));
+        }
+
+        if agent_sp_enabled && self.agent.llm.context_window().is_none() {
+            return Err(crate::ConfigError::Validation(
+                "Scratchpad enabled but [agent.llm].context_window is not set".to_string(),
+            ));
+        }
+        if let Some(o) = orch {
+            for (name, worker) in &o.workers {
+                if worker_sp_enabled(worker) {
+                    let effective_llm = worker.llm.as_ref().unwrap_or(&self.agent.llm);
+                    if effective_llm.context_window().is_none() {
+                        return Err(crate::ConfigError::Validation(format!(
+                            "Scratchpad enabled for worker '{name}' but its effective LLM has no context_window"
+                        )));
+                    }
+                }
             }
         }
 

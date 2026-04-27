@@ -58,6 +58,9 @@ integration-orchestration = []  # orchestration_events_test
 # SRE orchestration tests (separate - needs k8s-sre-mcp server config)
 integration-orchestration-sre = []  # sre_orchestration_test
 
+# Scratchpad integration tests (separate - needs scratchpad-test-mcp server config)
+integration-scratchpad = []  # scratchpad_test
+
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json", "stream"] }

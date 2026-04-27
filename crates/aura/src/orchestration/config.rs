@@ -1,6 +1,9 @@
 //! Configuration types for orchestration mode.
 
-use crate::config::{LlmConfig, VectorStoreConfig};
+use crate::{
+    config::{LlmConfig, VectorStoreConfig},
+    scratchpad::ScratchpadConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -205,6 +208,11 @@ pub struct WorkerConfig {
     /// math (e.g. scratchpad sizing, LOG-23439).
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+
+    /// Per-worker override of `[agent.scratchpad]`. Parsed from
+    /// `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
 }
 
 // ============================================================================

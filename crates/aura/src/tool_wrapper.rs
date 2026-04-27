@@ -180,8 +180,8 @@ pub trait ToolWrapper: Send + Sync {
     /// Modify the tool's JSON schema definition.
     ///
     /// Called once when the tool definition is requested.
-    /// Use this to add required fields (like `_aura_reasoning`)
-    /// or modify field types.
+    /// Use this to add fields (e.g. `_aura_reasoning`) or modify
+    /// field types.
     ///
     /// # Arguments
     /// * `schema` - The inner tool's parameter schema
@@ -510,6 +510,15 @@ where
 /// - Output: last wrapper transforms first, then second-to-last, etc. (reverse)
 /// - Errors: same as output (reverse order)
 /// - on_complete: all wrappers called in parallel
+///
+/// Asymmetry to know about when composing your own wrapper with a built-in
+/// one (e.g. scratchpad, persistence): schema/args walk the vec forward, but
+/// output/error walk it in reverse. So a wrapper placed *after* the
+/// built-in in the vec sees the **raw** tool output but a
+/// **built-in-modified** schema and args (e.g. extra scratchpad fields
+/// stripped from args before your wrapper runs). Audit / logging wrappers
+/// that ignore schema and args are unaffected; wrappers that introspect
+/// schema or transform args need to account for this.
 pub struct ComposedWrapper {
     wrappers: Vec<Arc<dyn ToolWrapper>>,
 }

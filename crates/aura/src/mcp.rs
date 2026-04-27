@@ -892,6 +892,43 @@ impl McpManager {
         names
     }
 
+    /// Iterate over every discovered MCP tool across both HTTP-streamable and
+    /// STDIO transports.
+    ///
+    /// Used by the scratchpad budget seed to BPE-count the actual JSON
+    /// schemas the LLM sees in its tool list, instead of falling back to a
+    /// per-tool constant heuristic.
+    pub fn tool_definitions_iter(&self) -> impl Iterator<Item = &rmcp::model::Tool> {
+        self.streamable_tools
+            .values()
+            .flat_map(|tools| tools.iter())
+            .chain(self.tool_definitions.iter().map(|(tool, _)| tool))
+    }
+
+    /// Returns a `server_name → tool_names` map for HTTP-streamable servers.
+    ///
+    /// Used by the scratchpad layer to resolve per-server `min_tokens`
+    /// patterns to concrete tool names at boot time, so the runtime
+    /// interception lookup is a server-aware exact match (not a
+    /// server-agnostic glob — see `scratchpad::scratchpad_tool_map`).
+    ///
+    /// STDIO tools are intentionally omitted: they're tracked in
+    /// `tool_definitions: Vec<(Tool, ServerSink)>` without a server-name
+    /// field, so we'd need a schema change to carry that through. STDIO
+    /// scratchpad support can be added later by attaching server_name to
+    /// each tool_definitions entry; until then STDIO tools fall through
+    /// the scratchpad interception path (same behavior as before this
+    /// refactor for STDIO).
+    pub fn tool_names_per_server(&self) -> HashMap<String, Vec<String>> {
+        self.streamable_tools
+            .iter()
+            .map(|(server_name, tools)| {
+                let names = tools.iter().map(|t| t.name.to_string()).collect();
+                (server_name.clone(), names)
+            })
+            .collect()
+    }
+
     /// Execute a tool by name (used by Ollama text-to-tool fallback).
     ///
     /// Called by `FallbackToolExecutor` when it detects tool calls in streamed text.

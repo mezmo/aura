@@ -31,6 +31,7 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use crate::scratchpad::{self, ContextBudget};
 use crate::tool_event_broker::{
     pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
 };
@@ -276,6 +277,10 @@ pub struct StreamingRequestHook {
     request_id: String,
     /// Shared usage state (returned separately for handler access)
     usage_state: UsageState,
+    /// Optional per-agent scratchpad budget. When set, the hook feeds the
+    /// LLM-reported per-turn input/output tokens into the budget as ground
+    /// truth so `remaining()` reflects actual context pressure.
+    scratchpad_budget: Option<ContextBudget>,
 }
 
 impl StreamingRequestHook {
@@ -289,6 +294,18 @@ impl StreamingRequestHook {
         timeout: Duration,
         request_id: impl Into<String>,
     ) -> (Self, watch::Sender<bool>, UsageState) {
+        Self::with_scratchpad_budget(timeout, request_id, None)
+    }
+
+    /// Like `new`, but additionally wires a scratchpad `ContextBudget` so the
+    /// hook can feed LLM-reported per-turn token counts back into the budget
+    /// after each completion turn (mirrors what orchestration workers do via
+    /// `StreamItem::TurnUsage`).
+    pub fn with_scratchpad_budget(
+        timeout: Duration,
+        request_id: impl Into<String>,
+        scratchpad_budget: Option<ContextBudget>,
+    ) -> (Self, watch::Sender<bool>, UsageState) {
         let (tx, rx) = watch::channel(false);
         let usage_state = UsageState::new();
         let hook = Self {
@@ -297,6 +314,7 @@ impl StreamingRequestHook {
             cancelled: rx,
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
+            scratchpad_budget,
         };
         (hook, tx, usage_state)
     }
@@ -307,6 +325,21 @@ impl StreamingRequestHook {
             return true;
         }
         self.start_time.elapsed() > self.timeout
+    }
+
+    /// Should the SSE event surface (`aura.tool_requested` / `aura.tool_complete`
+    /// / `aura.tool_usage`) publish events for `tool_name`?
+    ///
+    /// Returns `false` for scratchpad exploration tools so single-agent
+    /// matches orchestration behavior — orchestration's `ObserverWrapper`
+    /// doesn't wrap these tools, so they don't surface in
+    /// `aura.orchestrator.tool_call_*` events either.
+    ///
+    /// Extracted as an associated function so the gating logic is unit
+    /// testable without constructing a `CancelSignal` (which is not part of
+    /// rig's public API).
+    pub(crate) fn should_publish_tool_event(tool_name: &str) -> bool {
+        !scratchpad::is_scratchpad_tool(tool_name)
     }
 
     /// Check and cancel if needed, logging the reason.
@@ -381,21 +414,31 @@ where
         let request_id = self.request_id.clone();
         let tool_call_id = id;
         let args_str = args.to_string();
+        // Scratchpad exploration tools are suppressed from the event surface
+        // so single-agent matches orchestration behavior. See
+        // `should_publish_tool_event` for the rationale and unit tests.
+        // Skip the FIFO push + `aura.tool_requested` publish; `on_tool_result`
+        // makes the matching skip so push/pop stay symmetric. Cancellation
+        // is still checked.
+        let publish_event = Self::should_publish_tool_event(&tool_name);
         async move {
-            // Parse args as JSON (fallback to empty object if invalid)
-            let arguments: serde_json::Value =
-                serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+            if publish_event {
+                // Parse args as JSON (fallback to empty object if invalid)
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
 
-            // Rig 0.28+ passes correct tool_call_id; register for event correlation
-            if let Some(id) = &tool_call_id {
-                push_tool_call_id(&request_id, id.clone()).await;
-                publish_tool_requested(&request_id, id.clone(), tool_name.clone(), arguments).await;
-            } else {
-                tracing::warn!(
-                    "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
-                    tool_name,
-                    request_id
-                );
+                // Rig 0.28+ passes correct tool_call_id; register for event correlation
+                if let Some(id) = &tool_call_id {
+                    push_tool_call_id(&request_id, id.clone()).await;
+                    publish_tool_requested(&request_id, id.clone(), tool_name.clone(), arguments)
+                        .await;
+                } else {
+                    tracing::warn!(
+                        "Tool '{}' called without tool_call_id for request '{}' - event correlation unavailable",
+                        tool_name,
+                        request_id
+                    );
+                }
             }
 
             tracing::debug!(
@@ -425,37 +468,44 @@ where
         let tool_call_id = id.clone();
         let had_tool_call_id = id.is_some();
         let usage_state = self.usage_state.clone();
+        // Mirror the suppression in `on_tool_call`: skip pop + pending-id
+        // tracking for scratchpad tools so the FIFO queue stays symmetric
+        // and these tools don't surface in `aura.tool_usage` correlations.
+        // Cancellation is still checked.
+        let track_event = Self::should_publish_tool_event(&tool_name);
 
         async move {
-            // Note: error status is NOT set on Rig's execute_tool span here.
-            // Tool errors are captured on the child mcp.tool_call span by
-            // mcp_tool_execution.rs::record_tool_call_result(), which is the
-            // canonical TOOL span for Phoenix.
+            if track_event {
+                // Note: error status is NOT set on Rig's execute_tool span here.
+                // Tool errors are captured on the child mcp.tool_call span by
+                // mcp_tool_execution.rs::record_tool_call_result(), which is the
+                // canonical TOOL span for Phoenix.
 
-            // Only pop if on_tool_call pushed (i.e., tool_call_id was Some).
-            // This maintains push/pop symmetry and prevents popping IDs belonging
-            // to other tool calls when a tool arrives without an ID.
-            if had_tool_call_id && pop_tool_call_id(&request_id).await.is_none() {
-                tracing::warn!(
-                    "Queue desync: pop returned None for tool '{}' on request '{}' \
-                     (possible duplicate on_tool_result or Rig version issue)",
+                // Only pop if on_tool_call pushed (i.e., tool_call_id was Some).
+                // This maintains push/pop symmetry and prevents popping IDs belonging
+                // to other tool calls when a tool arrives without an ID.
+                if had_tool_call_id && pop_tool_call_id(&request_id).await.is_none() {
+                    tracing::warn!(
+                        "Queue desync: pop returned None for tool '{}' on request '{}' \
+                         (possible duplicate on_tool_result or Rig version issue)",
+                        tool_name,
+                        request_id
+                    );
+                }
+
+                // Add tool_id to pending list for usage association
+                // This allows us to correlate tools with the usage snapshot when
+                // on_stream_completion_response_finish fires
+                if let Some(id) = tool_call_id {
+                    usage_state.add_pending_tool_id(id);
+                }
+
+                tracing::debug!(
+                    "Tool '{}' completed (had_tool_call_id: {})",
                     tool_name,
-                    request_id
+                    had_tool_call_id
                 );
             }
-
-            // Add tool_id to pending list for usage association
-            // This allows us to correlate tools with the usage snapshot when
-            // on_stream_completion_response_finish fires
-            if let Some(id) = tool_call_id {
-                usage_state.add_pending_tool_id(id);
-            }
-
-            tracing::debug!(
-                "Tool '{}' completed (had_tool_call_id: {})",
-                tool_name,
-                had_tool_call_id
-            );
 
             if self.should_cancel() {
                 tracing::info!("Cancelling after tool '{}' result", tool_name);
@@ -475,6 +525,7 @@ where
     {
         let usage_state = self.usage_state.clone();
         let request_id = self.request_id.clone();
+        let scratchpad_budget = self.scratchpad_budget.clone();
 
         // Extract usage if the response type supports it
         // StreamingResponse implements GetTokenUsage which has token_usage()
@@ -495,6 +546,13 @@ where
                     usage.total_tokens,
                     is_tool_turn,
                 );
+
+                // Feed LLM ground-truth into the scratchpad budget so its
+                // remaining-budget hints reflect real context pressure (the
+                // intercept/extract counters keep their own totals).
+                if let Some(ref budget) = scratchpad_budget {
+                    budget.set_estimated_used(usage.input_tokens, usage.output_tokens);
+                }
 
                 if is_tool_turn {
                     tracing::debug!(
@@ -595,7 +653,10 @@ mod tests {
 
         let (prompt, completion, total) = usage_state.get_final_usage();
         assert_eq!(prompt, 750, "prompt should be the sum of all inputs");
-        assert_eq!(completion, 325, "completion should be the sum of all outputs");
+        assert_eq!(
+            completion, 325,
+            "completion should be the sum of all outputs"
+        );
         assert_eq!(total, 1075);
     }
 
@@ -607,7 +668,10 @@ mod tests {
 
         usage_state.accumulate_usage(500, 100);
         let (prompt, _, _) = usage_state.get_final_usage();
-        assert!(prompt > 0, "handler uses prompt > 0 to gate aura.usage emission");
+        assert!(
+            prompt > 0,
+            "handler uses prompt > 0 to gate aura.usage emission"
+        );
     }
 
     #[test]
@@ -684,6 +748,103 @@ mod tests {
         rc.set("first".to_string());
         rc.set("second".to_string());
         assert_eq!(rc.get().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn test_with_scratchpad_budget_none_matches_new() {
+        let (hook_a, _, _) = StreamingRequestHook::new(Duration::from_secs(60), "req_a");
+        let (hook_b, _, _) =
+            StreamingRequestHook::with_scratchpad_budget(Duration::from_secs(60), "req_b", None);
+        // Both hooks should report no scratchpad budget.
+        assert!(hook_a.scratchpad_budget.is_none());
+        assert!(hook_b.scratchpad_budget.is_none());
+    }
+
+    #[test]
+    fn test_with_scratchpad_budget_stores_budget() {
+        use crate::scratchpad::TiktokenCounter;
+        let counter = Arc::new(TiktokenCounter::default_counter());
+        let budget = ContextBudget::new(128_000, 0.20, 0, counter);
+        let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
+            Duration::from_secs(60),
+            "req_with_budget",
+            Some(budget.clone()),
+        );
+        let stored = hook
+            .scratchpad_budget
+            .as_ref()
+            .expect("budget must be stored");
+        // Mutate the original; the hook's clone shares atomics so it sees the change.
+        budget.record_intercepted(123);
+        let (intercepted, _) = stored.scratchpad_usage();
+        assert_eq!(
+            intercepted, 123,
+            "hook's budget must share state with caller's"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Scratchpad-tool event suppression
+    //
+    // `on_tool_call` and `on_tool_result` consult
+    // `should_publish_tool_event` before pushing/popping the FIFO queue or
+    // publishing `aura.tool_*` events. Rig's `CancelSignal::new` is private
+    // so we can't drive the hook methods end-to-end from a unit test —
+    // instead we lock in the gating predicate and verify it's wired to the
+    // canonical `is_scratchpad_tool` set.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn should_publish_tool_event_suppresses_every_scratchpad_tool() {
+        // Loops over the canonical set so the test auto-tracks any add /
+        // rename / remove in `scratchpad/tools.rs::all_tool_definitions()`.
+        for def in scratchpad::all_tool_definitions() {
+            assert!(
+                !StreamingRequestHook::should_publish_tool_event(&def.name),
+                "scratchpad tool '{}' must NOT publish to the SSE event surface",
+                def.name,
+            );
+        }
+    }
+
+    #[test]
+    fn should_publish_tool_event_allows_mcp_tool_names() {
+        // Representative MCP tools from the integration suites — none of
+        // these are in the scratchpad set, so all should publish.
+        for name in [
+            "list_pipelines",
+            "group_logs_by_field",
+            "get_log_histogram",
+            "sp_get_large_json",
+            "search_repositories",
+            "get_current_time",
+        ] {
+            assert!(
+                StreamingRequestHook::should_publish_tool_event(name),
+                "MCP tool '{name}' should publish to the SSE event surface",
+            );
+        }
+    }
+
+    #[test]
+    fn should_publish_tool_event_is_case_sensitive() {
+        // `is_scratchpad_tool` lookup is exact-name (matches Tool::NAME),
+        // so case-mismatched names are NOT suppressed. Lock that in so a
+        // future case-insensitive change doesn't silently widen suppression
+        // to MCP tools that happen to share a case-folded prefix.
+        assert!(StreamingRequestHook::should_publish_tool_event("HEAD"));
+        assert!(StreamingRequestHook::should_publish_tool_event("Head"));
+        assert!(StreamingRequestHook::should_publish_tool_event("head_x"));
+    }
+
+    #[test]
+    fn should_publish_tool_event_handles_edge_cases() {
+        // Empty / whitespace / punctuation should not match any scratchpad
+        // tool name and so should publish (matches MCP-tool default).
+        assert!(StreamingRequestHook::should_publish_tool_event(""));
+        assert!(StreamingRequestHook::should_publish_tool_event(" "));
+        assert!(StreamingRequestHook::should_publish_tool_event("head "));
+        assert!(StreamingRequestHook::should_publish_tool_event(" head"));
     }
 
     #[test]

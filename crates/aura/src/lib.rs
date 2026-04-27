@@ -27,6 +27,7 @@ pub mod rag_tools;
 pub mod request_cancellation;
 pub mod request_progress;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
+pub mod scratchpad;
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
@@ -58,6 +59,7 @@ pub use provider_agent::{
     ToolCall, ToolResult,
 };
 pub use rig::completion::Message;
+pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
 
 // Legacy aliases (deprecated)

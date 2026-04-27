@@ -593,6 +593,30 @@ fn handle_stream_item(
             vec![]
         }
         StreamItem::OrchestratorEvent(event) => handle_orchestrator_event(config, ctx, event),
+        StreamItem::ScratchpadUsage {
+            agent_id,
+            tokens_intercepted,
+            tokens_extracted,
+        } => {
+            tracing::debug!(
+                "Scratchpad usage for agent {}: intercepted=~{} tokens, extracted=~{} tokens",
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            );
+            let agent_ctx = aura::stream_events::AgentContext {
+                agent_id: agent_id.clone(),
+                agent_name: None,
+                parent_agent_id: None,
+            };
+            let event = AuraStreamEvent::scratchpad_usage(
+                *tokens_intercepted,
+                *tokens_extracted,
+                agent_ctx,
+                ctx.correlation.clone(),
+            );
+            vec![Bytes::from(event.format_sse())]
+        }
     }
 }
 
@@ -684,13 +708,26 @@ fn handle_tool_call(
 ) -> Vec<Bytes> {
     tracing::info!("Streaming tool call: {}", tool_call.name);
 
-    let mut output = Vec::with_capacity(2);
-
-    state.has_tool_calls = true;
+    // Record the id → name mapping for handle_tool_result regardless of
+    // suppression so the matching result can identify itself as scratchpad.
     state.tool_call_map.insert(
         tool_call.id.clone(),
         (tool_call.name.clone(), state.tool_call_index),
     );
+
+    // Suppress scratchpad exploration tools to match orchestration behavior.
+    // Orchestration's worker loop absorbs all ToolCall/ToolResult items, and
+    // its `ObserverWrapper` doesn't wrap scratchpad tools — so they never
+    // surface in `aura.orchestrator.tool_call_*`. The SSE handler is the
+    // single-agent equivalent surface, and `StreamingRequestHook` already
+    // suppresses `aura.tool_requested` for the same set.
+    if aura::scratchpad::is_scratchpad_tool(&tool_call.name) {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(2);
+
+    state.has_tool_calls = true;
 
     // Track tool start time for duration calculation in tool_complete event
     // Note: aura.tool_requested is emitted via StreamingRequestHook → tool_event_rx channel (not here)
@@ -753,6 +790,23 @@ fn handle_tool_result(
         tool_result.id,
         tool_result.call_id
     );
+
+    // Mirror the suppression in `handle_tool_call`: scratchpad exploration
+    // tools are absorbed end-to-end so single-agent matches orchestration.
+    let is_scratchpad = state
+        .tool_call_map
+        .get(&tool_result.id)
+        .or_else(|| {
+            tool_result
+                .call_id
+                .as_ref()
+                .and_then(|cid| state.tool_call_map.get(cid))
+        })
+        .map(|(name, _)| aura::scratchpad::is_scratchpad_tool(name))
+        .unwrap_or(false);
+    if is_scratchpad {
+        return Vec::new();
+    }
 
     let mut output = Vec::with_capacity(2);
     state.needs_separator = true;
@@ -1215,7 +1269,7 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura::stream_events::{AgentContext, CorrelationContext, event_names};
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
     /// The aura.tool_requested event is emitted via StreamingRequestHook → tool_event_rx channel
@@ -1258,7 +1312,7 @@ mod tests {
         // Verify NO aura.tool_requested event is emitted
         // (it should come via tool_event_rx channel from StreamingRequestHook, not here)
         assert!(
-            !output_str.contains("aura.tool_requested"),
+            !output_str.contains(event_names::TOOL_REQUESTED),
             "handle_tool_call should NOT emit aura.tool_requested directly - \
              it's emitted via StreamingRequestHook → tool_event_rx channel. Found: {}",
             output_str
