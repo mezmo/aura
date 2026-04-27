@@ -31,6 +31,7 @@
 //! let (prompt, completion, total) = usage_state.get_final_usage();
 //! ```
 
+use crate::scratchpad::ContextBudget;
 use crate::tool_event_broker::{
     pop_tool_call_id, publish_tool_requested, publish_tool_usage, push_tool_call_id,
 };
@@ -276,6 +277,10 @@ pub struct StreamingRequestHook {
     request_id: String,
     /// Shared usage state (returned separately for handler access)
     usage_state: UsageState,
+    /// Optional per-agent scratchpad budget. When set, the hook feeds the
+    /// LLM-reported per-turn input/output tokens into the budget as ground
+    /// truth so `remaining()` reflects actual context pressure.
+    scratchpad_budget: Option<ContextBudget>,
 }
 
 impl StreamingRequestHook {
@@ -289,6 +294,18 @@ impl StreamingRequestHook {
         timeout: Duration,
         request_id: impl Into<String>,
     ) -> (Self, watch::Sender<bool>, UsageState) {
+        Self::with_scratchpad_budget(timeout, request_id, None)
+    }
+
+    /// Like `new`, but additionally wires a scratchpad `ContextBudget` so the
+    /// hook can feed LLM-reported per-turn token counts back into the budget
+    /// after each completion turn (mirrors what orchestration workers do via
+    /// `StreamItem::TurnUsage`).
+    pub fn with_scratchpad_budget(
+        timeout: Duration,
+        request_id: impl Into<String>,
+        scratchpad_budget: Option<ContextBudget>,
+    ) -> (Self, watch::Sender<bool>, UsageState) {
         let (tx, rx) = watch::channel(false);
         let usage_state = UsageState::new();
         let hook = Self {
@@ -297,6 +314,7 @@ impl StreamingRequestHook {
             cancelled: rx,
             request_id: request_id.into(),
             usage_state: usage_state.clone(),
+            scratchpad_budget,
         };
         (hook, tx, usage_state)
     }
@@ -475,6 +493,7 @@ where
     {
         let usage_state = self.usage_state.clone();
         let request_id = self.request_id.clone();
+        let scratchpad_budget = self.scratchpad_budget.clone();
 
         // Extract usage if the response type supports it
         // StreamingResponse implements GetTokenUsage which has token_usage()
@@ -495,6 +514,13 @@ where
                     usage.total_tokens,
                     is_tool_turn,
                 );
+
+                // Feed LLM ground-truth into the scratchpad budget so its
+                // remaining-budget hints reflect real context pressure (the
+                // intercept/extract counters keep their own totals).
+                if let Some(ref budget) = scratchpad_budget {
+                    budget.set_estimated_used(usage.input_tokens, usage.output_tokens);
+                }
 
                 if is_tool_turn {
                     tracing::debug!(
@@ -595,7 +621,10 @@ mod tests {
 
         let (prompt, completion, total) = usage_state.get_final_usage();
         assert_eq!(prompt, 750, "prompt should be the sum of all inputs");
-        assert_eq!(completion, 325, "completion should be the sum of all outputs");
+        assert_eq!(
+            completion, 325,
+            "completion should be the sum of all outputs"
+        );
         assert_eq!(total, 1075);
     }
 
@@ -607,7 +636,10 @@ mod tests {
 
         usage_state.accumulate_usage(500, 100);
         let (prompt, _, _) = usage_state.get_final_usage();
-        assert!(prompt > 0, "handler uses prompt > 0 to gate aura.usage emission");
+        assert!(
+            prompt > 0,
+            "handler uses prompt > 0 to gate aura.usage emission"
+        );
     }
 
     #[test]
@@ -684,6 +716,39 @@ mod tests {
         rc.set("first".to_string());
         rc.set("second".to_string());
         assert_eq!(rc.get().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn test_with_scratchpad_budget_none_matches_new() {
+        let (hook_a, _, _) = StreamingRequestHook::new(Duration::from_secs(60), "req_a");
+        let (hook_b, _, _) =
+            StreamingRequestHook::with_scratchpad_budget(Duration::from_secs(60), "req_b", None);
+        // Both hooks should report no scratchpad budget.
+        assert!(hook_a.scratchpad_budget.is_none());
+        assert!(hook_b.scratchpad_budget.is_none());
+    }
+
+    #[test]
+    fn test_with_scratchpad_budget_stores_budget() {
+        use crate::scratchpad::TiktokenCounter;
+        let counter = Arc::new(TiktokenCounter::default_counter());
+        let budget = ContextBudget::new(128_000, 0.20, 0, counter);
+        let (hook, _, _) = StreamingRequestHook::with_scratchpad_budget(
+            Duration::from_secs(60),
+            "req_with_budget",
+            Some(budget.clone()),
+        );
+        let stored = hook
+            .scratchpad_budget
+            .as_ref()
+            .expect("budget must be stored");
+        // Mutate the original; the hook's clone shares atomics so it sees the change.
+        budget.record_intercepted(123);
+        let (intercepted, _) = stored.scratchpad_usage();
+        assert_eq!(
+            intercepted, 123,
+            "hook's budget must share state with caller's"
+        );
     }
 
     #[test]

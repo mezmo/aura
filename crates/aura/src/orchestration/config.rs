@@ -205,6 +205,11 @@ pub struct WorkerConfig {
     /// math (e.g. scratchpad sizing, LOG-23439).
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+
+    /// Per-worker override of `[agent.scratchpad]`. Parsed from
+    /// `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<crate::scratchpad::ScratchpadConfig>,
 }
 
 // ============================================================================

@@ -75,6 +75,22 @@ pub struct FilesystemTools {
     pub write_file: WriteFileTool,
 }
 
+/// Build a `StreamItem::ScratchpadUsage` for this agent's budget — `None` if
+/// the budget had no activity (no interception, no extraction). Pure decision
+/// helper shared by the single-agent stream tail and the orchestrator's
+/// per-worker emission so both paths stay in lock-step on the gating rule.
+pub(crate) fn scratchpad_usage_event(
+    budget: &crate::scratchpad::ContextBudget,
+    agent_id: &str,
+) -> Option<StreamItem> {
+    let (intercepted, extracted) = budget.scratchpad_usage();
+    (intercepted > 0 || extracted > 0).then(|| StreamItem::ScratchpadUsage {
+        agent_id: agent_id.to_string(),
+        tokens_intercepted: intercepted,
+        tokens_extracted: extracted,
+    })
+}
+
 /// Rig-native agent wrapper using provider-specific agents.
 ///
 /// # Tool Execution Paths
@@ -104,9 +120,98 @@ pub struct Agent {
     /// Configured context window size in tokens (from LLM TOML config).
     /// Used for usage percentage reporting in streaming events.
     pub(crate) context_window: Option<u64>,
+    /// Per-agent scratchpad budget for context tracking.
+    /// Set by orchestration workers (from resolved worker LLM + scratchpad config);
+    /// `None` for coordinator agents and non-scratchpad use.
+    pub(crate) scratchpad_budget: Option<crate::scratchpad::ContextBudget>,
 }
 
 impl Agent {
+    /// Wire up scratchpad for a single-agent config. Skipped in orchestration
+    /// mode (workers build their own per-worker budget in `create_worker()`)
+    /// and when no accessible MCP tool matches a scratchpad threshold.
+    async fn setup_single_agent_scratchpad(
+        config: &mut AgentConfig,
+        mcp_manager: Option<&Arc<McpManager>>,
+    ) -> Result<Option<crate::scratchpad::ContextBudget>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        use crate::scratchpad;
+
+        if config.orchestration_enabled() {
+            return Ok(None);
+        }
+
+        let sp_cfg = match config.agent.scratchpad.as_ref() {
+            Some(sp) if sp.enabled => sp.clone(),
+            _ => return Ok(None),
+        };
+
+        let scratchpad_tool_map = scratchpad::scratchpad_tool_map(config.mcp.as_ref());
+        let accessible_tools = mcp_manager
+            .map(|mgr| mgr.get_available_tool_names())
+            .unwrap_or_default();
+        let filter = config.agent.mcp_filter.as_deref().unwrap_or(&[]);
+        if !scratchpad::has_accessible_scratchpad_tool(
+            &accessible_tools,
+            filter,
+            &scratchpad_tool_map,
+        ) {
+            tracing::info!(
+                "Single-agent scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping"
+            );
+            return Ok(None);
+        }
+
+        // Validation enforces these upstream; re-check here so runtime
+        // misconfiguration fails loudly instead of silently degrading.
+        let context_window = config.llm.context_window().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                "Scratchpad enabled but [agent.llm].context_window is not set".into()
+            },
+        )? as usize;
+        let memory_dir = config
+            .effective_memory_dir()
+            .map(str::to_owned)
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "Scratchpad enabled but `memory_dir` is not set".into()
+            })?;
+
+        let (provider, model) = config.llm.model_info();
+        let token_counter = scratchpad::token_counter_for_provider(provider, model);
+        let initial_used = scratchpad::estimate_scratchpad_overhead(
+            &*token_counter,
+            &accessible_tools,
+            filter,
+            &[],
+        );
+
+        let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            sp_cfg: &sp_cfg,
+            storage_dir: std::path::Path::new(&memory_dir),
+            scratchpad_tool_map,
+            context_window,
+            initial_used,
+            token_counter,
+        })
+        .await?;
+
+        config.tool_wrapper = Some(match config.tool_wrapper.take() {
+            Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                existing,
+                build.wrapper,
+            ])),
+            None => build.wrapper,
+        });
+        config.preamble_override = Some(format!(
+            "{}{}",
+            config.effective_preamble(),
+            scratchpad::SCRATCHPAD_PREAMBLE
+        ));
+        config.scratchpad_tools_config = Some(build.tools_config);
+
+        Ok(Some(build.budget))
+    }
+
     /// Create a new agent from configuration.
     pub async fn new(
         config: &AgentConfig,
@@ -121,9 +226,33 @@ impl Agent {
             None
         };
 
-        // Get max depth for tool calls per turn
-        let max_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-        tracing::info!("  Max turn depth: {} (tool calls per turn)", max_depth);
+        // Clone so setup_single_agent_scratchpad can mutate extension fields
+        // (tool_wrapper, preamble_override, scratchpad_tools_config).
+        let mut config_owned = config.clone();
+        let agent_scratchpad_budget =
+            Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
+        let config = &config_owned;
+
+        // Scratchpad bonus only applies when scratchpad was actually wired up
+        // (enabled + context_window + a matching MCP tool).
+        let base_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = config
+            .scratchpad_tools_config
+            .as_ref()
+            .and(config.agent.scratchpad.as_ref())
+            .map(|sp| sp.turn_depth_bonus)
+            .unwrap_or(0);
+        let max_depth = base_depth + scratchpad_bonus;
+        if scratchpad_bonus > 0 {
+            tracing::info!(
+                "  Max turn depth: {} (base={}, scratchpad_bonus={})",
+                max_depth,
+                base_depth,
+                scratchpad_bonus
+            );
+        } else {
+            tracing::info!("  Max turn depth: {} (tool calls per turn)", max_depth);
+        }
 
         // Ollama fallback: parse tool calls from text output when native tool_call
         // structures aren't used. Requires MCP tools to be available.
@@ -420,6 +549,7 @@ impl Agent {
             fallback_tool_parsing,
             fallback_tool_names,
             context_window: config.llm.context_window(),
+            scratchpad_budget: agent_scratchpad_budget,
         })
     }
 
@@ -561,6 +691,27 @@ impl Agent {
                 tracing::info!("  Adding {} STDIO tools for client group", tools.len());
                 builder_state = builder_state.add_rmcp_tools(tools, client);
             }
+        }
+
+        if let Some(ref scratchpad) = config.scratchpad_tools_config {
+            use crate::scratchpad::{
+                GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool,
+                SchemaTool, SliceTool,
+            };
+            tracing::info!(
+                "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
+            );
+            let s = &scratchpad.storage;
+            let b = &scratchpad.budget;
+            builder_state = builder_state
+                .add_tool(HeadTool::new(s.clone(), b.clone()))
+                .add_tool(SliceTool::new(s.clone(), b.clone()))
+                .add_tool(GrepTool::new(s.clone(), b.clone()))
+                .add_tool(SchemaTool::new(s.clone(), b.clone()))
+                .add_tool(ItemSchemaTool::new(s.clone(), b.clone()))
+                .add_tool(GetInTool::new(s.clone(), b.clone()))
+                .add_tool(IterateOverTool::new(s.clone(), b.clone()))
+                .add_tool(ReadTool::new(s.clone(), b.clone()));
         }
 
         // Add read_artifact tool when orchestration persistence is available
@@ -737,6 +888,24 @@ impl Agent {
         self.maybe_wrap_with_fallback(stream)
     }
 
+    /// Append a final `StreamItem::ScratchpadUsage` if this agent has a
+    /// scratchpad budget with non-zero activity. Mirrors the per-worker event
+    /// the orchestrator emits after each task — the web server handler
+    /// converts this into the `aura.scratchpad_usage` SSE event for the UI.
+    fn append_scratchpad_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let Some(budget) = self.scratchpad_budget.clone() else {
+            return stream;
+        };
+        let tail = futures::stream::once(async move { scratchpad_usage_event(&budget, "main") })
+            .filter_map(|opt| async move { opt.map(Ok) });
+        Box::pin(stream.chain(tail))
+    }
+
     /// Conditionally wrap stream for Ollama text-to-tool parsing.
     ///
     /// When `fallback_tool_parsing` is enabled (Ollama config), this wraps the stream
@@ -809,10 +978,16 @@ impl Agent {
     ) {
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_prompt_with_timeout(query, self.max_depth, timeout, request_id)
+            .stream_prompt_with_timeout(
+                query,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.scratchpad_budget.clone(),
+            )
             .await;
         (
-            self.maybe_wrap_with_fallback(stream),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
             cancel_tx,
             usage_state,
         )
@@ -846,10 +1021,17 @@ impl Agent {
     ) {
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_chat_with_timeout(query, chat_history, self.max_depth, timeout, request_id)
+            .stream_chat_with_timeout(
+                query,
+                chat_history,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.scratchpad_budget.clone(),
+            )
             .await;
         (
-            self.maybe_wrap_with_fallback(stream),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
             cancel_tx,
             usage_state,
         )
@@ -1127,6 +1309,7 @@ impl AgentBuilder {
                         args,
                         env,
                         description,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (STDIO):", name);
                         tracing::info!("  Command: {:?}", cmd);
@@ -1141,6 +1324,7 @@ impl AgentBuilder {
                         headers,
                         description,
                         headers_from_request,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (HTTP Streamable):", name);
                         tracing::info!("  URL: {}", url);
@@ -1194,5 +1378,72 @@ impl AgentBuilder {
         tracing::info!("Agent built successfully with full tool integration");
 
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scratchpad::{ContextBudget, TiktokenCounter};
+
+    fn budget() -> ContextBudget {
+        let counter = Arc::new(TiktokenCounter::default_counter());
+        ContextBudget::new(128_000, 0.20, 0, counter)
+    }
+
+    #[test]
+    fn scratchpad_usage_event_returns_none_when_no_activity() {
+        let b = budget();
+        assert!(scratchpad_usage_event(&b, "main").is_none());
+    }
+
+    #[test]
+    fn scratchpad_usage_event_emits_when_only_intercepted_is_set() {
+        let b = budget();
+        b.record_intercepted(500);
+        let event = scratchpad_usage_event(&b, "main").expect("must emit when intercepted > 0");
+        match event {
+            StreamItem::ScratchpadUsage {
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            } => {
+                assert_eq!(agent_id, "main");
+                assert_eq!(tokens_intercepted, 500);
+                assert_eq!(tokens_extracted, 0);
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scratchpad_usage_event_emits_when_only_extracted_is_set() {
+        let b = budget();
+        b.record_extracted(200);
+        let event = scratchpad_usage_event(&b, "main").expect("must emit when extracted > 0");
+        match event {
+            StreamItem::ScratchpadUsage {
+                tokens_intercepted,
+                tokens_extracted,
+                ..
+            } => {
+                assert_eq!(tokens_intercepted, 0);
+                assert_eq!(tokens_extracted, 200);
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scratchpad_usage_event_uses_provided_agent_id() {
+        let b = budget();
+        b.record_intercepted(1);
+        let event = scratchpad_usage_event(&b, "data-explorer").expect("must emit");
+        match event {
+            StreamItem::ScratchpadUsage { agent_id, .. } => {
+                assert_eq!(agent_id, "data-explorer");
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
     }
 }

@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::orchestration::OrchestratorEvent;
+use crate::scratchpad::ContextBudget;
 use crate::streaming_request_hook::StreamingRequestHook;
 
 // Type aliases for provider-specific completion models
@@ -154,12 +155,14 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        scratchpad_budget: Option<ContextBudget>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let (hook, cancel_tx, usage_state) =
+            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
 
         match self {
             Self::OpenAI(agent) => {
@@ -238,12 +241,14 @@ impl ProviderAgent {
         max_depth: usize,
         timeout: Duration,
         request_id: &str,
+        scratchpad_budget: Option<ContextBudget>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
-        let (hook, cancel_tx, usage_state) = StreamingRequestHook::new(timeout, request_id);
+        let (hook, cancel_tx, usage_state) =
+            StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
 
         match self {
             Self::OpenAI(agent) => {
@@ -336,6 +341,20 @@ pub enum StreamItem {
     TurnUsage(Usage),
     /// Orchestrator status event (plan progress, task status, etc.)
     OrchestratorEvent(OrchestratorEvent),
+    /// Per-agent scratchpad usage report.
+    ///
+    /// Emitted after an agent (single-agent or orchestration worker) finishes
+    /// with scratchpad activity. The web server handler converts this to an
+    /// `aura.scratchpad_usage` SSE event, filling in correlation context from
+    /// the request.
+    ScratchpadUsage {
+        /// The agent that produced this usage (worker name, "main", etc.).
+        agent_id: String,
+        /// Tokens of raw tool output diverted to scratchpad.
+        tokens_intercepted: usize,
+        /// Tokens extracted from scratchpad back into context.
+        tokens_extracted: usize,
+    },
 }
 
 /// Final response information.

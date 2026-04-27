@@ -388,8 +388,9 @@ impl Orchestrator {
         // by spawn_tool_event_forwarder in factory.rs when the stream starts.
         let (tool_call_observer, _rx) = ToolCallObserver::new(32);
 
-        // Initialize execution persistence for debugging and retry intelligence
-        let persistence = if let Some(memory_dir) = orchestration_config.memory_dir() {
+        // Initialize execution persistence for debugging and retry intelligence.
+        let effective_memory_dir = agent_config.effective_memory_dir();
+        let persistence = if let Some(memory_dir) = effective_memory_dir {
             tracing::info!(
                 "Orchestrator: Initializing execution persistence at: {}",
                 memory_dir
@@ -410,7 +411,7 @@ impl Orchestrator {
         let journal_enabled = std::env::var("AURA_PROMPT_JOURNAL")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let prompt_journal = if orchestration_config.memory_dir().is_some() {
+        let prompt_journal = if effective_memory_dir.is_some() {
             let guard = persistence.lock().await;
             let run_id = guard.run_id().to_string();
             let run_path = guard.run_path().to_path_buf();
@@ -480,7 +481,7 @@ impl Orchestrator {
         use super::persistence_wrapper::PersistenceWrapper;
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
 
-        // Build tool wrapper: observer + duplicate guard + persistence
+        // Build base tool wrappers: observer + duplicate guard + persistence
         let persistence_wrapper = Arc::new(PersistenceWrapper::new(self.persistence.clone()));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
             self.tool_call_observer.clone(),
@@ -494,12 +495,6 @@ impl Orchestrator {
             block,
             escalation_flag.clone(),
         ));
-        // Observer first (emits start), then duplicate guard, then persistence (captures reasoning)
-        let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(vec![
-            observer_wrapper,
-            duplicate_guard,
-            persistence_wrapper,
-        ]));
 
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
@@ -511,6 +506,89 @@ impl Orchestrator {
         {
             worker_config.llm = override_llm.clone();
         }
+
+        // Per-worker scratchpad override falls back to [agent.scratchpad].
+        // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
+        // workers never share a budget.
+        let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
+        let effective_scratchpad = worker_cfg
+            .and_then(|w| w.scratchpad.as_ref())
+            .or(self.agent_config.agent.scratchpad.as_ref())
+            .cloned();
+
+        let mut scratchpad_tools = Vec::<Arc<dyn ToolWrapper>>::new();
+        if let Some(ref sp_cfg) = effective_scratchpad
+            && sp_cfg.enabled
+        {
+            let scratchpad_tool_map =
+                crate::scratchpad::scratchpad_tool_map(self.agent_config.mcp.as_ref());
+            let worker_filter = worker_cfg.map(|w| w.mcp_filter.as_slice()).unwrap_or(&[]);
+            let accessible_tools = self
+                .mcp_manager
+                .as_ref()
+                .map(|m| m.get_available_tool_names())
+                .unwrap_or_default();
+            let has_matching_tool = crate::scratchpad::has_accessible_scratchpad_tool(
+                &accessible_tools,
+                worker_filter,
+                &scratchpad_tool_map,
+            );
+
+            if !has_matching_tool {
+                tracing::info!(
+                    "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping",
+                    task_id
+                );
+            } else if let Some(ctx_window) = worker_config.llm.context_window() {
+                let (provider, model) = worker_config.llm.model_info();
+                let token_counter = crate::scratchpad::token_counter_for_provider(provider, model);
+                let worker_preamble = worker_cfg.map(|w| w.preamble.as_str()).unwrap_or("");
+                let initial_used = crate::scratchpad::estimate_scratchpad_overhead(
+                    &*token_counter,
+                    &accessible_tools,
+                    worker_filter,
+                    &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
+                );
+
+                // Hold the persistence lock only long enough to copy iteration_path
+                // (sync method). Drop the guard before any .await on storage.
+                let iter_dir = {
+                    let persistence = self.persistence.lock().await;
+                    persistence.iteration_path()
+                };
+
+                let build =
+                    crate::scratchpad::build_scratchpad(crate::scratchpad::ScratchpadBuildInputs {
+                        sp_cfg,
+                        storage_dir: &iter_dir,
+                        scratchpad_tool_map,
+                        context_window: ctx_window as usize,
+                        initial_used,
+                        token_counter,
+                    })
+                    .await?;
+
+                scratchpad_tools.push(build.wrapper);
+                worker_config.scratchpad_tools_config = Some(build.tools_config);
+            } else {
+                tracing::warn!(
+                    "Worker {}: scratchpad enabled but context_window unset on effective LLM; skipping",
+                    task_id
+                );
+            }
+        }
+
+        // ComposedWrapper applies transform_output in reverse-list order, so
+        // the LAST entry runs FIRST on the raw tool output. Persistence must
+        // see raw output (for debugging/retry), so it goes last. Scratchpad
+        // also needs raw output — persistence's transform_output is a
+        // passthrough that just caches the raw — and rewrites to the pointer.
+        // Duplicate-guard and observer then see the pointer, which is what
+        // should surface to the LLM/UI.
+        let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
+        wrappers.extend(scratchpad_tools);
+        wrappers.push(persistence_wrapper);
+        let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
 
         // Configure worker based on assignment
         if let Some(name) = worker_name {
@@ -587,14 +665,38 @@ impl Orchestrator {
         // Disable orchestration in worker config to avoid nested orchestration
         worker_config.orchestration = None;
 
-        // Per-worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH
-        let resolved_depth = worker_name
+        // Resolution order: worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH.
+        // Scratchpad bonus only applies when scratchpad was actually wired up.
+        let base_depth = worker_name
             .and_then(|name| self.config.workers.get(name))
             .and_then(|w| w.turn_depth)
             .or(self.agent_config.agent.turn_depth)
             .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = worker_config
+            .scratchpad_tools_config
+            .as_ref()
+            .and(effective_scratchpad.as_ref())
+            .map(|sp| sp.turn_depth_bonus)
+            .unwrap_or(0);
+        let resolved_depth = base_depth + scratchpad_bonus;
         worker_config.agent.turn_depth = Some(resolved_depth);
-        tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
+        if scratchpad_bonus > 0 {
+            tracing::info!(
+                "Worker {} turn_depth={} (base={}, scratchpad_bonus={})",
+                task_id,
+                resolved_depth,
+                base_depth,
+                scratchpad_bonus
+            );
+        } else {
+            tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
+        }
+
+        if worker_config.scratchpad_tools_config.is_some()
+            && let Some(ref mut preamble) = worker_config.preamble_override
+        {
+            preamble.push_str(crate::scratchpad::SCRATCHPAD_PREAMBLE);
+        }
 
         tracing::debug!(
             "Worker {} config: preamble length = {} chars, mcp_filter = {:?}",
@@ -629,6 +731,10 @@ impl Orchestrator {
             fallback_tool_parsing: false,
             fallback_tool_names: vec![],
             context_window: worker_config.llm.context_window(),
+            scratchpad_budget: worker_config
+                .scratchpad_tools_config
+                .as_ref()
+                .map(|sp| sp.budget.clone()),
         };
 
         Ok(AgentWithPreamble {
@@ -761,6 +867,10 @@ impl Orchestrator {
                         usage.input_tokens += turn.input_tokens;
                         usage.output_tokens += turn.output_tokens;
                         usage.total_tokens += turn.total_tokens;
+                        // Feed LLM ground-truth into the worker's per-agent scratchpad budget
+                        if let Some(ref budget) = agent.scratchpad_budget {
+                            budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                        }
                     }
                     Err(e) => return Err(e),
                     _ => {} // ToolCall, ToolCallDelta, ToolResult — rig handles execution
@@ -1779,7 +1889,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Load and inject session history from prior runs
         if self.config.session_history_turns() > 0
-            && let Some(memory_dir) = self.config.memory_dir()
+            && let Some(memory_dir) = self.agent_config.effective_memory_dir()
         {
             let persistence = self.persistence.lock().await;
             if let Some(session_id) = persistence.session_id() {
@@ -1845,6 +1955,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
                 context_window: None,
+                scratchpad_budget: None,
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1894,6 +2005,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
                 context_window: None,
+                scratchpad_budget: None,
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1943,6 +2055,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
                 context_window: None,
+                scratchpad_budget: None,
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2791,6 +2904,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             &worker_prompt,
         );
 
+        // initial_used only counts templates + tool schemas, so bill the
+        // per-task prompt here.
+        if let Some(ref budget) = worker.scratchpad_budget {
+            let task_prompt_tokens = budget.count_tokens(&worker_prompt);
+            budget.record_usage(task_prompt_tokens);
+            tracing::debug!(
+                "Task {}: task prompt ~{} tokens recorded in budget",
+                task_id,
+                task_prompt_tokens
+            );
+        }
+
         // Execute the task (workers get context from the task prompt, not conversation history)
         let result = self
             .stream_and_forward(
@@ -2819,6 +2944,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
             self.usage_state
                 .accumulate_usage(response.usage.input_tokens, response.usage.output_tokens);
+        }
+
+        // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
+        if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
+            let agent_id = worker_name
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| self.orchestrator_id.clone());
+            if let Some(event) = crate::builder::scratchpad_usage_event(budget, &agent_id) {
+                let _ = tx.send(Ok(event)).await;
+            }
         }
 
         // Detect context overflow in worker and provide actionable message
@@ -4500,6 +4635,7 @@ mod tests {
                 vector_stores: vec![],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
         workers.insert(
@@ -4511,6 +4647,7 @@ mod tests {
                 vector_stores: vec![],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 
@@ -4826,6 +4963,7 @@ Provide the synthesized response:"#,
                 vector_stores: vec![], // No RAG for operations
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
         workers.insert(
@@ -4837,6 +4975,7 @@ Provide the synthesized response:"#,
                 vector_stores: vec!["mezmo_docs".to_string()], // RAG access
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 
@@ -4900,6 +5039,7 @@ Provide the synthesized response:"#,
                 vector_stores: vec!["docs".to_string()],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 
@@ -4913,6 +5053,7 @@ Provide the synthesized response:"#,
                 vector_stores: vec!["kb".to_string(), "runbooks".to_string()],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 
@@ -4926,6 +5067,7 @@ Provide the synthesized response:"#,
                 vector_stores: vec![], // Explicitly no RAG access
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 
@@ -5058,6 +5200,7 @@ Provide the synthesized response:"#,
                 vector_stores: vec!["worker_store".to_string()],
                 turn_depth: None,
                 llm: None,
+                scratchpad: None,
             },
         );
 

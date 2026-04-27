@@ -80,6 +80,15 @@ pub mod server_urls {
         std::env::var("AURA_SERVER_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
     });
 
+    /// Single-agent aura web server URL. Used by the scratchpad integration
+    /// suite to exercise the single-agent path side-by-side with the
+    /// orchestration path. Defaults to localhost:8081 for local development.
+    /// Override with AURA_SINGLE_AGENT_SERVER_URL env var for container testing.
+    pub static AURA_SINGLE_AGENT_SERVER: LazyUrl = LazyUrl::new(|| {
+        std::env::var("AURA_SINGLE_AGENT_SERVER_URL")
+            .unwrap_or_else(|_| "http://localhost:8081".to_string())
+    });
+
     /// MCP cancellation test server URL. Defaults to localhost:9998.
     /// Override with MCP_SERVER_URL env var for container testing.
     pub static MCP_SERVER: LazyUrl = LazyUrl::new(|| {

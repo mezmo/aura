@@ -329,6 +329,44 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools this worker can use |
 | `vector_stores` | list | `[]` | Named vector stores this worker has access to |
 | `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
+| `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
+| `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
+
+### Scratchpad (Context Window Management)
+
+Scratchpad intercepts large MCP tool outputs and stores them on disk so the LLM can selectively explore them via eight read-only tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) rather than pushing the entire payload into context.
+
+Scratchpad works in both single-agent and orchestration modes. Configure at `[agent.scratchpad]` (applies to the single agent, or provides defaults for orchestration workers) and optionally override per worker at `[orchestration.worker.<name>.scratchpad]`. Set a top-level `memory_dir` for persistence:
+
+```toml
+# Top-level — required when scratchpad is enabled. Shared by single-agent
+# scratchpad and orchestration persistence.
+memory_dir = "/tmp/aura"
+
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.20          # 20% of context reserved for reasoning/output
+max_extraction_tokens = 10_000        # cap per extraction tool call
+turn_depth_bonus = 6                  # extra ReAct turns when scratchpad is active
+
+[orchestration.worker.data-explorer.scratchpad]
+# Override just for this worker
+max_extraction_tokens = 5_000
+```
+
+**Storage location**:
+- Single-agent: `{memory_dir}/scratchpad/`
+- Orchestration: `{memory_dir}/{run_id}/iteration-{n}/scratchpad/` (legacy `[orchestration.artifacts].memory_dir` still works as a fallback)
+
+Per-tool interception thresholds are configured at `[mcp.servers.<server>.scratchpad]` (keyed by glob pattern on tool name):
+
+```toml
+[mcp.servers.k8s-sre.scratchpad]
+"*_list_*"                  = { min_tokens = 512 }
+"k8s_list_service_monitors" = { min_tokens = 384 }
+```
+
+Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
 
 ### Ollama
 
