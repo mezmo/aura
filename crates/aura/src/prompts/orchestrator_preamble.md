@@ -20,6 +20,8 @@ You are a coordinator agent in a multi-agent orchestration system. Your role is 
 
 {{recon_guidance}}
 
+{{memory_guidance}}
+
 ## Task Description Quality
 
 When writing task descriptions for `create_plan`, **fully resolve all conversational references**. Workers do NOT see the conversation history. Replace:

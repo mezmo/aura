@@ -1,4 +1,6 @@
-# CLAUDE.md - Project Documentation
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Overview
 Aura is a TOML-based configuration system for composing Rig.rs AI agents with MCP tools and RAG pipelines.
@@ -17,11 +19,17 @@ All major features complete:
 
 ---
 
-## Quick Start
+## Build and Development Commands
 
 ```bash
 # Build
+cargo build --workspace
 cargo build --release
+
+# Lint and format
+make lint           # cargo clippy --all-targets --all-features -- -D warnings
+make fmt            # cargo fmt --all
+make fmt-check      # cargo fmt --all -- --check
 
 # Start web server (default config.toml)
 cargo run --bin aura-web-server
@@ -35,11 +43,55 @@ cargo run -p aura-cli -- --api-url http://localhost:8080
 # Build and run CLI (standalone mode — no server needed)
 cargo run -p aura-cli --features standalone-cli -- --standalone --config configs/my-agent.toml
 
-# Run integration tests (local, requires Docker)
-make test-integration-local                        # base integration
-make test-integration-orchestration-local          # orchestration integration
-make test-integration-sre-orchestration-local      # SRE orchestration integration
+# Debug loaded configs
+cargo run -p aura-config --bin debug_config -- path/to/configs/
 ```
+
+## Testing
+
+### Unit Tests
+
+```bash
+# All crates
+cargo test --workspace
+
+# Single crate
+cargo test -p aura
+cargo test -p aura-web-server
+cargo test -p aura-config
+cargo test -p aura-events
+cargo test -p aura-cli
+
+# Filter by test name within a crate
+cargo test -p aura <test_name_substring>
+```
+
+### Integration Tests (requires Docker)
+
+Integration tests **must use `--test-threads=1`** — suites share a server and are order-sensitive.
+
+```bash
+# Full suites via Make (handles Docker Compose lifecycle automatically)
+make test-integration-local                        # base integration (streaming, MCP, events, cancellation, progress)
+make test-integration-orchestration-local          # orchestration (math-mcp)
+make test-integration-sre-orchestration-local      # SRE orchestration
+
+# Manual: start infrastructure, run specific suite, tear down
+make test-integration-local-up
+cargo test --package aura-web-server --features integration-streaming --no-fail-fast -- --test-threads=1
+cargo test --package aura-web-server --features integration-mcp --no-fail-fast -- --test-threads=1
+cargo test --package aura-web-server --features integration-events --no-fail-fast -- --test-threads=1
+cargo test --package aura-web-server --features integration-cancellation --no-fail-fast -- --test-threads=1
+cargo test --package aura-web-server --features integration-progress --no-fail-fast -- --test-threads=1
+make test-integration-local-down
+
+# Orchestration suites use their own infra
+make test-integration-orchestration-local-up
+cargo test --package aura-web-server --features integration-orchestration --no-fail-fast -- --test-threads=1
+make test-integration-orchestration-local-down
+```
+
+Integration test files live in `crates/aura-web-server/tests/`.
 
 ## Project Structure
 
@@ -55,145 +107,117 @@ aura/
 ├── compose/                  # Docker Compose (integration + orchestration overlays)
 ├── configs/                  # E2E test and orchestration configurations
 ├── deployment/               # Helm charts and K8s manifests
-├── development/              # LibreChat and OpenWebUI setup
 ├── docs/                     # Architecture and protocol documentation
-├── examples/                 # Example and reference configurations
-├── scripts/                  # CI and utility scripts
 └── e2e-eval/                 # E2E eval scripts and results (gitignored)
-```
-
-## Key Features
-
-### Configuration System
-- TOML-based declarative configuration
-- Environment variable resolution (`{{ env.VAR }}`)
-- Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama)
-- Dynamic tool registration
-
-### MCP Integration
-- **HTTP Transport**: Full authentication and tool execution
-- **SSE Transport**: AWS Knowledge Base integration
-- **STDIO Transport**: Tool discovery
-- **Header Forwarding**: `headers_from_request` mappings with static TOML `headers` as fallback
-- **Cancellation**: `notifications/cancelled` propagation on client disconnect
-
-### Streaming
-- OpenAI-compatible SSE streaming (`/v1/chat/completions`)
-- Custom `aura.*` events (opt-in via `AURA_CUSTOM_EVENTS=true`):
-  - `aura.session_info`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`
-- Request cancellation on timeout or client disconnect
-- Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
-
-### Orchestration (Multi-Agent)
-- Coordinator/worker architecture with DAG-based parallel task execution
-- Dependency-aware multi-wave execution with quality evaluation
-- Iterative re-planning loops (`quality_threshold`, `max_planning_cycles`)
-- Three-way routing: direct answer, orchestrated plan, clarification
-- 11 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
-
-### CLI (`aura-cli`)
-- Interactive terminal client with REPL, one-shot mode, and conversation persistence
-- **Two backends:** HTTP mode (default) and standalone mode (`--standalone --config`, builds agents in-process)
-- Standalone mode requires `--features standalone-cli` at build time and explicit `--standalone` flag at runtime
-- `--model` works in both modes: HTTP passes it as starting model; standalone matches against agent.name/agent.alias in configs
-- `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for Aura vs OpenAI-compatible service
-- `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
-- Local tool execution: Shell, Read, ListFiles, Update, SearchFiles, FindFiles, FileInfo
-- Permission system (`.aura/settings.json`) with allow/deny glob rules
-- `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
-- Env vars: `AURA_API_URL`, `AURA_API_KEY`, `AURA_MODEL`, `AURA_EXTRA_HEADERS`
-- SSE event parsing uses shared types from `aura-events` crate (not in `default-members`, build explicitly with `cargo build -p aura-cli`)
-- See `crates/aura-cli/README.md` for full documentation
-
-### Shared Event Types (`aura-events`)
-- Lightweight crate defining `AuraStreamEvent` and `OrchestrationStreamEvent` enums
-- Both `Serialize + Deserialize` — used by the web server (producer) and CLI (consumer)
-- No agent, MCP, or provider dependencies — only `serde` and `serde_json`
-- `ProgressToken` type uses a local wire-compatible definition by default; enables `rmcp-types` feature for direct rmcp interop (used by the `aura` crate)
-
-## Environment Setup
-
-```bash
-export OPENAI_API_KEY="your-key"
-export ANTHROPIC_API_KEY="your-key"  # Optional
-export MEZMO_API_KEY="your-key"       # For Mezmo MCP
-export AWS_PROFILE="your-profile"     # For Knowledge Base
-export AWS_REGION="your-region"       # For Knowledge Base
 ```
 
 ## Architecture
 
-### Dependencies
-- **rig-core 0.28**: ProviderAgent architecture (via fork for StreamingPromptHook fix)
-- **rmcp 0.12**: MCP client with cancellation support
-- **Rig Fork**: `mezmo/rig` branch `mshearer/LOG-23351-openai-reasoning`
+### Agent Construction Pipeline
 
-### Key Modules
-- `provider_agent.rs` - Type-erased streaming across providers
-- `stream_events.rs` - Custom aura SSE events
-- `request_cancellation.rs` - Request lifecycle management
-- `tool_event_broker.rs` - FIFO queue for tool_call_id correlation (see critical assumption below)
-- `orchestration/` - Multi-agent coordinator, workers, DAG execution, orchestration SSE events
+```
+AgentConfig (TOML)
+    ↓
+AgentBuilder (aura-config resolves env vars, loads MCP tool lists)
+    ↓ (adds tools: filesystem, RAG, MCP)
+Agent (wraps ProviderAgent)
+    ↓ implements StreamingAgent
+Used by: aura-web-server or aura-cli standalone
+```
+
+When `orchestration.enabled = true`, an `Orchestrator` is built instead of `Agent` — both implement `StreamingAgent` so the web server treats them identically.
+
+### Streaming Data Flow
+
+The web server emits two interleaved SSE streams over a single HTTP response:
+- **OpenAI-compatible chunks** — `data: {"choices":[...]}` for token-by-token text
+- **`aura.*` events** — opt-in via `AURA_CUSTOM_EVENTS=true`
+
+Internally, `StreamItem` is the semantic unit (not SSE bytes). `crates/aura-web-server/src/streaming/handlers.rs` converts `StreamItem` variants into SSE chunks.
+
+### Key Modules (crates/aura/src/)
+
+- `builder.rs` — Agent construction, provider routing
+- `mcp.rs` — `McpManager`: tool discovery and execution across HTTP/SSE/STDIO transports
+- `provider_agent.rs` — Type-erased streaming across OpenAI/Anthropic/Bedrock/Ollama
+- `stream_events.rs` — `AuraStreamEvent` enum and SSE formatting
+- `streaming_request_hook.rs` — Rig hook capturing usage tokens
+- `tool_event_broker.rs` — FIFO queue correlating `tool_call_id` between hook and MCP contexts
+- `request_cancellation.rs` — Client disconnect → MCP `notifications/cancelled`
+- `orchestration/orchestrator.rs` — Multi-agent coordinator (252KB, central to orchestration)
+- `openinference_exporter.rs` — OTEL Phoenix span generation
 
 ### Critical Assumption: Rig Sequential Tool Execution
 
-The `tool_event_broker` uses a FIFO queue for correlating `tool_call_id` between hook and MCP execution contexts. **This relies on Rig 0.28 streaming mode executing tools sequentially.**
+`tool_event_broker` uses a FIFO queue for `tool_call_id` correlation. **This relies on Rig 0.28 executing tools sequentially** (not in parallel). If upgrading Rig, verify by checking `rig-core/src/agent/prompt_request/streaming.rs` for `.await` between `on_tool_call` and `on_tool_result`. See `docs/rig-tool-execution-order.md`.
 
-**If upgrading Rig**, verify this assumption by reviewing:
-- `rig-core/src/agent/prompt_request/streaming.rs`
-- Look for `.await` between `on_tool_call` and `on_tool_result` (ensures sequential)
-- Check for `FuturesUnordered` or parallel execution patterns (would break FIFO)
+### Orchestration (Multi-Agent)
 
-Confirmed sequential as of Rig 0.28: the streaming handler `.await`s each tool call inline. See `docs/rig-tool-execution-order.md`.
+- **Coordinator** decomposes the query into a plan via routing tools (CreatePlan, RespondDirectly, RequestClarification)
+- **Workers** execute tasks in dependency-ordered waves; results feed back to coordinator
+- **Re-planning**: iterative loop controlled by `quality_threshold` + `max_planning_cycles`
+- **Events**: 11 `aura.orchestrator.*` SSE events; see `docs/streaming-api-guide.md`
 
-## CI/CD
+### aura-events Crate
 
-**Status**: Jenkins/Makefile complete, Helm charts and K8s manifests in `deployment/`
+Lightweight shared types (`AuraStreamEvent`, `OrchestrationStreamEvent`) with only `serde` dependencies — no agent/MCP/provider deps. Allows `aura-cli` to consume events without pulling in the full agent stack. Enable `rmcp-types` feature for zero-copy rmcp interop (used by the `aura` crate internally).
+
+### aura-cli Notes
+
+- Not in workspace `default-members` — must build explicitly: `cargo build -p aura-cli`
+- Standalone mode requires `--features standalone-cli` at build time AND `--standalone` at runtime
+- `--model` and `--system-prompt` work in both HTTP and standalone modes (with different semantics)
+
+## Environment Variables
 
 ```bash
-make build          # Build release binary
-make test           # Run all tests
-make docker-build   # Build Docker image
-make lint           # Run clippy + fmt check
+# LLM providers
+export OPENAI_API_KEY="your-key"
+export ANTHROPIC_API_KEY="your-key"
+export MEZMO_API_KEY="your-key"       # For Mezmo MCP
+export AWS_PROFILE="your-profile"     # For Knowledge Base
+export AWS_REGION="your-region"
+
+# Server behavior
+export AURA_CUSTOM_EVENTS=true        # Emit aura.* SSE events alongside OpenAI chunks
+export AURA_EMIT_REASONING=true       # Emit aura.reasoning events (Anthropic extended thinking)
+export TOOL_RESULT_MODE=aura          # Tool result format: none | open-web-ui | aura
+export SHUTDOWN_TIMEOUT_SECS=30       # Grace period for in-flight streams on shutdown
+
+# CLI
+export AURA_API_URL=http://localhost:8080
+export AURA_API_KEY="your-key"
+export AURA_MODEL="gpt-4o"
+export AURA_EXTRA_HEADERS="X-Custom: value"
 ```
 
-## E2E Eval
+## Dependencies
 
-The `e2e-eval/` directory contains scripts for running E2E orchestration tests against the math-MCP setup.
+- **rig-core 0.28**: ProviderAgent architecture (Mezmo fork: `mezmo/rig` branch `mshearer/LOG-23351-openai-reasoning`)
+- **rmcp 0.12**: MCP client with cancellation support
+- **Rust edition 2024**, workspace resolver 3
+
+## E2E Eval
 
 ```bash
 # Prerequisites: cargo build --release, llama-server on 11435 (for local models)
 
-# Multi-turn session E2E (dependent prompts, session history injection)
+# Multi-turn session E2E
 PROMPT_SET=dependent ./e2e-eval/run-session-e2e.sh \
   configs/math-orchestration-opus-bedrock.toml \
   configs/math-orchestration-glm.toml
 
-# Single-turn model comparison (multiple iterations, timing stats)
+# Single-turn model comparison
 ./e2e-eval/run-model-comparison.sh 3 \
   configs/math-orchestration-glm.toml \
   configs/math-orchestration-qwen3.toml
-
-# Analyze session persistence artifacts
-python3 e2e-eval/analyze-session-history-eval.py \
-  --memory-dir /tmp/aura-math-opus-bedrock \
-  --session-id session_e2e_<ts>_opus-bedrock
-
-# Parse SSE captures from comparison runs
-python3 e2e-eval/parse-results.py e2e-eval/results-<timestamp>
 ```
-
-Scripts auto-start math-mcp and cycle the aura server per config. Model name derived from config filename. Results output to gitignored `session-results-*/` and `results-*/` dirs.
-
-Per-model configs live in `configs/math-orchestration-*.toml`. Local llama-server model aliases use `-p<N>` suffix for parallel slot profiles (e.g., `glm-64k-p6`, `qwen35-64k-p3`).
 
 ## Documentation
 
-- `README.md` - User-facing documentation
-- `crates/aura-cli/README.md` - CLI usage, backends, features, and build instructions
-- `CHANGELOG.md` - Auto-generated version history
-- `docs/streaming-api-guide.md` - SSE streaming, custom events, and orchestration events
-- `docs/ollama-guide.md` - Ollama configuration, fallback tool parsing, and local model guidance
-- `docs/request-lifecycle.md` - Request flow, lifecycle, timeout, cancellation, and shutdown
-- `docs/rig-tool-execution-order.md` - Tool execution order analysis
-- `docs/rig-fork-changes.md` - Rig fork changes and rationale
+- `docs/streaming-api-guide.md` — SSE streaming, custom events, orchestration events
+- `docs/ollama-guide.md` — Ollama config, fallback tool parsing, local model guidance
+- `docs/request-lifecycle.md` — Request flow, timeout, cancellation, shutdown
+- `docs/rig-tool-execution-order.md` — Tool execution order analysis
+- `docs/rig-fork-changes.md` — Rig fork changes and rationale
+- `crates/aura-cli/README.md` — CLI usage, backends, features, build instructions

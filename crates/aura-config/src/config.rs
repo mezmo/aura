@@ -88,6 +88,38 @@ impl Default for ArtifactsConfig {
     }
 }
 
+/// MemoryFS configuration for orchestration (aura-config side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub root_dir: Option<String>,
+    #[serde(default = "default_max_read_bytes")]
+    pub max_read_bytes: usize,
+    #[serde(default = "default_max_search_results")]
+    pub max_search_results: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root_dir: None,
+            max_read_bytes: default_max_read_bytes(),
+            max_search_results: default_max_search_results(),
+        }
+    }
+}
+
+fn default_max_read_bytes() -> usize {
+    65_536
+}
+
+fn default_max_search_results() -> usize {
+    50
+}
+
 /// Configuration for orchestration mode.
 ///
 /// Uses custom deserialization for backward compatibility with flat field format.
@@ -108,6 +140,7 @@ pub struct OrchestrationConfig {
     pub max_consecutive_duplicate_tool_calls: Option<usize>,
     pub timeouts: TimeoutsConfig,
     pub artifacts: ArtifactsConfig,
+    pub memory: MemoryConfig,
 }
 
 impl Default for OrchestrationConfig {
@@ -128,6 +161,7 @@ impl Default for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: None,
             timeouts: TimeoutsConfig::default(),
             artifacts: ArtifactsConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -166,6 +200,8 @@ struct RawOrchestrationConfig {
     timeouts: Option<TimeoutsConfig>,
     #[serde(default)]
     artifacts: Option<ArtifactsConfig>,
+    #[serde(default)]
+    memory: Option<MemoryConfig>,
     // Flat artifact fields (backward compat)
     #[serde(default, alias = "memory_path")]
     memory_dir: Option<String>,
@@ -185,6 +221,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         let raw = RawOrchestrationConfig::deserialize(deserializer)?;
 
         let timeouts = raw.timeouts.unwrap_or_default();
+        let memory = raw.memory.unwrap_or_default();
 
         let mut artifacts = raw.artifacts.unwrap_or_default();
         if let Some(v) = raw.memory_dir {
@@ -216,6 +253,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_consecutive_duplicate_tool_calls: raw.max_consecutive_duplicate_tool_calls,
             timeouts,
             artifacts,
+            memory,
         })
     }
 }

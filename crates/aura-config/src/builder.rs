@@ -213,6 +213,12 @@ impl RigBuilder {
                     result_summary_length: orch.artifacts.result_summary_length,
                     session_history_turns: orch.artifacts.session_history_turns,
                 },
+                memory: aura::orchestration::MemoryConfig {
+                    enabled: orch.memory.enabled,
+                    root_dir: orch.memory.root_dir.clone(),
+                    max_read_bytes: orch.memory.max_read_bytes,
+                    max_search_results: orch.memory.max_search_results,
+                },
             }
         });
 

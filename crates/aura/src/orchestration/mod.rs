@@ -43,6 +43,8 @@
 mod config;
 mod duplicate_call_guard;
 mod events;
+mod memory_fs;
+mod memory_writer;
 mod observer_wrapper;
 mod orchestrator;
 mod persistence;
@@ -55,7 +57,8 @@ pub mod tools;
 mod types;
 
 pub use config::{
-    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
+    ArtifactsConfig, MemoryConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility,
+    WorkerConfig,
 };
 pub use events::{OrchestratorEvent, RoutingMode};
 pub use observer_wrapper::ObserverWrapper;

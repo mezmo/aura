@@ -144,3 +144,34 @@ turn_depth = 5
 # in aura.session_info streaming events. Set this to your model's
 # actual context window.
 # context_window = 200000
+
+# ── Orchestration ──────────────────────────────────────────────────
+# [orchestration]
+# enabled = true
+# max_planning_cycles = 3
+# quality_threshold = 0.8
+# tools_in_planning = "summary"
+# allow_direct_answers = true
+# allow_clarification = true
+
+# Raw run manifests, task artifacts, prompt journals, and session history.
+# [orchestration.artifacts]
+# memory_dir = "/tmp/aura-orchestration"
+# result_artifact_threshold = 4000
+# result_summary_length = 2000
+# session_history_turns = 3
+
+# Durable Markdown memory over a mounted filesystem path. This is VFS agnostic:
+# local disk, Archil, NFS, Docker volumes, and Kubernetes PVCs all look like paths
+# to Aura. To use Archil, mount it first, then point root_dir or memory_dir at it.
+# [orchestration.memory]
+# enabled = true
+# root_dir = "/mnt/archil/aura-memory"
+# max_read_bytes = 65536
+# max_search_results = 50
+
+# [orchestration.worker.operations]
+# description = "Operational analysis and diagnostics"
+# preamble = "You are an operations specialist."
+# mcp_filter = ["ops_*"]
+# vector_stores = []
