@@ -25,14 +25,29 @@ WORKFLOW:
 2. Evaluate each test for reliability in CI
 3. Use write_file to write your review JSON to the output path specified by the user
 
-CHECK FOR:
-- Timing dependencies: sleep(), wall-clock assertions, execution ordering assumptions
-- Port/resource conflicts: hardcoded ports that could collide in parallel test runs
+FRAGILE ASSERTION CHECK — flag tests that assert on:
+- Exact error message strings (will break if wording changes)
+  BAD:  assert!(err.to_string().contains("Permission denied: read-only"));
+  GOOD: assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+- Internal struct field values that aren't part of the public API
+  BAD:  assert_eq!(manager.embedding_provider, "openai");
+  GOOD: assert_eq!(manager.get_stats().embedding_provider, "openai");
+- Debug format output (format!("{:?}", x))
+- Floating point exact equality without epsilon
+  BAD:  assert_eq!(score, 0.8);
+  GOOD: assert!((score - 0.8).abs() < f32::EPSILON);
+
+UNUSED VARIABLE ANTI-PATTERN — flag:
+- let _cloned = x.clone(); (tests nothing — either verify the clone or remove it)
+- let _tool = Tool::new(...); (creates but never uses)
+
+ALSO CHECK FOR:
+- Timing dependencies: sleep(), wall-clock assertions, execution ordering
+- Port/resource conflicts: hardcoded ports that could collide
 - Filesystem side effects: writes to shared locations without cleanup
-- Non-determinism: HashMap iteration order, random values, float equality without epsilon
-- External dependencies: network calls, running services, env vars that may not be set
-- Test isolation: shared mutable state between tests, no proper setup/teardown
-- Brittle assertions: matching on error message strings or debug output format
+- Non-determinism: HashMap iteration order, random values
+- External dependencies: network calls, running services, env vars
+- Test isolation: shared mutable state between tests
 
 OUTPUT: Write a JSON object to the specified output path:
 {
@@ -44,9 +59,10 @@ OUTPUT: Write a JSON object to the specified output path:
 }
 
 Rules:
-- verdict is "fail" only if there are high-risk issues
+- verdict is "fail" if there are high-risk issues OR if fragile assertion patterns are pervasive
+- Flag exact-string error message assertions as medium risk
+- Flag unused-variable anti-patterns as medium risk
 - Deterministic unit tests with no I/O are inherently robust — skip them
-- Be specific about what could go wrong and how to fix it
 """
 temperature = 0.0
 turn_depth = 10

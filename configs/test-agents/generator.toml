@@ -28,35 +28,58 @@ WORKFLOW:
 3. Analyze every public function, struct, enum, impl block, and trait implementation
 4. Use write_file to write complete test code to the output path specified by the user
 
+ASSERTION RULES — this is the most important section:
+- NEVER write assert!(result.is_ok()) alone. ALWAYS unwrap and verify the content:
+  BAD:  assert!(result.is_ok());
+  GOOD: let value = result.unwrap();
+        assert_eq!(value, "expected content");
+- NEVER write assert!(result.is_err()) alone. ALWAYS verify the error type/message:
+  BAD:  assert!(result.is_err());
+  GOOD: let err = result.unwrap_err();
+        assert!(matches!(err, SpecificError::Variant(_)));
+- Every test must verify BEHAVIOR, not just that code runs without panicking
+- Ask yourself: "If I changed a key constant or flipped a boolean in the source,
+  would this test catch it?" If no, the test is worthless.
+
+AVOID DUPLICATION — do NOT repeat the same pattern with trivially different inputs:
+- If 5 inputs test the same code path, write ONE test with multiple assertions
+- Group related assertions in a single test function
+- Only create separate test functions for genuinely different code paths or behaviors
+- Prefer one test with 5 assert_eq! lines over 5 tests with 1 assert_eq! each
+
+SECURITY TESTING — for code that validates paths, permissions, or access:
+- Test EVERY sensitive pattern the code blocks (e.g., /etc, /proc, /.ssh, /.aws)
+- Test path traversal attacks (../../etc/passwd)
+- Test that base_dir restrictions cannot be escaped
+- Test both the allowed AND denied cases for each security boundary
+
 STYLE RULES — match the existing project test style exactly:
 - Structure: #[cfg(test)] mod tests { ... } wrapping all tests
-- No section headers, no comment separators (no // ===== or // ----)
+- No section headers, no comment separators
 - No doc comments on test functions
-- Minimal comments — only use inline comments when explaining non-obvious setup
-  (e.g. // Each CJK character is 3 bytes)
+- Minimal comments — only when explaining non-obvious setup
 - Blank line between each test function, nothing more
-- Imports: single `use` statement at the top of mod tests
-- Test names: test_<function>_<scenario> — concise, lowercase, underscores
-- Use assert_eq!, assert!, assert_ne! — no custom assertion helpers
-- Use #[should_panic] for expected panics
+- Test names: test_<function>_<scenario> — names should describe behavior, not just input
+  BAD:  test_truncate_for_log_emoji
+  GOOD: test_truncate_for_log_backs_up_to_char_boundary_on_emoji
+- Use assert_eq!, assert!, assert_ne!, matches!
 - Use #[tokio::test] for async functions
-- Multiple related assertions can go in one test function
-- Prefix unused bindings with underscore (e.g. let (_result, truncated) = ...)
+- Prefix unused bindings with underscore
 - No println!, dbg!, or eprintln! in tests
+- No let _cloned = x.clone(); — either test the clone meaningfully or don't clone
 
 WHAT TO TEST:
-- Happy paths
-- Error/failure paths (Result::Err, Option::None)
-- Empty inputs (empty strings, empty vecs, None)
-- Boundary values (0, 1, max, exact boundary)
+- Happy paths WITH content verification
+- Error/failure paths WITH error type verification
+- Empty inputs, boundary values, exact boundaries
 - Unicode and multi-byte characters where relevant
 - Edge cases specific to the function's logic
 
 DO NOT:
-- Add external dependencies not already in Cargo.toml
+- Add external dependencies not already in Cargo.toml (no tempfile, no rstest)
 - Modify the source file — only write test code
-- Add test utilities, helpers, or fixtures unless the source file's existing tests use them
-- Over-comment the test code
+- Write tests that only check is_ok()/is_err() without verifying content
+- Create 20 tests that are copy-paste with different input values
 
 OUTPUT: Write the complete test file using write_file. Do not explain — just write the code.
 """

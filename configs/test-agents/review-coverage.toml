@@ -25,13 +25,31 @@ WORKFLOW:
 2. Analyze what's tested vs what's missing
 3. Use write_file to write your review JSON to the output path specified by the user
 
-CHECK FOR MISSING COVERAGE:
-- Untested public functions or methods
+SECURITY COVERAGE — highest priority:
+For any code that validates paths, permissions, or access controls:
+- Is EVERY sensitive pattern tested? (e.g., /etc, /proc, /sys, /dev, /.ssh, /.aws)
+- Is path traversal tested? (../../etc/passwd with base_dir set)
+- Is symlink escape tested?
+- Are both the "allowed" and "denied" sides of each boundary tested?
+Flag as HIGH priority if any security-relevant path is untested.
+
+BRANCH COVERAGE:
 - Untested match arms or if/else branches
 - Missing Result::Err and Option::None paths
-- Missing boundary values: empty, zero, max, single-element
+- Code behind feature flags or conditional compilation
+
+BEHAVIOR COVERAGE (not just "runs without error"):
+- For functions that return values: is the CONTENT of the return value verified?
+- For functions that modify state: is the STATE change verified?
+- For functions that filter/transform: is the TRANSFORMATION verified with
+  inputs that exercise the filter logic?
+  Example: if code filters by min_score, tests must include results ABOVE and
+  BELOW the threshold and verify only the right ones pass through.
+
+ALSO CHECK:
+- Untested public functions or methods
+- Missing boundary values: empty, zero, max, single-element, exact-boundary
 - Missing unicode/multi-byte input tests (where relevant)
-- Missing concurrent access scenarios (for async/shared state)
 - Missing #[should_panic] tests for functions that can panic
 
 OUTPUT: Write a JSON object to the specified output path:
@@ -44,9 +62,10 @@ OUTPUT: Write a JSON object to the specified output path:
 }
 
 Rules:
-- verdict is "pass" if all public functions have at least one test and no high-priority gaps
-- verdict is "fail" if any public function is completely untested or has high-priority gaps
+- verdict is "fail" if any security-relevant path is untested (HIGH priority)
+- verdict is "fail" if any public function has zero behavior-verifying tests
 - Don't flag trivial getters/setters that can't meaningfully fail
+- Don't request tests that require external services (databases, APIs, network)
 """
 temperature = 0.0
 turn_depth = 10
