@@ -1,0 +1,56 @@
+# compose/scratchpad-test.yml — TEST RUNNER overlay (one-shot)
+#
+# Adds a one-shot `aura-scratchpad-test` container that runs
+# `cargo test --features integration-scratchpad` against the stack
+# defined in base.yml + scratchpad.yml, then exits. Silences logs from
+# the long-running services so test output stays readable. Layers ON
+# TOP of scratchpad.yml — not standalone.
+#
+# The `integration-scratchpad` feature flag is intentionally NOT in
+# the parent `integration` list (different MCP server, different aura
+# config) so this suite has its own runner.
+#
+# Usage:
+#   docker compose -p aura-scratchpad-test \
+#     -f compose/base.yml \
+#     -f compose/scratchpad.yml \
+#     -f compose/scratchpad-test.yml \
+#     up --build --force-recreate --exit-code-from aura-scratchpad-test
+
+services:
+  # Silence infrastructure output during tests
+  mock-mcp:
+    attach: false
+    logging:
+      driver: "none"
+
+  aura-web-server:
+    attach: false
+    logging:
+      driver: "none"
+
+  # Scratchpad test runner container
+  aura-scratchpad-test:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      target: release-build
+      args:
+        - GITHUB_TOKEN
+    environment:
+      - AURA_SERVER_URL=http://aura-web-server:8080
+    env_file:
+      - ./env/test.env
+    depends_on:
+      aura-web-server:
+        condition: service_healthy
+    # Run scratchpad tests only
+    # NOTE: --test-threads=1 required due to LLM API rate limits
+    command: >
+      cargo test
+      --package aura-web-server
+      --features integration-scratchpad
+      --no-fail-fast
+      -- --test-threads=1
+    networks:
+      - aura-test

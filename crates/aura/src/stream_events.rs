@@ -121,6 +121,24 @@ pub enum WorkerPhase {
     Analyzing,
 }
 
+/// Constants for SSE event names on the base `aura.*` namespace.
+///
+/// Import these in tests or downstream consumers instead of hard-coding the
+/// string literals. Orchestration-specific events live in
+/// `orchestration::stream_events::event_names` under `aura.orchestrator.*`.
+pub mod event_names {
+    pub const SESSION_INFO: &str = "aura.session_info";
+    pub const TOOL_REQUESTED: &str = "aura.tool_requested";
+    pub const TOOL_START: &str = "aura.tool_start";
+    pub const TOOL_COMPLETE: &str = "aura.tool_complete";
+    pub const REASONING: &str = "aura.reasoning";
+    pub const PROGRESS: &str = "aura.progress";
+    pub const WORKER_PHASE: &str = "aura.worker_phase";
+    pub const TOOL_USAGE: &str = "aura.tool_usage";
+    pub const USAGE: &str = "aura.usage";
+    pub const SCRATCHPAD_USAGE: &str = "aura.scratchpad_usage";
+}
+
 /// Aura-specific streaming events sent via SSE `event:` field.
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
@@ -236,21 +254,35 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted after an agent (single-agent or orchestration worker) completes
+    /// with scratchpad activity. Reports how much raw tool output was diverted
+    /// to disk vs extracted back into context.
+    ScratchpadUsage {
+        /// Tokens of raw tool output diverted to scratchpad by this agent.
+        tokens_intercepted: usize,
+        /// Tokens extracted from scratchpad back into context by this agent.
+        tokens_extracted: usize,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
 }
 
 impl AuraStreamEvent {
     /// Get the SSE event name for this event type.
     pub fn event_name(&self) -> &'static str {
         match self {
-            Self::SessionInfo { .. } => "aura.session_info",
-            Self::ToolRequested { .. } => "aura.tool_requested",
-            Self::ToolStart { .. } => "aura.tool_start",
-            Self::ToolComplete { .. } => "aura.tool_complete",
-            Self::Reasoning { .. } => "aura.reasoning",
-            Self::Progress { .. } => "aura.progress",
-            Self::WorkerPhase { .. } => "aura.worker_phase",
-            Self::ToolUsage { .. } => "aura.tool_usage",
-            Self::Usage { .. } => "aura.usage",
+            Self::SessionInfo { .. } => event_names::SESSION_INFO,
+            Self::ToolRequested { .. } => event_names::TOOL_REQUESTED,
+            Self::ToolStart { .. } => event_names::TOOL_START,
+            Self::ToolComplete { .. } => event_names::TOOL_COMPLETE,
+            Self::Reasoning { .. } => event_names::REASONING,
+            Self::Progress { .. } => event_names::PROGRESS,
+            Self::WorkerPhase { .. } => event_names::WORKER_PHASE,
+            Self::ToolUsage { .. } => event_names::TOOL_USAGE,
+            Self::Usage { .. } => event_names::USAGE,
+            Self::ScratchpadUsage { .. } => event_names::SCRATCHPAD_USAGE,
         }
     }
 
@@ -428,6 +460,21 @@ impl AuraStreamEvent {
             correlation,
         }
     }
+
+    /// Create a ScratchpadUsage event.
+    pub fn scratchpad_usage(
+        tokens_intercepted: usize,
+        tokens_extracted: usize,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::ScratchpadUsage {
+            tokens_intercepted,
+            tokens_extracted,
+            agent,
+            correlation,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -474,7 +521,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.tool_requested");
+        assert_eq!(event.event_name(), event_names::TOOL_REQUESTED);
     }
 
     #[test]
@@ -486,7 +533,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.tool_start");
+        assert_eq!(event.event_name(), event_names::TOOL_START);
     }
 
     #[test]
@@ -499,7 +546,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.tool_complete");
+        assert_eq!(event.event_name(), event_names::TOOL_COMPLETE);
     }
 
     #[test]
@@ -509,7 +556,7 @@ mod tests {
             AgentContext::single_agent(),
             CorrelationContext::default(),
         );
-        assert_eq!(event.event_name(), "aura.reasoning");
+        assert_eq!(event.event_name(), event_names::REASONING);
     }
 
     #[test]
@@ -522,7 +569,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_requested\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_REQUESTED)));
         assert!(sse.contains("data: "));
         assert!(sse.contains("\"tool_id\":\"call_abc123\""));
         assert!(sse.contains("\"tool_name\":\"list_pipelines\""));
@@ -543,7 +590,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_start\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_START)));
         assert!(sse.contains("data: "));
         assert!(sse.contains("\"tool_id\":\"call_abc123\""));
         assert!(sse.contains("\"tool_name\":\"list_pipelines\""));
@@ -564,7 +611,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", Some("trace_123".to_string())),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_complete\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_COMPLETE)));
         assert!(sse.contains("\"duration_ms\":1234"));
         assert!(sse.contains("\"success\":true"));
         assert!(sse.contains("\"result\":\"Pipeline list result\""));
@@ -633,7 +680,7 @@ mod tests {
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.progress\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PROGRESS)));
         assert!(sse.contains("\"message\":\"Discovered 11 MCP tools\""));
         assert!(sse.contains("\"phase\":\"discovery\""));
         assert!(sse.contains("\"percent\":100"));
@@ -654,7 +701,7 @@ mod tests {
             CorrelationContext::default(),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.progress\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::PROGRESS)));
         assert!(!sse.contains("progress_token")); // Should be omitted when None
     }
 
@@ -667,7 +714,7 @@ mod tests {
             correlation: CorrelationContext::default(),
         };
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.worker_phase\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::WORKER_PHASE)));
         assert!(sse.contains("\"phase\":\"executing\""));
         assert!(sse.contains("\"task_id\":\"task_1\""));
         assert!(sse.contains("\"parent_agent_id\":\"orchestrator\""));
@@ -681,7 +728,7 @@ mod tests {
             CorrelationContext::new("sess_xyz", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.session_info\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::SESSION_INFO)));
         assert!(sse.contains("\"model\":\"gpt-4o\""));
         assert!(sse.contains("\"model_context_limit\":128000"));
         assert!(sse.contains("\"session_id\":\"sess_xyz\""));
@@ -695,7 +742,7 @@ mod tests {
             CorrelationContext::new("sess_abc", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.session_info\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::SESSION_INFO)));
         assert!(sse.contains("\"model\":\"unknown-model\""));
         assert!(!sse.contains("model_context_limit")); // Should be omitted when None
     }
@@ -710,7 +757,7 @@ mod tests {
             CorrelationContext::new("sess_123", None),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.tool_usage\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TOOL_USAGE)));
         assert!(sse.contains("\"tool_ids\":[\"call_abc\",\"call_def\"]"));
         assert!(sse.contains("\"prompt_tokens\":18777"));
         assert!(sse.contains("\"completion_tokens\":500"));
@@ -727,7 +774,7 @@ mod tests {
             CorrelationContext::new("sess_final", Some("trace_xyz".to_string())),
         );
         let sse = event.format_sse();
-        assert!(sse.starts_with("event: aura.usage\n"));
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::USAGE)));
         assert!(sse.contains("\"prompt_tokens\":21500"));
         assert!(sse.contains("\"completion_tokens\":342"));
         assert!(sse.contains("\"total_tokens\":21842"));
@@ -739,13 +786,71 @@ mod tests {
     fn test_event_name_new_events() {
         let session_info =
             AuraStreamEvent::session_info("gpt-4", None, CorrelationContext::default());
-        assert_eq!(session_info.event_name(), "aura.session_info");
+        assert_eq!(session_info.event_name(), event_names::SESSION_INFO);
 
         let tool_usage =
             AuraStreamEvent::tool_usage(vec![], 0, 0, 0, CorrelationContext::default());
-        assert_eq!(tool_usage.event_name(), "aura.tool_usage");
+        assert_eq!(tool_usage.event_name(), event_names::TOOL_USAGE);
 
         let usage = AuraStreamEvent::usage(0, 0, 0, CorrelationContext::default());
-        assert_eq!(usage.event_name(), "aura.usage");
+        assert_eq!(usage.event_name(), event_names::USAGE);
+    }
+
+    #[test]
+    fn test_scratchpad_usage_event_name() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            15_840,
+            1_200,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
+        assert_eq!(event.event_name(), "aura.scratchpad_usage");
+    }
+
+    #[test]
+    fn test_scratchpad_usage_format_sse() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            15_840,
+            1_200,
+            AgentContext::worker("data-explorer", None, "orchestrator"),
+            CorrelationContext::new("sess_xyz", Some("trace_123".to_string())),
+        );
+        let sse = event.format_sse();
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::SCRATCHPAD_USAGE)));
+        assert!(sse.contains("\"tokens_intercepted\":15840"));
+        assert!(sse.contains("\"tokens_extracted\":1200"));
+        assert!(sse.contains("\"agent_id\":\"data-explorer\""));
+        assert!(sse.contains("\"parent_agent_id\":\"orchestrator\""));
+        assert!(sse.contains("\"session_id\":\"sess_xyz\""));
+        assert!(sse.contains("\"trace_id\":\"trace_123\""));
+        // Event is agent-scoped, not task-scoped.
+        assert!(!sse.contains("task_id"));
+        assert!(sse.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_scratchpad_usage_single_agent_id_is_main() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            0,
+            0,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
+        let sse = event.format_sse();
+        assert!(sse.contains("\"agent_id\":\"main\""));
+        assert!(!sse.contains("parent_agent_id"));
+    }
+
+    #[test]
+    fn test_scratchpad_usage_zero_values_still_serialize() {
+        let event = AuraStreamEvent::scratchpad_usage(
+            0,
+            0,
+            AgentContext::single_agent(),
+            CorrelationContext::default(),
+        );
+        let sse = event.format_sse();
+        assert!(sse.contains("\"tokens_intercepted\":0"));
+        assert!(sse.contains("\"tokens_extracted\":0"));
     }
 }

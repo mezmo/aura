@@ -6,6 +6,7 @@ use crate::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
     },
+    scratchpad,
     tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
@@ -75,6 +76,22 @@ pub struct FilesystemTools {
     pub write_file: WriteFileTool,
 }
 
+/// Build a `StreamItem::ScratchpadUsage` for this agent's budget — `None` if
+/// the budget had no activity (no interception, no extraction). Pure decision
+/// helper shared by the single-agent stream tail and the orchestrator's
+/// per-worker emission so both paths stay in lock-step on the gating rule.
+pub(crate) fn scratchpad_usage_event(
+    budget: &scratchpad::ContextBudget,
+    agent_id: &str,
+) -> Option<StreamItem> {
+    let (intercepted, extracted) = budget.scratchpad_usage();
+    (intercepted > 0 || extracted > 0).then(|| StreamItem::ScratchpadUsage {
+        agent_id: agent_id.to_string(),
+        tokens_intercepted: intercepted,
+        tokens_extracted: extracted,
+    })
+}
+
 /// Rig-native agent wrapper using provider-specific agents.
 ///
 /// # Tool Execution Paths
@@ -104,9 +121,140 @@ pub struct Agent {
     /// Configured context window size in tokens (from LLM TOML config).
     /// Used for usage percentage reporting in streaming events.
     pub(crate) context_window: Option<u64>,
+    /// Per-agent scratchpad budget for context tracking.
+    /// Set by orchestration workers (from resolved worker LLM + scratchpad config);
+    /// `None` for coordinator agents and non-scratchpad use.
+    pub(crate) scratchpad_budget: Option<scratchpad::ContextBudget>,
 }
 
 impl Agent {
+    /// Wire up scratchpad for a single-agent config. Skipped in orchestration
+    /// mode (workers build their own per-worker budget in `create_worker()`)
+    /// and when no accessible MCP tool matches a scratchpad threshold.
+    ///
+    /// Per-request lifecycle: this runs inside `Agent::new`, which is called
+    /// fresh per chat request from
+    /// `aura-web-server::handlers::build_agent_for_request`. The `Agent` (and
+    /// this `ContextBudget`) is dropped when the request stream ends — there
+    /// is no cross-request budget state to manage. Request-specific data
+    /// (user query + chat history) is seeded into the budget at stream-start
+    /// in `Agent::stream_*_with_timeout`, not here, so this constructor
+    /// stays free of request-shape parameters.
+    async fn setup_single_agent_scratchpad(
+        config: &mut AgentConfig,
+        mcp_manager: Option<&Arc<McpManager>>,
+    ) -> Result<Option<scratchpad::ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
+        if config.orchestration_enabled() {
+            return Ok(None);
+        }
+
+        let sp_cfg = match config.agent.scratchpad.as_ref() {
+            Some(sp) if sp.enabled => sp.clone(),
+            _ => return Ok(None),
+        };
+
+        let tools_per_server = mcp_manager
+            .map(|mgr| mgr.tool_names_per_server())
+            .unwrap_or_default();
+        let scratchpad_tool_map =
+            scratchpad::scratchpad_tool_map(config.mcp.as_ref(), &tools_per_server);
+        let accessible_tools = mcp_manager
+            .map(|mgr| mgr.get_available_tool_names())
+            .unwrap_or_default();
+        let filter = config
+            .mcp_filter
+            .as_deref()
+            .or(config.agent.mcp_filter.as_deref())
+            .unwrap_or(&[]);
+        if !scratchpad::has_accessible_scratchpad_tool(
+            &accessible_tools,
+            filter,
+            &scratchpad_tool_map,
+        ) {
+            tracing::info!(
+                "Single-agent scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping"
+            );
+            return Ok(None);
+        }
+
+        // Validation enforces these upstream; re-check here so runtime
+        // misconfiguration fails loudly instead of silently degrading.
+        let context_window = config.llm.context_window().ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                "Scratchpad enabled but [agent.llm].context_window is not set".into()
+            },
+        )? as usize;
+        let memory_dir = config
+            .effective_memory_dir()
+            .map(str::to_owned)
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "Scratchpad enabled but `memory_dir` is not set".into()
+            })?;
+
+        let (provider, model) = config.llm.model_info();
+        let token_counter = scratchpad::token_counter_for_provider(provider, model);
+
+        // Exact MCP tool-schema tokens (BPE on the JSON each tool serializes to).
+        // The user query and chat history aren't counted here; they're seeded into
+        // `estimated_used` at stream-start in `Agent::stream_*_with_timeout`
+        // (see `seed_scratchpad_request_input`), where they're naturally
+        // available without dirtying constructors with request data.
+        let mcp_tool_tokens = mcp_manager
+            .map(|m| {
+                scratchpad::count_mcp_tool_schema_tokens(
+                    &*token_counter,
+                    m.tool_definitions_iter(),
+                    filter,
+                )
+            })
+            .unwrap_or(0);
+
+        let initial_used = scratchpad::estimate_scratchpad_overhead(
+            &*token_counter,
+            &[config.effective_preamble()],
+        ) + mcp_tool_tokens;
+
+        let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
+            sp_cfg: &sp_cfg,
+            storage_dir: std::path::Path::new(&memory_dir),
+            scratchpad_tool_map,
+            context_window,
+            initial_used,
+            token_counter,
+        })
+        .await?;
+
+        // Order in vec controls reverse-iter `transform_output`: the LAST
+        // entry in the vec runs FIRST on raw output. Place `existing` after
+        // scratchpad so a caller-supplied wrapper observes the raw tool
+        // output (matches the orchestration convention where persistence-
+        // class wrappers go after scratchpad — see `create_worker`).
+        //
+        // Asymmetry callers should know about: `wrap_schema`, `transform_args`,
+        // and `validate_args` walk the vec forward, so `existing` sees a
+        // scratchpad-wrapped schema (extra fields injected) and scratchpad-
+        // stripped args (scratchpad fields removed) — not the raw MCP
+        // versions. Audit / logging wrappers are unaffected; a wrapper that
+        // introspects schema or transforms args needs to account for this.
+        // See `ComposedWrapper` docs and the lockdown test at the bottom of
+        // this module (`test_composed_scratchpad_then_existing_observes_raw_output`).
+        config.tool_wrapper = Some(match config.tool_wrapper.take() {
+            Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                build.wrapper,
+                existing,
+            ])),
+            None => build.wrapper,
+        });
+        config.preamble_override = Some(format!(
+            "{}{}",
+            config.effective_preamble(),
+            scratchpad::SCRATCHPAD_PREAMBLE
+        ));
+        config.scratchpad_tools_config = Some(build.tools_config);
+
+        Ok(Some(build.budget))
+    }
+
     /// Create a new agent from configuration.
     pub async fn new(
         config: &AgentConfig,
@@ -121,9 +269,33 @@ impl Agent {
             None
         };
 
-        // Get max depth for tool calls per turn
-        let max_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-        tracing::info!("  Max turn depth: {} (tool calls per turn)", max_depth);
+        // Clone so setup_single_agent_scratchpad can mutate extension fields
+        // (tool_wrapper, preamble_override, scratchpad_tools_config).
+        let mut config_owned = config.clone();
+        let agent_scratchpad_budget =
+            Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
+        let config = &config_owned;
+
+        // Scratchpad bonus only applies when scratchpad was actually wired up
+        // (enabled + context_window + a matching MCP tool).
+        let base_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = config
+            .scratchpad_tools_config
+            .as_ref()
+            .and(config.agent.scratchpad.as_ref())
+            .map(|sp| sp.turn_depth_bonus)
+            .unwrap_or(0);
+        let max_depth = base_depth + scratchpad_bonus;
+        if scratchpad_bonus > 0 {
+            tracing::info!(
+                "  Max turn depth: {} (base={}, scratchpad_bonus={})",
+                max_depth,
+                base_depth,
+                scratchpad_bonus
+            );
+        } else {
+            tracing::info!("  Max turn depth: {} (tool calls per turn)", max_depth);
+        }
 
         // Ollama fallback: parse tool calls from text output when native tool_call
         // structures aren't used. Requires MCP tools to be available.
@@ -420,6 +592,7 @@ impl Agent {
             fallback_tool_parsing,
             fallback_tool_names,
             context_window: config.llm.context_window(),
+            scratchpad_budget: agent_scratchpad_budget,
         })
     }
 
@@ -561,6 +734,27 @@ impl Agent {
                 tracing::info!("  Adding {} STDIO tools for client group", tools.len());
                 builder_state = builder_state.add_rmcp_tools(tools, client);
             }
+        }
+
+        if let Some(ref scratchpad) = config.scratchpad_tools_config {
+            use crate::scratchpad::{
+                GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool,
+                SchemaTool, SliceTool,
+            };
+            tracing::info!(
+                "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
+            );
+            let s = &scratchpad.storage;
+            let b = &scratchpad.budget;
+            builder_state = builder_state
+                .add_tool(HeadTool::new(s.clone(), b.clone()))
+                .add_tool(SliceTool::new(s.clone(), b.clone()))
+                .add_tool(GrepTool::new(s.clone(), b.clone()))
+                .add_tool(SchemaTool::new(s.clone(), b.clone()))
+                .add_tool(ItemSchemaTool::new(s.clone(), b.clone()))
+                .add_tool(GetInTool::new(s.clone(), b.clone()))
+                .add_tool(IterateOverTool::new(s.clone(), b.clone()))
+                .add_tool(ReadTool::new(s.clone(), b.clone()));
         }
 
         // Add read_artifact tool when orchestration persistence is available
@@ -737,6 +931,24 @@ impl Agent {
         self.maybe_wrap_with_fallback(stream)
     }
 
+    /// Append a final `StreamItem::ScratchpadUsage` if this agent has a
+    /// scratchpad budget with non-zero activity. Mirrors the per-worker event
+    /// the orchestrator emits after each task — the web server handler
+    /// converts this into the `aura.scratchpad_usage` SSE event for the UI.
+    fn append_scratchpad_usage(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        let Some(budget) = self.scratchpad_budget.clone() else {
+            return stream;
+        };
+        let tail = futures::stream::once(async move { scratchpad_usage_event(&budget, "main") })
+            .filter_map(|opt| async move { opt.map(Ok) });
+        Box::pin(stream.chain(tail))
+    }
+
     /// Conditionally wrap stream for Ollama text-to-tool parsing.
     ///
     /// When `fallback_tool_parsing` is enabled (Ollama config), this wraps the stream
@@ -807,12 +1019,19 @@ impl Agent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
+        self.seed_scratchpad_request_input(query, &[]);
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_prompt_with_timeout(query, self.max_depth, timeout, request_id)
+            .stream_prompt_with_timeout(
+                query,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.scratchpad_budget.clone(),
+            )
             .await;
         (
-            self.maybe_wrap_with_fallback(stream),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
             cancel_tx,
             usage_state,
         )
@@ -844,15 +1063,46 @@ impl Agent {
         watch::Sender<bool>,
         crate::streaming_request_hook::UsageState,
     ) {
+        self.seed_scratchpad_request_input(query, &chat_history);
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_chat_with_timeout(query, chat_history, self.max_depth, timeout, request_id)
+            .stream_chat_with_timeout(
+                query,
+                chat_history,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.scratchpad_budget.clone(),
+            )
             .await;
         (
-            self.maybe_wrap_with_fallback(stream),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
             cancel_tx,
             usage_state,
         )
+    }
+
+    /// Seed the scratchpad budget's running estimate with the user query +
+    /// chat history at stream-start so early extraction budget checks see
+    /// the request shape before turn-1 LLM-reported `input_tokens` arrives.
+    /// No-op when scratchpad isn't wired up. `Debug` formatting on history
+    /// over-counts vs. per-provider serialization — conservative direction
+    /// for budget gating, and `set_estimated_used` corrects from LLM ground
+    /// truth after each turn anyway.
+    fn seed_scratchpad_request_input(
+        &self,
+        query: &str,
+        chat_history: &[rig::completion::Message],
+    ) {
+        let Some(budget) = &self.scratchpad_budget else {
+            return;
+        };
+        let query_tokens = budget.count_tokens(query);
+        let history_tokens: usize = chat_history
+            .iter()
+            .map(|m| budget.count_tokens(&format!("{m:?}")))
+            .sum();
+        budget.record_usage(query_tokens + history_tokens);
     }
 
     /// Get provider information
@@ -1127,6 +1377,7 @@ impl AgentBuilder {
                         args,
                         env,
                         description,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (STDIO):", name);
                         tracing::info!("  Command: {:?}", cmd);
@@ -1141,6 +1392,7 @@ impl AgentBuilder {
                         headers,
                         description,
                         headers_from_request,
+                        ..
                     } => {
                         tracing::info!("MCP Server '{}' (HTTP Streamable):", name);
                         tracing::info!("  URL: {}", url);
@@ -1194,5 +1446,201 @@ impl AgentBuilder {
         tracing::info!("Agent built successfully with full tool integration");
 
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scratchpad::TiktokenCounter;
+
+    fn budget() -> scratchpad::ContextBudget {
+        let counter = Arc::new(TiktokenCounter::default_counter());
+        scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
+    }
+
+    #[test]
+    fn scratchpad_usage_event_returns_none_when_no_activity() {
+        let b = budget();
+        assert!(scratchpad_usage_event(&b, "main").is_none());
+    }
+
+    #[test]
+    fn scratchpad_usage_event_emits_when_only_intercepted_is_set() {
+        let b = budget();
+        b.record_intercepted(500);
+        let event = scratchpad_usage_event(&b, "main").expect("must emit when intercepted > 0");
+        match event {
+            StreamItem::ScratchpadUsage {
+                agent_id,
+                tokens_intercepted,
+                tokens_extracted,
+            } => {
+                assert_eq!(agent_id, "main");
+                assert_eq!(tokens_intercepted, 500);
+                assert_eq!(tokens_extracted, 0);
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scratchpad_usage_event_emits_when_only_extracted_is_set() {
+        let b = budget();
+        b.record_extracted(200);
+        let event = scratchpad_usage_event(&b, "main").expect("must emit when extracted > 0");
+        match event {
+            StreamItem::ScratchpadUsage {
+                tokens_intercepted,
+                tokens_extracted,
+                ..
+            } => {
+                assert_eq!(tokens_intercepted, 0);
+                assert_eq!(tokens_extracted, 200);
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scratchpad_usage_event_uses_provided_agent_id() {
+        let b = budget();
+        b.record_intercepted(1);
+        let event = scratchpad_usage_event(&b, "data-explorer").expect("must emit");
+        match event {
+            StreamItem::ScratchpadUsage { agent_id, .. } => {
+                assert_eq!(agent_id, "data-explorer");
+            }
+            other => panic!("expected ScratchpadUsage, got {other:?}"),
+        }
+    }
+
+    /// End-to-end ordering test for the single-agent wrapper composition at
+    /// `setup_single_agent_scratchpad` (this file). Mirrors the orchestration
+    /// lockdown in `persistence_wrapper.rs::test_composed_persistence_after_scratchpad_captures_raw`.
+    ///
+    /// Locks down two related contracts that builder.rs:230 relies on:
+    /// 1. **Output runs reverse**: a caller-supplied `existing` wrapper placed
+    ///    after `ScratchpadWrapper` in the vec sees the **raw** tool output;
+    ///    scratchpad runs second and rewrites the LLM-facing output to a
+    ///    pointer.
+    /// 2. **Schema/args run forward**: `existing` sees whatever scratchpad
+    ///    emitted from `wrap_schema`/`transform_args`. Today scratchpad is a
+    ///    pass-through there, so this asserts identity. If scratchpad ever
+    ///    starts modifying schema or args, this test fails and forces a
+    ///    review of the asymmetry doc (see `ComposedWrapper` and the comment
+    ///    above the `Some(existing) => ...` arm in `setup_single_agent_scratchpad`).
+    ///
+    /// A reorder of the vec, a flip in `ComposedWrapper`'s iteration
+    /// direction, or a new transform inside `ScratchpadWrapper::wrap_schema`/
+    /// `transform_args` will all surface here.
+    #[tokio::test]
+    async fn test_composed_scratchpad_then_existing_observes_raw_output() {
+        use crate::mcp_response::CallOutcome;
+        use crate::scratchpad::{ScratchpadStorage, ScratchpadWrapper};
+        use crate::tool_wrapper::{
+            ComposedWrapper, ToolCallContext, ToolWrapper, TransformArgsResult,
+            TransformOutputResult,
+        };
+        use async_trait::async_trait;
+        use serde_json::Value;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        /// Fake "caller-supplied" wrapper that records what each composition
+        /// step hands it. Lets the test assert exactly what the existing
+        /// wrapper observes under the documented composition order.
+        #[derive(Default)]
+        struct RecordingWrapper {
+            schema_seen: Mutex<Option<Value>>,
+            args_seen: Mutex<Option<Value>>,
+            output_seen: Mutex<Option<String>>,
+        }
+
+        #[async_trait]
+        impl ToolWrapper for RecordingWrapper {
+            fn wrap_schema(&self, schema: Value) -> Value {
+                *self.schema_seen.lock().unwrap() = Some(schema.clone());
+                schema
+            }
+
+            fn transform_args(&self, args: Value, _ctx: &ToolCallContext) -> TransformArgsResult {
+                *self.args_seen.lock().unwrap() = Some(args.clone());
+                TransformArgsResult::new(args)
+            }
+
+            fn transform_output(
+                &self,
+                output: String,
+                _outcome: &CallOutcome,
+                _ctx: &ToolCallContext,
+                _extracted: Option<&Value>,
+            ) -> TransformOutputResult {
+                *self.output_seen.lock().unwrap() = Some(output.clone());
+                TransformOutputResult::new(output)
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-single-compose")
+                .await
+                .unwrap(),
+        );
+        let counter = TiktokenCounter::default_counter();
+        let sp_budget = scratchpad::ContextBudget::new(128_000, 0.20, 0, Arc::new(counter));
+
+        let scratchpad_tools = HashMap::from([("big_tool".to_string(), 10_usize)]);
+        let scratchpad: Arc<dyn ToolWrapper> =
+            Arc::new(ScratchpadWrapper::new(scratchpad_tools, storage, sp_budget));
+
+        let recording = Arc::new(RecordingWrapper::default());
+        let recording_dyn: Arc<dyn ToolWrapper> = recording.clone();
+
+        // Same ordering as `setup_single_agent_scratchpad`: scratchpad first,
+        // existing (recording) last → reverse iter on transform_output runs
+        // recording first → recording sees raw → scratchpad rewrites to pointer.
+        let composed = ComposedWrapper::new(vec![scratchpad, recording_dyn]);
+
+        // Forward iter: scratchpad's wrap_schema runs first, then recording.
+        let original_schema = serde_json::json!({"type": "object", "properties": {}});
+        let _ = composed.wrap_schema(original_schema.clone());
+        assert_eq!(
+            recording.schema_seen.lock().unwrap().as_ref(),
+            Some(&original_schema),
+            "ScratchpadWrapper should be a passthrough for wrap_schema; \
+             if this fails, the asymmetry doc on builder.rs:230 + ComposedWrapper \
+             needs a re-read because existing wrappers will now see a modified schema",
+        );
+
+        // Forward iter: scratchpad's transform_args runs first, then recording.
+        let ctx = ToolCallContext::new("big_tool").with_task_context(7, "single_agent".into(), 0);
+        let original_args = serde_json::json!({"input": "hello"});
+        let _ = composed.transform_args(original_args.clone(), &ctx);
+        assert_eq!(
+            recording.args_seen.lock().unwrap().as_ref(),
+            Some(&original_args),
+            "ScratchpadWrapper should be a passthrough for transform_args; \
+             if this fails, the asymmetry doc on builder.rs:230 + ComposedWrapper \
+             needs a re-read because existing wrappers will now see modified args",
+        );
+
+        // Reverse iter: recording's transform_output runs first on RAW output,
+        // then scratchpad runs on recording's pass-through output and rewrites
+        // it to a pointer.
+        let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
+        let outcome = CallOutcome::Success(raw.clone());
+        let result = composed.transform_output(raw.clone(), &outcome, &ctx, None);
+
+        assert_eq!(
+            recording.output_seen.lock().unwrap().as_deref(),
+            Some(raw.as_str()),
+            "existing wrapper must see RAW output, not the scratchpad pointer",
+        );
+        assert!(
+            result.output.contains("[scratchpad:"),
+            "scratchpad must rewrite the LLM-facing output to a pointer, got: {}",
+            &result.output[..result.output.len().min(120)]
+        );
     }
 }

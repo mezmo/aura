@@ -254,6 +254,9 @@ cargo run -p aura-config --bin debug_config
 Enable orchestration mode in config:
 
 ```toml
+# Top-level: shared by orchestration persistence and single-agent scratchpad
+memory_dir = "/tmp/orchestration-memory"
+
 [orchestration]
 enabled = true
 quality_threshold = 0.8
@@ -261,7 +264,6 @@ max_planning_cycles = 3
 tools_in_planning = "summary"
 allow_direct_answers = true
 allow_clarification = true
-memory_dir = "/tmp/orchestration-memory"
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
@@ -315,7 +317,7 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
-| `memory_dir` | string | — | Directory for cross-iteration artifact persistence |
+| `memory_dir` | string | — | **Legacy** — prefer top-level `memory_dir`. Directory for cross-iteration artifact persistence. Equivalent to `[orchestration.artifacts].memory_dir` |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
@@ -329,6 +331,49 @@ For a fuller multi-worker example, see [configs/example-workers.toml](configs/ex
 | `mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools this worker can use |
 | `vector_stores` | list | `[]` | Named vector stores this worker has access to |
 | `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
+| `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
+| `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
+
+### Scratchpad (Context Window Management)
+
+Scratchpad intercepts large MCP tool outputs and stores them on disk so the LLM can selectively explore them via eight read-only tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) rather than pushing the entire payload into context.
+
+Scratchpad works in both single-agent and orchestration modes. Configure at `[agent.scratchpad]` (applies to the single agent, or provides defaults for orchestration workers) and optionally override per worker at `[orchestration.worker.<name>.scratchpad]`. Set a top-level `memory_dir` for persistence:
+
+```toml
+# Top-level — required when scratchpad is enabled. Shared by single-agent
+# scratchpad and orchestration persistence.
+memory_dir = "/tmp/aura"
+
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.20          # 20% of context reserved for reasoning/output
+max_extraction_tokens = 10_000        # cap per extraction tool call
+turn_depth_bonus = 6                  # extra ReAct turns when scratchpad is active
+
+[orchestration.worker.data-explorer.scratchpad]
+# Override just for this worker
+max_extraction_tokens = 5_000
+```
+
+**Storage location**:
+- Single-agent: `{memory_dir}/scratchpad/`
+- Orchestration: `{memory_dir}/{run_id}/iteration-{n}/scratchpad/` (legacy `[orchestration.artifacts].memory_dir` still works as a fallback)
+
+Per-tool interception thresholds are configured at `[mcp.servers.<server>.scratchpad]`. Keys are **glob patterns** (default threshold `5_120` if omitted) that are matched against tool names at interception time:
+
+```toml
+[mcp.servers.k8s-sre.scratchpad]
+"*_list_*"                  = { min_tokens = 512 }   # broad
+"k8s_list_service_monitors" = { min_tokens = 384 }   # specific override
+"*"                         = { min_tokens = 4096 }  # catch-all
+```
+
+When multiple patterns match the same tool, the **longest (most specific) pattern wins**; on length ties the smallest threshold wins. Token counting uses real BPE tokenization via `tiktoken-rs` — not byte/character heuristics — so `min_tokens` reflects actual model token cost.
+
+**Per-call extraction limit (`max_extraction_tokens`, default 10_000):** every exploration tool checks the size of its result before returning. If a single call would exceed this cap (or the cumulative `ContextBudget`), the tool returns a structured JSON error like `{"error": "head_too_large", "estimated_tokens": ..., "suggestions": [...]}` instead of the content. The LLM sees this as a successful tool result and retries with smaller params — each retry consumes a turn, which is why `turn_depth_bonus` exists.
+
+Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
 
 ### Ollama
 

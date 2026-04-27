@@ -182,6 +182,7 @@ budget_tokens = 8000
                 args,
                 env,
                 description,
+                ..
             } => {
                 assert_eq!(cmd, &vec!["uvx"]);
                 assert_eq!(
@@ -1186,5 +1187,558 @@ system_prompt = "Test"
             msg.contains("[agent.llm]"),
             "error should tell the user to move it under [agent.llm]: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scratchpad configuration tests
+    //
+    // Covers:
+    //   * Top-level `memory_dir` parsing
+    //   * `[agent.scratchpad]` and `[orchestration.worker.<name>.scratchpad]`
+    //     TOML round-trip
+    //   * `[mcp.servers.<name>.scratchpad]` per-tool thresholds
+    //   * Validation rules (`validate_scratchpad`)
+    //   * `AgentConfig::effective_memory_dir()` resolution (top-level wins,
+    //     legacy `[orchestration.artifacts].memory_dir` as fallback)
+    // -----------------------------------------------------------------------
+
+    /// Minimal single-agent config template with `{SP}` placeholder for the
+    /// `[agent.scratchpad]` block and `{TOP}` for any top-level keys (e.g.
+    /// `memory_dir = "..."`).
+    fn single_agent_config(top: &str, scratchpad: &str) -> String {
+        format!(
+            r#"
+{top}
+
+[agent]
+name = "Test"
+system_prompt = "You are a test agent"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+{scratchpad}
+"#
+        )
+    }
+
+    #[test]
+    fn scratchpad_top_level_memory_dir_parses() {
+        let config = single_agent_config(
+            r#"memory_dir = "/tmp/aura-test""#,
+            r#"
+[agent.scratchpad]
+enabled = true
+"#,
+        );
+        let loaded = load_config_from_str(&config).expect("config should parse");
+        assert_eq!(loaded.memory_dir.as_deref(), Some("/tmp/aura-test"));
+    }
+
+    #[test]
+    fn scratchpad_agent_scratchpad_parses_with_defaults() {
+        let config = single_agent_config(
+            r#"memory_dir = "/tmp/aura-test""#,
+            r#"
+[agent.scratchpad]
+enabled = true
+"#,
+        );
+        let loaded = load_config_from_str(&config).expect("config should parse");
+        let sp = loaded
+            .agent
+            .scratchpad
+            .as_ref()
+            .expect("agent.scratchpad should be populated");
+        assert!(sp.enabled);
+        // Defaults are applied for the unspecified fields
+        assert!((sp.context_safety_margin - 0.20).abs() < f32::EPSILON);
+        assert_eq!(sp.max_extraction_tokens, 10_000);
+        assert_eq!(sp.turn_depth_bonus, 6);
+    }
+
+    #[test]
+    fn scratchpad_agent_scratchpad_parses_all_overrides() {
+        let config = single_agent_config(
+            r#"memory_dir = "/tmp/aura-test""#,
+            r#"
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.30
+max_extraction_tokens = 5000
+turn_depth_bonus = 12
+"#,
+        );
+        let loaded = load_config_from_str(&config).expect("config should parse");
+        let sp = loaded.agent.scratchpad.as_ref().unwrap();
+        assert!(sp.enabled);
+        assert!((sp.context_safety_margin - 0.30).abs() < f32::EPSILON);
+        assert_eq!(sp.max_extraction_tokens, 5000);
+        assert_eq!(sp.turn_depth_bonus, 12);
+    }
+
+    #[test]
+    fn scratchpad_worker_override_parses() {
+        let config = r#"
+memory_dir = "/tmp/aura"
+
+[agent]
+name = "Coordinator"
+system_prompt = "coordinate"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 200000
+
+[agent.scratchpad]
+enabled = true
+max_extraction_tokens = 10000
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.tight]
+description = "needs less extraction"
+preamble = "you are tight"
+
+[orchestration.worker.tight.scratchpad]
+enabled = true
+max_extraction_tokens = 2000
+turn_depth_bonus = 3
+"#;
+        let loaded = load_config_from_str(config).expect("config should parse");
+        let worker = loaded
+            .orchestration
+            .as_ref()
+            .expect("orchestration present")
+            .workers
+            .get("tight")
+            .expect("tight worker present");
+        let wsp = worker
+            .scratchpad
+            .as_ref()
+            .expect("worker scratchpad override present");
+        assert!(wsp.enabled);
+        assert_eq!(wsp.max_extraction_tokens, 2000);
+        assert_eq!(wsp.turn_depth_bonus, 3);
+    }
+
+    #[test]
+    fn scratchpad_mcp_server_thresholds_parse() {
+        let config = r#"
+memory_dir = "/tmp/aura"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[mcp.servers.example]
+transport = "http_streamable"
+url = "http://localhost:8000/mcp"
+
+[mcp.servers.example.scratchpad]
+"*_list_*" = { min_tokens = 512 }
+"foo_get_bar" = { min_tokens = 128 }
+"defaults_tool" = {}
+"#;
+        let loaded = load_config_from_str(config).expect("config should parse");
+        let mcp = loaded.mcp.as_ref().expect("mcp present");
+        let server = mcp.servers.get("example").expect("server present");
+        let thresholds = match server {
+            McpServerConfig::HttpStreamable { scratchpad, .. }
+            | McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+        };
+        assert_eq!(thresholds.get("*_list_*").unwrap().min_tokens, 512);
+        assert_eq!(thresholds.get("foo_get_bar").unwrap().min_tokens, 128);
+        // Empty entry should use default
+        assert_eq!(thresholds.get("defaults_tool").unwrap().min_tokens, 5_120);
+    }
+
+    #[test]
+    fn scratchpad_validation_single_agent_rejects_missing_memory_dir() {
+        let config = single_agent_config(
+            "", // no top-level memory_dir
+            r#"
+[agent.scratchpad]
+enabled = true
+"#,
+        );
+        let err = load_config_from_str(&config).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory_dir"),
+            "error should mention memory_dir: {msg}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_validation_single_agent_rejects_missing_context_window() {
+        let config = r#"
+memory_dir = "/tmp/aura"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+# context_window intentionally omitted
+
+[agent.scratchpad]
+enabled = true
+"#;
+        let err = load_config_from_str(config).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context_window"),
+            "error should mention context_window: {msg}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_validation_passes_when_disabled() {
+        // No memory_dir, no context_window, but scratchpad disabled → OK
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[agent.scratchpad]
+enabled = false
+"#;
+        load_config_from_str(config).expect("disabled scratchpad should not require memory_dir");
+    }
+
+    #[test]
+    fn scratchpad_validation_passes_when_unconfigured() {
+        // No [agent.scratchpad] at all → OK even without memory_dir
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        load_config_from_str(config).expect("unconfigured scratchpad should parse");
+    }
+
+    #[test]
+    fn scratchpad_validation_orchestration_agent_level_requires_memory_dir() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "test worker"
+preamble = "alpha"
+"#;
+        let err = load_config_from_str(config).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory_dir"),
+            "error should mention memory_dir: {msg}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_validation_orchestration_worker_only_requires_memory_dir() {
+        // Agent-level scratchpad disabled but worker has it enabled — still
+        // requires memory_dir.
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "test worker"
+preamble = "alpha"
+
+[orchestration.worker.alpha.scratchpad]
+enabled = true
+"#;
+        let err = load_config_from_str(config).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory_dir"),
+            "error should mention memory_dir: {msg}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_validation_accepts_legacy_artifacts_memory_dir() {
+        // Legacy `[orchestration.artifacts].memory_dir` should satisfy the
+        // memory_dir requirement for backward compatibility.
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "test worker"
+preamble = "alpha"
+"#;
+        load_config_from_str(config)
+            .expect("legacy [orchestration.artifacts].memory_dir should satisfy the requirement");
+    }
+
+    #[test]
+    fn scratchpad_validation_worker_llm_override_requires_context_window() {
+        // Worker overrides the LLM with one that has no context_window while
+        // scratchpad is enabled → error.
+        let config = r#"
+memory_dir = "/tmp/aura"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "worker with different model"
+preamble = "alpha"
+
+[orchestration.worker.alpha.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o-mini"
+# no context_window here
+"#;
+        let err = load_config_from_str(config).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context_window"),
+            "error should mention context_window: {msg}"
+        );
+        assert!(
+            msg.contains("alpha"),
+            "error should mention the offending worker name: {msg}"
+        );
+    }
+
+    #[test]
+    fn scratchpad_validation_complete_orchestration_config_passes() {
+        let config = r#"
+memory_dir = "/tmp/aura"
+
+[agent]
+name = "Coord"
+system_prompt = "coord"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 200000
+
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.15
+max_extraction_tokens = 20000
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.analyst]
+description = "analyst"
+preamble = "you analyze"
+
+[orchestration.worker.analyst.scratchpad]
+enabled = true
+max_extraction_tokens = 4000
+"#;
+        load_config_from_str(config).expect("valid orchestration config should parse");
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_prefers_top_level() {
+        // When both top-level memory_dir AND [orchestration.artifacts].memory_dir
+        // are set, the top-level one wins.
+        let config = r#"
+memory_dir = "/tmp/top-level"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        assert_eq!(
+            built.effective_memory_dir(),
+            Some("/tmp/top-level"),
+            "top-level memory_dir should win over legacy artifacts.memory_dir"
+        );
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_falls_back_to_legacy() {
+        // No top-level memory_dir — should fall back to the legacy one.
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        assert_eq!(built.effective_memory_dir(), Some("/tmp/legacy"));
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_falls_back_in_single_agent_mode() {
+        // Orchestration section present but disabled. effective_memory_dir()
+        // should still honor the legacy artifacts fallback so single-agent
+        // scratchpad setup resolves memory_dir the same way orchestration
+        // persistence and config validation do.
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[orchestration]
+enabled = false
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy-single-agent"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        assert_eq!(
+            built.effective_memory_dir(),
+            Some("/tmp/legacy-single-agent"),
+            "single-agent mode must honor [orchestration.artifacts].memory_dir fallback",
+        );
+        assert!(
+            !built.orchestration_enabled(),
+            "orchestration should be disabled in this test",
+        );
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_none_when_unset() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        assert_eq!(built.effective_memory_dir(), None);
     }
 }

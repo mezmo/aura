@@ -30,6 +30,7 @@ impl RigBuilder {
             context: self.config.agent.context.clone(),
             turn_depth: self.config.agent.turn_depth,
             mcp_filter: self.config.agent.mcp_filter.clone(),
+            scratchpad: self.config.agent.scratchpad.clone(),
         };
 
         let vector_stores: Vec<VectorStoreConfig> = self
@@ -63,22 +64,26 @@ impl RigBuilder {
                             args,
                             env,
                             description,
+                            scratchpad,
                         } => McpServerConfig::Stdio {
                             cmd: cmd.first().unwrap_or(&String::new()).clone(),
                             args: args.clone(),
                             env: env.clone(),
                             description: description.clone(),
+                            scratchpad: scratchpad.clone(),
                         },
                         crate::config::McpServerConfig::HttpStreamable {
                             url,
                             headers,
                             description,
                             headers_from_request,
+                            scratchpad,
                         } => McpServerConfig::HttpStreamable {
                             url: url.clone(),
                             headers: headers.clone(),
                             description: description.clone(),
                             headers_from_request: headers_from_request.clone(),
+                            scratchpad: scratchpad.clone(),
                         },
                     };
                     (name.clone(), converted_server)
@@ -111,6 +116,7 @@ impl RigBuilder {
                             vector_stores: worker.vector_stores.clone(),
                             turn_depth: worker.turn_depth,
                             llm: worker.llm.clone(),
+                            scratchpad: worker.scratchpad.clone(),
                         },
                     )
                 })
@@ -154,6 +160,7 @@ impl RigBuilder {
             vector_stores,
             mcp,
             tools,
+            memory_dir: self.config.memory_dir.clone(),
             orchestration,
             // Extension fields default to None (set by orchestrator for workers)
             tool_wrapper: None,
@@ -163,6 +170,7 @@ impl RigBuilder {
             orchestration_persistence: None,
             orchestration_chat_history: None,
             session_id: None,
+            scratchpad_tools_config: None,
         })
     }
 
@@ -279,6 +287,7 @@ mod tests {
                 headers: static_headers,
                 description: None,
                 headers_from_request,
+                scratchpad: HashMap::new(),
             },
         );
 
