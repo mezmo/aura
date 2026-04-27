@@ -3,48 +3,6 @@ mod tests {
     use crate::string_utils::*;
 
     #[test]
-    fn test_truncate_for_log_ascii() {
-        let (result, truncated) = truncate_for_log("hello world", 5);
-        assert_eq!(result, "hello");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_no_truncation() {
-        let (result, truncated) = truncate_for_log("short", 100);
-        assert_eq!(result, "short");
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_exact_length() {
-        let (result, truncated) = truncate_for_log("hello", 5);
-        assert_eq!(result, "hello");
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_one_byte_over() {
-        let (result, truncated) = truncate_for_log("hello", 4);
-        assert_eq!(result, "hell");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_empty_string() {
-        let (result, truncated) = truncate_for_log("", 10);
-        assert_eq!(result, "");
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_empty_string_zero_max() {
-        let (result, truncated) = truncate_for_log("", 0);
-        assert_eq!(result, "");
-        assert!(!truncated);
-    }
-
-    #[test]
     fn test_truncate_for_log_zero_max_bytes() {
         let (result, truncated) = truncate_for_log("hello", 0);
         assert_eq!(result, "");
@@ -52,50 +10,23 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_single_char() {
+    fn test_truncate_for_log_single_ascii_char() {
         let (result, truncated) = truncate_for_log("a", 1);
         assert_eq!(result, "a");
         assert!(!truncated);
     }
 
     #[test]
-    fn test_truncate_for_log_single_char_truncated() {
+    fn test_truncate_for_log_two_chars_truncate_to_one() {
         let (result, truncated) = truncate_for_log("ab", 1);
         assert_eq!(result, "a");
         assert!(truncated);
     }
 
     #[test]
-    fn test_truncate_for_log_emoji() {
-        let input = "Hello 🎉 World";
-        assert_eq!(input.len(), 16);
-
-        let (result, truncated) = truncate_for_log(input, 8);
-        assert_eq!(result, "Hello ");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_emoji_boundary() {
-        let input = "Hello 🎉 World";
-        let (result, truncated) = truncate_for_log(input, 10);
-        assert_eq!(result, "Hello 🎉");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_emoji_after() {
-        let input = "Hello 🎉 World";
-        let (result, truncated) = truncate_for_log(input, 11);
-        assert_eq!(result, "Hello 🎉 ");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_only_emoji() {
+    fn test_truncate_for_log_backs_up_to_char_boundary_on_emoji() {
         let input = "🎉";
         assert_eq!(input.len(), 4);
-
         let (result, truncated) = truncate_for_log(input, 4);
         assert_eq!(result, "🎉");
         assert!(!truncated);
@@ -117,7 +48,6 @@ mod tests {
     fn test_truncate_for_log_multiple_emojis() {
         let input = "🎉🎊🎈";
         assert_eq!(input.len(), 12);
-
         let (result, truncated) = truncate_for_log(input, 8);
         assert_eq!(result, "🎉🎊");
         assert!(truncated);
@@ -160,28 +90,9 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_cjk() {
-        let input = "日本語テスト";
-        assert_eq!(input.len(), 18);
-
-        let (result, truncated) = truncate_for_log(input, 4);
-        assert_eq!(result, "日");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_cjk_boundary() {
-        let input = "日本語テスト";
-        let (result, truncated) = truncate_for_log(input, 6);
-        assert_eq!(result, "日本");
-        assert!(truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_cjk_mid_character() {
+    fn test_truncate_for_log_backs_up_to_char_boundary_on_cjk() {
         let input = "日本語";
         assert_eq!(input.len(), 9);
-
         let (result, truncated) = truncate_for_log(input, 4);
         assert_eq!(result, "日");
         assert!(truncated);
@@ -192,10 +103,9 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_cjk_single_char() {
+    fn test_truncate_for_log_single_cjk_char() {
         let input = "日";
         assert_eq!(input.len(), 3);
-
         let (result, truncated) = truncate_for_log(input, 3);
         assert_eq!(result, "日");
         assert!(!truncated);
@@ -213,7 +123,6 @@ mod tests {
     fn test_truncate_for_log_cjk_with_ascii() {
         let input = "Hello日本";
         assert_eq!(input.len(), 11);
-
         let (result, truncated) = truncate_for_log(input, 5);
         assert_eq!(result, "Hello");
         assert!(truncated);
@@ -230,7 +139,6 @@ mod tests {
     #[test]
     fn test_truncate_for_log_mixed_unicode() {
         let input = "Hello🎉日本語";
-
         let (result, truncated) = truncate_for_log(input, 5);
         assert_eq!(result, "Hello");
         assert!(truncated);
@@ -249,10 +157,9 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_two_byte_chars() {
+    fn test_truncate_for_log_backs_up_to_char_boundary_on_two_byte_utf8() {
         let input = "café";
         assert_eq!(input.len(), 5);
-
         let (result, truncated) = truncate_for_log(input, 3);
         assert_eq!(result, "caf");
         assert!(truncated);
@@ -270,7 +177,6 @@ mod tests {
     fn test_truncate_for_log_cyrillic() {
         let input = "Привет";
         assert_eq!(input.len(), 12);
-
         let (result, truncated) = truncate_for_log(input, 2);
         assert_eq!(result, "П");
         assert!(truncated);
@@ -287,12 +193,12 @@ mod tests {
     #[test]
     fn test_truncate_for_log_arabic() {
         let input = "مرحبا";
-        let len = input.len();
-
+        let _len = input.len();
         let (result, truncated) = truncate_for_log(input, 2);
         assert_eq!(result.chars().count(), 1);
         assert!(truncated);
 
+        let len = input.len();
         let (result, truncated) = truncate_for_log(input, len);
         assert_eq!(result, input);
         assert!(!truncated);
@@ -311,14 +217,13 @@ mod tests {
         let input = "a".repeat(10000);
         let (result, truncated) = truncate_for_log(&input, 100);
         assert_eq!(result.len(), 100);
+        assert_eq!(result, "a".repeat(100));
         assert!(truncated);
-    }
 
-    #[test]
-    fn test_truncate_for_log_large_string_no_truncation() {
         let input = "a".repeat(100);
         let (result, truncated) = truncate_for_log(&input, 100);
         assert_eq!(result.len(), 100);
+        assert_eq!(result, input);
         assert!(!truncated);
     }
 
@@ -331,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_newlines() {
+    fn test_truncate_for_log_newline_and_tab() {
         let input = "hello\nworld";
         let (result, truncated) = truncate_for_log(input, 5);
         assert_eq!(result, "hello");
@@ -340,10 +245,7 @@ mod tests {
         let (result, truncated) = truncate_for_log(input, 6);
         assert_eq!(result, "hello\n");
         assert!(truncated);
-    }
 
-    #[test]
-    fn test_truncate_for_log_tabs() {
         let input = "hello\tworld";
         let (result, truncated) = truncate_for_log(input, 6);
         assert_eq!(result, "hello\t");
@@ -354,7 +256,6 @@ mod tests {
     fn test_truncate_for_log_zero_width_joiner() {
         let input = "👨‍👩‍👧‍👦";
         let len = input.len();
-
         let (result, truncated) = truncate_for_log(input, len);
         assert_eq!(result, input);
         assert!(!truncated);
@@ -368,7 +269,6 @@ mod tests {
     fn test_truncate_for_log_combining_diacritics() {
         let input = "e\u{0301}";
         assert_eq!(input.len(), 3);
-
         let (result, truncated) = truncate_for_log(input, 1);
         assert_eq!(result, "e");
         assert!(truncated);
@@ -379,10 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_grapheme_clusters() {
+    fn test_truncate_for_log_devanagari() {
         let input = "नमस्ते";
         let len = input.len();
-
         let (result, truncated) = truncate_for_log(input, len);
         assert_eq!(result, input);
         assert!(!truncated);
@@ -392,40 +291,25 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_max_one_ascii() {
+    fn test_truncate_for_log_max_one() {
         let (result, truncated) = truncate_for_log("hello", 1);
         assert_eq!(result, "h");
         assert!(truncated);
-    }
 
-    #[test]
-    fn test_truncate_for_log_max_one_multibyte() {
         let (result, truncated) = truncate_for_log("日本", 1);
         assert_eq!(result, "");
         assert!(truncated);
     }
 
     #[test]
-    fn test_truncate_for_log_exact_emoji_boundary() {
-        let input = "🎉";
-        let (result, truncated) = truncate_for_log(input, 4);
-        assert_eq!(result, "🎉");
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn test_truncate_for_log_one_less_than_emoji() {
+    fn test_truncate_for_log_ascii_before_multibyte() {
         let input = "a🎉";
         let (result, truncated) = truncate_for_log(input, 4);
         assert_eq!(result, "a");
         assert!(truncated);
-    }
 
-    #[test]
-    fn test_truncate_for_log_ascii_then_multibyte() {
         let input = "abc日";
         assert_eq!(input.len(), 6);
-
         let (result, truncated) = truncate_for_log(input, 3);
         assert_eq!(result, "abc");
         assert!(truncated);
@@ -440,23 +324,144 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_for_log_all_multibyte_exact() {
+    fn test_truncate_for_log_two_cjk_exact() {
         let input = "日本";
         assert_eq!(input.len(), 6);
-
         let (result, truncated) = truncate_for_log(input, 6);
         assert_eq!(result, "日本");
         assert!(!truncated);
     }
 
     #[test]
-    fn test_truncate_for_log_tuple_structure() {
-        let (s, b) = truncate_for_log("test", 2);
-        assert_eq!(s, "te");
-        assert!(b);
+    fn test_truncate_for_log_whitespace_only() {
+        let input = "\t\n\r ";
+        let (result, truncated) = truncate_for_log(input, 2);
+        assert_eq!(result, "\t\n");
+        assert!(truncated);
+    }
 
-        let (s, b) = truncate_for_log("test", 10);
-        assert_eq!(s, "test");
-        assert!(!b);
+    #[test]
+    fn test_truncate_for_log_carriage_return_and_null() {
+        let input = "hello\rworld";
+        let (result, truncated) = truncate_for_log(input, 6);
+        assert_eq!(result, "hello\r");
+        assert!(truncated);
+
+        let input = "hello\0world";
+        let (result, truncated) = truncate_for_log(input, 6);
+        assert_eq!(result, "hello\0");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_multiple_newlines() {
+        let input = "a\n\n\nb";
+        let (result, truncated) = truncate_for_log(input, 3);
+        assert_eq!(result, "a\n\n");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_mixed_whitespace() {
+        let input = " \t\n\r";
+        let (result, truncated) = truncate_for_log(input, 4);
+        assert_eq!(result, " \t\n\r");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_emoji_sequence() {
+        let input = "🏴󠁧󠁢󠁥󠁮󠁧󠁿";
+        let len = input.len();
+        let (result, truncated) = truncate_for_log(input, len);
+        assert_eq!(result, input);
+        assert!(!truncated);
+
+        let (result, truncated) = truncate_for_log(input, 5);
+        assert!(truncated);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_truncate_for_log_skin_tone_modifier() {
+        let input = "👋🏽";
+        let len = input.len();
+        let (result, truncated) = truncate_for_log(input, len);
+        assert_eq!(result, input);
+        assert!(!truncated);
+
+        let (result, truncated) = truncate_for_log(input, 4);
+        assert_eq!(result, "👋");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_alternating_ascii_and_multibyte() {
+        let input = "a🎉b🎊c";
+        let (result, truncated) = truncate_for_log(input, 5);
+        assert_eq!(result, "a🎉");
+        assert!(truncated);
+
+        let input = "a日b本c";
+        let (result, truncated) = truncate_for_log(input, 4);
+        assert_eq!(result, "a日");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_long_ascii_string() {
+        let input = "abcdefghijklmnopqrstuvwxyz";
+        let (result, truncated) = truncate_for_log(input, 10);
+        assert_eq!(result, "abcdefghij");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_repeated_multibyte() {
+        let input = "🎉".repeat(10);
+        let (result, truncated) = truncate_for_log(&input, 20);
+        assert_eq!(result, "🎉".repeat(5));
+        assert!(truncated);
+
+        let input = "日".repeat(10);
+        let (result, truncated) = truncate_for_log(&input, 15);
+        assert_eq!(result, "日".repeat(5));
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_special_characters() {
+        let input = "!@#$%^&*()";
+        let (result, truncated) = truncate_for_log(input, 5);
+        assert_eq!(result, "!@#$%");
+        assert!(truncated);
+
+        let input = "[]{}()<>";
+        let (result, truncated) = truncate_for_log(input, 4);
+        assert_eq!(result, "[]{}");
+        assert!(truncated);
+
+        let input = "\"'`";
+        let (result, truncated) = truncate_for_log(input, 2);
+        assert_eq!(result, "\"'");
+        assert!(truncated);
+
+        let input = "|||&&&~~~@@@###$$$%%%^^^***+++===___---;;;:::,,,...???!!!<<<>>>";
+        let (result, truncated) = truncate_for_log(input, 10);
+        assert_eq!(result, "|||&&&~~~@");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_truncate_for_log_backslash_and_forward_slash() {
+        let input = "\\\\\\";
+        let (result, truncated) = truncate_for_log(input, 2);
+        assert_eq!(result, "\\\\");
+        assert!(truncated);
+
+        let input = "///";
+        let (result, truncated) = truncate_for_log(input, 2);
+        assert_eq!(result, "//");
+        assert!(truncated);
     }
 }

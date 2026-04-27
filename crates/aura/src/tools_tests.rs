@@ -100,8 +100,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "hello world");
+        let content = result.unwrap();
+        assert_eq!(content, "hello world");
     }
 
     #[tokio::test]
@@ -116,8 +116,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "");
+        let content = result.unwrap();
+        assert_eq!(content, "");
     }
 
     #[tokio::test]
@@ -129,8 +129,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::PathNotFound(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PathNotFound(_)));
     }
 
     #[tokio::test]
@@ -146,8 +146,9 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::PermissionDenied(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("File too large"));
     }
 
     #[tokio::test]
@@ -163,8 +164,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().len(), 100);
+        let content = result.unwrap();
+        assert_eq!(content.len(), 100);
     }
 
     #[tokio::test]
@@ -180,8 +181,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::PermissionDenied(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
     }
 
     #[tokio::test]
@@ -195,8 +196,9 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::InvalidPath(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::InvalidPath(_)));
+        assert!(err.to_string().contains("not a file"));
     }
 
     #[tokio::test]
@@ -212,8 +214,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), content);
+        let read_content = result.unwrap();
+        assert_eq!(read_content, content);
     }
 
     #[tokio::test]
@@ -229,7 +231,6 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
         let listing = result.unwrap();
         assert_eq!(listing.total_count, 2);
         assert_eq!(listing.entries.len(), 2);
@@ -246,7 +247,6 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
         let listing = result.unwrap();
         assert_eq!(listing.total_count, 0);
         assert_eq!(listing.entries.len(), 0);
@@ -262,8 +262,9 @@ mod tests {
         let result = tool.call(args).await;
         
         assert!(result.is_err());
-        let err = result.err().unwrap();
-        assert!(matches!(err, FilesystemError::PathNotFound(_)));
+        if let Err(err) = result {
+            assert!(matches!(err, FilesystemError::PathNotFound(_)));
+        }
     }
 
     #[tokio::test]
@@ -279,8 +280,10 @@ mod tests {
         let result = tool.call(args).await;
         
         assert!(result.is_err());
-        let err = result.err().unwrap();
-        assert!(matches!(err, FilesystemError::InvalidPath(_)));
+        if let Err(err) = result {
+            assert!(matches!(err, FilesystemError::InvalidPath(_)));
+            assert!(err.to_string().contains("not a directory"));
+        }
     }
 
     #[tokio::test]
@@ -296,7 +299,6 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
         let listing = result.unwrap();
         assert_eq!(listing.entries.len(), 2);
         
@@ -324,7 +326,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        let message = result.unwrap();
+        assert!(message.contains("File written successfully"));
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "test content");
     }
@@ -342,8 +345,9 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::PermissionDenied(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("Write access disabled"));
     }
 
     #[tokio::test]
@@ -359,7 +363,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "");
     }
@@ -378,7 +382,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
         let read_content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(read_content, content);
     }
@@ -396,7 +400,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "new content");
     }
@@ -417,7 +421,7 @@ mod tests {
         };
         let result = tool.call(args).await;
 
-        assert!(result.is_ok());
+        result.unwrap();
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "content");
     }
@@ -436,6 +440,8 @@ mod tests {
         assert_eq!(definition.name, "read_file");
         assert!(definition.description.contains("Read"));
         assert!(definition.parameters.get("type").is_some());
+        assert!(definition.parameters.get("properties").is_some());
+        assert!(definition.parameters.get("required").is_some());
     }
 
     #[tokio::test]
@@ -451,7 +457,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        let content = result.unwrap();
+        assert_eq!(content, "hello");
     }
 
     #[tokio::test]
@@ -483,7 +490,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        let listing = result.unwrap();
+        assert_eq!(listing.entries.len(), 1);
     }
 
     #[tokio::test]
@@ -499,7 +507,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -532,7 +540,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -552,7 +560,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[test]
@@ -642,27 +650,6 @@ mod tests {
         assert_eq!(cloned.max_file_size, tool.max_file_size);
     }
 
-    #[test]
-    fn test_read_file_tool_clone() {
-        let fs_tool = FilesystemTool::new();
-        let tool = ReadFileTool(fs_tool);
-        let _cloned = tool.clone();
-    }
-
-    #[test]
-    fn test_list_dir_tool_clone() {
-        let fs_tool = FilesystemTool::new();
-        let tool = ListDirTool(fs_tool);
-        let _cloned = tool.clone();
-    }
-
-    #[test]
-    fn test_write_file_tool_clone() {
-        let fs_tool = FilesystemTool::new();
-        let tool = WriteFileTool(fs_tool);
-        let _cloned = tool.clone();
-    }
-
     #[tokio::test]
     async fn test_read_file_tool_large_file() {
         let temp_dir = create_temp_dir();
@@ -676,7 +663,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
     }
 
     #[tokio::test]
@@ -691,7 +679,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
     }
 
     #[tokio::test]
@@ -708,7 +697,6 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
         let listing = result.unwrap();
         assert_eq!(listing.total_count, 3);
     }
@@ -727,7 +715,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
         let read_content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(read_content.len(), 10_000);
     }
@@ -746,7 +734,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
         let read_content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(read_content, content);
     }
@@ -763,7 +751,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
     }
 
     #[tokio::test]
@@ -779,7 +768,6 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
         let listing = result.unwrap();
         assert_eq!(listing.total_count, 2);
     }
@@ -798,7 +786,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
         let read_content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(read_content, content);
     }
@@ -816,7 +804,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        let read_content = result.unwrap();
+        assert_eq!(read_content.len(), 1_048_576);
     }
 
     #[tokio::test]
@@ -832,7 +821,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
     }
 
     #[tokio::test]
@@ -850,7 +840,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        let content = result.unwrap();
+        assert_eq!(content, "content");
     }
 
     #[tokio::test]
@@ -869,8 +860,9 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::PermissionDenied(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("outside of base directory"));
     }
 
     #[tokio::test]
@@ -888,7 +880,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        let listing = result.unwrap();
+        assert_eq!(listing.entries.len(), 1);
     }
 
     #[tokio::test]
@@ -907,8 +900,9 @@ mod tests {
         let result = tool.call(args).await;
         
         assert!(result.is_err());
-        let err = result.err().unwrap();
-        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        if let Err(err) = result {
+            assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        }
     }
 
     #[tokio::test]
@@ -928,7 +922,7 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_ok());
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -949,8 +943,8 @@ mod tests {
         };
         let result = tool.call(args).await;
         
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), FilesystemError::PermissionDenied(_)));
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
     }
 
     #[test]
@@ -989,5 +983,528 @@ mod tests {
             create_dirs: None,
         };
         assert_eq!(args.content, "");
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_etc() {
+        let temp_dir = create_temp_dir();
+        let etc_dir = temp_dir.path().join("etc");
+        fs::create_dir(&etc_dir).unwrap();
+        let file_path = etc_dir.join("passwd");
+        fs::write(&file_path, "test").unwrap();
+
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/etc"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_proc() {
+        let temp_dir = create_temp_dir();
+        let proc_dir = temp_dir.path().join("proc");
+        fs::create_dir(&proc_dir).unwrap();
+        let file_path = proc_dir.join("cpuinfo");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/proc"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_sys() {
+        let temp_dir = create_temp_dir();
+        let sys_dir = temp_dir.path().join("sys");
+        fs::create_dir(&sys_dir).unwrap();
+        let file_path = sys_dir.join("kernel");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/sys"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_dev() {
+        let temp_dir = create_temp_dir();
+        let dev_dir = temp_dir.path().join("dev");
+        fs::create_dir(&dev_dir).unwrap();
+        let file_path = dev_dir.join("null");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/dev"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_var_log() {
+        let temp_dir = create_temp_dir();
+        let var_dir = temp_dir.path().join("var");
+        fs::create_dir(&var_dir).unwrap();
+        let log_dir = var_dir.join("log");
+        fs::create_dir(&log_dir).unwrap();
+        let file_path = log_dir.join("syslog");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_dot_ssh() {
+        let temp_dir = create_temp_dir();
+        let ssh_dir = temp_dir.path().join(".ssh");
+        fs::create_dir(&ssh_dir).unwrap();
+        let file_path = ssh_dir.join("id_rsa");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/.ssh"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_dot_aws() {
+        let temp_dir = create_temp_dir();
+        let aws_dir = temp_dir.path().join(".aws");
+        fs::create_dir(&aws_dir).unwrap();
+        let file_path = aws_dir.join("credentials");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/.aws"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_dot_config() {
+        let temp_dir = create_temp_dir();
+        let config_dir = temp_dir.path().join(".config");
+        fs::create_dir(&config_dir).unwrap();
+        let file_path = config_dir.join("config");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        assert!(err.to_string().contains("/.config"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_etc_in_list_dir() {
+        let temp_dir = create_temp_dir();
+        let etc_dir = temp_dir.path().join("etc");
+        fs::create_dir(&etc_dir).unwrap();
+        
+        let tool = ListDirTool(FilesystemTool::new());
+        let args = ListDirArgs {
+            path: etc_dir.to_str().unwrap().to_string(),
+            recursive: None,
+        };
+        let result = tool.call(args).await;
+        
+        assert!(result.is_err());
+        if let Err(err) = result {
+            assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_blocks_ssh_in_write_file() {
+        let temp_dir = create_temp_dir();
+        let ssh_dir = temp_dir.path().join(".ssh");
+        fs::create_dir(&ssh_dir).unwrap();
+        let file_path = ssh_dir.join("authorized_keys");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = WriteFileTool(FilesystemTool::new().with_write_access(true));
+        let args = WriteFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            content: "malicious key".to_string(),
+            create_dirs: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_case_insensitive_etc() {
+        let temp_dir = create_temp_dir();
+        let etc_dir = temp_dir.path().join("ETC");
+        fs::create_dir(&etc_dir).unwrap();
+        let file_path = etc_dir.join("passwd");
+        fs::write(&file_path, "test").unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_relative_path_conversion() {
+        let temp_dir = create_temp_dir();
+        let _file_path = create_test_file(&temp_dir, "test.txt", "content");
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: "test.txt".to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        std::env::set_current_dir(original_dir).unwrap();
+        
+        let content = result.unwrap();
+        assert_eq!(content, "content");
+    }
+
+    #[tokio::test]
+    async fn test_file_info_serialization() {
+        let file_info = FileInfo {
+            name: "test.txt".to_string(),
+            path: "/tmp/test.txt".to_string(),
+            is_file: true,
+            is_dir: false,
+            size: Some(1024),
+        };
+        
+        let json = serde_json::to_string(&file_info).unwrap();
+        assert!(json.contains("test.txt"));
+        assert!(json.contains("1024"));
+    }
+
+    #[tokio::test]
+    async fn test_directory_listing_serialization() {
+        let listing = DirectoryListing {
+            path: "/tmp".to_string(),
+            entries: vec![
+                FileInfo {
+                    name: "file1.txt".to_string(),
+                    path: "/tmp/file1.txt".to_string(),
+                    is_file: true,
+                    is_dir: false,
+                    size: Some(100),
+                },
+            ],
+            total_count: 1,
+        };
+        
+        let json = serde_json::to_string(&listing).unwrap();
+        assert!(json.contains("file1.txt"));
+        assert!(json.contains("total_count"));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_tool_path_in_result() {
+        let temp_dir = create_temp_dir();
+        let _file_path = create_test_file(&temp_dir, "test.txt", "content");
+        
+        let tool = ListDirTool(FilesystemTool::new());
+        let args = ListDirArgs {
+            path: temp_dir.path().to_str().unwrap().to_string(),
+            recursive: None,
+        };
+        let result = tool.call(args).await;
+        
+        let listing = result.unwrap();
+        assert!(listing.path.contains(temp_dir.path().to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_tool_entry_paths() {
+        let temp_dir = create_temp_dir();
+        create_test_file(&temp_dir, "test.txt", "content");
+        
+        let tool = ListDirTool(FilesystemTool::new());
+        let args = ListDirArgs {
+            path: temp_dir.path().to_str().unwrap().to_string(),
+            recursive: None,
+        };
+        let result = tool.call(args).await;
+        
+        let listing = result.unwrap();
+        let entry = &listing.entries[0];
+        assert_eq!(entry.name, "test.txt");
+        assert!(entry.path.ends_with("test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool_result_message() {
+        let temp_dir = create_temp_dir();
+        let file_path = create_test_file_for_write(&temp_dir, "new.txt");
+        
+        let tool = WriteFileTool(FilesystemTool::new().with_write_access(true));
+        let args = WriteFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            content: "test".to_string(),
+            create_dirs: None,
+        };
+        let result = tool.call(args).await;
+        
+        let message = result.unwrap();
+        assert!(message.contains("File written successfully"));
+        assert!(message.contains("new.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_multiline_content() {
+        let temp_dir = create_temp_dir();
+        let content = "line1\nline2\nline3\nline4";
+        let file_path = create_test_file(&temp_dir, "multiline.txt", content);
+        
+        let tool = ReadFileTool(FilesystemTool::new());
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: None,
+        };
+        let result = tool.call(args).await;
+        
+        let read_content = result.unwrap();
+        assert_eq!(read_content, content);
+        assert_eq!(read_content.lines().count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_tool_file_size_accuracy() {
+        let temp_dir = create_temp_dir();
+        let content = "a".repeat(1234);
+        create_test_file(&temp_dir, "sized.txt", &content);
+        
+        let tool = ListDirTool(FilesystemTool::new());
+        let args = ListDirArgs {
+            path: temp_dir.path().to_str().unwrap().to_string(),
+            recursive: None,
+        };
+        let result = tool.call(args).await;
+        
+        let listing = result.unwrap();
+        let entry = listing.entries.iter().find(|e| e.name == "sized.txt").unwrap();
+        assert_eq!(entry.size, Some(1234));
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool_preserves_exact_content() {
+        let temp_dir = create_temp_dir();
+        let file_path = create_test_file_for_write(&temp_dir, "exact.txt");
+        let content = "exact content with spaces   and\ttabs\nand newlines";
+        
+        let tool = WriteFileTool(FilesystemTool::new().with_write_access(true));
+        let args = WriteFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            content: content.to_string(),
+            create_dirs: None,
+        };
+        let result = tool.call(args).await;
+        
+        result.unwrap();
+        let read_content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(read_content, content);
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_tool_max_file_size_custom_values() {
+        let tool1 = FilesystemTool::new().with_max_file_size(1);
+        assert_eq!(tool1.max_file_size, 1);
+        
+        let tool2 = FilesystemTool::new().with_max_file_size(999_999_999);
+        assert_eq!(tool2.max_file_size, 999_999_999);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_respects_custom_max_size_over_default() {
+        let temp_dir = create_temp_dir();
+        let content = "a".repeat(100);
+        let file_path = create_test_file(&temp_dir, "test.txt", &content);
+        
+        let tool = ReadFileTool(FilesystemTool::new().with_max_file_size(1000));
+        let args = ReadFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            max_size: Some(50),
+        };
+        let result = tool.call(args).await;
+        
+        let err = result.unwrap_err();
+        assert!(matches!(err, FilesystemError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_tool_mixed_files_and_dirs() {
+        let temp_dir = create_temp_dir();
+        create_test_file(&temp_dir, "file1.txt", "content");
+        create_test_file(&temp_dir, "file2.txt", "content");
+        fs::create_dir(temp_dir.path().join("dir1")).unwrap();
+        fs::create_dir(temp_dir.path().join("dir2")).unwrap();
+        
+        let tool = ListDirTool(FilesystemTool::new());
+        let args = ListDirArgs {
+            path: temp_dir.path().to_str().unwrap().to_string(),
+            recursive: None,
+        };
+        let result = tool.call(args).await;
+        
+        let listing = result.unwrap();
+        assert_eq!(listing.total_count, 4);
+        let files = listing.entries.iter().filter(|e| e.is_file).count();
+        let dirs = listing.entries.iter().filter(|e| e.is_dir).count();
+        assert_eq!(files, 2);
+        assert_eq!(dirs, 2);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_tool_binary_like_content() {
+        let temp_dir = create_temp_dir();
+        let file_path = create_test_file_for_write(&temp_dir, "binary.txt");
+        let content = "\x00\x01\x02\x03\x7E\x7F";
+        
+        let tool = WriteFileTool(FilesystemTool::new().with_write_access(true));
+        let args = WriteFileArgs {
+            path: file_path.to_str().unwrap().to_string(),
+            content: content.to_string(),
+            create_dirs: None,
+        };
+        let result = tool.call(args).await;
+        
+        result.unwrap();
+        let read_content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(read_content, content);
+    }
+
+    #[test]
+    fn test_filesystem_error_display_messages() {
+        let err1 = FilesystemError::PermissionDenied("test path".to_string());
+        assert_eq!(err1.to_string(), "Permission denied: test path");
+        
+        let err2 = FilesystemError::PathNotFound("missing.txt".to_string());
+        assert_eq!(err2.to_string(), "Path not found: missing.txt");
+        
+        let err3 = FilesystemError::InvalidPath("bad/path".to_string());
+        assert_eq!(err3.to_string(), "Invalid path: bad/path");
+    }
+
+    #[tokio::test]
+    async fn test_read_file_args_max_size_boundary_values() {
+        let args1 = ReadFileArgs {
+            path: "/test".to_string(),
+            max_size: Some(0),
+        };
+        assert_eq!(args1.max_size, Some(0));
+        
+        let args2 = ReadFileArgs {
+            path: "/test".to_string(),
+            max_size: Some(usize::MAX),
+        };
+        assert_eq!(args2.max_size, Some(usize::MAX));
+    }
+
+    #[test]
+    fn test_list_dir_args_recursive_values() {
+        let args1 = ListDirArgs {
+            path: "/test".to_string(),
+            recursive: Some(true),
+        };
+        assert_eq!(args1.recursive, Some(true));
+        
+        let args2 = ListDirArgs {
+            path: "/test".to_string(),
+            recursive: Some(false),
+        };
+        assert_eq!(args2.recursive, Some(false));
+        
+        let args3 = ListDirArgs {
+            path: "/test".to_string(),
+            recursive: None,
+        };
+        assert_eq!(args3.recursive, None);
+    }
+
+    #[test]
+    fn test_write_file_args_create_dirs_values() {
+        let args1 = WriteFileArgs {
+            path: "/test".to_string(),
+            content: "test".to_string(),
+            create_dirs: Some(true),
+        };
+        assert_eq!(args1.create_dirs, Some(true));
+        
+        let args2 = WriteFileArgs {
+            path: "/test".to_string(),
+            content: "test".to_string(),
+            create_dirs: Some(false),
+        };
+        assert_eq!(args2.create_dirs, Some(false));
+        
+        let args3 = WriteFileArgs {
+            path: "/test".to_string(),
+            content: "test".to_string(),
+            create_dirs: None,
+        };
+        assert_eq!(args3.create_dirs, None);
     }
 }

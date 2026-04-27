@@ -75,11 +75,42 @@ WHAT TO TEST:
 - Unicode and multi-byte characters where relevant
 - Edge cases specific to the function's logic
 
+CRATE-SPECIFIC RULES FOR THE AURA CRATE:
+- The test file is a sibling module at the crate root, NOT a submodule of the source.
+  So use `use crate::<module>::*;` for imports, NOT `use super::*;`
+- Types like FilesystemTool, ReadFileTool, ListDirTool, WriteFileTool are re-exported
+  from the crate root. Import them as: `use crate::tools::{FilesystemTool, ReadFileTool, ...};`
+  The `use crate::<module>::*;` glob does NOT bring in these wrapper types.
+- For Tool trait methods (definition, call), import: `use rig::tool::Tool;`
+- For VectorStoreManager in tests, use the test stub constructor:
+  `VectorStoreManager::new_stub("name", None)` — do NOT construct the struct directly.
+- Private helper functions (like parse_value_str, default_limit, is_reasoning_model,
+  build_ollama_params) are pub(crate) and accessible from sibling test modules.
+- The tempfile crate is NOT available. For filesystem tests, create a TempDir struct:
+  ```
+  struct TempDir(PathBuf);
+  impl TempDir { fn path(&self) -> &Path { &self.0 } }
+  impl Drop for TempDir { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+  fn create_temp_dir() -> TempDir {
+      use std::sync::atomic::{AtomicU64, Ordering};
+      static COUNTER: AtomicU64 = AtomicU64::new(0);
+      let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+      let dir = std::env::temp_dir().join(format!("aura_test_{}_{}", std::process::id(), id));
+      fs::create_dir_all(&dir).unwrap();
+      TempDir(dir)
+  }
+  ```
+- For write_file tests: the file MUST exist before calling write_file because
+  validate_path() uses canonicalize() which requires the file to exist.
+  Pre-create files with: `fs::write(&path, "").unwrap();`
+
 DO NOT:
-- Add external dependencies not already in Cargo.toml (no tempfile, no rstest)
+- Use tempfile crate (it is NOT in Cargo.toml)
+- Construct VectorStoreManager with struct literal syntax (fields are private)
 - Modify the source file — only write test code
 - Write tests that only check is_ok()/is_err() without verifying content
 - Create 20 tests that are copy-paste with different input values
+- Import types that are not accessible from a sibling module
 
 OUTPUT: Write the complete test file using write_file. Do not explain — just write the code.
 """
