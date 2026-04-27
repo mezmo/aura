@@ -1,6 +1,9 @@
 //! Configuration types for orchestration mode.
 
-use crate::config::{LlmConfig, VectorStoreConfig};
+use crate::{
+    config::{LlmConfig, VectorStoreConfig},
+    scratchpad::ScratchpadConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -205,6 +208,11 @@ pub struct WorkerConfig {
     /// math (e.g. scratchpad sizing, LOG-23439).
     #[serde(default)]
     pub llm: Option<LlmConfig>,
+
+    /// Per-worker override of `[agent.scratchpad]`. Parsed from
+    /// `[orchestration.worker.<name>.scratchpad]`.
+    #[serde(default)]
+    pub scratchpad: Option<ScratchpadConfig>,
 }
 
 // ============================================================================
@@ -479,10 +487,7 @@ impl OrchestrationConfig {
             .replace("{{recon_guidance}}", recon_guidance);
 
         // AURA_ESCAPE_HATCH=false strips the "Resolve tool gaps" directive for A/B testing
-        if std::env::var("AURA_ESCAPE_HATCH")
-            .map(|v| v == "false" || v == "0")
-            .unwrap_or(false)
-        {
+        if !crate::env_flags::bool_env("AURA_ESCAPE_HATCH", true) {
             tracing::info!("AURA_ESCAPE_HATCH=false — stripping escape hatch directive");
             preamble = preamble.replace(
                 "5. **Resolve tool gaps pragmatically**: If a user requests an operation with no matching tool, create a plan using the available tools and note the gap in `planning_summary`. Do NOT deliberate at length about missing capabilities — route what you can, report what you cannot.\n",

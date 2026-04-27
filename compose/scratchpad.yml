@@ -1,0 +1,74 @@
+# compose/scratchpad.yml — STACK overlay (long-running services)
+#
+# Defines the scratchpad suite's runtime: scratchpad-test-mcp MCP server
+# and a single aura-web-server (port 8080) that loads BOTH the
+# orchestration and single-agent scratchpad configs from a directory.
+# Tests pick which config handles a given request via the OpenAI
+# `model` field, matched against each config's agent alias
+# ("scratchpad-orch" vs "scratchpad-single"). Mock-mcp from base.yml is
+# stubbed out (scratchpad tests don't use it).
+#
+# This file is consumed two ways:
+#   1. Local dev: layer on top of base.yml + dev.yml; run `cargo test`
+#      from the host against the exposed port.
+#   2. CI: scratchpad-test.yml (the TEST RUNNER overlay) layers on top
+#      of this file and adds a one-shot test container.
+#
+# Usage:
+#   # Local dev (services run, tests run from host):
+#   docker compose -f compose/base.yml -f compose/scratchpad.yml \
+#     -f compose/dev.yml up -d
+#
+#   # CI (one-shot test runner — see scratchpad-test.yml header):
+#   docker compose -p aura-scratchpad-test \
+#     -f compose/base.yml -f compose/scratchpad.yml \
+#     -f compose/scratchpad-test.yml up --build \
+#     --exit-code-from aura-scratchpad-test
+
+services:
+  # Stub out mock-mcp from base.yml — scratchpad tests don't use it.
+  # Override with a minimal container so the stack doesn't need the external
+  # aura-mock-mcp:local image (which requires `make mock-mcp-build`).
+  mock-mcp:
+    image: alpine:latest
+    command: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      timeout: 1s
+      retries: 1
+      start_period: 1s
+
+  scratchpad-test-mcp:
+    build:
+      context: ../tests/integration/scratchpad-mcp
+    ports:
+      - "8083:8083"  # Scratchpad test MCP server
+    healthcheck:
+      test: >
+        curl -sf http://localhost:8083/mcp -X POST
+        -H "Content-Type: application/json"
+        -H "Accept: application/json, text/event-stream"
+        -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}},"id":1}'
+        > /dev/null || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - aura-test
+
+  aura-web-server:
+    environment:
+      # Point CONFIG_PATH at a directory; aura-web-server loads every
+      # *.toml in it as a separate agent. Requests select between them
+      # via the `model` field (alias match: "scratchpad-orch" vs
+      # "scratchpad-single").
+      - CONFIG_PATH=/app/config/scratchpad
+    volumes:
+      # Mount both scratchpad configs into the same directory.
+      - ../configs/integration-scratchpad.toml:/app/config/scratchpad/orch.toml:ro
+      - ../configs/integration-scratchpad-single-agent.toml:/app/config/scratchpad/single.toml:ro
+    depends_on:
+      scratchpad-test-mcp:
+        condition: service_healthy

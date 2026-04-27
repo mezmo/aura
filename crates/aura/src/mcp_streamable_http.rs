@@ -451,8 +451,12 @@ impl StreamableHttpMcpClient {
                 tool_name, tool_call_id, progress_token
             );
         } else {
-            warn!(
-                "No tool_call_id in queue for tool '{}' on request '{}' - hook may not have fired or FIFO queue mismatch",
+            // Expected in orchestration mode: workers stream via `agent.stream_chat()`
+            // without `StreamingRequestHook`, so nothing pushes onto the FIFO queue.
+            // Orchestration emits its own `aura.orchestrator.tool_call_*` events via
+            // `ObserverWrapper`, so the missing `aura.tool_start` is by design.
+            debug!(
+                "No tool_call_id in queue for tool '{}' on request '{}' - hook not attached (orchestration) or queue mismatch",
                 tool_name, http_request_id
             );
         }

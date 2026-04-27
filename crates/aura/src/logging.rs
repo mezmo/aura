@@ -159,12 +159,10 @@ pub fn truncate_for_otel(s: &str) -> String {
 
 /// Read content-recording env vars. Called once at the top of `init_logging`.
 fn init_content_config() {
-    if let Ok(val) = std::env::var("OTEL_RECORD_CONTENT") {
-        RECORD_CONTENT.store(
-            matches!(val.as_str(), "true" | "1" | "yes"),
-            Ordering::Relaxed,
-        );
-    }
+    RECORD_CONTENT.store(
+        crate::env_flags::bool_env("OTEL_RECORD_CONTENT", false),
+        Ordering::Relaxed,
+    );
     if let Ok(val) = std::env::var("OTEL_CONTENT_MAX_LENGTH")
         && let Ok(n) = val.parse::<usize>()
     {

@@ -69,6 +69,7 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.worker_phase` | Worker phase transitions in multi-agent mode (planning/executing/analyzing) | ✅ Implemented |
 | `aura.tool_usage` | Usage snapshot after tool execution (associates tool IDs with token counts) | ✅ Implemented |
 | `aura.usage` | Final token usage emitted at stream end (prompt/completion/total) | ✅ Implemented |
+| `aura.scratchpad_usage` | Per-agent scratchpad usage summary (single-agent or worker), emitted when an agent finishes with scratchpad activity | ✅ Implemented |
 | `aura.orchestrator.*` | Orchestration lifecycle events (see [Orchestration Events](#orchestration-events) below) | ✅ Implemented |
 
 ### Event Flow
@@ -262,6 +263,14 @@ data:
 ```
 
 Use `prompt_tokens` with `model_context_limit` from `aura.session_info` to calculate context window fill percentage: `(prompt_tokens / model_context_limit) * 100`. No `agent_id` field (only `CorrelationContext`).
+
+**Scratchpad usage** (per-agent report when an agent finishes with scratchpad activity):
+```
+event: aura.scratchpad_usage
+data: {"agent_id":"main","tokens_intercepted":15840,"tokens_extracted":1200,"session_id":"sess_xyz"}
+```
+
+Emitted once per agent that used scratchpad — fires for both single-agent and orchestration worker contexts (in the latter, `agent_id` is the worker name). `tokens_intercepted` is the total tool output diverted to disk; `tokens_extracted` is what the agent pulled back into context via the scratchpad exploration tools.
 
 ### Client Handling
 
@@ -542,6 +551,8 @@ data:
   "session_id": "sess_xyz"
 }
 ```
+
+Note: Workers that use scratchpad emit `aura.scratchpad_usage` when they finish — see the [Custom Events](#event-types) section above. This is a base `aura.*` event (not orchestration-specific) so the same event fires for single-agent deployments and workers alike.
 
 ### Orchestration Correlation
 

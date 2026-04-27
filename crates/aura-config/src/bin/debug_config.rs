@@ -84,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     headers,
                     description,
                     headers_from_request,
+                    ..
                 } => {
                     println!(
                         "  - {}: HTTP Streamable at {} ({} headers)",
@@ -104,6 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args,
                     env,
                     description,
+                    ..
                 } => {
                     println!(
                         "  - {}: STDIO command {:?} with {} args, {} env vars",

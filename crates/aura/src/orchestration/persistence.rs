@@ -244,7 +244,7 @@ impl ExecutionPersistence {
     }
 
     /// Get iteration directory path (flat, directly under run dir).
-    fn iteration_path(&self) -> PathBuf {
+    pub(super) fn iteration_path(&self) -> PathBuf {
         self.base_path
             .join(format!("iteration-{}", self.current_iteration))
     }

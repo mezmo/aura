@@ -54,13 +54,27 @@ struct Args {
     streaming_buffer_size: usize,
 
     /// Enable Aura custom SSE events (aura.tool_requested, aura.tool_start, aura.tool_complete, etc.)
-    /// These are emitted alongside OpenAI-compatible chunks for enhanced client UX
-    #[arg(long, env = "AURA_CUSTOM_EVENTS", default_value = "false", action = clap::ArgAction::Set)]
+    /// These are emitted alongside OpenAI-compatible chunks for enhanced client UX.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_CUSTOM_EVENTS",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     aura_custom_events: bool,
 
-    /// Enable reasoning event emission (aura.reasoning)
-    /// Only effective when aura_custom_events is also enabled
-    #[arg(long, env = "AURA_EMIT_REASONING", default_value = "false", action = clap::ArgAction::Set)]
+    /// Enable reasoning event emission (aura.reasoning).
+    /// Only effective when aura_custom_events is also enabled.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_EMIT_REASONING",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
     aura_emit_reasoning: bool,
 
     /// SSE streaming request timeout in seconds.

@@ -12,6 +12,7 @@
 //! - `aura.reasoning` - Emitted for LLM reasoning (requires AURA_EMIT_REASONING=true)
 //!
 
+use aura::stream_events::event_names;
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::sse::{SseEvent, events_by_type, parse_sse_stream};
 use serde_json::{Value, json};
@@ -41,19 +42,19 @@ async fn send_tool_request(client: &reqwest::Client) -> reqwest::Response {
 }
 
 fn find_tool_start_events(events: &[SseEvent]) -> Vec<&SseEvent> {
-    events_by_type(events, "aura.tool_start")
+    events_by_type(events, event_names::TOOL_START)
 }
 
 fn find_progress_events(events: &[SseEvent]) -> Vec<&SseEvent> {
-    events_by_type(events, "aura.progress")
+    events_by_type(events, event_names::PROGRESS)
 }
 
 fn find_tool_requested_events(events: &[SseEvent]) -> Vec<&SseEvent> {
-    events_by_type(events, "aura.tool_requested")
+    events_by_type(events, event_names::TOOL_REQUESTED)
 }
 
 fn find_tool_complete_events(events: &[SseEvent]) -> Vec<&SseEvent> {
-    events_by_type(events, "aura.tool_complete")
+    events_by_type(events, event_names::TOOL_COMPLETE)
 }
 
 /// Test 1: Verify aura.tool_requested events are emitted when AURA_CUSTOM_EVENTS=true
@@ -76,7 +77,7 @@ async fn test_aura_tool_requested_events_emitted() {
     // Find aura.tool_requested events
     let tool_requested_events: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type.as_deref() == Some("aura.tool_requested"))
+        .filter(|e| e.event_type.as_deref() == Some(event_names::TOOL_REQUESTED))
         .collect();
 
     // Verify we got at least one tool_requested event (LLM should use list_files tool)
@@ -148,7 +149,7 @@ async fn test_aura_tool_complete_events_emitted() {
     // Find aura.tool_complete events
     let tool_complete_events: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type.as_deref() == Some("aura.tool_complete"))
+        .filter(|e| e.event_type.as_deref() == Some(event_names::TOOL_COMPLETE))
         .collect();
 
     // Verify we got at least one tool_complete event
@@ -223,12 +224,12 @@ async fn test_aura_tool_events_paired() {
     // Collect tool_requested and tool_complete events
     let tool_requested_events: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type.as_deref() == Some("aura.tool_requested"))
+        .filter(|e| e.event_type.as_deref() == Some(event_names::TOOL_REQUESTED))
         .collect();
 
     let tool_complete_events: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type.as_deref() == Some("aura.tool_complete"))
+        .filter(|e| e.event_type.as_deref() == Some(event_names::TOOL_COMPLETE))
         .collect();
 
     // If no events, custom events are disabled
@@ -397,7 +398,7 @@ async fn test_aura_tool_complete_includes_result() {
     // Find aura.tool_complete events
     let tool_complete_events: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type.as_deref() == Some("aura.tool_complete"))
+        .filter(|e| e.event_type.as_deref() == Some(event_names::TOOL_COMPLETE))
         .collect();
 
     // If custom events are disabled, skip test
@@ -502,7 +503,7 @@ async fn test_aura_tool_complete_failure_detection() {
     // Find aura.tool_complete events
     let tool_complete_events: Vec<_> = events
         .iter()
-        .filter(|e| e.event_type.as_deref() == Some("aura.tool_complete"))
+        .filter(|e| e.event_type.as_deref() == Some(event_names::TOOL_COMPLETE))
         .collect();
 
     // If custom events are disabled, skip test
@@ -699,9 +700,9 @@ async fn test_full_tool_event_lifecycle() {
             })
         };
 
-        let requested_pos = find_event_pos("aura.tool_requested", tool_id);
-        let start_pos = find_event_pos("aura.tool_start", tool_id);
-        let complete_pos = find_event_pos("aura.tool_complete", tool_id);
+        let requested_pos = find_event_pos(event_names::TOOL_REQUESTED, tool_id);
+        let start_pos = find_event_pos(event_names::TOOL_START, tool_id);
+        let complete_pos = find_event_pos(event_names::TOOL_COMPLETE, tool_id);
 
         if let (Some(req), Some(start), Some(complete)) = (requested_pos, start_pos, complete_pos) {
             assert!(req < start, "tool_requested should come before tool_start");

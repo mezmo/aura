@@ -727,9 +727,7 @@ impl IterationContext {
     pub fn build_reflection_prompt(&self, max_iterations: usize) -> String {
         use super::templates::{ReflectionVars, render_reflection_prompt};
 
-        let enrich = std::env::var("AURA_ENRICH_REPLAN")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
+        let enrich = crate::env_flags::bool_env("AURA_ENRICH_REPLAN", true);
 
         // Categorize tasks
         let mut completed_lines = Vec::new();
