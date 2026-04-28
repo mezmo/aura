@@ -20,7 +20,7 @@ Add a Prometheus-compatible `/metrics` endpoint to Aura's web server. Use the `m
 - [x] Article IV: Implementation commits will follow conventional commit format.
 - [x] Article V: New integration tests use `integration-metrics` feature flag, added to the `integration` parent flag.
 - [x] Article VI: No secrets involved.
-- [x] Article VII: `AURA_METRICS_ENABLED` defaults to `true`. `AURA_METRICS_BIND_ADDRESS` defaults to `127.0.0.1:9090`. No TOML config changes required.
+- [x] Article VII: `AURA_METRICS_ENABLED` defaults to `true`. No TOML config changes required. (Separate metrics bind address is deferred to V2.)
 
 ## Technical Context
 
@@ -88,7 +88,7 @@ pub fn record_tokens(token_type: &str, provider: &str, agent: &str, count: u64) 
     }
 }
 
-/// Track unique tool names per server to enforce cardinality cap.
+/// Track unique tool names globally (across all MCP servers) to enforce cardinality cap.
 static TOOL_NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
@@ -244,11 +244,9 @@ Prometheus scrapes GET /metrics
 ### Tool Duration Recording Strategy
 
 The `aura` crate does NOT gain a `metrics` dependency. Instead, tool duration is recorded at the `aura-web-server` handler layer by:
-1. Observing `aura.tool_start` and `aura.tool_complete` custom SSE events (which already carry `tool_name`, `duration_ms`, and `success` fields — see `stream_events.rs`)
-2. The `ToolLifecycleEvent::Complete` event in `tool_event_broker.rs` already carries `duration_ms`
-3. The handler subscribes to tool events and records the histogram when `tool_complete` fires
-
-Note: There is no `ToolLifecycleEvent::Complete` variant. The `ToolLifecycleEvent` enum only has `Requested` and `Start`. Tool completion with duration is handled at the handler level in `streaming/handlers.rs` via `AuraStreamEvent::tool_complete_success/failure`, which computes duration from `state.tool_start_times`. The metrics recording hooks into this existing handler-level completion event.
+1. Tool completion with duration is handled at the handler level in `streaming/handlers.rs` via `AuraStreamEvent::tool_complete_success/failure`, which computes `duration_ms` from `state.tool_start_times`
+2. The `ToolLifecycleEvent` enum in `tool_event_broker.rs` only has `Requested` and `Start` variants (no `Complete`)
+3. Metrics recording hooks into the existing handler-level `tool_complete` event construction point, where `tool_name`, `duration_ms`, and `success` are already available
 
 This preserves Article II: the `aura` crate only produces events, the web server records metrics from them.
 

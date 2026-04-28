@@ -84,6 +84,7 @@
 2. Convert to `ErrorCategory` via `From`
 
 **Expected Result:**
+- `Complete` → `ErrorCategory::Internal` (defensive case — should not be called on success path)
 - `StreamError("err")` → `ErrorCategory::LlmError`
 - `Disconnected` → `ErrorCategory::Cancelled`
 - `Timeout` → `ErrorCategory::LlmTimeout`

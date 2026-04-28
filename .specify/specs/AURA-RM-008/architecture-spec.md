@@ -11,7 +11,7 @@
 
 ## Summary
 
-Introduce a unified `ErrorCategory` enum in the `aura` crate that classifies all runtime errors into a fixed taxonomy. Add a sanitization layer that separates internal error messages (for logs) from generic client-facing messages (for API responses). Extend both `ErrorDetail` and `ChatCompletionErrorDetail` structs with a `code` field. Map existing error sources into the taxonomy at their crate boundaries — `DetectedToolError` mapping in `aura`, `StreamTermination` mapping in `aura-web-server`.
+Introduce a unified `ErrorCategory` enum in the `aura` crate that classifies all runtime errors into a fixed taxonomy. Add a sanitization layer that separates internal error messages (for logs) from generic client-facing messages (for API responses). Extend `ErrorDetail` with a new `code` field (`ChatCompletionErrorDetail` is left unchanged — it already has an OpenAI-compatible `code` field). Map existing error sources into the taxonomy at their crate boundaries — `DetectedToolError` mapping in `aura`, `StreamTermination` mapping in `aura-web-server`.
 
 ## Constitution Compliance Check
 
@@ -202,7 +202,7 @@ ALL six ErrorDetail construction sites must be updated:
 | handlers.rs | 132 | `"internal_error"` | `Internal` (build agent failure) |
 | handlers.rs | 167 | `"invalid_request_error"` | `RequestValidation` (wrong last message role) |
 | handlers.rs | 175 | `"invalid_request_error"` | `RequestValidation` (empty messages) |
-| handlers.rs | 241 | `"invalid_request_error"` | `RequestValidation` (model not found) |
+| handlers.rs | 241 | `"invalid_request_error"` | `RequestValidation` (no messages provided) |
 | handlers.rs | 545 | `"internal_error"` | `Internal` (completion error) |
 | main.rs | 102 | `"service_unavailable"` | `ServiceUnavailable` (shutdown guard) |
 
@@ -270,7 +270,7 @@ No new configuration. The taxonomy is code-defined.
 - **`error_type` values are FROZEN**: `"internal_error"`, `"invalid_request_error"`, `"service_unavailable"` remain unchanged. Clients matching on these values are NOT broken.
 - **New `code` field is additive**: Uses `skip_serializing_if = "Option::is_none"` so it only appears when set.
 - **Error messages change**: Client-facing messages become generic. This is a behavioral change but improves security. Clients that parsed error message strings for debugging will need to use server-side logs instead.
-- **Both `ErrorDetail` and `ChatCompletionErrorDetail`** gain the `code` field for consistency.
+- Only `ErrorDetail` gains the `code` field. `ChatCompletionErrorDetail` is left unchanged (existing `code: String` field is for OpenAI-compatible error codes).
 
 ## Alternatives Considered
 
@@ -291,7 +291,7 @@ No new configuration. The taxonomy is code-defined.
 1. Create `error_taxonomy.rs` with `ErrorCategory` enum, `ALL_CATEGORIES`, `client_message()`, `as_label()` — Satisfies: AC-008.1.1, AC-008.4.1
 2. Create `AuraError` struct with `new()`, `client_message()` — Satisfies: AC-008.3.1, AC-008.3.2
 3. Add `From<&DetectedToolError>` impl — Satisfies: AC-008.1.2
-4. Add `code` field to both `ErrorDetail` and `ChatCompletionErrorDetail` — Satisfies: AC-008.2.1, AC-008.2.2
+4. Add `code` field to `ErrorDetail` only (ChatCompletionErrorDetail unchanged) — Satisfies: AC-008.2.1, AC-008.2.2
 5. Add `From<&StreamTermination>` impl in `aura-web-server` — Satisfies: AC-008.1.3
 6. Update handler error construction to use `AuraError` with sanitization — Satisfies: AC-008.3.1
 7. Unit tests — Satisfies: all ACs via quality spec

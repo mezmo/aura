@@ -22,7 +22,7 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 - Error counters (by error type from AURA-RM-008 taxonomy)
 - In-flight request gauge
 - MCP server connection state gauge
-- Access control: metrics bind to a configurable address (default localhost only)
+- Access control: V1 serves metrics on the same bind address as the main API; operators use network-level controls to restrict access (dedicated bind address deferred to V2)
 - Kill switch: `AURA_METRICS_ENABLED` env var (default true)
 
 ### Out of Scope
@@ -146,7 +146,7 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 Metric label values MUST be sourced from config-defined sets, never from user input:
 - `agent`: from TOML `agent.name` — bounded by number of loaded configs
 - `server`: from TOML `mcp.servers.<name>` — bounded by config
-- `tool`: from MCP `tools/list` response — **potentially unbounded**. If a server exposes more than 100 unique tool names, tools beyond the first 100 are aggregated under the label `_other`.
+- `tool`: from MCP `tools/list` response — **potentially unbounded**. Globally across all MCP servers, if more than 100 unique tool names are observed, tools beyond the first 100 are aggregated under the label `_other`. Tool names longer than 64 characters are also aggregated to `_other`.
 - `provider`: from LLM config — bounded (5 providers: openai, anthropic, bedrock, gemini, ollama)
 - `status_code`: from HTTP response — bounded (~5 codes: 200, 400, 401, 500, 503)
 - `error_type`: from ErrorCategory — bounded (13 categories)
