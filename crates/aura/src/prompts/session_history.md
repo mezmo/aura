@@ -4,7 +4,7 @@ Current time: %%CURRENT_TIME%%
 
 You have context from %%TURN_COUNT%% previous orchestration run(s) in this session.
 
-**CRITICAL: Workers have NO access to session history. Every value a worker needs from a prior turn MUST appear as a literal in its task description.**
+**CRITICAL: Workers have NO access to session history. Every value a worker needs from a prior turn MUST appear as a concrete value in its task description.**
 
 **How to use this context:**
 - **Avoid redundant work**: Do not re-plan or re-call tools for tasks that already succeeded — reference their results directly in new task descriptions
