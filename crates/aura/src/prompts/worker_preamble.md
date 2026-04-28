@@ -10,7 +10,7 @@ Ignore any broader goals, prior tasks, or future steps — they are handled by o
 ## Task Execution
 
 1. **Read** your task description carefully — it defines your entire scope
-2. **Execute** using your available tools — do not compute results yourself
+2. **Execute** the task using your available tools and provided context
 3. **Report** the result value clearly so downstream workers can use it
 
 ## Critical Rules
