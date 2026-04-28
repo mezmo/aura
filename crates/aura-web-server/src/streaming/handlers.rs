@@ -76,6 +76,9 @@ pub enum StreamTermination {
     Shutdown,
 }
 
+/// Map stream termination reasons to the error taxonomy.
+/// Callers should guard against `Complete` (success case) before using this —
+/// the `Internal` mapping for `Complete` is defensive and should never be recorded as an error.
 impl From<&StreamTermination> for aura::ErrorCategory {
     fn from(term: &StreamTermination) -> Self {
         match term {
@@ -776,10 +779,12 @@ fn handle_tool_result(
         .map(|(name, _)| name.clone())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Parse result text once (used for both metrics and custom events)
+    let result_text = serde_json::from_str::<String>(&tool_result.result)
+        .unwrap_or_else(|_| tool_result.result.clone());
+
     // Record tool duration metric (always, regardless of custom events)
     {
-        let result_text = serde_json::from_str::<String>(&tool_result.result)
-            .unwrap_or_else(|_| tool_result.result.clone());
         let status = detect_tool_error(&result_text);
         let status_label = match &status {
             ToolResultStatus::Error(_) => "error",
@@ -796,11 +801,6 @@ fn handle_tool_result(
     // Emit aura.tool_complete custom event (if enabled)
     if config.emit_custom_events {
         let tool_name = tool_name_for_metrics.clone();
-
-        // Aura's ToolResult has result as a plain String
-        // Try to unescape JSON-quoted strings for error detection
-        let result_text = serde_json::from_str::<String>(&tool_result.result)
-            .unwrap_or_else(|_| tool_result.result.clone());
 
         tracing::debug!(
             "Tool '{}' result_text (first 200 chars): {}",

@@ -138,14 +138,26 @@ mod tests {
         known.clear();
         drop(known);
 
-        // First 100 unique names should pass through
-        for i in 0..100 {
+        // Insert exactly MAX_UNIQUE_TOOL_LABELS unique names
+        for i in 0..MAX_UNIQUE_TOOL_LABELS {
             let name = format!("tool_{i}");
-            assert!(name.len() <= MAX_TOOL_NAME_LEN);
+            let mut set = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+            set.insert(name);
         }
 
-        // Very long tool names should be capped
+        let set = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(set.len(), MAX_UNIQUE_TOOL_LABELS);
+        assert!(set.contains("tool_0"));
+        assert!(set.contains("tool_99"));
+        assert!(!set.contains("tool_100"));
+        drop(set);
+
+        // Very long tool names get capped regardless of count
         let long_name = "a".repeat(MAX_TOOL_NAME_LEN + 1);
         assert!(long_name.len() > MAX_TOOL_NAME_LEN);
+
+        // Clean up for other tests
+        let mut known = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        known.clear();
     }
 }

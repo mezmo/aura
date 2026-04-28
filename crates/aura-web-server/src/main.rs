@@ -93,12 +93,16 @@ struct Args {
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
+/// Exempts /health and /metrics so Kubernetes probes and Prometheus scrapers
+/// continue working during graceful shutdown.
 async fn shutdown_guard(
     data: web::Data<AppState>,
     req: actix_web::dev::ServiceRequest,
     next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
-    if data.shutdown_token.is_cancelled() {
+    let path = req.path();
+    let is_exempt = path == "/health" || path == "/metrics";
+    if data.shutdown_token.is_cancelled() && !is_exempt {
         let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
             error: ErrorDetail::classified(
                 "service_unavailable",

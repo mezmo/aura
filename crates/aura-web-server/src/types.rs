@@ -369,7 +369,7 @@ mod tests {
             code: None,
         };
         let json = serde_json::to_value(&ErrorResponse { error: detail }).unwrap();
-        assert!(json["error"]["code"].is_null(), "code field should be absent when None");
+        assert!(json["error"].get("code").is_none(), "code field should be absent when None");
         assert_eq!(json["error"]["type"], "internal_error");
     }
 
