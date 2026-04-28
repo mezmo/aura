@@ -347,4 +347,51 @@ mod tests {
         assert_eq!(json["error"]["param"], "model");
         assert_eq!(json["error"]["code"], "model_not_found");
     }
+
+    #[test]
+    fn test_error_detail_with_code_serializes_code_field() {
+        let detail = ErrorDetail {
+            message: "test".to_string(),
+            error_type: "internal_error".to_string(),
+            code: Some("llm_timeout".to_string()),
+        };
+        let json = serde_json::to_value(&ErrorResponse { error: detail }).unwrap();
+        assert_eq!(json["error"]["code"], "llm_timeout");
+        assert_eq!(json["error"]["type"], "internal_error");
+        assert_eq!(json["error"]["message"], "test");
+    }
+
+    #[test]
+    fn test_error_detail_without_code_omits_code_field() {
+        let detail = ErrorDetail {
+            message: "test".to_string(),
+            error_type: "internal_error".to_string(),
+            code: None,
+        };
+        let json = serde_json::to_value(&ErrorResponse { error: detail }).unwrap();
+        assert!(json["error"]["code"].is_null(), "code field should be absent when None");
+        assert_eq!(json["error"]["type"], "internal_error");
+    }
+
+    #[test]
+    fn test_error_detail_classified_uses_generic_message() {
+        let detail = ErrorDetail::classified(
+            "internal_error",
+            aura::ErrorCategory::McpConnectionFailed,
+            "MCP server 'pagerduty' at 10.0.1.5:8080 refused",
+        );
+        assert_eq!(detail.message, "A downstream service is temporarily unavailable");
+        assert_eq!(detail.error_type, "internal_error");
+        assert_eq!(detail.code, Some("mcp_connection_failed".to_string()));
+        assert!(!detail.message.contains("pagerduty"));
+        assert!(!detail.message.contains("10.0.1.5"));
+    }
+
+    #[test]
+    fn test_error_detail_validation_passes_through_message() {
+        let detail = ErrorDetail::validation("messages array is empty");
+        assert_eq!(detail.message, "messages array is empty");
+        assert_eq!(detail.error_type, "invalid_request_error");
+        assert_eq!(detail.code, Some("request_validation".to_string()));
+    }
 }

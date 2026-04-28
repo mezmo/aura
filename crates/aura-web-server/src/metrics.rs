@@ -79,7 +79,7 @@ pub fn record_tool_duration(server: &str, tool: &str, status: &str, duration_sec
     let tool_label = if tool.len() > MAX_TOOL_NAME_LEN {
         "_other"
     } else {
-        let mut known = KNOWN_TOOLS.lock().unwrap();
+        let mut known = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
         if known.contains(tool) || known.len() < MAX_UNIQUE_TOOL_LABELS {
             known.insert(tool.to_string());
             tool
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_tool_label_cardinality_cap() {
-        let mut known = KNOWN_TOOLS.lock().unwrap();
+        let mut known = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
         known.clear();
         drop(known);
 

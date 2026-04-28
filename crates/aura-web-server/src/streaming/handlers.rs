@@ -702,14 +702,10 @@ fn handle_tool_call(
         (tool_call.name.clone(), state.tool_call_index),
     );
 
-    // Track tool start time for duration calculation in tool_complete event
-    // Note: aura.tool_requested is emitted via StreamingRequestHook → tool_event_rx channel (not here)
-    // to avoid duplication and maintain proper correlation with tool_call_id via FIFO queue
-    if config.emit_custom_events {
-        state
-            .tool_start_times
-            .insert(tool_call.id.clone(), std::time::Instant::now());
-    }
+    // Track tool start time for duration calculation (always — used for metrics and custom events)
+    state
+        .tool_start_times
+        .insert(tool_call.id.clone(), std::time::Instant::now());
 
     // Determine arguments based on tool result mode
     let arguments = match config.tool_result_mode {
@@ -1059,6 +1055,30 @@ mod tests {
         assert!(
             output_str.contains("tool_calls"),
             "OpenAI tool_calls chunk should still be emitted"
+        );
+    }
+
+    #[test]
+    fn test_stream_termination_maps_to_error_category() {
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Complete),
+            aura::ErrorCategory::Internal,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::StreamError("err".to_string())),
+            aura::ErrorCategory::LlmError,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Disconnected),
+            aura::ErrorCategory::Cancelled,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Timeout),
+            aura::ErrorCategory::LlmTimeout,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Shutdown),
+            aura::ErrorCategory::ServiceUnavailable,
         );
     }
 
