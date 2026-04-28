@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod config;
 pub mod error;
+pub mod error_taxonomy;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
 pub mod logging;
@@ -70,6 +71,7 @@ pub use request_progress::{
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use stream_events::{AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
+pub use error_taxonomy::{AuraError, ErrorCategory, ALL_CATEGORIES};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_event_broker::{
     ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,

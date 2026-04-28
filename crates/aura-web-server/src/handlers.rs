@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{Instrument, error};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::streaming::{
@@ -127,12 +127,12 @@ async fn build_agent_for_request(
         .build_agent_with_headers(Some(req_headers))
         .await
         .map_err(|e| {
-            error!("Failed to build agent: {}", e);
             HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Failed to build agent: {e}"),
-                    error_type: "internal_error".to_string(),
-                },
+                error: ErrorDetail::classified(
+                    "internal_error",
+                    aura::ErrorCategory::Internal,
+                    &format!("Failed to build agent: {e}"),
+                ),
             })
         })?;
     Ok(Arc::new(agent))
@@ -164,18 +164,14 @@ async fn prepare_request(
         Some(msg) if msg.role == Role::User => msg.content,
         Some(msg) => {
             return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Last message must be from user, got: {}", msg.role),
-                    error_type: "invalid_request_error".to_string(),
-                },
+                error: ErrorDetail::validation(
+                    &format!("Last message must be from user, got: {}", msg.role),
+                ),
             }));
         }
         None => {
             return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "messages array is empty".to_string(),
-                    error_type: "invalid_request_error".to_string(),
-                },
+                error: ErrorDetail::validation("messages array is empty"),
             }));
         }
     };
@@ -238,10 +234,7 @@ pub async fn chat_completions(
     // Validate we have messages
     if req.messages.is_empty() {
         return HttpResponse::BadRequest().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "No messages provided".to_string(),
-                error_type: "invalid_request_error".to_string(),
-            },
+            error: ErrorDetail::validation("No messages provided"),
         });
     }
 
@@ -540,12 +533,12 @@ async fn handle_non_streaming_completion(
     match result_rx.await {
         Ok(collected) => build_json_response(response_ctx, max_tokens, collected),
         Err(_) => {
-            error!("Completion task panicked or was dropped");
             HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "Internal error during completion".to_string(),
-                    error_type: "internal_error".to_string(),
-                },
+                error: ErrorDetail::classified(
+                    "internal_error",
+                    aura::ErrorCategory::Internal,
+                    "Completion task panicked or was dropped",
+                ),
             })
         }
     }

@@ -99,10 +99,11 @@ async fn shutdown_guard(
 ) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
     if data.shutdown_token.is_cancelled() {
         let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "Server is shutting down".to_string(),
-                error_type: "service_unavailable".to_string(),
-            },
+            error: ErrorDetail::classified(
+                "service_unavailable",
+                aura::ErrorCategory::ServiceUnavailable,
+                "Server is shutting down",
+            ),
         });
         return Ok(req.into_response(response).map_into_right_body());
     }

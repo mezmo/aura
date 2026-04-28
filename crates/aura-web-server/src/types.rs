@@ -208,6 +208,40 @@ pub struct ErrorDetail {
     pub message: String,
     #[serde(rename = "type")]
     pub error_type: String,
+    /// Error taxonomy label from ErrorCategory. Additive field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl ErrorDetail {
+    /// Create an error with taxonomy classification and sanitized client message.
+    /// The internal_message is logged but not exposed to the client.
+    pub fn classified(
+        error_type: &str,
+        category: aura::ErrorCategory,
+        internal_message: &str,
+    ) -> Self {
+        let aura_err = aura::AuraError::new(category, internal_message);
+        tracing::warn!(
+            error_category = category.as_label(),
+            internal_message = internal_message,
+            "Request error"
+        );
+        Self {
+            message: aura_err.client_message(),
+            error_type: error_type.to_string(),
+            code: Some(category.as_label().to_string()),
+        }
+    }
+
+    /// Create a request validation error (passes through the message since it's client input).
+    pub fn validation(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            error_type: "invalid_request_error".to_string(),
+            code: Some(aura::ErrorCategory::RequestValidation.as_label().to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
