@@ -88,9 +88,25 @@ pub fn record_tokens(token_type: &str, provider: &str, agent: &str, count: u64) 
     }
 }
 
+/// Track unique tool names per server to enforce cardinality cap.
+static TOOL_NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+const MAX_UNIQUE_TOOL_LABELS: usize = 100;
+
 pub fn record_tool_duration(server: &str, tool: &str, status: &str, duration_secs: f64) {
-    // Cardinality guard: if tool name is very long or unusual, use "_other"
-    let tool_label = if tool.len() > 64 { "_other" } else { tool };
+    // Cardinality guard: cap unique tool labels at 100, length at 64 chars
+    let tool_label = if tool.len() > 64 {
+        "_other"
+    } else {
+        let mut names = TOOL_NAMES.lock().unwrap();
+        if names.contains(tool) || names.len() < MAX_UNIQUE_TOOL_LABELS {
+            names.insert(tool.to_string());
+            tool
+        } else {
+            "_other"
+        }
+    };
     histogram!("aura_mcp_tool_duration_seconds",
         "server" => server.to_string(),
         "tool" => tool_label.to_string(),
@@ -156,10 +172,10 @@ let duration = start_time.elapsed().as_secs_f64();
 let (provider, _model) = agent.get_provider_info();
 metrics::record_request_duration("POST", status_code, &agent_name, duration);
 
-// Token recording from UsageState
-let usage = usage_state.snapshot();
-metrics::record_tokens("prompt", provider, &agent_name, usage.prompt_tokens);
-metrics::record_tokens("completion", provider, &agent_name, usage.completion_tokens);
+// Token recording from UsageState (actual API: get_final_usage() -> (u64, u64, u64))
+let (prompt_tokens, completion_tokens, _total) = usage_state.get_final_usage();
+metrics::record_tokens("prompt", provider, &agent_name, prompt_tokens);
+metrics::record_tokens("completion", provider, &agent_name, completion_tokens);
 
 // Error recording (if error occurred)
 if let Some(category) = error_category {
@@ -223,7 +239,7 @@ Prometheus scrapes GET /metrics
 | Env Var | Default | Description |
 |---------|---------|-------------|
 | `AURA_METRICS_ENABLED` | `true` | Set to `false` to disable `/metrics` endpoint entirely |
-| `AURA_METRICS_BIND_ADDRESS` | N/A (same server) | Future: separate bind address for metrics. V1 uses the same server. |
+| N/A | N/A | V1 metrics are served on the same bind address as the main server. A separate `AURA_METRICS_BIND_ADDRESS` is deferred to V2. Operators must use network-level controls (firewall, Kubernetes NetworkPolicy) to restrict `/metrics` access if the main server binds to `0.0.0.0`. |
 
 ### Tool Duration Recording Strategy
 
@@ -231,6 +247,8 @@ The `aura` crate does NOT gain a `metrics` dependency. Instead, tool duration is
 1. Observing `aura.tool_start` and `aura.tool_complete` custom SSE events (which already carry `tool_name`, `duration_ms`, and `success` fields — see `stream_events.rs`)
 2. The `ToolLifecycleEvent::Complete` event in `tool_event_broker.rs` already carries `duration_ms`
 3. The handler subscribes to tool events and records the histogram when `tool_complete` fires
+
+Note: There is no `ToolLifecycleEvent::Complete` variant. The `ToolLifecycleEvent` enum only has `Requested` and `Start`. Tool completion with duration is handled at the handler level in `streaming/handlers.rs` via `AuraStreamEvent::tool_complete_success/failure`, which computes duration from `state.tool_start_times`. The metrics recording hooks into this existing handler-level completion event.
 
 This preserves Article II: the `aura` crate only produces events, the web server records metrics from them.
 

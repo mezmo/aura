@@ -153,7 +153,7 @@ Metric label values MUST be sourced from config-defined sets, never from user in
 
 ## Metric Label Sensitivity Note
 
-Prometheus labels contain operational topology information (agent names, MCP server names, tool names, provider names). This data is considered sensitive. The `/metrics` endpoint must NOT be exposed to untrusted networks. Use the `AURA_METRICS_BIND_ADDRESS` config to restrict access (default: `127.0.0.1:9090`).
+Prometheus labels contain operational topology information (agent names, MCP server names, tool names, provider names). This data is considered sensitive. The `/metrics` endpoint must NOT be exposed to untrusted networks. In V1, metrics are served on the same bind address as the main API. Operators must use network-level controls (firewall rules, Kubernetes NetworkPolicy, reverse proxy) to restrict access to `/metrics`. A dedicated metrics bind address is planned for V2.
 
 ## Dependencies
 

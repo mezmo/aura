@@ -176,7 +176,7 @@ impl From<&StreamTermination> for ErrorCategory {
 }
 ```
 
-**Modified: `crates/aura-web-server/src/types.rs` — both error structs:**
+**Modified: `crates/aura-web-server/src/types.rs` — ErrorDetail struct:**
 
 ```rust
 #[derive(Debug, Serialize)]
@@ -184,30 +184,32 @@ pub struct ErrorDetail {
     pub message: String,
     #[serde(rename = "type")]
     pub error_type: String,
-    /// Taxonomy error code from ErrorCategory. Additive field.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-}
-
-// Also update ChatCompletionErrorDetail to include `code` for consistency:
-#[derive(Debug, Serialize)]
-pub struct ChatCompletionErrorDetail {
-    pub message: String,
-    #[serde(rename = "type")]
-    pub error_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
+    /// Taxonomy label from ErrorCategory. Additive field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
 }
 ```
 
-**Modified: `crates/aura-web-server/src/handlers.rs` — error construction:**
+**ChatCompletionErrorDetail is NOT modified** — it already has a `code: String` field used for OpenAI-compatible error codes (`"missing_required_parameter"`, `"model_not_found"`). Adding a taxonomy `code` would collide with this existing field and violate Article I. If taxonomy classification is needed on ChatCompletionErrorDetail in the future, use a separate `error_category: Option<String>` field.
+```
 
-Where errors are built, use `AuraError` for classification and sanitization:
+**Modified: `crates/aura-web-server/src/handlers.rs` and `main.rs` — error construction:**
+
+ALL six ErrorDetail construction sites must be updated:
+
+| File | Line | Current error_type | Taxonomy Category |
+|------|------|-------------------|-------------------|
+| handlers.rs | 132 | `"internal_error"` | `Internal` (build agent failure) |
+| handlers.rs | 167 | `"invalid_request_error"` | `RequestValidation` (wrong last message role) |
+| handlers.rs | 175 | `"invalid_request_error"` | `RequestValidation` (empty messages) |
+| handlers.rs | 241 | `"invalid_request_error"` | `RequestValidation` (model not found) |
+| handlers.rs | 545 | `"internal_error"` | `Internal` (completion error) |
+| main.rs | 102 | `"service_unavailable"` | `ServiceUnavailable` (shutdown guard) |
+
+Pattern for each site:
 
 ```rust
-// Before (current code, line 133):
+// Before (current):
 ErrorDetail {
     message: format!("Failed to build agent: {e}"),
     error_type: "internal_error".to_string(),
@@ -217,10 +219,14 @@ ErrorDetail {
 let aura_err = AuraError::new(ErrorCategory::Internal, format!("Failed to build agent: {e}"));
 tracing::warn!(internal_message = %aura_err.internal_message, "Request error");
 ErrorDetail {
-    message: aura_err.client_message(),            // generic, safe
+    message: aura_err.client_message(),             // generic, safe
     error_type: "internal_error".to_string(),       // FROZEN — not changed
     code: Some(aura_err.category.as_label().to_string()), // NEW taxonomy label
 }
+```
+
+**SAFETY NOTE for RequestValidation sites (lines 167, 175, 241):**
+These pass through user-input-derived messages. Only use `RequestValidation` when the message is derived from client input (e.g., "Last message must be from user, got: system"). NEVER classify library/parser errors as `RequestValidation` — those should be `Internal`.
 ```
 
 ### Error Handling Flow

@@ -114,7 +114,8 @@ Note: The `StreamTermination` → `ErrorCategory` mapping lives in `aura-web-ser
 
 #### Edge Cases
 - The `type` field values are FROZEN at their current values. Only the new `code` field uses taxonomy labels.
-- Both `ErrorDetail` and `ChatCompletionErrorDetail` structs gain the `code` field for consistency.
+- `ErrorDetail` gains a new `code: Option<String>` field for the taxonomy label.
+- `ChatCompletionErrorDetail` already has a `code: String` field used for OpenAI-compatible error codes (`"missing_required_parameter"`, `"model_not_found"`). This field is LEFT UNCHANGED. A separate `error_category: Option<String>` field is added for the taxonomy label to avoid collision.
 
 ### US-008.3: Error Message Sanitization
 
@@ -147,7 +148,7 @@ Note: The `StreamTermination` → `ErrorCategory` mapping lives in `aura-web-ser
 | `mcp_tool_error` | "A tool execution error occurred" |
 | `mcp_timeout` | "A tool call did not respond in time" |
 | `config_validation` | "Server configuration error" |
-| `request_validation` | (pass through — client input errors are safe to show) |
+| `request_validation` | "Invalid request" (default), or pass-through of the user-input-derived message via `AuraError::client_message()`. SAFETY: only pass through messages derived from client input, never library error strings. |
 | `budget_exceeded` | "Token budget exceeded for this request" |
 | `service_unavailable` | "Server is shutting down" |
 | `cancelled` | "Request was cancelled" |
