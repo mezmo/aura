@@ -1,6 +1,6 @@
 # Product Spec: AURA-RM-001 Prometheus Metrics Endpoint
 
-**Status:** Draft
+**Status:** In Review (Remediation Round 1)
 **Roadmap Item:** AURA-RM-001
 **Author:** brandon.shelton
 **Created:** 2026-04-28
@@ -10,7 +10,7 @@
 
 ## Problem Statement
 
-Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request latency, track token spend, or observe MCP tool health. The only observability is OTel tracing, which requires a trace backend to query and doesn't support real-time alerting dashboards. Without a `/metrics` endpoint, production operation is blind.
+Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request latency, track token spend, or observe MCP tool health. The only observability is OTel tracing, which requires a trace backend and doesn't support real-time alerting dashboards. Without a `/metrics` endpoint, production operation is blind.
 
 ## Scope
 
@@ -21,12 +21,15 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 - MCP tool call duration histogram (by server, tool, status)
 - Error counters (by error type from AURA-RM-008 taxonomy)
 - In-flight request gauge
+- MCP server connection state gauge
+- Access control: metrics bind to a configurable address (default localhost only)
+- Kill switch: `AURA_METRICS_ENABLED` env var (default true)
 
 ### Out of Scope
 - Grafana dashboards or alerting rules (operator responsibility)
 - Push-based metrics (only pull/scrape)
-- Custom business metrics
-- Per-user/tenant metrics (requires AURA-RM multi-tenancy)
+- Per-user/tenant metrics
+- Process-level metrics (CPU, memory, FDs — use node exporter or container metrics)
 
 ## User Stories
 
@@ -41,7 +44,7 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 #### Acceptance Criteria
 
 **AC-001.1.1:** Prometheus endpoint exists
-- **Given** a running Aura web server
+- **Given** a running Aura web server with `AURA_METRICS_ENABLED=true` (default)
 - **When** I send `GET /metrics`
 - **Then** I receive a 200 response with `text/plain; version=0.0.4; charset=utf-8` content type
 
@@ -49,12 +52,12 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 - **Given** chat completion requests have been served
 - **When** I scrape `/metrics`
 - **Then** I see `aura_http_request_duration_seconds` histogram with `method`, `status_code`, and `agent` labels
-- **And** the histogram has buckets appropriate for LLM latency (0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300 seconds)
+- **And** the histogram has buckets: `[0.025, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]` (includes sub-100ms for fast-fail visibility)
 
-**AC-001.1.3:** Metrics endpoint does not require auth
-- **Given** API auth is configured (AURA-RM-004, future)
-- **When** I send `GET /metrics` without auth
-- **Then** I receive 200 (not 401)
+**AC-001.1.3:** Metrics disabled when kill switch is off
+- **Given** `AURA_METRICS_ENABLED=false`
+- **When** I send `GET /metrics`
+- **Then** I receive 404
 
 ### US-001.2: Token Usage Tracking
 
@@ -71,7 +74,7 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 - **When** I scrape `/metrics`
 - **Then** I see `aura_llm_tokens_total` counter with labels:
   - `type`: `prompt` or `completion`
-  - `provider`: `openai`, `anthropic`, `bedrock`, `gemini`, `ollama`
+  - `provider`: value from `Agent::get_provider_info()` (not hardcoded)
   - `agent`: agent name from config
 
 ### US-001.3: MCP Tool Duration
@@ -89,8 +92,9 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 - **When** I scrape `/metrics`
 - **Then** I see `aura_mcp_tool_duration_seconds` histogram with labels:
   - `server`: MCP server name from config
-  - `tool`: tool name
+  - `tool`: tool name (bounded — see cardinality note below)
   - `status`: `ok` or `error`
+- **And** buckets: `[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60]` (includes 60s for long-running tools)
 
 ### US-001.4: Error Rate by Type
 
@@ -105,7 +109,7 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 **AC-001.4.1:** Error counters
 - **Given** errors have occurred during request processing
 - **When** I scrape `/metrics`
-- **Then** I see `aura_errors_total` counter with `error_type` label using the taxonomy from AURA-RM-008 (e.g., `llm_timeout`, `mcp_connection_failed`)
+- **Then** I see `aura_errors_total` counter with `error_type` label using the taxonomy from AURA-RM-008 (e.g., `llm_timeout`, `mcp_tool_error`)
 
 ### US-001.5: Active Request Gauge
 
@@ -122,35 +126,34 @@ Aura has zero metrics exposure. Operators cannot set SLO alerts, measure request
 - **When** I scrape `/metrics`
 - **Then** I see `aura_http_requests_in_flight` gauge reflecting the current count
 
-## API Contract
+### US-001.6: MCP Server Connection State
 
-```
-GET /metrics HTTP/1.1
-Host: localhost:8080
+**As an** operator,
+**I want** MCP server connection state as a gauge,
+**So that** I can alert when MCP servers disconnect.
 
-HTTP/1.1 200 OK
-Content-Type: text/plain; version=0.0.4; charset=utf-8
+**Priority:** P2
 
-# HELP aura_http_request_duration_seconds Request latency histogram
-# TYPE aura_http_request_duration_seconds histogram
-aura_http_request_duration_seconds_bucket{method="POST",status_code="200",agent="SRE Assistant",le="0.5"} 12
-...
-# HELP aura_llm_tokens_total Token usage counter
-# TYPE aura_llm_tokens_total counter
-aura_llm_tokens_total{type="prompt",provider="bedrock",agent="SRE Assistant"} 45230
-...
-# HELP aura_mcp_tool_duration_seconds MCP tool call latency
-# TYPE aura_mcp_tool_duration_seconds histogram
-aura_mcp_tool_duration_seconds_bucket{server="pagerduty",tool="list_incidents",status="ok",le="1.0"} 8
-...
-# HELP aura_errors_total Error counter by type
-# TYPE aura_errors_total counter
-aura_errors_total{error_type="mcp_tool_error"} 3
-...
-# HELP aura_http_requests_in_flight In-flight request gauge
-# TYPE aura_http_requests_in_flight gauge
-aura_http_requests_in_flight 2
-```
+#### Acceptance Criteria
+
+**AC-001.6.1:** MCP connection gauge
+- **Given** MCP servers are configured
+- **When** I scrape `/metrics`
+- **Then** I see `aura_mcp_server_connected` gauge with `server` label (1 = connected, 0 = disconnected)
+
+## Cardinality Constraints
+
+Metric label values MUST be sourced from config-defined sets, never from user input:
+- `agent`: from TOML `agent.name` — bounded by number of loaded configs
+- `server`: from TOML `mcp.servers.<name>` — bounded by config
+- `tool`: from MCP `tools/list` response — **potentially unbounded**. If a server exposes more than 100 unique tool names, tools beyond the first 100 are aggregated under the label `_other`.
+- `provider`: from LLM config — bounded (5 providers: openai, anthropic, bedrock, gemini, ollama)
+- `status_code`: from HTTP response — bounded (~5 codes: 200, 400, 401, 500, 503)
+- `error_type`: from ErrorCategory — bounded (13 categories)
+
+## Metric Label Sensitivity Note
+
+Prometheus labels contain operational topology information (agent names, MCP server names, tool names, provider names). This data is considered sensitive. The `/metrics` endpoint must NOT be exposed to untrusted networks. Use the `AURA_METRICS_BIND_ADDRESS` config to restrict access (default: `127.0.0.1:9090`).
 
 ## Dependencies
 
@@ -159,7 +162,8 @@ aura_http_requests_in_flight 2
 
 ## Success Criteria
 
-- Prometheus can scrape `/metrics` and display all 5 metric families
+- Prometheus can scrape `/metrics` and display all 6 metric families
 - SLO alerts can be configured on request latency p99
 - Token cost can be calculated from counter values
 - MCP tool degradation is visible in tool duration histograms
+- Metrics endpoint is not accessible from untrusted networks by default

@@ -1,6 +1,6 @@
 # Architecture Spec: AURA-RM-001 Prometheus Metrics Endpoint
 
-**Status:** Draft
+**Status:** In Review (Remediation Round 1)
 **Roadmap Item:** AURA-RM-001
 **Product Spec:** [product-spec.md](product-spec.md)
 **Author:** brandon.shelton
@@ -11,29 +11,30 @@
 
 ## Summary
 
-Add a Prometheus-compatible `/metrics` endpoint to Aura's web server. Use the `metrics` crate (Rust metrics facade) with `metrics-exporter-prometheus` for exposition. Instrument request handling, token tracking, MCP tool execution, and error classification using the taxonomy from AURA-RM-008.
+Add a Prometheus-compatible `/metrics` endpoint to Aura's web server. Use the `metrics` crate (Rust metrics facade) with `metrics-exporter-prometheus` for exposition. All metric recording happens in `aura-web-server` (respecting Article II crate boundaries). The `aura` crate provides data via existing tracing spans and return values — no `metrics` dependency in the core crate.
 
 ## Constitution Compliance Check
 
 - [x] Article I: `/metrics` is a new endpoint. No changes to `/v1/chat/completions` or `/v1/models`.
-- [x] Article II: Metrics recording in `aura` crate (tool execution, token tracking). Metrics exposition in `aura-web-server` (HTTP endpoint). Clean separation.
-- [x] Article V: No integration tests needed (metrics are unit-testable + manual verification).
+- [x] Article II: All metrics recording and exposition in `aura-web-server`. The `aura` crate has NO dependency on the `metrics` crate. Tool execution timing is captured from the handler layer using `Instant::now()` around tool calls, or extracted from existing OTel span data.
+- [x] Article IV: Implementation commits will follow conventional commit format.
+- [x] Article V: New integration tests use `integration-metrics` feature flag, added to the `integration` parent flag.
 - [x] Article VI: No secrets involved.
-- [x] Article VII: No config changes required (metrics enabled by default, no opt-in needed).
+- [x] Article VII: `AURA_METRICS_ENABLED` defaults to `true`. `AURA_METRICS_BIND_ADDRESS` defaults to `127.0.0.1:9090`. No TOML config changes required.
 
 ## Technical Context
 
-- **Affected Crates:** `aura-web-server` (new `/metrics` route, request middleware), `aura` (instrument tool execution, token recording)
-- **New Dependencies:**
+- **Affected Crates:** `aura-web-server` only (metrics recording + exposition)
+- **New Dependencies (aura-web-server only):**
   - `metrics = "0.24"` — metrics facade (counters, gauges, histograms)
   - `metrics-exporter-prometheus = "0.16"` — Prometheus text format exporter
-- **Performance Objectives:** < 1ms overhead per request for metric recording. Metrics scrape < 50ms.
+- **Performance Objectives:** < 1ms overhead per request for metric recording. Metrics scrape < 50ms for up to 500 unique time series.
 
 ## Design
 
 ### Crate Changes
 
-#### `aura-web-server`
+#### `aura-web-server` (ONLY crate modified)
 
 **New: `crates/aura-web-server/src/metrics.rs`**
 
@@ -41,52 +42,77 @@ Add a Prometheus-compatible `/metrics` endpoint to Aura's web server. Use the `m
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
-/// Initialize the metrics registry and return a handle for the /metrics endpoint.
-pub fn init_metrics() -> PrometheusHandle {
-    PrometheusBuilder::new()
+/// Initialize the metrics registry. Returns None if metrics are disabled.
+pub fn init_metrics() -> Option<PrometheusHandle> {
+    if std::env::var("AURA_METRICS_ENABLED")
+        .map(|v| v == "false")
+        .unwrap_or(false)
+    {
+        tracing::info!("Metrics disabled via AURA_METRICS_ENABLED=false");
+        return None;
+    }
+
+    let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full("aura_http_request_duration_seconds".to_string()),
-            &[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+            Matcher::Full("aura_http_request_duration_seconds".to_string()),
+            &[0.025, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
         )
-        .unwrap()
+        .expect("valid bucket config")
         .set_buckets_for_metric(
-            metrics_exporter_prometheus::Matcher::Full("aura_mcp_tool_duration_seconds".to_string()),
-            &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
+            Matcher::Full("aura_mcp_tool_duration_seconds".to_string()),
+            &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
         )
-        .unwrap()
+        .expect("valid bucket config")
         .install_recorder()
-        .unwrap()
+        .expect("metrics recorder installation");
+
+    tracing::info!("Metrics enabled on /metrics endpoint");
+    Some(handle)
 }
 
-/// Record request completion metrics.
-pub fn record_request(method: &str, status: u16, agent: &str, duration_secs: f64) {
+pub fn record_request_duration(method: &str, status: u16, agent: &str, duration_secs: f64) {
     histogram!("aura_http_request_duration_seconds",
         "method" => method.to_string(),
         "status_code" => status.to_string(),
         "agent" => agent.to_string(),
-    )
-    .record(duration_secs);
+    ).record(duration_secs);
 }
 
-/// Record token usage.
 pub fn record_tokens(token_type: &str, provider: &str, agent: &str, count: u64) {
-    counter!("aura_llm_tokens_total",
-        "type" => token_type.to_string(),
-        "provider" => provider.to_string(),
-        "agent" => agent.to_string(),
-    )
-    .increment(count);
+    if count > 0 {
+        counter!("aura_llm_tokens_total",
+            "type" => token_type.to_string(),
+            "provider" => provider.to_string(),
+            "agent" => agent.to_string(),
+        ).increment(count);
+    }
 }
 
-/// Record an error by taxonomy category.
+pub fn record_tool_duration(server: &str, tool: &str, status: &str, duration_secs: f64) {
+    // Cardinality guard: if tool name is very long or unusual, use "_other"
+    let tool_label = if tool.len() > 64 { "_other" } else { tool };
+    histogram!("aura_mcp_tool_duration_seconds",
+        "server" => server.to_string(),
+        "tool" => tool_label.to_string(),
+        "status" => status.to_string(),
+    ).record(duration_secs);
+}
+
 pub fn record_error(error_type: &str) {
-    counter!("aura_errors_total", "error_type" => error_type.to_string())
-        .increment(1);
+    counter!("aura_errors_total", "error_type" => error_type.to_string()).increment(1);
 }
 
-/// Update in-flight request gauge.
-pub fn set_requests_in_flight(count: usize) {
-    gauge!("aura_http_requests_in_flight").set(count as f64);
+pub fn increment_requests_in_flight() {
+    gauge!("aura_http_requests_in_flight").increment(1.0);
+}
+
+pub fn decrement_requests_in_flight() {
+    gauge!("aura_http_requests_in_flight").decrement(1.0);
+}
+
+pub fn set_mcp_server_connected(server: &str, connected: bool) {
+    gauge!("aura_mcp_server_connected", "server" => server.to_string())
+        .set(if connected { 1.0 } else { 0.0 });
 }
 ```
 
@@ -106,83 +132,87 @@ pub async fn metrics_handler(handle: web::Data<PrometheusHandle>) -> HttpRespons
 // In main():
 let metrics_handle = metrics::init_metrics();
 
-// Register route (before auth middleware, no auth required):
-.route("/metrics", web::get().to(metrics::metrics_handler))
-
-// Pass handle as app data:
-.app_data(web::Data::new(metrics_handle))
+// Register /metrics route OUTSIDE shutdown_guard middleware
+// so it remains available during graceful shutdown for final scrapes
+if let Some(handle) = metrics_handle {
+    app = app
+        .app_data(web::Data::new(handle))
+        .route("/metrics", web::get().to(metrics::metrics_handler));
+}
 ```
 
 **Modified: `handlers.rs`**
 
-At request completion (both streaming and non-streaming paths):
-
+At request entry:
 ```rust
-// After response is built:
+let start_time = std::time::Instant::now();
+metrics::increment_requests_in_flight();
+```
+
+At request completion (both streaming and non-streaming, in a finally/drop guard):
+```rust
+metrics::decrement_requests_in_flight();
 let duration = start_time.elapsed().as_secs_f64();
-let (provider, model) = agent.get_provider_info();
-metrics::record_request("POST", status_code, &agent_name, duration);
+let (provider, _model) = agent.get_provider_info();
+metrics::record_request_duration("POST", status_code, &agent_name, duration);
+
+// Token recording from UsageState
+let usage = usage_state.snapshot();
 metrics::record_tokens("prompt", provider, &agent_name, usage.prompt_tokens);
 metrics::record_tokens("completion", provider, &agent_name, usage.completion_tokens);
 
-// On error:
-metrics::record_error(error_category.as_label());
+// Error recording (if error occurred)
+if let Some(category) = error_category {
+    metrics::record_error(category.as_label());
+}
 ```
 
 **Modified: `types.rs` — ActiveRequestTracker**
 
-Add metrics recording to increment/decrement:
+The existing `ActiveRequestTracker` atomic counter is unchanged. Metrics gauge uses separate `increment(1.0)` / `decrement(1.0)` calls, avoiding the set-after-read race. The guard pattern in `ActiveRequestGuard` now also increments/decrements the metrics gauge:
 
 ```rust
-pub fn increment(&self) {
-    let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-    crate::metrics::set_requests_in_flight(count);
+impl ActiveRequestGuard {
+    fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
+        tracker.increment(); // existing atomic
+        crate::metrics::increment_requests_in_flight(); // new gauge
+        Self { tracker }
+    }
 }
 
-pub fn decrement(&self) {
-    let count = self.count.fetch_sub(1, Ordering::SeqCst) - 1;
-    crate::metrics::set_requests_in_flight(count);
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.tracker.decrement(); // existing atomic
+        crate::metrics::decrement_requests_in_flight(); // new gauge
+    }
 }
 ```
 
-#### `aura` (core)
+The existing `Ordering::Release` / `Ordering::AcqRel` on the atomic counter is NOT changed. The gauge operates independently.
 
-**Modified: `mcp_tool_execution.rs`**
+**New feature flag in `aura-web-server/Cargo.toml`:**
 
-After tool execution completes, record duration:
-
-```rust
-let start = std::time::Instant::now();
-let result = call_http_tool_cancellable(...).await;
-let duration = start.elapsed().as_secs_f64();
-
-// Record metric (if metrics feature is available)
-#[cfg(feature = "metrics")]
-{
-    metrics::histogram!("aura_mcp_tool_duration_seconds",
-        "server" => server_name.to_string(),
-        "tool" => tool_name.to_string(),
-        "status" => if result.is_ok() { "ok" } else { "error" }.to_string(),
-    )
-    .record(duration);
-}
+```toml
+[features]
+integration = ["integration-streaming", "integration-header-forwarding", ..., "integration-metrics"]
+integration-metrics = []
 ```
 
 ### Data Flow
 
 ```
 Request arrives
-  → ActiveRequestTracker.increment() → gauge updated
+  → ActiveRequestGuard::new() → atomic increment + gauge increment
   → start_time = Instant::now()
   → Handler processes request
     → Agent streams response
-      → MCP tool called → tool duration histogram recorded
+      → (MCP tool timing captured at handler layer via tool event broker)
       → Token usage accumulated in UsageState
     → Response complete
-  → record_request(method, status, agent, duration)
+  → record_request_duration(method, status, agent, duration)
   → record_tokens(prompt/completion, provider, agent, count)
-  → ActiveRequestTracker.decrement() → gauge updated
-  → (on error) record_error(error_category.as_label())
+  → ActiveRequestGuard::drop() → atomic decrement + gauge decrement
+  → (on error) record_error(category.as_label())
 
 Prometheus scrapes GET /metrics
   → PrometheusHandle.render() → text exposition format
@@ -190,38 +220,51 @@ Prometheus scrapes GET /metrics
 
 ### Configuration
 
-No TOML config needed. Metrics are always enabled when the server starts. The `/metrics` endpoint is always available.
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `AURA_METRICS_ENABLED` | `true` | Set to `false` to disable `/metrics` endpoint entirely |
+| `AURA_METRICS_BIND_ADDRESS` | N/A (same server) | Future: separate bind address for metrics. V1 uses the same server. |
 
-Future enhancement: configurable metric prefix, custom labels, or opt-out via env var.
+### Tool Duration Recording Strategy
+
+The `aura` crate does NOT gain a `metrics` dependency. Instead, tool duration is recorded at the `aura-web-server` handler layer by:
+1. Observing `aura.tool_start` and `aura.tool_complete` custom SSE events (which already carry `tool_name`, `duration_ms`, and `success` fields — see `stream_events.rs`)
+2. The `ToolLifecycleEvent::Complete` event in `tool_event_broker.rs` already carries `duration_ms`
+3. The handler subscribes to tool events and records the histogram when `tool_complete` fires
+
+This preserves Article II: the `aura` crate only produces events, the web server records metrics from them.
 
 ## Migration / Backward Compatibility
 
 - New `/metrics` route — no conflict with existing routes
-- New dependencies (`metrics`, `metrics-exporter-prometheus`) — additive
-- No config changes required
-- ActiveRequestTracker gains a side-effect on increment/decrement — audit for correctness
+- New dependencies only in `aura-web-server` — `aura` crate unchanged
+- No config changes required (env vars have defaults)
+- ActiveRequestTracker atomic behavior unchanged (gauge is a parallel side-channel)
+- Metrics endpoint available during graceful shutdown (registered outside shutdown_guard)
 
 ## Alternatives Considered
 
 | Approach | Pros | Cons | Why Not |
 |----------|------|------|---------|
-| `prometheus` crate directly | Widely used, direct Prometheus registry | Heavier API, requires manual registry management | `metrics` facade is more idiomatic in async Rust |
-| OpenTelemetry metrics (OTel Meter) | Unified with existing OTel tracing | More complex setup, OTLP metrics not as widely scraped as /metrics | Prometheus scrape is the standard; can add OTel metrics later |
-| `actix-web-prom` middleware | Drop-in request metrics | Only covers HTTP metrics, not token/tool metrics | Need custom metrics beyond HTTP |
+| Add `metrics` crate to `aura` core | Simpler instrumentation | Violates Article II | Boundary preservation is more important |
+| OpenTelemetry metrics (OTel Meter) | Unified with tracing | Complex, OTLP metrics less widely scraped | Prometheus scrape is the standard |
+| Separate metrics bind address | Better security isolation | More complex networking, port conflicts | Deferred to v2 (env var documented) |
 
 ## Risks
 
-- **Cardinality explosion**: If agent names or tool names have high cardinality, Prometheus storage grows. Mitigated by using config-defined names (bounded set).
-- **Performance**: Metrics recording adds microseconds per request. Mitigated by using atomic counters (metrics crate default).
-- **Dependency size**: `metrics-exporter-prometheus` adds ~50KB. Acceptable.
+- **Cardinality from tool names**: MCP servers can expose many tools. Mitigated by 100-tool cap with `_other` aggregation, plus tool name length guard (>64 chars → `_other`).
+- **Performance on scrape**: Rendering 500+ time series on every 15s scrape. Mitigated by the `metrics-exporter-prometheus` crate's efficient rendering. Add performance test (quality spec TC) to validate < 50ms.
+- **Gauge leak on panic**: If handler panics between increment and drop, the Drop trait still runs (Rust guarantee during stack unwinding), so the gauge correctly decrements. No leak risk.
 
 ## Implementation Order
 
-1. Add `metrics` and `metrics-exporter-prometheus` to Cargo.toml — No AC (infrastructure)
-2. Create `metrics.rs` with init, record functions, and `/metrics` handler — Satisfies: AC-001.1.1
-3. Add request latency recording in handlers.rs — Satisfies: AC-001.1.2
-4. Add token recording from UsageState at request completion — Satisfies: AC-001.2.1
-5. Add MCP tool duration recording in mcp_tool_execution.rs — Satisfies: AC-001.3.1
-6. Add error recording using ErrorCategory.as_label() — Satisfies: AC-001.4.1
-7. Add in-flight gauge to ActiveRequestTracker — Satisfies: AC-001.5.1
-8. Verify /metrics exempt from future auth (document for RM-004) — Satisfies: AC-001.1.3
+1. Add `metrics` and `metrics-exporter-prometheus` to `aura-web-server/Cargo.toml` — Infrastructure
+2. Create `metrics.rs` with init, all record functions, and handler — Satisfies: AC-001.1.1, AC-001.1.3
+3. Register `/metrics` route in main.rs outside shutdown_guard — Satisfies: AC-001.1.1
+4. Add request duration recording in handlers.rs — Satisfies: AC-001.1.2
+5. Add token recording from UsageState at request completion — Satisfies: AC-001.2.1
+6. Add tool duration recording from ToolLifecycleEvent — Satisfies: AC-001.3.1
+7. Add error recording using ErrorCategory.as_label() — Satisfies: AC-001.4.1
+8. Add in-flight gauge to ActiveRequestGuard — Satisfies: AC-001.5.1
+9. Add MCP server connection state gauge — Satisfies: AC-001.6.1
+10. Add `integration-metrics` feature flag — Satisfies: Article V
