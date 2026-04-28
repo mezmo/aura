@@ -215,7 +215,12 @@ pub struct ErrorDetail {
 
 impl ErrorDetail {
     /// Create an error with taxonomy classification and sanitized client message.
-    /// The internal_message is logged but not exposed to the client.
+    ///
+    /// Encapsulates three concerns: (1) classifying the error via ErrorCategory,
+    /// (2) logging the internal message at WARN level for debugging, and
+    /// (3) replacing the client-facing message with a safe generic string.
+    /// This prevents internal details (hostnames, ports, library errors) from
+    /// reaching API consumers while preserving the existing `error_type` values.
     pub fn classified(
         error_type: &str,
         category: aura::ErrorCategory,
@@ -234,7 +239,11 @@ impl ErrorDetail {
         }
     }
 
-    /// Create a request validation error (passes through the message since it's client input).
+    /// Create a request validation error that passes the message through directly.
+    ///
+    /// Unlike `classified()`, this does not sanitize the message because request
+    /// validation errors contain client-supplied input (e.g., "Last message must
+    /// be from user, got: system") which is safe to return.
     pub fn validation(message: &str) -> Self {
         Self {
             message: message.to_string(),

@@ -7,7 +7,8 @@ use crate::tool_error_detection::DetectedToolError;
 
 /// Unified error taxonomy for all Aura runtime errors.
 /// Each variant maps to a Prometheus-label-safe string and a generic client message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
     LlmTimeout,
     LlmRateLimit,
