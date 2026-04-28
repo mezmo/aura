@@ -27,6 +27,7 @@ struct ActiveRequestGuard {
 impl ActiveRequestGuard {
     fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
         tracker.increment();
+        crate::metrics::increment_requests_in_flight();
         Self { tracker }
     }
 }
@@ -34,6 +35,7 @@ impl ActiveRequestGuard {
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         self.tracker.decrement();
+        crate::metrics::decrement_requests_in_flight();
     }
 }
 
@@ -150,6 +152,7 @@ struct RequestSetup {
     created_timestamp: u64,
     chat_session_id: String,
     has_chat_history: bool,
+    agent_name: String,
 }
 
 /// Extract query, chat history, and build agent — shared across both code paths.
@@ -211,6 +214,7 @@ async fn prepare_request(
     let created_timestamp = Utc::now().timestamp() as u64;
     let has_chat_history = !chat_history.is_empty();
 
+    let agent_name = config.agent.name.clone();
     Ok(RequestSetup {
         query,
         chat_history,
@@ -221,6 +225,7 @@ async fn prepare_request(
         created_timestamp,
         chat_session_id: chat_session_id.to_string(),
         has_chat_history,
+        agent_name,
     })
 }
 
@@ -262,17 +267,30 @@ pub async fn chat_completions(
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
+    let request_start = std::time::Instant::now();
+
     let mut req = req.into_inner();
     let setup = match prepare_request(&data, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
         Err(response) => return response,
     };
 
-    if req.stream == Some(true) {
+    let agent_name = setup.agent_name.clone();
+
+    let response = if req.stream == Some(true) {
         handle_streaming_completion(data, setup, req.max_tokens).await
     } else {
         handle_non_streaming_completion(&data, setup, req.max_tokens).await
-    }
+    };
+
+    crate::metrics::record_request_duration(
+        "POST",
+        response.status().as_u16(),
+        &agent_name,
+        request_start.elapsed().as_secs_f64(),
+    );
+
+    response
 }
 
 /// Build configuration for the spawned completion task from AppState and RequestSetup.
@@ -362,6 +380,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
     };
 
     let response_content = config.response_content.clone();
+    let provider_for_metrics = config.provider.clone();
     let otel_ctx = StreamOtelContext {
         provider: config.provider,
         model: config.model,
@@ -428,6 +447,17 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
     };
 
     otel_ctx.record_output(&termination);
+
+    // Record token usage metrics
+    let (prompt_tokens, completion_tokens, _total) = usage_state.get_final_usage();
+    crate::metrics::record_tokens("prompt", &provider_for_metrics, &setup.agent_name, prompt_tokens);
+    crate::metrics::record_tokens("completion", &provider_for_metrics, &setup.agent_name, completion_tokens);
+
+    // Record error metrics for non-success terminations
+    if !matches!(termination, StreamTermination::Complete) {
+        let category = aura::ErrorCategory::from(&termination);
+        crate::metrics::record_error(category.as_label());
+    }
 
     match &termination {
         StreamTermination::Complete => {

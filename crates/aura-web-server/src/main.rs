@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod handlers;
+mod metrics;
 mod streaming;
 mod types;
 
@@ -196,9 +197,12 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
+    // Initialize Prometheus metrics (None if disabled via AURA_METRICS_ENABLED=false)
+    let metrics_handle = metrics::init();
+
     // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
     let server = HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(app_state.clone())
             .wrap(middleware::from_fn(shutdown_guard))
             .wrap(middleware::Logger::default())
@@ -207,7 +211,15 @@ async fn run() -> std::io::Result<()> {
             .route(
                 "/v1/chat/completions",
                 web::post().to(handlers::chat_completions),
-            )
+            );
+
+        if let Some(handle) = &metrics_handle {
+            app = app
+                .app_data(web::Data::new(handle.clone()))
+                .route("/metrics", web::get().to(metrics::handler));
+        }
+
+        app
     })
     .bind((args.host.as_str(), args.port))?
     .disable_signals()

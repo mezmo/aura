@@ -76,6 +76,18 @@ pub enum StreamTermination {
     Shutdown,
 }
 
+impl From<&StreamTermination> for aura::ErrorCategory {
+    fn from(term: &StreamTermination) -> Self {
+        match term {
+            StreamTermination::Complete => aura::ErrorCategory::Internal,
+            StreamTermination::StreamError(_) => aura::ErrorCategory::LlmError,
+            StreamTermination::Disconnected => aura::ErrorCategory::Cancelled,
+            StreamTermination::Timeout => aura::ErrorCategory::LlmTimeout,
+            StreamTermination::Shutdown => aura::ErrorCategory::ServiceUnavailable,
+        }
+    }
+}
+
 /// User-facing message when context overflow is detected.
 const CONTEXT_OVERFLOW_MESSAGE: &str = "My tools returned more data than I can work with at once.\n\n\
     **To help me out, try:**\n\

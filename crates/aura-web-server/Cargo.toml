@@ -25,6 +25,8 @@ opentelemetry = { workspace = true, optional = true }
 env_logger = "0.11"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 [features]
 default = ["otel"]
@@ -39,6 +41,7 @@ integration = [
     "integration-events",
     "integration-cancellation",
     "integration-progress",
+    "integration-metrics",
 ]
 
 # Per-suite flags (can run individually)
@@ -48,6 +51,7 @@ integration-mcp = []                      # fastmcp_structured_content_test
 integration-events = []                   # aura_events_test, proactive_tool_ui_tests
 integration-cancellation = []             # cancellation_test, cancellation_notification_test
 integration-progress = []                 # mcp_progress_test, progress_disconnect_test
+integration-metrics = []                  # metrics_test
 
 # Optional - requires Qdrant (separate epic)
 integration-vector = []         # vector_label_filter_tests
