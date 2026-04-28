@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{Instrument, error};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::streaming::{
@@ -27,6 +27,7 @@ struct ActiveRequestGuard {
 impl ActiveRequestGuard {
     fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
         tracker.increment();
+        crate::metrics::increment_requests_in_flight();
         Self { tracker }
     }
 }
@@ -34,6 +35,7 @@ impl ActiveRequestGuard {
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         self.tracker.decrement();
+        crate::metrics::decrement_requests_in_flight();
     }
 }
 
@@ -127,14 +129,28 @@ async fn build_agent_for_request(
         .build_agent_with_headers(Some(req_headers))
         .await
         .map_err(|e| {
-            error!("Failed to build agent: {}", e);
+            // Record MCP server as disconnected on build failure if it looks like an MCP error
+            if let Some(mcp_config) = &config.mcp {
+                for server_name in mcp_config.servers.keys() {
+                    crate::metrics::set_mcp_server_connected(server_name, false);
+                }
+            }
             HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Failed to build agent: {e}"),
-                    error_type: "internal_error".to_string(),
-                },
+                error: ErrorDetail::classified(
+                    "internal_error",
+                    aura::ErrorCategory::Internal,
+                    &format!("Failed to build agent: {e}"),
+                ),
             })
         })?;
+
+    // Record MCP servers as connected on successful agent build
+    if let Some(mcp_config) = &config.mcp {
+        for server_name in mcp_config.servers.keys() {
+            crate::metrics::set_mcp_server_connected(server_name, true);
+        }
+    }
+
     Ok(Arc::new(agent))
 }
 
@@ -150,6 +166,7 @@ struct RequestSetup {
     created_timestamp: u64,
     chat_session_id: String,
     has_chat_history: bool,
+    agent_name: String,
 }
 
 /// Extract query, chat history, and build agent — shared across both code paths.
@@ -164,18 +181,15 @@ async fn prepare_request(
         Some(msg) if msg.role == Role::User => msg.content,
         Some(msg) => {
             return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Last message must be from user, got: {}", msg.role),
-                    error_type: "invalid_request_error".to_string(),
-                },
+                error: ErrorDetail::validation(&format!(
+                    "Last message must be from user, got: {}",
+                    msg.role
+                )),
             }));
         }
         None => {
             return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "messages array is empty".to_string(),
-                    error_type: "invalid_request_error".to_string(),
-                },
+                error: ErrorDetail::validation("messages array is empty"),
             }));
         }
     };
@@ -215,6 +229,7 @@ async fn prepare_request(
     let created_timestamp = Utc::now().timestamp() as u64;
     let has_chat_history = !chat_history.is_empty();
 
+    let agent_name = config.agent.name.clone();
     Ok(RequestSetup {
         query,
         chat_history,
@@ -225,6 +240,7 @@ async fn prepare_request(
         created_timestamp,
         chat_session_id: chat_session_id.to_string(),
         has_chat_history,
+        agent_name,
     })
 }
 
@@ -235,14 +251,21 @@ pub async fn chat_completions(
     req: web::Json<ChatCompletionRequest>,
     http_req: actix_web::HttpRequest,
 ) -> HttpResponse {
+    let request_start = std::time::Instant::now();
+
     // Validate we have messages
     if req.messages.is_empty() {
-        return HttpResponse::BadRequest().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "No messages provided".to_string(),
-                error_type: "invalid_request_error".to_string(),
-            },
+        let response = HttpResponse::BadRequest().json(ErrorResponse {
+            error: ErrorDetail::validation("No messages provided"),
         });
+        crate::metrics::record_request_duration(
+            "POST",
+            400,
+            "unknown",
+            request_start.elapsed().as_secs_f64(),
+        );
+        crate::metrics::record_error(aura::ErrorCategory::RequestValidation.as_label());
+        return response;
     }
 
     // Extract or generate chat_session_id
@@ -272,14 +295,37 @@ pub async fn chat_completions(
     let mut req = req.into_inner();
     let setup = match prepare_request(&data, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
-        Err(response) => return response,
+        Err(response) => {
+            let status = response.status().as_u16();
+            crate::metrics::record_request_duration(
+                "POST",
+                status,
+                "unknown",
+                request_start.elapsed().as_secs_f64(),
+            );
+            if status >= 400 {
+                crate::metrics::record_error(aura::ErrorCategory::RequestValidation.as_label());
+            }
+            return response;
+        }
     };
 
-    if req.stream == Some(true) {
+    let agent_name = setup.agent_name.clone();
+
+    let response = if req.stream == Some(true) {
         handle_streaming_completion(data, setup, req.max_tokens).await
     } else {
         handle_non_streaming_completion(&data, setup, req.max_tokens).await
-    }
+    };
+
+    crate::metrics::record_request_duration(
+        "POST",
+        response.status().as_u16(),
+        &agent_name,
+        request_start.elapsed().as_secs_f64(),
+    );
+
+    response
 }
 
 /// Build configuration for the spawned completion task from AppState and RequestSetup.
@@ -369,6 +415,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
     };
 
     let response_content = config.response_content.clone();
+    let provider_for_metrics = config.provider.clone();
     let otel_ctx = StreamOtelContext {
         provider: config.provider,
         model: config.model,
@@ -435,6 +482,27 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
     };
 
     otel_ctx.record_output(&termination);
+
+    // Record token usage metrics
+    let (prompt_tokens, completion_tokens, _total) = usage_state.get_final_usage();
+    crate::metrics::record_tokens(
+        "prompt",
+        &provider_for_metrics,
+        &setup.agent_name,
+        prompt_tokens,
+    );
+    crate::metrics::record_tokens(
+        "completion",
+        &provider_for_metrics,
+        &setup.agent_name,
+        completion_tokens,
+    );
+
+    // Record error metrics for non-success terminations
+    if !matches!(termination, StreamTermination::Complete) {
+        let category = aura::ErrorCategory::from(&termination);
+        crate::metrics::record_error(category.as_label());
+    }
 
     match &termination {
         StreamTermination::Complete => {
@@ -539,15 +607,13 @@ async fn handle_non_streaming_completion(
 
     match result_rx.await {
         Ok(collected) => build_json_response(response_ctx, max_tokens, collected),
-        Err(_) => {
-            error!("Completion task panicked or was dropped");
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "Internal error during completion".to_string(),
-                    error_type: "internal_error".to_string(),
-                },
-            })
-        }
+        Err(_) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: ErrorDetail::classified(
+                "internal_error",
+                aura::ErrorCategory::Internal,
+                "Completion task panicked or was dropped",
+            ),
+        }),
     }
 }
 

@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod handlers;
+mod metrics;
 mod streaming;
 mod types;
 
@@ -92,17 +93,22 @@ struct Args {
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
+/// Exempts /health and /metrics so Kubernetes probes and Prometheus scrapers
+/// continue working during graceful shutdown.
 async fn shutdown_guard(
     data: web::Data<AppState>,
     req: actix_web::dev::ServiceRequest,
     next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
-    if data.shutdown_token.is_cancelled() {
+    let path = req.path();
+    let is_exempt = path == "/health" || path == "/metrics";
+    if data.shutdown_token.is_cancelled() && !is_exempt {
         let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "Server is shutting down".to_string(),
-                error_type: "service_unavailable".to_string(),
-            },
+            error: ErrorDetail::classified(
+                "service_unavailable",
+                aura::ErrorCategory::ServiceUnavailable,
+                "Server is shutting down",
+            ),
         });
         return Ok(req.into_response(response).map_into_right_body());
     }
@@ -195,9 +201,12 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
+    // Initialize Prometheus metrics (None if disabled via AURA_METRICS_ENABLED=false)
+    let metrics_handle = metrics::init();
+
     // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
     let server = HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(app_state.clone())
             .wrap(middleware::from_fn(shutdown_guard))
             .wrap(middleware::Logger::default())
@@ -206,7 +215,15 @@ async fn run() -> std::io::Result<()> {
             .route(
                 "/v1/chat/completions",
                 web::post().to(handlers::chat_completions),
-            )
+            );
+
+        if let Some(handle) = &metrics_handle {
+            app = app
+                .app_data(web::Data::new(handle.clone()))
+                .route("/metrics", web::get().to(metrics::handler));
+        }
+
+        app
     })
     .bind((args.host.as_str(), args.port))?
     .disable_signals()
