@@ -208,6 +208,53 @@ pub struct ErrorDetail {
     pub message: String,
     #[serde(rename = "type")]
     pub error_type: String,
+    /// Error taxonomy label from ErrorCategory. Additive field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl ErrorDetail {
+    /// Create an error with taxonomy classification and sanitized client message.
+    ///
+    /// Encapsulates three concerns: (1) classifying the error via ErrorCategory,
+    /// (2) logging the internal message at WARN level for debugging, and
+    /// (3) replacing the client-facing message with a safe generic string.
+    /// This prevents internal details (hostnames, ports, library errors) from
+    /// reaching API consumers while preserving the existing `error_type` values.
+    pub fn classified(
+        error_type: &str,
+        category: aura::ErrorCategory,
+        internal_message: &str,
+    ) -> Self {
+        let aura_err = aura::AuraError::new(category, internal_message);
+        tracing::warn!(
+            error_category = category.as_label(),
+            internal_message = internal_message,
+            "Request error"
+        );
+        Self {
+            message: aura_err.client_message(),
+            error_type: error_type.to_string(),
+            code: Some(category.as_label().to_string()),
+        }
+    }
+
+    /// Create a request validation error that passes the message through directly.
+    ///
+    /// Unlike `classified()`, this does not sanitize the message because request
+    /// validation errors contain client-supplied input (e.g., "Last message must
+    /// be from user, got: system") which is safe to return.
+    pub fn validation(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            error_type: "invalid_request_error".to_string(),
+            code: Some(
+                aura::ErrorCategory::RequestValidation
+                    .as_label()
+                    .to_string(),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,5 +350,58 @@ mod tests {
         assert_eq!(json["error"]["type"], "invalid_request_error");
         assert_eq!(json["error"]["param"], "model");
         assert_eq!(json["error"]["code"], "model_not_found");
+    }
+
+    #[test]
+    fn test_error_detail_with_code_serializes_code_field() {
+        let detail = ErrorDetail {
+            message: "test".to_string(),
+            error_type: "internal_error".to_string(),
+            code: Some("llm_timeout".to_string()),
+        };
+        let json = serde_json::to_value(&ErrorResponse { error: detail }).unwrap();
+        assert_eq!(json["error"]["code"], "llm_timeout");
+        assert_eq!(json["error"]["type"], "internal_error");
+        assert_eq!(json["error"]["message"], "test");
+    }
+
+    #[test]
+    fn test_error_detail_without_code_omits_code_field() {
+        let detail = ErrorDetail {
+            message: "test".to_string(),
+            error_type: "internal_error".to_string(),
+            code: None,
+        };
+        let json = serde_json::to_value(&ErrorResponse { error: detail }).unwrap();
+        assert!(
+            json["error"].get("code").is_none(),
+            "code field should be absent when None"
+        );
+        assert_eq!(json["error"]["type"], "internal_error");
+    }
+
+    #[test]
+    fn test_error_detail_classified_uses_generic_message() {
+        let detail = ErrorDetail::classified(
+            "internal_error",
+            aura::ErrorCategory::McpConnectionFailed,
+            "MCP server 'pagerduty' at 10.0.1.5:8080 refused",
+        );
+        assert_eq!(
+            detail.message,
+            "A downstream service is temporarily unavailable"
+        );
+        assert_eq!(detail.error_type, "internal_error");
+        assert_eq!(detail.code, Some("mcp_connection_failed".to_string()));
+        assert!(!detail.message.contains("pagerduty"));
+        assert!(!detail.message.contains("10.0.1.5"));
+    }
+
+    #[test]
+    fn test_error_detail_validation_passes_through_message() {
+        let detail = ErrorDetail::validation("messages array is empty");
+        assert_eq!(detail.message, "messages array is empty");
+        assert_eq!(detail.error_type, "invalid_request_error");
+        assert_eq!(detail.code, Some("request_validation".to_string()));
     }
 }

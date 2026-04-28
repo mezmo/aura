@@ -109,17 +109,11 @@ impl VectorStoreManager {
     }
 
     /// Load AWS SDK config with optional region and profile
-    async fn load_aws_config(
-        region: &str,
-        profile: Option<&str>,
-    ) -> aws_config::SdkConfig {
+    async fn load_aws_config(region: &str, profile: Option<&str>) -> aws_config::SdkConfig {
         use aws_config::{BehaviorVersion, Region};
 
         if let Some(profile_name) = profile {
-            info!(
-                "Loading AWS config with profile '{}'",
-                profile_name
-            );
+            info!("Loading AWS config with profile '{}'", profile_name);
             aws_config::defaults(BehaviorVersion::latest())
                 .region(Region::new(region.to_string()))
                 .profile_name(profile_name)
@@ -222,8 +216,7 @@ impl VectorStoreManager {
         let qdrant_store = match embedding {
             EmbeddingModelConfig::OpenAI { api_key, model, .. } => {
                 let embedding_model = Self::create_openai_embedding_model(api_key, model)?;
-                let store =
-                    QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
+                let store = QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
                 QdrantStoreKind::OpenAI(store)
             }
             EmbeddingModelConfig::Bedrock {
@@ -232,10 +225,8 @@ impl VectorStoreManager {
                 profile,
             } => {
                 let embedding_model =
-                    Self::create_bedrock_embedding_model(model, region, profile.as_deref())
-                        .await?;
-                let store =
-                    QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
+                    Self::create_bedrock_embedding_model(model, region, profile.as_deref()).await?;
+                let store = QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
                 QdrantStoreKind::Bedrock(store)
             }
         };
@@ -268,11 +259,7 @@ impl VectorStoreManager {
         info!("  Knowledge Base ID: {}", knowledge_base_id);
         info!("  Region: {}", region);
 
-        let sdk_config = Self::load_aws_config(
-            region,
-            profile,
-        )
-        .await;
+        let sdk_config = Self::load_aws_config(region, profile).await;
 
         let client = aws_sdk_bedrockagentruntime::Client::new(&sdk_config);
         info!("Bedrock Knowledge Base client initialized");
@@ -296,7 +283,8 @@ impl VectorStoreManager {
     pub async fn add_documents(&self, documents: Vec<String>) -> Result<(), BuilderError> {
         if self.store_type == "bedrock_kb" {
             return Err(BuilderError::VectorStoreError(
-                "Bedrock Knowledge Base is read-only; manage documents via the AWS console".to_string(),
+                "Bedrock Knowledge Base is read-only; manage documents via the AWS console"
+                    .to_string(),
             ));
         }
 
@@ -386,22 +374,18 @@ impl VectorStoreManager {
         limit: usize,
     ) -> Result<Vec<SearchResult>, BuilderError> {
         let client = self.bedrock_kb_client.as_ref().ok_or_else(|| {
-            BuilderError::VectorStoreError(
-                "Bedrock KB client not initialized".to_string(),
-            )
+            BuilderError::VectorStoreError("Bedrock KB client not initialized".to_string())
         })?;
-        let kb_id = self.bedrock_kb_id.as_ref().ok_or_else(|| {
-            BuilderError::VectorStoreError(
-                "Bedrock KB ID not set".to_string(),
-            )
-        })?;
+        let kb_id = self
+            .bedrock_kb_id
+            .as_ref()
+            .ok_or_else(|| BuilderError::VectorStoreError("Bedrock KB ID not set".to_string()))?;
 
         debug!("Performing Bedrock KB retrieve for: '{}'", query);
 
-        let retrieval_query =
-            aws_sdk_bedrockagentruntime::types::KnowledgeBaseQuery::builder()
-                .text(query)
-                .build();
+        let retrieval_query = aws_sdk_bedrockagentruntime::types::KnowledgeBaseQuery::builder()
+            .text(query)
+            .build();
 
         let retrieval_config =
             aws_sdk_bedrockagentruntime::types::KnowledgeBaseRetrievalConfiguration::builder()
@@ -420,9 +404,7 @@ impl VectorStoreManager {
             .send()
             .await
             .map_err(|e| {
-                BuilderError::VectorStoreError(format!(
-                    "Bedrock KB retrieve failed: {e}"
-                ))
+                BuilderError::VectorStoreError(format!("Bedrock KB retrieve failed: {e}"))
             })?;
 
         let results: Vec<SearchResult> = response
@@ -492,12 +474,8 @@ impl VectorStoreManager {
                     })?;
 
                 let mut candidates = match qdrant_store.as_ref() {
-                    QdrantStoreKind::OpenAI(store) => {
-                        store.top_n::<Value>(search_request).await
-                    }
-                    QdrantStoreKind::Bedrock(store) => {
-                        store.top_n::<Value>(search_request).await
-                    }
+                    QdrantStoreKind::OpenAI(store) => store.top_n::<Value>(search_request).await,
+                    QdrantStoreKind::Bedrock(store) => store.top_n::<Value>(search_request).await,
                 }
                 .map_err(|e| {
                     BuilderError::VectorStoreError(format!("Qdrant search failed: {e}"))

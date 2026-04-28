@@ -252,9 +252,59 @@ Aura supports Ollama, including fallback tool-call parsing for model outputs tha
 
 ### Observability
 
+#### Tracing (OpenTelemetry)
+
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
 Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
+
+#### Metrics (Prometheus)
+
+Aura exposes a Prometheus-compatible `/metrics` endpoint for real-time monitoring. Enabled by default (set `AURA_METRICS_ENABLED=false` to disable).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `aura_http_request_duration_seconds` | histogram | method, status_code, agent | Request latency with buckets from 25ms to 300s |
+| `aura_llm_tokens_total` | counter | type (prompt/completion), provider, agent | Token usage accumulator |
+| `aura_mcp_tool_duration_seconds` | histogram | server, tool, status | MCP tool call latency |
+| `aura_errors_total` | counter | error_type | Error counter by taxonomy category |
+| `aura_http_requests_in_flight` | gauge | — | Active concurrent requests |
+| `aura_mcp_server_connected` | gauge | server | MCP server connection state (1=up, 0=down) |
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'aura'
+    static_configs:
+      - targets: ['localhost:8080']
+```
+
+Example PromQL queries:
+
+```promql
+# Request rate
+rate(aura_http_request_duration_seconds_count[5m])
+
+# p99 latency
+histogram_quantile(0.99, rate(aura_http_request_duration_seconds_bucket[5m]))
+
+# Token burn rate per minute
+rate(aura_llm_tokens_total[5m]) * 60
+
+# Error rate by type
+rate(aura_errors_total[5m])
+```
+
+#### Error Taxonomy
+
+API error responses include a structured `code` field for programmatic error handling:
+
+```json
+{"error": {"message": "...", "type": "internal_error", "code": "llm_timeout"}}
+```
+
+Error categories: `llm_timeout`, `llm_rate_limit`, `llm_auth_error`, `llm_error`, `mcp_connection_failed`, `mcp_tool_error`, `mcp_timeout`, `config_validation`, `request_validation`, `budget_exceeded`, `service_unavailable`, `cancelled`, `internal`. Client-facing error messages are sanitized — internal details (hostnames, ports, library errors) are logged server-side only.
 
 ## Docker Deployment
 
@@ -311,7 +361,7 @@ Run web server integration test workflow:
 Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 
 - Parent flag: `integration`
-- Suite flags: `integration-streaming`, `integration-header-forwarding`, `integration-mcp`, `integration-events`, `integration-cancellation`, `integration-progress`
+- Suite flags: `integration-streaming`, `integration-header-forwarding`, `integration-mcp`, `integration-events`, `integration-cancellation`, `integration-progress`, `integration-metrics`
 - Optional suite: `integration-vector` (requires external Qdrant setup)
 
 Detailed test guidance: [crates/aura-web-server/README.md#running-integration-tests](crates/aura-web-server/README.md#running-integration-tests).
