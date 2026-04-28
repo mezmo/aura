@@ -2,7 +2,7 @@
 //!
 //! Enabled by default. Set `AURA_METRICS_ENABLED=false` to disable the `/metrics` endpoint.
 
-use actix_web::{web, HttpResponse};
+use actix_web::{HttpResponse, web};
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::collections::HashSet;
@@ -21,7 +21,9 @@ pub fn init() -> Option<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Full("aura_http_request_duration_seconds".to_string()),
-            &[0.025, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+            &[
+                0.025, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+            ],
         )
         .expect("valid request duration buckets")
         .set_buckets_for_metric(
@@ -68,8 +70,7 @@ pub fn record_tokens(token_type: &str, provider: &str, agent: &str, count: u64) 
 }
 
 /// Track unique tool names globally to enforce cardinality cap.
-static KNOWN_TOOLS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+static KNOWN_TOOLS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 const MAX_UNIQUE_TOOL_LABELS: usize = 100;
 const MAX_TOOL_NAME_LEN: usize = 64;
@@ -114,8 +115,11 @@ pub fn decrement_requests_in_flight() {
 
 /// Set MCP server connection state (1.0 = connected, 0.0 = disconnected).
 pub fn set_mcp_server_connected(server: &str, connected: bool) {
-    gauge!("aura_mcp_server_connected", "server" => server.to_string())
-        .set(if connected { 1.0 } else { 0.0 });
+    gauge!("aura_mcp_server_connected", "server" => server.to_string()).set(if connected {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 #[cfg(test)]

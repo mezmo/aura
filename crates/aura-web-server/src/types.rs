@@ -248,7 +248,11 @@ impl ErrorDetail {
         Self {
             message: message.to_string(),
             error_type: "invalid_request_error".to_string(),
-            code: Some(aura::ErrorCategory::RequestValidation.as_label().to_string()),
+            code: Some(
+                aura::ErrorCategory::RequestValidation
+                    .as_label()
+                    .to_string(),
+            ),
         }
     }
 }
@@ -369,7 +373,10 @@ mod tests {
             code: None,
         };
         let json = serde_json::to_value(&ErrorResponse { error: detail }).unwrap();
-        assert!(json["error"].get("code").is_none(), "code field should be absent when None");
+        assert!(
+            json["error"].get("code").is_none(),
+            "code field should be absent when None"
+        );
         assert_eq!(json["error"]["type"], "internal_error");
     }
 
@@ -380,7 +387,10 @@ mod tests {
             aura::ErrorCategory::McpConnectionFailed,
             "MCP server 'pagerduty' at 10.0.1.5:8080 refused",
         );
-        assert_eq!(detail.message, "A downstream service is temporarily unavailable");
+        assert_eq!(
+            detail.message,
+            "A downstream service is temporarily unavailable"
+        );
         assert_eq!(detail.error_type, "internal_error");
         assert_eq!(detail.code, Some("mcp_connection_failed".to_string()));
         assert!(!detail.message.contains("pagerduty"));

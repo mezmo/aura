@@ -83,15 +83,13 @@ temperature = 0.5
         );
         let vector_store = &config.vector_stores[0];
         match &vector_store.store {
-            crate::config::VectorStoreType::InMemory { embedding_model } => {
-                match embedding_model {
-                    crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
-                        assert_eq!(model, "text-embedding-3-small");
-                        assert_eq!(api_key, "test_embedding_key");
-                    }
-                    _ => panic!("Expected OpenAI embedding config"),
+            crate::config::VectorStoreType::InMemory { embedding_model } => match embedding_model {
+                crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
+                    assert_eq!(model, "text-embedding-3-small");
+                    assert_eq!(api_key, "test_embedding_key");
                 }
-            }
+                _ => panic!("Expected OpenAI embedding config"),
+            },
             _ => panic!("Expected InMemory vector store"),
         }
 
@@ -346,14 +344,12 @@ system_prompt = "Test with env vars"
             _ => panic!("Expected OpenAI LLM config"),
         }
         match &config.vector_stores[0].store {
-            crate::config::VectorStoreType::InMemory { embedding_model } => {
-                match embedding_model {
-                    crate::config::EmbeddingConfig::OpenAI { api_key, .. } => {
-                        assert_eq!(api_key, "mock_openai_key");
-                    }
-                    _ => panic!("Expected OpenAI embedding config"),
+            crate::config::VectorStoreType::InMemory { embedding_model } => match embedding_model {
+                crate::config::EmbeddingConfig::OpenAI { api_key, .. } => {
+                    assert_eq!(api_key, "mock_openai_key");
                 }
-            }
+                _ => panic!("Expected OpenAI embedding config"),
+            },
             _ => panic!("Expected InMemory vector store"),
         }
 
@@ -949,20 +945,20 @@ system_prompt = "Test"
 
         let vector_store = &config.vector_stores[0];
         match &vector_store.store {
-            crate::config::VectorStoreType::Qdrant { embedding_model, .. } => {
-                match embedding_model {
-                    crate::config::EmbeddingConfig::Bedrock {
-                        model,
-                        region,
-                        profile,
-                    } => {
-                        assert_eq!(model, "amazon.titan-embed-text-v2:0");
-                        assert_eq!(region, "us-west-2");
-                        assert_eq!(profile, &Some("my-profile".to_string()));
-                    }
-                    _ => panic!("Expected Bedrock embedding config"),
+            crate::config::VectorStoreType::Qdrant {
+                embedding_model, ..
+            } => match embedding_model {
+                crate::config::EmbeddingConfig::Bedrock {
+                    model,
+                    region,
+                    profile,
+                } => {
+                    assert_eq!(model, "amazon.titan-embed-text-v2:0");
+                    assert_eq!(region, "us-west-2");
+                    assert_eq!(profile, &Some("my-profile".to_string()));
                 }
-            }
+                _ => panic!("Expected Bedrock embedding config"),
+            },
             _ => panic!("Expected Qdrant vector store"),
         }
     }
@@ -992,17 +988,15 @@ system_prompt = "Test"
 
         let vector_store = &config.vector_stores[0];
         match &vector_store.store {
-            crate::config::VectorStoreType::InMemory { embedding_model } => {
-                match embedding_model {
-                    crate::config::EmbeddingConfig::Bedrock {
-                        region, profile, ..
-                    } => {
-                        assert_eq!(region, "us-east-1");
-                        assert_eq!(profile, &None);
-                    }
-                    _ => panic!("Expected Bedrock embedding config"),
+            crate::config::VectorStoreType::InMemory { embedding_model } => match embedding_model {
+                crate::config::EmbeddingConfig::Bedrock {
+                    region, profile, ..
+                } => {
+                    assert_eq!(region, "us-east-1");
+                    assert_eq!(profile, &None);
                 }
-            }
+                _ => panic!("Expected Bedrock embedding config"),
+            },
             _ => panic!("Expected InMemory vector store"),
         }
     }
@@ -1058,7 +1052,10 @@ name = "Test"
 system_prompt = "Test"
 "#;
         let result = load_config_from_str(config_str);
-        assert!(result.is_err(), "OpenAI embedding without api_key should fail validation");
+        assert!(
+            result.is_err(),
+            "OpenAI embedding without api_key should fail validation"
+        );
     }
 
     #[test]
@@ -1081,8 +1078,7 @@ context_prefix = "Company documentation"
 name = "Test"
 system_prompt = "Test"
 "#;
-        let config = load_config_from_str(config_str)
-            .expect("Failed to parse bedrock_kb config");
+        let config = load_config_from_str(config_str).expect("Failed to parse bedrock_kb config");
 
         let store = &config.vector_stores[0];
         assert_eq!(store.name, "company_docs");
@@ -1150,10 +1146,7 @@ system_prompt = "Test"
         let result = load_config_from_str(config_str);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("region"),
-            "Error should mention region: {err}"
-        );
+        assert!(err.contains("region"), "Error should mention region: {err}");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
 pub mod error;
@@ -28,7 +29,6 @@ mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibili
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
-pub mod bedrock_embedding;
 pub(crate) mod string_utils;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
@@ -59,6 +59,7 @@ pub type AuraToolCall = provider_agent::ToolCall;
 #[deprecated(since = "1.2.0", note = "use ToolResult instead")]
 pub type AuraToolResult = provider_agent::ToolResult;
 
+pub use error_taxonomy::{ALL_CATEGORIES, AuraError, ErrorCategory};
 pub use mcp::McpManager;
 pub use mcp_progress::ProgressEnabledHandler;
 pub use mcp_streamable_http::InFlightRequests;
@@ -71,7 +72,6 @@ pub use request_progress::{
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use stream_events::{AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase};
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
-pub use error_taxonomy::{AuraError, ErrorCategory, ALL_CATEGORIES};
 pub use tool_error_detection::{DetectedToolError, ToolResultStatus, detect_tool_error};
 pub use tool_event_broker::{
     ToolCallId, ToolEventBroker, ToolLifecycleEvent, ToolName, ToolUsageEvent,

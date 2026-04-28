@@ -181,9 +181,10 @@ async fn prepare_request(
         Some(msg) if msg.role == Role::User => msg.content,
         Some(msg) => {
             return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail::validation(
-                    &format!("Last message must be from user, got: {}", msg.role),
-                ),
+                error: ErrorDetail::validation(&format!(
+                    "Last message must be from user, got: {}",
+                    msg.role
+                )),
             }));
         }
         None => {
@@ -464,8 +465,18 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
 
     // Record token usage metrics
     let (prompt_tokens, completion_tokens, _total) = usage_state.get_final_usage();
-    crate::metrics::record_tokens("prompt", &provider_for_metrics, &setup.agent_name, prompt_tokens);
-    crate::metrics::record_tokens("completion", &provider_for_metrics, &setup.agent_name, completion_tokens);
+    crate::metrics::record_tokens(
+        "prompt",
+        &provider_for_metrics,
+        &setup.agent_name,
+        prompt_tokens,
+    );
+    crate::metrics::record_tokens(
+        "completion",
+        &provider_for_metrics,
+        &setup.agent_name,
+        completion_tokens,
+    );
 
     // Record error metrics for non-success terminations
     if !matches!(termination, StreamTermination::Complete) {
@@ -576,15 +587,13 @@ async fn handle_non_streaming_completion(
 
     match result_rx.await {
         Ok(collected) => build_json_response(response_ctx, max_tokens, collected),
-        Err(_) => {
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail::classified(
-                    "internal_error",
-                    aura::ErrorCategory::Internal,
-                    "Completion task panicked or was dropped",
-                ),
-            })
-        }
+        Err(_) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: ErrorDetail::classified(
+                "internal_error",
+                aura::ErrorCategory::Internal,
+                "Completion task panicked or was dropped",
+            ),
+        }),
     }
 }
 
