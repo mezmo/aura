@@ -767,19 +767,39 @@ fn handle_tool_result(
     let mut output = Vec::with_capacity(2);
     state.needs_separator = true;
 
+    // Calculate tool duration (always, for metrics even when custom events are off)
+    let duration_ms = state
+        .tool_start_times
+        .remove(&tool_result.id)
+        .map(|start| start.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+
+    let tool_name_for_metrics = state
+        .tool_call_map
+        .get(&tool_result.id)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Record tool duration metric (always, regardless of custom events)
+    {
+        let result_text = serde_json::from_str::<String>(&tool_result.result)
+            .unwrap_or_else(|_| tool_result.result.clone());
+        let status = detect_tool_error(&result_text);
+        let status_label = match &status {
+            ToolResultStatus::Error(_) => "error",
+            ToolResultStatus::Success => "ok",
+        };
+        crate::metrics::record_tool_duration(
+            "default",
+            &tool_name_for_metrics,
+            status_label,
+            duration_ms as f64 / 1000.0,
+        );
+    }
+
     // Emit aura.tool_complete custom event (if enabled)
     if config.emit_custom_events {
-        let duration_ms = state
-            .tool_start_times
-            .remove(&tool_result.id)
-            .map(|start| start.elapsed().as_millis() as u64)
-            .unwrap_or(0);
-
-        let tool_name = state
-            .tool_call_map
-            .get(&tool_result.id)
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        let tool_name = tool_name_for_metrics.clone();
 
         // Aura's ToolResult has result as a plain String
         // Try to unescape JSON-quoted strings for error detection

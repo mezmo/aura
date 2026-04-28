@@ -129,6 +129,12 @@ async fn build_agent_for_request(
         .build_agent_with_headers(Some(req_headers))
         .await
         .map_err(|e| {
+            // Record MCP server as disconnected on build failure if it looks like an MCP error
+            if let Some(mcp_config) = &config.mcp {
+                for server_name in mcp_config.servers.keys() {
+                    crate::metrics::set_mcp_server_connected(server_name, false);
+                }
+            }
             HttpResponse::InternalServerError().json(ErrorResponse {
                 error: ErrorDetail::classified(
                     "internal_error",
@@ -137,6 +143,14 @@ async fn build_agent_for_request(
                 ),
             })
         })?;
+
+    // Record MCP servers as connected on successful agent build
+    if let Some(mcp_config) = &config.mcp {
+        for server_name in mcp_config.servers.keys() {
+            crate::metrics::set_mcp_server_connected(server_name, true);
+        }
+    }
+
     Ok(Arc::new(agent))
 }
 
