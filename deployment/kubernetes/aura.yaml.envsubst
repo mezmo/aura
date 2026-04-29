@@ -1,3 +1,4 @@
+---
 apiVersion: "deploy.razee.io/v1alpha2"
 kind: MustacheTemplate
 metadata:
@@ -13,395 +14,395 @@ metadata:
     razee.io/branch: "${GIT_BRANCH}"
 spec:
   env:
-  - name: command
-    optional: true
-    default: '["./aura-web-server"]'
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: command
-        type: json
+    - name: command
+      optional: true
+      default: '["./aura-web-server"]'
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: command
+          type: json
 
-  - name: args
-    optional: true
-    default: '["--verbose"]'
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: args
-        type: json
+    - name: args
+      optional: true
+      default: '["--verbose"]'
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: args
+          type: json
 
-  - name: loglevel
-    optional: true
-    default: info
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: loglevel
+    - name: loglevel
+      optional: true
+      default: info
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: loglevel
 
-  - name: http_port
-    optional: true
-    default: 8080
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: http_port
-        type: number
+    - name: http_port
+      optional: true
+      default: 8080
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: http_port
+          type: number
 
-  # Streaming configuration
-  - name: tool_result_mode
-    optional: true
-    default: "aura"
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: tool_result_mode
+    # Streaming configuration
+    - name: tool_result_mode
+      optional: true
+      default: "aura"
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: tool_result_mode
 
-  - name: tool_result_max_length
-    optional: true
-    default: 0
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: tool_result_max_length
-        type: number
+    - name: tool_result_max_length
+      optional: true
+      default: 0
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: tool_result_max_length
+          type: number
 
-  - name: aura_custom_events
-    optional: true
-    default: "true"
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: aura_custom_events
+    - name: aura_custom_events
+      optional: true
+      default: "true"
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: aura_custom_events
 
-  - name: aura_emit_reasoning
-    optional: true
-    default: "true"
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: aura_emit_reasoning
+    - name: aura_emit_reasoning
+      optional: true
+      default: "true"
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: aura_emit_reasoning
 
-  - name: streaming_timeout_secs
-    optional: true
-    default: 900
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: streaming_timeout_secs
-        type: number
+    - name: streaming_timeout_secs
+      optional: true
+      default: 900
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: streaming_timeout_secs
+          type: number
 
-  - name: default_agent
-    optional: true
-    default: "Operations Assistant (GPT-5.2)"
-    valueFrom:
-      configMapKeyRef:
-        name: aura-api
-        namespace: aura
-        key: default_agent
+    - name: default_agent
+      optional: true
+      default: "Operations Assistant (GPT-5.2)"
+      valueFrom:
+        configMapKeyRef:
+          name: aura-api
+          namespace: aura
+          key: default_agent
 
-  - name: requests_cpu
-    optional: true
-    default: 1
-    valueFrom:
-      configMapKeyRef:
-        name: resources
-        namespace: default
-        type: number
-        key: aura_requests-cpu
+    - name: requests_cpu
+      optional: true
+      default: 1
+      valueFrom:
+        configMapKeyRef:
+          name: resources
+          namespace: default
+          type: number
+          key: aura_requests-cpu
 
-  - name: requests_memory
-    optional: true
-    default: 2Gi
-    valueFrom:
-      configMapKeyRef:
-        name: resources
-        namespace: default
-        key: aura_requests-memory
+    - name: requests_memory
+      optional: true
+      default: 2Gi
+      valueFrom:
+        configMapKeyRef:
+          name: resources
+          namespace: default
+          key: aura_requests-memory
 
-  - name: limits_cpu
-    optional: true
-    default: 4
-    valueFrom:
-      configMapKeyRef:
-        name: resources
-        namespace: default
-        type: number
-        key: aura_limits-cpu
+    - name: limits_cpu
+      optional: true
+      default: 4
+      valueFrom:
+        configMapKeyRef:
+          name: resources
+          namespace: default
+          type: number
+          key: aura_limits-cpu
 
-  - name: limits_memory
-    optional: true
-    default: 8Gi
-    valueFrom:
-      configMapKeyRef:
-        name: resources
-        namespace: default
-        key: aura_limits-memory
+    - name: limits_memory
+      optional: true
+      default: 8Gi
+      valueFrom:
+        configMapKeyRef:
+          name: resources
+          namespace: default
+          key: aura_limits-memory
 
   strTemplates:
-  - |
+    - |
 
-    kind: List
-    apiVersion: v1
-    items:
-    - kind: ServiceAccount
+      kind: List
       apiVersion: v1
-      metadata:
-        name: aura-api
-        namespace: aura
-        labels:
-          app: aura-api
-          app.kubernetes.io/name: aura-api
-      imagePullSecrets:
-      - name: gcr
-
-    - kind: Role
-      apiVersion: rbac.authorization.k8s.io/v1
-      metadata:
-        name: aura-api
-        namespace: aura
-        labels:
-          app: aura-api
-          app.kubernetes.io/name: aura-api
-      rules:
-        - apiGroups: [""]
-          resources: ["configmaps", "secrets"]
-          verbs: ["get", "list"]
-
-    - kind: RoleBinding
-      apiVersion: rbac.authorization.k8s.io/v1
-      metadata:
-        name: aura-api
-        namespace: aura
-        labels:
-          app: aura-api
-          app.kubernetes.io/name: aura-api
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: Role
-        name: aura-api
-      subjects:
-        - kind: ServiceAccount
+      items:
+      - kind: ServiceAccount
+        apiVersion: v1
+        metadata:
           name: aura-api
-
-    # Removed logdan_control MCP server - not deployed to K8s (local dev only)
-    # See config.toml [mcp.servers.logdan_control] for local configuration
-
-    - kind: Service
-      apiVersion: v1
-      metadata:
-        name: aura-api
-        namespace: aura
-        labels:
-          app: aura
-      spec:
-        type: ClusterIP
-        selector:
-          app: aura-api
-        ports:
-          - name: http
-            port: 80
-            targetPort: {{{http_port}}}
-            protocol: TCP
-
-    - kind: Deployment
-      apiVersion: apps/v1
-      metadata:
-        name: aura-api
-        namespace: aura
-        labels:
-          app: aura
-          version: "${RELEASE_VERSION}"
-        annotations:
-          razee.io/git-repo: "${GIT_URL}"
-          razee.io/commit-sha: "${GIT_SHA1}"
-          razee.io/build-url: "${BUILD_URL}"
-          razee.io/branch: "${GIT_BRANCH}"
-      spec:
-        selector:
-          matchLabels:
+          namespace: aura
+          labels:
             app: aura-api
-        strategy:
-          type: RollingUpdate
-          rollingUpdate:
-            maxSurge: 1
-            maxUnavailable: 0
-        template:
-          metadata:
-            labels:
+            app.kubernetes.io/name: aura-api
+        imagePullSecrets:
+        - name: gcr
+
+      - kind: Role
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: aura-api
+          namespace: aura
+          labels:
+            app: aura-api
+            app.kubernetes.io/name: aura-api
+        rules:
+          - apiGroups: [""]
+            resources: ["configmaps", "secrets"]
+            verbs: ["get", "list"]
+
+      - kind: RoleBinding
+        apiVersion: rbac.authorization.k8s.io/v1
+        metadata:
+          name: aura-api
+          namespace: aura
+          labels:
+            app: aura-api
+            app.kubernetes.io/name: aura-api
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: aura-api
+        subjects:
+          - kind: ServiceAccount
+            name: aura-api
+
+      # Removed logdan_control MCP server - not deployed to K8s (local dev only)
+      # See config.toml [mcp.servers.logdan_control] for local configuration
+
+      - kind: Service
+        apiVersion: v1
+        metadata:
+          name: aura-api
+          namespace: aura
+          labels:
+            app: aura
+        spec:
+          type: ClusterIP
+          selector:
+            app: aura-api
+          ports:
+            - name: http
+              port: 80
+              targetPort: {{{http_port}}}
+              protocol: TCP
+
+      - kind: Deployment
+        apiVersion: apps/v1
+        metadata:
+          name: aura-api
+          namespace: aura
+          labels:
+            app: aura
+            version: "${RELEASE_VERSION}"
+          annotations:
+            razee.io/git-repo: "${GIT_URL}"
+            razee.io/commit-sha: "${GIT_SHA1}"
+            razee.io/build-url: "${BUILD_URL}"
+            razee.io/branch: "${GIT_BRANCH}"
+        spec:
+          selector:
+            matchLabels:
               app: aura-api
-              version: ${RELEASE_VERSION}
-          spec:
-            serviceAccountName: aura-api
-            containers:
-            - name: aura-api
-              command: {{^command}}[]{{/command}}
-              {{#command}}
-              - "{{{.}}}"
-              {{/command}}
-              args: {{^args}}[]{{/args}}
-              {{#args}}
-              - "{{{.}}}"
-              {{/args}}
-              image: mezmo/aura:${RELEASE_VERSION}
-              imagePullPolicy: IfNotPresent
-              env:
-              # Server configuration
-              - name: HOST
-                value: "0.0.0.0"
+          strategy:
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 1
+              maxUnavailable: 0
+          template:
+            metadata:
+              labels:
+                app: aura-api
+                version: ${RELEASE_VERSION}
+            spec:
+              serviceAccountName: aura-api
+              containers:
+              - name: aura-api
+                command: {{^command}}[]{{/command}}
+                {{#command}}
+                - "{{{.}}}"
+                {{/command}}
+                args: {{^args}}[]{{/args}}
+                {{#args}}
+                - "{{{.}}}"
+                {{/args}}
+                image: mezmo/aura:${RELEASE_VERSION}
+                imagePullPolicy: IfNotPresent
+                env:
+                # Server configuration
+                - name: HOST
+                  value: "0.0.0.0"
 
-              - name: PORT
-                value: "{{{http_port}}}"
+                - name: PORT
+                  value: "{{{http_port}}}"
 
-              - name: CONFIG_PATH
-                value: "/etc/aura/"
+                - name: CONFIG_PATH
+                  value: "/etc/aura/"
 
-              {{#default_agent}}
-              - name: DEFAULT_AGENT
-                value: "{{{default_agent}}}"
-              {{/default_agent}}
+                {{#default_agent}}
+                - name: DEFAULT_AGENT
+                  value: "{{{default_agent}}}"
+                {{/default_agent}}
 
-              # Streaming configuration
-              - name: TOOL_RESULT_MODE
-                value: "{{{tool_result_mode}}}"
+                # Streaming configuration
+                - name: TOOL_RESULT_MODE
+                  value: "{{{tool_result_mode}}}"
 
-              - name: TOOL_RESULT_MAX_LENGTH
-                value: "{{{tool_result_max_length}}}"
+                - name: TOOL_RESULT_MAX_LENGTH
+                  value: "{{{tool_result_max_length}}}"
 
-              - name: AURA_CUSTOM_EVENTS
-                value: "{{{aura_custom_events}}}"
+                - name: AURA_CUSTOM_EVENTS
+                  value: "{{{aura_custom_events}}}"
 
-              - name: AURA_EMIT_REASONING
-                value: "{{{aura_emit_reasoning}}}"
+                - name: AURA_EMIT_REASONING
+                  value: "{{{aura_emit_reasoning}}}"
 
-              - name: STREAMING_TIMEOUT_SECS
-                value: "{{{streaming_timeout_secs}}}"
+                - name: STREAMING_TIMEOUT_SECS
+                  value: "{{{streaming_timeout_secs}}}"
 
-              - name: SERVER_GUID
-                valueFrom:
-                  fieldRef:
-                    fieldPath: metadata.name
+                - name: SERVER_GUID
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
 
-              # API Keys from secrets
-              - name: OPENAI_API_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: aura-secrets
-                    key: openai_api_key
-                    optional: true
+                # API Keys from secrets
+                - name: OPENAI_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: aura-secrets
+                      key: openai_api_key
+                      optional: true
 
-              - name: ANTHROPIC_API_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: aura-secrets
-                    key: anthropic_api_key
-                    optional: true
+                - name: ANTHROPIC_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: aura-secrets
+                      key: anthropic_api_key
+                      optional: true
 
-              - name: MEZMO_API_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: aura-secrets
-                    key: mezmo_api_key
-                    optional: true
+                - name: MEZMO_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: aura-secrets
+                      key: mezmo_api_key
+                      optional: true
 
-              - name: AWS_ACCESS_KEY_ID
-                valueFrom:
-                  secretKeyRef:
-                    name: aura-secrets
-                    key: aws_access_key_id
-                    optional: true
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: aura-secrets
+                      key: aws_access_key_id
+                      optional: true
 
-              - name: AWS_SECRET_ACCESS_KEY
-                valueFrom:
-                  secretKeyRef:
-                    name: aura-secrets
-                    key: aws_secret_access_key
-                    optional: true
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: aura-secrets
+                      key: aws_secret_access_key
+                      optional: true
 
-              - name: AWS_REGION
-                valueFrom:
-                  secretKeyRef:
-                    name: aura-secrets
-                    key: aws_region
-                    optional: true
+                - name: AWS_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: aura-secrets
+                      key: aws_region
+                      optional: true
 
-              # Health probes
-              startupProbe:
-                httpGet:
-                  path: /health
-                  port: {{{http_port}}}
-                periodSeconds: 5
-                failureThreshold: 60
+                # Health probes
+                startupProbe:
+                  httpGet:
+                    path: /health
+                    port: {{{http_port}}}
+                  periodSeconds: 5
+                  failureThreshold: 60
 
-              livenessProbe:
-                timeoutSeconds: 15
-                httpGet:
-                  path: /health
-                  port: {{{http_port}}}
-                initialDelaySeconds: 5
-                periodSeconds: 30
+                livenessProbe:
+                  timeoutSeconds: 15
+                  httpGet:
+                    path: /health
+                    port: {{{http_port}}}
+                  initialDelaySeconds: 5
+                  periodSeconds: 30
 
-              readinessProbe:
-                timeoutSeconds: 15
-                httpGet:
-                  path: /health
-                  port: {{{http_port}}}
-                initialDelaySeconds: 5
-                periodSeconds: 30
+                readinessProbe:
+                  timeoutSeconds: 15
+                  httpGet:
+                    path: /health
+                    port: {{{http_port}}}
+                  initialDelaySeconds: 5
+                  periodSeconds: 30
 
-              # Resource limits
-              resources:
-                requests:
-                  memory: "{{{requests_memory}}}"
-                  cpu: "{{{requests_cpu}}}"
-                limits:
-                  memory: "{{{limits_memory}}}"
-                  cpu: "{{{limits_cpu}}}"
+                # Resource limits
+                resources:
+                  requests:
+                    memory: "{{{requests_memory}}}"
+                    cpu: "{{{requests_cpu}}}"
+                  limits:
+                    memory: "{{{limits_memory}}}"
+                    cpu: "{{{limits_cpu}}}"
 
-              # Volume mounts for config
-              volumeMounts:
+                # Volume mounts for config
+                volumeMounts:
+                - name: config
+                  mountPath: /etc/aura
+                  readOnly: true
+
+              # Volumes
+              volumes:
               - name: config
-                mountPath: /etc/aura
-                readOnly: true
+                configMap:
+                  name: aura-config
 
-            # Volumes
-            volumes:
-            - name: config
-              configMap:
-                name: aura-config
-
-            # Node affinity and tolerations
-            affinity:
-              nodeAffinity:
-                requiredDuringSchedulingIgnoredDuringExecution:
-                  nodeSelectorTerms:
-                  - matchExpressions:
-                    - key: workload-pipeline
-                      operator: In
-                      values:
-                      - enabled
-              podAntiAffinity:
-                preferredDuringSchedulingIgnoredDuringExecution:
-                - weight: 1
-                  podAffinityTerm:
-                    topologyKey: "kubernetes.io/hostname"
-                    labelSelector:
-                      matchExpressions:
-                      - key: app
+              # Node affinity and tolerations
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                    - matchExpressions:
+                      - key: workload-pipeline
                         operator: In
                         values:
-                        - aura
-            tolerations:
-            - effect: NoSchedule
-              key: workload-pipeline
-              operator: Equal
-              value: enabled
+                        - enabled
+                podAntiAffinity:
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                  - weight: 1
+                    podAffinityTerm:
+                      topologyKey: "kubernetes.io/hostname"
+                      labelSelector:
+                        matchExpressions:
+                        - key: app
+                          operator: In
+                          values:
+                          - aura
+              tolerations:
+              - effect: NoSchedule
+                key: workload-pipeline
+                operator: Equal
+                value: enabled

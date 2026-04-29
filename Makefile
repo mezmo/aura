@@ -52,7 +52,7 @@ endif
 export
 
 # Source in repository specific environment variables
-MAKEFILE_LIB=.makefiles
+MAKEFILE_LIB ?= .makefiles
 MAKEFILE_INCLUDES=$(wildcard $(MAKEFILE_LIB)/*.mk)
 include $(MAKEFILE_INCLUDES)
 
@@ -153,8 +153,7 @@ fmt-check::           ## Check code formatting (CI)
 	cargo fmt --all -- --check
 
 .PHONY:lint
-lint::                ## Run clippy linter
-	cargo clippy --all-targets --all-features -- -D warnings
+lint::                ## Apply all lint targets
 
 .PHONY:ci
 ci:: fmt-check test lint  ## Run CI checks locally (fmt + test + lint)
@@ -162,12 +161,6 @@ ci:: fmt-check test lint  ## Run CI checks locally (fmt + test + lint)
 
 .PHONY:clean
 clean::               ## Cleanup the local checkout
-	-rm -rf *.backup tmp/ output/
-	cargo clean
-
-.PHONY:clean-all
-clean-all:: clean     ## Full cleanup of all artifacts
-	-git clean -Xdf
 
 .PHONY:docker-build
 docker-build::        ## Build Docker image (full release)
