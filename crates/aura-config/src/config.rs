@@ -71,6 +71,10 @@ pub struct ArtifactsConfig {
     pub session_history_turns: usize,
     #[serde(default = "default_persistence_drain_timeout_ms")]
     pub persistence_drain_timeout_ms: u64,
+    #[serde(default = "default_tool_output_artifact_threshold")]
+    pub tool_output_artifact_threshold: usize,
+    #[serde(default = "default_tool_output_duration_threshold_ms")]
+    pub tool_output_duration_threshold_ms: u64,
 }
 
 fn default_session_history_turns() -> usize {
@@ -81,6 +85,14 @@ fn default_persistence_drain_timeout_ms() -> u64 {
     2000
 }
 
+fn default_tool_output_artifact_threshold() -> usize {
+    500
+}
+
+fn default_tool_output_duration_threshold_ms() -> u64 {
+    5000
+}
+
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
@@ -89,6 +101,8 @@ impl Default for ArtifactsConfig {
             result_summary_length: default_result_summary_length(),
             session_history_turns: default_session_history_turns(),
             persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
+            tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
+            tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
         }
     }
 }
@@ -178,6 +192,10 @@ struct RawOrchestrationConfig {
     session_history_turns: Option<usize>,
     #[serde(default)]
     persistence_drain_timeout_ms: Option<u64>,
+    #[serde(default)]
+    tool_output_artifact_threshold: Option<usize>,
+    #[serde(default)]
+    tool_output_duration_threshold_ms: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -204,6 +222,12 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         }
         if let Some(v) = raw.persistence_drain_timeout_ms {
             artifacts.persistence_drain_timeout_ms = v;
+        }
+        if let Some(v) = raw.tool_output_artifact_threshold {
+            artifacts.tool_output_artifact_threshold = v;
+        }
+        if let Some(v) = raw.tool_output_duration_threshold_ms {
+            artifacts.tool_output_duration_threshold_ms = v;
         }
 
         Ok(OrchestrationConfig {

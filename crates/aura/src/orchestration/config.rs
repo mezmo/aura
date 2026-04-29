@@ -91,6 +91,14 @@ fn default_persistence_drain_timeout_ms() -> u64 {
     2000
 }
 
+fn default_tool_output_artifact_threshold() -> usize {
+    500
+}
+
+fn default_tool_output_duration_threshold_ms() -> u64 {
+    5000
+}
+
 fn default_result_artifact_threshold() -> usize {
     4000
 }
@@ -292,6 +300,19 @@ pub struct ArtifactsConfig {
     /// and write_plan(). Default: 2000ms.
     #[serde(default = "default_persistence_drain_timeout_ms")]
     pub persistence_drain_timeout_ms: u64,
+
+    /// Character threshold for promoting tool outputs to artifact files.
+    /// Outputs exceeding this size get written to artifacts/ with an inline
+    /// footer referencing the file. Set to 0 to promote all tool outputs.
+    /// Default: 500.
+    #[serde(default = "default_tool_output_artifact_threshold")]
+    pub tool_output_artifact_threshold: usize,
+
+    /// Duration threshold (ms) for promoting tool outputs to artifact files.
+    /// Tool calls exceeding this duration get promoted regardless of size.
+    /// Set to 0 to disable duration-based promotion. Default: 5000ms.
+    #[serde(default = "default_tool_output_duration_threshold_ms")]
+    pub tool_output_duration_threshold_ms: u64,
 }
 
 fn default_session_history_turns() -> usize {
@@ -306,6 +327,8 @@ impl Default for ArtifactsConfig {
             result_summary_length: default_result_summary_length(),
             session_history_turns: default_session_history_turns(),
             persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
+            tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
+            tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
         }
     }
 }
@@ -432,6 +455,16 @@ impl OrchestrationConfig {
     /// Timeout (ms) for draining in-flight persistence writes.
     pub fn persistence_drain_timeout_ms(&self) -> u64 {
         self.artifacts.persistence_drain_timeout_ms
+    }
+
+    /// Character threshold for promoting tool outputs to artifacts.
+    pub fn tool_output_artifact_threshold(&self) -> usize {
+        self.artifacts.tool_output_artifact_threshold
+    }
+
+    /// Duration threshold (ms) for promoting tool outputs to artifacts.
+    pub fn tool_output_duration_threshold_ms(&self) -> u64 {
+        self.artifacts.tool_output_duration_threshold_ms
     }
 }
 
@@ -634,6 +667,10 @@ struct RawOrchestrationConfig {
     session_history_turns: Option<usize>,
     #[serde(default)]
     persistence_drain_timeout_ms: Option<u64>,
+    #[serde(default)]
+    tool_output_artifact_threshold: Option<usize>,
+    #[serde(default)]
+    tool_output_duration_threshold_ms: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -661,6 +698,12 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         }
         if let Some(v) = raw.persistence_drain_timeout_ms {
             artifacts.persistence_drain_timeout_ms = v;
+        }
+        if let Some(v) = raw.tool_output_artifact_threshold {
+            artifacts.tool_output_artifact_threshold = v;
+        }
+        if let Some(v) = raw.tool_output_duration_threshold_ms {
+            artifacts.tool_output_duration_threshold_ms = v;
         }
 
         Ok(OrchestrationConfig {
@@ -708,6 +751,8 @@ mod tests {
         assert!(config.memory_dir().is_none());
         assert_eq!(config.session_history_turns(), 3);
         assert_eq!(config.persistence_drain_timeout_ms(), 2000);
+        assert_eq!(config.tool_output_artifact_threshold(), 500);
+        assert_eq!(config.tool_output_duration_threshold_ms(), 5000);
     }
 
     #[test]
@@ -1370,5 +1415,51 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.persistence_drain_timeout_ms(), 3000);
+    }
+
+    #[test]
+    fn test_tool_output_thresholds_default() {
+        let config = OrchestrationConfig::default();
+        assert_eq!(config.tool_output_artifact_threshold(), 500);
+        assert_eq!(config.tool_output_duration_threshold_ms(), 5000);
+    }
+
+    #[test]
+    fn test_tool_output_thresholds_in_artifacts_sub_table() {
+        let toml = r#"
+            enabled = true
+
+            [artifacts]
+            tool_output_artifact_threshold = 100
+            tool_output_duration_threshold_ms = 2000
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.tool_output_artifact_threshold(), 100);
+        assert_eq!(config.tool_output_duration_threshold_ms(), 2000);
+    }
+
+    #[test]
+    fn test_tool_output_thresholds_flat_backward_compat() {
+        let toml = r#"
+            enabled = true
+            tool_output_artifact_threshold = 0
+            tool_output_duration_threshold_ms = 0
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.tool_output_artifact_threshold(), 0);
+        assert_eq!(config.tool_output_duration_threshold_ms(), 0);
+    }
+
+    #[test]
+    fn test_tool_output_thresholds_flat_overrides_sub_table() {
+        let toml = r#"
+            enabled = true
+            tool_output_artifact_threshold = 200
+
+            [artifacts]
+            tool_output_artifact_threshold = 1000
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.tool_output_artifact_threshold(), 200);
     }
 }

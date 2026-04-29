@@ -492,14 +492,21 @@ impl Orchestrator {
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
 
         // Build tool wrapper: observer + duplicate guard + persistence
-        let (in_flight, drain_notify) = {
+        let (in_flight, drain_notify, iteration, persistence_enabled) = {
             let p = self.persistence.lock().await;
-            (p.in_flight_counter(), p.drain_notify())
+            (p.in_flight_counter(), p.drain_notify(), p.current_iteration(), p.is_enabled())
         };
         let persistence_wrapper = Arc::new(PersistenceWrapper::new(
-            self.persistence.clone(),
-            in_flight,
-            drain_notify,
+            super::persistence_wrapper::PersistenceWrapperParams {
+                persistence: self.persistence.clone(),
+                in_flight,
+                drain_notify,
+                worker_name: worker_name.map(String::from),
+                iteration,
+                persistence_enabled,
+                size_threshold: self.config.tool_output_artifact_threshold(),
+                duration_threshold_ms: self.config.tool_output_duration_threshold_ms(),
+            },
         ));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
             self.tool_call_observer.clone(),

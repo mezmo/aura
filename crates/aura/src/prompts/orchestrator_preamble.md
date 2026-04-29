@@ -75,4 +75,4 @@ Do NOT use parallel groups for steps that depend on each other — sequential or
 
 ## Artifacts
 
-When a task result is too large to include inline, it is saved to an artifact file and the inline result will contain a summary with a reference like `[Full result (N chars) saved to artifact: task-0-sre-iter-1-result.txt]`. Use `read_artifact` to load the full content when the summary is insufficient for your decision.
+When a task result or tool output is too large to include inline, it is saved to an artifact file and the inline text will contain a reference like `[Full result (N chars) saved to artifact: task-0-sre-iter-1-result.txt]` or `[Tool output saved to artifact: task-0-sre-iter-1-log_search-0-output.txt]`. Use `read_artifact` to load the full content when the summary is insufficient for your decision.

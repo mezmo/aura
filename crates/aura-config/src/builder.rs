@@ -144,6 +144,8 @@ impl RigBuilder {
                     result_summary_length: orch.artifacts.result_summary_length,
                     session_history_turns: orch.artifacts.session_history_turns,
                     persistence_drain_timeout_ms: orch.artifacts.persistence_drain_timeout_ms,
+                    tool_output_artifact_threshold: orch.artifacts.tool_output_artifact_threshold,
+                    tool_output_duration_threshold_ms: orch.artifacts.tool_output_duration_threshold_ms,
                 },
             }
         });

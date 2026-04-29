@@ -146,6 +146,9 @@ pub struct ToolCallRecord {
     pub error: Option<String>,
     /// Duration in milliseconds
     pub duration_ms: u64,
+    /// Artifact filename if tool output was promoted to an artifact file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_filename: Option<String>,
 }
 
 /// Summary of a worker's execution for a task.
@@ -269,6 +272,11 @@ impl ExecutionPersistence {
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Whether persistence is enabled (writes go to disk).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Get the run ID for this execution.
@@ -454,6 +462,43 @@ impl ExecutionPersistence {
         tracing::debug!(
             "Written result artifact ({} chars) to: {}",
             result.len(),
+            artifact_path.display()
+        );
+        Ok(filename)
+    }
+
+    /// Write a tool output to an artifact file.
+    ///
+    /// Returns the artifact filename for reference in footers and ToolCallRecord.
+    /// Filename: `task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt`
+    pub async fn write_tool_output_artifact(
+        &self,
+        task_id: usize,
+        worker_name: &str,
+        iteration: usize,
+        tool_name: &str,
+        call_idx: usize,
+        output: &str,
+    ) -> io::Result<String> {
+        if !self.enabled {
+            return Ok(String::new());
+        }
+
+        let artifacts_dir = self.artifacts_path();
+        fs::create_dir_all(&artifacts_dir).await?;
+
+        let worker = sanitize_filename_component(worker_name);
+        let tool = sanitize_filename_component(tool_name);
+        let filename = format!(
+            "task-{}-{}-iter-{}-{}-{}-output.txt",
+            task_id, worker, iteration, tool, call_idx
+        );
+        let artifact_path = artifacts_dir.join(&filename);
+        fs::write(&artifact_path, output).await?;
+
+        tracing::debug!(
+            "Written tool output artifact ({} chars) to: {}",
+            output.len(),
             artifact_path.display()
         );
         Ok(filename)
@@ -1306,6 +1351,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filename, "task-3-default-iter-1-result.txt");
+    }
+
+    // ========================================================================
+    // Tool Output Artifact Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_write_tool_output_artifact() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_tool_output_artifact(0, "sre", 1, "log_search", 0, "search results here")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-0-sre-iter-1-log-search-0-output.txt");
+
+        let content = persistence.read_artifact(&filename).await.unwrap();
+        assert_eq!(content, "search results here");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_output_artifact_sanitizes_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_tool_output_artifact(2, "SRE/Ops", 1, "My Search Tool", 3, "data")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-2-sre-ops-iter-1-my-search-tool-3-output.txt");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_output_artifact_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        let filename = persistence
+            .write_tool_output_artifact(0, "w", 1, "t", 0, "data")
+            .await
+            .unwrap();
+        assert!(filename.is_empty());
     }
 
     // ========================================================================
