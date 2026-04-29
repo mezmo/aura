@@ -32,7 +32,11 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
+use tokio::sync::Notify;
 
 use super::events::RoutingMode;
 use super::types::{Plan, TaskStatus};
@@ -171,6 +175,13 @@ pub struct TaskExecutionRecord {
 }
 
 /// Manages execution artifact persistence (async).
+///
+/// Tracks in-flight async writes via `in_flight` / `drain_notify` so callers
+/// can wait for all fire-and-forget `on_complete` persistence hooks to finish
+/// before reading back artifacts. The `Arc` counter and notify fields live
+/// outside the Mutex so increment/decrement is lock-free, but `on_complete`
+/// still acquires the Mutex for the actual file I/O — callers must release
+/// the Mutex before calling `drain()` to avoid deadlock.
 #[derive(Clone)]
 pub struct ExecutionPersistence {
     base_path: PathBuf,
@@ -178,6 +189,8 @@ pub struct ExecutionPersistence {
     session_id: Option<String>,
     current_iteration: usize,
     enabled: bool,
+    in_flight: Arc<AtomicUsize>,
+    drain_notify: Arc<Notify>,
 }
 
 impl ExecutionPersistence {
@@ -240,6 +253,8 @@ impl ExecutionPersistence {
             session_id,
             current_iteration: 1,
             enabled: true,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -251,6 +266,8 @@ impl ExecutionPersistence {
             session_id: None,
             current_iteration: 1,
             enabled: false,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -273,6 +290,45 @@ impl ExecutionPersistence {
     pub fn start_new_iteration(&mut self) -> usize {
         self.current_iteration += 1;
         self.current_iteration
+    }
+
+    /// Arc handle to the in-flight write counter.
+    ///
+    /// Shared with `PersistenceWrapper` instances so fire-and-forget
+    /// `on_complete` hooks can increment/decrement without holding the Mutex.
+    pub fn in_flight_counter(&self) -> Arc<AtomicUsize> {
+        self.in_flight.clone()
+    }
+
+    /// Arc handle to the drain notification channel.
+    pub fn drain_notify(&self) -> Arc<Notify> {
+        self.drain_notify.clone()
+    }
+
+    /// Wait for all in-flight persistence writes to complete, bounded by `timeout`.
+    ///
+    /// Returns `true` if the counter reached zero before the deadline.
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        // Yield to let recently-spawned on_complete tasks poll their first
+        // increment before we check the counter (closes TOCTOU window between
+        // tokio::spawn and fetch_add inside on_complete).
+        tokio::task::yield_now().await;
+
+        if self.in_flight.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        tokio::select! {
+            _ = async {
+                while self.in_flight.load(Ordering::Acquire) > 0 {
+                    self.drain_notify.notified().await;
+                }
+            } => true,
+            _ = tokio::time::sleep(timeout) => {
+                let remaining = self.in_flight.load(Ordering::Acquire);
+                tracing::warn!(remaining, "Persistence drain timed out");
+                false
+            }
+        }
     }
 
     /// Get iteration directory path (flat, directly under run dir).
@@ -1251,4 +1307,47 @@ mod tests {
             .unwrap();
         assert_eq!(filename, "task-3-default-iter-1-result.txt");
     }
+
+    // ========================================================================
+    // Drain Barrier Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_drain_completes_immediately_with_no_in_flight() {
+        let persistence = ExecutionPersistence::disabled();
+        assert!(persistence.drain(Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_waits_for_in_flight_write() {
+        let persistence = ExecutionPersistence::disabled();
+        let counter = persistence.in_flight_counter();
+        let notify = persistence.drain_notify();
+
+        counter.fetch_add(1, Ordering::Release);
+
+        let drain_handle = {
+            let persistence = persistence.clone();
+            tokio::spawn(async move { persistence.drain(Duration::from_secs(5)).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain_handle.is_finished());
+
+        counter.fetch_sub(1, Ordering::Release);
+        notify.notify_one();
+
+        assert!(drain_handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_drain_times_out() {
+        let persistence = ExecutionPersistence::disabled();
+        let counter = persistence.in_flight_counter();
+        counter.fetch_add(1, Ordering::Release);
+
+        let drained = persistence.drain(Duration::from_millis(50)).await;
+        assert!(!drained);
+    }
+
 }

@@ -87,6 +87,10 @@ fn default_max_planning_cycles() -> usize {
 }
 
 /// Default character threshold for artifact extraction.
+fn default_persistence_drain_timeout_ms() -> u64 {
+    2000
+}
+
 fn default_result_artifact_threshold() -> usize {
     4000
 }
@@ -283,6 +287,11 @@ pub struct ArtifactsConfig {
     /// Default: 3.
     #[serde(default = "default_session_history_turns")]
     pub session_history_turns: usize,
+
+    /// Timeout (ms) for draining in-flight persistence writes between execute()
+    /// and write_plan(). Default: 2000ms.
+    #[serde(default = "default_persistence_drain_timeout_ms")]
+    pub persistence_drain_timeout_ms: u64,
 }
 
 fn default_session_history_turns() -> usize {
@@ -296,6 +305,7 @@ impl Default for ArtifactsConfig {
             result_artifact_threshold: default_result_artifact_threshold(),
             result_summary_length: default_result_summary_length(),
             session_history_turns: default_session_history_turns(),
+            persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
         }
     }
 }
@@ -417,6 +427,11 @@ impl OrchestrationConfig {
     /// Maximum prior run manifests to inject as session context.
     pub fn session_history_turns(&self) -> usize {
         self.artifacts.session_history_turns
+    }
+
+    /// Timeout (ms) for draining in-flight persistence writes.
+    pub fn persistence_drain_timeout_ms(&self) -> u64 {
+        self.artifacts.persistence_drain_timeout_ms
     }
 }
 
@@ -617,6 +632,8 @@ struct RawOrchestrationConfig {
     result_summary_length: Option<usize>,
     #[serde(default)]
     session_history_turns: Option<usize>,
+    #[serde(default)]
+    persistence_drain_timeout_ms: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for OrchestrationConfig {
@@ -641,6 +658,9 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         }
         if let Some(v) = raw.session_history_turns {
             artifacts.session_history_turns = v;
+        }
+        if let Some(v) = raw.persistence_drain_timeout_ms {
+            artifacts.persistence_drain_timeout_ms = v;
         }
 
         Ok(OrchestrationConfig {
@@ -687,6 +707,7 @@ mod tests {
         assert_eq!(config.result_summary_length(), 2000);
         assert!(config.memory_dir().is_none());
         assert_eq!(config.session_history_turns(), 3);
+        assert_eq!(config.persistence_drain_timeout_ms(), 2000);
     }
 
     #[test]
@@ -1304,5 +1325,50 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.session_history_turns(), 3);
+    }
+
+    // ========================================================================
+    // Persistence Drain Timeout Tests
+    // ========================================================================
+
+    #[test]
+    fn test_persistence_drain_timeout_default() {
+        let config = OrchestrationConfig::default();
+        assert_eq!(config.persistence_drain_timeout_ms(), 2000);
+    }
+
+    #[test]
+    fn test_persistence_drain_timeout_in_artifacts_sub_table() {
+        let toml = r#"
+            enabled = true
+
+            [artifacts]
+            persistence_drain_timeout_ms = 5000
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.persistence_drain_timeout_ms(), 5000);
+    }
+
+    #[test]
+    fn test_persistence_drain_timeout_flat_backward_compat() {
+        let toml = r#"
+            enabled = true
+            persistence_drain_timeout_ms = 500
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.persistence_drain_timeout_ms(), 500);
+    }
+
+    #[test]
+    fn test_persistence_drain_timeout_flat_overrides_sub_table() {
+        let toml = r#"
+            enabled = true
+            persistence_drain_timeout_ms = 3000
+
+            [artifacts]
+            persistence_drain_timeout_ms = 1000
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.persistence_drain_timeout_ms(), 3000);
     }
 }

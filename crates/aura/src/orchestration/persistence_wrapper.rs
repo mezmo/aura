@@ -15,8 +15,9 @@
 use async_trait::async_trait;
 use rig::tool::ToolError;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolCallRecord};
 use crate::mcp_response::CallOutcome;
@@ -26,6 +27,21 @@ use crate::tool_wrapper::{
 
 /// The namespaced field name for reasoning (signals framework/internal field).
 const REASONING_FIELD: &str = "_aura_reasoning";
+
+/// RAII guard that decrements the in-flight counter and notifies drain waiters
+/// on drop. Guarantees the counter is decremented even on early returns or
+/// panics inside `on_complete`.
+struct DrainGuard {
+    counter: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+        self.notify.notify_one();
+    }
+}
 
 /// Tool wrapper that captures reasoning and persists execution details.
 ///
@@ -39,11 +55,23 @@ const REASONING_FIELD: &str = "_aura_reasoning";
 pub struct PersistenceWrapper {
     /// Shared persistence manager for writing records
     persistence: Arc<Mutex<ExecutionPersistence>>,
+    /// In-flight write counter (shared across all wrappers in an iteration)
+    in_flight: Arc<AtomicUsize>,
+    /// Notification channel for drain waiters
+    drain_notify: Arc<Notify>,
 }
 
 impl PersistenceWrapper {
-    pub fn new(persistence: Arc<Mutex<ExecutionPersistence>>) -> Self {
-        Self { persistence }
+    pub fn new(
+        persistence: Arc<Mutex<ExecutionPersistence>>,
+        in_flight: Arc<AtomicUsize>,
+        drain_notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            persistence,
+            in_flight,
+            drain_notify,
+        }
     }
 }
 
@@ -126,6 +154,12 @@ impl ToolWrapper for PersistenceWrapper {
         result: Result<&str, &str>,
         duration_ms: u64,
     ) {
+        self.in_flight.fetch_add(1, Ordering::Acquire);
+        let _guard = DrainGuard {
+            counter: self.in_flight.clone(),
+            notify: self.drain_notify.clone(),
+        };
+
         // Extract task context (required for persistence)
         let (task_id, attempt) = match (ctx.task_id, ctx.attempt) {
             (Some(tid), Some(att)) => (tid, att),
@@ -233,6 +267,12 @@ pub fn extract_reasoning(mut args: Value) -> (Option<String>, Value) {
 mod tests {
     use crate::WrappedTool;
     use rig::tool::{Tool as RigTool, ToolError};
+
+    fn test_wrapper(persistence: Arc<Mutex<ExecutionPersistence>>) -> PersistenceWrapper {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let drain_notify = Arc::new(Notify::new());
+        PersistenceWrapper::new(persistence, in_flight, drain_notify)
+    }
 
     use super::*;
 
@@ -353,7 +393,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
-        let wrapper = PersistenceWrapper::new(persistence);
+        let wrapper = test_wrapper(persistence);
 
         let args = serde_json::json!({
             "param": "value",
@@ -384,7 +424,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
-        let wrapper = PersistenceWrapper::new(persistence);
+        let wrapper = test_wrapper(persistence);
 
         let schema = serde_json::json!({
             "type": "object",
@@ -470,7 +510,7 @@ mod tests {
         let mock = MockTool::new("test_tool", "response");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(0, initiator.clone(), 1)
@@ -498,7 +538,7 @@ mod tests {
         let mock = MockTool::new("calculator", "42");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(1, initiator.clone(), 1)
@@ -520,7 +560,7 @@ mod tests {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
@@ -543,7 +583,7 @@ mod tests {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
@@ -567,7 +607,7 @@ mod tests {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
@@ -592,7 +632,7 @@ mod tests {
         let mock = MockTool::new("custom_name", "response");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(0, initiator.clone(), 1)
@@ -600,5 +640,65 @@ mod tests {
         };
 
         assert_eq!(wrapped.name(), "custom_name");
+    }
+
+    #[test]
+    fn test_drain_guard_decrements_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+
+        counter.fetch_add(1, Ordering::Release);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+
+        {
+            let _guard = DrainGuard {
+                counter: counter.clone(),
+                notify: notify.clone(),
+            };
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_drain_guard_decrements_on_early_return() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+
+        counter.fetch_add(1, Ordering::Release);
+
+        let do_work = || -> Option<()> {
+            let _guard = DrainGuard {
+                counter: counter.clone(),
+                notify: notify.clone(),
+            };
+            // Simulate early return before any work
+            None?;
+            Some(())
+        };
+
+        let _ = do_work();
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_increments_and_decrements_in_flight() {
+        let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
+        let (in_flight, drain_notify) = {
+            let p = persistence.lock().await;
+            (p.in_flight_counter(), p.drain_notify())
+        };
+        let wrapper = PersistenceWrapper::new(
+            persistence.clone(),
+            in_flight.clone(),
+            drain_notify,
+        );
+
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+
+        let ctx = ToolCallContext::new("test_tool").with_task_context(0, "worker".to_string(), 1);
+        wrapper.on_complete(&ctx, None, Ok("output"), 100).await;
+
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
     }
 }

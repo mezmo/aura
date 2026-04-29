@@ -492,7 +492,15 @@ impl Orchestrator {
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
 
         // Build tool wrapper: observer + duplicate guard + persistence
-        let persistence_wrapper = Arc::new(PersistenceWrapper::new(self.persistence.clone()));
+        let (in_flight, drain_notify) = {
+            let p = self.persistence.lock().await;
+            (p.in_flight_counter(), p.drain_notify())
+        };
+        let persistence_wrapper = Arc::new(PersistenceWrapper::new(
+            self.persistence.clone(),
+            in_flight,
+            drain_notify,
+        ));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
             self.tool_call_observer.clone(),
             task_id,
@@ -3207,6 +3215,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
+
+        // Drain in-flight persistence writes before reading back artifacts.
+        // Root cause: tool_wrapper.rs fire-and-forget `tokio::spawn` for
+        // on_complete means writes may still be in progress when we reach here.
+        // Clone ExecutionPersistence (cheap: just bumps Arcs) to release the
+        // MutexGuard before entering drain. on_complete tasks hold the original
+        // Arc<Mutex<...>> and need the lock for file I/O.
+        {
+            let drain_timeout = std::time::Duration::from_millis(
+                self.config.persistence_drain_timeout_ms(),
+            );
+            let persistence = self.persistence.lock().await.clone();
+            if !persistence.drain(drain_timeout).await {
+                tracing::warn!("Persistence drain timed out — tool output refs may be incomplete");
+            }
+        }
 
         // Persistence fix: write plan after execute to capture task statuses
         {
