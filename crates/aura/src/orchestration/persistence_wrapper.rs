@@ -18,9 +18,10 @@ use async_trait::async_trait;
 use rig::tool::ToolError;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolCallRecord};
 use crate::mcp_response::CallOutcome;
@@ -35,6 +36,21 @@ const REASONING_FIELD: &str = "_aura_reasoning";
 /// `on_complete` can rendezvous on the same entry in `raw_outputs`.
 const CALL_ID_FIELD: &str = "_persistence_call_id";
 
+/// RAII guard that decrements the in-flight counter and notifies drain waiters
+/// on drop. Guarantees the counter is decremented even on early returns or
+/// panics inside `on_complete`.
+struct DrainGuard {
+    counter: Arc<AtomicUsize>,
+    notify: Arc<Notify>,
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+        self.notify.notify_one();
+    }
+}
+
 /// Tool wrapper that captures reasoning and persists execution details.
 ///
 /// This wrapper:
@@ -44,6 +60,7 @@ const CALL_ID_FIELD: &str = "_persistence_call_id";
 ///    that rewrites the output, e.g. `ScratchpadWrapper`)
 /// 4. Writes the record in `on_complete` using the captured raw output plus
 ///    the `duration_ms` that only the completion hook receives
+/// 5. Promotes qualifying tool outputs to artifact files (size/duration threshold)
 ///
 /// Only used in orchestration mode for worker agents.
 #[derive(Clone)]
@@ -54,14 +71,54 @@ pub struct PersistenceWrapper {
     /// `transform_output` and removed in `on_complete`. Bounded because each
     /// tool call inserts and removes exactly one entry.
     raw_outputs: Arc<StdMutex<HashMap<String, String>>>,
+    /// In-flight write counter (shared across all wrappers in an iteration)
+    in_flight: Arc<AtomicUsize>,
+    /// Notification channel for drain waiters
+    drain_notify: Arc<Notify>,
+    /// Worker name for artifact filenames (None → "default")
+    worker_name: Option<String>,
+    /// Iteration snapshot at wrapper construction time
+    iteration: usize,
+    /// Whether persistence is enabled (snapshotted at construction)
+    persistence_enabled: bool,
+    /// Character threshold for tool output promotion (0 = promote all)
+    size_threshold: usize,
+    /// Duration threshold in ms for tool output promotion (0 = disabled)
+    duration_threshold_ms: u64,
+    /// Per-wrapper call counter for deterministic artifact filenames
+    call_counter: Arc<AtomicUsize>,
+}
+
+/// Construction parameters for `PersistenceWrapper`.
+pub struct PersistenceWrapperParams {
+    pub persistence: Arc<Mutex<ExecutionPersistence>>,
+    pub in_flight: Arc<AtomicUsize>,
+    pub drain_notify: Arc<Notify>,
+    pub worker_name: Option<String>,
+    pub iteration: usize,
+    pub persistence_enabled: bool,
+    pub size_threshold: usize,
+    pub duration_threshold_ms: u64,
 }
 
 impl PersistenceWrapper {
-    pub fn new(persistence: Arc<Mutex<ExecutionPersistence>>) -> Self {
+    pub fn new(params: PersistenceWrapperParams) -> Self {
         Self {
-            persistence,
+            persistence: params.persistence,
             raw_outputs: Arc::new(StdMutex::new(HashMap::new())),
+            in_flight: params.in_flight,
+            drain_notify: params.drain_notify,
+            worker_name: params.worker_name,
+            iteration: params.iteration,
+            persistence_enabled: params.persistence_enabled,
+            size_threshold: params.size_threshold,
+            duration_threshold_ms: params.duration_threshold_ms,
+            call_counter: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn effective_worker_name(&self) -> &str {
+        self.worker_name.as_deref().unwrap_or("default")
     }
 }
 
@@ -74,13 +131,13 @@ impl ToolWrapper for PersistenceWrapper {
 
     fn transform_args(&self, args: Value, _ctx: &ToolCallContext) -> TransformArgsResult {
         let (reasoning, clean_args) = extract_reasoning(args);
-        // A fresh call id per invocation lets `transform_output` and
-        // `on_complete` share state via `raw_outputs` without colliding when
-        // the same tool is invoked multiple times in one attempt.
         let call_id = uuid::Uuid::new_v4().to_string();
+        let call_idx = self.call_counter.fetch_add(1, Ordering::Relaxed);
+
         let extracted = serde_json::json!({
             "reasoning": reasoning.unwrap_or_default(),
             CALL_ID_FIELD: call_id,
+            "call_idx": call_idx
         });
 
         TransformArgsResult {
@@ -118,26 +175,54 @@ impl ToolWrapper for PersistenceWrapper {
         Ok(())
     }
 
-    /// Captures the RAW tool output into `raw_outputs`. Must run BEFORE any
-    /// wrapper that rewrites the output (e.g. `ScratchpadWrapper` replacing a
-    /// large payload with a pointer) so `on_complete` can persist what the
-    /// tool actually produced. The caller orders wrappers so this one runs
-    /// first in reverse-iteration (i.e. PersistenceWrapper is last in the
-    /// ComposedWrapper list).
+    /// Captures the RAW tool output into `raw_outputs` (must run BEFORE any
+    /// wrapper that rewrites the output, e.g. `ScratchpadWrapper`), then
+    /// appends an artifact footer when size-based promotion qualifies.
+    ///
+    /// Suppressed when persistence is disabled (no backing file will exist).
+    /// Duration-based promotion is handled in `on_complete` — those artifacts
+    /// are written for observability but lack an inline footer because the
+    /// output has already been returned to the LLM by that point.
     fn transform_output(
         &self,
         output: String,
         _outcome: &CallOutcome,
-        _ctx: &ToolCallContext,
+        ctx: &ToolCallContext,
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
+        // 1. Cache raw output for persistence (before any footer append)
         if let Some(call_id) = find_field(extracted, CALL_ID_FIELD) {
             self.raw_outputs
                 .lock()
                 .unwrap()
                 .insert(call_id.to_string(), output.clone());
         }
-        TransformOutputResult::new(output)
+
+        // 2. Artifact footer (only if persistence enabled + size qualifies)
+        if !self.persistence_enabled {
+            return TransformOutputResult::new(output);
+        }
+
+        let call_idx = extract_call_idx(extracted);
+        let should_promote = self.size_threshold == 0 || output.len() > self.size_threshold;
+
+        if !should_promote {
+            return TransformOutputResult::new(output);
+        }
+
+        let worker = super::persistence::sanitize_filename_component(self.effective_worker_name());
+        let tool = super::persistence::sanitize_filename_component(&ctx.tool_name);
+        let task_id = ctx.task_id.unwrap_or(0);
+        let filename = format!(
+            "task-{}-{}-iter-{}-{}-{}-output.txt",
+            task_id, worker, self.iteration, tool, call_idx
+        );
+
+        let footer = format!(
+            "\n\n[Tool output saved to artifact: {}]",
+            filename
+        );
+        TransformOutputResult::new(format!("{}{}", output, footer))
     }
 
     async fn on_complete(
@@ -147,6 +232,12 @@ impl ToolWrapper for PersistenceWrapper {
         result: Result<&str, &str>,
         duration_ms: u64,
     ) {
+        self.in_flight.fetch_add(1, Ordering::Acquire);
+        let _guard = DrainGuard {
+            counter: self.in_flight.clone(),
+            notify: self.drain_notify.clone(),
+        };
+
         let (task_id, attempt) = match (ctx.task_id, ctx.attempt) {
             (Some(tid), Some(att)) => (tid, att),
             _ => {
@@ -170,6 +261,54 @@ impl ToolWrapper for PersistenceWrapper {
             Err(e) => (None, Some(e.to_string())),
         };
 
+        // Artifact promotion: use raw output from cache (clean, no footer)
+        let call_idx = extract_call_idx(extracted);
+        let output_text = output.as_deref().unwrap_or("");
+        // Strip any artifact footer appended by transform_output so we write
+        // clean output and compute thresholds on the original size.
+        let output_clean = output_text
+            .rfind("\n\n[Tool output saved to artifact: ")
+            .map(|pos| &output_text[..pos])
+            .unwrap_or(output_text);
+        let should_promote = match (output_clean.len(), self.size_threshold, self.duration_threshold_ms) {
+            (_, 0, _) => true,
+            (len, thresh, _) if len > thresh => true,
+            (_, _, 0) => false,
+            (_, _, thresh) if duration_ms > thresh => true,
+            _ => false,
+        };
+
+        // Single lock acquisition for both artifact write and tool call append
+        let persistence_guard = self.persistence.lock().await;
+
+        // Write artifact file if promoted
+        let artifact_filename = if should_promote && result.is_ok() {
+            match persistence_guard
+                .write_tool_output_artifact(
+                    task_id,
+                    self.effective_worker_name(),
+                    self.iteration,
+                    &ctx.tool_name,
+                    call_idx,
+                    output_clean,
+                )
+                .await
+            {
+                Ok(filename) => Some(filename),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to write tool output artifact for {}: {}",
+                        ctx.tool_name,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Build tool call record (store clean output without footer)
         let record = ToolCallRecord {
             tool: ctx.tool_name.clone(),
             arguments: ctx
@@ -177,12 +316,15 @@ impl ToolWrapper for PersistenceWrapper {
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({})),
             reasoning,
-            output,
+            output: output.map(|o| {
+                o.rfind("\n\n[Tool output saved to artifact: ")
+                    .map(|pos| o[..pos].to_string())
+                    .unwrap_or(o)
+            }),
             error,
             duration_ms,
+            artifact_filename,
         };
-
-        let persistence_guard = self.persistence.lock().await;
         if let Err(e) = persistence_guard
             .append_tool_call(task_id, attempt, &record)
             .await
@@ -236,6 +378,21 @@ pub fn add_reasoning_to_schema(schema: &mut Value) {
     }
 }
 
+/// Extract the call_idx from the extracted metadata (set during transform_args).
+fn extract_call_idx(extracted: Option<&Value>) -> usize {
+    extracted
+        .and_then(|v| {
+            if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .find_map(|item| item.get("call_idx"))
+                    .and_then(|v| v.as_u64())
+            } else {
+                v.get("call_idx").and_then(|v| v.as_u64())
+            }
+        })
+        .unwrap_or(0) as usize
+}
+
 /// Extract reasoning from tool arguments, returning (reasoning, cleaned_args).
 ///
 /// The cleaned args have the `_aura_reasoning` field removed so the inner tool
@@ -255,6 +412,19 @@ pub fn extract_reasoning(mut args: Value) -> (Option<String>, Value) {
 mod tests {
     use crate::WrappedTool;
     use rig::tool::{Tool as RigTool, ToolError};
+
+    fn test_wrapper(persistence: Arc<Mutex<ExecutionPersistence>>) -> PersistenceWrapper {
+        PersistenceWrapper::new(PersistenceWrapperParams {
+            persistence,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
+            worker_name: None,
+            iteration: 1,
+            persistence_enabled: false,
+            size_threshold: 500,
+            duration_threshold_ms: 5000,
+        })
+    }
 
     use super::*;
 
@@ -375,7 +545,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
-        let wrapper = PersistenceWrapper::new(persistence);
+        let wrapper = test_wrapper(persistence);
 
         let args = serde_json::json!({
             "param": "value",
@@ -395,10 +565,11 @@ mod tests {
         );
         assert_eq!(result.args["param"], "value");
 
-        // Extracted should contain reasoning
+        // Extracted should contain reasoning and call_idx
         assert!(result.extracted.is_some());
         let extracted = result.extracted.unwrap();
         assert_eq!(extracted["reasoning"], "test reasoning");
+        assert_eq!(extracted["call_idx"], 0);
     }
 
     #[test]
@@ -406,7 +577,7 @@ mod tests {
         use tokio::sync::Mutex;
 
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
-        let wrapper = PersistenceWrapper::new(persistence);
+        let wrapper = test_wrapper(persistence);
 
         let schema = serde_json::json!({
             "type": "object",
@@ -492,7 +663,7 @@ mod tests {
         let mock = MockTool::new("test_tool", "response");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(0, initiator.clone(), 1)
@@ -520,7 +691,7 @@ mod tests {
         let mock = MockTool::new("calculator", "42");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(1, initiator.clone(), 1)
@@ -542,7 +713,7 @@ mod tests {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
@@ -565,7 +736,7 @@ mod tests {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
@@ -589,7 +760,7 @@ mod tests {
         let mock = MockTool::new("echo", "echoed");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
@@ -614,7 +785,7 @@ mod tests {
         let mock = MockTool::new("custom_name", "response");
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapped = {
-            let wrapper = Arc::new(PersistenceWrapper::new(persistence.clone()));
+            let wrapper = Arc::new(test_wrapper(persistence.clone()));
             let initiator = "initiator".to_string();
             WrappedTool::new(mock, wrapper).with_context_factory(move |tool_name| {
                 ToolCallContext::new(tool_name).with_task_context(0, initiator.clone(), 1)
@@ -629,8 +800,21 @@ mod tests {
     /// raw tool output even when a later wrapper (e.g. scratchpad) rewrites it.
     #[tokio::test]
     async fn test_raw_output_cached_and_retrieved_by_call_id() {
-        let wrapper =
-            PersistenceWrapper::new(Arc::new(Mutex::new(ExecutionPersistence::disabled())));
+        let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
+        let (in_flight, drain_notify) = {
+            let p = persistence.lock().await;
+            (p.in_flight_counter(), p.drain_notify())
+        };
+        let wrapper = PersistenceWrapper::new(PersistenceWrapperParams {
+            persistence,
+            in_flight,
+            drain_notify,
+            worker_name: None,
+            iteration: 1,
+            persistence_enabled: false,
+            size_threshold: 0,
+            duration_threshold_ms: 0,
+        });
 
         let ctx = ToolCallContext::new("tool").with_task_context(1, "w".into(), 0);
         let TransformArgsResult { extracted, .. } =
@@ -694,9 +878,21 @@ mod tests {
             budget,
         ));
 
-        let persistence = Arc::new(PersistenceWrapper::new(Arc::new(Mutex::new(
-            ExecutionPersistence::disabled(),
-        ))));
+        let persistence_inner = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
+        let (in_flight, drain_notify) = {
+            let p = persistence_inner.lock().await;
+            (p.in_flight_counter(), p.drain_notify())
+        };
+        let persistence = Arc::new(PersistenceWrapper::new(PersistenceWrapperParams {
+            persistence: persistence_inner,
+            in_flight,
+            drain_notify,
+            worker_name: None,
+            iteration: 1,
+            persistence_enabled: false,
+            size_threshold: 0,
+            duration_threshold_ms: 0,
+        }));
         let persistence_dyn: Arc<dyn ToolWrapper> = persistence.clone();
 
         // Same ordering as `orchestrator.rs::create_worker`: scratchpad
@@ -733,6 +929,350 @@ mod tests {
             cached.as_deref(),
             Some(raw.as_str()),
             "persistence must cache the RAW payload, not the scratchpad pointer"
+        );
+    }
+
+    #[test]
+    fn test_drain_guard_decrements_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+
+        counter.fetch_add(1, Ordering::Release);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+
+        {
+            let _guard = DrainGuard {
+                counter: counter.clone(),
+                notify: notify.clone(),
+            };
+            assert_eq!(counter.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_drain_guard_decrements_on_early_return() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+
+        counter.fetch_add(1, Ordering::Release);
+
+        let do_work = || -> Option<()> {
+            let _guard = DrainGuard {
+                counter: counter.clone(),
+                notify: notify.clone(),
+            };
+            // Simulate early return before any work
+            None?;
+            Some(())
+        };
+
+        let _ = do_work();
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_increments_and_decrements_in_flight() {
+        let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
+        let (in_flight, drain_notify) = {
+            let p = persistence.lock().await;
+            (p.in_flight_counter(), p.drain_notify())
+        };
+        let wrapper = PersistenceWrapper::new(PersistenceWrapperParams {
+            persistence: persistence.clone(),
+            in_flight: in_flight.clone(),
+            drain_notify,
+            worker_name: None,
+            iteration: 1,
+            persistence_enabled: false,
+            size_threshold: 500,
+            duration_threshold_ms: 5000,
+        });
+
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+
+        let ctx = ToolCallContext::new("test_tool").with_task_context(0, "worker".to_string(), 1);
+        wrapper.on_complete(&ctx, None, Ok("output"), 100).await;
+
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    }
+
+    // ========================================================================
+    // Tool Output Promotion Tests
+    // ========================================================================
+
+    fn promotion_wrapper(
+        worker_name: Option<String>,
+        iteration: usize,
+        persistence_enabled: bool,
+        size_threshold: usize,
+        duration_threshold_ms: u64,
+    ) -> PersistenceWrapper {
+        PersistenceWrapper::new(PersistenceWrapperParams {
+            persistence: Arc::new(Mutex::new(ExecutionPersistence::disabled())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
+            worker_name,
+            iteration,
+            persistence_enabled,
+            size_threshold,
+            duration_threshold_ms,
+        })
+    }
+
+    async fn enabled_wrapper(
+        persistence: Arc<Mutex<ExecutionPersistence>>,
+        worker_name: Option<String>,
+        size_threshold: usize,
+        duration_threshold_ms: u64,
+    ) -> PersistenceWrapper {
+        let (in_flight, drain_notify) = {
+            let p = persistence.lock().await;
+            (p.in_flight_counter(), p.drain_notify())
+        };
+        PersistenceWrapper::new(PersistenceWrapperParams {
+            persistence,
+            in_flight,
+            drain_notify,
+            worker_name,
+            iteration: 1,
+            persistence_enabled: true,
+            size_threshold,
+            duration_threshold_ms,
+        })
+    }
+
+    #[test]
+    fn test_transform_output_appends_footer_when_size_exceeded() {
+        let wrapper = promotion_wrapper(Some("sre".to_string()), 2, true, 10, 5000);
+
+        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
+        let outcome = CallOutcome::Success(String::new());
+        let long_output = "x".repeat(20);
+
+        let result = wrapper.transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted));
+        assert!(result.output.contains("[Tool output saved to artifact: task-0-sre-iter-2-log-search-0-output.txt]"));
+        assert!(result.output.starts_with(&long_output));
+    }
+
+    #[test]
+    fn test_transform_output_no_footer_when_below_threshold() {
+        let wrapper = promotion_wrapper(Some("sre".to_string()), 1, true, 500, 5000);
+
+        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
+        let outcome = CallOutcome::Success(String::new());
+
+        let result = wrapper.transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted));
+        assert_eq!(result.output, "short output");
+        assert!(!result.output.contains("[Tool output saved to artifact"));
+    }
+
+    #[test]
+    fn test_transform_output_promotes_all_when_size_zero() {
+        let wrapper = promotion_wrapper(None, 1, true, 0, 5000);
+
+        let ctx = ToolCallContext::new("my_tool").with_task_context(3, "w".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
+        let outcome = CallOutcome::Success(String::new());
+
+        let result = wrapper.transform_output("tiny".to_string(), &outcome, &ctx, Some(&extracted));
+        assert!(result.output.contains("[Tool output saved to artifact: task-3-default-iter-1-my-tool-0-output.txt]"));
+    }
+
+    #[test]
+    fn test_call_counter_increments_across_calls() {
+        let wrapper = promotion_wrapper(Some("worker".to_string()), 1, false, 0, 5000);
+
+        let ctx = ToolCallContext::new("tool_a").with_task_context(0, "worker".to_string(), 1);
+
+        let result1 = wrapper.transform_args(serde_json::json!({"key": "val"}), &ctx);
+        assert_eq!(result1.extracted.as_ref().unwrap()["call_idx"], 0);
+
+        let result2 = wrapper.transform_args(serde_json::json!({"key": "val2"}), &ctx);
+        assert_eq!(result2.extracted.as_ref().unwrap()["call_idx"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_writes_artifact_when_size_exceeded() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("research".to_string()), 10, 5000).await;
+
+        let ctx = ToolCallContext::new("kb_search").with_task_context(0, "research".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+        let long_output = "x".repeat(50);
+
+        wrapper.on_complete(&ctx, Some(&extracted), Ok(&long_output), 100).await;
+
+        let p = persistence.lock().await;
+        let artifacts = p.list_artifacts().await.unwrap();
+        assert!(artifacts.contains(&"task-0-research-iter-1-kb-search-0-output.txt".to_string()));
+
+        let content = p.read_artifact("task-0-research-iter-1-kb-search-0-output.txt").await.unwrap();
+        assert_eq!(content.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_writes_artifact_when_duration_exceeded() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("sre".to_string()), 500, 100).await;
+
+        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+
+        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 200).await;
+
+        let p = persistence.lock().await;
+        let artifacts = p.list_artifacts().await.unwrap();
+        assert!(artifacts.contains(&"task-0-sre-iter-1-log-search-0-output.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_no_artifact_when_below_thresholds() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
+
+        let ctx = ToolCallContext::new("simple_tool").with_task_context(0, "worker".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+
+        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 100).await;
+
+        let p = persistence.lock().await;
+        let artifacts = p.list_artifacts().await.unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_no_artifact_when_duration_disabled() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 0).await;
+
+        let ctx = ToolCallContext::new("slow_tool").with_task_context(0, "worker".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+
+        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 999999).await;
+
+        let p = persistence.lock().await;
+        let artifacts = p.list_artifacts().await.unwrap();
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn test_extract_call_idx_from_direct_object() {
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 5});
+        assert_eq!(extract_call_idx(Some(&extracted)), 5);
+    }
+
+    #[test]
+    fn test_extract_call_idx_from_composed_array() {
+        let extracted = serde_json::json!([
+            {"observer": true},
+            {"reasoning": "test", "call_idx": 3}
+        ]);
+        assert_eq!(extract_call_idx(Some(&extracted)), 3);
+    }
+
+    #[test]
+    fn test_extract_call_idx_missing() {
+        assert_eq!(extract_call_idx(None), 0);
+        assert_eq!(extract_call_idx(Some(&serde_json::json!({}))), 0);
+    }
+
+    #[test]
+    fn test_tool_output_artifact_filename_sanitization() {
+        let wrapper = promotion_wrapper(Some("SRE/Ops Worker".to_string()), 1, true, 0, 5000);
+
+        let ctx = ToolCallContext::new("my_search tool").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
+        let outcome = CallOutcome::Success(String::new());
+
+        let result = wrapper.transform_output("output".to_string(), &outcome, &ctx, Some(&extracted));
+        assert!(result.output.contains("task-0-sre-ops-worker-iter-1-my-search-tool-0-output.txt"));
+    }
+
+    #[test]
+    fn test_transform_output_no_footer_when_persistence_disabled() {
+        let wrapper = promotion_wrapper(Some("sre".to_string()), 1, false, 0, 5000);
+
+        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
+        let outcome = CallOutcome::Success(String::new());
+
+        let result = wrapper.transform_output("big output here".to_string(), &outcome, &ctx, Some(&extracted));
+        assert_eq!(result.output, "big output here");
+        assert!(!result.output.contains("[Tool output saved to artifact"));
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_artifact_filename_none_when_not_promoted() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
+
+        let ctx = ToolCallContext::new("simple_tool").with_task_context(0, "worker".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+
+        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 100).await;
+
+        let p = persistence.lock().await;
+        let iter_path = p.run_path().join("iteration-1");
+        let tool_calls_path = iter_path.join("task-0.attempt-1.tool-calls.json");
+        let content = tokio::fs::read_to_string(&tool_calls_path).await.unwrap();
+        let records: Vec<ToolCallRecord> = serde_json::from_str(&content).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].artifact_filename.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_on_complete_artifact_filename_set_when_promoted() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("sre".to_string()), 10, 5000).await;
+
+        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+        let long_output = "x".repeat(50);
+
+        wrapper.on_complete(&ctx, Some(&extracted), Ok(&long_output), 100).await;
+
+        let p = persistence.lock().await;
+        let iter_path = p.run_path().join("iteration-1");
+        let tool_calls_path = iter_path.join("task-0.attempt-1.tool-calls.json");
+        let content = tokio::fs::read_to_string(&tool_calls_path).await.unwrap();
+        let records: Vec<ToolCallRecord> = serde_json::from_str(&content).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].artifact_filename.as_deref(),
+            Some("task-0-sre-iter-1-log-search-0-output.txt")
         );
     }
 }
