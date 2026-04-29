@@ -693,7 +693,7 @@ impl IterationContext {
     /// Per-task completed results are included inline, truncated to 500 bytes
     /// so the coordinator can route with full context. When a completed result
     /// was spilled to an artifact, the
-    /// `[Full result (N chars) saved to artifact: task-N-result.txt]` footer
+    /// `[Full result (N chars) saved to artifact: task-N-worker-iter-M-result.txt]` footer
     /// is re-appended after truncation so the coordinator can discover the
     /// artifact via `read_artifact`.
     pub fn build_continuation_prompt(&self, max_iterations: usize) -> String {
@@ -1284,8 +1284,9 @@ mod tests {
         let mut task = Task::new(0, "Big result", "Produce output");
         // 600 'x' chars + the artifact footer (past 500-byte budget)
         let body = "x".repeat(600);
-        let long_result =
-            format!("{body}\n\n[Full result (12345 chars) saved to artifact: task-0-result.txt]");
+        let long_result = format!(
+            "{body}\n\n[Full result (12345 chars) saved to artifact: task-0-sre-iter-1-result.txt]"
+        );
         task.complete(long_result);
         plan.add_task(task);
 
@@ -1294,7 +1295,7 @@ mod tests {
 
         // The body is truncated but the artifact footer survives.
         assert!(prompt.contains("COMPLETED TASKS"));
-        assert!(prompt.contains("saved to artifact: task-0-result.txt"));
+        assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
         assert!(prompt.contains("12345 chars"));
     }
 

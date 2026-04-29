@@ -13,7 +13,7 @@
 //! └── {run_id}/
 //!     ├── manifest.json                # Typed run manifest (RunManifest)
 //!     ├── artifacts/                   # Run-level result artifacts
-//!     │   └── task-0-result.txt
+//!     │   └── task-0-default-iter-1-result.txt
 //!     └── iteration-{n}/              # One flat dir per iteration
 //!         ├── plan.json
 //!         ├── ...
@@ -36,6 +36,33 @@ use tokio::fs;
 
 use super::events::RoutingMode;
 use super::types::{Plan, TaskStatus};
+
+// ============================================================================
+// Filename Helpers
+// ============================================================================
+
+/// Sanitize a string for use as a filename component.
+///
+/// Lowercases, replaces non-alphanumeric characters with `-`, collapses
+/// consecutive `-`, and trims leading/trailing `-`. Returns `"unknown"` for
+/// empty input. Used for worker names and tool names in artifact filenames.
+pub fn sanitize_filename_component(s: &str) -> String {
+    let s = s.to_lowercase();
+    let sanitized: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let collapsed = sanitized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "unknown".to_string()
+    } else {
+        collapsed
+    }
+}
 
 // ============================================================================
 // Run Manifest Types
@@ -340,7 +367,15 @@ impl ExecutionPersistence {
     /// Write a large result to an artifact file.
     ///
     /// Returns the artifact filename (not the full path) for reference in summaries.
-    pub async fn write_result_artifact(&self, task_id: usize, result: &str) -> io::Result<String> {
+    /// Filenames are iteration-namespaced to avoid collisions across replans:
+    /// `task-{id}-{worker}-iter-{n}-result.txt`
+    pub async fn write_result_artifact(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        iteration: usize,
+        result: &str,
+    ) -> io::Result<String> {
         if !self.enabled {
             return Ok(String::new());
         }
@@ -348,7 +383,8 @@ impl ExecutionPersistence {
         let artifacts_dir = self.artifacts_path();
         fs::create_dir_all(&artifacts_dir).await?;
 
-        let filename = format!("task-{}-result.txt", task_id);
+        let worker = sanitize_filename_component(worker_name.unwrap_or("default"));
+        let filename = format!("task-{}-{}-iter-{}-result.txt", task_id, worker, iteration);
         let artifact_path = artifacts_dir.join(&filename);
         fs::write(&artifact_path, result).await?;
 
@@ -654,10 +690,10 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_result_artifact(0, "full result content")
+            .write_result_artifact(0, Some("research"), 1, "full result content")
             .await
             .unwrap();
-        assert_eq!(filename, "task-0-result.txt");
+        assert_eq!(filename, "task-0-research-iter-1-result.txt");
 
         let content = persistence.read_artifact(&filename).await.unwrap();
         assert_eq!(content, "full result content");
@@ -676,18 +712,18 @@ mod tests {
 
         // Write two artifacts
         persistence
-            .write_result_artifact(0, "result 0")
+            .write_result_artifact(0, None, 1, "result 0")
             .await
             .unwrap();
         persistence
-            .write_result_artifact(1, "result 1")
+            .write_result_artifact(1, Some("stats"), 1, "result 1")
             .await
             .unwrap();
 
         let artifacts = persistence.list_artifacts().await.unwrap();
         assert_eq!(artifacts.len(), 2);
-        assert!(artifacts.contains(&"task-0-result.txt".to_string()));
-        assert!(artifacts.contains(&"task-1-result.txt".to_string()));
+        assert!(artifacts.contains(&"task-0-default-iter-1-result.txt".to_string()));
+        assert!(artifacts.contains(&"task-1-stats-iter-1-result.txt".to_string()));
     }
 
     #[tokio::test]
@@ -723,13 +759,15 @@ mod tests {
 
         // Write returns empty string
         let filename = persistence
-            .write_result_artifact(0, "content")
+            .write_result_artifact(0, None, 1, "content")
             .await
             .unwrap();
         assert!(filename.is_empty());
 
         // Read fails
-        let result = persistence.read_artifact("task-0-result.txt").await;
+        let result = persistence
+            .read_artifact("task-0-default-iter-1-result.txt")
+            .await;
         assert!(result.is_err());
 
         // List returns empty
@@ -819,7 +857,7 @@ mod tests {
                     result_preview: None,
                 },
             ],
-            artifact_paths: vec!["task-0-result.txt".to_string()],
+            artifact_paths: vec!["task-0-research-iter-1-result.txt".to_string()],
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -832,7 +870,10 @@ mod tests {
         assert_eq!(deserialized.task_summaries.len(), 2);
         assert_eq!(deserialized.task_summaries[0].status, TaskStatus::Complete);
         assert_eq!(deserialized.task_summaries[1].status, TaskStatus::Failed);
-        assert_eq!(deserialized.artifact_paths, vec!["task-0-result.txt"]);
+        assert_eq!(
+            deserialized.artifact_paths,
+            vec!["task-0-research-iter-1-result.txt"]
+        );
     }
 
     #[tokio::test]
@@ -1124,5 +1165,72 @@ mod tests {
 
         assert!(result.contains("Failed"));
         assert!(result.contains("FAILED: \"Connection refused\""));
+    }
+
+    // ========================================================================
+    // Filename Sanitization Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sanitize_filename_component_normal() {
+        assert_eq!(sanitize_filename_component("research"), "research");
+        assert_eq!(sanitize_filename_component("sre"), "sre");
+    }
+
+    #[test]
+    fn test_sanitize_filename_component_special_chars() {
+        assert_eq!(sanitize_filename_component("my worker"), "my-worker");
+        assert_eq!(sanitize_filename_component("sre/ops"), "sre-ops");
+        assert_eq!(sanitize_filename_component("a..b"), "a-b");
+        assert_eq!(sanitize_filename_component("UPPER_case"), "upper-case");
+    }
+
+    #[test]
+    fn test_sanitize_filename_component_empty() {
+        assert_eq!(sanitize_filename_component(""), "unknown");
+        assert_eq!(sanitize_filename_component("///"), "unknown");
+        assert_eq!(sanitize_filename_component("..."), "unknown");
+    }
+
+    #[test]
+    fn test_sanitize_filename_component_collapse() {
+        assert_eq!(sanitize_filename_component("a---b"), "a-b");
+        assert_eq!(sanitize_filename_component("--leading"), "leading");
+        assert_eq!(sanitize_filename_component("trailing--"), "trailing");
+    }
+
+    // ========================================================================
+    // Namespaced Artifact Filename Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_artifact_filename_includes_worker_and_iteration() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_result_artifact(0, Some("sre"), 2, "content")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-0-sre-iter-2-result.txt");
+
+        let content = persistence.read_artifact(&filename).await.unwrap();
+        assert_eq!(content, "content");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_filename_default_worker() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_result_artifact(3, None, 1, "content")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-3-default-iter-1-result.txt");
     }
 }

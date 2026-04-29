@@ -2408,7 +2408,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             {
                 match result {
                     Ok(result_str) => {
-                        let final_result = self.maybe_create_artifact(task_id, result_str).await;
+                        let final_result = self
+                            .maybe_create_artifact(task_id, worker_name.as_deref(), result_str)
+                            .await;
                         let result_for_event = final_result.clone();
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.complete(final_result);
@@ -2497,7 +2499,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// If result exceeds artifact threshold, write full result to artifact file
     /// and return a summary. Otherwise return the original result unchanged.
-    async fn maybe_create_artifact(&self, task_id: usize, result: String) -> String {
+    async fn maybe_create_artifact(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        result: String,
+    ) -> String {
         let threshold = self.config.result_artifact_threshold();
         if result.len() <= threshold {
             return result;
@@ -2505,8 +2512,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let summary_len = self.config.result_summary_length();
         let persistence = self.persistence.lock().await;
+        let iteration = persistence.current_iteration();
 
-        match persistence.write_result_artifact(task_id, &result).await {
+        match persistence
+            .write_result_artifact(task_id, worker_name, iteration, &result)
+            .await
+        {
             Ok(filename) => {
                 let (truncated, _) = safe_truncate(&result, summary_len);
                 format!(
@@ -2693,7 +2704,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // dependents are blocked in the DAG.
         let result: Result<String, StreamError> = match result {
             Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
-                let processed = self.maybe_create_artifact(task_id, worker_output).await;
+                let processed = self
+                    .maybe_create_artifact(task_id, *worker_name, worker_output)
+                    .await;
                 Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
             }
             other => other,
@@ -4629,15 +4642,18 @@ mod tests {
         let large_result = "x".repeat(5000);
         {
             let p = persistence.lock().await;
-            let filename = p.write_result_artifact(0, &large_result).await.unwrap();
-            assert_eq!(filename, "task-0-result.txt");
+            let filename = p
+                .write_result_artifact(0, Some("research"), 1, &large_result)
+                .await
+                .unwrap();
+            assert_eq!(filename, "task-0-research-iter-1-result.txt");
         }
 
         // Verify ReadArtifactTool can retrieve it
         let tool = ReadArtifactTool::new(persistence.clone());
         let output = tool
             .call(super::super::tools::read_artifact::ReadArtifactArgs {
-                filename: "task-0-result.txt".to_string(),
+                filename: "task-0-research-iter-1-result.txt".to_string(),
             })
             .await
             .unwrap();
@@ -4680,20 +4696,32 @@ mod tests {
         // Write artifacts for multiple tasks
         {
             let p = persistence.lock().await;
-            p.write_result_artifact(0, "result 0").await.unwrap();
-            p.write_result_artifact(1, "result 1").await.unwrap();
-            p.write_result_artifact(2, "result 2").await.unwrap();
+            p.write_result_artifact(0, None, 1, "result 0")
+                .await
+                .unwrap();
+            p.write_result_artifact(1, Some("stats"), 1, "result 1")
+                .await
+                .unwrap();
+            p.write_result_artifact(2, Some("math"), 1, "result 2")
+                .await
+                .unwrap();
 
             let artifacts = p.list_artifacts().await.unwrap();
             assert_eq!(artifacts.len(), 3);
         }
 
+        let expected_names = [
+            "task-0-default-iter-1-result.txt",
+            "task-1-stats-iter-1-result.txt",
+            "task-2-math-iter-1-result.txt",
+        ];
+
         // Verify each can be read back
         let tool = ReadArtifactTool::new(persistence);
-        for i in 0..3 {
+        for (i, name) in expected_names.iter().enumerate() {
             let output = tool
                 .call(super::super::tools::read_artifact::ReadArtifactArgs {
-                    filename: format!("task-{}-result.txt", i),
+                    filename: name.to_string(),
                 })
                 .await
                 .unwrap();
