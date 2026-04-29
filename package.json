@@ -1,0 +1,36 @@
+{
+  "name": "@mezmoinc/aura",
+  "version": "1.19.1",
+  "private": true,
+  "description": "A production-ready framework for declaratively composing AI agents.",
+  "keywords": [
+    "aura",
+    "mezmo",
+    "telemetry",
+    "SRE",
+    "artificial",
+    "intelligence",
+    "AI"
+  ],
+  "homepage": "https://github.com/mezmo/aura#readme",
+  "bugs": {
+    "url": "https://github.com/mezmo/aura/issues"
+  },
+  "scripts": {
+    "commitlint": "commitlint-mzm"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/mezmo/aura.git"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "commonjs",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples"
+  },
+  "devDependencies": {
+    "@mezmoinc/commitlint-config": "^1.0.0"
+  }
+}
