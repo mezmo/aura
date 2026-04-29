@@ -17,6 +17,10 @@ pipeline {
     string(name: 'SANITY_BUILD', defaultValue: '', description: 'This a scheduled sanity build that skips releasing.')
   }
 
+  tools {
+    nodejs 'NodeJS 24'
+  }
+
   triggers {
     issueCommentTrigger(TRIGGER_PATTERN)
   }
@@ -28,18 +32,14 @@ pipeline {
   }
 
   environment {
-    GITHUB_TOKEN = credentials('github-api-token')
-    NPM_CONFIG_CACHE = '.npm'
-    NPM_CONFIG_USERCONFIG = '.npm/rc'
-    SPAWN_WRAP_SHIM_ROOT = '.npm'
     RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
     CARGO_HOME = "${env.WORKSPACE}/.cargo"
+    FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
     PATH = """${sh(
        returnStdout: true,
        script: 'echo /opt/rust/cargo/bin:\$PATH'
     )}
     """
-    FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
   }
 
   post {
@@ -73,16 +73,17 @@ pipeline {
         error("A maintainer needs to approve this PR for CI by commenting")
       }
     }
-    stage('Validate') {
-      tools {
-        nodejs 'NodeJS 20'
-      }
 
-      steps {
-        script {
-          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-          npm.auth token: GITHUB_TOKEN
-          sh "npx @answerbook/commitlint-config-logdna"
+    stage('Setup') {
+      sh 'npm install'
+    }
+
+    stage('Validate') {
+      stages {
+        stage("commitlint") {
+          steps {
+            sh "npm run commitlint"
+          }
         }
       }
     }
@@ -229,6 +230,13 @@ pipeline {
     }
 
     stage('Release') {
+      environment {
+        GITHUB_TOKEN = credentials('github-api-token')
+        NPM_CONFIG_CACHE = '.npm'
+        NPM_CONFIG_USERCONFIG = '.npm/rc'
+        SPAWN_WRAP_SHIM_ROOT = '.npm'
+      }
+
       when {
         beforeAgent true
         branch DEFAULT_BRANCH
