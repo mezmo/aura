@@ -25,7 +25,7 @@ impl ReadArtifactTool {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ReadArtifactArgs {
-    /// The artifact filename to read (e.g. "task-0-result.txt").
+    /// The artifact filename to read (e.g. "task-0-sre-iter-1-result.txt").
     pub filename: String,
 }
 
@@ -62,7 +62,7 @@ impl Tool for ReadArtifactTool {
                 "properties": {
                     "filename": {
                         "type": "string",
-                        "description": "The artifact filename (e.g. 'task-0-result.txt')"
+                        "description": "The artifact filename (e.g. 'task-0-sre-iter-1-result.txt')"
                     }
                 },
                 "required": ["filename"]
@@ -105,7 +105,7 @@ mod tests {
         // Write a test artifact
         {
             let p = persistence.lock().await;
-            p.write_result_artifact(0, "full result content here")
+            p.write_result_artifact(0, Some("research"), 1, "full result content here")
                 .await
                 .unwrap();
         }
@@ -118,13 +118,13 @@ mod tests {
         let (tool, _dir) = setup_tool().await;
         let result = tool
             .call(ReadArtifactArgs {
-                filename: "task-0-result.txt".to_string(),
+                filename: "task-0-research-iter-1-result.txt".to_string(),
             })
             .await
             .unwrap();
 
         assert!(result.found);
-        assert_eq!(result.filename, "task-0-result.txt");
+        assert_eq!(result.filename, "task-0-research-iter-1-result.txt");
         assert_eq!(result.content, "full result content here");
     }
 
@@ -133,7 +133,7 @@ mod tests {
         let (tool, _dir) = setup_tool().await;
         let result = tool
             .call(ReadArtifactArgs {
-                filename: "task-99-result.txt".to_string(),
+                filename: "task-99-default-iter-1-result.txt".to_string(),
             })
             .await
             .unwrap();

@@ -9,6 +9,7 @@ mod inspect_tool_params;
 mod list_tools;
 pub(crate) mod read_artifact;
 pub mod routing_tools;
+pub mod submit_result;
 
 pub use get_conversation_context::GetConversationContextTool;
 pub use inspect_tool_params::InspectToolParamsTool;
@@ -17,3 +18,4 @@ pub use read_artifact::ReadArtifactTool;
 pub use routing_tools::{
     CreatePlanTool, RequestClarificationTool, RespondDirectlyTool, RoutingDecision, RoutingToolSet,
 };
+pub use submit_result::{Confidence, SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
