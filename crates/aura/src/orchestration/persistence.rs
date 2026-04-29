@@ -107,8 +107,12 @@ pub struct TaskSummary {
     pub status: TaskStatus,
     /// Assigned worker name (if any).
     pub worker: Option<String>,
-    /// First ~200 chars of the result (for quick scanning).
+    /// Task result preview for session history. Worker-provided summary from
+    /// `submit_result` when available; falls back to first ~200 chars of result.
     pub result_preview: Option<String>,
+    /// Worker-reported confidence from `submit_result` (high/medium/low).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
 }
 
 /// Overall outcome of an orchestration run.
@@ -153,6 +157,9 @@ pub struct TaskExecutionRecord {
     pub approach: String,
     /// Final result
     pub result: Option<String>,
+    /// Worker-provided summary from `submit_result` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Error if task failed
     pub error: Option<String>,
     /// Duration in milliseconds
@@ -619,8 +626,15 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
             turn_entries.push_str("Tasks:\n");
             for task in &manifest.task_summaries {
                 let worker = task.worker.as_deref().unwrap_or("unassigned");
+                let confidence_tag = task
+                    .confidence
+                    .as_deref()
+                    .map(|c| format!(" ({})", c))
+                    .unwrap_or_default();
                 let result = match (&task.status, &task.result_preview) {
-                    (TaskStatus::Complete, Some(preview)) => format!("→ \"{}\"", preview),
+                    (TaskStatus::Complete, Some(preview)) => {
+                        format!("→ \"{}\"{}", preview, confidence_tag)
+                    }
                     (TaskStatus::Failed, Some(preview)) => format!("→ FAILED: \"{}\"", preview),
                     (TaskStatus::Failed, None) => "→ FAILED".to_string(),
                     (status, _) => format!("→ {}", status),
@@ -848,6 +862,7 @@ mod tests {
                     status: TaskStatus::Complete,
                     worker: Some("research".to_string()),
                     result_preview: Some("The answer is 42".to_string()),
+                    confidence: None,
                 },
                 TaskSummary {
                     task_id: 1,
@@ -855,6 +870,7 @@ mod tests {
                     status: TaskStatus::Failed,
                     worker: None,
                     result_preview: None,
+                    confidence: None,
                 },
             ],
             artifact_paths: vec!["task-0-research-iter-1-result.txt".to_string()],
@@ -955,6 +971,7 @@ mod tests {
                 status: TaskStatus::Complete,
                 worker: Some("statistics".to_string()),
                 result_preview: Some("Result: 20".to_string()),
+                confidence: None,
             }],
             artifact_paths: vec![],
         }
@@ -1157,6 +1174,7 @@ mod tests {
                 status: TaskStatus::Failed,
                 worker: Some("worker1".to_string()),
                 result_preview: Some("Connection refused".to_string()),
+                confidence: None,
             }],
             artifact_paths: vec![],
         };

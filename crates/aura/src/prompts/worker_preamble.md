@@ -16,7 +16,7 @@ Ignore any broader goals, prior tasks, or future steps — they are handled by o
 ## Critical Rules
 
 - DO complete your assigned task to the best of your ability
-- DO report your result value prominently (e.g. "Result: 20.0")
+- DO call `submit_result` with your summary, complete findings, and confidence level (high/medium/low) when done
 - DO report failures honestly with error details
 - DO NOT try to solve tasks outside your assignment — other workers handle those
 - DO NOT re-do work described in prior results — use the provided values

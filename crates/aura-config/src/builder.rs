@@ -161,6 +161,7 @@ impl RigBuilder {
             mcp_filter: None,
             orchestration_persistence: None,
             orchestration_chat_history: None,
+            orchestration_submit_result: None,
             session_id: None,
         })
     }

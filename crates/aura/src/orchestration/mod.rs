@@ -71,8 +71,10 @@ pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;
 pub use tools::GetConversationContextTool;
 pub use tools::ReadArtifactTool;
+pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub use prompt_constants::{context, fields, sections};
 pub use types::{
-    Plan, PlanAttemptFailure, PlanningResponse, StepInput, Task, TaskJson, TaskStatus,
+    Plan, PlanAttemptFailure, PlanningResponse, StepInput, StructuredTaskOutput, Task, TaskJson,
+    TaskStatus,
 };

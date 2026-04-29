@@ -569,6 +569,12 @@ impl Agent {
             builder_state = builder_state.add_tool(read_artifact);
         }
 
+        // Add submit_result tool when orchestration submit decision is available
+        if let Some(ref decision) = config.orchestration_submit_result {
+            let submit_tool = crate::orchestration::SubmitResultTool::new(decision.clone());
+            builder_state = builder_state.add_tool(submit_tool);
+        }
+
         // Add get_conversation_context tool when chat history is available
         if let Some(ref history) = config.orchestration_chat_history {
             let context_tool =

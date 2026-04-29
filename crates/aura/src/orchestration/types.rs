@@ -295,6 +295,18 @@ pub struct Task {
     /// in the previous iteration's plan (set by `apply_result_reuse()`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse_result_from: Option<usize>,
+    /// Structured output from `submit_result` tool. When present, `summary`
+    /// is used as the inline preview in continuation prompts and manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<StructuredTaskOutput>,
+}
+
+/// Structured metadata from `submit_result`, collapsed into a single optional
+/// to eliminate invalid states (e.g., confidence without summary).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredTaskOutput {
+    pub summary: String,
+    pub confidence: super::tools::submit_result::Confidence,
 }
 
 impl Task {
@@ -310,6 +322,7 @@ impl Task {
             worker: None,
             rationale: rationale.into(),
             reuse_result_from: None,
+            structured_output: None,
         }
     }
 
@@ -709,9 +722,24 @@ impl IterationContext {
             match t.status {
                 TaskStatus::Complete => {
                     let result = t.result.as_deref().unwrap_or("(no result)");
-                    let detail = preserve_artifact_footer(result, 500);
-                    completed_lines
-                        .push(format!("- Task {}: {} → {}", t.id, t.description, detail));
+                    if let Some(ref so) = t.structured_output {
+                        let footer = extract_artifact_footer(result)
+                            .map(|f| format!(" {}", f))
+                            .unwrap_or_default();
+                        let detail = preserve_artifact_footer(&so.summary, 500);
+                        completed_lines.push(format!(
+                            "- Task {}: {} → {} (confidence: {}){}",
+                            t.id, t.description, detail, so.confidence, footer
+                        ));
+                    } else {
+                        // Reused tasks from prior iterations may lack structured_output
+                        // if the original run predates submit_result.
+                        let detail = preserve_artifact_footer(result, 500);
+                        completed_lines.push(format!(
+                            "- Task {}: {} → {}",
+                            t.id, t.description, detail
+                        ));
+                    }
                 }
                 TaskStatus::Failed => {
                     has_failed_tasks = true;
@@ -840,6 +868,14 @@ impl IterationContext {
             reuse_guidance,
         })
     }
+}
+
+/// Extract the artifact footer from a result string, if present.
+///
+/// Returns the full `[Full result (N chars) saved to artifact: FILE]` string.
+fn extract_artifact_footer(result: &str) -> Option<&str> {
+    const FOOTER_PREFIX: &str = "[Full result (";
+    result.rfind(FOOTER_PREFIX).map(|idx| &result[idx..])
 }
 
 /// Truncate `result` to `budget` bytes while preserving any trailing
@@ -1297,6 +1333,63 @@ mod tests {
         assert!(prompt.contains("COMPLETED TASKS"));
         assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
         assert!(prompt.contains("12345 chars"));
+    }
+
+    #[test]
+    fn test_continuation_prompt_summary_preserves_artifact_footer() {
+        use super::super::tools::submit_result::Confidence;
+
+        let mut plan = Plan::new("Test summary + artifact footer");
+        let mut task = Task::new(0, "Big result", "Produce output");
+        let body = "x".repeat(600);
+        let long_result = format!(
+            "{body}\n\n[Full result (12345 chars) saved to artifact: task-0-sre-iter-1-result.txt]"
+        );
+        task.complete(long_result);
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "Found 47 error groups across 3 services".to_string(),
+            confidence: Confidence::High,
+        });
+        plan.add_task(task);
+
+        let ctx = IterationContext::new(1, plan, None, vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(prompt.contains("Found 47 error groups"));
+        assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
+        assert!(prompt.contains("(confidence: high)"));
+    }
+
+    #[test]
+    fn test_reuse_result_from_carries_structured_output() {
+        use super::super::tools::submit_result::Confidence;
+        use crate::orchestration::orchestrator::Orchestrator;
+
+        let mut previous = Plan::new("Previous goal");
+        let mut prev_task = Task::new(0, "Compute mean", "stats");
+        prev_task.complete("42".to_string());
+        prev_task.structured_output = Some(StructuredTaskOutput {
+            summary: "Mean is 42".to_string(),
+            confidence: Confidence::High,
+        });
+        previous.add_task(prev_task);
+
+        let response = PlanningResponse::StepsPlan {
+            goal: "New goal".into(),
+            steps: vec![StepInput::ReuseTask {
+                reuse_result_from: 0,
+            }],
+            routing_rationale: "test".into(),
+            planning_summary: "test".into(),
+        };
+        let mut plan = response.into_plan().unwrap();
+        Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
+
+        assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
+        assert_eq!(plan.tasks[0].result.as_deref(), Some("42"));
+        let so = plan.tasks[0].structured_output.as_ref().unwrap();
+        assert_eq!(so.summary, "Mean is 42");
+        assert_eq!(so.confidence, Confidence::High);
     }
 
     #[test]

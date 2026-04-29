@@ -88,6 +88,11 @@ pub struct AgentConfig {
     /// Threaded from the web server's `chat_session_id`.
     #[serde(skip)]
     pub session_id: Option<String>,
+
+    /// Shared decision state for worker `submit_result` tool (not serialized).
+    /// When set, workers get the `submit_result` tool for structured output.
+    #[serde(skip)]
+    pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
 }
 
 /// Configuration for TodoWrite/ReadTodos tool injection.
@@ -116,6 +121,7 @@ impl Clone for AgentConfig {
             orchestration_persistence: self.orchestration_persistence.clone(),
             orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
+            orchestration_submit_result: self.orchestration_submit_result.clone(),
         }
     }
 }
@@ -155,6 +161,13 @@ impl std::fmt::Debug for AgentConfig {
                     .map(|h| format!("<{} messages>", h.len())),
             )
             .field("session_id", &self.session_id)
+            .field(
+                "orchestration_submit_result",
+                &self
+                    .orchestration_submit_result
+                    .as_ref()
+                    .map(|_| "<submit_result>"),
+            )
             .finish()
     }
 }
@@ -491,6 +504,7 @@ impl Default for AgentConfig {
             orchestration_persistence: None,
             orchestration_chat_history: None,
             session_id: None,
+            orchestration_submit_result: None,
         }
     }
 }
