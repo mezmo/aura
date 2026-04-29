@@ -13,6 +13,12 @@ pub struct ActiveRequestTracker {
     drained: Notify,
 }
 
+impl Default for ActiveRequestTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ActiveRequestTracker {
     pub fn new() -> Self {
         Self {
@@ -69,6 +75,8 @@ pub struct AppState {
     pub active_requests: Arc<ActiveRequestTracker>,
     /// Default agent name or alias, used when `model` is omitted from the request
     pub default_agent: Option<String>,
+    /// Health check service with cached readiness results
+    pub health_service: Arc<crate::health::HealthCheckService>,
 }
 
 /// OpenAI-compatible message role

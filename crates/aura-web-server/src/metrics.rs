@@ -113,6 +113,47 @@ pub fn decrement_requests_in_flight() {
     gauge!("aura_http_requests_in_flight").decrement(1.0);
 }
 
+/// Record health check result as Prometheus metrics.
+pub fn record_health_check(result: &crate::health::HealthCheckResult) {
+    // Overall readiness gauge
+    gauge!("aura_health_ready").set(match result.status {
+        crate::health::HealthStatus::Healthy => 1.0,
+        crate::health::HealthStatus::Unhealthy => 0.0,
+    });
+
+    // Check duration histogram
+    histogram!("aura_health_check_duration_seconds")
+        .record(result.check_duration_ms as f64 / 1000.0);
+
+    // Per-subsystem status gauges
+    for llm in &result.checks.llm {
+        let ok = matches!(llm.status, crate::health::SubsystemStatus::Ok);
+        gauge!("aura_health_subsystem_status",
+            "subsystem" => "llm",
+            "name" => llm.provider.clone(),
+        )
+        .set(if ok { 1.0 } else { 0.0 });
+    }
+
+    for (name, mcp) in &result.checks.mcp {
+        let ok = matches!(mcp.status, crate::health::SubsystemStatus::Ok);
+        gauge!("aura_health_subsystem_status",
+            "subsystem" => "mcp",
+            "name" => name.clone(),
+        )
+        .set(if ok { 1.0 } else { 0.0 });
+    }
+
+    for (name, vs) in &result.checks.vector_stores {
+        let ok = matches!(vs.status, crate::health::SubsystemStatus::Ok);
+        gauge!("aura_health_subsystem_status",
+            "subsystem" => "vector_store",
+            "name" => name.clone(),
+        )
+        .set(if ok { 1.0 } else { 0.0 });
+    }
+}
+
 /// Set MCP server connection state (1.0 = connected, 0.0 = disconnected).
 pub fn set_mcp_server_connected(server: &str, connected: bool) {
     gauge!("aura_mcp_server_connected", "server" => server.to_string()).set(if connected {

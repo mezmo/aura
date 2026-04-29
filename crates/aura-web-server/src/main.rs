@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod handlers;
+mod health;
 mod metrics;
 mod streaming;
 mod types;
@@ -90,6 +91,18 @@ struct Args {
     /// Not required when only one configuration is loaded via CONFIG_PATH.
     #[arg(long, env = "DEFAULT_AGENT")]
     default_agent: Option<String>,
+
+    /// Health check cache TTL in seconds. Readiness probe results are cached for
+    /// this duration to avoid flooding subsystems with probes on every K8s check.
+    /// Recommend setting slightly less than K8s periodSeconds.
+    #[arg(long, env = "HEALTH_CHECK_CACHE_TTL_SECS", default_value = "10")]
+    health_check_cache_ttl_secs: u64,
+
+    /// Health check probe timeout in seconds. Individual subsystem probes that
+    /// exceed this timeout are marked as unhealthy. Must be shorter than K8s
+    /// probe timeoutSeconds (recommend K8s timeout >= probe timeout + 5s).
+    #[arg(long, env = "HEALTH_CHECK_TIMEOUT_SECS", default_value = "5")]
+    health_check_timeout_secs: u64,
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
@@ -101,7 +114,7 @@ async fn shutdown_guard(
     next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
     let path = req.path();
-    let is_exempt = path == "/health" || path == "/metrics";
+    let is_exempt = path == "/health" || path.starts_with("/health/") || path == "/metrics";
     if data.shutdown_token.is_cancelled() && !is_exempt {
         let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
             error: ErrorDetail::classified(
@@ -180,6 +193,21 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
+    // Health check configuration
+    if args.health_check_timeout_secs >= 10 {
+        tracing::warn!(
+            timeout_secs = args.health_check_timeout_secs,
+            "Health check timeout is >= 10s, which may exceed K8s probe timeoutSeconds. \
+             Recommend setting HEALTH_CHECK_TIMEOUT_SECS < K8s timeoutSeconds - 5s."
+        );
+    }
+
+    let health_service = Arc::new(health::HealthCheckService::new(
+        configs_arc.clone(),
+        std::time::Duration::from_secs(args.health_check_cache_ttl_secs),
+        std::time::Duration::from_secs(args.health_check_timeout_secs),
+    ));
+
     // Create app state
     let app_state = web::Data::new(AppState {
         configs: configs_arc,
@@ -194,6 +222,7 @@ async fn run() -> std::io::Result<()> {
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
+        health_service,
     });
 
     info!(
@@ -211,6 +240,8 @@ async fn run() -> std::io::Result<()> {
             .wrap(middleware::from_fn(shutdown_guard))
             .wrap(middleware::Logger::default())
             .route("/health", web::get().to(handlers::health))
+            .route("/health/live", web::get().to(health::liveness))
+            .route("/health/ready", web::get().to(health::readiness))
             .route("/v1/models", web::get().to(handlers::list_models))
             .route(
                 "/v1/chat/completions",
