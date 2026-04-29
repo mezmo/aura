@@ -17,7 +17,9 @@
     "url": "https://github.com/mezmo/aura/issues"
   },
   "scripts": {
-    "commitlint": "commitlint-mzm"
+    "commitlint": "commitlint-mzm",
+    "release": "semantic-release",
+    "release:dry": "semantic-release --no-ci --dry-run --branches=${BRANCH_NAME:-main}"
   },
   "repository": {
     "type": "git",
@@ -31,6 +33,7 @@
     "example": "examples"
   },
   "devDependencies": {
-    "@mezmoinc/commitlint-config": "^1.0.0"
+    "@mezmoinc/commitlint-config": "^1.0.0",
+    "@mezmoinc/release-config-docker": "^1.0.2"
   }
 }
