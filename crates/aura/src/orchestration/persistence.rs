@@ -13,7 +13,7 @@
 //! └── {run_id}/
 //!     ├── manifest.json                # Typed run manifest (RunManifest)
 //!     ├── artifacts/                   # Run-level result artifacts
-//!     │   └── task-0-result.txt
+//!     │   └── task-0-default-iter-1-result.txt
 //!     └── iteration-{n}/              # One flat dir per iteration
 //!         ├── plan.json
 //!         ├── ...
@@ -32,10 +32,41 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs;
+use tokio::sync::Notify;
 
 use super::events::RoutingMode;
 use super::types::{Plan, TaskStatus};
+
+// ============================================================================
+// Filename Helpers
+// ============================================================================
+
+/// Sanitize a string for use as a filename component.
+///
+/// Lowercases, replaces non-alphanumeric characters with `-`, collapses
+/// consecutive `-`, and trims leading/trailing `-`. Returns `"unknown"` for
+/// empty input. Used for worker names and tool names in artifact filenames.
+pub fn sanitize_filename_component(s: &str) -> String {
+    let s = s.to_lowercase();
+    let sanitized: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let collapsed = sanitized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "unknown".to_string()
+    } else {
+        collapsed
+    }
+}
 
 // ============================================================================
 // Run Manifest Types
@@ -80,8 +111,12 @@ pub struct TaskSummary {
     pub status: TaskStatus,
     /// Assigned worker name (if any).
     pub worker: Option<String>,
-    /// First ~200 chars of the result (for quick scanning).
+    /// Task result preview for session history. Worker-provided summary from
+    /// `submit_result` when available; falls back to first ~200 chars of result.
     pub result_preview: Option<String>,
+    /// Worker-reported confidence from `submit_result` (high/medium/low).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
 }
 
 /// Overall outcome of an orchestration run.
@@ -111,6 +146,9 @@ pub struct ToolCallRecord {
     pub error: Option<String>,
     /// Duration in milliseconds
     pub duration_ms: u64,
+    /// Artifact filename if tool output was promoted to an artifact file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_filename: Option<String>,
 }
 
 /// Summary of a worker's execution for a task.
@@ -126,6 +164,9 @@ pub struct TaskExecutionRecord {
     pub approach: String,
     /// Final result
     pub result: Option<String>,
+    /// Worker-provided summary from `submit_result` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Error if task failed
     pub error: Option<String>,
     /// Duration in milliseconds
@@ -137,6 +178,13 @@ pub struct TaskExecutionRecord {
 }
 
 /// Manages execution artifact persistence (async).
+///
+/// Tracks in-flight async writes via `in_flight` / `drain_notify` so callers
+/// can wait for all fire-and-forget `on_complete` persistence hooks to finish
+/// before reading back artifacts. The `Arc` counter and notify fields live
+/// outside the Mutex so increment/decrement is lock-free, but `on_complete`
+/// still acquires the Mutex for the actual file I/O — callers must release
+/// the Mutex before calling `drain()` to avoid deadlock.
 #[derive(Clone)]
 pub struct ExecutionPersistence {
     base_path: PathBuf,
@@ -144,6 +192,8 @@ pub struct ExecutionPersistence {
     session_id: Option<String>,
     current_iteration: usize,
     enabled: bool,
+    in_flight: Arc<AtomicUsize>,
+    drain_notify: Arc<Notify>,
 }
 
 impl ExecutionPersistence {
@@ -206,6 +256,8 @@ impl ExecutionPersistence {
             session_id,
             current_iteration: 1,
             enabled: true,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -217,7 +269,14 @@ impl ExecutionPersistence {
             session_id: None,
             current_iteration: 1,
             enabled: false,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Whether persistence is enabled (writes go to disk).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Get the run ID for this execution.
@@ -239,6 +298,45 @@ impl ExecutionPersistence {
     pub fn start_new_iteration(&mut self) -> usize {
         self.current_iteration += 1;
         self.current_iteration
+    }
+
+    /// Arc handle to the in-flight write counter.
+    ///
+    /// Shared with `PersistenceWrapper` instances so fire-and-forget
+    /// `on_complete` hooks can increment/decrement without holding the Mutex.
+    pub fn in_flight_counter(&self) -> Arc<AtomicUsize> {
+        self.in_flight.clone()
+    }
+
+    /// Arc handle to the drain notification channel.
+    pub fn drain_notify(&self) -> Arc<Notify> {
+        self.drain_notify.clone()
+    }
+
+    /// Wait for all in-flight persistence writes to complete, bounded by `timeout`.
+    ///
+    /// Returns `true` if the counter reached zero before the deadline.
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        // Yield to let recently-spawned on_complete tasks poll their first
+        // increment before we check the counter (closes TOCTOU window between
+        // tokio::spawn and fetch_add inside on_complete).
+        tokio::task::yield_now().await;
+
+        if self.in_flight.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        tokio::select! {
+            _ = async {
+                while self.in_flight.load(Ordering::Acquire) > 0 {
+                    self.drain_notify.notified().await;
+                }
+            } => true,
+            _ = tokio::time::sleep(timeout) => {
+                let remaining = self.in_flight.load(Ordering::Acquire);
+                tracing::warn!(remaining, "Persistence drain timed out");
+                false
+            }
+        }
     }
 
     /// Get iteration directory path (flat, directly under run dir).
@@ -340,7 +438,15 @@ impl ExecutionPersistence {
     /// Write a large result to an artifact file.
     ///
     /// Returns the artifact filename (not the full path) for reference in summaries.
-    pub async fn write_result_artifact(&self, task_id: usize, result: &str) -> io::Result<String> {
+    /// Filenames are iteration-namespaced to avoid collisions across replans:
+    /// `task-{id}-{worker}-iter-{n}-result.txt`
+    pub async fn write_result_artifact(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        iteration: usize,
+        result: &str,
+    ) -> io::Result<String> {
         if !self.enabled {
             return Ok(String::new());
         }
@@ -348,13 +454,51 @@ impl ExecutionPersistence {
         let artifacts_dir = self.artifacts_path();
         fs::create_dir_all(&artifacts_dir).await?;
 
-        let filename = format!("task-{}-result.txt", task_id);
+        let worker = sanitize_filename_component(worker_name.unwrap_or("default"));
+        let filename = format!("task-{}-{}-iter-{}-result.txt", task_id, worker, iteration);
         let artifact_path = artifacts_dir.join(&filename);
         fs::write(&artifact_path, result).await?;
 
         tracing::debug!(
             "Written result artifact ({} chars) to: {}",
             result.len(),
+            artifact_path.display()
+        );
+        Ok(filename)
+    }
+
+    /// Write a tool output to an artifact file.
+    ///
+    /// Returns the artifact filename for reference in footers and ToolCallRecord.
+    /// Filename: `task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt`
+    pub async fn write_tool_output_artifact(
+        &self,
+        task_id: usize,
+        worker_name: &str,
+        iteration: usize,
+        tool_name: &str,
+        call_idx: usize,
+        output: &str,
+    ) -> io::Result<String> {
+        if !self.enabled {
+            return Ok(String::new());
+        }
+
+        let artifacts_dir = self.artifacts_path();
+        fs::create_dir_all(&artifacts_dir).await?;
+
+        let worker = sanitize_filename_component(worker_name);
+        let tool = sanitize_filename_component(tool_name);
+        let filename = format!(
+            "task-{}-{}-iter-{}-{}-{}-output.txt",
+            task_id, worker, iteration, tool, call_idx
+        );
+        let artifact_path = artifacts_dir.join(&filename);
+        fs::write(&artifact_path, output).await?;
+
+        tracing::debug!(
+            "Written tool output artifact ({} chars) to: {}",
+            output.len(),
             artifact_path.display()
         );
         Ok(filename)
@@ -583,8 +727,15 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
             turn_entries.push_str("Tasks:\n");
             for task in &manifest.task_summaries {
                 let worker = task.worker.as_deref().unwrap_or("unassigned");
+                let confidence_tag = task
+                    .confidence
+                    .as_deref()
+                    .map(|c| format!(" ({})", c))
+                    .unwrap_or_default();
                 let result = match (&task.status, &task.result_preview) {
-                    (TaskStatus::Complete, Some(preview)) => format!("→ \"{}\"", preview),
+                    (TaskStatus::Complete, Some(preview)) => {
+                        format!("→ \"{}\"{}", preview, confidence_tag)
+                    }
                     (TaskStatus::Failed, Some(preview)) => format!("→ FAILED: \"{}\"", preview),
                     (TaskStatus::Failed, None) => "→ FAILED".to_string(),
                     (status, _) => format!("→ {}", status),
@@ -654,10 +805,10 @@ mod tests {
             .unwrap();
 
         let filename = persistence
-            .write_result_artifact(0, "full result content")
+            .write_result_artifact(0, Some("research"), 1, "full result content")
             .await
             .unwrap();
-        assert_eq!(filename, "task-0-result.txt");
+        assert_eq!(filename, "task-0-research-iter-1-result.txt");
 
         let content = persistence.read_artifact(&filename).await.unwrap();
         assert_eq!(content, "full result content");
@@ -676,18 +827,18 @@ mod tests {
 
         // Write two artifacts
         persistence
-            .write_result_artifact(0, "result 0")
+            .write_result_artifact(0, None, 1, "result 0")
             .await
             .unwrap();
         persistence
-            .write_result_artifact(1, "result 1")
+            .write_result_artifact(1, Some("stats"), 1, "result 1")
             .await
             .unwrap();
 
         let artifacts = persistence.list_artifacts().await.unwrap();
         assert_eq!(artifacts.len(), 2);
-        assert!(artifacts.contains(&"task-0-result.txt".to_string()));
-        assert!(artifacts.contains(&"task-1-result.txt".to_string()));
+        assert!(artifacts.contains(&"task-0-default-iter-1-result.txt".to_string()));
+        assert!(artifacts.contains(&"task-1-stats-iter-1-result.txt".to_string()));
     }
 
     #[tokio::test]
@@ -723,13 +874,15 @@ mod tests {
 
         // Write returns empty string
         let filename = persistence
-            .write_result_artifact(0, "content")
+            .write_result_artifact(0, None, 1, "content")
             .await
             .unwrap();
         assert!(filename.is_empty());
 
         // Read fails
-        let result = persistence.read_artifact("task-0-result.txt").await;
+        let result = persistence
+            .read_artifact("task-0-default-iter-1-result.txt")
+            .await;
         assert!(result.is_err());
 
         // List returns empty
@@ -810,6 +963,7 @@ mod tests {
                     status: TaskStatus::Complete,
                     worker: Some("research".to_string()),
                     result_preview: Some("The answer is 42".to_string()),
+                    confidence: None,
                 },
                 TaskSummary {
                     task_id: 1,
@@ -817,9 +971,10 @@ mod tests {
                     status: TaskStatus::Failed,
                     worker: None,
                     result_preview: None,
+                    confidence: None,
                 },
             ],
-            artifact_paths: vec!["task-0-result.txt".to_string()],
+            artifact_paths: vec!["task-0-research-iter-1-result.txt".to_string()],
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -832,7 +987,10 @@ mod tests {
         assert_eq!(deserialized.task_summaries.len(), 2);
         assert_eq!(deserialized.task_summaries[0].status, TaskStatus::Complete);
         assert_eq!(deserialized.task_summaries[1].status, TaskStatus::Failed);
-        assert_eq!(deserialized.artifact_paths, vec!["task-0-result.txt"]);
+        assert_eq!(
+            deserialized.artifact_paths,
+            vec!["task-0-research-iter-1-result.txt"]
+        );
     }
 
     #[tokio::test]
@@ -914,6 +1072,7 @@ mod tests {
                 status: TaskStatus::Complete,
                 worker: Some("statistics".to_string()),
                 result_preview: Some("Result: 20".to_string()),
+                confidence: None,
             }],
             artifact_paths: vec![],
         }
@@ -1116,6 +1275,7 @@ mod tests {
                 status: TaskStatus::Failed,
                 worker: Some("worker1".to_string()),
                 result_preview: Some("Connection refused".to_string()),
+                confidence: None,
             }],
             artifact_paths: vec![],
         };
@@ -1125,4 +1285,159 @@ mod tests {
         assert!(result.contains("Failed"));
         assert!(result.contains("FAILED: \"Connection refused\""));
     }
+
+    // ========================================================================
+    // Filename Sanitization Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sanitize_filename_component_normal() {
+        assert_eq!(sanitize_filename_component("research"), "research");
+        assert_eq!(sanitize_filename_component("sre"), "sre");
+    }
+
+    #[test]
+    fn test_sanitize_filename_component_special_chars() {
+        assert_eq!(sanitize_filename_component("my worker"), "my-worker");
+        assert_eq!(sanitize_filename_component("sre/ops"), "sre-ops");
+        assert_eq!(sanitize_filename_component("a..b"), "a-b");
+        assert_eq!(sanitize_filename_component("UPPER_case"), "upper-case");
+    }
+
+    #[test]
+    fn test_sanitize_filename_component_empty() {
+        assert_eq!(sanitize_filename_component(""), "unknown");
+        assert_eq!(sanitize_filename_component("///"), "unknown");
+        assert_eq!(sanitize_filename_component("..."), "unknown");
+    }
+
+    #[test]
+    fn test_sanitize_filename_component_collapse() {
+        assert_eq!(sanitize_filename_component("a---b"), "a-b");
+        assert_eq!(sanitize_filename_component("--leading"), "leading");
+        assert_eq!(sanitize_filename_component("trailing--"), "trailing");
+    }
+
+    // ========================================================================
+    // Namespaced Artifact Filename Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_artifact_filename_includes_worker_and_iteration() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_result_artifact(0, Some("sre"), 2, "content")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-0-sre-iter-2-result.txt");
+
+        let content = persistence.read_artifact(&filename).await.unwrap();
+        assert_eq!(content, "content");
+    }
+
+    #[tokio::test]
+    async fn test_artifact_filename_default_worker() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_result_artifact(3, None, 1, "content")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-3-default-iter-1-result.txt");
+    }
+
+    // ========================================================================
+    // Tool Output Artifact Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_write_tool_output_artifact() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_tool_output_artifact(0, "sre", 1, "log_search", 0, "search results here")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-0-sre-iter-1-log-search-0-output.txt");
+
+        let content = persistence.read_artifact(&filename).await.unwrap();
+        assert_eq!(content, "search results here");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_output_artifact_sanitizes_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let filename = persistence
+            .write_tool_output_artifact(2, "SRE/Ops", 1, "My Search Tool", 3, "data")
+            .await
+            .unwrap();
+        assert_eq!(filename, "task-2-sre-ops-iter-1-my-search-tool-3-output.txt");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_output_artifact_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        let filename = persistence
+            .write_tool_output_artifact(0, "w", 1, "t", 0, "data")
+            .await
+            .unwrap();
+        assert!(filename.is_empty());
+    }
+
+    // ========================================================================
+    // Drain Barrier Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_drain_completes_immediately_with_no_in_flight() {
+        let persistence = ExecutionPersistence::disabled();
+        assert!(persistence.drain(Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_waits_for_in_flight_write() {
+        let persistence = ExecutionPersistence::disabled();
+        let counter = persistence.in_flight_counter();
+        let notify = persistence.drain_notify();
+
+        counter.fetch_add(1, Ordering::Release);
+
+        let drain_handle = {
+            let persistence = persistence.clone();
+            tokio::spawn(async move { persistence.drain(Duration::from_secs(5)).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drain_handle.is_finished());
+
+        counter.fetch_sub(1, Ordering::Release);
+        notify.notify_one();
+
+        assert!(drain_handle.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_drain_times_out() {
+        let persistence = ExecutionPersistence::disabled();
+        let counter = persistence.in_flight_counter();
+        counter.fetch_add(1, Ordering::Release);
+
+        let drained = persistence.drain(Duration::from_millis(50)).await;
+        assert!(!drained);
+    }
+
 }

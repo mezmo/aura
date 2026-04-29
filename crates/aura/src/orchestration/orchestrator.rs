@@ -91,6 +91,12 @@ struct TaskExecutionParams<'a> {
     plan_goal: &'a str,
 }
 
+/// Result from `execute_task` including structured output from `submit_result`.
+struct TaskExecutionResult {
+    result: String,
+    structured_output: Option<super::types::StructuredTaskOutput>,
+}
+
 /// Named return type for `create_*` coordinator/worker methods.
 ///
 /// Replaces bare `(Agent, String)` tuples where the `String` was the preamble
@@ -102,6 +108,9 @@ struct AgentWithPreamble {
     /// guard when a tool-call loop is terminated; read by `execute_task` after
     /// the multi_turn loop to convert a false `Ok` into `TaskStatus::Failed`.
     escalation_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared state for the worker's `submit_result` tool. Read after the
+    /// worker completes to extract structured output (summary, result, confidence).
+    submit_result_decision: super::tools::SubmitResultDecision,
 }
 
 /// Bundled coordinator tools for `build_agent_with_tools`.
@@ -483,7 +492,22 @@ impl Orchestrator {
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper};
 
         // Build base tool wrappers: observer + duplicate guard + persistence
-        let persistence_wrapper = Arc::new(PersistenceWrapper::new(self.persistence.clone()));
+        let (in_flight, drain_notify, iteration, persistence_enabled) = {
+            let p = self.persistence.lock().await;
+            (p.in_flight_counter(), p.drain_notify(), p.current_iteration(), p.is_enabled())
+        };
+        let persistence_wrapper = Arc::new(PersistenceWrapper::new(
+            super::persistence_wrapper::PersistenceWrapperParams {
+                persistence: self.persistence.clone(),
+                in_flight,
+                drain_notify,
+                worker_name: worker_name.map(String::from),
+                iteration,
+                persistence_enabled,
+                size_threshold: self.config.tool_output_artifact_threshold(),
+                duration_threshold_ms: self.config.tool_output_duration_threshold_ms(),
+            },
+        ));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
             self.tool_call_observer.clone(),
             task_id,
@@ -682,6 +706,11 @@ impl Orchestrator {
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());
 
+        // Give workers the submit_result tool for structured output
+        let submit_result_decision: super::tools::SubmitResultDecision =
+            Arc::new(Mutex::new(None));
+        worker_config.orchestration_submit_result = Some(submit_result_decision.clone());
+
         // Disable orchestration in worker config to avoid nested orchestration
         worker_config.orchestration = None;
 
@@ -764,6 +793,7 @@ impl Orchestrator {
             agent,
             preamble,
             escalation_flag,
+            submit_result_decision,
         })
     }
 
@@ -2111,6 +2141,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            submit_result_decision: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -2613,11 +2644,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 futures.next().await
             {
                 match result {
-                    Ok(result_str) => {
-                        let final_result = self.maybe_create_artifact(task_id, result_str).await;
+                    Ok(exec_result) => {
+                        let final_result = self
+                            .maybe_create_artifact(
+                                task_id,
+                                worker_name.as_deref(),
+                                exec_result.result,
+                            )
+                            .await;
                         let result_for_event = final_result.clone();
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.complete(final_result);
+                            t.structured_output = exec_result.structured_output;
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
@@ -2703,7 +2741,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// If result exceeds artifact threshold, write full result to artifact file
     /// and return a summary. Otherwise return the original result unchanged.
-    async fn maybe_create_artifact(&self, task_id: usize, result: String) -> String {
+    async fn maybe_create_artifact(
+        &self,
+        task_id: usize,
+        worker_name: Option<&str>,
+        result: String,
+    ) -> String {
         let threshold = self.config.result_artifact_threshold();
         if result.len() <= threshold {
             return result;
@@ -2711,8 +2754,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let summary_len = self.config.result_summary_length();
         let persistence = self.persistence.lock().await;
+        let iteration = persistence.current_iteration();
 
-        match persistence.write_result_artifact(task_id, &result).await {
+        match persistence
+            .write_result_artifact(task_id, worker_name, iteration, &result)
+            .await
+        {
             Ok(filename) => {
                 let (truncated, _) = safe_truncate(&result, summary_len);
                 format!(
@@ -2801,7 +2848,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<String, StreamError> {
+    ) -> Result<TaskExecutionResult, StreamError> {
         let TaskExecutionParams {
             task_description,
             task_context,
@@ -2825,6 +2872,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             agent: worker,
             preamble: worker_preamble,
             escalation_flag,
+            submit_result_decision,
         } = self.create_worker(task_id, attempt, *worker_name).await?;
 
         // Build the worker prompt — task-first, no original query (prevents scope creep)
@@ -2921,10 +2969,45 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // dependents are blocked in the DAG.
         let result: Result<String, StreamError> = match result {
             Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
-                let processed = self.maybe_create_artifact(task_id, worker_output).await;
+                let processed = self
+                    .maybe_create_artifact(task_id, *worker_name, worker_output)
+                    .await;
                 Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
             }
             other => other,
+        };
+
+        // Extract structured output from submit_result. Workers are required
+        // to call submit_result; failure to do so is treated as a task failure
+        // (SoftFailure category — worker produced output but didn't follow protocol).
+        let (result, structured_output): (
+            Result<String, StreamError>,
+            Option<super::types::StructuredTaskOutput>,
+        ) = match result {
+            Ok(raw_response) => {
+                let structured = submit_result_decision.lock().await.take();
+                match structured {
+                    Some(output) => (
+                        Ok(output.result),
+                        Some(super::types::StructuredTaskOutput {
+                            summary: output.summary,
+                            confidence: output.confidence,
+                        }),
+                    ),
+                    None => {
+                        let (preview, _) = safe_truncate(&raw_response, 200);
+                        (
+                            Err(format!(
+                                "Worker did not call submit_result for task {}. Raw output: {}",
+                                task_id, preview,
+                            )
+                            .into()),
+                            None,
+                        )
+                    }
+                }
+            }
+            Err(e) => (Err(e), None),
         };
 
         // Persist the worker execution
@@ -2941,9 +3024,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 attempt,
                 approach: "Direct task execution via worker agent".to_string(),
                 result: result_str.clone(),
+                summary: structured_output.as_ref().map(|s| s.summary.clone()),
                 error: error_str,
                 duration_ms,
-                confidence: None,
+                confidence: structured_output
+                    .as_ref()
+                    .map(|s| s.confidence.to_string()),
                 orchestrator_notes: None,
             };
 
@@ -2968,7 +3054,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Err(e) => crate::logging::set_span_error(&span, e.to_string()),
             }
         }
-        result
+        result.map(|r| TaskExecutionResult {
+            result: r,
+            structured_output,
+        })
     }
 
     /// Build a summary of task execution statuses for replan context.
@@ -3114,6 +3203,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 prev_task.description
                             );
                             task.complete(result.clone());
+                            task.structured_output =
+                                prev_task.structured_output.clone();
                         }
                     } else {
                         tracing::warn!(
@@ -3359,6 +3450,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
+
+        // Drain in-flight persistence writes before reading back artifacts.
+        // Root cause: tool_wrapper.rs fire-and-forget `tokio::spawn` for
+        // on_complete means writes may still be in progress when we reach here.
+        // Clone ExecutionPersistence (cheap: just bumps Arcs) to release the
+        // MutexGuard before entering drain. on_complete tasks hold the original
+        // Arc<Mutex<...>> and need the lock for file I/O.
+        {
+            let drain_timeout = std::time::Duration::from_millis(
+                self.config.persistence_drain_timeout_ms(),
+            );
+            let persistence = self.persistence.lock().await.clone();
+            if !persistence.drain(drain_timeout).await {
+                tracing::warn!("Persistence drain timed out — tool output refs may be incomplete");
+            }
+        }
 
         // Persistence fix: write plan after execute to capture task statuses
         {
@@ -3725,9 +3832,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 status: t.status,
                 worker: t.worker.clone(),
                 result_preview: t
-                    .result
+                    .structured_output
                     .as_ref()
-                    .map(|r| safe_truncate(r, 200).0.to_string()),
+                    .map(|s| s.summary.clone())
+                    .or_else(|| {
+                        t.result
+                            .as_ref()
+                            .map(|r| safe_truncate(r, 200).0.to_string())
+                    }),
+                confidence: t
+                    .structured_output
+                    .as_ref()
+                    .map(|s| s.confidence.to_string()),
             })
             .collect();
 
@@ -4865,15 +4981,18 @@ mod tests {
         let large_result = "x".repeat(5000);
         {
             let p = persistence.lock().await;
-            let filename = p.write_result_artifact(0, &large_result).await.unwrap();
-            assert_eq!(filename, "task-0-result.txt");
+            let filename = p
+                .write_result_artifact(0, Some("research"), 1, &large_result)
+                .await
+                .unwrap();
+            assert_eq!(filename, "task-0-research-iter-1-result.txt");
         }
 
         // Verify ReadArtifactTool can retrieve it
         let tool = ReadArtifactTool::new(persistence.clone());
         let output = tool
             .call(super::super::tools::read_artifact::ReadArtifactArgs {
-                filename: "task-0-result.txt".to_string(),
+                filename: "task-0-research-iter-1-result.txt".to_string(),
             })
             .await
             .unwrap();
@@ -4916,20 +5035,32 @@ mod tests {
         // Write artifacts for multiple tasks
         {
             let p = persistence.lock().await;
-            p.write_result_artifact(0, "result 0").await.unwrap();
-            p.write_result_artifact(1, "result 1").await.unwrap();
-            p.write_result_artifact(2, "result 2").await.unwrap();
+            p.write_result_artifact(0, None, 1, "result 0")
+                .await
+                .unwrap();
+            p.write_result_artifact(1, Some("stats"), 1, "result 1")
+                .await
+                .unwrap();
+            p.write_result_artifact(2, Some("math"), 1, "result 2")
+                .await
+                .unwrap();
 
             let artifacts = p.list_artifacts().await.unwrap();
             assert_eq!(artifacts.len(), 3);
         }
 
+        let expected_names = [
+            "task-0-default-iter-1-result.txt",
+            "task-1-stats-iter-1-result.txt",
+            "task-2-math-iter-1-result.txt",
+        ];
+
         // Verify each can be read back
         let tool = ReadArtifactTool::new(persistence);
-        for i in 0..3 {
+        for (i, name) in expected_names.iter().enumerate() {
             let output = tool
                 .call(super::super::tools::read_artifact::ReadArtifactArgs {
-                    filename: format!("task-{}-result.txt", i),
+                    filename: name.to_string(),
                 })
                 .await
                 .unwrap();

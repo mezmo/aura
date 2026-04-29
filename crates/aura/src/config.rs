@@ -100,6 +100,11 @@ pub struct AgentConfig {
     /// `Some` when scratchpad is wired up for this agent or worker.
     #[serde(skip)]
     pub scratchpad_tools_config: Option<ScratchpadToolsConfig>,
+
+    /// Shared decision state for worker `submit_result` tool (not serialized).
+    /// When set, workers get the `submit_result` tool for structured output.
+    #[serde(skip)]
+    pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
 }
 
 /// Configuration for TodoWrite/ReadTodos tool injection.
@@ -130,6 +135,7 @@ impl Clone for AgentConfig {
             orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
+            orchestration_submit_result: self.orchestration_submit_result.clone(),
         }
     }
 }
@@ -169,6 +175,13 @@ impl std::fmt::Debug for AgentConfig {
                     .map(|h| format!("<{} messages>", h.len())),
             )
             .field("session_id", &self.session_id)
+            .field(
+                "orchestration_submit_result",
+                &self
+                    .orchestration_submit_result
+                    .as_ref()
+                    .map(|_| "<submit_result>"),
+            )
             .finish()
     }
 }
@@ -586,6 +599,7 @@ impl Default for AgentConfig {
             orchestration_chat_history: None,
             session_id: None,
             scratchpad_tools_config: None,
+            orchestration_submit_result: None,
         }
     }
 }

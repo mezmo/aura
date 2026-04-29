@@ -189,6 +189,9 @@ impl RigBuilder {
                     result_artifact_threshold: orch.artifacts.result_artifact_threshold,
                     result_summary_length: orch.artifacts.result_summary_length,
                     session_history_turns: orch.artifacts.session_history_turns,
+                    persistence_drain_timeout_ms: orch.artifacts.persistence_drain_timeout_ms,
+                    tool_output_artifact_threshold: orch.artifacts.tool_output_artifact_threshold,
+                    tool_output_duration_threshold_ms: orch.artifacts.tool_output_duration_threshold_ms,
                 },
             }
         });
@@ -208,6 +211,7 @@ impl RigBuilder {
             mcp_filter: None,
             orchestration_persistence: None,
             orchestration_chat_history: None,
+            orchestration_submit_result: None,
             session_id: None,
             scratchpad_tools_config: None,
         })
