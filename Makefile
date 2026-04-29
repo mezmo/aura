@@ -6,10 +6,7 @@
 # Provide standard defaults - set overrides in .config.mk
 SHELL=/bin/bash -o pipefail
 ALWAYS_TIMESTAMP_VERSION ?= false
-APP_NAME ?= aura-api
-PROJECT_NAME ?= aura
-DEFAULT_BRANCH ?= main
-PUBLISH_LATEST ?= false
+APP_NAME ?= $(shell git remote -v | awk '/origin/ && /fetch/ { sub(/\.git/, ""); n=split($$2, origin, "/"); print origin[n]}')
 
 ## Define sources for rendering and templating
 GIT_SHA1 ?= $(shell git log --pretty=format:'%h' -n 1)
@@ -164,22 +161,22 @@ clean::               ## Cleanup the local checkout
 
 .PHONY:docker-build
 docker-build::        ## Build Docker image (full release)
-	$(DOCKER) build -t $(PROJECT_NAME):latest .
+	$(DOCKER) build -t $(APP_NAME):latest .
 
 .PHONY:docker-test
 docker-test::         ## Run Docker build with test stage (base)
-	$(DOCKER) build --target release-lint-test -t $(PROJECT_NAME):test .
+	$(DOCKER) build --target release-lint-test -t $(APP_NAME):test .
 
 .PHONY:docker-build-release
 docker-build-release:: ## Build Docker release stage only
-	$(DOCKER) build --target release -t $(PROJECT_NAME):$(RELEASE_VERSION) .
+	$(DOCKER) build --target release -t $(APP_NAME):$(RELEASE_VERSION) .
 
 .PHONY:publish
 publish::             ## Placeholder for publishing artifacts
 
 .PHONY:version
 version::             ## Show version information
-	@echo "RELEASE_VERSION: $(RELEASE_VERSION)"
-	@echo "BUILD_VERSION: $(BUILD_VERSION)"
-	@echo "GIT_SHA1: $(GIT_SHA1)"
-	@echo "GIT_BRANCH: $(GIT_BRANCH)"
+	@MAKEFLAGS+=--no-print-directory $(MAKE) debug-RELEASE_VERSION
+	@MAKEFLAGS+=--no-print-directory $(MAKE) debug-BUILD_VERSION
+	@MAKEFLAGS+=--no-print-directory $(MAKE) debug-GIT_SHA1
+	@MAKEFLAGS+=--no-print-directory $(MAKE) debug-GIT_BRANCH

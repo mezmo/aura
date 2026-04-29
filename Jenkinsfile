@@ -4,12 +4,38 @@ def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
 def TRIGGER_PATTERN = '.*@triggerbuild.*'
 def DOCKER_REPO = "docker.io/mezmo"
+def BUILD_SLUG = slugify(env.BUILD_TAG)
 
+// FIXME: Temporary workaround until aura is updated
+// to produce structured output / reports
+// This is just here to help simplify the pipeline workflow
+def withReport(checkName, command) {
+  def logFile = "output-${checkName.replaceAll(/[^a-zA-Z0-9]/, "_")}.log"
+  publishChecks(name: checkName, status: 'IN_PROGRESS', title: 'Running...')
+
+  try {
+    sh script: "${command} 2>&1 | tee ${logFile}"
+    publishChecks(name: checkName, conclusion: 'SUCCESS', summary: 'Check passed!')
+  } catch (Exception e) {
+    def consoleOutput = readFile(logFile).trim()
+    publishChecks(
+      name: checkName,
+      conclusion: 'FAILURE',
+      summary: "Command failed: ${e.message}",
+      text: "### Console Output\n```\n${consoleOutput}\n```"
+    )
+
+    // throwing will trigger the FAILURE check state
+    throw e
+  } finally {
+    sh "rm -f ${logFile}"
+  }
+}
 pipeline {
   agent {
     node {
       label 'ec2-fleet'
-      customWorkspace("/tmp/workspace/${env.BUILD_TAG}")
+      customWorkspace("/tmp/workspace/${BUILD_SLUG}")
     }
   }
 
@@ -35,11 +61,6 @@ pipeline {
     RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
     CARGO_HOME = "${env.WORKSPACE}/.cargo"
     FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
-    PATH = """${sh(
-       returnStdout: true,
-       script: 'echo /opt/rust/cargo/bin:\$PATH'
-    )}
-    """
   }
 
   post {
@@ -75,7 +96,9 @@ pipeline {
     }
 
     stage('Setup') {
-      sh 'npm install'
+      steps{
+        sh 'npm install'
+      }
     }
 
     stage('Validate') {
@@ -97,95 +120,64 @@ pipeline {
       }
 
       stages {
-        stage('Test Suite: Run') {
-          steps {
-            publishChecks(
-              name: 'test-suite',
-              title: 'Test Suite',
-              summary: 'Running tests...',
-              status: 'IN_PROGRESS'
-            )
-          }
-        }
-
         stage('Test Suite: Parallel') {
-          steps {
-            script {
-              def failed = false
-              def failureText = ''
-              try {
-                parallel(
-                  'Unit Tests': {
-                    sh(script: 'docker build --target release-build .')
-                  },
-                  'Integration Tests': {
-                    withEnv(['MOCK_MCP_IMAGE=mezmo/aura-mock-mcp:latest']) {
-                      withCredentials([
-                        string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
-                      ]) {
-                        try {
-                          sh 'make test-integration'
-                        } finally {
-                          sh 'make test-integration-down'
-                        }
-                      }
-                    }
-                  },
-                  'Release Tests': {
-                    if (CURRENT_BRANCH != DEFAULT_BRANCH) {
-                      withEnv([
-                        "GIT_BRANCH=${CURRENT_BRANCH}",
-                        "BRANCH_NAME=${CURRENT_BRANCH}",
-                        'CHANGE_ID='
-                      ]) {
-                        def nodeHome = tool 'NodeJS 20'
-                        withEnv(["PATH+NODE=${nodeHome}/bin"]) {
-                          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-                          npm.auth token: GITHUB_TOKEN
-                          // Trigger rustup to read rust-toolchain.toml and auto-install the specified nightly
-                          // Running any cargo command will cause rustup to install the toolchain if not present
-                          sh 'echo "Cargo version:" && cargo --version'
-                          sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-                          sh 'npx semantic-release --dry-run --no-ci'
-                        }
-                      }
-                    }
+          parallel {
+            stage('Unit Tests') {
+              steps {
+                // FIXME. It looks like this doesn't do anything the other tests aren't doing
+                // This seems frivolous
+                withReport('Unit Tests', 'docker build --target release-build .')
+              }
+            }
+
+            stage('Integration Tests') {
+              environment {
+                MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
+              }
+              steps {
+                withCredentials([
+                  string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
+                ]) {
+                  withReport('Integration Tests', 'make test-integration')
+                }
+              }
+            }
+
+            stage('Relese Test') {
+              when {
+                not {
+                  expression { CURRENT_BRANCH == DEFAULT_BRANCH }
+                }
+              }
+
+              environment {
+                 GIT_BRANCH = "${CURRENT_BRANCH}"
+                 BRANCH_NAME = "${CURRENT_BRANCH}"
+                 CHANGE_ID = ''
+              }
+
+              steps {
+                withCredentials([
+                   string(credentialsId: 'github-api-token', variable: 'GITHUB_TOKEN'),
+                ]) {
+                  buildx {
+                    withReport('Release Test', 'npm run release:dry')
                   }
-                )
-              } catch (Exception e) {
-                failed = true
-                failureText = e.getMessage() ?: 'See build logs for details.'
-                throw e
-              } finally {
-                if (failed) {
-                  publishChecks(
-                    name: 'test-suite',
-                    title: 'Test Suite',
-                    summary: 'Tests failed',
-                    text: failureText,
-                    status: 'COMPLETED',
-                    conclusion: 'FAILURE'
-                  )
                 }
               }
             }
           }
 
           post {
-            success {
-              publishChecks(
-                name: 'test-suite',
-                title: 'Test Suite',
-                summary: 'All tests passed',
-                status: 'COMPLETED',
-                conclusion: 'SUCCESS'
-              )
+            always {
+              sh 'make test-integration-down'
             }
           }
         }
       }
     }
 
+    // FIXME: This needs to be removed with the removal of razee stuff
     stage('Feature Build') {
       when {
         expression {
@@ -193,19 +185,8 @@ pipeline {
         }
       }
 
-      tools {
-        nodejs 'NodeJS 20'
-      }
-
       steps {
         script {
-          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-          npm.auth token: GITHUB_TOKEN
-          sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-          sh 'npx semantic-release'
-
-          def RELEASE_VERSION = FEATURE_TAG
-
           buildx.build(
             project: PROJECT_NAME
           , push: true
@@ -222,21 +203,14 @@ pipeline {
             secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
           ]]) {
             sh script: 'make clean'
-            sh script: "make render RELEASE_VERSION=${RELEASE_VERSION}", label: "Generate feature branch k8s Artifacts"
-            sh script: "make publish RELEASE_VERSION=${RELEASE_VERSION}", label: "Publish feature branch k8s Artifacts"
+            sh script: "make render RELEASE_VERSION=${FEATURE_TAG}", label: "Generate feature branch k8s Artifacts"
+            sh script: "make publish RELEASE_VERSION=${FEATURE_TAG}", label: "Publish feature branch k8s Artifacts"
           }
         }
       }
     }
 
     stage('Release') {
-      environment {
-        GITHUB_TOKEN = credentials('github-api-token')
-        NPM_CONFIG_CACHE = '.npm'
-        NPM_CONFIG_USERCONFIG = '.npm/rc'
-        SPAWN_WRAP_SHIM_ROOT = '.npm'
-      }
-
       when {
         beforeAgent true
         branch DEFAULT_BRANCH
@@ -248,35 +222,25 @@ pipeline {
         }
       }
 
-      tools {
-        nodejs 'NodeJS 20'
-      }
-
       steps {
         script {
-          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-          npm.auth token: GITHUB_TOKEN
-          sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-          sh 'npx semantic-release'
 
+          // FIXME: We shouldn't need to do this
+          // once the release version has been updated running make clean render publish
+          // should resolve the right version. I think this can also go
           // 1.2.3
           def RELEASE_VERSION_PATCH = sh(
             returnStdout: true,
             script: 'cargo metadata -q --no-deps --format-version 1 | jq -r \'.packages[0].version\''
           ).trim()
-          // 1.2
-          def RELEASE_VERSION_MINOR = RELEASE_VERSION_PATCH.tokenize('.').take(2).join('.')
-          // 1
-          def RELEASE_VERSION_MAJOR = RELEASE_VERSION_PATCH.tokenize('.')[0]
 
-          buildx.build(
-            project: PROJECT_NAME
-          , push: true
-          , tags: ['latest', RELEASE_VERSION_PATCH, RELEASE_VERSION_MINOR, RELEASE_VERSION_MAJOR]
-          , dockerfile: "Dockerfile"
-          , args: [RELEASE_VERSION: RELEASE_VERSION_PATCH]
-          , docker_repo: DOCKER_REPO
-          )
+          withCredentials([
+             string(credentialsId: 'github-api-token', variable: 'GITHUB_TOKEN'),
+          ]) {
+            buildx {
+              withReport('Release', 'npm run release')
+            }
+          }
 
           withCredentials([[
             $class: 'AmazonWebServicesCredentialsBinding',
