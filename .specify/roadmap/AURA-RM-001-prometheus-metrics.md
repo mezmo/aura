@@ -1,7 +1,7 @@
 # AURA-RM-001: Prometheus Metrics Endpoint
 
 **Priority:** P0 (Critical)
-**Status:** Not Started
+**Status:** Implemented
 **Dependencies:** AURA-RM-008 (Structured Error Taxonomy)
 **Depended on by:** AURA-RM-003, AURA-RM-005, AURA-RM-011
 **Affected Crates:** `aura-web-server`, `aura`

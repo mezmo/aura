@@ -4,10 +4,10 @@ This document defines the development lifecycle for new features in the Aura pro
 
 ## Overview
 
-Every feature follows a 7-phase lifecycle. Each phase has an explicit entry criterion, work product, and exit criterion. The process ensures traceability from roadmap items through user stories, specs, code, and tests.
+Every feature follows an 8-phase lifecycle. Each phase has an explicit entry criterion, work product, and exit criterion. The process ensures traceability from roadmap items through user stories, specs, code, tests, and documentation.
 
 ```
-Roadmap Item → User Stories → Specs → Review → Plan → Implement → Review → QA → Release
+Roadmap Item → User Stories → Specs → Review → Plan → Implement → Review → QA → Docs → Release
 ```
 
 ## Phase 1: Roadmap to User Stories
@@ -130,13 +130,31 @@ Same protocol: **zero Must Fix AND zero Should Fix** before merge.
 
 **Exit:** All ACs verified. Traceability matrix complete.
 
-## Phase 7: Validation + Release
+## Phase 7: Documentation
 
-- `make ci` (fmt-check, test, lint)
+**Entry:** QA verification complete, all acceptance criteria passing.
+
+**Work:**
+- Update `README.md` with new features, configuration options, and usage examples
+- Update relevant docs/ files (streaming-api-guide, request-lifecycle, etc.)
+- Add or update PromQL examples, config snippets, or API contract changes
+- Update integration test feature flag list if new flags were added
+- Update CHANGELOG.md with the feature summary
+- Review all documentation changes for accuracy against the implemented code
+
+**Exit:** All user-facing documentation reflects the current implementation. A new user could discover and use the feature from documentation alone.
+
+## Phase 8: Validation + Release
+
+- `cargo fmt --check` — formatting clean
+- `cargo clippy --all-targets --all-features -- -D warnings` — linter clean
+- `cargo test --workspace --lib` — all tests pass
 - Integration test suite with new feature flags
 - Backward compatibility: existing example configs still load
-- Update documentation (README.md, relevant docs/)
-- Conventional commit, semantic release via Jenkins pipeline
+- No secrets in diff
+- Squash or clean commit history for PR
+- Conventional commit format with proper footer
+- Semantic release via Jenkins pipeline
 
 ## Traceability
 

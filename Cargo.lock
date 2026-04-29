@@ -491,6 +491,8 @@ dependencies = [
  "aura",
  "aura-config",
  "aura-test-utils",
+ "aws-config",
+ "aws-credential-types",
  "chrono",
  "clap",
  "env_logger",
