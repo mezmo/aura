@@ -12,14 +12,11 @@ use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-async fn send_chat_request(
-    client: &reqwest::Client,
-    messages: Vec<Value>,
-) -> reqwest::Response {
+async fn send_chat_request(client: &reqwest::Client, messages: Vec<Value>) -> reqwest::Response {
     client
         .post(format!("{AURA_SERVER}/v1/chat/completions"))
         .json(&json!({
-            "model": "Test Assistant",
+            "model": "test-assistant",
             "messages": messages,
             "stream": false,
             "metadata": {
@@ -99,10 +96,7 @@ async fn test_metrics_request_duration_after_chat() {
         metrics.contains("aura_http_request_duration_seconds_bucket"),
         "missing request duration histogram buckets"
     );
-    assert!(
-        metrics.contains("method=\"POST\""),
-        "missing method label"
-    );
+    assert!(metrics.contains("method=\"POST\""), "missing method label");
     assert!(
         metrics.contains("status_code=\"200\""),
         "missing status_code label"
@@ -213,11 +207,7 @@ async fn test_metrics_mcp_connection_gauge() {
     let client = reqwest::Client::new();
 
     // Send a request to trigger agent build (which records MCP connection state)
-    let _ = send_chat_request(
-        &client,
-        vec![json!({"role": "user", "content": "hi"})],
-    )
-    .await;
+    let _ = send_chat_request(&client, vec![json!({"role": "user", "content": "hi"})]).await;
 
     let metrics = scrape_metrics(&client).await;
 
@@ -246,10 +236,7 @@ async fn test_metrics_scrape_performance() {
     let metrics = scrape_metrics(&client).await;
     let duration = start.elapsed();
 
-    assert!(
-        !metrics.is_empty(),
-        "metrics response should not be empty"
-    );
+    assert!(!metrics.is_empty(), "metrics response should not be empty");
     assert!(
         duration.as_millis() < 50,
         "metrics scrape took {}ms, expected < 50ms",
