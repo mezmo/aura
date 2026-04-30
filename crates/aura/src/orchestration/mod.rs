@@ -70,6 +70,7 @@ pub use stream_events::EventContext;
 pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;
 pub use tools::GetConversationContextTool;
+pub use tools::ListPriorRunsTool;
 pub use tools::ReadArtifactTool;
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
