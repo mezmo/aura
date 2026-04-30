@@ -63,8 +63,8 @@ use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    FailedTaskRecord, FailureSummary, IterationContext, IterationOutcome, Plan, PlanAttemptFailure,
-    PlanningResponse, Task, TaskStatus,
+    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
+    PlanAttemptFailure, PlanningResponse, Task, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -2675,8 +2675,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                     Err(e) => {
                         let err_str = e.to_string();
+                        let category = Self::categorize_failure_error(&err_str);
                         if let Some(t) = plan.get_task_mut(task_id) {
-                            t.fail(err_str.clone());
+                            t.fail(err_str.clone(), category);
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
@@ -2694,23 +2695,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
                         let (task_preview, _) = safe_truncate(&task_desc, 100);
-                        let error_category = if err_str.contains("timed out") {
-                            "timeout"
-                        } else if is_context_overflow_error(e.as_ref()) {
-                            "context overflow"
-                        } else if err_str.contains("MaxDepthError")
-                            || err_str.contains("reached limit")
-                        {
-                            "depth exhaustion"
-                        } else {
-                            "error"
-                        };
                         tracing::warn!(
                             "Worker '{}' failed task {} after {}ms ({}): {}. Task was: {}",
                             worker_label,
                             task_id,
                             duration_ms,
-                            error_category,
+                            category,
                             e,
                             task_preview
                         );
@@ -2729,12 +2719,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> Vec<super::types::FailedTaskRecord> {
         plan.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Failed)
-            .map(|t| super::types::FailedTaskRecord {
-                description: t.description.clone(),
-                error: t.error.clone().unwrap_or_else(|| "unknown".to_string()),
-                iteration,
-                worker: t.worker.clone(),
+            .filter_map(|t| match &t.state {
+                TaskState::Failed { error, category } => Some(super::types::FailedTaskRecord {
+                    description: t.description.clone(),
+                    error: error.clone(),
+                    iteration,
+                    worker: t.worker.clone(),
+                    category: *category,
+                }),
+                _ => None,
             })
             .collect()
     }
@@ -2809,16 +2802,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan.tasks
                         .iter()
                         .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| {
-                            dep_task.result.as_ref().map(|result| {
-                                format!(
-                                    "{} — Task {} ({}):\n{}",
-                                    sections::PRIOR_WORK,
-                                    dep_task.id,
-                                    dep_task.description,
-                                    result
-                                )
-                            })
+                        .and_then(|dep_task| match &dep_task.state {
+                            TaskState::Complete { result } => Some(format!(
+                                "{} — Task {} ({}):\n{}",
+                                sections::PRIOR_WORK,
+                                dep_task.id,
+                                dep_task.description,
+                                result
+                            )),
+                            _ => None,
                         })
                 })
                 .collect();
@@ -3069,22 +3061,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan.tasks
             .iter()
             .map(|t| {
-                let status_detail = match t.status {
-                    TaskStatus::Complete => {
-                        let len = t.result.as_ref().map(|r| r.len()).unwrap_or(0);
-                        format!("✓ complete ({} chars)", len)
+                let status_detail = match &t.state {
+                    TaskState::Complete { result } => {
+                        format!("✓ complete ({} chars)", result.len())
                     }
-                    TaskStatus::Failed => {
-                        let err = t.error.as_deref().unwrap_or("unknown error");
-                        format!("✗ failed: {}", err)
+                    TaskState::Failed { error, .. } => {
+                        format!("✗ failed: {}", error)
                     }
-                    TaskStatus::Pending => {
-                        // Check if blocked by failed dependency
+                    TaskState::Pending => {
                         let blocked_by = t.dependencies.iter().any(|dep_id| {
                             plan.tasks
                                 .iter()
                                 .find(|dt| dt.id == *dep_id)
-                                .map(|dt| dt.status == TaskStatus::Failed)
+                                .map(|dt| matches!(dt.state, TaskState::Failed { .. }))
                                 .unwrap_or(false)
                         });
                         if blocked_by {
@@ -3093,7 +3082,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             "⏳ pending".to_string()
                         }
                     }
-                    TaskStatus::Running => "▶ running".to_string(),
+                    TaskState::Running => "▶ running".to_string(),
                 };
                 format!("Task {}: {} [{}]", t.id, t.description, status_detail)
             })
@@ -3101,30 +3090,46 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .join("\n")
     }
 
-    /// Categorize a task failure error string into a human-readable category.
-    fn categorize_failure_error(error: &str) -> &'static str {
+    /// Classify a task failure error string into a structured category.
+    fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains("timed out") {
-            "timeout"
-        } else if lower.contains("context")
-            && (lower.contains("limit") || lower.contains("overflow"))
+            FailureCategory::AgentTimeout
+        } else if (lower.contains("context")
+            && (lower.contains("limit")
+                || lower.contains("overflow")
+                || lower.contains("exceeded")
+                || lower.contains("length")))
+            || lower.contains("maximum context")
+            || lower.contains("token limit")
+            || lower.contains("tokens exceeded")
+            || lower.contains("maximum number of tokens")
+            || (lower.contains("too") && lower.contains("long") && lower.contains("token"))
         {
-            "context overflow"
+            FailureCategory::ContextOverflow
         } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
-            "depth exhaustion"
+            FailureCategory::DepthExhausted
+        } else if lower.contains("duplicate call loop") {
+            FailureCategory::LoopDetected
+        } else if lower.contains("did not call submit_result") {
+            FailureCategory::SoftFailure
         } else if lower.contains("rate limit")
             || lower.contains("429")
+            || lower.contains("too many requests")
             || lower.contains("503")
             || lower.contains("502")
             || lower.contains("service unavailable")
-            || lower.contains("authentication")
+        {
+            FailureCategory::ProviderOverloaded
+        } else if lower.contains("authentication")
             || lower.contains("unauthorized")
             || lower.contains("403")
+            || lower.contains("401")
             || lower.contains("api key")
         {
-            "provider_error"
+            FailureCategory::ProviderAuthError
         } else {
-            "LLM error"
+            FailureCategory::AgentError
         }
     }
 
@@ -3138,9 +3143,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if failures.is_empty() || completed_count > 0 {
             return false;
         }
-        failures
-            .iter()
-            .all(|f| Self::categorize_failure_error(&f.error) == "provider_error")
+        failures.iter().all(|f| {
+            matches!(
+                f.category,
+                FailureCategory::ProviderOverloaded | FailureCategory::ProviderAuthError
+            )
+        })
     }
 
     /// Send an orchestrator event through the stream channel.
@@ -3194,24 +3202,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for task in &mut plan.tasks {
             if let Some(reuse_id) = task.reuse_result_from {
                 if let Some(prev_task) = previous.tasks.iter().find(|t| t.id == reuse_id) {
-                    if prev_task.status == TaskStatus::Complete {
-                        if let Some(ref result) = prev_task.result {
-                            tracing::info!(
-                                "Task {} reusing result from previous task {} ({})",
-                                task.id,
-                                reuse_id,
-                                prev_task.description
-                            );
-                            task.complete(result.clone());
-                            task.structured_output =
-                                prev_task.structured_output.clone();
-                        }
+                    if let TaskState::Complete { ref result } = prev_task.state {
+                        tracing::info!(
+                            "Task {} reusing result from previous task {} ({})",
+                            task.id,
+                            reuse_id,
+                            prev_task.description
+                        );
+                        task.complete(result.clone());
+                        task.structured_output = prev_task.structured_output.clone();
                     } else {
                         tracing::warn!(
                             "Task {} requested reuse from task {} but it was not complete (status: {:?})",
                             task.id,
                             reuse_id,
-                            prev_task.status
+                            TaskStatus::from(&prev_task.state)
                         );
                     }
                 } else {
@@ -3485,12 +3490,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let failure_summary = if has_failures {
             let failure_detail = if !this_iteration_failures.is_empty() {
-                let mut category_counts: std::collections::HashMap<&str, usize> =
+                let mut category_counts: std::collections::HashMap<FailureCategory, usize> =
                     std::collections::HashMap::new();
                 for f in this_iteration_failures {
-                    *category_counts
-                        .entry(Self::categorize_failure_error(&f.error))
-                        .or_insert(0) += 1;
+                    *category_counts.entry(f.category).or_insert(0) += 1;
                 }
                 let mut categories: Vec<_> = category_counts.into_iter().collect();
                 categories.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
@@ -3778,22 +3781,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
         out.push_str(failure_note);
         out.push_str("\n\nRaw task results:\n\n");
         for t in &plan.tasks {
-            match t.status {
-                TaskStatus::Complete => {
-                    let result = t.result.as_deref().unwrap_or("(no result)");
+            match &t.state {
+                TaskState::Complete { result } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\n{}\n\n",
                         t.id, t.description, result
                     ));
                 }
-                TaskStatus::Failed => {
-                    let err = t.error.as_deref().unwrap_or("unknown");
+                TaskState::Failed { error, .. } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\nFailed: {}\n\n",
-                        t.id, t.description, err
+                        t.id, t.description, error
                     ));
                 }
-                TaskStatus::Pending | TaskStatus::Running => {
+                TaskState::Pending | TaskState::Running => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\n(not executed)\n\n",
                         t.id, t.description
@@ -3829,21 +3830,26 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map(|t| TaskSummary {
                 task_id: t.id,
                 description: t.description.clone(),
-                status: t.status,
+                status: TaskStatus::from(&t.state),
                 worker: t.worker.clone(),
                 result_preview: t
                     .structured_output
                     .as_ref()
                     .map(|s| s.summary.clone())
-                    .or_else(|| {
-                        t.result
-                            .as_ref()
-                            .map(|r| safe_truncate(r, 200).0.to_string())
+                    .or_else(|| match &t.state {
+                        TaskState::Complete { result } => {
+                            Some(safe_truncate(result, 200).0.to_string())
+                        }
+                        _ => None,
                     }),
                 confidence: t
                     .structured_output
                     .as_ref()
                     .map(|s| s.confidence.to_string()),
+                failure_category: match &t.state {
+                    TaskState::Failed { category, .. } => Some(*category),
+                    _ => None,
+                },
             })
             .collect();
 
@@ -4162,9 +4168,10 @@ mod tests {
         assert_eq!(task.dependencies, vec![0]);
         assert_eq!(task.rationale, "depends on first");
 
-        // Verify the dependency has a result
-        let dep_result = plan.tasks[0].result.as_ref().unwrap();
-        assert_eq!(dep_result, "First result");
+        let TaskState::Complete { ref result } = plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "First result");
     }
 
     // ========================================================================
@@ -5159,18 +5166,19 @@ mod tests {
         Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
 
         // Task 0 should be marked complete with the previous result
-        assert_eq!(new_plan.tasks[0].status, TaskStatus::Complete);
-        assert_eq!(new_plan.tasks[0].result.as_deref(), Some("data result"));
+        let TaskState::Complete { ref result } = new_plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "data result");
         // Task 1 should be unchanged
-        assert_eq!(new_plan.tasks[1].status, TaskStatus::Pending);
-        assert!(new_plan.tasks[1].result.is_none());
+        assert!(matches!(new_plan.tasks[1].state, TaskState::Pending));
     }
 
     #[test]
     fn test_apply_result_reuse_ignores_failed_tasks() {
         let mut prev = Plan::new("prev");
         let mut t = Task::new(0, "Bad task", "Failed");
-        t.fail("error");
+        t.fail("error", FailureCategory::AgentError);
         prev.add_task(t);
 
         let mut new_plan = Plan::new("new");
@@ -5181,8 +5189,7 @@ mod tests {
         Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
 
         // Should NOT carry forward since previous task was failed
-        assert_eq!(new_plan.tasks[0].status, TaskStatus::Pending);
-        assert!(new_plan.tasks[0].result.is_none());
+        assert!(matches!(new_plan.tasks[0].state, TaskState::Pending));
     }
 
     #[test]
@@ -5194,7 +5201,7 @@ mod tests {
 
         // Should not panic with None previous
         Orchestrator::apply_result_reuse(&mut plan, None);
-        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
     }
 
     #[test]
@@ -5209,7 +5216,7 @@ mod tests {
 
         Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
         // Should not carry forward — task 99 doesn't exist
-        assert_eq!(new_plan.tasks[0].status, TaskStatus::Pending);
+        assert!(matches!(new_plan.tasks[0].state, TaskState::Pending));
     }
 
     // ========================================================================
@@ -5220,23 +5227,23 @@ mod tests {
     fn test_categorize_failure_provider_errors() {
         assert_eq!(
             Orchestrator::categorize_failure_error("Rate limit exceeded"),
-            "provider_error"
+            FailureCategory::ProviderOverloaded
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("HTTP 429 Too Many Requests"),
-            "provider_error"
+            FailureCategory::ProviderOverloaded
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("503 Service Unavailable"),
-            "provider_error"
+            FailureCategory::ProviderOverloaded
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Authentication failed: invalid API key"),
-            "provider_error"
+            FailureCategory::ProviderAuthError
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Unauthorized: 403"),
-            "provider_error"
+            FailureCategory::ProviderAuthError
         );
     }
 
@@ -5244,19 +5251,19 @@ mod tests {
     fn test_categorize_failure_other_categories() {
         assert_eq!(
             Orchestrator::categorize_failure_error("Request timed out after 30s"),
-            "timeout"
+            FailureCategory::AgentTimeout
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("context limit exceeded"),
-            "context overflow"
+            FailureCategory::ContextOverflow
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("MaxDepthError: reached limit"),
-            "depth exhaustion"
+            FailureCategory::DepthExhausted
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Something went wrong"),
-            "LLM error"
+            FailureCategory::AgentError
         );
     }
 
@@ -5265,11 +5272,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_failure(error: &str) -> FailedTaskRecord {
+        let category = Orchestrator::categorize_failure_error(error);
         FailedTaskRecord {
             description: "test task".into(),
             error: error.into(),
             iteration: 1,
             worker: None,
+            category,
         }
     }
 
@@ -5310,5 +5319,93 @@ mod tests {
     #[test]
     fn test_should_not_short_circuit_empty_failures() {
         assert!(!Orchestrator::should_short_circuit_provider_errors(&[], 0));
+    }
+
+    #[test]
+    fn test_categorize_failure_loop_detected() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Worker blocked by duplicate call loop"),
+            FailureCategory::LoopDetected
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_soft_failure() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Worker did not call submit_result"),
+            FailureCategory::SoftFailure
+        );
+    }
+
+    #[test]
+    fn test_categorize_provider_overloaded_vs_auth() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Rate limit exceeded (429)"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("503 Service Unavailable"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("403 Forbidden"),
+            FailureCategory::ProviderAuthError
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("401 Unauthorized"),
+            FailureCategory::ProviderAuthError
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Invalid API key"),
+            FailureCategory::ProviderAuthError
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_context_overflow_token_patterns() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("token limit reached"),
+            FailureCategory::ContextOverflow
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("maximum number of tokens exceeded"),
+            FailureCategory::ContextOverflow
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("maximum context length"),
+            FailureCategory::ContextOverflow
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Input too long for token window"),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_502_provider_overloaded() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("502 Bad Gateway"),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_precedence_timeout_before_provider() {
+        // "timed out" should match AgentTimeout even if message also contains "503"
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Request timed out after 503 retries"),
+            FailureCategory::AgentTimeout
+        );
+    }
+
+    #[test]
+    fn test_should_short_circuit_both_provider_categories() {
+        let failures = vec![
+            make_failure("Rate limit exceeded"),
+            make_failure("Authentication failed"),
+        ];
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
     }
 }
