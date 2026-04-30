@@ -1,0 +1,125 @@
+# SRE + Scratchpad E2E Test Config
+#
+# Based on sre-orchestration-with-scratchpad.toml with broadened
+# scratchpad globs to cover prometheus_* tools (18KB in verbose mode).
+#
+# Prerequisites:
+#   docker build -t k8s-sre-mcp:local tests/integration/k8s-sre-mcp
+#   docker run -p 8082:8082 -e VERBOSE_MODE=true k8s-sre-mcp:local
+#
+# Run:
+#   CONFIG_PATH=configs/sre-scratchpad-e2e.toml \
+#   OPENAI_API_KEY=sk-... \
+#   AURA_CUSTOM_EVENTS=true \
+#   cargo run --bin aura-web-server
+#
+# Test queries (matching BUILTIN_ASSERTIONS_SRE_SCRATCHPAD):
+#   direct:          "What namespaces exist in the cluster?"
+#   orchestrated:    "Discover workloads in production, check Prometheus targets, create ServiceMonitors for unmonitored services"
+#   multi-task-rich: "Investigate Prometheus target health and suggest remediations for any broken exporters"
+
+memory_dir = "/tmp/aura-sre-scratchpad-e2e"
+
+[agent]
+name = "SRE Orchestrator (+scratchpad)"
+system_prompt = """
+You are an SRE assistant coordinator. You decompose Kubernetes observability
+tasks into specialized sub-tasks and delegate to the appropriate worker.
+
+ROUTING GUIDANCE:
+- Workload discovery, namespace listing, service inspection: delegate to k8s-discovery
+- Prometheus queries, target health, metric metadata: delegate to prometheus-analyst
+- Creating ServiceMonitors, alerting rules, applying manifests: delegate to monitoring-engineer
+- Multi-domain tasks (e.g., discover then monitor): create a plan with multiple workers
+- Simple factual questions about the cluster: answer directly if possible
+"""
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+temperature = 0.3
+context_window = 200_000
+
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.20
+max_extraction_tokens = 10_000
+turn_depth_bonus = 6
+
+[mcp]
+sanitize_schemas = false
+
+[mcp.servers.k8s-sre]
+transport = "http_streamable"
+url = "http://{{ env.K8S_SRE_MCP_HOST | default: '127.0.0.1' }}:8082/mcp"
+headers = {}
+description = "Kubernetes SRE tools: cluster discovery, Prometheus metrics, Alertmanager rules, and ServiceMonitor management"
+
+[mcp.servers.k8s-sre.scratchpad]
+"*_list_*" = { min_tokens = 512 }
+"*_get_*" = { min_tokens = 256 }
+"prometheus_*" = { min_tokens = 512 }
+"k8s_list_service_monitors" = { min_tokens = 384 }
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+quality_threshold = 0.7
+
+allow_direct_answers = true
+allow_clarification = true
+
+tools_in_planning = "summary"
+
+[orchestration.timeouts]
+per_call_timeout_secs = 180
+
+[orchestration.worker.k8s-discovery]
+description = "Kubernetes workload and service discovery: list namespaces, workloads, services, and inspect details"
+turn_depth = 8
+mcp_filter = [
+  "k8s_list_namespaces",
+  "k8s_list_workloads",
+  "k8s_get_workload",
+  "k8s_list_services",
+  "k8s_get_service",
+]
+preamble = """
+You are a Kubernetes Discovery Specialist. Use your tools to explore the cluster.
+Always use tools — do not guess or fabricate cluster state.
+Report workload names, kinds, replicas, labels, ports, and annotations.
+"""
+
+[orchestration.worker.prometheus-analyst]
+description = "Prometheus metrics analysis: query metrics, check targets, inspect metadata and labels"
+turn_depth = 8
+mcp_filter = [
+  "prometheus_query",
+  "prometheus_targets",
+  "prometheus_metric_metadata",
+  "prometheus_label_values",
+]
+preamble = """
+You are a Prometheus Analyst. Use your tools to query and analyze metrics.
+Always call the appropriate tool — do not fabricate metric values.
+Report query results clearly with metric names, labels, and values.
+"""
+
+[orchestration.worker.monitoring-engineer]
+description = "Monitoring configuration: create ServiceMonitors, apply manifests, manage alerting rules"
+turn_depth = 8
+mcp_filter = [
+  "k8s_apply_manifest",
+  "k8s_list_service_monitors",
+  "alertmanager_get_status",
+  "alertmanager_get_alerts",
+  "alertmanager_get_rules",
+  "alertmanager_create_rule",
+]
+preamble = """
+You are a Monitoring Engineer. Use your tools to configure observability.
+When creating ServiceMonitors, generate valid YAML with correct apiVersion,
+kind, metadata, and spec. When creating alert rules, provide meaningful
+expressions and annotations. Always verify existing monitors before creating duplicates.
+"""

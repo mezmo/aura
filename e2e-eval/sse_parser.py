@@ -331,7 +331,7 @@ def parse_sse_file(path: Path) -> dict:
     scratchpad_tokens_intercepted = 0
     scratchpad_tokens_extracted = 0
     for event_name, data in event_data_pairs:
-        if event_name == "aura.orchestrator.scratchpad_usage" and data:
+        if event_name == "aura.scratchpad_usage" and data:
             try:
                 payload = json.loads(data)
                 scratchpad_tokens_intercepted = payload.get("tokens_intercepted", 0)

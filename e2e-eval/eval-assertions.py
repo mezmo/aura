@@ -151,6 +151,103 @@ BUILTIN_ASSERTIONS_SCRATCHPAD = {
 }
 
 
+# ── Built-in Assertions for SRE (k8s-sre-mcp verbose_data) ──────────
+
+BUILTIN_ASSERTIONS_SRE = {
+    "direct": {
+        # "What namespaces exist in the cluster?"
+        # All 7 namespaces from verbose_data.NAMESPACES should be listed.
+        "answer_contains": [
+            "production",
+            "staging",
+            "kube-system",
+            "monitoring",
+            "cert-manager",
+            "istio-system",
+            "logging",
+        ],
+    },
+    "orchestrated": {
+        # "Discover workloads in production, check Prometheus targets,
+        #  create ServiceMonitors for unmonitored services"
+        "answer_contains": [
+            "payment-service",
+            "user-api",
+            "order-service",
+            "inventory-api",
+            "search-service",
+            "nginx-ingress",
+            "Prometheus",
+            "ServiceMonitor",
+        ],
+    },
+    "multi-task-rich": {
+        # "Investigate Prometheus target health and suggest remediations
+        #  for any broken exporters"
+        "answer_contains": [
+            "HighErrorRate",
+            "PodCrashLoopBackOff",
+            "HighMemoryUsage",
+            "HighLatencyP99",
+            "payment-service",
+            "search-service",
+            "nginx",
+            "restart",
+        ],
+    },
+}
+
+# ── Hybrid SRE + Scratchpad (fact-coverage + interception checks) ────
+
+BUILTIN_ASSERTIONS_SRE_SCRATCHPAD = {
+    "direct": {
+        # Namespace listing — k8s_list_namespaces returns ~97 bytes,
+        # too small for scratchpad interception even in verbose mode.
+        "answer_contains": [
+            "production",
+            "staging",
+            "kube-system",
+            "monitoring",
+            "cert-manager",
+            "istio-system",
+            "logging",
+        ],
+        "scratchpad_intercepted": False,
+    },
+    "orchestrated": {
+        # Multi-worker workflow — k8s_list_workloads returns ~101KB in
+        # verbose mode, which WILL trigger scratchpad interception.
+        "answer_contains": [
+            "payment-service",
+            "user-api",
+            "order-service",
+            "inventory-api",
+            "search-service",
+            "nginx-ingress",
+            "Prometheus",
+            "ServiceMonitor",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1,
+    },
+    "multi-task-rich": {
+        # Alert investigation — multiple large tool calls across domains.
+        "answer_contains": [
+            "HighErrorRate",
+            "PodCrashLoopBackOff",
+            "HighMemoryUsage",
+            "HighLatencyP99",
+            "payment-service",
+            "search-service",
+            "nginx",
+            "restart",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1,
+    },
+}
+
+
 @dataclass
 class AssertionResult:
     """Result of a single assertion check."""
@@ -396,6 +493,10 @@ def load_assertions_config(config_path: Path) -> dict:
 def collect_sse_files(results_dir: Path) -> dict[str, list[tuple[str, int, Path]]]:
     """Collect SSE files grouped by prompt label.
 
+    Supports two result-dir layouts:
+      - run-model-comparison.sh:  {model}/iter-{N}/{label}.sse
+      - run-session-e2e.sh:       {model}/{label}.sse  (single iteration)
+
     Returns: {prompt_label: [(model, iteration, path), ...]}
     """
     files_by_prompt = defaultdict(list)
@@ -404,13 +505,20 @@ def collect_sse_files(results_dir: Path) -> dict[str, list[tuple[str, int, Path]
         if not model_dir.is_dir() or model_dir.name in ("__pycache__", "results.csv"):
             continue
         model = model_dir.name
+
+        # Layout A: {model}/iter-N/{label}.sse
+        found_iter = False
         for iter_dir in sorted(model_dir.iterdir()):
-            if not iter_dir.is_dir() or not iter_dir.name.startswith("iter-"):
-                continue
-            iteration = int(iter_dir.name.split("-")[1])
-            for sse_file in sorted(iter_dir.glob("*.sse")):
-                label = sse_file.stem
-                files_by_prompt[label].append((model, iteration, sse_file))
+            if iter_dir.is_dir() and iter_dir.name.startswith("iter-"):
+                found_iter = True
+                iteration = int(iter_dir.name.split("-")[1])
+                for sse_file in sorted(iter_dir.glob("*.sse")):
+                    files_by_prompt[sse_file.stem].append((model, iteration, sse_file))
+
+        # Layout B (session-e2e): {model}/{label}.sse  (treat as iteration 1)
+        if not found_iter:
+            for sse_file in sorted(model_dir.glob("*.sse")):
+                files_by_prompt[sse_file.stem].append((model, 1, sse_file))
 
     return dict(files_by_prompt)
 
@@ -420,12 +528,16 @@ def detect_prompt_set(prompt_labels: set[str]) -> str:
     if any(label.startswith("sp-") for label in prompt_labels):
         return "scratchpad"
 
+    sre_labels = set(BUILTIN_ASSERTIONS_SRE.keys())
     independent_labels = set(BUILTIN_ASSERTIONS.keys())
     dependent_labels = set(BUILTIN_ASSERTIONS_DEPENDENT.keys())
 
     independent_overlap = prompt_labels & independent_labels
     dependent_overlap = prompt_labels & dependent_labels
+    sre_overlap = prompt_labels & sre_labels
 
+    if len(sre_overlap) >= 2:
+        return "sre"
     if len(dependent_overlap) > len(independent_overlap):
         return "dependent"
     return "independent"
@@ -452,9 +564,15 @@ def main():
         help="Output results as JSON",
     )
     parser.add_argument(
-        "--prompt-set", choices=["independent", "dependent", "scratchpad", "auto"],
+        "--prompt-set",
+        choices=["independent", "dependent", "scratchpad", "sre", "sre-scratchpad", "auto"],
         default="auto",
         help="Which built-in assertion set to use (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--csv", type=Path, default=None,
+        help="Append per-prompt coverage rows to this CSV path "
+        "(columns: results_dir, model, iteration, prompt, passed, total, coverage_pct).",
     )
     args = parser.parse_args()
 
@@ -479,6 +597,10 @@ def main():
 
         if prompt_set == "scratchpad":
             assertions = BUILTIN_ASSERTIONS_SCRATCHPAD
+        elif prompt_set == "sre-scratchpad":
+            assertions = BUILTIN_ASSERTIONS_SRE_SCRATCHPAD
+        elif prompt_set == "sre":
+            assertions = BUILTIN_ASSERTIONS_SRE
         elif prompt_set == "dependent":
             assertions = BUILTIN_ASSERTIONS_DEPENDENT
         else:
@@ -572,6 +694,31 @@ def main():
             for r in all_results:
                 if not r.passed:
                     print(f"  [{r.model}] {r.prompt} / {r.check}: {r.detail}")
+
+    if args.csv:
+        import csv
+        by_triple = defaultdict(list)
+        for r in all_results:
+            by_triple[(r.model, r.iteration, r.prompt)].append(r)
+
+        write_header = not args.csv.exists()
+        with args.csv.open("a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow([
+                    "results_dir", "model", "iteration", "prompt",
+                    "passed", "total", "coverage_pct",
+                ])
+            for (model, iteration, prompt), rs in sorted(by_triple.items()):
+                passed = sum(1 for r in rs if r.passed)
+                total_r = len(rs)
+                pct = round(100.0 * passed / total_r, 1) if total_r else 0.0
+                w.writerow([
+                    str(args.results_dir), model, iteration, prompt,
+                    passed, total_r, pct,
+                ])
+        if not args.json:
+            print(f"\n[csv] Appended {len(by_triple)} prompt-level rows -> {args.csv}")
 
     sys.exit(0 if fail_count == 0 else 1)
 
