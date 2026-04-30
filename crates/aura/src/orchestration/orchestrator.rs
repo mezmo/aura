@@ -3582,7 +3582,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
     async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
-        use super::persistence::{RunManifest, RunStatus, TaskSummary};
+        use super::persistence::{
+            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
+            ToolOutcome, ToolTraceEntry,
+        };
         use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
@@ -3596,10 +3599,69 @@ Assign tasks to the worker whose tools best match the required operations."#,
             RunStatus::Failed
         };
 
-        let task_summaries = plan
-            .tasks
-            .iter()
-            .map(|t| TaskSummary {
+        let artifacts_meta = match persistence.list_artifacts_with_metadata().await {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!("Failed to list artifacts for manifest: {}", e);
+                Vec::new()
+            }
+        };
+
+        let mut task_summaries = Vec::with_capacity(plan.tasks.len());
+
+        for t in &plan.tasks {
+            let task_prefix = format!("task-{}-", t.id);
+            let task_artifacts: Vec<ArtifactEntry> = artifacts_meta
+                .iter()
+                .filter(|(name, _)| name.starts_with(&task_prefix))
+                .map(|(name, size)| ArtifactEntry {
+                    filename: name.clone(),
+                    size_bytes: *size,
+                    kind: artifact_kind_from_filename(name),
+                })
+                .collect();
+
+            let tool_records = persistence.load_tool_records_for_task(t.id).await;
+            let tool_trace: Vec<ToolTraceEntry> = tool_records
+                .iter()
+                .map(|r| ToolTraceEntry {
+                    tool: r.tool.clone(),
+                    reasoning: r.reasoning.clone(),
+                    duration_ms: r.duration_ms,
+                    outcome: if let Some(ref err) = r.error {
+                        ToolOutcome::Error {
+                            message: err.clone(),
+                        }
+                    } else {
+                        ToolOutcome::Success {
+                            output_bytes: r
+                                .output
+                                .as_ref()
+                                .map(|o| o.len() as u64)
+                                .unwrap_or(0),
+                        }
+                    },
+                    artifact_filename: r.artifact_filename.clone(),
+                })
+                .collect();
+
+            let (error, error_context) = match &t.state {
+                TaskState::Failed { error, category } => {
+                    let last_tool = tool_trace.last().map(|tr| tr.tool.clone());
+                    (
+                        Some(error.clone()),
+                        Some(ErrorContext {
+                            category: *category,
+                            last_tool_call: last_tool,
+                            attempt_count: 1,
+                            partial_result: None,
+                        }),
+                    )
+                }
+                _ => (None, None),
+            };
+
+            task_summaries.push(TaskSummary {
                 task_id: t.id,
                 description: t.description.clone(),
                 status: TaskStatus::from(&t.state),
@@ -3622,16 +3684,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     TaskState::Failed { category, .. } => Some(*category),
                     _ => None,
                 },
-            })
-            .collect();
+                error,
+                error_context,
+                tool_trace,
+                artifacts: task_artifacts,
+            });
+        }
 
-        let artifact_paths = match persistence.list_artifacts().await {
-            Ok(paths) => paths,
-            Err(e) => {
-                tracing::warn!("Failed to list artifacts for manifest: {}", e);
-                Vec::new()
-            }
-        };
+        let artifact_paths = artifacts_meta.into_iter().map(|(name, _)| name).collect();
 
         let manifest = RunManifest {
             run_id: persistence.run_id().to_string(),
@@ -3654,6 +3714,40 @@ Assign tasks to the worker whose tools best match the required operations."#,
 // StreamingAgent is implemented by OrchestratorFactory (see factory.rs),
 // which creates an Orchestrator lazily inside stream() to avoid duplicate
 // MCP connections and persistence directories.
+
+/// Determine artifact kind from the filename convention.
+///
+/// Filenames ending in `-result.txt` are worker result artifacts.
+/// Filenames ending in `-output.txt` are promoted tool output artifacts;
+/// the tool name is extracted from the filename structure.
+fn artifact_kind_from_filename(filename: &str) -> super::persistence::ArtifactKind {
+    use super::persistence::ArtifactKind;
+    if filename.ends_with("-result.txt") {
+        ArtifactKind::Result
+    } else if filename.ends_with("-output.txt") {
+        // Format: task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt
+        // Extract tool_name: split by '-', skip known prefix segments, take up to call_idx
+        let without_suffix = filename.trim_end_matches("-output.txt");
+        let parts: Vec<&str> = without_suffix.split('-').collect();
+        // Find "iter" marker position, tool_name segments follow iter-{n}
+        let tool_name = parts
+            .iter()
+            .position(|&p| p == "iter")
+            .and_then(|iter_pos| {
+                // Skip iter-{n}, take segments up to the last one (call_idx)
+                let after_iter = &parts[iter_pos + 2..];
+                if after_iter.len() > 1 {
+                    Some(after_iter[..after_iter.len() - 1].join("-"))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        ArtifactKind::ToolOutput { tool_name }
+    } else {
+        ArtifactKind::Result
+    }
+}
 
 /// Truncate a query string for logging.
 fn truncate_query(query: &str, max_len: usize) -> String {
@@ -5171,5 +5265,40 @@ mod tests {
         assert!(Orchestrator::should_short_circuit_provider_errors(
             &failures, 0
         ));
+    }
+
+    // ========================================================================
+    // Artifact Kind From Filename Tests
+    // ========================================================================
+
+    #[test]
+    fn test_artifact_kind_from_filename_result() {
+        use crate::orchestration::persistence::ArtifactKind;
+        let kind = artifact_kind_from_filename("task-0-sre-iter-1-result.txt");
+        assert!(matches!(kind, ArtifactKind::Result));
+    }
+
+    #[test]
+    fn test_artifact_kind_from_filename_tool_output() {
+        use crate::orchestration::persistence::ArtifactKind;
+        let kind = artifact_kind_from_filename("task-0-sre-iter-1-log-search-0-output.txt");
+        match kind {
+            ArtifactKind::ToolOutput { tool_name } => {
+                assert_eq!(tool_name, "log-search");
+            }
+            _ => panic!("Expected ToolOutput"),
+        }
+    }
+
+    #[test]
+    fn test_artifact_kind_from_filename_multi_segment_tool() {
+        use crate::orchestration::persistence::ArtifactKind;
+        let kind = artifact_kind_from_filename("task-2-ops-iter-1-my-search-tool-3-output.txt");
+        match kind {
+            ArtifactKind::ToolOutput { tool_name } => {
+                assert_eq!(tool_name, "my-search-tool");
+            }
+            _ => panic!("Expected ToolOutput"),
+        }
     }
 }
