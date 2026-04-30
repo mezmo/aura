@@ -117,6 +117,9 @@ pub struct TaskSummary {
     /// Worker-reported confidence from `submit_result` (high/medium/low).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<String>,
+    /// Structured failure classification (if failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<super::types::FailureCategory>,
 }
 
 /// Overall outcome of an orchestration run.
@@ -964,6 +967,7 @@ mod tests {
                     worker: Some("research".to_string()),
                     result_preview: Some("The answer is 42".to_string()),
                     confidence: None,
+                    failure_category: None,
                 },
                 TaskSummary {
                     task_id: 1,
@@ -972,6 +976,7 @@ mod tests {
                     worker: None,
                     result_preview: None,
                     confidence: None,
+                    failure_category: Some(super::super::types::FailureCategory::AgentError),
                 },
             ],
             artifact_paths: vec!["task-0-research-iter-1-result.txt".to_string()],
@@ -1073,6 +1078,7 @@ mod tests {
                 worker: Some("statistics".to_string()),
                 result_preview: Some("Result: 20".to_string()),
                 confidence: None,
+                failure_category: None,
             }],
             artifact_paths: vec![],
         }
@@ -1276,6 +1282,7 @@ mod tests {
                 worker: Some("worker1".to_string()),
                 result_preview: Some("Connection refused".to_string()),
                 confidence: None,
+                failure_category: Some(super::super::types::FailureCategory::AgentError),
             }],
             artifact_paths: vec![],
         };
