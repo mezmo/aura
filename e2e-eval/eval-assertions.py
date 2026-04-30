@@ -110,6 +110,66 @@ BUILTIN_ASSERTIONS_DEPENDENT = {
     },
 }
 
+# ── SRE / k8s-sre-mcp VERBOSE-mode fact-coverage assertions ──────────
+#
+# Fact lists are derived from tests/integration/k8s-sre-mcp/verbose_data.py.
+# Scoring is per-fact — an answer gets fact_coverage = matched / total.
+# No strict routing/worker checks because model choice varies the path
+# (direct vs orchestrated vs multi-iteration are all legitimate for SRE).
+# `answer_contains_any` relaxes to pass if ≥1 substring matches; the
+# list is long so the per-fact breakdown is the real signal (coverage%).
+BUILTIN_ASSERTIONS_SRE = {
+    "direct": {
+        # "What namespaces exist in the cluster?"
+        # All 7 namespaces from verbose_data.NAMESPACES should be listed.
+        "answer_contains": [
+            "production",
+            "staging",
+            "kube-system",
+            "monitoring",
+            "cert-manager",
+            "istio-system",
+            "logging",
+        ],
+    },
+    "orchestrated": {
+        # "Discover workloads in production, check Prometheus targets,
+        #  create ServiceMonitors for unmonitored services"
+        # Expected: production workloads + prometheus target references +
+        # ServiceMonitor creation/identification.
+        "answer_contains": [
+            # Production workloads (from verbose_data production namespace)
+            "payment-service",
+            "user-api",
+            "order-service",
+            "inventory-api",
+            "search-service",
+            "nginx-ingress",
+            # Prometheus / monitoring concepts
+            "Prometheus",
+            "ServiceMonitor",
+        ],
+    },
+    "multi-task-rich": {
+        # "Investigate Prometheus target health and suggest remediations
+        #  for any broken exporters"
+        # Expected: specific firing alerts / broken targets + remediation language.
+        "answer_contains": [
+            # Firing/broken alert identifiers
+            "HighErrorRate",
+            "PodCrashLoopBackOff",
+            "HighMemoryUsage",
+            "HighLatencyP99",
+            # Affected components
+            "payment-service",
+            "search-service",
+            "nginx",
+            # Remediation intent language
+            "restart",
+        ],
+    },
+}
+
 
 @dataclass
 class AssertionResult:
@@ -294,6 +354,10 @@ def load_assertions_config(config_path: Path) -> dict:
 def collect_sse_files(results_dir: Path) -> dict[str, list[tuple[str, int, Path]]]:
     """Collect SSE files grouped by prompt label.
 
+    Supports two result-dir layouts:
+      - run-model-comparison.sh:  {model}/iter-{N}/{label}.sse
+      - run-session-e2e.sh:       {model}/{label}.sse  (single iteration)
+
     Returns: {prompt_label: [(model, iteration, path), ...]}
     """
     files_by_prompt = defaultdict(list)
@@ -302,13 +366,20 @@ def collect_sse_files(results_dir: Path) -> dict[str, list[tuple[str, int, Path]
         if not model_dir.is_dir() or model_dir.name in ("__pycache__", "results.csv"):
             continue
         model = model_dir.name
+
+        # Layout A: {model}/iter-N/{label}.sse
+        found_iter = False
         for iter_dir in sorted(model_dir.iterdir()):
-            if not iter_dir.is_dir() or not iter_dir.name.startswith("iter-"):
-                continue
-            iteration = int(iter_dir.name.split("-")[1])
-            for sse_file in sorted(iter_dir.glob("*.sse")):
-                label = sse_file.stem
-                files_by_prompt[label].append((model, iteration, sse_file))
+            if iter_dir.is_dir() and iter_dir.name.startswith("iter-"):
+                found_iter = True
+                iteration = int(iter_dir.name.split("-")[1])
+                for sse_file in sorted(iter_dir.glob("*.sse")):
+                    files_by_prompt[sse_file.stem].append((model, iteration, sse_file))
+
+        # Layout B (session-e2e): {model}/{label}.sse  (treat as iteration 1)
+        if not found_iter:
+            for sse_file in sorted(model_dir.glob("*.sse")):
+                files_by_prompt[sse_file.stem].append((model, 1, sse_file))
 
     return dict(files_by_prompt)
 
@@ -317,10 +388,17 @@ def detect_prompt_set(prompt_labels: set[str]) -> str:
     """Detect which prompt set was used based on prompt labels found."""
     independent_labels = set(BUILTIN_ASSERTIONS.keys())
     dependent_labels = set(BUILTIN_ASSERTIONS_DEPENDENT.keys())
+    sre_labels = set(BUILTIN_ASSERTIONS_SRE.keys())
 
     independent_overlap = prompt_labels & independent_labels
     dependent_overlap = prompt_labels & dependent_labels
+    sre_overlap = prompt_labels & sre_labels
 
+    # SRE labels are distinctive ({"direct", "orchestrated", "multi-task-rich"}).
+    # "direct" also appears in some generic sets, so only pick SRE when at least
+    # two SRE-specific labels match.
+    if len(sre_overlap) >= 2:
+        return "sre"
     if len(dependent_overlap) > len(independent_overlap):
         return "dependent"
     return "independent"
@@ -347,9 +425,14 @@ def main():
         help="Output results as JSON",
     )
     parser.add_argument(
-        "--prompt-set", choices=["independent", "dependent", "auto"],
+        "--prompt-set", choices=["independent", "dependent", "sre", "auto"],
         default="auto",
         help="Which built-in assertion set to use (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--csv", type=Path, default=None,
+        help="Append per-prompt coverage rows to this CSV path "
+        "(columns: results_dir, model, iteration, prompt, passed, total, coverage_pct).",
     )
     args = parser.parse_args()
 
@@ -374,6 +457,8 @@ def main():
 
         if prompt_set == "dependent":
             assertions = BUILTIN_ASSERTIONS_DEPENDENT
+        elif prompt_set == "sre":
+            assertions = BUILTIN_ASSERTIONS_SRE
         else:
             assertions = BUILTIN_ASSERTIONS
 
@@ -465,6 +550,33 @@ def main():
             for r in all_results:
                 if not r.passed:
                     print(f"  [{r.model}] {r.prompt} / {r.check}: {r.detail}")
+
+    # Optional: emit per-prompt coverage rows to CSV
+    if args.csv:
+        import csv
+        # Group by (model, iteration, prompt) for coverage aggregation
+        by_triple = defaultdict(list)
+        for r in all_results:
+            by_triple[(r.model, r.iteration, r.prompt)].append(r)
+
+        write_header = not args.csv.exists()
+        with args.csv.open("a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow([
+                    "results_dir", "model", "iteration", "prompt",
+                    "passed", "total", "coverage_pct",
+                ])
+            for (model, iteration, prompt), rs in sorted(by_triple.items()):
+                passed = sum(1 for r in rs if r.passed)
+                total = len(rs)
+                pct = round(100.0 * passed / total, 1) if total else 0.0
+                w.writerow([
+                    str(args.results_dir), model, iteration, prompt,
+                    passed, total, pct,
+                ])
+        if not args.json:
+            print(f"\n[csv] Appended {len(by_triple)} prompt-level rows → {args.csv}")
 
     sys.exit(0 if fail_count == 0 else 1)
 
