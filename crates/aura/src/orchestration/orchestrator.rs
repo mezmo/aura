@@ -63,7 +63,7 @@ use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
-    PlanAttemptFailure, PlanningResponse, Task, TaskStatus,
+    PlanAttemptFailure, PlanningResponse, Task, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -2513,13 +2513,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> Vec<super::types::FailedTaskRecord> {
         plan.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Failed)
-            .map(|t| super::types::FailedTaskRecord {
-                description: t.description.clone(),
-                error: t.error.clone().unwrap_or_else(|| "unknown".to_string()),
-                iteration,
-                worker: t.worker.clone(),
-                category: t.failure_category.unwrap_or_default(),
+            .filter_map(|t| match &t.state {
+                TaskState::Failed { error, category } => Some(super::types::FailedTaskRecord {
+                    description: t.description.clone(),
+                    error: error.clone(),
+                    iteration,
+                    worker: t.worker.clone(),
+                    category: *category,
+                }),
+                _ => None,
             })
             .collect()
     }
@@ -2594,16 +2596,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan.tasks
                         .iter()
                         .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| {
-                            dep_task.result.as_ref().map(|result| {
-                                format!(
-                                    "{} — Task {} ({}):\n{}",
-                                    sections::PRIOR_WORK,
-                                    dep_task.id,
-                                    dep_task.description,
-                                    result
-                                )
-                            })
+                        .and_then(|dep_task| match &dep_task.state {
+                            TaskState::Complete { result } => Some(format!(
+                                "{} — Task {} ({}):\n{}",
+                                sections::PRIOR_WORK,
+                                dep_task.id,
+                                dep_task.description,
+                                result
+                            )),
+                            _ => None,
                         })
                 })
                 .collect();
@@ -2832,22 +2833,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan.tasks
             .iter()
             .map(|t| {
-                let status_detail = match t.status {
-                    TaskStatus::Complete => {
-                        let len = t.result.as_ref().map(|r| r.len()).unwrap_or(0);
-                        format!("✓ complete ({} chars)", len)
+                let status_detail = match &t.state {
+                    TaskState::Complete { result } => {
+                        format!("✓ complete ({} chars)", result.len())
                     }
-                    TaskStatus::Failed => {
-                        let err = t.error.as_deref().unwrap_or("unknown error");
-                        format!("✗ failed: {}", err)
+                    TaskState::Failed { error, .. } => {
+                        format!("✗ failed: {}", error)
                     }
-                    TaskStatus::Pending => {
-                        // Check if blocked by failed dependency
+                    TaskState::Pending => {
                         let blocked_by = t.dependencies.iter().any(|dep_id| {
                             plan.tasks
                                 .iter()
                                 .find(|dt| dt.id == *dep_id)
-                                .map(|dt| dt.status == TaskStatus::Failed)
+                                .map(|dt| matches!(dt.state, TaskState::Failed { .. }))
                                 .unwrap_or(false)
                         });
                         if blocked_by {
@@ -2856,7 +2854,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             "⏳ pending".to_string()
                         }
                     }
-                    TaskStatus::Running => "▶ running".to_string(),
+                    TaskState::Running => "▶ running".to_string(),
                 };
                 format!("Task {}: {} [{}]", t.id, t.description, status_detail)
             })
@@ -2976,24 +2974,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for task in &mut plan.tasks {
             if let Some(reuse_id) = task.reuse_result_from {
                 if let Some(prev_task) = previous.tasks.iter().find(|t| t.id == reuse_id) {
-                    if prev_task.status == TaskStatus::Complete {
-                        if let Some(ref result) = prev_task.result {
-                            tracing::info!(
-                                "Task {} reusing result from previous task {} ({})",
-                                task.id,
-                                reuse_id,
-                                prev_task.description
-                            );
-                            task.complete(result.clone());
-                            task.structured_output =
-                                prev_task.structured_output.clone();
-                        }
+                    if let TaskState::Complete { ref result } = prev_task.state {
+                        tracing::info!(
+                            "Task {} reusing result from previous task {} ({})",
+                            task.id,
+                            reuse_id,
+                            prev_task.description
+                        );
+                        task.complete(result.clone());
+                        task.structured_output = prev_task.structured_output.clone();
                     } else {
                         tracing::warn!(
                             "Task {} requested reuse from task {} but it was not complete (status: {:?})",
                             task.id,
                             reuse_id,
-                            prev_task.status
+                            TaskStatus::from(&prev_task.state)
                         );
                     }
                 } else {
@@ -3558,22 +3553,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
         out.push_str(failure_note);
         out.push_str("\n\nRaw task results:\n\n");
         for t in &plan.tasks {
-            match t.status {
-                TaskStatus::Complete => {
-                    let result = t.result.as_deref().unwrap_or("(no result)");
+            match &t.state {
+                TaskState::Complete { result } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\n{}\n\n",
                         t.id, t.description, result
                     ));
                 }
-                TaskStatus::Failed => {
-                    let err = t.error.as_deref().unwrap_or("unknown");
+                TaskState::Failed { error, .. } => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\nFailed: {}\n\n",
-                        t.id, t.description, err
+                        t.id, t.description, error
                     ));
                 }
-                TaskStatus::Pending | TaskStatus::Running => {
+                TaskState::Pending | TaskState::Running => {
                     out.push_str(&format!(
                         "## Task {}: {}\n\n(not executed)\n\n",
                         t.id, t.description
@@ -3609,22 +3602,26 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map(|t| TaskSummary {
                 task_id: t.id,
                 description: t.description.clone(),
-                status: t.status,
+                status: TaskStatus::from(&t.state),
                 worker: t.worker.clone(),
                 result_preview: t
                     .structured_output
                     .as_ref()
                     .map(|s| s.summary.clone())
-                    .or_else(|| {
-                        t.result
-                            .as_ref()
-                            .map(|r| safe_truncate(r, 200).0.to_string())
+                    .or_else(|| match &t.state {
+                        TaskState::Complete { result } => {
+                            Some(safe_truncate(result, 200).0.to_string())
+                        }
+                        _ => None,
                     }),
                 confidence: t
                     .structured_output
                     .as_ref()
                     .map(|s| s.confidence.to_string()),
-                failure_category: t.failure_category,
+                failure_category: match &t.state {
+                    TaskState::Failed { category, .. } => Some(*category),
+                    _ => None,
+                },
             })
             .collect();
 
@@ -3943,9 +3940,10 @@ mod tests {
         assert_eq!(task.dependencies, vec![0]);
         assert_eq!(task.rationale, "depends on first");
 
-        // Verify the dependency has a result
-        let dep_result = plan.tasks[0].result.as_ref().unwrap();
-        assert_eq!(dep_result, "First result");
+        let TaskState::Complete { ref result } = plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "First result");
     }
 
     // ========================================================================
@@ -4932,11 +4930,12 @@ mod tests {
         Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
 
         // Task 0 should be marked complete with the previous result
-        assert_eq!(new_plan.tasks[0].status, TaskStatus::Complete);
-        assert_eq!(new_plan.tasks[0].result.as_deref(), Some("data result"));
+        let TaskState::Complete { ref result } = new_plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "data result");
         // Task 1 should be unchanged
-        assert_eq!(new_plan.tasks[1].status, TaskStatus::Pending);
-        assert!(new_plan.tasks[1].result.is_none());
+        assert!(matches!(new_plan.tasks[1].state, TaskState::Pending));
     }
 
     #[test]
@@ -4954,8 +4953,7 @@ mod tests {
         Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
 
         // Should NOT carry forward since previous task was failed
-        assert_eq!(new_plan.tasks[0].status, TaskStatus::Pending);
-        assert!(new_plan.tasks[0].result.is_none());
+        assert!(matches!(new_plan.tasks[0].state, TaskState::Pending));
     }
 
     #[test]
@@ -4967,7 +4965,7 @@ mod tests {
 
         // Should not panic with None previous
         Orchestrator::apply_result_reuse(&mut plan, None);
-        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
     }
 
     #[test]
@@ -4982,7 +4980,7 @@ mod tests {
 
         Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
         // Should not carry forward — task 99 doesn't exist
-        assert_eq!(new_plan.tasks[0].status, TaskStatus::Pending);
+        assert!(matches!(new_plan.tasks[0].state, TaskState::Pending));
     }
 
     // ========================================================================

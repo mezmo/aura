@@ -76,5 +76,5 @@ pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 pub use prompt_constants::{context, fields, sections};
 pub use types::{
     Plan, PlanAttemptFailure, PlanningResponse, StepInput, StructuredTaskOutput, Task, TaskJson,
-    TaskStatus,
+    TaskState, TaskStatus,
 };

@@ -171,7 +171,7 @@ impl Plan {
     pub fn pending_count(&self) -> usize {
         self.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
+            .filter(|t| matches!(t.state, TaskState::Pending))
             .count()
     }
 
@@ -179,7 +179,7 @@ impl Plan {
     pub fn completed_count(&self) -> usize {
         self.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Complete)
+            .filter(|t| matches!(t.state, TaskState::Complete { .. }))
             .count()
     }
 
@@ -187,7 +187,7 @@ impl Plan {
     pub fn failed_count(&self) -> usize {
         self.tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Failed)
+            .filter(|t| matches!(t.state, TaskState::Failed { .. }))
             .count()
     }
 
@@ -195,18 +195,18 @@ impl Plan {
     pub fn is_finished(&self) -> bool {
         self.tasks
             .iter()
-            .all(|t| t.status == TaskStatus::Complete || t.status == TaskStatus::Failed)
+            .all(|t| matches!(t.state, TaskState::Complete { .. } | TaskState::Failed { .. }))
     }
 
     /// Get the next task that is ready to run (pending with all dependencies complete).
     pub fn next_ready_task(&self) -> Option<&Task> {
         self.tasks.iter().find(|task| {
-            task.status == TaskStatus::Pending
+            matches!(task.state, TaskState::Pending)
                 && task.dependencies.iter().all(|dep_id| {
                     self.tasks
                         .iter()
                         .find(|t| t.id == *dep_id)
-                        .map(|t| t.status == TaskStatus::Complete)
+                        .map(|t| matches!(t.state, TaskState::Complete { .. }))
                         .unwrap_or(true)
                 })
         })
@@ -220,25 +220,24 @@ impl Plan {
     /// Returns tasks that are ready to execute.
     ///
     /// A task is ready when:
-    /// - Status is `Pending`
-    /// - All dependencies have status `Complete`
+    /// - State is `Pending`
+    /// - All dependencies have state `Complete`
     ///
     /// Tasks with failed dependencies are NOT returned (use `blocked_tasks()` to find them).
     pub fn ready_tasks(&self) -> Vec<&Task> {
         self.tasks
             .iter()
             .filter(|task| {
-                if task.status != TaskStatus::Pending {
+                if !matches!(task.state, TaskState::Pending) {
                     return false;
                 }
 
-                // Check each dependency
                 for dep_id in &task.dependencies {
                     let dep = self.tasks.iter().find(|t| t.id == *dep_id);
-                    match dep.map(|t| &t.status) {
-                        Some(TaskStatus::Complete) => continue, // Dependency satisfied
-                        Some(TaskStatus::Failed) => return false, // Blocked by failure
-                        _ => return false, // Not ready yet (pending/running/missing)
+                    match dep.map(|t| &t.state) {
+                        Some(TaskState::Complete { .. }) => continue,
+                        Some(TaskState::Failed { .. }) => return false,
+                        _ => return false,
                     }
                 }
                 true
@@ -254,12 +253,12 @@ impl Plan {
         self.tasks
             .iter()
             .filter(|task| {
-                task.status == TaskStatus::Pending
+                matches!(task.state, TaskState::Pending)
                     && task.dependencies.iter().any(|dep_id| {
                         self.tasks
                             .iter()
                             .find(|t| t.id == *dep_id)
-                            .map(|t| t.status == TaskStatus::Failed)
+                            .map(|t| matches!(t.state, TaskState::Failed { .. }))
                             .unwrap_or(false)
                     })
             })
@@ -268,7 +267,7 @@ impl Plan {
 }
 
 /// A discrete task within a plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Task {
     /// Unique identifier for this task.
     pub id: usize,
@@ -276,32 +275,99 @@ pub struct Task {
     pub description: String,
     /// IDs of tasks that must complete before this one can start.
     pub dependencies: Vec<usize>,
-    /// Current execution status.
-    pub status: TaskStatus,
-    /// Result of execution (if complete).
-    pub result: Option<String>,
-    /// Error message (if failed).
-    pub error: Option<String>,
-    /// Structured failure classification (if failed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failure_category: Option<FailureCategory>,
+    /// Execution state — use pattern matching to access variant data.
+    pub state: TaskState,
     /// Assigned worker name (when specialized workers are configured).
-    ///
-    /// When set, this task will be executed by the named worker agent
-    /// with its specific preamble and MCP tool filter. When `None`,
-    /// the generic worker preamble is used.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
     /// Why this task exists and how it advances the goal.
     pub rationale: String,
     /// When set, this task reuses the result from the specified task ID
     /// in the previous iteration's plan (set by `apply_result_reuse()`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reuse_result_from: Option<usize>,
     /// Structured output from `submit_result` tool. When present, `summary`
     /// is used as the inline preview in continuation prompts and manifests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Top-level because it's orthogonal to pass/fail — workers can submit
+    /// structured output regardless of task outcome.
     pub structured_output: Option<StructuredTaskOutput>,
+}
+
+impl Serialize for Task {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("description", &self.description)?;
+        map.serialize_entry("dependencies", &self.dependencies)?;
+        map.serialize_entry("status", &TaskStatus::from(&self.state))?;
+        match &self.state {
+            TaskState::Complete { result } => {
+                map.serialize_entry("result", result)?;
+            }
+            TaskState::Failed { error, category } => {
+                map.serialize_entry("error", error)?;
+                map.serialize_entry("failure_category", category)?;
+            }
+            _ => {}
+        }
+        if let Some(ref w) = self.worker {
+            map.serialize_entry("worker", w)?;
+        }
+        map.serialize_entry("rationale", &self.rationale)?;
+        if let Some(reuse) = self.reuse_result_from {
+            map.serialize_entry("reuse_result_from", &reuse)?;
+        }
+        if let Some(ref so) = self.structured_output {
+            map.serialize_entry("structured_output", so)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Task {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct TaskHelper {
+            id: usize,
+            description: String,
+            #[serde(default)]
+            dependencies: Vec<usize>,
+            status: TaskStatus,
+            result: Option<String>,
+            error: Option<String>,
+            #[serde(default)]
+            failure_category: Option<FailureCategory>,
+            #[serde(default)]
+            worker: Option<String>,
+            #[serde(default)]
+            rationale: String,
+            #[serde(default)]
+            reuse_result_from: Option<usize>,
+            #[serde(default)]
+            structured_output: Option<StructuredTaskOutput>,
+        }
+        let h = TaskHelper::deserialize(deserializer)?;
+        let state = match h.status {
+            TaskStatus::Pending => TaskState::Pending,
+            TaskStatus::Running => TaskState::Running,
+            TaskStatus::Complete => TaskState::Complete {
+                result: h.result.unwrap_or_default(),
+            },
+            TaskStatus::Failed => TaskState::Failed {
+                error: h.error.unwrap_or_else(|| "unknown".into()),
+                category: h.failure_category.unwrap_or_default(),
+            },
+        };
+        Ok(Task {
+            id: h.id,
+            description: h.description,
+            dependencies: h.dependencies,
+            state,
+            worker: h.worker,
+            rationale: h.rationale,
+            reuse_result_from: h.reuse_result_from,
+            structured_output: h.structured_output,
+        })
+    }
 }
 
 /// Structured metadata from `submit_result`, collapsed into a single optional
@@ -319,10 +385,7 @@ impl Task {
             id,
             description: description.into(),
             dependencies: Vec::new(),
-            status: TaskStatus::Pending,
-            result: None,
-            error: None,
-            failure_category: None,
+            state: TaskState::Pending,
             worker: None,
             rationale: rationale.into(),
             reuse_result_from: None,
@@ -350,20 +413,22 @@ impl Task {
 
     /// Mark this task as running.
     pub fn start(&mut self) {
-        self.status = TaskStatus::Running;
+        self.state = TaskState::Running;
     }
 
     /// Mark this task as complete with a result.
     pub fn complete(&mut self, result: impl Into<String>) {
-        self.status = TaskStatus::Complete;
-        self.result = Some(result.into());
+        self.state = TaskState::Complete {
+            result: result.into(),
+        };
     }
 
     /// Mark this task as failed with an error and structured category.
     pub fn fail(&mut self, error: impl Into<String>, category: FailureCategory) {
-        self.status = TaskStatus::Failed;
-        self.error = Some(error.into());
-        self.failure_category = Some(category);
+        self.state = TaskState::Failed {
+            error: error.into(),
+            category,
+        };
     }
 }
 
@@ -420,6 +485,28 @@ impl std::fmt::Display for FailureCategory {
             Self::DependencyFailed => write!(f, "dependency_failed"),
             Self::SoftFailure => write!(f, "soft_failure"),
             Self::AgentError => write!(f, "agent_error"),
+        }
+    }
+}
+
+/// Rich state of a task, making invalid states unrepresentable.
+///
+/// Use pattern matching or `matches!()` for boolean checks.
+#[derive(Debug, Clone)]
+pub enum TaskState {
+    Pending,
+    Running,
+    Complete { result: String },
+    Failed { error: String, category: FailureCategory },
+}
+
+impl From<&TaskState> for TaskStatus {
+    fn from(state: &TaskState) -> Self {
+        match state {
+            TaskState::Pending => TaskStatus::Pending,
+            TaskState::Running => TaskStatus::Running,
+            TaskState::Complete { .. } => TaskStatus::Complete,
+            TaskState::Failed { .. } => TaskStatus::Failed,
         }
     }
 }
@@ -769,9 +856,8 @@ impl IterationContext {
         let mut has_failed_tasks = false;
 
         for t in &self.previous_plan.tasks {
-            match t.status {
-                TaskStatus::Complete => {
-                    let result = t.result.as_deref().unwrap_or("(no result)");
+            match &t.state {
+                TaskState::Complete { result } => {
                     if let Some(ref so) = t.structured_output {
                         let footer = extract_artifact_footer(result)
                             .map(|f| format!(" {}", f))
@@ -782,8 +868,6 @@ impl IterationContext {
                             t.id, t.description, detail, so.confidence, footer
                         ));
                     } else {
-                        // Reused tasks from prior iterations may lack structured_output
-                        // if the original run predates submit_result.
                         let detail = preserve_artifact_footer(result, 500);
                         completed_lines.push(format!(
                             "- Task {}: {} → {}",
@@ -791,11 +875,10 @@ impl IterationContext {
                         ));
                     }
                 }
-                TaskStatus::Failed => {
+                TaskState::Failed { error, category } => {
                     has_failed_tasks = true;
-                    let err = t.error.as_deref().unwrap_or("unknown");
-                    let line = match (t.failure_category, &t.structured_output) {
-                        (Some(FailureCategory::SoftFailure), Some(so))
+                    let line = match (category, &t.structured_output) {
+                        (FailureCategory::SoftFailure, Some(so))
                             if !so.summary.is_empty() =>
                         {
                             let detail = preserve_artifact_footer(&so.summary, 500);
@@ -804,19 +887,14 @@ impl IterationContext {
                                 t.id, t.description, so.confidence, detail
                             )
                         }
-                        (Some(cat), _) => format!(
+                        (cat, _) => format!(
                             "- Task {}: {} → failed [{}]: {}",
-                            t.id, t.description, cat, err
-                        ),
-                        (None, _) => format!(
-                            "- Task {}: {} → failed: {}",
-                            t.id, t.description, err
+                            t.id, t.description, cat, error
                         ),
                     };
                     redesign_lines.push(line);
                 }
-                TaskStatus::Pending | TaskStatus::Running => {
-                    // Tasks blocked by failed dependencies
+                TaskState::Pending | TaskState::Running => {
                     blocked_lines.push(format!(
                         "- Task {}: {} → blocked (dependency failed)",
                         t.id, t.description
@@ -1205,6 +1283,80 @@ mod tests {
     }
 
     // ========================================================================
+    // TaskState serde backward-compat tests
+    // ========================================================================
+
+    #[test]
+    fn test_task_serde_roundtrip_pending() {
+        let task = Task::new(0, "Fetch data", "test rationale");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""status":"pending"#));
+        assert!(!json.contains("result"));
+        assert!(!json.contains("error"));
+        let roundtripped: Task = serde_json::from_str(&json).unwrap();
+        assert!(matches!(roundtripped.state, TaskState::Pending));
+    }
+
+    #[test]
+    fn test_task_serde_roundtrip_complete() {
+        let mut task = Task::new(0, "Fetch data", "test rationale");
+        task.complete("42");
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""status":"complete"#));
+        assert!(json.contains(r#""result":"42"#));
+        assert!(!json.contains("error"));
+        let roundtripped: Task = serde_json::from_str(&json).unwrap();
+        let TaskState::Complete { ref result } = roundtripped.state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_task_serde_roundtrip_failed() {
+        let mut task = Task::new(0, "Fetch data", "test rationale");
+        task.fail("timed out", FailureCategory::AgentTimeout);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""status":"failed"#));
+        assert!(json.contains(r#""error":"timed out"#));
+        assert!(json.contains(r#""failure_category":"agent_timeout"#));
+        let roundtripped: Task = serde_json::from_str(&json).unwrap();
+        let TaskState::Failed { ref error, category } = roundtripped.state else {
+            panic!("expected Failed");
+        };
+        assert_eq!(error, "timed out");
+        assert_eq!(category, FailureCategory::AgentTimeout);
+    }
+
+    #[test]
+    fn test_task_deserialize_legacy_null_fields() {
+        let json = r#"{"id":0,"description":"Test","dependencies":[],"status":"pending","result":null,"error":null,"rationale":"test"}"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert!(matches!(task.state, TaskState::Pending));
+    }
+
+    #[test]
+    fn test_task_deserialize_legacy_complete_with_null_error() {
+        let json = r#"{"id":0,"description":"Test","dependencies":[],"status":"complete","result":"data","error":null,"rationale":"test"}"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        let TaskState::Complete { ref result } = task.state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "data");
+    }
+
+    #[test]
+    fn test_task_deserialize_legacy_failed_without_category() {
+        let json = r#"{"id":0,"description":"Test","dependencies":[],"status":"failed","result":null,"error":"boom","rationale":"test"}"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        let TaskState::Failed { ref error, category } = task.state else {
+            panic!("expected Failed");
+        };
+        assert_eq!(error, "boom");
+        assert_eq!(category, FailureCategory::AgentError);
+    }
+
+    // ========================================================================
     // FailureSummary tests
     // ========================================================================
 
@@ -1469,8 +1621,10 @@ mod tests {
         let mut plan = response.into_plan().unwrap();
         Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
 
-        assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
-        assert_eq!(plan.tasks[0].result.as_deref(), Some("42"));
+        let TaskState::Complete { ref result } = plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "42");
         let so = plan.tasks[0].structured_output.as_ref().unwrap();
         assert_eq!(so.summary, "Mean is 42");
         assert_eq!(so.confidence, Confidence::High);
@@ -2157,12 +2311,14 @@ mod tests {
             planning_summary: "test".into(),
         };
         let mut plan = response.into_plan().unwrap();
-        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
 
         Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
 
-        assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
-        assert_eq!(plan.tasks[0].result.as_deref(), Some("42"));
+        let TaskState::Complete { ref result } = plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "42");
     }
 
     #[test]
@@ -2237,13 +2393,15 @@ mod tests {
         };
         let mut plan = response.into_plan().unwrap();
         assert_eq!(plan.tasks[0].reuse_result_from, Some(0));
-        assert_eq!(plan.tasks[0].status, TaskStatus::Pending);
+        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
 
         Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
 
-        assert_eq!(plan.tasks[0].status, TaskStatus::Complete);
-        assert_eq!(plan.tasks[0].result.as_deref(), Some("log data here"));
-        assert_eq!(plan.tasks[1].status, TaskStatus::Pending);
+        let TaskState::Complete { ref result } = plan.tasks[0].state else {
+            panic!("expected Complete");
+        };
+        assert_eq!(result, "log data here");
+        assert!(matches!(plan.tasks[1].state, TaskState::Pending));
     }
 
     #[test]
