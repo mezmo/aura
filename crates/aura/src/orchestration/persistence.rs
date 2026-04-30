@@ -94,6 +94,12 @@ pub struct RunManifest {
     /// How the coordinator routed this query.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<RoutingMode>,
+    /// Human-readable outcome description (e.g. "Answered directly", "3/4 tasks completed").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Coordinator's summary of the final response (from respond_directly or synthesis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_summary: Option<String>,
     /// Summary of each task in the plan.
     pub task_summaries: Vec<TaskSummary>,
     /// Relative paths to large artifact files.
@@ -120,6 +126,65 @@ pub struct TaskSummary {
     /// Structured failure classification (if failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_category: Option<super::types::FailureCategory>,
+    /// Error message from TaskState::Failed (if failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Structured failure detail for session history rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_context: Option<ErrorContext>,
+    /// Condensed tool call chain for this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_trace: Vec<ToolTraceEntry>,
+    /// Artifacts produced by this task (hierarchical view of flat storage).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactEntry>,
+}
+
+/// Structured failure detail for a task in the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorContext {
+    pub category: super::types::FailureCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_call: Option<String>,
+    pub attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_result: Option<String>,
+}
+
+/// Condensed tool call entry for the manifest tool trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolTraceEntry {
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    pub duration_ms: u64,
+    pub outcome: ToolOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_filename: Option<String>,
+}
+
+/// Outcome of a single tool call in the trace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcome {
+    Success { output_bytes: u64 },
+    Error { message: String },
+}
+
+/// An artifact file produced during a task's execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactEntry {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub kind: ArtifactKind,
+}
+
+/// Distinguishes worker result artifacts from promoted tool output artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Result,
+    ToolOutput { tool_name: String },
 }
 
 /// Overall outcome of an orchestration run.
@@ -534,6 +599,64 @@ impl ExecutionPersistence {
         fs::read_to_string(&artifact_path).await
     }
 
+    /// Read an artifact from a different run in the same session.
+    ///
+    /// Resolves against `{session_dir}/{run_id}/artifacts/{filename}` where
+    /// `session_dir` is the parent of the current run directory. Both `run_id`
+    /// and `filename` are validated to prevent path traversal.
+    pub async fn read_artifact_cross_run(
+        &self,
+        filename: &str,
+        run_id: &str,
+    ) -> io::Result<String> {
+        if !self.enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Persistence is disabled",
+            ));
+        }
+
+        fn is_safe_component(s: &str) -> bool {
+            !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+        }
+
+        if !is_safe_component(run_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid run_id for cross-run artifact read",
+            ));
+        }
+        if !is_safe_component(filename) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid artifact filename",
+            ));
+        }
+
+        let session_dir = self
+            .base_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No parent directory"))?;
+
+        let artifact_path = session_dir.join(run_id).join("artifacts").join(filename);
+
+        // Defense-in-depth: resolved path must be under the session directory
+        let canonical_session = session_dir
+            .canonicalize()
+            .unwrap_or_else(|_| session_dir.to_path_buf());
+        let canonical_artifact = artifact_path
+            .canonicalize()
+            .map_err(|e| io::Error::new(e.kind(), format!("Artifact not found: {e}")))?;
+        if !canonical_artifact.starts_with(&canonical_session) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cross-run artifact path escapes session directory",
+            ));
+        }
+
+        fs::read_to_string(&artifact_path).await
+    }
+
     /// List all artifact filenames.
     pub async fn list_artifacts(&self) -> io::Result<Vec<String>> {
         if !self.enabled {
@@ -554,6 +677,72 @@ impl ExecutionPersistence {
         }
         filenames.sort();
         Ok(filenames)
+    }
+
+    /// List all artifact filenames with file sizes.
+    pub async fn list_artifacts_with_metadata(&self) -> io::Result<Vec<(String, u64)>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+
+        let artifacts_dir = self.artifacts_path();
+        if !artifacts_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = fs::read_dir(&artifacts_dir).await?;
+        let mut results = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if let Some(name) = entry.file_name().to_str() {
+                let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+                results.push((name.to_string(), size));
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(results)
+    }
+
+    /// Load all tool call records for a given task across all iterations.
+    ///
+    /// Scans `iteration-*/task-{task_id}.attempt-*.tool-calls.json` under the
+    /// run directory. Returns an empty vec on file-not-found (graceful for old runs).
+    pub async fn load_tool_records_for_task(
+        &self,
+        task_id: usize,
+    ) -> Vec<ToolCallRecord> {
+        if !self.enabled {
+            return Vec::new();
+        }
+
+        let mut all_records = Vec::new();
+        let prefix = format!("task-{task_id}.attempt-");
+
+        for iter_num in 1..=self.current_iteration {
+            let iter_dir = self.base_path.join(format!("iteration-{iter_num}"));
+            if !iter_dir.exists() {
+                continue;
+            }
+            let Ok(mut entries) = fs::read_dir(&iter_dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if !name_str.starts_with(&prefix) || !name_str.ends_with(".tool-calls.json") {
+                    continue;
+                }
+                let Ok(content) = fs::read_to_string(entry.path()).await else {
+                    continue;
+                };
+                if let Ok(records) = serde_json::from_str::<Vec<ToolCallRecord>>(&content) {
+                    all_records.extend(records);
+                }
+            }
+        }
+
+        all_records
     }
 
     // ========================================================================
@@ -726,28 +915,30 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
         ));
         turn_entries.push_str(&format!("Goal: \"{}\"\n", manifest.goal));
 
+        if let Some(outcome) = &manifest.outcome {
+            turn_entries.push_str(&format!("Outcome: {}\n", outcome));
+        }
+
+        if let Some(summary) = &manifest.response_summary {
+            turn_entries.push_str(&format!("Response: \"{}\"\n", summary));
+        }
+
         if !manifest.task_summaries.is_empty() {
             turn_entries.push_str("Tasks:\n");
             for task in &manifest.task_summaries {
-                let worker = task.worker.as_deref().unwrap_or("unassigned");
-                let confidence_tag = task
-                    .confidence
-                    .as_deref()
-                    .map(|c| format!(" ({})", c))
-                    .unwrap_or_default();
-                let result = match (&task.status, &task.result_preview) {
-                    (TaskStatus::Complete, Some(preview)) => {
-                        format!("→ \"{}\"{}", preview, confidence_tag)
-                    }
-                    (TaskStatus::Failed, Some(preview)) => format!("→ FAILED: \"{}\"", preview),
-                    (TaskStatus::Failed, None) => "→ FAILED".to_string(),
-                    (status, _) => format!("→ {}", status),
-                };
-                turn_entries.push_str(&format!(
-                    "  - Task {} [{}]: {} {}\n",
-                    task.task_id, worker, task.description, result
-                ));
+                render_task_summary(task, &mut turn_entries);
             }
+        }
+
+        let has_artifacts = manifest
+            .task_summaries
+            .iter()
+            .any(|t| !t.artifacts.is_empty());
+        if has_artifacts {
+            turn_entries.push_str(&format!(
+                "  (use run_id=\"{}\" with read_artifact for cross-run access)\n",
+                manifest.run_id
+            ));
         }
 
         turn_entries.push('\n');
@@ -760,6 +951,81 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
         )
         .replace("%%TURN_COUNT%%", &manifests.len().to_string())
         .replace("%%TURN_ENTRIES%%", turn_entries.trim_end())
+}
+
+fn render_task_summary(task: &TaskSummary, out: &mut String) {
+    let worker = task.worker.as_deref().unwrap_or("unassigned");
+
+    match task.status {
+        TaskStatus::Complete => {
+            let confidence_tag = task
+                .confidence
+                .as_deref()
+                .map(|c| format!(" ({})", c))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  Task {} [{}] — Complete{}\n",
+                task.task_id, worker, confidence_tag
+            ));
+            out.push_str(&format!("    \"{}\"\n", task.description));
+            if let Some(preview) = &task.result_preview {
+                out.push_str(&format!("    Summary: \"{}\"\n", preview));
+            }
+        }
+        TaskStatus::Failed => {
+            let category_tag = task
+                .failure_category
+                .as_ref()
+                .map(|c| format!(" ({})", c))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  Task {} [{}] — FAILED{}\n",
+                task.task_id, worker, category_tag
+            ));
+            out.push_str(&format!("    \"{}\"\n", task.description));
+            if let Some(error) = &task.error {
+                out.push_str(&format!("    Error: {}\n", error));
+            }
+            if let Some(ctx) = &task.error_context
+                && let Some(partial) = &ctx.partial_result
+            {
+                out.push_str(&format!("    Partial progress: {}\n", partial));
+            }
+        }
+        _ => {
+            out.push_str(&format!(
+                "  Task {} [{}] — {}\n",
+                task.task_id, worker, task.status
+            ));
+            out.push_str(&format!("    \"{}\"\n", task.description));
+        }
+    }
+
+    if !task.tool_trace.is_empty() {
+        let chain: Vec<String> = task
+            .tool_trace
+            .iter()
+            .map(|t| {
+                let duration = format!("{:.1}s", t.duration_ms as f64 / 1000.0);
+                match &t.outcome {
+                    ToolOutcome::Success { .. } => format!("{} ({})", t.tool, duration),
+                    ToolOutcome::Error { message } => {
+                        format!("{} (FAILED: {})", t.tool, message)
+                    }
+                }
+            })
+            .collect();
+        out.push_str(&format!("    Tool chain: {}\n", chain.join(" → ")));
+    }
+
+    if !task.artifacts.is_empty() {
+        let listing: Vec<String> = task
+            .artifacts
+            .iter()
+            .map(|a| format!("{} ({}B)", a.filename, a.size_bytes))
+            .collect();
+        out.push_str(&format!("    Artifacts: {}\n", listing.join(", ")));
+    }
 }
 
 #[cfg(test)]
@@ -872,6 +1138,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_artifact_cross_run_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let memory_dir = temp_dir.path().join("memory");
+        let session_id = "session_xrun".to_string();
+
+        // Create run A and write an artifact
+        let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
+            .await
+            .unwrap();
+        let run_a_id = run_a.run_id().to_string();
+        run_a
+            .write_result_artifact(0, Some("sre"), 1, "prior run content")
+            .await
+            .unwrap();
+
+        // Create run B
+        let run_b = ExecutionPersistence::new(&memory_dir, Some(session_id))
+            .await
+            .unwrap();
+
+        // Read run A's artifact from run B
+        let content = run_b
+            .read_artifact_cross_run("task-0-sre-iter-1-result.txt", &run_a_id)
+            .await
+            .unwrap();
+        assert_eq!(content, "prior run content");
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_cross_run_invalid_run_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        for bad_id in &["../escape", "foo/bar", "..\\win", ""] {
+            let result = persistence
+                .read_artifact_cross_run("task-0-default-iter-1-result.txt", bad_id)
+                .await;
+            assert!(result.is_err(), "Should reject run_id: {:?}", bad_id);
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
     async fn test_disabled_persistence_artifacts() {
         let persistence = ExecutionPersistence::disabled();
 
@@ -959,6 +1270,8 @@ mod tests {
             status: RunStatus::Success,
             iterations: 2,
             routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![
                 TaskSummary {
                     task_id: 0,
@@ -968,6 +1281,10 @@ mod tests {
                     result_preview: Some("The answer is 42".to_string()),
                     confidence: None,
                     failure_category: None,
+                    error: None,
+                    error_context: None,
+                    tool_trace: vec![],
+                    artifacts: vec![],
                 },
                 TaskSummary {
                     task_id: 1,
@@ -977,6 +1294,10 @@ mod tests {
                     result_preview: None,
                     confidence: None,
                     failure_category: Some(super::super::types::FailureCategory::AgentError),
+                    error: Some("Connection refused".to_string()),
+                    error_context: None,
+                    tool_trace: vec![],
+                    artifacts: vec![],
                 },
             ],
             artifact_paths: vec!["task-0-research-iter-1-result.txt".to_string()],
@@ -1013,6 +1334,8 @@ mod tests {
             status: RunStatus::PartialSuccess,
             iterations: 1,
             routing_mode: Some(RoutingMode::Routed),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![],
             artifact_paths: vec![],
         };
@@ -1038,6 +1361,8 @@ mod tests {
             status: RunStatus::Failed,
             iterations: 0,
             routing_mode: None,
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![],
             artifact_paths: vec![],
         };
@@ -1071,6 +1396,8 @@ mod tests {
             status: RunStatus::Success,
             iterations: 1,
             routing_mode: Some(RoutingMode::Routed),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![TaskSummary {
                 task_id: 0,
                 description: "Compute mean".to_string(),
@@ -1079,6 +1406,10 @@ mod tests {
                 result_preview: Some("Result: 20".to_string()),
                 confidence: None,
                 failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![],
             }],
             artifact_paths: vec![],
         }
@@ -1239,8 +1570,8 @@ mod tests {
         assert!(result.contains("### Turn 1 (2026-03-20T01:57:24Z)"));
         assert!(result.contains("Success"));
         assert!(result.contains("Compute mean of [10,20,30]"));
-        assert!(result.contains("Task 0 [statistics]: Compute mean"));
-        assert!(result.contains("Result: 20"));
+        assert!(result.contains("Task 0 [statistics] — Complete"));
+        assert!(result.contains("Summary: \"Result: 20\""));
         // Guidance text from template
         assert!(result.contains("Avoid redundant work"));
         assert!(result.contains("Embed concrete values for workers"));
@@ -1275,6 +1606,8 @@ mod tests {
             status: RunStatus::Failed,
             iterations: 1,
             routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![TaskSummary {
                 task_id: 0,
                 description: "Bad task".to_string(),
@@ -1283,6 +1616,10 @@ mod tests {
                 result_preview: Some("Connection refused".to_string()),
                 confidence: None,
                 failure_category: Some(super::super::types::FailureCategory::AgentError),
+                error: Some("Connection refused".to_string()),
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![],
             }],
             artifact_paths: vec![],
         };
@@ -1290,7 +1627,205 @@ mod tests {
         let result = build_session_context(&[manifest]);
 
         assert!(result.contains("Failed"));
-        assert!(result.contains("FAILED: \"Connection refused\""));
+        assert!(result.contains("FAILED (agent_error)"));
+        assert!(result.contains("Error: Connection refused"));
+    }
+
+    #[test]
+    fn test_build_session_context_with_tool_trace() {
+        let manifest = RunManifest {
+            run_id: "run-trace".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Analyze logs".to_string(),
+            status: RunStatus::Success,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: Some("2/2 tasks completed".to_string()),
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Search error logs".to_string(),
+                status: TaskStatus::Complete,
+                worker: Some("sre".to_string()),
+                result_preview: Some("Found 3 error groups".to_string()),
+                confidence: Some("high".to_string()),
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![
+                    ToolTraceEntry {
+                        tool: "search_logs".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 1200,
+                        outcome: ToolOutcome::Success { output_bytes: 4096 },
+                        artifact_filename: None,
+                    },
+                    ToolTraceEntry {
+                        tool: "submit_result".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 50,
+                        outcome: ToolOutcome::Success { output_bytes: 256 },
+                        artifact_filename: None,
+                    },
+                ],
+                artifacts: vec![],
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Outcome: 2/2 tasks completed"));
+        assert!(result.contains("Task 0 [sre] — Complete (high)"));
+        assert!(result.contains("Summary: \"Found 3 error groups\""));
+        assert!(result.contains("Tool chain: search_logs (1.2s) → submit_result (0.1s)"));
+    }
+
+    #[test]
+    fn test_build_session_context_with_artifacts() {
+        let manifest = RunManifest {
+            run_id: "run-artifacts".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Generate report".to_string(),
+            status: RunStatus::Success,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 1,
+                description: "Write summary".to_string(),
+                status: TaskStatus::Complete,
+                worker: Some("writer".to_string()),
+                result_preview: Some("Report complete".to_string()),
+                confidence: None,
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![
+                    ArtifactEntry {
+                        filename: "task-1-writer-iter1-result.txt".to_string(),
+                        size_bytes: 2048,
+                        kind: ArtifactKind::Result,
+                    },
+                    ArtifactEntry {
+                        filename: "task-1-writer-iter1-search-output.txt".to_string(),
+                        size_bytes: 8192,
+                        kind: ArtifactKind::ToolOutput {
+                            tool_name: "search".to_string(),
+                        },
+                    },
+                ],
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Artifacts: task-1-writer-iter1-result.txt (2048B)"));
+        assert!(result.contains("task-1-writer-iter1-search-output.txt (8192B)"));
+        assert!(result.contains("run_id=\"run-artifacts\""));
+        assert!(result.contains("read_artifact"));
+    }
+
+    #[test]
+    fn test_build_session_context_failed_with_error_context() {
+        let manifest = RunManifest {
+            run_id: "run-err".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Query database".to_string(),
+            status: RunStatus::Failed,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: Some("0/1 tasks completed".to_string()),
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Run SQL query".to_string(),
+                status: TaskStatus::Failed,
+                worker: Some("db-worker".to_string()),
+                result_preview: None,
+                confidence: None,
+                failure_category: Some(super::super::types::FailureCategory::AgentTimeout),
+                error: Some("Timed out after 30s".to_string()),
+                error_context: Some(ErrorContext {
+                    category: super::super::types::FailureCategory::AgentTimeout,
+                    last_tool_call: Some("execute_sql".to_string()),
+                    attempt_count: 2,
+                    partial_result: Some("Retrieved 50 of 500 rows".to_string()),
+                }),
+                tool_trace: vec![
+                    ToolTraceEntry {
+                        tool: "execute_sql".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 15000,
+                        outcome: ToolOutcome::Success { output_bytes: 1024 },
+                        artifact_filename: None,
+                    },
+                    ToolTraceEntry {
+                        tool: "execute_sql".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 30000,
+                        outcome: ToolOutcome::Error {
+                            message: "timeout".to_string(),
+                        },
+                        artifact_filename: None,
+                    },
+                ],
+                artifacts: vec![],
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("FAILED (agent_timeout)"));
+        assert!(result.contains("Error: Timed out after 30s"));
+        assert!(result.contains("Partial progress: Retrieved 50 of 500 rows"));
+        assert!(result.contains(
+            "Tool chain: execute_sql (15.0s) → execute_sql (FAILED: timeout)"
+        ));
+    }
+
+    #[test]
+    fn test_build_session_context_direct_response() {
+        let manifest = RunManifest {
+            run_id: "run-direct".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "What is 2+2?".to_string(),
+            status: RunStatus::Success,
+            iterations: 0,
+            routing_mode: Some(RoutingMode::DirectAnswer),
+            outcome: Some("Answered directly".to_string()),
+            response_summary: Some("The answer is 4.".to_string()),
+            task_summaries: vec![],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Outcome: Answered directly"));
+        assert!(result.contains("Response: \"The answer is 4.\""));
+        assert!(!result.contains("Tasks:"));
+        assert!(!result.contains("run_id=\"run-direct\""));
+    }
+
+    #[test]
+    fn test_build_session_context_no_artifact_hint_when_empty() {
+        let manifests = vec![make_test_manifest(
+            "run-1",
+            "2026-03-20T01:00:00Z",
+            "Simple query",
+        )];
+
+        let result = build_session_context(&manifests);
+
+        assert!(!result.contains("run_id=\"run-1\""));
     }
 
     // ========================================================================
@@ -1445,6 +1980,226 @@ mod tests {
 
         let drained = persistence.drain(Duration::from_millis(50)).await;
         assert!(!drained);
+    }
+
+    // ========================================================================
+    // Hierarchical Manifest Tests (C1)
+    // ========================================================================
+
+    #[test]
+    fn test_manifest_backward_compat_missing_new_fields() {
+        let old_json = r#"{
+            "run_id": "run-old",
+            "session_id": "cs_old",
+            "timestamp": "2026-03-19T12:00:00Z",
+            "goal": "Old run",
+            "status": "success",
+            "iterations": 1,
+            "routing_mode": "orchestrated",
+            "task_summaries": [{
+                "task_id": 0,
+                "description": "Old task",
+                "status": "complete",
+                "worker": "w1",
+                "result_preview": "done"
+            }],
+            "artifact_paths": ["task-0-w1-iter-1-result.txt"]
+        }"#;
+
+        let manifest: RunManifest = serde_json::from_str(old_json).unwrap();
+        assert_eq!(manifest.run_id, "run-old");
+        assert_eq!(manifest.task_summaries.len(), 1);
+        let ts = &manifest.task_summaries[0];
+        assert!(ts.error.is_none());
+        assert!(ts.error_context.is_none());
+        assert!(ts.tool_trace.is_empty());
+        assert!(ts.artifacts.is_empty());
+        assert!(ts.failure_category.is_none());
+        assert!(ts.confidence.is_none());
+        assert!(manifest.outcome.is_none());
+        assert!(manifest.response_summary.is_none());
+    }
+
+    #[test]
+    fn test_manifest_serde_with_enriched_fields() {
+        use super::super::types::FailureCategory;
+
+        let manifest = RunManifest {
+            run_id: "run-enriched".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-04-30T12:00:00Z".to_string(),
+            goal: "Enriched test".to_string(),
+            status: RunStatus::PartialSuccess,
+            iterations: 2,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: Some("1/2 tasks completed".to_string()),
+            response_summary: None,
+            task_summaries: vec![
+                TaskSummary {
+                    task_id: 0,
+                    description: "Search logs".to_string(),
+                    status: TaskStatus::Complete,
+                    worker: Some("sre".to_string()),
+                    result_preview: Some("Found 47 errors".to_string()),
+                    confidence: Some("high".to_string()),
+                    failure_category: None,
+                    error: None,
+                    error_context: None,
+                    tool_trace: vec![
+                        ToolTraceEntry {
+                            tool: "log_search".to_string(),
+                            reasoning: "Searching for errors".to_string(),
+                            duration_ms: 8200,
+                            outcome: ToolOutcome::Success { output_bytes: 48291 },
+                            artifact_filename: Some("task-0-sre-iter-1-log-search-0-output.txt".to_string()),
+                        },
+                    ],
+                    artifacts: vec![
+                        ArtifactEntry {
+                            filename: "task-0-sre-iter-1-result.txt".to_string(),
+                            size_bytes: 3200,
+                            kind: ArtifactKind::Result,
+                        },
+                        ArtifactEntry {
+                            filename: "task-0-sre-iter-1-log-search-0-output.txt".to_string(),
+                            size_bytes: 48291,
+                            kind: ArtifactKind::ToolOutput { tool_name: "log-search".to_string() },
+                        },
+                    ],
+                },
+                TaskSummary {
+                    task_id: 1,
+                    description: "Query deployments".to_string(),
+                    status: TaskStatus::Failed,
+                    worker: Some("sre".to_string()),
+                    result_preview: None,
+                    confidence: None,
+                    failure_category: Some(FailureCategory::AgentError),
+                    error: Some("403 Forbidden".to_string()),
+                    error_context: Some(ErrorContext {
+                        category: FailureCategory::AgentError,
+                        last_tool_call: Some("get_deployments".to_string()),
+                        attempt_count: 1,
+                        partial_result: Some("Staging query succeeded".to_string()),
+                    }),
+                    tool_trace: vec![
+                        ToolTraceEntry {
+                            tool: "get_deployments".to_string(),
+                            reasoning: "Checking staging".to_string(),
+                            duration_ms: 1200,
+                            outcome: ToolOutcome::Success { output_bytes: 890 },
+                            artifact_filename: None,
+                        },
+                        ToolTraceEntry {
+                            tool: "get_deployments".to_string(),
+                            reasoning: "Checking prod".to_string(),
+                            duration_ms: 30200,
+                            outcome: ToolOutcome::Error { message: "403 Forbidden".to_string() },
+                            artifact_filename: None,
+                        },
+                    ],
+                    artifacts: vec![],
+                },
+            ],
+            artifact_paths: vec!["task-0-sre-iter-1-result.txt".to_string()],
+        };
+
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        let deserialized: RunManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.task_summaries.len(), 2);
+
+        let t0 = &deserialized.task_summaries[0];
+        assert_eq!(t0.tool_trace.len(), 1);
+        assert_eq!(t0.tool_trace[0].tool, "log_search");
+        assert!(matches!(t0.tool_trace[0].outcome, ToolOutcome::Success { output_bytes: 48291 }));
+        assert_eq!(t0.artifacts.len(), 2);
+        assert!(matches!(t0.artifacts[0].kind, ArtifactKind::Result));
+
+        let t1 = &deserialized.task_summaries[1];
+        assert_eq!(t1.error.as_deref(), Some("403 Forbidden"));
+        assert_eq!(t1.error_context.as_ref().unwrap().last_tool_call.as_deref(), Some("get_deployments"));
+        assert_eq!(t1.tool_trace.len(), 2);
+        assert!(matches!(t1.tool_trace[1].outcome, ToolOutcome::Error { .. }));
+    }
+
+    #[test]
+    fn test_tool_outcome_serde() {
+        let success = ToolOutcome::Success { output_bytes: 1234 };
+        let json = serde_json::to_string(&success).unwrap();
+        assert!(json.contains("output_bytes"));
+        let deserialized: ToolOutcome = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolOutcome::Success { output_bytes: 1234 }));
+
+        let error = ToolOutcome::Error { message: "timeout".to_string() };
+        let json = serde_json::to_string(&error).unwrap();
+        let deserialized: ToolOutcome = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ToolOutcome::Error { .. }));
+    }
+
+    #[test]
+    fn test_artifact_kind_serde() {
+        let result_kind = ArtifactKind::Result;
+        let json = serde_json::to_string(&result_kind).unwrap();
+        assert_eq!(json, "\"result\"");
+
+        let tool_kind = ArtifactKind::ToolOutput { tool_name: "log_search".to_string() };
+        let json = serde_json::to_string(&tool_kind).unwrap();
+        assert!(json.contains("tool_name"));
+        let deserialized: ArtifactKind = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ArtifactKind::ToolOutput { tool_name } if tool_name == "log_search"));
+    }
+
+    #[tokio::test]
+    async fn test_load_tool_records_for_task() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let record = ToolCallRecord {
+            tool: "log_search".to_string(),
+            arguments: serde_json::json!({"query": "errors"}),
+            reasoning: "Searching for errors".to_string(),
+            output: Some("found 47".to_string()),
+            error: None,
+            duration_ms: 1500,
+            artifact_filename: None,
+        };
+
+        persistence.append_tool_call(0, 1, &record).await.unwrap();
+
+        let records = persistence.load_tool_records_for_task(0).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool, "log_search");
+        assert_eq!(records[0].duration_ms, 1500);
+
+        let empty = persistence.load_tool_records_for_task(99).await;
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_artifacts_with_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        persistence
+            .write_result_artifact(0, Some("sre"), 1, "short")
+            .await
+            .unwrap();
+        persistence
+            .write_result_artifact(1, Some("sre"), 1, "a longer result here")
+            .await
+            .unwrap();
+
+        let meta = persistence.list_artifacts_with_metadata().await.unwrap();
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta[0].0, "task-0-sre-iter-1-result.txt");
+        assert_eq!(meta[0].1, 5); // "short" = 5 bytes
+        assert_eq!(meta[1].0, "task-1-sre-iter-1-result.txt");
+        assert_eq!(meta[1].1, 20); // "a longer result here" = 20 bytes
     }
 
 }

@@ -11,7 +11,7 @@ use crate::orchestration::persistence::ExecutionPersistence;
 /// Reads full content of a result artifact file.
 ///
 /// Available to both coordinator and workers when execution persistence is enabled.
-/// Used to access full results when inline summaries reference an artifact file.
+/// Supports cross-run artifact access via optional `run_id` parameter.
 #[derive(Clone)]
 pub struct ReadArtifactTool {
     persistence: Arc<Mutex<ExecutionPersistence>>,
@@ -27,6 +27,11 @@ impl ReadArtifactTool {
 pub struct ReadArtifactArgs {
     /// The artifact filename to read (e.g. "task-0-sre-iter-1-result.txt").
     pub filename: String,
+    /// Optional run ID for cross-run artifact access. When omitted, reads from
+    /// the current run. When provided, resolves against that run's artifacts
+    /// within the same session.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,9 +58,9 @@ impl Tool for ReadArtifactTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Read the full content of a result artifact from the current \
-                orchestration run only. Use this when a task result was too large to include \
-                inline and references an artifact file."
+            description: "Read the full content of a result artifact. By default reads from \
+                the current run. Supply an optional run_id to read artifacts from a prior run \
+                in this session (see session history for available run_id values)."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -63,6 +68,10 @@ impl Tool for ReadArtifactTool {
                     "filename": {
                         "type": "string",
                         "description": "The artifact filename (e.g. 'task-0-sre-iter-1-result.txt')"
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "description": "Run ID for cross-run artifact access. Omit to read from the current run."
                     }
                 },
                 "required": ["filename"]
@@ -71,10 +80,23 @@ impl Tool for ReadArtifactTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        tracing::info!("read_artifact called for: {}", args.filename);
-
         let persistence = self.persistence.lock().await;
-        match persistence.read_artifact(&args.filename).await {
+
+        let result = if let Some(ref run_id) = args.run_id {
+            tracing::info!(
+                "read_artifact cross-run: filename={}, run_id={}",
+                args.filename,
+                run_id
+            );
+            persistence
+                .read_artifact_cross_run(&args.filename, run_id)
+                .await
+        } else {
+            tracing::info!("read_artifact called for: {}", args.filename);
+            persistence.read_artifact(&args.filename).await
+        };
+
+        match result {
             Ok(content) => Ok(ReadArtifactOutput {
                 found: true,
                 filename: args.filename,
@@ -119,6 +141,7 @@ mod tests {
         let result = tool
             .call(ReadArtifactArgs {
                 filename: "task-0-research-iter-1-result.txt".to_string(),
+                run_id: None,
             })
             .await
             .unwrap();
@@ -134,6 +157,7 @@ mod tests {
         let result = tool
             .call(ReadArtifactArgs {
                 filename: "task-99-default-iter-1-result.txt".to_string(),
+                run_id: None,
             })
             .await
             .unwrap();
@@ -148,6 +172,7 @@ mod tests {
         let result = tool
             .call(ReadArtifactArgs {
                 filename: "../../../etc/passwd".to_string(),
+                run_id: None,
             })
             .await;
 
@@ -162,5 +187,104 @@ mod tests {
         let def = tool.definition("".to_string()).await;
         assert_eq!(def.name, "read_artifact");
         assert!(def.description.contains("artifact"));
+        assert!(def.description.contains("run_id"));
+
+        let params = def.parameters;
+        let props = params.get("properties").unwrap();
+        assert!(props.get("run_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_read_cross_run_artifact() {
+        let temp_dir = TempDir::new().unwrap();
+        let memory_dir = temp_dir.path().join("memory");
+        let session_id = "session_cross_run".to_string();
+
+        // Create run A and write an artifact
+        let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
+            .await
+            .unwrap();
+        let run_a_id = run_a.run_id().to_string();
+        run_a
+            .write_result_artifact(0, Some("sre"), 1, "cross-run artifact content")
+            .await
+            .unwrap();
+
+        // Create run B (the "current" run)
+        let run_b = ExecutionPersistence::new(&memory_dir, Some(session_id))
+            .await
+            .unwrap();
+        let persistence = Arc::new(Mutex::new(run_b));
+        let tool = ReadArtifactTool::new(persistence);
+
+        // Read run A's artifact from run B via cross-run
+        let result = tool
+            .call(ReadArtifactArgs {
+                filename: "task-0-sre-iter-1-result.txt".to_string(),
+                run_id: Some(run_a_id),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.found);
+        assert_eq!(result.content, "cross-run artifact content");
+    }
+
+    #[tokio::test]
+    async fn test_read_cross_run_path_traversal() {
+        let (tool, _dir) = setup_tool().await;
+        let result = tool
+            .call(ReadArtifactArgs {
+                filename: "task-0-research-iter-1-result.txt".to_string(),
+                run_id: Some("../../etc".to_string()),
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_cross_run_nonexistent_run() {
+        let (tool, _dir) = setup_tool().await;
+        let result = tool
+            .call(ReadArtifactArgs {
+                filename: "task-0-research-iter-1-result.txt".to_string(),
+                run_id: Some("nonexistent-run-id".to_string()),
+            })
+            .await
+            .unwrap();
+
+        assert!(!result.found);
+    }
+
+    #[tokio::test]
+    async fn test_read_cross_run_no_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let memory_dir = temp_dir.path().join("memory");
+
+        // Create run A (flat layout, no session_id) and write artifact
+        let run_a = ExecutionPersistence::new(&memory_dir, None).await.unwrap();
+        let run_a_id = run_a.run_id().to_string();
+        run_a
+            .write_result_artifact(0, Some("default"), 1, "flat layout artifact")
+            .await
+            .unwrap();
+
+        // Create run B (flat layout)
+        let run_b = ExecutionPersistence::new(&memory_dir, None).await.unwrap();
+        let persistence = Arc::new(Mutex::new(run_b));
+        let tool = ReadArtifactTool::new(persistence);
+
+        // Cross-run read still works via parent directory
+        let result = tool
+            .call(ReadArtifactArgs {
+                filename: "task-0-default-iter-1-result.txt".to_string(),
+                run_id: Some(run_a_id),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.found);
+        assert_eq!(result.content, "flat layout artifact");
     }
 }
