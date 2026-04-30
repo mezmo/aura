@@ -282,6 +282,9 @@ pub struct Task {
     pub result: Option<String>,
     /// Error message (if failed).
     pub error: Option<String>,
+    /// Structured failure classification (if failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<FailureCategory>,
     /// Assigned worker name (when specialized workers are configured).
     ///
     /// When set, this task will be executed by the named worker agent
@@ -319,6 +322,7 @@ impl Task {
             status: TaskStatus::Pending,
             result: None,
             error: None,
+            failure_category: None,
             worker: None,
             rationale: rationale.into(),
             reuse_result_from: None,
@@ -355,10 +359,11 @@ impl Task {
         self.result = Some(result.into());
     }
 
-    /// Mark this task as failed with an error.
-    pub fn fail(&mut self, error: impl Into<String>) {
+    /// Mark this task as failed with an error and structured category.
+    pub fn fail(&mut self, error: impl Into<String>, category: FailureCategory) {
         self.status = TaskStatus::Failed;
         self.error = Some(error.into());
+        self.failure_category = Some(category);
     }
 }
 
@@ -375,6 +380,48 @@ pub enum TaskStatus {
     Complete,
     /// Task failed.
     Failed,
+}
+
+/// Structured classification of why a task failed, surfaced in the
+/// continuation prompt so the coordinator can make informed replan decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    /// Worker timed out before completing.
+    AgentTimeout,
+    /// Worker hit its context window limit.
+    ContextOverflow,
+    /// Worker exhausted its maximum tool call depth.
+    DepthExhausted,
+    /// Duplicate call guard fired — worker stuck in a loop.
+    LoopDetected,
+    /// LLM temporarily unavailable (429/503).
+    ProviderOverloaded,
+    /// LLM credentials or auth failed (401/403).
+    ProviderAuthError,
+    /// Upstream dependency task failed.
+    DependencyFailed,
+    /// Worker completed but reported unable to produce a result.
+    SoftFailure,
+    /// Unclassified worker failure.
+    #[default]
+    AgentError,
+}
+
+impl std::fmt::Display for FailureCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentTimeout => write!(f, "agent_timeout"),
+            Self::ContextOverflow => write!(f, "context_overflow"),
+            Self::DepthExhausted => write!(f, "depth_exhausted"),
+            Self::LoopDetected => write!(f, "loop_detected"),
+            Self::ProviderOverloaded => write!(f, "provider_overloaded"),
+            Self::ProviderAuthError => write!(f, "provider_auth_error"),
+            Self::DependencyFailed => write!(f, "dependency_failed"),
+            Self::SoftFailure => write!(f, "soft_failure"),
+            Self::AgentError => write!(f, "agent_error"),
+        }
+    }
 }
 
 impl std::fmt::Display for TaskStatus {
@@ -551,6 +598,9 @@ pub struct FailedTaskRecord {
     pub iteration: usize,
     /// Worker that was assigned (if any).
     pub worker: Option<String>,
+    /// Structured failure classification.
+    #[serde(default)]
+    pub category: FailureCategory,
 }
 
 /// A categorized planning attempt failure with timing information.
@@ -744,10 +794,26 @@ impl IterationContext {
                 TaskStatus::Failed => {
                     has_failed_tasks = true;
                     let err = t.error.as_deref().unwrap_or("unknown");
-                    redesign_lines.push(format!(
-                        "- Task {}: {} → failed: {}",
-                        t.id, t.description, err
-                    ));
+                    let line = match (t.failure_category, &t.structured_output) {
+                        (Some(FailureCategory::SoftFailure), Some(so))
+                            if !so.summary.is_empty() =>
+                        {
+                            let detail = preserve_artifact_footer(&so.summary, 500);
+                            format!(
+                                "- Task {}: {} → soft_failure ({} confidence): {}",
+                                t.id, t.description, so.confidence, detail
+                            )
+                        }
+                        (Some(cat), _) => format!(
+                            "- Task {}: {} → failed [{}]: {}",
+                            t.id, t.description, cat, err
+                        ),
+                        (None, _) => format!(
+                            "- Task {}: {} → failed: {}",
+                            t.id, t.description, err
+                        ),
+                    };
+                    redesign_lines.push(line);
                 }
                 TaskStatus::Pending | TaskStatus::Running => {
                     // Tasks blocked by failed dependencies
@@ -802,16 +868,23 @@ impl IterationContext {
                     .map(|w| format!(" (worker: {w})"))
                     .unwrap_or_default();
                 fh.push_str(&format!(
-                    "\n- Iteration {}: \"{}\"{} — {}",
-                    record.iteration, record.description, worker_info, record.error,
+                    "\n- Iteration {}: \"{}\"{} — [{}] {}",
+                    record.iteration,
+                    record.description,
+                    worker_info,
+                    record.category,
+                    record.error,
                 ));
             }
 
-            // Identify repeated failures
-            let mut desc_counts: std::collections::HashMap<&str, usize> =
+            // Identify repeated failures — group by (description, category)
+            // so the same task failing with different categories is not flagged.
+            let mut desc_counts: std::collections::HashMap<(&str, FailureCategory), usize> =
                 std::collections::HashMap::new();
             for record in &self.failure_history {
-                *desc_counts.entry(&record.description).or_insert(0) += 1;
+                *desc_counts
+                    .entry((&record.description, record.category))
+                    .or_insert(0) += 1;
             }
             let repeated: Vec<_> = desc_counts
                 .into_iter()
@@ -819,10 +892,10 @@ impl IterationContext {
                 .collect();
             if !repeated.is_empty() {
                 fh.push_str("\n\nOBSERVED PATTERNS:");
-                for (desc, count) in &repeated {
+                for ((desc, cat), count) in &repeated {
                     fh.push_str(&format!(
-                        "\n- \"{}\" has failed {} times — consider a fundamentally different approach",
-                        desc, count,
+                        "\n- \"{}\" has failed {} times with [{}] — consider a fundamentally different approach",
+                        desc, count, cat,
                     ));
                 }
             }
@@ -986,7 +1059,9 @@ mod tests {
         plan.add_task(Task::new(2, "Task C", "Independent task"));
 
         // Fail task 0
-        plan.get_task_mut(0).unwrap().fail("Something went wrong");
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("Something went wrong", FailureCategory::AgentError);
 
         // Task 1 should NOT be ready (dependency failed)
         // Task 2 should be ready (no dependencies)
@@ -1009,7 +1084,9 @@ mod tests {
         );
 
         // Fail task 0
-        plan.get_task_mut(0).unwrap().fail("Something went wrong");
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("Something went wrong", FailureCategory::AgentError);
 
         // Task 1 should now be blocked
         let blocked = plan.blocked_tasks();
@@ -1030,7 +1107,9 @@ mod tests {
         plan.add_task(Task::new(2, "Task C", "Depends on B").with_dependency(1));
 
         // Fail task 0
-        plan.get_task_mut(0).unwrap().fail("Error");
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("Error", FailureCategory::AgentError);
 
         // Only task 1 is immediately blocked (direct dependency)
         // Task 2 is not blocked yet because its direct dependency (task 1) hasn't failed
@@ -1056,7 +1135,9 @@ mod tests {
         plan.get_task_mut(0).unwrap().complete("Done");
         assert!(!plan.is_finished());
 
-        plan.get_task_mut(1).unwrap().fail("Error");
+        plan.get_task_mut(1)
+            .unwrap()
+            .fail("Error", FailureCategory::AgentError);
         assert!(plan.is_finished()); // All tasks either complete or failed
     }
 
@@ -1230,7 +1311,7 @@ mod tests {
     fn test_continuation_prompt_with_failure_history() {
         let mut plan = Plan::new("Debug the issue");
         let mut task = Task::new(0, "Gather logs", "Collect logs");
-        task.fail("Timeout contacting service");
+        task.fail("Timeout contacting service", FailureCategory::AgentTimeout);
         plan.add_task(task);
 
         let fs = FailureSummary {
@@ -1242,6 +1323,7 @@ mod tests {
             error: "Timeout contacting service".to_string(),
             iteration: 1,
             worker: Some("operations".to_string()),
+            category: FailureCategory::AgentTimeout,
         }];
 
         let ctx = IterationContext::new(1, plan, Some(fs), failures);
@@ -1259,7 +1341,7 @@ mod tests {
     fn test_continuation_prompt_with_repeated_failures() {
         let mut plan = Plan::new("Debug the issue");
         let mut task = Task::new(0, "Fetch data", "Get data");
-        task.fail("Connection refused");
+        task.fail("Connection refused", FailureCategory::AgentError);
         plan.add_task(task);
 
         let fs = FailureSummary {
@@ -1272,12 +1354,14 @@ mod tests {
                 error: "Timeout".to_string(),
                 iteration: 1,
                 worker: None,
+                category: FailureCategory::AgentError,
             },
             FailedTaskRecord {
                 description: "Fetch data".to_string(),
                 error: "Connection refused".to_string(),
                 iteration: 2,
                 worker: None,
+                category: FailureCategory::AgentError,
             },
         ];
 
@@ -1396,7 +1480,7 @@ mod tests {
     fn test_continuation_prompt_urgency_final_attempt() {
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
-        task.fail("error");
+        task.fail("error", FailureCategory::AgentError);
         plan.add_task(task);
 
         let fs = FailureSummary {
@@ -1414,7 +1498,7 @@ mod tests {
     fn test_continuation_prompt_no_urgency_early_iteration() {
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
-        task.fail("error");
+        task.fail("error", FailureCategory::AgentError);
         plan.add_task(task);
 
         let fs = FailureSummary {
@@ -1457,7 +1541,7 @@ mod tests {
         plan.add_task(completed);
 
         let mut failed = Task::new(1, "Failed task", "Broken");
-        failed.fail("boom");
+        failed.fail("boom", FailureCategory::AgentError);
         plan.add_task(failed);
 
         let fs = FailureSummary {
@@ -1474,7 +1558,7 @@ mod tests {
     fn test_continuation_prompt_no_reuse_guidance_when_all_failed() {
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Failed task", "Tried");
-        task.fail("error");
+        task.fail("error", FailureCategory::AgentError);
         plan.add_task(task);
 
         let fs = FailureSummary {
@@ -1496,7 +1580,7 @@ mod tests {
         plan.add_task(completed);
 
         let mut failed = Task::new(1, "Failed task", "Broken");
-        failed.fail("Connection refused");
+        failed.fail("Connection refused", FailureCategory::AgentError);
         plan.add_task(failed);
 
         // Task 2 depends on failed task 1, so it stays Pending (blocked)
@@ -2169,6 +2253,7 @@ mod tests {
             error: "Division by zero".into(),
             iteration: 2,
             worker: Some("math".into()),
+            category: FailureCategory::AgentError,
         };
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: FailedTaskRecord = serde_json::from_str(&json).unwrap();
@@ -2197,6 +2282,7 @@ mod tests {
                 error: "oops".into(),
                 iteration: 1,
                 worker: None,
+                category: FailureCategory::AgentError,
             }],
         );
         let json = serde_json::to_string(&ctx).unwrap();
@@ -2224,5 +2310,276 @@ mod tests {
         let json = serde_json::to_string(&ctx).unwrap();
         let deserialized: IterationContext = serde_json::from_str(&json).unwrap();
         assert!(deserialized.failure_summary.is_none());
+    }
+
+    #[test]
+    fn test_continuation_prompt_renders_failure_category() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Gather logs", "Collect logs");
+        task.fail("Worker timed out after 30s", FailureCategory::AgentTimeout);
+        plan.add_task(task);
+
+        let fs = FailureSummary {
+            reasoning: "Failed".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(
+            prompt.contains("[agent_timeout]"),
+            "prompt should contain category label: {}",
+            prompt
+        );
+        assert!(prompt.contains("Worker timed out after 30s"));
+    }
+
+    #[test]
+    fn test_failure_history_includes_category() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Fetch data", "Get data");
+        task.fail("Connection refused", FailureCategory::AgentError);
+        plan.add_task(task);
+
+        let failures = vec![FailedTaskRecord {
+            description: "Fetch data".to_string(),
+            error: "Connection refused".to_string(),
+            iteration: 1,
+            worker: None,
+            category: FailureCategory::AgentError,
+        }];
+        let fs = FailureSummary {
+            reasoning: "Failed".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(2, plan, Some(fs), failures);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(
+            prompt.contains("[agent_error]"),
+            "failure history should contain category label: {}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_observed_patterns_group_by_description_and_category() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Fetch data", "Get data");
+        task.fail("timeout", FailureCategory::AgentTimeout);
+        plan.add_task(task);
+
+        // Same task description, different categories — should NOT trigger pattern
+        let failures = vec![
+            FailedTaskRecord {
+                description: "Fetch data".to_string(),
+                error: "timeout".to_string(),
+                iteration: 1,
+                worker: None,
+                category: FailureCategory::AgentTimeout,
+            },
+            FailedTaskRecord {
+                description: "Fetch data".to_string(),
+                error: "connection refused".to_string(),
+                iteration: 2,
+                worker: None,
+                category: FailureCategory::AgentError,
+            },
+        ];
+        let fs = FailureSummary {
+            reasoning: "Failed".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(3, plan, Some(fs), failures);
+        let prompt = ctx.build_continuation_prompt(4);
+
+        assert!(
+            !prompt.contains("OBSERVED PATTERNS"),
+            "different categories for same task should not trigger pattern: {}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_failure_category_serde_roundtrip() {
+        let record = FailedTaskRecord {
+            description: "task".into(),
+            error: "boom".into(),
+            iteration: 1,
+            worker: None,
+            category: FailureCategory::ContextOverflow,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            json.contains("\"context_overflow\""),
+            "should serialize as snake_case: {}",
+            json
+        );
+        let deserialized: FailedTaskRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.category, FailureCategory::ContextOverflow);
+    }
+
+    #[test]
+    fn test_soft_failure_renders_worker_summary() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Analyze logs", "Check logs");
+        task.fail(
+            "Worker did not call submit_result",
+            FailureCategory::SoftFailure,
+        );
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "Found partial matches but could not correlate across services".into(),
+            confidence: super::super::tools::submit_result::Confidence::Low,
+        });
+        plan.add_task(task);
+
+        let fs = FailureSummary {
+            reasoning: "Inconclusive".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(
+            prompt.contains("soft_failure"),
+            "should contain soft_failure label: {}",
+            prompt
+        );
+        assert!(
+            prompt.contains("low confidence"),
+            "should show confidence level: {}",
+            prompt
+        );
+        assert!(
+            prompt.contains("partial matches"),
+            "should include worker summary: {}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_soft_failure_empty_summary_falls_back_to_bracket_format() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Analyze logs", "Check logs");
+        task.fail("inconclusive", FailureCategory::SoftFailure);
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "".into(),
+            confidence: super::super::tools::submit_result::Confidence::High,
+        });
+        plan.add_task(task);
+
+        let fs = FailureSummary {
+            reasoning: "Inconclusive".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(
+            prompt.contains("[soft_failure]"),
+            "empty summary should fall back to bracket format: {}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_failure_category_all_variants_serde_roundtrip() {
+        let variants = [
+            (FailureCategory::AgentTimeout, "agent_timeout"),
+            (FailureCategory::ContextOverflow, "context_overflow"),
+            (FailureCategory::DepthExhausted, "depth_exhausted"),
+            (FailureCategory::LoopDetected, "loop_detected"),
+            (FailureCategory::ProviderOverloaded, "provider_overloaded"),
+            (FailureCategory::ProviderAuthError, "provider_auth_error"),
+            (FailureCategory::DependencyFailed, "dependency_failed"),
+            (FailureCategory::SoftFailure, "soft_failure"),
+            (FailureCategory::AgentError, "agent_error"),
+        ];
+        for (variant, expected_str) in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{}\"", expected_str),
+                "serde mismatch for {:?}",
+                variant
+            );
+            let deserialized: FailureCategory = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, variant);
+        }
+    }
+
+    #[test]
+    fn test_failed_task_record_legacy_json_defaults_category() {
+        let json = r#"{"description":"test","error":"boom","iteration":1,"worker":null}"#;
+        let record: FailedTaskRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            record.category,
+            FailureCategory::AgentError,
+            "missing category should default to AgentError"
+        );
+    }
+
+    #[test]
+    fn test_observed_patterns_same_category_triggers_warning() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Fetch data", "Get data");
+        task.fail("timeout", FailureCategory::AgentTimeout);
+        plan.add_task(task);
+
+        let failures = vec![
+            FailedTaskRecord {
+                description: "Fetch data".to_string(),
+                error: "timeout".to_string(),
+                iteration: 1,
+                worker: None,
+                category: FailureCategory::AgentTimeout,
+            },
+            FailedTaskRecord {
+                description: "Fetch data".to_string(),
+                error: "timeout again".to_string(),
+                iteration: 2,
+                worker: None,
+                category: FailureCategory::AgentTimeout,
+            },
+        ];
+        let fs = FailureSummary {
+            reasoning: "Failed".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(3, plan, Some(fs), failures);
+        let prompt = ctx.build_continuation_prompt(4);
+
+        assert!(
+            prompt.contains("OBSERVED PATTERNS"),
+            "same category should trigger pattern: {}",
+            prompt
+        );
+        assert!(prompt.contains("[agent_timeout]"));
+    }
+
+    #[test]
+    fn test_soft_failure_without_structured_output() {
+        let mut plan = Plan::new("Goal");
+        let mut task = Task::new(0, "Analyze logs", "Check logs");
+        task.fail(
+            "Worker did not call submit_result",
+            FailureCategory::SoftFailure,
+        );
+        // No structured_output set
+        plan.add_task(task);
+
+        let fs = FailureSummary {
+            reasoning: "Inconclusive".into(),
+            gaps: vec![],
+        };
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![]);
+        let prompt = ctx.build_continuation_prompt(3);
+
+        assert!(
+            prompt.contains("[soft_failure]"),
+            "should fall back to bracket format: {}",
+            prompt
+        );
+        assert!(prompt.contains("Worker did not call submit_result"));
     }
 }

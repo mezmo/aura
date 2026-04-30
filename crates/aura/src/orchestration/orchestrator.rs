@@ -62,8 +62,8 @@ use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    FailedTaskRecord, FailureSummary, IterationContext, IterationOutcome, Plan, PlanAttemptFailure,
-    PlanningResponse, Task, TaskStatus,
+    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
+    PlanAttemptFailure, PlanningResponse, Task, TaskStatus,
 };
 
 // ============================================================================
@@ -2469,8 +2469,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                     Err(e) => {
                         let err_str = e.to_string();
+                        let category = Self::categorize_failure_error(&err_str);
                         if let Some(t) = plan.get_task_mut(task_id) {
-                            t.fail(err_str.clone());
+                            t.fail(err_str.clone(), category);
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
@@ -2488,23 +2489,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
                         let (task_preview, _) = safe_truncate(&task_desc, 100);
-                        let error_category = if err_str.contains("timed out") {
-                            "timeout"
-                        } else if is_context_overflow_error(e.as_ref()) {
-                            "context overflow"
-                        } else if err_str.contains("MaxDepthError")
-                            || err_str.contains("reached limit")
-                        {
-                            "depth exhaustion"
-                        } else {
-                            "error"
-                        };
                         tracing::warn!(
                             "Worker '{}' failed task {} after {}ms ({}): {}. Task was: {}",
                             worker_label,
                             task_id,
                             duration_ms,
-                            error_category,
+                            category,
                             e,
                             task_preview
                         );
@@ -2529,6 +2519,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 error: t.error.clone().unwrap_or_else(|| "unknown".to_string()),
                 iteration,
                 worker: t.worker.clone(),
+                category: t.failure_category.unwrap_or_default(),
             })
             .collect()
     }
@@ -2873,30 +2864,46 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .join("\n")
     }
 
-    /// Categorize a task failure error string into a human-readable category.
-    fn categorize_failure_error(error: &str) -> &'static str {
+    /// Classify a task failure error string into a structured category.
+    fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains("timed out") {
-            "timeout"
-        } else if lower.contains("context")
-            && (lower.contains("limit") || lower.contains("overflow"))
+            FailureCategory::AgentTimeout
+        } else if (lower.contains("context")
+            && (lower.contains("limit")
+                || lower.contains("overflow")
+                || lower.contains("exceeded")
+                || lower.contains("length")))
+            || lower.contains("maximum context")
+            || lower.contains("token limit")
+            || lower.contains("tokens exceeded")
+            || lower.contains("maximum number of tokens")
+            || (lower.contains("too") && lower.contains("long") && lower.contains("token"))
         {
-            "context overflow"
+            FailureCategory::ContextOverflow
         } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
-            "depth exhaustion"
+            FailureCategory::DepthExhausted
+        } else if lower.contains("duplicate call loop") {
+            FailureCategory::LoopDetected
+        } else if lower.contains("did not call submit_result") {
+            FailureCategory::SoftFailure
         } else if lower.contains("rate limit")
             || lower.contains("429")
+            || lower.contains("too many requests")
             || lower.contains("503")
             || lower.contains("502")
             || lower.contains("service unavailable")
-            || lower.contains("authentication")
+        {
+            FailureCategory::ProviderOverloaded
+        } else if lower.contains("authentication")
             || lower.contains("unauthorized")
             || lower.contains("403")
+            || lower.contains("401")
             || lower.contains("api key")
         {
-            "provider_error"
+            FailureCategory::ProviderAuthError
         } else {
-            "LLM error"
+            FailureCategory::AgentError
         }
     }
 
@@ -2910,9 +2917,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if failures.is_empty() || completed_count > 0 {
             return false;
         }
-        failures
-            .iter()
-            .all(|f| Self::categorize_failure_error(&f.error) == "provider_error")
+        failures.iter().all(|f| {
+            matches!(
+                f.category,
+                FailureCategory::ProviderOverloaded | FailureCategory::ProviderAuthError
+            )
+        })
     }
 
     /// Send an orchestrator event through the stream channel.
@@ -3257,12 +3267,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let failure_summary = if has_failures {
             let failure_detail = if !this_iteration_failures.is_empty() {
-                let mut category_counts: std::collections::HashMap<&str, usize> =
+                let mut category_counts: std::collections::HashMap<FailureCategory, usize> =
                     std::collections::HashMap::new();
                 for f in this_iteration_failures {
-                    *category_counts
-                        .entry(Self::categorize_failure_error(&f.error))
-                        .or_insert(0) += 1;
+                    *category_counts.entry(f.category).or_insert(0) += 1;
                 }
                 let mut categories: Vec<_> = category_counts.into_iter().collect();
                 categories.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
@@ -3616,6 +3624,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .structured_output
                     .as_ref()
                     .map(|s| s.confidence.to_string()),
+                failure_category: t.failure_category,
             })
             .collect();
 
@@ -4934,7 +4943,7 @@ mod tests {
     fn test_apply_result_reuse_ignores_failed_tasks() {
         let mut prev = Plan::new("prev");
         let mut t = Task::new(0, "Bad task", "Failed");
-        t.fail("error");
+        t.fail("error", FailureCategory::AgentError);
         prev.add_task(t);
 
         let mut new_plan = Plan::new("new");
@@ -4984,23 +4993,23 @@ mod tests {
     fn test_categorize_failure_provider_errors() {
         assert_eq!(
             Orchestrator::categorize_failure_error("Rate limit exceeded"),
-            "provider_error"
+            FailureCategory::ProviderOverloaded
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("HTTP 429 Too Many Requests"),
-            "provider_error"
+            FailureCategory::ProviderOverloaded
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("503 Service Unavailable"),
-            "provider_error"
+            FailureCategory::ProviderOverloaded
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Authentication failed: invalid API key"),
-            "provider_error"
+            FailureCategory::ProviderAuthError
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Unauthorized: 403"),
-            "provider_error"
+            FailureCategory::ProviderAuthError
         );
     }
 
@@ -5008,19 +5017,19 @@ mod tests {
     fn test_categorize_failure_other_categories() {
         assert_eq!(
             Orchestrator::categorize_failure_error("Request timed out after 30s"),
-            "timeout"
+            FailureCategory::AgentTimeout
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("context limit exceeded"),
-            "context overflow"
+            FailureCategory::ContextOverflow
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("MaxDepthError: reached limit"),
-            "depth exhaustion"
+            FailureCategory::DepthExhausted
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Something went wrong"),
-            "LLM error"
+            FailureCategory::AgentError
         );
     }
 
@@ -5029,11 +5038,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_failure(error: &str) -> FailedTaskRecord {
+        let category = Orchestrator::categorize_failure_error(error);
         FailedTaskRecord {
             description: "test task".into(),
             error: error.into(),
             iteration: 1,
             worker: None,
+            category,
         }
     }
 
@@ -5074,5 +5085,93 @@ mod tests {
     #[test]
     fn test_should_not_short_circuit_empty_failures() {
         assert!(!Orchestrator::should_short_circuit_provider_errors(&[], 0));
+    }
+
+    #[test]
+    fn test_categorize_failure_loop_detected() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Worker blocked by duplicate call loop"),
+            FailureCategory::LoopDetected
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_soft_failure() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Worker did not call submit_result"),
+            FailureCategory::SoftFailure
+        );
+    }
+
+    #[test]
+    fn test_categorize_provider_overloaded_vs_auth() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Rate limit exceeded (429)"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("503 Service Unavailable"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("403 Forbidden"),
+            FailureCategory::ProviderAuthError
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("401 Unauthorized"),
+            FailureCategory::ProviderAuthError
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Invalid API key"),
+            FailureCategory::ProviderAuthError
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_context_overflow_token_patterns() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("token limit reached"),
+            FailureCategory::ContextOverflow
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("maximum number of tokens exceeded"),
+            FailureCategory::ContextOverflow
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("maximum context length"),
+            FailureCategory::ContextOverflow
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Input too long for token window"),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_502_provider_overloaded() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("502 Bad Gateway"),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_precedence_timeout_before_provider() {
+        // "timed out" should match AgentTimeout even if message also contains "503"
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Request timed out after 503 retries"),
+            FailureCategory::AgentTimeout
+        );
+    }
+
+    #[test]
+    fn test_should_short_circuit_both_provider_categories() {
+        let failures = vec![
+            make_failure("Rate limit exceeded"),
+            make_failure("Authentication failed"),
+        ];
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
     }
 }
