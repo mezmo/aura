@@ -125,6 +125,7 @@ struct CoordinatorTools {
     /// `respond_directly` or `request_clarification`.
     allow_create_plan: bool,
     read_artifact: Option<ReadArtifactTool>,
+    list_prior_runs: Option<super::tools::ListPriorRunsTool>,
 }
 
 // ============================================================================
@@ -1579,6 +1580,7 @@ impl Orchestrator {
             PlanningResponse::Direct {
                 response: answer,
                 routing_rationale,
+                ..
             } if !allow_direct_answers => {
                 tracing::info!(
                     "Config override: converting direct answer to orchestrated plan (allow_direct_answers=false)"
@@ -1983,6 +1985,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
+        if let Some(list_prior_runs) = tools.list_prior_runs {
+            state = state.add_tool(list_prior_runs);
+        }
         state.build()
     }
 
@@ -2026,9 +2031,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
 
         // Build coordinator preamble: orchestration framework template + user system prompt
+        let include_history_tools = self.config.memory_dir().is_some()
+            && self.persistence.lock().await.session_id().is_some();
         let mut preamble = self.config.build_coordinator_preamble(
             self.agent_config.effective_preamble(),
             include_recon_tools,
+            include_history_tools,
         );
         let temperature = self.agent_config.llm.temperature();
 
@@ -2110,6 +2118,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_tools,
             allow_create_plan,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
+            list_prior_runs: if include_history_tools {
+                Some(super::tools::ListPriorRunsTool::new(
+                    self.persistence.clone(),
+                    std::path::PathBuf::from(self.config.memory_dir().unwrap()),
+                ))
+            } else {
+                None
+            },
         };
 
         let provider_agent = self
@@ -3279,6 +3295,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
+                response_summary,
             } => {
                 span.record("orchestration.routing", "direct");
                 Self::emit_event(
@@ -3287,6 +3304,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         response: response.clone(),
                         routing_rationale,
                     },
+                )
+                .await;
+                self.write_direct_response_manifest(
+                    query,
+                    &response,
+                    response_summary.as_deref(),
                 )
                 .await;
                 Ok(response)
@@ -3587,6 +3610,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 PlanningResponse::Direct {
                     response,
                     routing_rationale,
+                    response_summary,
                 },
                 _,
                 _,
@@ -3617,7 +3641,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest(&plan, iteration).await;
+                self.write_run_manifest_with_summary(
+                    &plan,
+                    iteration,
+                    response_summary,
+                )
+                .await;
                 Ok(IterationOutcome::FinalResult(response))
             }
             Ok((
@@ -3809,8 +3838,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
-    async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
-        use super::persistence::{RunManifest, RunStatus, TaskSummary};
+    async fn write_run_manifest(
+        &self,
+        plan: &Plan,
+        iterations: usize,
+    ) {
+        self.write_run_manifest_with_summary(plan, iterations, None)
+            .await;
+    }
+
+    async fn write_run_manifest_with_summary(
+        &self,
+        plan: &Plan,
+        iterations: usize,
+        response_summary: Option<String>,
+    ) {
+        use super::persistence::{
+            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
+            ToolOutcome, ToolTraceEntry,
+        };
         use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
@@ -3824,10 +3870,69 @@ Assign tasks to the worker whose tools best match the required operations."#,
             RunStatus::Failed
         };
 
-        let task_summaries = plan
-            .tasks
-            .iter()
-            .map(|t| TaskSummary {
+        let artifacts_meta = match persistence.list_artifacts_with_metadata().await {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::warn!("Failed to list artifacts for manifest: {}", e);
+                Vec::new()
+            }
+        };
+
+        let mut task_summaries = Vec::with_capacity(plan.tasks.len());
+
+        for t in &plan.tasks {
+            let task_prefix = format!("task-{}-", t.id);
+            let task_artifacts: Vec<ArtifactEntry> = artifacts_meta
+                .iter()
+                .filter(|(name, _)| name.starts_with(&task_prefix))
+                .map(|(name, size)| ArtifactEntry {
+                    filename: name.clone(),
+                    size_bytes: *size,
+                    kind: artifact_kind_from_filename(name),
+                })
+                .collect();
+
+            let tool_records = persistence.load_tool_records_for_task(t.id).await;
+            let tool_trace: Vec<ToolTraceEntry> = tool_records
+                .iter()
+                .map(|r| ToolTraceEntry {
+                    tool: r.tool.clone(),
+                    reasoning: r.reasoning.clone(),
+                    duration_ms: r.duration_ms,
+                    outcome: if let Some(ref err) = r.error {
+                        ToolOutcome::Error {
+                            message: err.clone(),
+                        }
+                    } else {
+                        ToolOutcome::Success {
+                            output_bytes: r
+                                .output
+                                .as_ref()
+                                .map(|o| o.len() as u64)
+                                .unwrap_or(0),
+                        }
+                    },
+                    artifact_filename: r.artifact_filename.clone(),
+                })
+                .collect();
+
+            let (error, error_context) = match &t.state {
+                TaskState::Failed { error, category } => {
+                    let last_tool = tool_trace.last().map(|tr| tr.tool.clone());
+                    (
+                        Some(error.clone()),
+                        Some(ErrorContext {
+                            category: *category,
+                            last_tool_call: last_tool,
+                            attempt_count: 1,
+                            partial_result: None,
+                        }),
+                    )
+                }
+                _ => (None, None),
+            };
+
+            task_summaries.push(TaskSummary {
                 task_id: t.id,
                 description: t.description.clone(),
                 status: TaskStatus::from(&t.state),
@@ -3850,15 +3955,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     TaskState::Failed { category, .. } => Some(*category),
                     _ => None,
                 },
-            })
-            .collect();
+                error,
+                error_context,
+                tool_trace,
+                artifacts: task_artifacts,
+            });
+        }
 
-        let artifact_paths = match persistence.list_artifacts().await {
-            Ok(paths) => paths,
-            Err(e) => {
-                tracing::warn!("Failed to list artifacts for manifest: {}", e);
-                Vec::new()
-            }
+        let artifact_paths = artifacts_meta.into_iter().map(|(name, _)| name).collect();
+
+        let completed = plan.completed_count();
+        let total = plan.tasks.len();
+        let outcome = if total == 0 {
+            None
+        } else if all_complete {
+            Some(format!("{total}/{total} tasks completed"))
+        } else {
+            Some(format!("{completed}/{total} tasks completed"))
         };
 
         let manifest = RunManifest {
@@ -3869,6 +3982,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             status,
             iterations,
             routing_mode: Some(super::events::RoutingMode::for_plan(plan.tasks.len())),
+            outcome,
+            response_summary,
             task_summaries,
             artifact_paths,
         };
@@ -3877,11 +3992,81 @@ Assign tasks to the worker whose tools best match the required operations."#,
             tracing::warn!("Failed to write run manifest: {}", e);
         }
     }
+
+    async fn write_direct_response_manifest(
+        &self,
+        query: &str,
+        response: &str,
+        summary: Option<&str>,
+    ) {
+        use super::persistence::{RunManifest, RunStatus};
+        use crate::string_utils::safe_truncate;
+
+        let persistence = self.persistence.lock().await;
+
+        let response_summary = Some(
+            summary
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| safe_truncate(response, 200).0.to_string()),
+        );
+
+        let manifest = RunManifest {
+            run_id: persistence.run_id().to_string(),
+            session_id: persistence.session_id().map(|s| s.to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            goal: query.to_string(),
+            status: RunStatus::Success,
+            iterations: 0,
+            routing_mode: Some(super::events::RoutingMode::DirectAnswer),
+            outcome: Some("Answered directly".to_string()),
+            response_summary,
+            task_summaries: vec![],
+            artifact_paths: vec![],
+        };
+
+        if let Err(e) = persistence.write_manifest(&manifest).await {
+            tracing::warn!("Failed to write direct response manifest: {}", e);
+        }
+    }
 }
 
 // StreamingAgent is implemented by OrchestratorFactory (see factory.rs),
 // which creates an Orchestrator lazily inside stream() to avoid duplicate
 // MCP connections and persistence directories.
+
+/// Determine artifact kind from the filename convention.
+///
+/// Filenames ending in `-result.txt` are worker result artifacts.
+/// Filenames ending in `-output.txt` are promoted tool output artifacts;
+/// the tool name is extracted from the filename structure.
+fn artifact_kind_from_filename(filename: &str) -> super::persistence::ArtifactKind {
+    use super::persistence::ArtifactKind;
+    if filename.ends_with("-result.txt") {
+        ArtifactKind::Result
+    } else if filename.ends_with("-output.txt") {
+        // Format: task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt
+        // Extract tool_name: split by '-', skip known prefix segments, take up to call_idx
+        let without_suffix = filename.trim_end_matches("-output.txt");
+        let parts: Vec<&str> = without_suffix.split('-').collect();
+        // Find "iter" marker position, tool_name segments follow iter-{n}
+        let tool_name = parts
+            .iter()
+            .position(|&p| p == "iter")
+            .and_then(|iter_pos| {
+                // Skip iter-{n}, take segments up to the last one (call_idx)
+                let after_iter = &parts[iter_pos + 2..];
+                if after_iter.len() > 1 {
+                    Some(after_iter[..after_iter.len() - 1].join("-"))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        ArtifactKind::ToolOutput { tool_name }
+    } else {
+        ArtifactKind::Result
+    }
+}
 
 /// Truncate a query string for logging.
 fn truncate_query(query: &str, max_len: usize) -> String {
@@ -4641,6 +4826,7 @@ mod tests {
         let response = PlanningResponse::Direct {
             response: "42".to_string(),
             routing_rationale: "Simple math".to_string(),
+            response_summary: None,
         };
         assert!(response.into_plan().is_none());
     }
@@ -4698,6 +4884,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "42".to_string(),
             routing_rationale: "trivial".to_string(),
+            response_summary: None,
         };
         let out = Orchestrator::enforce_routing_config(direct, "what is 6*7?", true, true);
         assert!(matches!(out, PlanningResponse::Direct { .. }));
@@ -4718,6 +4905,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "the meaning of life is 42".to_string(),
             routing_rationale: "trivial answer".to_string(),
+            response_summary: None,
         };
         let out = Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
 
@@ -4822,6 +5010,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "hello".to_string(),
             routing_rationale: "greeting".to_string(),
+            response_summary: None,
         };
         let json = serde_json::to_string(&direct).unwrap();
         let parsed: PlanningResponse = serde_json::from_str(&json).unwrap();
@@ -5000,6 +5189,7 @@ mod tests {
         let output = tool
             .call(super::super::tools::read_artifact::ReadArtifactArgs {
                 filename: "task-0-research-iter-1-result.txt".to_string(),
+                run_id: None,
             })
             .await
             .unwrap();
@@ -5068,6 +5258,7 @@ mod tests {
             let output = tool
                 .call(super::super::tools::read_artifact::ReadArtifactArgs {
                     filename: name.to_string(),
+                    run_id: None,
                 })
                 .await
                 .unwrap();
@@ -5407,5 +5598,40 @@ mod tests {
         assert!(Orchestrator::should_short_circuit_provider_errors(
             &failures, 0
         ));
+    }
+
+    // ========================================================================
+    // Artifact Kind From Filename Tests
+    // ========================================================================
+
+    #[test]
+    fn test_artifact_kind_from_filename_result() {
+        use crate::orchestration::persistence::ArtifactKind;
+        let kind = artifact_kind_from_filename("task-0-sre-iter-1-result.txt");
+        assert!(matches!(kind, ArtifactKind::Result));
+    }
+
+    #[test]
+    fn test_artifact_kind_from_filename_tool_output() {
+        use crate::orchestration::persistence::ArtifactKind;
+        let kind = artifact_kind_from_filename("task-0-sre-iter-1-log-search-0-output.txt");
+        match kind {
+            ArtifactKind::ToolOutput { tool_name } => {
+                assert_eq!(tool_name, "log-search");
+            }
+            _ => panic!("Expected ToolOutput"),
+        }
+    }
+
+    #[test]
+    fn test_artifact_kind_from_filename_multi_segment_tool() {
+        use crate::orchestration::persistence::ArtifactKind;
+        let kind = artifact_kind_from_filename("task-2-ops-iter-1-my-search-tool-3-output.txt");
+        match kind {
+            ArtifactKind::ToolOutput { tool_name } => {
+                assert_eq!(tool_name, "my-search-tool");
+            }
+            _ => panic!("Expected ToolOutput"),
+        }
     }
 }
