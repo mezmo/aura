@@ -43,6 +43,8 @@ mod config;
 mod duplicate_call_guard;
 mod events;
 mod factory;
+#[cfg(test)]
+mod frame_validation_tests;
 mod observer_wrapper;
 mod orchestrator;
 mod persistence;

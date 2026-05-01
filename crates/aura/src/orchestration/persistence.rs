@@ -1006,10 +1006,13 @@ fn render_task_summary(task: &TaskSummary, out: &mut String) {
             if let Some(error) = &task.error {
                 out.push_str(&format!("    Error: {}\n", error));
             }
-            if let Some(ctx) = &task.error_context
-                && let Some(partial) = &ctx.partial_result
-            {
-                out.push_str(&format!("    Partial progress: {}\n", partial));
+            if let Some(ctx) = &task.error_context {
+                if let Some(tool) = &ctx.last_tool_call {
+                    out.push_str(&format!("    Last tool: {}\n", tool));
+                }
+                if let Some(partial) = &ctx.partial_result {
+                    out.push_str(&format!("    Partial progress: {}\n", partial));
+                }
             }
         }
         _ => {
@@ -1805,6 +1808,7 @@ mod tests {
 
         assert!(result.contains("FAILED (agent_timeout)"));
         assert!(result.contains("Error: Timed out after 30s"));
+        assert!(result.contains("Last tool: execute_sql"));
         assert!(result.contains("Partial progress: Retrieved 50 of 500 rows"));
         assert!(result.contains(
             "Tool chain: execute_sql (15.0s) → execute_sql (FAILED: timeout)"

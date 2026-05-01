@@ -962,7 +962,7 @@ impl Orchestrator {
 
     /// Build the iter-1 planning wrapper (fresh query, no prior iteration).
     /// Enumerates the three routing tools with neutral bullets.
-    fn build_planning_wrapper(
+    pub(crate) fn build_planning_wrapper(
         query: &str,
         worker_section: &str,
         worker_guidelines: &str,

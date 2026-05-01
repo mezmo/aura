@@ -884,8 +884,8 @@ impl IterationContext {
                             t.id, t.description, detail
                         ));
                     }
-                    if let Some(chain) = render_tool_chain(self.tool_traces.get(&t.id)) {
-                        completed_lines.push(format!("    {}", chain));
+                    for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
+                        completed_lines.push(format!("    {}", line));
                     }
                 }
                 TaskState::Failed { error, category } => {
@@ -906,8 +906,8 @@ impl IterationContext {
                         ),
                     };
                     redesign_lines.push(line);
-                    if let Some(chain) = render_tool_chain(self.tool_traces.get(&t.id)) {
-                        redesign_lines.push(format!("    {}", chain));
+                    for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
+                        redesign_lines.push(format!("    {}", line));
                     }
                 }
                 TaskState::Pending | TaskState::Running => {
@@ -1085,16 +1085,20 @@ fn preserve_artifact_footer(result: &str, budget: usize) -> String {
     }
 }
 
-/// Render a condensed tool chain line from pre-loaded tool traces.
+/// Render condensed tool chain + artifact ref lines from pre-loaded traces.
 ///
-/// Returns `None` when the trace slice is empty or absent.
-/// Format: `Tool chain: tool_a (1.2s, "reasoning...") → tool_b (FAILED: error)`
-fn render_tool_chain(
+/// Returns empty vec when the trace slice is empty or absent.
+/// First line: `Tool chain: tool_a (1.2s, "reasoning...") → tool_b (FAILED: error)`
+/// Subsequent lines: `[Tool output: filename (N bytes)]` for each promoted artifact.
+fn render_tool_chain_lines(
     traces: Option<&Vec<super::persistence::ToolTraceEntry>>,
-) -> Option<String> {
+) -> Vec<String> {
     use super::persistence::ToolOutcome;
 
-    let traces = traces.filter(|v| !v.is_empty())?;
+    let traces = match traces.filter(|v| !v.is_empty()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
 
     let parts: Vec<String> = traces
         .iter()
@@ -1116,7 +1120,17 @@ fn render_tool_chain(
         })
         .collect();
 
-    Some(format!("Tool chain: {}", parts.join(" → ")))
+    let mut lines = vec![format!("Tool chain: {}", parts.join(" → "))];
+
+    for t in traces {
+        if let (Some(filename), ToolOutcome::Success { output_bytes }) =
+            (&t.artifact_filename, &t.outcome)
+        {
+            lines.push(format!("[Tool output: {} ({} bytes)]", filename, output_bytes));
+        }
+    }
+
+    lines
 }
 
 fn truncate_reasoning(s: &str, max_chars: usize) -> String {
