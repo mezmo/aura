@@ -1,3 +1,16 @@
+## Changelog
+
+## [1.19.2](https://github.com/mezmo/aura/compare/v1.19.1...v1.19.2) (2026-05-01)
+
+
+### Chores
+
+* **setup**: rework ci and release setup [a5b7a0d](https://github.com/mezmo/aura/commit/a5b7a0d449481f21184274cb7a469f7bc8dd084e) - Eric Satterwhite [LOG-23601](https://mezmo.atlassian.net/browse/LOG-23601)* **setup**: update commitlint setup [41cab5f](https://github.com/mezmo/aura/commit/41cab5f790ddd08ce65762eba99b2fe92ef5acdc) - Eric Satterwhite [LOG-23601](https://mezmo.atlassian.net/browse/LOG-23601)
+
+### Style
+
+* **lint**: fix deployment yaml to pass lint [4180b87](https://github.com/mezmo/aura/commit/4180b8794798f3c15df39a13e31a314fabed06e6) - Eric Satterwhite [LOG-23601](https://mezmo.atlassian.net/browse/LOG-23601)
+
 ## [1.19.1](https://github.com/mezmo/aura/compare/v1.19.0...v1.19.1) (2026-04-23)
 
 
