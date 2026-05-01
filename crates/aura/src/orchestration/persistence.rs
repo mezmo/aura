@@ -313,7 +313,7 @@ impl ExecutionPersistence {
         };
 
         // Generate unique run ID
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::now_v7().to_string();
         let run_path = effective_base.join(&run_id);
 
         fs::create_dir_all(&run_path).await?;
@@ -347,6 +347,56 @@ impl ExecutionPersistence {
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(Notify::new()),
         })
+    }
+
+    /// Prune oldest run directories if the session exceeds `max_runs`.
+    ///
+    /// Skips the current run and the `latest` symlink. Directories are sorted
+    /// lexicographically (UUID v7 = chronological order) and the oldest are
+    /// removed first. Best-effort: errors on individual deletions are logged
+    /// but don't fail the operation.
+    pub async fn prune_session_runs(&self, max_runs: usize) {
+        if !self.enabled || max_runs == 0 || self.session_id.is_none() {
+            return;
+        }
+
+        let session_dir = match self.base_path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return,
+        };
+
+        let mut run_dirs: Vec<String> = Vec::new();
+        let mut entries = match fs::read_dir(&session_dir).await {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name == "latest" || name == self.run_id {
+                    continue;
+                }
+                run_dirs.push(name.to_string());
+            }
+        }
+
+        if run_dirs.len() < max_runs {
+            return;
+        }
+
+        run_dirs.sort();
+        let to_remove = run_dirs.len() - max_runs + 1;
+        for dir_name in run_dirs.iter().take(to_remove) {
+            let path = session_dir.join(dir_name);
+            match fs::remove_dir_all(&path).await {
+                Ok(()) => tracing::info!("Pruned old run directory: {}", dir_name),
+                Err(e) => tracing::warn!("Failed to prune run directory {}: {}", dir_name, e),
+            }
+        }
     }
 
     /// Create a disabled persistence manager (no-op writes).
@@ -962,10 +1012,6 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
     }
 
     SESSION_HISTORY_TEMPLATE
-        .replace(
-            "%%CURRENT_TIME%%",
-            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        )
         .replace("%%TURN_COUNT%%", &manifests.len().to_string())
         .replace("%%TURN_ENTRIES%%", turn_entries.trim_end())
 }
@@ -1585,8 +1631,7 @@ mod tests {
         let result = build_session_context(&manifests);
 
         assert!(result.contains("## Session History"));
-        assert!(result.contains("Current time: "));
-        assert!(result.contains("1 previous orchestration run(s)"));
+        assert!(result.contains("1 prior run(s) shown above"));
         assert!(result.contains("### Turn 1 (2026-03-20T01:57:24Z)"));
         assert!(result.contains("Success"));
         assert!(result.contains("Compute mean of [10,20,30]"));
@@ -1607,7 +1652,7 @@ mod tests {
 
         let result = build_session_context(&manifests);
 
-        assert!(result.contains("2 previous orchestration run(s)"));
+        assert!(result.contains("2 prior run(s) shown above"));
         // Turn 1 should be the older one (chronological order)
         let turn1_pos = result.find("### Turn 1").unwrap();
         let turn2_pos = result.find("### Turn 2").unwrap();

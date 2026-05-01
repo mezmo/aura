@@ -40,7 +40,7 @@ pub struct ClientTool {
 /// This is the system-wide fallback when `[agent].turn_depth` is not set in TOML.
 /// Models with extended thinking (e.g. qwen3-coder) burn ReAct turns on reasoning
 /// before tool calls, so 12 gives adequate headroom.
-pub const DEFAULT_MAX_DEPTH: usize = 12;
+pub const DEFAULT_MAX_DEPTH: usize = 16;
 
 /// Shallow-merge two JSON values at the top level.
 ///

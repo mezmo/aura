@@ -87,6 +87,12 @@ pub struct ArtifactsConfig {
     pub tool_output_duration_threshold_ms: u64,
     #[serde(default)]
     pub show_tool_reasoning_in_continuation: bool,
+    #[serde(default = "default_max_session_runs")]
+    pub max_session_runs: usize,
+}
+
+fn default_max_session_runs() -> usize {
+    20
 }
 
 fn default_session_history_turns() -> usize {
@@ -116,6 +122,7 @@ impl Default for ArtifactsConfig {
             tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
             tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
             show_tool_reasoning_in_continuation: false,
+            max_session_runs: default_max_session_runs(),
         }
     }
 }

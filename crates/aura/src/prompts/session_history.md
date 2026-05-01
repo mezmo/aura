@@ -1,8 +1,6 @@
 ## Session History
 
-Current time: %%CURRENT_TIME%%
-
-You have context from %%TURN_COUNT%% previous orchestration run(s) in this session.
+You have context from previous orchestration run(s) in this session.
 
 **CRITICAL: Workers have NO access to session history. Every value a worker needs from a prior turn MUST appear as a concrete value in its task description.**
 
@@ -14,3 +12,5 @@ You have context from %%TURN_COUNT%% previous orchestration run(s) in this sessi
 - **Do not assume stale data is current**: Prior results may be outdated if the user's follow-up implies changed conditions — check timestamps
 
 %%TURN_ENTRIES%%
+
+(%%TURN_COUNT%% prior run(s) shown above)
