@@ -256,7 +256,7 @@ fn test_continuation_full_scenario() {
     };
 
     let ctx = IterationContext::new(2, plan, Some(fs), failure_history, traces);
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, true);
 
     // Header
     assert!(
@@ -343,7 +343,7 @@ fn test_continuation_final_attempt_urgency() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(3, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
         prompt.contains("(FINAL ATTEMPT)"),
@@ -372,32 +372,19 @@ fn test_continuation_mixed_structured_and_raw() {
     plan.add_task(t1);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
-    // Structured path: shows summary + confidence
-    assert!(
-        prompt.contains("Concise structured summary"),
-        "structured summary"
-    );
-    assert!(
-        prompt.contains("confidence: medium"),
-        "confidence from structured"
-    );
+    // Structured path with no artifact: inlines full result, not summary
+    assert!(prompt.contains("Full detailed result from structured output"), "full result inlined");
+    assert!(prompt.contains("confidence: medium"), "confidence from structured");
+    // Summary is NOT shown when result fits inline (no artifact)
+    assert!(!prompt.contains("Concise structured summary"), "summary not shown when no artifact");
 
-    // Raw path: shows truncated result directly
-    assert!(
-        prompt.contains("Raw unstructured worker output"),
-        "raw output"
-    );
+    // Raw path: shows full result directly
+    assert!(prompt.contains("Raw unstructured worker output"), "raw output");
     // Raw path should NOT contain "confidence:"
-    let raw_line = prompt
-        .lines()
-        .find(|l| l.contains("raw") && l.contains("Raw unstructured"));
-    assert!(raw_line.is_some(), "raw task line exists");
-    assert!(
-        !raw_line.unwrap().contains("confidence:"),
-        "no confidence on raw task"
-    );
+    let raw_section = prompt.lines().any(|l| l.contains("Raw unstructured") && !l.contains("confidence:"));
+    assert!(raw_section, "no confidence on raw task");
 }
 
 // ========================================================================
@@ -613,7 +600,7 @@ fn test_session_history_multi_run_chronological() {
     assert!(history.contains("First query"), "run 1 goal");
     assert!(history.contains("Second query"), "run 2 goal");
     assert!(history.contains("Third query"), "run 3 goal");
-    assert!(history.contains("3 previous"), "turn count");
+    assert!(history.contains("3 prior run(s)"), "turn count");
 
     // Verify rendered in chronological order (earliest first) despite desc input
     let first_pos = history.find("First query").unwrap();
@@ -746,7 +733,7 @@ fn test_session_history_and_continuation_independent_artifact_refs() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let continuation = ctx.build_continuation_prompt(3);
+    let continuation = ctx.build_continuation_prompt(3, false);
 
     assert!(
         continuation.contains("task-0-sre-iter-1-result.txt"),
@@ -793,30 +780,26 @@ fn test_continuation_tool_output_artifacts_visible() {
     );
 
     let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, true);
 
     // Tool chain line present
     assert!(prompt.contains("Tool chain:"), "chain line: {}", prompt);
 
-    // Tool output artifact refs visible to coordinator for reuse decisions
+    // Artifact inventory visible to coordinator for read_artifact calls
     assert!(
-        prompt.contains("[Tool output: task-0-sre-iter-1-log_search-0-output.txt"),
-        "log_search artifact ref: {}",
-        prompt
+        prompt.contains("[Artifact: task-0-sre-iter-1-log_search-0-output.txt"),
+        "log_search artifact ref: {}", prompt
     );
     assert!(
-        prompt.contains("[Tool output: task-0-sre-iter-1-get_metrics-1-output.txt"),
-        "get_metrics artifact ref: {}",
-        prompt
+        prompt.contains("[Artifact: task-0-sre-iter-1-get_metrics-1-output.txt"),
+        "get_metrics artifact ref: {}", prompt
     );
     assert!(prompt.contains("48000 bytes"), "artifact size");
 
-    // Tool without artifact should NOT produce a [Tool output:] line
+    // Tool without artifact should NOT produce an [Artifact:] line
     assert_eq!(
-        prompt.matches("[Tool output:").count(),
-        2,
-        "exactly 2 artifact refs (not 3): {}",
-        prompt
+        prompt.matches("[Artifact:").count(), 2,
+        "exactly 2 artifact refs (not 3): {}", prompt
     );
 }
 
@@ -842,7 +825,7 @@ fn test_continuation_failed_task_no_artifact_refs() {
     );
 
     let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, true);
 
     // Failed tools don't produce artifacts
     assert!(
@@ -877,7 +860,7 @@ fn test_continuation_all_failure_categories() {
         plan.add_task(t);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         assert!(
             prompt.contains(&format!("[{}]", display)),
@@ -904,7 +887,7 @@ fn test_continuation_soft_failure_with_structured_output() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     // SoftFailure with structured output uses the summary path
     assert!(
@@ -930,7 +913,7 @@ fn test_continuation_soft_failure_without_structured_output() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     // SoftFailure without structured output falls back to bracket format
     assert!(
@@ -995,7 +978,6 @@ fn test_planning_wrapper_basic_structure() {
         "What are the error rates in the payments service?",
         "\n\nAVAILABLE WORKERS:\n## sre\nSRE tools for log and metric analysis\nTools: log_search, get_metrics",
         "\n- Assign each task to a worker\n- Valid worker names: \"sre\"",
-        "",
     );
 
     assert!(
@@ -1025,7 +1007,11 @@ fn test_planning_wrapper_basic_structure() {
 
 #[test]
 fn test_planning_wrapper_no_workers() {
-    let prompt = Orchestrator::build_planning_wrapper("What is 2+2?", "", "", "");
+    let prompt = Orchestrator::build_planning_wrapper(
+        "What is 2+2?",
+        "",
+        "",
+    );
 
     assert!(prompt.contains("USER QUERY: What is 2+2?"), "query present");
     assert!(!prompt.contains("AVAILABLE WORKERS"), "no worker section");
@@ -1036,36 +1022,11 @@ fn test_planning_wrapper_no_workers() {
 }
 
 #[test]
-fn test_planning_wrapper_with_error_section() {
-    let error = "\n\nPREVIOUS PLANNING ERROR:\nFailed to parse plan JSON: expected object, got array\nPlease try again with valid JSON.";
-    let prompt = Orchestrator::build_planning_wrapper(
-        "Investigate error rates",
-        "\n\nAVAILABLE WORKERS:\n## sre\nSRE analysis",
-        "",
-        error,
-    );
-
-    assert!(
-        prompt.contains("PREVIOUS PLANNING ERROR"),
-        "error section present"
-    );
-    assert!(
-        prompt.contains("expected object, got array"),
-        "error detail"
-    );
-    assert!(
-        prompt.contains("USER QUERY: Investigate error rates"),
-        "query still present"
-    );
-}
-
-#[test]
 fn test_planning_wrapper_multi_worker_guidelines() {
     let prompt = Orchestrator::build_planning_wrapper(
         "Investigate infrastructure issues",
         "\n\nAVAILABLE WORKERS:\n## sre\nSRE tools\n\n## dev\nDev tools",
         "\n- Assign each task to a worker\n- Valid worker names: \"sre\", \"dev\"\n- Choose the worker whose tools best match",
-        "",
     );
 
     assert!(prompt.contains("\"sre\", \"dev\""), "multiple worker names");
@@ -1161,7 +1122,7 @@ fn test_continuation_running_task_renders_as_blocked() {
     plan.add_task(t0);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
         prompt.contains("blocked (dependency failed)"),
@@ -1181,7 +1142,7 @@ fn test_continuation_clean_success_no_failure_sections() {
     plan.add_task(t1);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
         prompt.contains("COMPLETED TASKS"),
@@ -1199,14 +1160,14 @@ fn test_continuation_clean_success_no_failure_sections() {
 }
 
 #[test]
-fn test_continuation_preserve_artifact_footer_no_footer() {
+fn test_continuation_short_result_no_artifact() {
     let mut plan = Plan::new("Test goal");
     let mut t = Task::new(0, "short result task", "Task with short result");
     t.complete("Short result, no artifact needed".to_string());
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
         prompt.contains("Short result, no artifact needed"),
@@ -1224,7 +1185,7 @@ fn test_continuation_reuse_guidance_absent_when_all_failed() {
     plan.add_task(t);
 
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
         !prompt.contains("reuse_result_from"),
@@ -1249,7 +1210,7 @@ fn test_continuation_failure_history_worker_none() {
     }];
 
     let ctx = IterationContext::new(1, plan, None, history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(prompt.contains("FAILURE HISTORY"), "history present");
     // Should NOT contain "(worker: )" with empty worker
@@ -1302,7 +1263,7 @@ fn test_continuation_multiple_repeated_failure_patterns() {
     ];
 
     let ctx = IterationContext::new(2, plan, None, history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
         prompt.contains("OBSERVED PATTERNS"),
@@ -1336,7 +1297,7 @@ fn test_continuation_empty_reasoning_in_tool_chain() {
     );
 
     let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, true);
 
     let chain_line = prompt.lines().find(|l| l.contains("Tool chain:")).unwrap();
     assert!(
@@ -1515,11 +1476,8 @@ fn test_session_history_current_time_placeholder_replaced() {
     );
 
     let history = build_session_context(&[manifest]);
-    assert!(
-        !history.contains("%%CURRENT_TIME%%"),
-        "template placeholder must be replaced"
-    );
-    assert!(history.contains("Current time:"), "time label present");
+    assert!(!history.contains("%%CURRENT_TIME%%"), "template placeholder must not appear");
+    assert!(!history.contains("Current time:"), "current time moved to user messages");
 }
 
 #[test]
@@ -1585,7 +1543,7 @@ fn test_continuation_section_ordering() {
     }];
 
     let ctx = IterationContext::new(1, plan, Some(fs), history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3);
+    let prompt = ctx.build_continuation_prompt(3, false);
 
     let completed_pos = prompt.find("COMPLETED TASKS").unwrap();
     let blocked_pos = prompt.find("BLOCKED TASKS").unwrap();

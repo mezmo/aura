@@ -94,16 +94,18 @@ impl Tool for RespondDirectlyTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Answer the user's query directly from general knowledge. \
-                Use this ONLY for simple factual questions that do NOT require any tool \
-                execution, data retrieval, system inspection, or multi-step analysis."
+            description: "Answer the user's query directly. At initial routing, use \
+                for simple factual questions that do not require tool execution. \
+                At end-of-iteration, use to synthesize the completed task results \
+                into the final answer — inline all concrete findings, names, and \
+                values because the user does not see task results directly."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "response": {
                         "type": "string",
-                        "description": "The complete response to send to the user"
+                        "description": "The complete response to send to the user. This is the ONLY text the user sees — include all concrete data points, names, and values from task results."
                     },
                     "routing_rationale": {
                         "type": "string",
