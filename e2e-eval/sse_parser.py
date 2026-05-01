@@ -156,6 +156,7 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
                         tc["success"] = payload.get("success", True)
                         tc["duration_ms"] = payload.get("duration_ms")
                         tc["result"] = payload.get("result")
+                        tc["result_len"] = len(tc["result"]) if tc["result"] else 0
                         break
 
         elif event_name == "aura.orchestrator.task_completed":
@@ -164,6 +165,13 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
                 tasks[tid]["success"] = payload.get("success", False)
                 tasks[tid]["duration_ms"] = payload.get("duration_ms")
                 tasks[tid]["result"] = payload.get("result")
+
+    # Post-process: extract artifact references from task results
+    artifact_pattern = re.compile(r"\[Full result \(\d+ chars\) saved to artifact: (.+?)\]")
+    for tid in tasks:
+        result = tasks[tid].get("result") or ""
+        match = artifact_pattern.search(result)
+        tasks[tid]["artifact_ref"] = match.group(1) if match else None
 
     # Return in task_id order
     return [tasks[tid] for tid in sorted(tasks.keys())]
@@ -335,6 +343,42 @@ def parse_sse_file(path: Path) -> dict:
     for r in replans:
         replan_triggers[r["trigger"]] += 1
 
+    # Scratchpad metrics (returns 0 when no scratchpad events — safe for non-scratchpad binaries)
+    scratchpad_tokens_intercepted = 0
+    scratchpad_tokens_extracted = 0
+    for event_name, data in event_data_pairs:
+        if event_name == "aura.scratchpad_usage" and data:
+            try:
+                payload = json.loads(data)
+                scratchpad_tokens_intercepted = payload.get("tokens_intercepted", 0)
+                scratchpad_tokens_extracted = payload.get("tokens_extracted", 0)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            break
+    scratchpad_savings_pct = (
+        round(100.0 * (1.0 - scratchpad_tokens_extracted / scratchpad_tokens_intercepted), 1)
+        if scratchpad_tokens_intercepted > 0 else 0.0
+    )
+
+    # Scratchpad exploration tool usage
+    exploration_tool_names = {"schema", "item_schema", "head", "slice", "grep",
+                              "get_in", "iterate_over", "read"}
+    scratchpad_exploration_tools = []
+    for name in _extract_tool_names(event_data_pairs):
+        if name in exploration_tool_names and name not in scratchpad_exploration_tools:
+            scratchpad_exploration_tools.append(name)
+
+    # Context window from session_info
+    context_window = None
+    for event_name, data in event_data_pairs:
+        if event_name == "aura.session_info" and data:
+            try:
+                payload = json.loads(data)
+                context_window = payload.get("model_context_limit")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            break
+
     # New fields: answer_text, tool_names, worker_ids, tasks
     answer_text = _extract_answer_text(text)
     tool_names = _extract_tool_names(event_data_pairs)
@@ -368,6 +412,13 @@ def parse_sse_file(path: Path) -> dict:
         "tool_names": tool_names,
         "worker_ids": worker_ids,
         "tasks": tasks,
+        "artifact_count": sum(1 for t in tasks if t.get("artifact_ref")),
+        "scratchpad_tokens_intercepted": scratchpad_tokens_intercepted,
+        "scratchpad_tokens_extracted": scratchpad_tokens_extracted,
+        "scratchpad_savings_pct": scratchpad_savings_pct,
+        "scratchpad_exploration_tools": scratchpad_exploration_tools,
+        "scratchpad_exploration_count": len(scratchpad_exploration_tools),
+        "context_window": context_window,
     }
 
 

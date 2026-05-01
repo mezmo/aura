@@ -111,6 +111,64 @@ BUILTIN_ASSERTIONS_DEPENDENT = {
 }
 
 
+# ── Built-in Assertions for SRE Hard E2E (needle-in-haystack + category survival) ──
+
+BUILTIN_ASSERTIONS_SRE_HARD = {
+    "probe-paths": {
+        "answer_contains": [
+            "/actuator/health",
+            "/healthz",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 500,
+    },
+    "restart-investigation": {
+        "answer_contains": [
+            "notification-service",
+            "PodCrashLoopBackOff",
+        ],
+        "scratchpad_intercepted": True,
+    },
+    "security-audit": {
+        "answer_contains": [
+            "readOnlyRootFilesystem",
+            "STRIPE_API_KEY",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1000,
+    },
+    "multi-category-findings": {
+        "answer_contains": [
+            "HighErrorRate",
+            "CertExpiringSoon",
+            "PodCrashLoopBackOff",
+            "RabbitMQQueueDepth",
+            "PostgresReplicationLag",
+        ],
+        "category_markers": [
+            "HighErrorRate",
+            "CertExpiringSoon",
+            "NodeDiskPressure",
+            "PodCrashLoopBackOff",
+            "RabbitMQQueueDepth",
+            "PostgresReplicationLag",
+            "HighMemoryUsage",
+            "HighLatencyP99",
+            "PodRestartLoop",
+        ],
+        "category_min": 6,
+    },
+    "sidecar-infrastructure": {
+        "answer_contains": [
+            "istio-proxy",
+            "log-forwarder",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 500,
+    },
+}
+
+
 @dataclass
 class AssertionResult:
     """Result of a single assertion check."""
@@ -238,10 +296,67 @@ def check_completed(prompt: str, parsed: dict) -> AssertionResult:
     return AssertionResult(prompt, "completed", passed, detail)
 
 
+def check_scratchpad_intercepted(
+    prompt: str, parsed: dict, expected: bool,
+) -> AssertionResult:
+    actual = parsed.get("scratchpad_tokens_intercepted", 0) > 0
+    passed = actual == expected
+    tokens = parsed.get("scratchpad_tokens_intercepted", 0)
+    if expected:
+        detail = f"intercepted={tokens} tokens" if passed else "expected interception but tokens_intercepted=0"
+    else:
+        detail = "not intercepted (correct)" if passed else f"unexpectedly intercepted {tokens} tokens"
+    return AssertionResult(prompt, "scratchpad_intercepted", passed, detail)
+
+
+def check_scratchpad_exploration_min(
+    prompt: str, parsed: dict, min_count: int,
+) -> AssertionResult:
+    actual = parsed.get("scratchpad_exploration_count", 0)
+    tools = parsed.get("scratchpad_exploration_tools", [])
+    passed = actual >= min_count
+    detail = f"used {actual} exploration tools: {', '.join(tools) if tools else '(none)'}"
+    if not passed:
+        detail += f" (expected >= {min_count})"
+    return AssertionResult(prompt, "scratchpad_exploration_min", passed, detail)
+
+
+def check_scratchpad_extracted_min(
+    prompt: str, parsed: dict, min_tokens: int,
+) -> AssertionResult:
+    actual = parsed.get("scratchpad_tokens_extracted", 0)
+    passed = actual >= min_tokens
+    detail = f"extracted {actual} tokens"
+    if not passed:
+        detail += f" (expected >= {min_tokens})"
+    return AssertionResult(prompt, "scratchpad_extracted_min", passed, detail)
+
+
+def check_category_count(
+    prompt: str, parsed: dict, markers: list[str], min_count: int,
+) -> AssertionResult:
+    answer = parsed.get("answer_text", "")
+    found = [m for m in markers if m in answer]
+    passed = len(found) >= min_count
+    detail = f"found {len(found)}/{len(markers)} categories: {', '.join(found) if found else '(none)'}"
+    if not passed:
+        missing = [m for m in markers if m not in answer]
+        detail += f" (missing: {', '.join(missing[:5])})"
+    return AssertionResult(prompt, "category_count", passed, detail)
+
+
+def check_artifact_created(prompt: str, parsed: dict) -> AssertionResult:
+    count = parsed.get("artifact_count", 0)
+    passed = count > 0
+    detail = f"{count} task(s) produced artifacts" if passed else "no artifacts created"
+    return AssertionResult(prompt, "artifact_created", passed, detail)
+
+
 def run_assertions(
     prompt: str,
     parsed: dict,
     assertion_spec: dict,
+    skip_scratchpad: bool = False,
 ) -> list[AssertionResult]:
     """Run all assertions for a single prompt against parsed SSE data."""
     results = []
@@ -264,6 +379,29 @@ def run_assertions(
     # Answer contains
     if "answer_contains" in assertion_spec:
         results.extend(check_answer_contains(prompt, parsed, assertion_spec["answer_contains"]))
+
+    # Scratchpad assertions (skippable via --skip-scratchpad)
+    if not skip_scratchpad:
+        if "scratchpad_intercepted" in assertion_spec:
+            results.append(check_scratchpad_intercepted(
+                prompt, parsed, assertion_spec["scratchpad_intercepted"],
+            ))
+        if "scratchpad_exploration_min" in assertion_spec:
+            results.append(check_scratchpad_exploration_min(
+                prompt, parsed, assertion_spec["scratchpad_exploration_min"],
+            ))
+        if "scratchpad_extracted_min" in assertion_spec:
+            results.append(check_scratchpad_extracted_min(
+                prompt, parsed, assertion_spec["scratchpad_extracted_min"],
+            ))
+
+    # Category count
+    if "category_markers" in assertion_spec and "category_min" in assertion_spec:
+        results.append(check_category_count(
+            prompt, parsed,
+            assertion_spec["category_markers"],
+            assertion_spec["category_min"],
+        ))
 
     return results
 
@@ -306,21 +444,33 @@ def collect_sse_files(results_dir: Path) -> dict[str, list[tuple[str, int, Path]
         if not model_dir.is_dir() or model_dir.name in ("__pycache__", "results.csv"):
             continue
         model = model_dir.name
+
+        # Layout A: {model}/iter-N/{label}.sse
+        found_iter = False
         for iter_dir in sorted(model_dir.iterdir()):
-            if not iter_dir.is_dir() or not iter_dir.name.startswith("iter-"):
-                continue
-            iteration = int(iter_dir.name.split("-")[1])
-            for sse_file in sorted(iter_dir.glob("*.sse")):
-                label = sse_file.stem
-                files_by_prompt[label].append((model, iteration, sse_file))
+            if iter_dir.is_dir() and iter_dir.name.startswith("iter-"):
+                found_iter = True
+                iteration = int(iter_dir.name.split("-")[1])
+                for sse_file in sorted(iter_dir.glob("*.sse")):
+                    files_by_prompt[sse_file.stem].append((model, iteration, sse_file))
+
+        # Layout B (session-e2e / sre-hard): {model}/{label}.sse (treat as iteration 1)
+        if not found_iter:
+            for sse_file in sorted(model_dir.glob("*.sse")):
+                files_by_prompt[sse_file.stem].append((model, 1, sse_file))
 
     return dict(files_by_prompt)
 
 
 def detect_prompt_set(prompt_labels: set[str]) -> str:
     """Detect which prompt set was used based on prompt labels found."""
+    sre_hard_labels = set(BUILTIN_ASSERTIONS_SRE_HARD.keys())
     independent_labels = set(BUILTIN_ASSERTIONS.keys())
     dependent_labels = set(BUILTIN_ASSERTIONS_DEPENDENT.keys())
+
+    sre_hard_overlap = prompt_labels & sre_hard_labels
+    if len(sre_hard_overlap) >= 2:
+        return "sre-hard"
 
     independent_overlap = prompt_labels & independent_labels
     dependent_overlap = prompt_labels & dependent_labels
@@ -351,9 +501,13 @@ def main():
         help="Output results as JSON",
     )
     parser.add_argument(
-        "--prompt-set", choices=["independent", "dependent", "auto"],
+        "--prompt-set", choices=["independent", "dependent", "sre-hard", "auto"],
         default="auto",
         help="Which built-in assertion set to use (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--skip-scratchpad", action="store_true",
+        help="Skip scratchpad assertions (for binaries without scratchpad feature)",
     )
     args = parser.parse_args()
 
@@ -376,7 +530,9 @@ def main():
         if prompt_set == "auto":
             prompt_set = detect_prompt_set(set(files_by_prompt.keys()))
 
-        if prompt_set == "dependent":
+        if prompt_set == "sre-hard":
+            assertions = BUILTIN_ASSERTIONS_SRE_HARD
+        elif prompt_set == "dependent":
             assertions = BUILTIN_ASSERTIONS_DEPENDENT
         else:
             assertions = BUILTIN_ASSERTIONS
@@ -399,7 +555,8 @@ def main():
 
         for model, iteration, sse_path in sse_entries:
             parsed = parse_sse_file(sse_path)
-            results = run_assertions(prompt_label, parsed, spec)
+            results = run_assertions(prompt_label, parsed, spec,
+                                     skip_scratchpad=args.skip_scratchpad)
             for r in results:
                 r.model = model
                 r.iteration = iteration
