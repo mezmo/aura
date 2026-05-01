@@ -154,6 +154,80 @@ SSE protocol details, event types, custom events, and client handling are docume
 
 For LibreChat/OpenWebUI integration, see [development/README.md](development/README.md).
 
+### Client-Side Tools
+
+> ---
+> # **USE AT YOUR OWN RISK**
+> ---
+>
+> **Setting `enable_client_tools = true` on an agent grants the LLM the ability to call tools that execute on the *client's* machine.** When clients (e.g. `aura-cli`) advertise tools like `Shell`, `Read`, or `Update`, the LLM can invoke them and the client will execute them with the privileges of the user running the client. This is functionally equivalent to giving the model a shell prompt on every connecting client.
+>
+> **The risks are real:**
+> - **Prompt injection.** Anything the model reads — a file, an MCP tool output, a vector-store hit, a URL — can contain instructions that hijack the model into running destructive commands. The server cannot tell a legitimate request from an injected one.
+> - **Hallucination.** The model can confidently call the wrong tool with the wrong arguments. There is no undo for a `Shell("rm -rf ...")` invocation.
+> - **No server-side sandbox.** The server only forwards tool calls; execution happens client-side with full host privileges. Whatever sandboxing exists is the client's responsibility.
+> - **Per-agent permission filters reduce blast radius but are not a security boundary.** `client_tool_filter` controls which tools the model *can ask for*, not what they do once invoked.
+>
+> **Only enable on agents where:**
+> - You trust the model, the provider, and every data source the model can read (configs, MCP servers, vector stores, web fetches).
+> - You trust every client that will connect with `--enable-client-tools` and the user account it runs under.
+> - You and your users accept that worst-case loss (deleted files, leaked credentials, modified source) is acceptable or recoverable.
+>
+> Disabled by default. Opting an agent in is your decision and your responsibility — and your users'.
+>
+> See [aura-cli's matching warning](crates/aura-cli/README.md#client-side-tools) for the client-side perspective.
+
+> **Single-agent configurations only.** Client-side tools are not supported in orchestrated (multi-agent) configurations — when `[orchestration].enabled = true`, any `tools` array on the request is dropped with a warning. The reason: the passthrough mechanism requires terminating the user-facing SSE stream with `finish_reason: "tool_calls"`, which doesn't compose with the coordinator/worker pipeline. If you need local tools, use a single-agent config.
+
+The server honors a `tools` array on incoming chat completion requests. Whether those tools are actually attached to the LLM is a **per-agent opt-in** in TOML — there is no server-wide flag. Tools that get attached are registered as **passthrough** tools: the LLM sees them alongside any server-side MCP tools and can call them, but instead of executing server-side, the stream terminates with `finish_reason: "tool_calls"` so the client can run the tool locally and submit the result back as a `role: "tool"` follow-up.
+
+```toml
+[agent]
+name = "Assistant"
+system_prompt = "..."
+enable_client_tools = true
+client_tool_filter = ["Read", "ListFiles", "Find*"]   # optional; omitted/empty = all
+```
+
+`client_tool_filter` is a list of glob patterns matched against the request's `tools[].function.name`. An empty or omitted filter means all client tools are available. A request that supplies tools never reaches an agent that did not opt in.
+
+```bash
+# 1) Initial request advertising a client-side tool
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": true,
+    "messages": [{"role": "user", "content": "What time is it?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "Get the current time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }]
+  }'
+
+# 2) Stream ends with finish_reason: "tool_calls". The client executes the tool
+#    locally and submits the result back in a follow-up request:
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": true,
+    "tools": [ ... same tools array ... ],
+    "messages": [
+      {"role": "user", "content": "What time is it?"},
+      {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "call_abc", "type": "function",
+         "function": {"name": "get_current_time", "arguments": "{}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "call_abc", "content": "2026-04-30T14:30:00Z"}
+    ]
+  }'
+```
+
+When the loaded agent doesn't opt in (the default), any `tools` field on the request is silently dropped; the server runs MCP tools as usual but never asks the client to execute anything. Per-agent opt-in is the design — accepting client-supplied tool definitions means trusting the client to execute them, so it should be a deliberate config decision. See [aura-cli](crates/aura-cli/README.md#client-side-tools) for the matching client-side flag (`--enable-client-tools`) and how the two halves coordinate.
+
 ## Configuration
 
 > **Breaking changes (21 April 2026)**: `[llm]` has moved under `[agent.llm]` and workers may now override the LLM via `[orchestration.worker.<name>.llm]`. See [./docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md).

@@ -25,13 +25,13 @@
 
 use crate::orchestration::events::RoutingMode;
 use crate::stream_events::{AgentContext, CorrelationContext};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Shared context included in every orchestration SSE event.
 ///
 /// Bundles agent identity and correlation IDs (session, trace) to avoid
 /// repeating the same two `#[serde(flatten)]` fields on every variant.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventContext {
     #[serde(flatten)]
     pub agent: AgentContext,
@@ -46,7 +46,7 @@ impl EventContext {
 }
 
 /// Shared identity fields for task events (TaskStarted, TaskCompleted).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskContext {
     pub task_id: usize,
     pub orchestrator_id: String,
@@ -54,7 +54,7 @@ pub struct TaskContext {
 }
 
 /// Outcome fields shared by completion events (TaskCompleted, ToolCallCompleted).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompletionOutcome {
     pub success: bool,
     pub duration_ms: u64,
@@ -81,7 +81,7 @@ pub mod event_names {
 ///
 /// These events provide real-time visibility into multi-agent execution
 /// and are emitted alongside standard `AuraStreamEvent`s.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator creates a plan from user query.

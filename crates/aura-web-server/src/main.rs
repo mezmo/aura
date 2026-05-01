@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-mod handlers;
-mod streaming;
-mod types;
+use aura_web_server::handlers;
+use aura_web_server::streaming;
+use aura_web_server::types;
 
 use streaming::ToolResultMode;
 use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
@@ -202,6 +202,7 @@ async fn run() -> std::io::Result<()> {
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
+        additional_tools: Arc::new(Vec::new),
     });
 
     info!(

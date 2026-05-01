@@ -109,6 +109,11 @@ pub mod config {
         /// Enable fallback tool call parsing for Ollama models.
         /// When true, text content that looks like tool calls will be parsed and executed.
         pub fallback_tool_parsing: bool,
+        /// Whether the request includes client-side tool definitions and the
+        /// server is configured to honor them. When true, passthrough tool
+        /// results are suppressed and the final chunk uses
+        /// `finish_reason: "tool_calls"` instead of `"stop"`.
+        pub has_client_tools: bool,
     }
 
     impl StreamConfig {
@@ -124,12 +129,19 @@ pub mod config {
                 tool_result_mode,
                 tool_result_max_length,
                 fallback_tool_parsing: false,
+                has_client_tools: false,
             }
         }
 
         /// Enable fallback tool call parsing (for Ollama models).
         pub fn with_fallback_tool_parsing(mut self, enabled: bool) -> Self {
             self.fallback_tool_parsing = enabled;
+            self
+        }
+
+        /// Mark the request as carrying client-side tool definitions.
+        pub fn with_client_tools(mut self, enabled: bool) -> Self {
+            self.has_client_tools = enabled;
             self
         }
     }
@@ -139,6 +151,7 @@ pub mod context {
     //! Per-request turn context and mutable state.
 
     use super::openai::UsageInfo;
+    use aura::CorrelationContextExt;
     use aura::stream_events::{AgentContext, CorrelationContext};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -148,10 +161,13 @@ pub mod context {
     /// OpenAI function call type identifier.
     pub const FUNCTION_TYPE: &str = "function";
     /// OpenAI finish_reason: normal completion.
-    /// Also used after server-side tool execution completes (Aura never sends finish_reason "tool_calls").
+    /// Used after server-side tool execution (MCP/local) completes inline.
     pub const FINISH_REASON_STOP: &str = "stop";
     /// OpenAI finish_reason: hit max_tokens limit.
     pub const FINISH_REASON_LENGTH: &str = "length";
+    /// OpenAI finish_reason: the model wants the *client* to execute a tool.
+    /// Emitted only when client-side passthrough tools are in use.
+    pub const FINISH_REASON_TOOL_CALLS: &str = "tool_calls";
 
     /// Immutable context for a single streaming turn (created once per request).
     #[derive(Clone)]
@@ -207,6 +223,10 @@ pub mod context {
         pub accumulated_content: String,
         /// Stream error captured for OTel span recording.
         pub stream_error: Option<String>,
+        /// Set when the LLM invoked a passthrough (client-side) tool. Drives
+        /// the final `finish_reason: "tool_calls"` and suppresses the synthetic
+        /// passthrough marker from being delivered to the client.
+        pub has_passthrough_tool_calls: bool,
     }
 
     impl TurnState {
@@ -221,6 +241,7 @@ pub mod context {
 
 // Re-export for convenience
 pub use config::{StreamConfig, ToolResultMode};
+pub use context::FINISH_REASON_TOOL_CALLS;
 pub use context::{
     CHUNK_OBJECT, FINISH_REASON_LENGTH, FINISH_REASON_STOP, FUNCTION_TYPE, TurnContext, TurnState,
 };
@@ -228,10 +249,6 @@ pub use openai::{
     ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChunkDelta, FunctionCallChunk,
     MessageRole, ToolCallChunk,
 };
-
-// Re-export UsageInfo for tests (construct StreamOutcome fixtures)
-#[cfg(test)]
-pub use openai::UsageInfo;
 
 /// Error prefix patterns from Rig's tool error handling.
 const ERROR_PREFIXES: &[(&str, &str)] = &[
@@ -257,15 +274,13 @@ pub fn truncate_result(result: &str, max_length: usize) -> String {
 }
 
 /// Format as SSE message: `data: {json}\n\n`
-pub fn format_sse_chunk<T: serde::Serialize>(
-    value: &T,
-) -> Result<actix_web::web::Bytes, serde_json::Error> {
+pub fn format_sse_chunk<T: serde::Serialize>(value: &T) -> Result<bytes::Bytes, serde_json::Error> {
     let json = serde_json::to_string(value)?;
     let mut buffer = String::with_capacity(json.len() + 10);
     buffer.push_str("data: ");
     buffer.push_str(&json);
     buffer.push_str("\n\n");
-    Ok(actix_web::web::Bytes::from(buffer))
+    Ok(bytes::Bytes::from(buffer))
 }
 
 #[derive(Debug)]

@@ -14,6 +14,7 @@ use rig::agent::{AgentBuilder, AgentBuilderSimple, MultiTurnStreamItem};
 use rig::completion::{CompletionModel, Usage};
 use rig::message::ToolResultContent;
 use rig::streaming::{StreamingChat, StreamingPrompt};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -156,6 +157,7 @@ impl ProviderAgent {
         timeout: Duration,
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
+        client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
@@ -163,6 +165,7 @@ impl ProviderAgent {
     ) {
         let (hook, cancel_tx, usage_state) =
             StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
             Self::OpenAI(agent) => {
@@ -242,6 +245,7 @@ impl ProviderAgent {
         timeout: Duration,
         request_id: &str,
         scratchpad_budget: Option<ContextBudget>,
+        client_tool_names: HashSet<String>,
     ) -> (
         Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>,
         watch::Sender<bool>,
@@ -249,6 +253,7 @@ impl ProviderAgent {
     ) {
         let (hook, cancel_tx, usage_state) =
             StreamingRequestHook::with_scratchpad_budget(timeout, request_id, scratchpad_budget);
+        let hook = hook.with_client_tool_names(client_tool_names);
 
         match self {
             Self::OpenAI(agent) => {
@@ -537,6 +542,20 @@ where
             BuilderState::WithTools(builder) => {
                 BuilderState::WithTools(builder.rmcp_tools(tools, client))
             }
+        }
+    }
+
+    /// Add multiple dynamic tools to the agent builder.
+    ///
+    /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding
+    /// tools from external crates that implement `rig::tool::Tool`.
+    pub fn add_tools_dyn(self, tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> BuilderState<M> {
+        if tools.is_empty() {
+            return self;
+        }
+        match self {
+            BuilderState::Initial(builder) => BuilderState::WithTools(builder.tools(tools)),
+            BuilderState::WithTools(builder) => BuilderState::WithTools(builder.tools(tools)),
         }
     }
 

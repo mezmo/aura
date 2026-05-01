@@ -22,6 +22,7 @@ pub mod mcp_tool_execution;
 #[cfg(feature = "otel")]
 pub mod openinference_exporter;
 pub mod orchestration;
+pub mod passthrough_tool;
 pub mod prompts;
 mod provider_agent; // Private - internal implementation detail
 pub mod rag_tools;
@@ -55,11 +56,15 @@ pub use orchestration::{
     OrchestratorEvent, OrchestratorFactory, Plan, PlanAttemptFailure, PlanningResponse,
     RoutingMode, Task, TaskJson, TaskStatus, TimeoutsConfig,
 };
+pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{
     FinalResponseInfo, StreamError, StreamItem, StreamedAssistantContent, StreamedUserContent,
     ToolCall, ToolResult,
 };
-pub use rig::completion::Message;
+pub use rig::completion::{Message, ToolDefinition as RigToolDefinition};
+pub use rig::message::{AssistantContent, ToolCall as RigToolCall, ToolResultContent, UserContent};
+pub use rig::one_or_many::OneOrMany;
+pub use rig::tool::{Tool as RigTool, ToolDyn};
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
 
@@ -84,7 +89,8 @@ pub use request_progress::{
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
 pub use stream_events::{
-    AgentContext, AuraStreamEvent, CorrelationContext, WorkerPhase, format_named_sse,
+    AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
+    format_named_sse,
 };
 pub use streaming_request_hook::{ResponseContent, StreamingRequestHook, UsageState};
 pub use tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent, ToolOutcome};

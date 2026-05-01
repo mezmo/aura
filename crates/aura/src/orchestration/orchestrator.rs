@@ -738,7 +738,9 @@ impl Orchestrator {
             String::new()
         };
 
-        // Build worker agent using shared MCP connections
+        // Build worker agent using shared MCP connections.
+        // Client-side tools are not supported in orchestration mode and are
+        // never attached to workers (or the coordinator).
         let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
 
         let agent = Agent {
@@ -753,6 +755,7 @@ impl Orchestrator {
                 .scratchpad_tools_config
                 .as_ref()
                 .map(|sp| sp.budget.clone()),
+            client_tool_names: Default::default(),
         };
 
         Ok(AgentWithPreamble {
@@ -2046,6 +2049,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 fallback_tool_names: vec![],
                 context_window: None,
                 scratchpad_budget: None,
+                client_tool_names: Default::default(),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2096,6 +2100,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 fallback_tool_names: vec![],
                 context_window: None,
                 scratchpad_budget: None,
+                client_tool_names: Default::default(),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2146,6 +2151,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 fallback_tool_names: vec![],
                 context_window: None,
                 scratchpad_budget: None,
+                client_tool_names: Default::default(),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2290,7 +2296,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Workers share the orchestrator's `Arc<McpManager>` rather than creating
     /// their own MCP connections. Tool filtering is handled by `add_all_tools`
-    /// via `worker_config.mcp_filter`.
+    /// via `worker_config.mcp_filter`. Workers never receive client-side
+    /// passthrough tools — see `create_worker` for the rationale.
     async fn build_worker_provider_agent(
         &self,
         worker_config: &AgentConfig,
@@ -2342,7 +2349,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -2373,7 +2380,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -2412,7 +2419,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -2440,7 +2447,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -2467,7 +2474,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp).await?;
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
         }
