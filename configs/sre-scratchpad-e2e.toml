@@ -28,8 +28,8 @@ tasks into specialized sub-tasks and delegate to the appropriate worker.
 
 ROUTING GUIDANCE:
 - Workload discovery, namespace listing, service inspection: delegate to k8s-discovery
-- Prometheus queries, target health, metric metadata: delegate to prometheus-analyst
-- Creating ServiceMonitors, alerting rules, applying manifests: delegate to monitoring-engineer
+- Prometheus queries, target health, metric metadata, firing alerts, alert rules: delegate to prometheus-analyst
+- Creating ServiceMonitors, creating alerting rules, applying manifests: delegate to monitoring-engineer
 - Multi-domain tasks (e.g., discover then monitor): create a plan with multiple workers
 - Simple factual questions about the cluster: answer directly if possible
 """
@@ -92,29 +92,31 @@ Report workload names, kinds, replicas, labels, ports, and annotations.
 """
 
 [orchestration.worker.prometheus-analyst]
-description = "Prometheus metrics analysis: query metrics, check targets, inspect metadata and labels"
+description = "Observability analysis: query Prometheus metrics, check target health, inspect metric metadata, check firing alerts and alert rules"
 turn_depth = 8
 mcp_filter = [
   "prometheus_query",
   "prometheus_targets",
   "prometheus_metric_metadata",
   "prometheus_label_values",
+  "alertmanager_get_status",
+  "alertmanager_get_alerts",
+  "alertmanager_get_rules",
 ]
 preamble = """
-You are a Prometheus Analyst. Use your tools to query and analyze metrics.
-Always call the appropriate tool — do not fabricate metric values.
-Report query results clearly with metric names, labels, and values.
+You are an Observability Analyst. Use your tools to query metrics and
+investigate alerts. Always call the appropriate tool — do not fabricate
+metric values or alert state. Report query results clearly with metric
+names, labels, and values. When checking alerts, report name, state,
+severity, and affected resources.
 """
 
 [orchestration.worker.monitoring-engineer]
-description = "Monitoring configuration: create ServiceMonitors, apply manifests, manage alerting rules"
+description = "Monitoring configuration: create ServiceMonitors, apply manifests, create alerting rules"
 turn_depth = 8
 mcp_filter = [
   "k8s_apply_manifest",
   "k8s_list_service_monitors",
-  "alertmanager_get_status",
-  "alertmanager_get_alerts",
-  "alertmanager_get_rules",
   "alertmanager_create_rule",
 ]
 preamble = """
