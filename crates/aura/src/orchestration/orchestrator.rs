@@ -495,7 +495,12 @@ impl Orchestrator {
         // Build base tool wrappers: observer + duplicate guard + persistence
         let (in_flight, drain_notify, iteration, persistence_enabled) = {
             let p = self.persistence.lock().await;
-            (p.in_flight_counter(), p.drain_notify(), p.current_iteration(), p.is_enabled())
+            (
+                p.in_flight_counter(),
+                p.drain_notify(),
+                p.current_iteration(),
+                p.is_enabled(),
+            )
         };
         let persistence_wrapper = Arc::new(PersistenceWrapper::new(
             super::persistence_wrapper::PersistenceWrapperParams {
@@ -708,8 +713,7 @@ impl Orchestrator {
         worker_config.orchestration_persistence = Some(self.persistence.clone());
 
         // Give workers the submit_result tool for structured output
-        let submit_result_decision: super::tools::SubmitResultDecision =
-            Arc::new(Mutex::new(None));
+        let submit_result_decision: super::tools::SubmitResultDecision = Arc::new(Mutex::new(None));
         worker_config.orchestration_submit_result = Some(submit_result_decision.clone());
 
         // Disable orchestration in worker config to avoid nested orchestration
@@ -1165,7 +1169,7 @@ impl Orchestrator {
 
     /// Build the iter-1 planning wrapper (fresh query, no prior iteration).
     /// Enumerates the three routing tools with neutral bullets.
-    fn build_planning_wrapper(
+    pub(crate) fn build_planning_wrapper(
         query: &str,
         worker_section: &str,
         worker_guidelines: &str,
@@ -3035,9 +3039,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 summary: structured_output.as_ref().map(|s| s.summary.clone()),
                 error: error_str,
                 duration_ms,
-                confidence: structured_output
-                    .as_ref()
-                    .map(|s| s.confidence.to_string()),
+                confidence: structured_output.as_ref().map(|s| s.confidence.to_string()),
                 orchestrator_notes: None,
             };
 
@@ -3199,8 +3201,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         )
         .await;
 
-        let context =
-            IterationContext::new(iteration, plan, failure_summary, failure_history.to_vec());
+        // tool_traces intentionally empty — this context is only used for
+        // previous_plan carry-forward, not continuation prompt rendering
+        // (discarded in run_iteration via `let _ = previous_context`).
+        let context = IterationContext::new(
+            iteration,
+            plan,
+            failure_summary,
+            failure_history.to_vec(),
+            std::collections::HashMap::new(),
+        );
         (Some(context), Plan::new(""))
     }
 
@@ -3306,12 +3316,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     },
                 )
                 .await;
-                self.write_direct_response_manifest(
-                    query,
-                    &response,
-                    response_summary.as_deref(),
-                )
-                .await;
+                self.write_direct_response_manifest(query, &response, response_summary.as_deref())
+                    .await;
                 Ok(response)
             }
             PlanningResponse::Clarification {
@@ -3486,9 +3492,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // MutexGuard before entering drain. on_complete tasks hold the original
         // Arc<Mutex<...>> and need the lock for file I/O.
         {
-            let drain_timeout = std::time::Duration::from_millis(
-                self.config.persistence_drain_timeout_ms(),
-            );
+            let drain_timeout =
+                std::time::Duration::from_millis(self.config.persistence_drain_timeout_ms());
             let persistence = self.persistence.lock().await.clone();
             if !persistence.drain(drain_timeout).await {
                 tracing::warn!("Persistence drain timed out — tool output refs may be incomplete");
@@ -3590,11 +3595,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // build_raw_task_results ships the worker output the user already
         // paid for instead of an empty response.
         // ----------------------------------------------------------------
+        let tool_traces = if self.config.show_tool_reasoning_in_continuation() {
+            self.load_tool_traces_for_plan(&plan).await
+        } else {
+            std::collections::HashMap::new()
+        };
         let post_execute_ctx = IterationContext::new(
             iteration,
             plan.clone(),
             failure_summary,
             failure_history.clone(),
+            tool_traces,
         );
         Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
@@ -3641,12 +3652,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest_with_summary(
-                    &plan,
-                    iteration,
-                    response_summary,
-                )
-                .await;
+                self.write_run_manifest_with_summary(&plan, iteration, response_summary)
+                    .await;
                 Ok(IterationOutcome::FinalResult(response))
             }
             Ok((
@@ -3836,13 +3843,32 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Write a typed `RunManifest` summarizing this orchestration run.
     ///
-    /// Called at the end of `run_orchestration_loop()` on all exit paths.
-    /// Errors are logged but not propagated — manifest is observability, not control flow.
-    async fn write_run_manifest(
+    /// Pre-load tool call records for all tasks in a plan, converting to
+    /// condensed `ToolTraceEntry` for continuation prompt rendering.
+    async fn load_tool_traces_for_plan(
         &self,
         plan: &Plan,
-        iterations: usize,
-    ) {
+    ) -> std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>> {
+        use super::persistence::ToolTraceEntry;
+
+        let persistence = self.persistence.lock().await;
+        let mut traces = std::collections::HashMap::new();
+
+        for t in &plan.tasks {
+            let records = persistence.load_tool_records_for_task(t.id).await;
+            if records.is_empty() {
+                continue;
+            }
+            let entries: Vec<ToolTraceEntry> = records.iter().map(ToolTraceEntry::from).collect();
+            traces.insert(t.id, entries);
+        }
+
+        traces
+    }
+
+    /// Called at the end of `run_orchestration_loop()` on all exit paths.
+    /// Errors are logged but not propagated — manifest is observability, not control flow.
+    async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
         self.write_run_manifest_with_summary(plan, iterations, None)
             .await;
     }
@@ -3854,8 +3880,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         response_summary: Option<String>,
     ) {
         use super::persistence::{
-            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
-            ToolOutcome, ToolTraceEntry,
+            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
         };
         use crate::string_utils::safe_truncate;
 
@@ -3893,28 +3918,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             let tool_records = persistence.load_tool_records_for_task(t.id).await;
-            let tool_trace: Vec<ToolTraceEntry> = tool_records
-                .iter()
-                .map(|r| ToolTraceEntry {
-                    tool: r.tool.clone(),
-                    reasoning: r.reasoning.clone(),
-                    duration_ms: r.duration_ms,
-                    outcome: if let Some(ref err) = r.error {
-                        ToolOutcome::Error {
-                            message: err.clone(),
-                        }
-                    } else {
-                        ToolOutcome::Success {
-                            output_bytes: r
-                                .output
-                                .as_ref()
-                                .map(|o| o.len() as u64)
-                                .unwrap_or(0),
-                        }
-                    },
-                    artifact_filename: r.artifact_filename.clone(),
-                })
-                .collect();
+            let tool_trace: Vec<ToolTraceEntry> =
+                tool_records.iter().map(ToolTraceEntry::from).collect();
 
             let (error, error_context) = match &t.state {
                 TaskState::Failed { error, category } => {
