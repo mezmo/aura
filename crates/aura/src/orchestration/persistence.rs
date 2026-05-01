@@ -857,28 +857,30 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
         ));
         turn_entries.push_str(&format!("Goal: \"{}\"\n", manifest.goal));
 
+        if let Some(outcome) = &manifest.outcome {
+            turn_entries.push_str(&format!("Outcome: {}\n", outcome));
+        }
+
+        if let Some(summary) = &manifest.response_summary {
+            turn_entries.push_str(&format!("Response: \"{}\"\n", summary));
+        }
+
         if !manifest.task_summaries.is_empty() {
             turn_entries.push_str("Tasks:\n");
             for task in &manifest.task_summaries {
-                let worker = task.worker.as_deref().unwrap_or("unassigned");
-                let confidence_tag = task
-                    .confidence
-                    .as_deref()
-                    .map(|c| format!(" ({})", c))
-                    .unwrap_or_default();
-                let result = match (&task.status, &task.result_preview) {
-                    (TaskStatus::Complete, Some(preview)) => {
-                        format!("→ \"{}\"{}", preview, confidence_tag)
-                    }
-                    (TaskStatus::Failed, Some(preview)) => format!("→ FAILED: \"{}\"", preview),
-                    (TaskStatus::Failed, None) => "→ FAILED".to_string(),
-                    (status, _) => format!("→ {}", status),
-                };
-                turn_entries.push_str(&format!(
-                    "  - Task {} [{}]: {} {}\n",
-                    task.task_id, worker, task.description, result
-                ));
+                render_task_summary(task, &mut turn_entries);
             }
+        }
+
+        let has_artifacts = manifest
+            .task_summaries
+            .iter()
+            .any(|t| !t.artifacts.is_empty());
+        if has_artifacts {
+            turn_entries.push_str(&format!(
+                "  (use run_id=\"{}\" with read_artifact for cross-run access)\n",
+                manifest.run_id
+            ));
         }
 
         turn_entries.push('\n');
@@ -891,6 +893,81 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
         )
         .replace("%%TURN_COUNT%%", &manifests.len().to_string())
         .replace("%%TURN_ENTRIES%%", turn_entries.trim_end())
+}
+
+fn render_task_summary(task: &TaskSummary, out: &mut String) {
+    let worker = task.worker.as_deref().unwrap_or("unassigned");
+
+    match task.status {
+        TaskStatus::Complete => {
+            let confidence_tag = task
+                .confidence
+                .as_deref()
+                .map(|c| format!(" ({})", c))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  Task {} [{}] — Complete{}\n",
+                task.task_id, worker, confidence_tag
+            ));
+            out.push_str(&format!("    \"{}\"\n", task.description));
+            if let Some(preview) = &task.result_preview {
+                out.push_str(&format!("    Summary: \"{}\"\n", preview));
+            }
+        }
+        TaskStatus::Failed => {
+            let category_tag = task
+                .failure_category
+                .as_ref()
+                .map(|c| format!(" ({})", c))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "  Task {} [{}] — FAILED{}\n",
+                task.task_id, worker, category_tag
+            ));
+            out.push_str(&format!("    \"{}\"\n", task.description));
+            if let Some(error) = &task.error {
+                out.push_str(&format!("    Error: {}\n", error));
+            }
+            if let Some(ctx) = &task.error_context
+                && let Some(partial) = &ctx.partial_result
+            {
+                out.push_str(&format!("    Partial progress: {}\n", partial));
+            }
+        }
+        _ => {
+            out.push_str(&format!(
+                "  Task {} [{}] — {}\n",
+                task.task_id, worker, task.status
+            ));
+            out.push_str(&format!("    \"{}\"\n", task.description));
+        }
+    }
+
+    if !task.tool_trace.is_empty() {
+        let chain: Vec<String> = task
+            .tool_trace
+            .iter()
+            .map(|t| {
+                let duration = format!("{:.1}s", t.duration_ms as f64 / 1000.0);
+                match &t.outcome {
+                    ToolOutcome::Success { .. } => format!("{} ({})", t.tool, duration),
+                    ToolOutcome::Error { message } => {
+                        format!("{} (FAILED: {})", t.tool, message)
+                    }
+                }
+            })
+            .collect();
+        out.push_str(&format!("    Tool chain: {}\n", chain.join(" → ")));
+    }
+
+    if !task.artifacts.is_empty() {
+        let listing: Vec<String> = task
+            .artifacts
+            .iter()
+            .map(|a| format!("{} ({}B)", a.filename, a.size_bytes))
+            .collect();
+        out.push_str(&format!("    Artifacts: {}\n", listing.join(", ")));
+    }
 }
 
 #[cfg(test)]
@@ -1390,8 +1467,8 @@ mod tests {
         assert!(result.contains("### Turn 1 (2026-03-20T01:57:24Z)"));
         assert!(result.contains("Success"));
         assert!(result.contains("Compute mean of [10,20,30]"));
-        assert!(result.contains("Task 0 [statistics]: Compute mean"));
-        assert!(result.contains("Result: 20"));
+        assert!(result.contains("Task 0 [statistics] — Complete"));
+        assert!(result.contains("Summary: \"Result: 20\""));
         // Guidance text from template
         assert!(result.contains("Avoid redundant work"));
         assert!(result.contains("Embed concrete values for workers"));
@@ -1447,7 +1524,205 @@ mod tests {
         let result = build_session_context(&[manifest]);
 
         assert!(result.contains("Failed"));
-        assert!(result.contains("FAILED: \"Connection refused\""));
+        assert!(result.contains("FAILED (agent_error)"));
+        assert!(result.contains("Error: Connection refused"));
+    }
+
+    #[test]
+    fn test_build_session_context_with_tool_trace() {
+        let manifest = RunManifest {
+            run_id: "run-trace".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Analyze logs".to_string(),
+            status: RunStatus::Success,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: Some("2/2 tasks completed".to_string()),
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Search error logs".to_string(),
+                status: TaskStatus::Complete,
+                worker: Some("sre".to_string()),
+                result_preview: Some("Found 3 error groups".to_string()),
+                confidence: Some("high".to_string()),
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![
+                    ToolTraceEntry {
+                        tool: "search_logs".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 1200,
+                        outcome: ToolOutcome::Success { output_bytes: 4096 },
+                        artifact_filename: None,
+                    },
+                    ToolTraceEntry {
+                        tool: "submit_result".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 50,
+                        outcome: ToolOutcome::Success { output_bytes: 256 },
+                        artifact_filename: None,
+                    },
+                ],
+                artifacts: vec![],
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Outcome: 2/2 tasks completed"));
+        assert!(result.contains("Task 0 [sre] — Complete (high)"));
+        assert!(result.contains("Summary: \"Found 3 error groups\""));
+        assert!(result.contains("Tool chain: search_logs (1.2s) → submit_result (0.1s)"));
+    }
+
+    #[test]
+    fn test_build_session_context_with_artifacts() {
+        let manifest = RunManifest {
+            run_id: "run-artifacts".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Generate report".to_string(),
+            status: RunStatus::Success,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 1,
+                description: "Write summary".to_string(),
+                status: TaskStatus::Complete,
+                worker: Some("writer".to_string()),
+                result_preview: Some("Report complete".to_string()),
+                confidence: None,
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![
+                    ArtifactEntry {
+                        filename: "task-1-writer-iter1-result.txt".to_string(),
+                        size_bytes: 2048,
+                        kind: ArtifactKind::Result,
+                    },
+                    ArtifactEntry {
+                        filename: "task-1-writer-iter1-search-output.txt".to_string(),
+                        size_bytes: 8192,
+                        kind: ArtifactKind::ToolOutput {
+                            tool_name: "search".to_string(),
+                        },
+                    },
+                ],
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Artifacts: task-1-writer-iter1-result.txt (2048B)"));
+        assert!(result.contains("task-1-writer-iter1-search-output.txt (8192B)"));
+        assert!(result.contains("run_id=\"run-artifacts\""));
+        assert!(result.contains("read_artifact"));
+    }
+
+    #[test]
+    fn test_build_session_context_failed_with_error_context() {
+        let manifest = RunManifest {
+            run_id: "run-err".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "Query database".to_string(),
+            status: RunStatus::Failed,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: Some("0/1 tasks completed".to_string()),
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Run SQL query".to_string(),
+                status: TaskStatus::Failed,
+                worker: Some("db-worker".to_string()),
+                result_preview: None,
+                confidence: None,
+                failure_category: Some(super::super::types::FailureCategory::AgentTimeout),
+                error: Some("Timed out after 30s".to_string()),
+                error_context: Some(ErrorContext {
+                    category: super::super::types::FailureCategory::AgentTimeout,
+                    last_tool_call: Some("execute_sql".to_string()),
+                    attempt_count: 2,
+                    partial_result: Some("Retrieved 50 of 500 rows".to_string()),
+                }),
+                tool_trace: vec![
+                    ToolTraceEntry {
+                        tool: "execute_sql".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 15000,
+                        outcome: ToolOutcome::Success { output_bytes: 1024 },
+                        artifact_filename: None,
+                    },
+                    ToolTraceEntry {
+                        tool: "execute_sql".to_string(),
+                        reasoning: String::new(),
+                        duration_ms: 30000,
+                        outcome: ToolOutcome::Error {
+                            message: "timeout".to_string(),
+                        },
+                        artifact_filename: None,
+                    },
+                ],
+                artifacts: vec![],
+            }],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("FAILED (agent_timeout)"));
+        assert!(result.contains("Error: Timed out after 30s"));
+        assert!(result.contains("Partial progress: Retrieved 50 of 500 rows"));
+        assert!(result.contains(
+            "Tool chain: execute_sql (15.0s) → execute_sql (FAILED: timeout)"
+        ));
+    }
+
+    #[test]
+    fn test_build_session_context_direct_response() {
+        let manifest = RunManifest {
+            run_id: "run-direct".to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: "2026-03-20T01:00:00Z".to_string(),
+            goal: "What is 2+2?".to_string(),
+            status: RunStatus::Success,
+            iterations: 0,
+            routing_mode: Some(RoutingMode::DirectAnswer),
+            outcome: Some("Answered directly".to_string()),
+            response_summary: Some("The answer is 4.".to_string()),
+            task_summaries: vec![],
+            artifact_paths: vec![],
+        };
+
+        let result = build_session_context(&[manifest]);
+
+        assert!(result.contains("Outcome: Answered directly"));
+        assert!(result.contains("Response: \"The answer is 4.\""));
+        assert!(!result.contains("Tasks:"));
+        assert!(!result.contains("run_id=\"run-direct\""));
+    }
+
+    #[test]
+    fn test_build_session_context_no_artifact_hint_when_empty() {
+        let manifests = vec![make_test_manifest(
+            "run-1",
+            "2026-03-20T01:00:00Z",
+            "Simple query",
+        )];
+
+        let result = build_session_context(&manifests);
+
+        assert!(!result.contains("run_id=\"run-1\""));
     }
 
     // ========================================================================
