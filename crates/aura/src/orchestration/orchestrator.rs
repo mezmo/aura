@@ -2971,8 +2971,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         )
         .await;
 
-        let context =
-            IterationContext::new(iteration, plan, failure_summary, failure_history.to_vec());
+        // tool_traces intentionally empty — this context is only used for
+        // previous_plan carry-forward, not continuation prompt rendering
+        // (discarded in run_iteration via `let _ = previous_context`).
+        let context = IterationContext::new(
+            iteration,
+            plan,
+            failure_summary,
+            failure_history.to_vec(),
+            std::collections::HashMap::new(),
+        );
         (Some(context), Plan::new(""))
     }
 
@@ -3362,11 +3370,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // build_raw_task_results ships the worker output the user already
         // paid for instead of an empty response.
         // ----------------------------------------------------------------
+        let tool_traces = if self.config.show_tool_reasoning_in_continuation() {
+            self.load_tool_traces_for_plan(&plan).await
+        } else {
+            std::collections::HashMap::new()
+        };
         let post_execute_ctx = IterationContext::new(
             iteration,
             plan.clone(),
             failure_summary,
             failure_history.clone(),
+            tool_traces,
         );
         Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
@@ -3608,6 +3622,30 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Write a typed `RunManifest` summarizing this orchestration run.
     ///
+    /// Pre-load tool call records for all tasks in a plan, converting to
+    /// condensed `ToolTraceEntry` for continuation prompt rendering.
+    async fn load_tool_traces_for_plan(
+        &self,
+        plan: &Plan,
+    ) -> std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>> {
+        use super::persistence::ToolTraceEntry;
+
+        let persistence = self.persistence.lock().await;
+        let mut traces = std::collections::HashMap::new();
+
+        for t in &plan.tasks {
+            let records = persistence.load_tool_records_for_task(t.id).await;
+            if records.is_empty() {
+                continue;
+            }
+            let entries: Vec<ToolTraceEntry> =
+                records.iter().map(ToolTraceEntry::from).collect();
+            traces.insert(t.id, entries);
+        }
+
+        traces
+    }
+
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
     async fn write_run_manifest(
@@ -3626,8 +3664,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         response_summary: Option<String>,
     ) {
         use super::persistence::{
-            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
-            ToolOutcome, ToolTraceEntry,
+            ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
         };
         use crate::string_utils::safe_truncate;
 
@@ -3665,28 +3702,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             let tool_records = persistence.load_tool_records_for_task(t.id).await;
-            let tool_trace: Vec<ToolTraceEntry> = tool_records
-                .iter()
-                .map(|r| ToolTraceEntry {
-                    tool: r.tool.clone(),
-                    reasoning: r.reasoning.clone(),
-                    duration_ms: r.duration_ms,
-                    outcome: if let Some(ref err) = r.error {
-                        ToolOutcome::Error {
-                            message: err.clone(),
-                        }
-                    } else {
-                        ToolOutcome::Success {
-                            output_bytes: r
-                                .output
-                                .as_ref()
-                                .map(|o| o.len() as u64)
-                                .unwrap_or(0),
-                        }
-                    },
-                    artifact_filename: r.artifact_filename.clone(),
-                })
-                .collect();
+            let tool_trace: Vec<ToolTraceEntry> =
+                tool_records.iter().map(ToolTraceEntry::from).collect();
 
             let (error, error_context) = match &t.state {
                 TaskState::Failed { error, category } => {

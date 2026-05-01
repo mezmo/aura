@@ -146,6 +146,7 @@ impl RigBuilder {
                     persistence_drain_timeout_ms: orch.artifacts.persistence_drain_timeout_ms,
                     tool_output_artifact_threshold: orch.artifacts.tool_output_artifact_threshold,
                     tool_output_duration_threshold_ms: orch.artifacts.tool_output_duration_threshold_ms,
+                    show_tool_reasoning_in_continuation: orch.artifacts.show_tool_reasoning_in_continuation,
                 },
             }
         });

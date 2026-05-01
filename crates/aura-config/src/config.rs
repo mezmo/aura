@@ -75,6 +75,8 @@ pub struct ArtifactsConfig {
     pub tool_output_artifact_threshold: usize,
     #[serde(default = "default_tool_output_duration_threshold_ms")]
     pub tool_output_duration_threshold_ms: u64,
+    #[serde(default)]
+    pub show_tool_reasoning_in_continuation: bool,
 }
 
 fn default_session_history_turns() -> usize {
@@ -103,6 +105,7 @@ impl Default for ArtifactsConfig {
             persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
             tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
             tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
+            show_tool_reasoning_in_continuation: false,
         }
     }
 }

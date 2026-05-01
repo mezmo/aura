@@ -219,6 +219,26 @@ pub struct ToolCallRecord {
     pub artifact_filename: Option<String>,
 }
 
+impl From<&ToolCallRecord> for ToolTraceEntry {
+    fn from(r: &ToolCallRecord) -> Self {
+        Self {
+            tool: r.tool.clone(),
+            reasoning: r.reasoning.clone(),
+            duration_ms: r.duration_ms,
+            outcome: if let Some(ref err) = r.error {
+                ToolOutcome::Error {
+                    message: err.clone(),
+                }
+            } else {
+                ToolOutcome::Success {
+                    output_bytes: r.output.as_ref().map(|o| o.len() as u64).unwrap_or(0),
+                }
+            },
+            artifact_filename: r.artifact_filename.clone(),
+        }
+    }
+}
+
 /// Summary of a worker's execution for a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskExecutionRecord {

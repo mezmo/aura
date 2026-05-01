@@ -313,6 +313,13 @@ pub struct ArtifactsConfig {
     /// Set to 0 to disable duration-based promotion. Default: 5000ms.
     #[serde(default = "default_tool_output_duration_threshold_ms")]
     pub tool_output_duration_threshold_ms: u64,
+
+    /// When true, include condensed tool reasoning traces in the continuation
+    /// prompt so the coordinator can see why workers called specific tools.
+    /// Adds context tokens — most valuable for debugging and complex multi-
+    /// iteration runs. Default: false.
+    #[serde(default)]
+    pub show_tool_reasoning_in_continuation: bool,
 }
 
 fn default_session_history_turns() -> usize {
@@ -329,6 +336,7 @@ impl Default for ArtifactsConfig {
             persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
             tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
             tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
+            show_tool_reasoning_in_continuation: false,
         }
     }
 }
@@ -465,6 +473,11 @@ impl OrchestrationConfig {
     /// Duration threshold (ms) for promoting tool outputs to artifacts.
     pub fn tool_output_duration_threshold_ms(&self) -> u64 {
         self.artifacts.tool_output_duration_threshold_ms
+    }
+
+    /// Whether to include condensed tool reasoning in continuation prompts.
+    pub fn show_tool_reasoning_in_continuation(&self) -> bool {
+        self.artifacts.show_tool_reasoning_in_continuation
     }
 }
 
