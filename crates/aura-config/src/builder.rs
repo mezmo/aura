@@ -155,6 +155,7 @@ impl RigBuilder {
                     tool_output_artifact_threshold: orch.artifacts.tool_output_artifact_threshold,
                     tool_output_duration_threshold_ms: orch.artifacts.tool_output_duration_threshold_ms,
                     show_tool_reasoning_in_continuation: orch.artifacts.show_tool_reasoning_in_continuation,
+                    max_session_runs: orch.artifacts.max_session_runs,
                 },
             }
         });

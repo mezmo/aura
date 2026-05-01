@@ -328,6 +328,16 @@ pub struct ArtifactsConfig {
     /// iteration runs. Default: false.
     #[serde(default)]
     pub show_tool_reasoning_in_continuation: bool,
+
+    /// Maximum number of run directories retained per session. When a new run
+    /// is created and the directory count exceeds this limit, the oldest runs
+    /// are pruned. Set to 0 to disable pruning. Default: 20.
+    #[serde(default = "default_max_session_runs")]
+    pub max_session_runs: usize,
+}
+
+fn default_max_session_runs() -> usize {
+    20
 }
 
 fn default_session_history_turns() -> usize {
@@ -345,6 +355,7 @@ impl Default for ArtifactsConfig {
             tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
             tool_output_duration_threshold_ms: default_tool_output_duration_threshold_ms(),
             show_tool_reasoning_in_continuation: false,
+            max_session_runs: default_max_session_runs(),
         }
     }
 }
@@ -481,6 +492,11 @@ impl OrchestrationConfig {
     /// Duration threshold (ms) for promoting tool outputs to artifacts.
     pub fn tool_output_duration_threshold_ms(&self) -> u64 {
         self.artifacts.tool_output_duration_threshold_ms
+    }
+
+    /// Maximum run directories retained per session (0 = no pruning).
+    pub fn max_session_runs(&self) -> usize {
+        self.artifacts.max_session_runs
     }
 
     /// Whether to include condensed tool reasoning in continuation prompts.

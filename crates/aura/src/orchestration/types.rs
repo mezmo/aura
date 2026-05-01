@@ -4,11 +4,8 @@
 //! queries into tasks, track their execution, and manage dependencies.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-
-use crate::string_utils::safe_truncate;
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
@@ -453,8 +450,9 @@ pub enum TaskStatus {
 
 /// Structured classification of why a task failed, surfaced in the
 /// continuation prompt so the coordinator can make informed replan decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, strum::Display)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum FailureCategory {
     /// Worker timed out before completing.
     AgentTimeout,
@@ -468,6 +466,8 @@ pub enum FailureCategory {
     ProviderOverloaded,
     /// LLM credentials or auth failed (401/403).
     ProviderAuthError,
+    /// LLM model not found or invalid model identifier (404).
+    ProviderNotFound,
     /// Upstream dependency task failed.
     DependencyFailed,
     /// Worker completed but reported unable to produce a result.
@@ -475,22 +475,6 @@ pub enum FailureCategory {
     /// Unclassified worker failure.
     #[default]
     AgentError,
-}
-
-impl std::fmt::Display for FailureCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AgentTimeout => write!(f, "agent_timeout"),
-            Self::ContextOverflow => write!(f, "context_overflow"),
-            Self::DepthExhausted => write!(f, "depth_exhausted"),
-            Self::LoopDetected => write!(f, "loop_detected"),
-            Self::ProviderOverloaded => write!(f, "provider_overloaded"),
-            Self::ProviderAuthError => write!(f, "provider_auth_error"),
-            Self::DependencyFailed => write!(f, "dependency_failed"),
-            Self::SoftFailure => write!(f, "soft_failure"),
-            Self::AgentError => write!(f, "agent_error"),
-        }
-    }
 }
 
 /// Rich state of a task, making invalid states unrepresentable.
@@ -701,114 +685,7 @@ pub struct FailedTaskRecord {
     pub category: FailureCategory,
 }
 
-/// A categorized planning attempt failure with timing information.
-///
-/// Replaces stringly-typed error collection in the planning retry loop,
-/// enabling accurate summary logs (e.g. "3 timeouts" vs "3 parse failures").
-#[derive(Debug, Clone)]
-pub enum PlanAttemptFailure {
-    /// The LLM call timed out before producing a response.
-    Timeout {
-        attempt: usize,
-        timeout_secs: u64,
-        elapsed: Duration,
-    },
-    /// The coordinator exhausted its turn depth without calling a routing tool.
-    DepthExhausted {
-        attempt: usize,
-        detail: String,
-        elapsed: Duration,
-    },
-    /// The coordinator responded but the response could not be parsed as a plan.
-    ParseFailure {
-        attempt: usize,
-        detail: String,
-        response_preview: String,
-        elapsed: Duration,
-    },
-    /// An LLM provider error (rate limit, auth, network, etc.).
-    LlmError {
-        attempt: usize,
-        detail: String,
-        elapsed: Duration,
-    },
-}
-
-impl PlanAttemptFailure {
-    /// Failure category label for summary logs.
-    pub fn category(&self) -> &'static str {
-        match self {
-            PlanAttemptFailure::Timeout { .. } => "timeout",
-            PlanAttemptFailure::DepthExhausted { .. } => "depth exhaustion",
-            PlanAttemptFailure::ParseFailure { .. } => "parse failure",
-            PlanAttemptFailure::LlmError { .. } => "LLM error",
-        }
-    }
-
-    /// Wall-clock time this attempt consumed.
-    pub fn elapsed(&self) -> Duration {
-        match self {
-            PlanAttemptFailure::Timeout { elapsed, .. }
-            | PlanAttemptFailure::DepthExhausted { elapsed, .. }
-            | PlanAttemptFailure::ParseFailure { elapsed, .. }
-            | PlanAttemptFailure::LlmError { elapsed, .. } => *elapsed,
-        }
-    }
-}
-
-impl std::fmt::Display for PlanAttemptFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlanAttemptFailure::Timeout {
-                attempt,
-                timeout_secs,
-                elapsed,
-            } => write!(
-                f,
-                "Attempt {} timed out after {:.1}s (limit: {}s)",
-                attempt,
-                elapsed.as_secs_f64(),
-                timeout_secs,
-            ),
-            PlanAttemptFailure::DepthExhausted {
-                attempt,
-                detail,
-                elapsed,
-            } => write!(
-                f,
-                "Attempt {} exhausted turn depth after {:.1}s: {}",
-                attempt,
-                elapsed.as_secs_f64(),
-                detail,
-            ),
-            PlanAttemptFailure::ParseFailure {
-                attempt,
-                detail,
-                response_preview,
-                elapsed,
-            } => write!(
-                f,
-                "Attempt {} parse failed after {:.1}s: {}. Response: {}",
-                attempt,
-                elapsed.as_secs_f64(),
-                detail,
-                response_preview,
-            ),
-            PlanAttemptFailure::LlmError {
-                attempt,
-                detail,
-                elapsed,
-            } => write!(
-                f,
-                "Attempt {} LLM error after {:.1}s: {}",
-                attempt,
-                elapsed.as_secs_f64(),
-                detail,
-            ),
-        }
-    }
-}
-
+/// Context from a previous iteration, used for the post-execute
 /// Context from a previous iteration, used for the post-execute
 /// coordinator decision (continuation prompt).
 ///
@@ -858,13 +735,10 @@ impl IterationContext {
     /// repeated-failure detection, and a conditional reuse hint. Uses the
     /// `.md` template in `crates/aura/src/prompts/continuation_prompt.md`.
     ///
-    /// Per-task completed results are included inline, truncated to 500 bytes
-    /// so the coordinator can route with full context. When a completed result
-    /// was spilled to an artifact, the
-    /// `[Full result (N chars) saved to artifact: task-N-worker-iter-M-result.txt]` footer
-    /// is re-appended after truncation so the coordinator can discover the
-    /// artifact via `read_artifact`.
-    pub fn build_continuation_prompt(&self, max_iterations: usize) -> String {
+    /// Per-task completed results are inlined fully when no artifact was
+    /// created (result ≤ threshold). When the result was spilled to an
+    /// artifact, shows summary + artifact pointer instead.
+    pub fn build_continuation_prompt(&self, max_iterations: usize, show_tool_chain: bool) -> String {
         use super::templates::{ContinuationVars, render_continuation_prompt};
 
         // Categorize tasks
@@ -876,33 +750,61 @@ impl IterationContext {
         for t in &self.previous_plan.tasks {
             match &t.state {
                 TaskState::Complete { result } => {
-                    if let Some(ref so) = t.structured_output {
-                        let footer = extract_artifact_footer(result)
-                            .map(|f| format!(" {}", f))
+                    let has_artifact = extract_artifact_footer(result).is_some();
+                    if has_artifact {
+                        // Result exceeded threshold — artifact on disk.
+                        // Show summary/preview + artifact pointer.
+                        let confidence = t.structured_output.as_ref()
+                            .map(|so| format!(" (confidence: {})", so.confidence))
                             .unwrap_or_default();
-                        let detail = preserve_artifact_footer(&so.summary, 500);
+                        let body = if let Some(ref so) = t.structured_output {
+                            let footer = extract_artifact_footer(result).unwrap();
+                            format!("    {}\n    {}", so.summary, footer)
+                        } else {
+                            indent_lines(result)
+                        };
                         completed_lines.push(format!(
-                            "- Task {}: {} → {} (confidence: {}){}",
-                            t.id, t.description, detail, so.confidence, footer
+                            "- Task {}: {}{}\n{}",
+                            t.id, t.description, confidence, body
                         ));
                     } else {
-                        let detail = preserve_artifact_footer(result, 500);
-                        completed_lines
-                            .push(format!("- Task {}: {} → {}", t.id, t.description, detail));
+                        // Result fits in context — inline it fully.
+                        let confidence = t.structured_output.as_ref()
+                            .map(|so| format!(" (confidence: {})", so.confidence))
+                            .unwrap_or_default();
+                        completed_lines.push(format!(
+                            "- Task {}: {}{}\n{}",
+                            t.id, t.description, confidence, indent_lines(result)
+                        ));
                     }
-                    for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
+                    for line in render_artifact_lines(self.tool_traces.get(&t.id)) {
                         completed_lines.push(format!("    {}", line));
+                    }
+                    if show_tool_chain {
+                        for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
+                            completed_lines.push(format!("    {}", line));
+                        }
                     }
                 }
                 TaskState::Failed { error, category } => {
                     has_failed_tasks = true;
                     let line = match (category, &t.structured_output) {
-                        (FailureCategory::SoftFailure, Some(so)) if !so.summary.is_empty() => {
-                            let detail = preserve_artifact_footer(&so.summary, 500);
-                            format!(
-                                "- Task {}: {} → soft_failure ({} confidence): {}",
-                                t.id, t.description, so.confidence, detail
-                            )
+                        (FailureCategory::SoftFailure, Some(so))
+                            if !so.summary.is_empty() =>
+                        {
+                            let has_artifact = extract_artifact_footer(error).is_some();
+                            if has_artifact {
+                                let footer = extract_artifact_footer(error).unwrap();
+                                format!(
+                                    "- Task {}: {} → soft_failure ({} confidence)\n    {}\n    {}",
+                                    t.id, t.description, so.confidence, so.summary, footer
+                                )
+                            } else {
+                                format!(
+                                    "- Task {}: {} → soft_failure ({} confidence)\n{}",
+                                    t.id, t.description, so.confidence, indent_lines(&so.summary)
+                                )
+                            }
                         }
                         (cat, _) => format!(
                             "- Task {}: {} → failed [{}]: {}",
@@ -1049,51 +951,43 @@ fn extract_artifact_footer(result: &str) -> Option<&str> {
     result.rfind(FOOTER_PREFIX).map(|idx| &result[idx..])
 }
 
-/// Truncate `result` to `budget` bytes while preserving any trailing
-/// artifact footer (`[Full result (N chars) saved to artifact: FILE]`)
-/// that `maybe_create_artifact` appended past the budget. Without this,
-/// a naive truncation would slice off the artifact pointer and the
-/// coordinator would lose the ability to `read_artifact` the full content.
-fn preserve_artifact_footer(result: &str, budget: usize) -> String {
-    // Detect the artifact-footer marker appended by maybe_create_artifact.
-    const FOOTER_PREFIX: &str = "[Full result (";
-    let footer_start = result.rfind(FOOTER_PREFIX);
-
-    match footer_start {
-        Some(idx) => {
-            // Everything before the footer is the body; footer keeps its full text.
-            let body = &result[..idx];
-            let footer = &result[idx..];
-            let (truncated_body, was_truncated) = safe_truncate(body, budget);
-            let body_str = if was_truncated {
-                format!("{truncated_body}...")
-            } else {
-                truncated_body.to_string()
-            };
-            // Re-join truncated body with full footer. Artifact footer is
-            // what lets the coordinator discover the artifact via read_artifact.
-            if body_str.is_empty() {
-                footer.to_string()
-            } else {
-                format!("{body_str} {footer}")
-            }
-        }
-        None => {
-            let (truncated, was_truncated) = safe_truncate(result, budget);
-            if was_truncated {
-                format!("{truncated}...")
-            } else {
-                truncated.to_string()
-            }
-        }
-    }
+/// Indent each line of `text` by 4 spaces for nesting under a task header.
+fn indent_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// Render condensed tool chain + artifact ref lines from pre-loaded traces.
+/// Render artifact inventory lines from pre-loaded traces.
 ///
-/// Returns empty vec when the trace slice is empty or absent.
-/// First line: `Tool chain: tool_a (1.2s, "reasoning...") → tool_b (FAILED: error)`
-/// Subsequent lines: `[Tool output: filename (N bytes)]` for each promoted artifact.
+/// Always rendered in the continuation prompt so the coordinator has a
+/// deterministic list of filenames available via `read_artifact`.
+fn render_artifact_lines(
+    traces: Option<&Vec<super::persistence::ToolTraceEntry>>,
+) -> Vec<String> {
+    use super::persistence::ToolOutcome;
+
+    let traces = match traces.filter(|v| !v.is_empty()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut lines = Vec::new();
+    for t in traces {
+        if let (Some(filename), ToolOutcome::Success { output_bytes }) =
+            (&t.artifact_filename, &t.outcome)
+        {
+            lines.push(format!("[Artifact: {} ({} bytes)]", filename, output_bytes));
+        }
+    }
+    lines
+}
+
+/// Render verbose tool chain + artifact ref lines from pre-loaded traces.
+///
+/// Gated by `show_tool_reasoning_in_continuation`. Includes tool names,
+/// durations, reasoning snippets, and error details.
 fn render_tool_chain_lines(
     traces: Option<&Vec<super::persistence::ToolTraceEntry>>,
 ) -> Vec<String> {
@@ -1124,20 +1018,7 @@ fn render_tool_chain_lines(
         })
         .collect();
 
-    let mut lines = vec![format!("Tool chain: {}", parts.join(" → "))];
-
-    for t in traces {
-        if let (Some(filename), ToolOutcome::Success { output_bytes }) =
-            (&t.artifact_filename, &t.outcome)
-        {
-            lines.push(format!(
-                "[Tool output: {} ({} bytes)]",
-                filename, output_bytes
-            ));
-        }
-    }
-
-    lines
+    vec![format!("Tool chain: {}", parts.join(" → "))]
 }
 
 fn truncate_reasoning(s: &str, max_chars: usize) -> String {
@@ -1504,7 +1385,7 @@ mod tests {
         };
 
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         // Verify key sections are present
         assert!(prompt.contains("ITERATION 1 of 3"));
@@ -1538,7 +1419,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(2, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(prompt.contains("ITERATION 2 of 3"));
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1567,7 +1448,7 @@ mod tests {
         }];
 
         let ctx = IterationContext::new(1, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(prompt.contains("FAILURE HISTORY:"));
         assert!(prompt.contains("Iteration 1: \"Gather logs\""));
@@ -1606,7 +1487,7 @@ mod tests {
         ];
 
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(prompt.contains("FAILURE HISTORY:"));
         assert!(prompt.contains("OBSERVED PATTERNS:"));
@@ -1615,24 +1496,20 @@ mod tests {
     }
 
     #[test]
-    fn test_continuation_prompt_truncation() {
-        let mut plan = Plan::new("Test truncation");
+    fn test_continuation_prompt_inlines_small_result() {
+        let mut plan = Plan::new("Test inline");
         let mut task = Task::new(0, "Big result", "Produce output");
-        // 600-char result exceeds 500-byte truncation limit
+        // 600-char result has no artifact footer → inlined fully
         let long_result = "x".repeat(600);
-        task.complete(long_result);
+        task.complete(long_result.clone());
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
-        // Should contain truncated result with "..." suffix
         assert!(prompt.contains("COMPLETED TASKS"));
-        assert!(prompt.contains("..."));
-        // Should NOT contain the full 600-char string
-        assert!(!prompt.contains(&"x".repeat(600)));
-        // But should contain 500 chars worth
-        assert!(prompt.contains(&"x".repeat(500)));
+        // Full result inlined — no truncation when no artifact exists
+        assert!(prompt.contains(&"x".repeat(600)));
     }
 
     #[test]
@@ -1651,7 +1528,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         // The body is truncated but the artifact footer survives.
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1677,7 +1554,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(prompt.contains("Found 47 error groups"));
         assert!(prompt.contains("saved to artifact: task-0-sre-iter-1-result.txt"));
@@ -1731,7 +1608,7 @@ mod tests {
         };
         // iteration=2, max=3 → next would be iteration 3 = max, so FINAL ATTEMPT
         let ctx = IterationContext::new(2, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(prompt.contains("(FINAL ATTEMPT)"));
     }
@@ -1748,7 +1625,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(!prompt.contains("FINAL ATTEMPT"));
     }
@@ -1767,7 +1644,7 @@ mod tests {
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(!prompt.contains("reuse_result_from"));
     }
@@ -1791,7 +1668,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(prompt.contains("reuse_result_from"));
     }
@@ -1808,7 +1685,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(!prompt.contains("reuse_result_from"));
     }
@@ -1835,7 +1712,7 @@ mod tests {
             gaps: vec!["Task 1 failed".into()],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         // All three sections should be present
         assert!(prompt.contains("COMPLETED TASKS"));
@@ -1970,104 +1847,6 @@ mod tests {
             routing_rationale: "reason_c".to_string(),
         };
         assert_eq!(clar.routing_rationale(), "reason_c");
-    }
-
-    // ========================================================================
-    // PlanAttemptFailure tests
-    // ========================================================================
-
-    #[test]
-    fn test_plan_attempt_failure_display_timeout() {
-        let f = PlanAttemptFailure::Timeout {
-            attempt: 1,
-            timeout_secs: 60,
-            elapsed: Duration::from_secs_f64(60.1),
-        };
-        let s = f.to_string();
-        assert!(s.contains("Attempt 1 timed out"), "got: {}", s);
-        assert!(s.contains("60.1s"), "got: {}", s);
-        assert!(s.contains("limit: 60s"), "got: {}", s);
-        assert_eq!(f.category(), "timeout");
-    }
-
-    #[test]
-    fn test_plan_attempt_failure_display_depth_exhausted() {
-        let f = PlanAttemptFailure::DepthExhausted {
-            attempt: 2,
-            detail: "inspect_tool_params consumed the budget".to_string(),
-            elapsed: Duration::from_secs_f64(35.3),
-        };
-        let s = f.to_string();
-        assert!(s.contains("Attempt 2 exhausted turn depth"), "got: {}", s);
-        assert!(s.contains("35.3s"), "got: {}", s);
-        assert!(s.contains("inspect_tool_params"), "got: {}", s);
-        assert_eq!(f.category(), "depth exhaustion");
-    }
-
-    #[test]
-    fn test_plan_attempt_failure_display_parse_failure() {
-        let f = PlanAttemptFailure::ParseFailure {
-            attempt: 3,
-            detail: "expected JSON object".to_string(),
-            response_preview: "I'll help you with...".to_string(),
-            elapsed: Duration::from_secs_f64(12.7),
-        };
-        let s = f.to_string();
-        assert!(s.contains("Attempt 3 parse failed"), "got: {}", s);
-        assert!(s.contains("12.7s"), "got: {}", s);
-        assert!(s.contains("expected JSON object"), "got: {}", s);
-        assert!(s.contains("I'll help you with"), "got: {}", s);
-        assert_eq!(f.category(), "parse failure");
-    }
-
-    #[test]
-    fn test_plan_attempt_failure_display_llm_error() {
-        let f = PlanAttemptFailure::LlmError {
-            attempt: 1,
-            detail: "rate limit exceeded".to_string(),
-            elapsed: Duration::from_secs_f64(0.5),
-        };
-        let s = f.to_string();
-        assert!(s.contains("Attempt 1 LLM error"), "got: {}", s);
-        assert!(s.contains("0.5s"), "got: {}", s);
-        assert!(s.contains("rate limit exceeded"), "got: {}", s);
-        assert_eq!(f.category(), "LLM error");
-    }
-
-    #[test]
-    fn test_plan_attempt_failure_elapsed_accessor() {
-        let cases = [
-            PlanAttemptFailure::Timeout {
-                attempt: 1,
-                timeout_secs: 60,
-                elapsed: Duration::from_secs(60),
-            },
-            PlanAttemptFailure::DepthExhausted {
-                attempt: 1,
-                detail: String::new(),
-                elapsed: Duration::from_secs(30),
-            },
-            PlanAttemptFailure::ParseFailure {
-                attempt: 1,
-                detail: String::new(),
-                response_preview: String::new(),
-                elapsed: Duration::from_secs(10),
-            },
-            PlanAttemptFailure::LlmError {
-                attempt: 1,
-                detail: String::new(),
-                elapsed: Duration::from_millis(500),
-            },
-        ];
-        let expected = [
-            Duration::from_secs(60),
-            Duration::from_secs(30),
-            Duration::from_secs(10),
-            Duration::from_millis(500),
-        ];
-        for (f, exp) in cases.iter().zip(expected.iter()) {
-            assert_eq!(f.elapsed(), *exp, "elapsed mismatch for {:?}", f);
-        }
     }
 
     #[test]
@@ -2575,7 +2354,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(
             prompt.contains("[agent_timeout]"),
@@ -2604,7 +2383,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(
             prompt.contains("[agent_error]"),
@@ -2642,7 +2421,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(3, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(4);
+        let prompt = ctx.build_continuation_prompt(4, false);
 
         assert!(
             !prompt.contains("OBSERVED PATTERNS"),
@@ -2689,7 +2468,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(
             prompt.contains("soft_failure"),
@@ -2724,7 +2503,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(
             prompt.contains("[soft_failure]"),
@@ -2798,7 +2577,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(3, plan, Some(fs), failures, HashMap::new());
-        let prompt = ctx.build_continuation_prompt(4);
+        let prompt = ctx.build_continuation_prompt(4, false);
 
         assert!(
             prompt.contains("OBSERVED PATTERNS"),
@@ -2824,7 +2603,7 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, false);
 
         assert!(
             prompt.contains("[soft_failure]"),
@@ -2877,7 +2656,7 @@ mod tests {
         );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         assert!(
             prompt.contains("Tool chain:"),
@@ -2921,7 +2700,7 @@ mod tests {
         );
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         assert!(
             prompt.contains("Tool chain:"),
@@ -2946,7 +2725,7 @@ mod tests {
         plan.add_task(t);
 
         let ctx_without = IterationContext::new(1, plan.clone(), None, vec![], HashMap::new());
-        let prompt_without = ctx_without.build_continuation_prompt(3);
+        let prompt_without = ctx_without.build_continuation_prompt(3, true);
 
         assert!(
             !prompt_without.contains("Tool chain:"),
@@ -2966,7 +2745,7 @@ mod tests {
         traces.insert(0, vec![make_trace("tool_a", &long_reasoning, 1000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         assert!(
             prompt.contains("…"),
@@ -2993,7 +2772,7 @@ mod tests {
         traces.insert(0, vec![make_trace("log_search", "searching", 5000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         let chain_count = prompt.matches("Tool chain:").count();
         assert_eq!(
@@ -3014,7 +2793,7 @@ mod tests {
         traces.insert(0, vec![make_trace("tool_a", "", 1000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         assert!(
             prompt.contains("tool_a (1.0s)"),
@@ -3035,7 +2814,7 @@ mod tests {
         traces.insert(0, vec![make_trace("only_tool", "single call", 2000, None)]);
 
         let ctx = IterationContext::new(1, plan, None, vec![], traces);
-        let prompt = ctx.build_continuation_prompt(3);
+        let prompt = ctx.build_continuation_prompt(3, true);
 
         assert!(
             prompt.contains("Tool chain: only_tool (2.0s"),

@@ -64,7 +64,7 @@ use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
-    PlanAttemptFailure, PlanningResponse, Task, TaskState, TaskStatus,
+    PlanningResponse, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -76,8 +76,12 @@ pub(super) const STREAM_CHUNK_SIZE: usize = 50;
 
 /// Maximum ReAct depth for the planning coordinator.
 /// Defense-in-depth alongside stream_and_collect's early exit.
-/// Allows: 1 recon tool (list_tools) + 1 routing tool + 1 spare.
-const PLANNING_COORDINATOR_MAX_DEPTH: usize = 3;
+/// Allows: 1 list_tools + 1 inspect_tool_params + 1 read_artifact + 1 routing + 2 spare.
+const PLANNING_COORDINATOR_MAX_DEPTH: usize = 6;
+
+/// Maximum attempts for a worker task before giving up.
+/// Attempt 1 = normal execution. Attempt 2 = retry with correction prompt.
+const MAX_WORKER_ATTEMPTS: usize = 2;
 
 // ============================================================================
 // Helper Structs
@@ -113,17 +117,24 @@ struct AgentWithPreamble {
     submit_result_decision: super::tools::SubmitResultDecision,
 }
 
+/// Persistent coordinator state for conversation across planning iterations.
+///
+/// Created once at `run_orchestration` entry and threaded through the
+/// plan → execute → continue loop. The conversation grows monotonically
+/// with each coordinator turn (planning prompt, correction, continuation).
+struct CoordinatorState {
+    agent: Agent,
+    preamble: String,
+    conversation: Vec<rig::completion::Message>,
+    routing_decision: super::tools::routing_tools::RoutingDecision,
+}
+
 /// Bundled coordinator tools for `build_agent_with_tools`.
 struct CoordinatorTools {
     list_tools: Option<ListToolsTool>,
     inspect_tool_params: Option<InspectToolParamsTool>,
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
-    routing_tools: Option<RoutingToolSet>,
-    /// When `false`, the `create_plan` tool is omitted from the coordinator's
-    /// tool set. Used on the final iteration's post-execute call to enforce
-    /// the replan budget structurally — the coordinator must pick
-    /// `respond_directly` or `request_clarification`.
-    allow_create_plan: bool,
+    routing_tools: RoutingToolSet,
     read_artifact: Option<ReadArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
 }
@@ -173,67 +184,6 @@ pub(super) fn spawn_cancellation_watcher(
             }
         }
     })
-}
-
-/// Extract the first JSON object from a response string.
-///
-/// Handles markdown code blocks by finding the outermost `{` and `}`.
-/// Extract all top-level JSON objects from a response string.
-///
-/// Uses brace-depth tracking to correctly handle nested objects, escaped
-/// characters inside strings, and surrounding text such as markdown code
-/// fences or multiple concatenated objects.
-fn extract_json_objects(response: &str) -> Vec<&str> {
-    let mut results = Vec::new();
-    let bytes = response.as_bytes();
-    let mut pos = 0;
-
-    while pos < bytes.len() {
-        if bytes[pos] != b'{' {
-            pos += 1;
-            continue;
-        }
-
-        let start = pos;
-        let mut depth: i32 = 0;
-        let mut in_string = false;
-        let mut escaped = false;
-
-        for i in start..bytes.len() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match bytes[i] {
-                b'\\' if in_string => escaped = true,
-                b'"' => in_string = !in_string,
-                b'{' if !in_string => depth += 1,
-                b'}' if !in_string => {
-                    depth -= 1;
-                    if depth == 0 {
-                        results.push(&response[start..=i]);
-                        pos = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if depth != 0 {
-            break;
-        }
-    }
-
-    results
-}
-
-/// Extract the first top-level JSON object from a response string.
-fn extract_json_object(response: &str) -> &str {
-    extract_json_objects(response)
-        .into_iter()
-        .next()
-        .unwrap_or(response)
 }
 
 /// Extract task_id from a tool_call_id string.
@@ -371,14 +321,25 @@ pub struct Orchestrator {
     pub(super) usage_state: crate::UsageState,
 }
 
-/// Worker identity for reasoning attribution in `stream_and_forward`.
+/// Stream context for reasoning attribution in `stream_and_forward`.
 ///
 /// When `Some`, reasoning items are wrapped as `OrchestratorEvent::WorkerReasoning`
 /// with proper task/worker attribution. When `None`, reasoning is forwarded raw
 /// (coordinator context — attributed as `agent_id: "main"` by handlers).
-struct WorkerIdentity<'a> {
+struct StreamContext<'a> {
     task_id: usize,
-    worker_name: &'a str,
+    worker_id: &'a str,
+}
+
+/// Shared parameters for streaming LLM calls (`stream_and_forward` / `stream_and_collect`).
+///
+/// Groups the per-call prompt payload and event routing — the data that every streaming
+/// variant needs regardless of ReAct depth or reasoning attribution mode.
+struct StreamCallParams<'a> {
+    prompt: &'a str,
+    history: Vec<rig::completion::Message>,
+    phase: &'a str,
+    event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
 }
 
 impl Orchestrator {
@@ -409,11 +370,12 @@ impl Orchestrator {
                 "Orchestrator: Initializing execution persistence at: {}",
                 memory_dir
             );
-            Arc::new(Mutex::new(
-                ExecutionPersistence::new(memory_dir, agent_config.session_id.clone())
-                    .await
-                    .map_err(|e| format!("Failed to initialize persistence: {}", e))?,
-            ))
+            let p = ExecutionPersistence::new(memory_dir, agent_config.session_id.clone())
+                .await
+                .map_err(|e| format!("Failed to initialize persistence: {}", e))?;
+            p.prune_session_runs(orchestration_config.max_session_runs())
+                .await;
+            Arc::new(Mutex::new(p))
         } else {
             tracing::info!("Orchestrator: Persistence disabled (no memory_dir configured)");
             Arc::new(Mutex::new(ExecutionPersistence::disabled()))
@@ -857,11 +819,9 @@ impl Orchestrator {
     async fn stream_and_forward(
         &self,
         agent: &Agent,
-        prompt: &str,
-        history: Vec<rig::completion::Message>,
-        phase: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-        worker: Option<WorkerIdentity<'_>>,
+        params: StreamCallParams<'_>,
+        stream_context: Option<StreamContext<'_>>,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
         use crate::provider_agent::{
@@ -872,6 +832,7 @@ impl Orchestrator {
         use rig::completion::Usage;
         use std::collections::HashMap;
 
+        let StreamCallParams { prompt, history, phase, event_tx } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
@@ -899,12 +860,12 @@ impl Orchestrator {
                         StreamedAssistantContent::ReasoningDelta { delta, .. },
                     )) => {
                         if let Some(tx) = event_tx {
-                            if let Some(ref w) = worker {
+                            if let Some(ref ctx) = stream_context {
                                 let _ = tx
                                     .send(Ok(StreamItem::OrchestratorEvent(
                                         OrchestratorEvent::WorkerReasoning {
-                                            task_id: w.task_id,
-                                            worker_id: w.worker_name.to_string(),
+                                            task_id: ctx.task_id,
+                                            worker_id: ctx.worker_id.to_string(),
                                             content: delta,
                                         },
                                     )))
@@ -940,8 +901,8 @@ impl Orchestrator {
                             scratchpad_tool_starts.insert(tc.id.clone(), std::time::Instant::now());
                             let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
                                 .unwrap_or(serde_json::json!({}));
-                            let (task_id, worker_id) = match worker.as_ref() {
-                                Some(w) => (Some(w.task_id), w.worker_name.to_string()),
+                            let (task_id, worker_id) = match stream_context.as_ref() {
+                                Some(w) => (Some(w.task_id), w.worker_id.to_string()),
                                 None => (None, "main".to_string()),
                             };
                             let _ = tx
@@ -969,7 +930,7 @@ impl Orchestrator {
                                 .remove(&tr.id)
                                 .map(|start| start.elapsed().as_millis() as u64)
                                 .unwrap_or(0);
-                            let task_id = worker.as_ref().map(|w| w.task_id);
+                            let task_id = stream_context.as_ref().map(|w| w.task_id);
                             let success =
                                 matches!(detect_tool_error(&tr.result), ToolResultStatus::Success);
                             let _ = tx
@@ -1003,7 +964,24 @@ impl Orchestrator {
                         }
                     }
                     Err(e) => return Err(e),
-                    _ => {} // ToolCall (non-scratchpad), ToolCallDelta, ToolResult (non-scratchpad) — rig handles execution
+                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                        tracing::debug!(
+                            "{}: tool result received (id={}, call_id={})",
+                            phase,
+                            tr.id,
+                            tr.call_id.as_deref().unwrap_or("-")
+                        );
+                        if decision_ready().await {
+                            tracing::debug!("{}: decision captured, reading turn usage", phase);
+                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
+                                usage.input_tokens += turn.input_tokens;
+                                usage.output_tokens += turn.output_tokens;
+                                usage.total_tokens += turn.total_tokens;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {} // ToolCall, ToolCallDelta — rig handles execution
                 }
             }
 
@@ -1048,10 +1026,7 @@ impl Orchestrator {
     async fn stream_and_collect(
         &self,
         agent: &Agent,
-        prompt: &str,
-        history: Vec<rig::completion::Message>,
-        phase: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        params: StreamCallParams<'_>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
@@ -1061,9 +1036,10 @@ impl Orchestrator {
         use futures::StreamExt;
         use rig::completion::Usage;
 
+        let StreamCallParams { prompt, history, phase, event_tx } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
-            let mut stream = agent.stream_chat_with_depth(prompt, history, 1).await;
+            let mut stream = agent.stream_chat_with_depth(prompt, history, agent.max_depth).await;
             let mut content = String::new();
             let mut usage = Usage {
                 input_tokens: 0,
@@ -1173,11 +1149,12 @@ impl Orchestrator {
         query: &str,
         worker_section: &str,
         worker_guidelines: &str,
-        error_section: &str,
     ) -> String {
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         format!(
-            "Analyze this user query and decide on the best approach.\n\n\
-             USER QUERY: {query}{worker_section}{error_section}\n\n\
+            "Current time: {timestamp}\n\n\
+             Analyze this user query and decide on the best approach.\n\n\
+             USER QUERY: {query}{worker_section}\n\n\
              You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
              1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
                 NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
@@ -1185,7 +1162,8 @@ impl Orchestrator {
                 When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.\n\n\
              3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
                 Use sparingly when a reasonable interpretation exists.\n\n\
-             {worker_guidelines}\n\n\
+             {worker_guidelines}\n\
+             - For time-scoped tasks, include the current time and relevant time range in the task description so workers have explicit time context\n\n\
              Call the appropriate routing tool now.",
         )
     }
@@ -1198,23 +1176,20 @@ impl Orchestrator {
     fn build_continuation_wrapper(
         ctx: &IterationContext,
         max_iterations: usize,
-        error_section: &str,
+        show_tool_chain: bool,
     ) -> String {
-        let base = ctx.build_continuation_prompt(max_iterations);
-        if error_section.is_empty() {
-            base
-        } else {
-            format!("{base}{error_section}")
-        }
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let base = ctx.build_continuation_prompt(max_iterations, show_tool_chain);
+        format!("Current time: {timestamp}\n\n{base}")
     }
 
-    /// Plan with routing tool support.
+    /// Plan with routing tool support via persistent conversation.
     ///
-    /// Creates a coordinator with routing tools (`respond_directly`, `create_plan`,
-    /// `request_clarification`) and reads the tool-based routing decision after the
-    /// coordinator chat completes.
+    /// Uses the coordinator from `CoordinatorState` (created once at
+    /// `run_orchestration` entry) and grows the conversation with each turn.
+    /// If the coordinator doesn't call a routing tool, appends a correction
+    /// message and retries within the same conversation context.
     ///
-    /// Falls back to text-based plan parsing if no routing tool was called.
     /// Enforces config flags: converts Direct/Clarification to single-task
     /// Orchestrated when `allow_direct_answers`/`allow_clarification` is false.
     #[tracing::instrument(
@@ -1226,111 +1201,80 @@ impl Orchestrator {
         &self,
         query: &str,
         chat_history: &[rig::completion::Message],
+        coordinator_state: &mut CoordinatorState,
         previous: Option<&IterationContext>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
     ) -> Result<(PlanningResponse, String, String), StreamError> {
-        use super::tools::routing_tools::RoutingDecision;
+        let max_correction_attempts = self.config.max_plan_parse_retries;
 
-        let max_plan_parse_retries = self.config.max_plan_parse_retries;
-
-        // Create routing toolset and capture decision handle
-        let routing_toolset = RoutingToolSet::new();
-        let routing_decision: RoutingDecision = routing_toolset.decision.clone();
-
-        // Post-execute continuation calls zero the recon tools — execute has
-        // already happened, so list_tools / inspect_tool_params have no
-        // legitimate use at the decision point.
-        let include_recon = previous.is_none();
-        // On the final iteration's post-execute call, omit `create_plan` from
-        // the tool set: the replan budget is exhausted, so the coordinator
-        // must pick `respond_directly` or `request_clarification`. The
-        // `(FINAL ATTEMPT)` urgency in the continuation prompt signals intent;
-        // stripping the tool makes it structural.
-        let allow_create_plan = match previous {
-            None => true,
-            Some(ctx) => ctx.iteration < self.config.max_planning_cycles,
-        };
-        let AgentWithPreamble {
-            agent: coordinator,
-            preamble: coordinator_preamble,
-            ..
-        } = self
-            .create_coordinator(Some(routing_toolset), include_recon, allow_create_plan)
-            .await?;
-
-        // Build prompt components (planning phase only; continuation phase
-        // renders its own complete user message).
         let (worker_section, _worker_field, worker_guidelines) =
             self.build_worker_prompt_sections();
 
-        let mut plan_errors: Vec<PlanAttemptFailure> = Vec::new();
-        let mut final_prompt = String::new();
-        let mut final_response = String::new();
+        // Build the primary user message based on call phase.
+        let planning_prompt = match previous {
+            None => Self::build_planning_wrapper(
+                query,
+                &worker_section,
+                &worker_guidelines,
+            ),
+            Some(ctx) => Self::build_continuation_wrapper(
+                ctx,
+                self.config.max_planning_cycles,
+                self.config.show_tool_reasoning_in_continuation(),
+            ),
+        };
 
-        for attempt in 1..=max_plan_parse_retries {
-            // Reset any stale routing decision from a previous failed attempt
+        let mut final_prompt: Option<String> = None;
+        let mut final_response: Option<String> = None;
+        let planning_start = Instant::now();
+
+        for attempt in 1..=max_correction_attempts {
+            // Clear any stale routing decision
             {
-                let mut guard = routing_decision.lock().await;
+                let mut guard = coordinator_state.routing_decision.lock().await;
                 *guard = None;
             }
 
             let attempt_start = Instant::now();
-            tracing::info!(
-                "Planning attempt {}/{} (max_plan_parse_retries={}, per_call_timeout={}s)",
-                attempt,
-                max_plan_parse_retries,
-                max_plan_parse_retries,
-                self.config.per_call_timeout_secs(),
-            );
-            let error_section = if let Some(err) = plan_errors.last() {
-                format!(
-                    "\n\nPREVIOUS PLANNING ERROR:\n\
-                     Your previous response could not be parsed: {}\n\n\
-                     Please call one of the routing tools (respond_directly, create_plan, or request_clarification).",
-                    err
-                )
+            // First attempt sends the planning/continuation prompt; subsequent
+            // attempts send a correction message within the same conversation.
+            let prompt = if attempt == 1 {
+                planning_prompt.clone()
             } else {
-                String::new()
+                "You must call one of the routing tools (respond_directly, create_plan, or request_clarification). Do not respond with text — call a tool.".to_string()
             };
 
-            // Build the user message based on call phase. The iter-1 planning
-            // wrapper enumerates the routing tools; the post-execute
-            // continuation wrapper renders the continuation prompt from the
-            // iteration context and does NOT re-enumerate the routing tools
-            // (the coordinator already has them in its preamble).
-            let planning_prompt = match previous {
-                None => Self::build_planning_wrapper(
-                    query,
-                    &worker_section,
-                    &worker_guidelines,
-                    &error_section,
-                ),
-                Some(ctx) => Self::build_continuation_wrapper(
-                    ctx,
-                    self.config.max_planning_cycles,
-                    &error_section,
-                ),
-            };
+            tracing::info!(
+                "Planning attempt {}/{} (per_call_timeout={}s, conversation_len={})",
+                attempt,
+                max_correction_attempts,
+                self.config.per_call_timeout_secs(),
+                coordinator_state.conversation.len(),
+            );
 
-            // Record in prompt journal
+            // Build full history: external chat + accumulated coordinator conversation
+            let mut full_history = chat_history.to_vec();
+            full_history.extend(coordinator_state.conversation.iter().cloned());
+
             self.journal_record(
                 JournalPhase::Planning {
                     attempt,
-                    max_attempts: max_plan_parse_retries,
+                    max_attempts: max_correction_attempts,
                 },
-                &coordinator_preamble,
-                &planning_prompt,
+                &coordinator_state.preamble,
+                &prompt,
             );
 
-            // Call coordinator with early-exit streaming (prevents ReAct loop waste)
-            let rd = routing_decision.clone();
+            let rd = coordinator_state.routing_decision.clone();
             let response = match self
                 .stream_and_collect(
-                    &coordinator,
-                    &planning_prompt,
-                    chat_history.to_vec(),
-                    "Planning",
-                    event_tx,
+                    &coordinator_state.agent,
+                    StreamCallParams {
+                        prompt: &prompt,
+                        history: full_history,
+                        phase: "Planning",
+                        event_tx,
+                    },
                     || {
                         let rd = rd.clone();
                         Box::pin(async move { rd.lock().await.is_some() })
@@ -1358,57 +1302,63 @@ impl Orchestrator {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    let elapsed = attempt_start.elapsed();
-                    let failure = if err_str.contains("timed out") {
-                        PlanAttemptFailure::Timeout {
+                    // Record the failed user turn in conversation for context
+                    coordinator_state.conversation.push(
+                        rig::completion::Message::user(&prompt),
+                    );
+                    if err_str.contains("timed out") {
+                        tracing::warn!(
+                            "Planning attempt {} timed out after {:.1}s",
                             attempt,
-                            timeout_secs: self.config.per_call_timeout_secs(),
-                            elapsed,
-                        }
-                    } else if err_str.contains("MaxDepthError") || err_str.contains("reached limit")
+                            attempt_start.elapsed().as_secs_f64(),
+                        );
+                    } else if err_str.contains("MaxDepthError")
+                        || err_str.contains("reached limit")
                     {
-                        PlanAttemptFailure::DepthExhausted {
+                        tracing::warn!(
+                            "Planning attempt {} exhausted depth after {:.1}s: {}",
                             attempt,
-                            detail: format!(
-                                "coordinator exhausted all turns without calling a routing tool (inspect_tool_params may have consumed the budget). Error: {}",
-                                err_str
-                            ),
-                            elapsed,
-                        }
+                            attempt_start.elapsed().as_secs_f64(),
+                            err_str,
+                        );
                     } else {
-                        PlanAttemptFailure::LlmError {
+                        tracing::warn!(
+                            "Planning attempt {} error after {:.1}s: {}",
                             attempt,
-                            detail: err_str,
-                            elapsed,
-                        }
-                    };
-                    tracing::warn!("{}", failure);
-                    plan_errors.push(failure);
-                    continue;
+                            attempt_start.elapsed().as_secs_f64(),
+                            err_str,
+                        );
+                    }
+                    return Err(format!("Planning failed: {}", err_str).into());
                 }
             };
 
-            final_prompt = planning_prompt;
+            // Grow conversation: user turn
+            coordinator_state.conversation.push(
+                rig::completion::Message::user(&prompt),
+            );
 
             // Check if a routing tool was called
-            let decision = routing_decision.lock().await.take();
+            let decision = coordinator_state.routing_decision.lock().await.take();
 
             if let Some(planning_response) = decision {
-                // Use the routing decision as the planning response for persistence.
-                // The stream's text content is typically empty because the coordinator
-                // produces its output via tool calls, not streamed text.
-                final_response = if response.content.trim().is_empty() {
+                let response_text = if response.content.trim().is_empty() {
                     serde_json::to_string_pretty(&planning_response)
                         .unwrap_or_else(|_| response.content.clone())
                 } else {
                     response.content.clone()
                 };
 
-                // Persist planning phase artifacts (after routing decision is available)
+                // Grow conversation: assistant turn (serialized routing decision)
+                coordinator_state.conversation.push(
+                    rig::completion::Message::assistant(&response_text),
+                );
+
+                // Persist planning phase artifacts
                 {
                     let persistence = self.persistence.lock().await;
                     if let Err(e) = persistence
-                        .write_planning_phase(&final_prompt, &final_response)
+                        .write_planning_phase(&prompt, &response_text)
                         .await
                     {
                         tracing::warn!("Failed to persist planning phase: {}", e);
@@ -1423,7 +1373,6 @@ impl Orchestrator {
                     truncate_query(&routing_rationale, 80),
                 );
 
-                // Enforce config flags
                 let planning_response = Self::enforce_routing_config(
                     planning_response,
                     query,
@@ -1431,7 +1380,6 @@ impl Orchestrator {
                     self.config.allow_clarification,
                 );
 
-                // Persist plan for plan-bearing routing decisions
                 if matches!(&planning_response, PlanningResponse::StepsPlan { .. })
                     && let Some(plan) = planning_response.clone().into_plan()
                 {
@@ -1441,15 +1389,19 @@ impl Orchestrator {
                     }
                 }
 
-                return Ok((planning_response, final_prompt, final_response));
+                return Ok((planning_response, prompt, response_text));
             }
 
-            // Fallback: no routing tool called — persist the raw text response
-            final_response = response.content.clone();
+            // No routing tool called — record assistant response and try correction
+            let response_text = response.content.clone();
+            coordinator_state.conversation.push(
+                rig::completion::Message::assistant(&response_text),
+            );
+
             {
                 let persistence = self.persistence.lock().await;
                 if let Err(e) = persistence
-                    .write_planning_phase(&final_prompt, &final_response)
+                    .write_planning_phase(&prompt, &response_text)
                     .await
                 {
                     tracing::warn!("Failed to persist planning phase: {}", e);
@@ -1458,100 +1410,32 @@ impl Orchestrator {
 
             let (response_preview, _) = safe_truncate(&response.content, 300);
             tracing::warn!(
-                "No routing tool called (attempt {}/{}). The coordinator responded with text instead of calling create_plan/respond_directly/request_clarification. Response: {}",
+                "No routing tool called (attempt {}/{}). Appending correction to conversation. Response: {}",
                 attempt,
-                max_plan_parse_retries,
+                max_correction_attempts,
                 response_preview,
             );
 
-            match self.parse_plan_response(&response.content, query) {
-                Ok(plan) => {
-                    tracing::info!(
-                        "Fallback parse (attempt {}, {:.1}s): {} task(s) for goal: {}",
-                        attempt,
-                        attempt_start.elapsed().as_secs_f64(),
-                        plan.tasks.len(),
-                        truncate_query(&plan.goal, 50)
-                    );
-
-                    {
-                        let persistence = self.persistence.lock().await;
-                        if let Err(e) = persistence.write_plan(&plan).await {
-                            tracing::warn!("Failed to persist plan: {}", e);
-                        }
-                    }
-
-                    // Wrap as StepsPlan response (sequential LeafTasks).
-                    // Loses fine-grained dependency info from text-parsed plans,
-                    // but this is an emergency fallback path; sequential is safe.
-                    let steps: Vec<super::types::StepInput> = plan
-                        .tasks
-                        .iter()
-                        .map(|t| super::types::StepInput::LeafTask {
-                            task: t.description.clone(),
-                            worker: t.worker.clone(),
-                        })
-                        .collect();
-
-                    return Ok((
-                        PlanningResponse::StepsPlan {
-                            goal: plan.goal,
-                            steps,
-                            routing_rationale: "Fallback: text-based plan parsing".to_string(),
-                            planning_summary: String::new(),
-                        },
-                        final_prompt,
-                        final_response,
-                    ));
-                }
-                Err(e) => {
-                    let (response_preview, _) = safe_truncate(&response.content, 200);
-                    let failure = PlanAttemptFailure::ParseFailure {
-                        attempt,
-                        detail: e.to_string(),
-                        response_preview: response_preview.to_string(),
-                        elapsed: attempt_start.elapsed(),
-                    };
-                    tracing::warn!("{}", failure);
-                    plan_errors.push(failure);
-                }
-            }
+            final_prompt = Some(prompt);
+            final_response = Some(response_text);
         }
 
-        // All attempts failed — build categorized summary and fall back
-        {
-            let total_elapsed: Duration = plan_errors.iter().map(|f| f.elapsed()).sum();
-            let mut category_counts: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            for f in &plan_errors {
-                *category_counts.entry(f.category()).or_insert(0) += 1;
-            }
-            // Build "2 timeouts, 1 parse failure" style summary
-            let mut categories: Vec<_> = category_counts.into_iter().collect();
-            categories.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-            let category_summary = categories
-                .iter()
-                .map(|(cat, count)| {
-                    if *count == 1 {
-                        format!("1 {}", cat)
-                    } else {
-                        format!("{} {}s", count, cat)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            tracing::warn!(
-                "All {} planning attempts failed ({}; total {:.1}s). Falling back to single-task plan.",
-                max_plan_parse_retries,
-                category_summary,
-                total_elapsed.as_secs_f64(),
-            );
-            for failure in &plan_errors {
-                tracing::warn!("  {}", failure);
-            }
+        // All correction attempts exhausted
+        tracing::warn!(
+            "All {} planning attempts failed after {:.1}s. Coordinator did not call a routing tool.",
+            max_correction_attempts,
+            planning_start.elapsed().as_secs_f64(),
+        );
+
+        if previous.is_some() {
+            return Err(format!(
+                "All {} post-execute planning attempts failed (coordinator could not route)",
+                max_correction_attempts,
+            )
+            .into());
         }
 
-        let response = PlanningResponse::StepsPlan {
+        let fallback = PlanningResponse::StepsPlan {
             goal: query.to_string(),
             steps: vec![super::types::StepInput::LeafTask {
                 task: format!("Execute: {}", truncate_query(query, 100)),
@@ -1564,7 +1448,7 @@ impl Orchestrator {
         let (query_preview, _) = safe_truncate(query, 100);
         tracing::info!("Created fallback single-task plan for: {}", query_preview);
 
-        Ok((response, final_prompt, final_response))
+        Ok((fallback, final_prompt.unwrap_or_default(), final_response.unwrap_or_default()))
     }
 
     /// Enforce config flags on a routing decision.
@@ -1979,13 +1863,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for tool in tools.vector_tools {
             state = state.add_tool(tool);
         }
-        if let Some(routing) = tools.routing_tools {
-            state = state.add_tool(routing.respond_directly);
-            if tools.allow_create_plan {
-                state = state.add_tool(routing.create_plan);
-            }
-            state = state.add_tool(routing.request_clarification);
-        }
+        state = state.add_tool(tools.routing_tools.respond_directly);
+        state = state.add_tool(tools.routing_tools.create_plan);
+        state = state.add_tool(tools.routing_tools.request_clarification);
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
@@ -2004,13 +1884,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - `list_tools`: Returns all available tool names
     /// - `inspect_tool_params`: Returns parameter schema for a specific tool
     ///
-    /// When `routing_tools` is `Some`, the three routing tools are also added to the
+    /// The three routing tools are also added to the
     /// coordinator agent, enabling structured routing decisions via tool calling.
     async fn create_coordinator(
         &self,
-        routing_tools: Option<RoutingToolSet>,
+        routing_tools: RoutingToolSet,
         allow_recon_tools: bool,
-        allow_create_plan: bool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use crate::vector_dynamic::DynamicVectorSearchTool;
         use crate::vector_store::VectorStoreManager;
@@ -2120,7 +1999,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             vector_tools,
             routing_tools,
-            allow_create_plan,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
             list_prior_runs: if include_history_tools {
                 Some(super::tools::ListPriorRunsTool::new(
@@ -2143,8 +2021,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let model_name = self.agent_config.llm.model_name().to_string();
 
-        // Planning coordinator uses a tight depth budget: 1 recon + 1 routing + 1 spare.
-        // stream_and_collect() provides the primary early-exit guard; this is defense-in-depth.
+        // Coordinator depth budget allows recon + read_artifact + routing within one
+        // stream_and_collect call. The decision_ready early-exit is the primary guard;
+        // max_depth is defense-in-depth. GPT 5.2 observed using read_artifact during
+        // post-execute synthesis (13 calls in 5-prompt E2E suite).
         let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
         Ok(AgentWithPreamble {
@@ -2487,90 +2367,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Parse the LLM response into a Plan.
-    ///
-    /// When specialized workers are configured, validates that any assigned
-    /// worker names exist in the configuration. Returns an error if an
-    /// invalid worker is specified.
-    fn parse_plan_response(&self, response: &str, original_query: &str) -> Result<Plan, String> {
-        let json_str = extract_json_object(response);
-
-        // Parse the JSON
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {}", e))?;
-
-        // Extract goal
-        let goal = parsed["goal"]
-            .as_str()
-            .unwrap_or(original_query)
-            .to_string();
-
-        let mut plan = Plan::new(goal);
-
-        // Get valid worker names for validation
-        let valid_workers: std::collections::HashSet<&str> =
-            self.config.available_worker_names().into_iter().collect();
-
-        // Extract tasks
-        let tasks = parsed["tasks"].as_array().ok_or("Missing 'tasks' array")?;
-
-        let mut seen_ids = std::collections::HashSet::new();
-        for task_value in tasks {
-            let id = task_value["id"].as_u64().ok_or("Task missing 'id'")? as usize;
-            if !seen_ids.insert(id) {
-                return Err(format!("Duplicate task id: {}", id));
-            }
-            let description = task_value["description"]
-                .as_str()
-                .ok_or("Task missing 'description'")?
-                .to_string();
-
-            // Rationale is required - explains why this task exists and how it advances the goal
-            let rationale = task_value["rationale"]
-                .as_str()
-                .ok_or_else(|| format!("Task {} missing required 'rationale' field", id))?
-                .to_string();
-
-            let mut task = Task::new(id, description, rationale);
-
-            // Parse dependencies
-            if let Some(deps) = task_value["dependencies"].as_array() {
-                for dep in deps {
-                    if let Some(dep_id) = dep.as_u64() {
-                        task = task.with_dependency(dep_id as usize);
-                    }
-                }
-            }
-
-            // Parse and validate worker assignment
-            if self.config.has_workers() {
-                // When workers are configured, all tasks must have a valid worker assignment
-                let worker_name = task_value["worker"]
-                    .as_str()
-                    .ok_or_else(|| format!("Task {} missing required 'worker' field", id))?;
-
-                if !valid_workers.contains(worker_name) {
-                    return Err(format!(
-                        "Task {} assigned to unknown worker '{}'. Valid workers: {:?}",
-                        id,
-                        worker_name,
-                        valid_workers.iter().collect::<Vec<_>>()
-                    ));
-                }
-                task = task.with_worker(worker_name);
-            }
-            // If workers aren't configured, ignore any worker field
-
-            plan.add_task(task);
-        }
-
-        if plan.tasks.is_empty() {
-            return Err("Plan has no tasks".to_string());
-        }
-
-        Ok(plan)
-    }
-
     /// Execute phase: run tasks and collect results.
     ///
     /// Iterates through tasks respecting dependencies, executes ready tasks in parallel,
@@ -2673,15 +2469,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             )
                             .await;
                         let result_for_event = final_result.clone();
+                        let success = exec_result.structured_output.is_some();
                         if let Some(t) = plan.get_task_mut(task_id) {
-                            t.complete(final_result);
+                            if success {
+                                t.complete(final_result);
+                            } else {
+                                t.fail(final_result, FailureCategory::SoftFailure);
+                            }
                             t.structured_output = exec_result.structured_output;
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
                                 OrchestratorEvent::TaskCompleted {
                                     task_id,
-                                    success: true,
+                                    success,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
                                     worker_id: worker_name
@@ -2691,7 +2492,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 },
                             )))
                             .await;
-                        tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
+                        if success {
+                            tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
+                        } else {
+                            tracing::warn!(
+                                "Task {} did not call submit_result (SoftFailure) after {}ms",
+                                task_id,
+                                duration_ms
+                            );
+                        }
                     }
                     Err(e) => {
                         let err_str = e.to_string();
@@ -2877,177 +2686,305 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        // Create worker with persistence context (attempt 1 for now - retry logic is Phase 2+)
-        let attempt = 1;
-        let start_time = std::time::Instant::now();
-        let AgentWithPreamble {
-            agent: worker,
-            preamble: worker_preamble,
-            escalation_flag,
-            submit_result_decision,
-        } = self.create_worker(task_id, attempt, *worker_name).await?;
-
-        // Build the worker prompt — task-first, no original query (prevents scope creep)
+        // Build the base worker prompt once — reused across retry attempts
         let context_str = task_context
             .as_ref()
             .map(|c| format!("{}\n\n", c))
             .unwrap_or_default();
-        let worker_prompt =
+        let base_worker_prompt =
             super::templates::render_worker_task_prompt(&super::templates::WorkerTaskVars {
                 orchestration_goal: plan_goal,
                 context: &context_str,
                 your_task: task_description,
             });
 
-        // Record in prompt journal
-        self.journal_record(
-            JournalPhase::Worker {
-                task_id,
-                worker_name: *worker_name,
-                attempt,
-            },
-            &worker_preamble,
-            &worker_prompt,
-        );
+        let start_time = std::time::Instant::now();
+        let mut last_usage = rig::completion::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        };
+        let mut last_raw_response = String::new();
+        let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
-        // initial_used only counts templates + tool schemas, so bill the
-        // per-task prompt here.
-        if let Some(ref budget) = worker.scratchpad_budget {
-            let task_prompt_tokens = budget.count_tokens(&worker_prompt);
-            budget.record_usage(task_prompt_tokens);
-            tracing::debug!(
-                "Task {}: task prompt ~{} tokens recorded in budget",
-                task_id,
-                task_prompt_tokens
-            );
-        }
+        for attempt in 1..=MAX_WORKER_ATTEMPTS {
+            let is_final_attempt = attempt == MAX_WORKER_ATTEMPTS;
 
-        // Execute the task (workers get context from the task prompt, not conversation history)
-        let result = self
-            .stream_and_forward(
-                &worker,
-                &worker_prompt,
-                vec![],
-                "Worker task",
-                event_tx,
-                worker_name.map(|name| WorkerIdentity {
+            let AgentWithPreamble {
+                agent: worker,
+                preamble: worker_preamble,
+                escalation_flag,
+                submit_result_decision,
+            } = self.create_worker(task_id, attempt, *worker_name).await?;
+
+            // Build prompt for this attempt
+            let (prompt, history) = if attempt == 1 {
+                (base_worker_prompt.clone(), vec![])
+            } else {
+                // Retry: append correction to previous conversation
+                let correction = "[SYSTEM CORRECTION] You did not call the submit_result tool in your previous response. \
+You MUST call submit_result to complete this task. Please try again.".to_string();
+                let history = vec![
+                    rig::completion::Message::user(base_worker_prompt.clone()),
+                    rig::completion::Message::assistant(last_raw_response.clone()),
+                ];
+                (correction, history)
+            };
+
+            // initial_used only counts templates + tool schemas, so bill the
+            // per-task prompt here.
+            if let Some(ref budget) = worker.scratchpad_budget {
+                let task_prompt_tokens = budget.count_tokens(&prompt);
+                budget.record_usage(task_prompt_tokens);
+                tracing::debug!(
+                    "Task {}: task prompt ~{} tokens recorded in budget",
                     task_id,
-                    worker_name: name,
-                }),
-            )
-            .await;
-        let duration_ms = start_time.elapsed().as_millis() as u64;
+                    task_prompt_tokens
+                );
+            }
 
-        // Record token usage on the orchestration.worker span
-        if let Ok(ref response) = result {
-            let span = tracing::Span::current();
-            crate::logging::set_token_usage(
-                &span,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                response.usage.total_tokens,
-                0,
+            // Record in prompt journal
+            self.journal_record(
+                JournalPhase::Worker {
+                    task_id,
+                    worker_name: *worker_name,
+                    attempt,
+                },
+                &worker_preamble,
+                &prompt,
             );
-            self.usage_state
-                .accumulate_usage(response.usage.input_tokens, response.usage.output_tokens);
-        }
 
-        // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
-        if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
-            let agent_id = worker_name
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| self.orchestrator_id.clone());
-            if let Some(event) = crate::builder::scratchpad_usage_event(budget, &agent_id) {
-                let _ = tx.send(Ok(event)).await;
-            }
-        }
-
-        // Detect context overflow in worker and provide actionable message
-        let result = match result {
-            Ok(r) => Ok(r.content),
-            Err(e) if is_context_overflow_error(e.as_ref()) => {
-                let suggestion = context_overflow_suggestion("worker");
-                Err(format!(
-                    "Worker context limit exceeded for task {}. {}",
-                    task_id, suggestion
+            // Execute the task
+            let srd = submit_result_decision.clone();
+            let stream_result = self
+                .stream_and_forward(
+                    &worker,
+                    StreamCallParams {
+                        prompt: &prompt,
+                        history,
+                        phase: "Worker task",
+                        event_tx,
+                    },
+                    worker_name.map(|name| StreamContext {
+                        task_id,
+                        worker_id: name,
+                    }),
+                    || {
+                        let srd = srd.clone();
+                        Box::pin(async move { srd.lock().await.is_some() })
+                    },
                 )
-                .into())
-            }
-            Err(e) => Err(e),
-        };
+                .await;
 
-        // Check escalation flag: guard detected a duplicate call loop but
-        // rig reported Ok. Convert to Err so the task is marked Failed and
-        // dependents are blocked in the DAG.
-        let result: Result<String, StreamError> = match result {
-            Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
-                let processed = self
-                    .maybe_create_artifact(task_id, *worker_name, worker_output)
-                    .await;
-                Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
-            }
-            other => other,
-        };
-
-        // Extract structured output from submit_result. Workers are required
-        // to call submit_result; failure to do so is treated as a task failure
-        // (SoftFailure category — worker produced output but didn't follow protocol).
-        let (result, structured_output): (
-            Result<String, StreamError>,
-            Option<super::types::StructuredTaskOutput>,
-        ) = match result {
-            Ok(raw_response) => {
-                let structured = submit_result_decision.lock().await.take();
-                match structured {
-                    Some(output) => (
-                        Ok(output.result),
-                        Some(super::types::StructuredTaskOutput {
-                            summary: output.summary,
-                            confidence: output.confidence,
-                        }),
-                    ),
-                    None => {
-                        let (preview, _) = safe_truncate(&raw_response, 200);
-                        (
-                            Err(format!(
-                                "Worker did not call submit_result for task {}. Raw output: {}",
-                                task_id, preview,
-                            )
-                            .into()),
-                            None,
-                        )
-                    }
+            // Emit per-agent ScratchpadUsage event if this worker used scratchpad.
+            if let (Some(budget), Some(tx)) = (worker.scratchpad_budget.as_ref(), event_tx) {
+                let agent_id = worker_name
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| self.orchestrator_id.clone());
+                if let Some(event) = crate::builder::scratchpad_usage_event(budget, &agent_id) {
+                    let _ = tx.send(Ok(event)).await;
                 }
             }
-            Err(e) => (Err(e), None),
+
+            // Track token usage per attempt.
+            // usage_state tracks TOTAL cost across all attempts (each is a separate API call).
+            // Span metrics capture only the final attempt's usage (what produced the result).
+            if let Ok(ref response) = stream_result {
+                self.usage_state.accumulate_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                );
+                last_usage = response.usage;
+            }
+
+            // Detect context overflow and other errors — don't retry hard errors
+            let result = match stream_result {
+                Ok(r) => Ok(r.content),
+                Err(e) if is_context_overflow_error(e.as_ref()) => {
+                    let suggestion = context_overflow_suggestion("worker");
+                    Err(format!(
+                        "Worker context limit exceeded for task {}. {}",
+                        task_id, suggestion
+                    )
+                    .into())
+                }
+                Err(e) => Err(e),
+            };
+
+            // Check escalation flag (duplicate call loop)
+            let result: Result<String, StreamError> = match result {
+                Ok(worker_output)
+                    if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    let processed = self
+                        .maybe_create_artifact(task_id, *worker_name, worker_output)
+                        .await;
+                    Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
+                }
+                other => other,
+            };
+
+            // Extract structured output from submit_result
+            match result {
+                Ok(raw_response) => {
+                    let structured = submit_result_decision.lock().await.take();
+                    match structured {
+                        Some(output) => {
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            self.set_worker_span_usage(
+                                last_usage.input_tokens,
+                                last_usage.output_tokens,
+                                last_usage.total_tokens,
+                            );
+                            self.persist_worker_execution(
+                                task_id,
+                                task_description,
+                                attempt,
+                                duration_ms,
+                                Ok(&output.result),
+                                Some(&super::types::StructuredTaskOutput {
+                                    summary: output.summary.clone(),
+                                    confidence: output.confidence,
+                                }),
+                                &prompt,
+                            )
+                            .await;
+                            return Ok(TaskExecutionResult {
+                                result: output.result,
+                                structured_output: Some(super::types::StructuredTaskOutput {
+                                    summary: output.summary,
+                                    confidence: output.confidence,
+                                }),
+                            });
+                        }
+                        None if is_final_attempt => {
+                            tracing::warn!(
+                                "Worker did not call submit_result for task {} after {} attempts. Preserving raw output via artifact flow.",
+                                task_id, attempt
+                            );
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            self.set_worker_span_usage(
+                                last_usage.input_tokens,
+                                last_usage.output_tokens,
+                                last_usage.total_tokens,
+                            );
+                            self.persist_worker_execution(
+                                task_id,
+                                task_description,
+                                attempt,
+                                duration_ms,
+                                Ok(&raw_response),
+                                None,
+                                &prompt,
+                            )
+                            .await;
+                            return Ok(TaskExecutionResult {
+                                result: raw_response,
+                                structured_output: None,
+                            });
+                        }
+                        None => {
+                            tracing::info!(
+                                "Worker attempt {} for task {} did not call submit_result. Retrying with correction.",
+                                attempt, task_id
+                            );
+                            last_raw_response = raw_response;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    break; // Hard errors are not retried
+                }
+            }
+        }
+
+        // All attempts exhausted or hard error occurred
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        self.set_worker_span_usage(
+            last_usage.input_tokens,
+            last_usage.output_tokens,
+            last_usage.total_tokens,
+        );
+        if let Some(ref e) = last_error {
+            self.persist_worker_execution(
+                task_id,
+                task_description,
+                MAX_WORKER_ATTEMPTS,
+                duration_ms,
+                Err(e.as_ref()),
+                None,
+                &base_worker_prompt,
+            )
+            .await;
+            Err(format!(
+                "Worker failed task {} after {} attempts: {}",
+                task_id, MAX_WORKER_ATTEMPTS, e
+            )
+            .into())
+        } else {
+            // Should not reach here — final attempt should have returned above
+            self.persist_worker_execution(
+                task_id,
+                task_description,
+                MAX_WORKER_ATTEMPTS,
+                duration_ms,
+                Ok(&last_raw_response),
+                None,
+                &base_worker_prompt,
+            )
+            .await;
+            Ok(TaskExecutionResult {
+                result: last_raw_response,
+                structured_output: None,
+            })
+        }
+    }
+
+    /// Set token usage metrics on the current orchestration.worker span.
+    /// usage_state is already updated per-attempt in the retry loop.
+    fn set_worker_span_usage(&self, input: u64, output: u64, total: u64) {
+        let span = tracing::Span::current();
+        crate::logging::set_token_usage(&span, input, output, total, 0);
+    }
+
+    /// Persist a single worker execution attempt to the journal and persistence store.
+    async fn persist_worker_execution(
+        &self,
+        task_id: usize,
+        task_description: &str,
+        attempt: usize,
+        duration_ms: u64,
+        result: Result<&str, &(dyn std::error::Error + Send + Sync)>,
+        structured_output: Option<&super::types::StructuredTaskOutput>,
+        worker_prompt: &str,
+    ) {
+        let (result_str, error_str) = match result {
+            Ok(r) => (Some(r.to_string()), None),
+            Err(e) => (None, Some(e.to_string())),
         };
 
-        // Persist the worker execution
+        let record = super::persistence::TaskExecutionRecord {
+            task_id,
+            description: task_description.to_string(),
+            attempt,
+            approach: "Direct task execution via worker agent".to_string(),
+            result: result_str.clone(),
+            summary: structured_output.map(|s| s.summary.clone()),
+            error: error_str,
+            duration_ms,
+            confidence: structured_output.map(|s| s.confidence.to_string()),
+            orchestrator_notes: None,
+        };
+
         {
             let persistence = self.persistence.lock().await;
-            let (result_str, error_str) = match &result {
-                Ok(r) => (Some(r.clone()), None),
-                Err(e) => (None, Some(e.to_string())),
-            };
-
-            let record = super::persistence::TaskExecutionRecord {
-                task_id,
-                description: task_description.to_string(),
-                attempt,
-                approach: "Direct task execution via worker agent".to_string(),
-                result: result_str.clone(),
-                summary: structured_output.as_ref().map(|s| s.summary.clone()),
-                error: error_str,
-                duration_ms,
-                confidence: structured_output.as_ref().map(|s| s.confidence.to_string()),
-                orchestrator_notes: None,
-            };
-
             if let Err(e) = persistence
                 .write_task_execution(
                     task_id,
                     attempt,
-                    &worker_prompt,
+                    worker_prompt,
                     result_str.as_deref().unwrap_or("(error)"),
                     &record,
                 )
@@ -3059,15 +2996,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         {
             let span = tracing::Span::current();
-            match &result {
+            match result {
                 Ok(_) => crate::logging::set_span_ok(&span),
                 Err(e) => crate::logging::set_span_error(&span, e.to_string()),
             }
         }
-        result.map(|r| TaskExecutionResult {
-            result: r,
-            structured_output,
-        })
     }
 
     /// Build a summary of task execution statuses for replan context.
@@ -3109,6 +3042,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// Classify a task failure error string into a structured category.
+    ///
+    /// These are deterministic string matches against error messages produced by
+    /// our rig fork (mezmo/rig @ d7e9d92) and our own orchestrator code — never
+    /// against non-deterministic model output. Rig's `CompletionError::ProviderError(String)`
+    /// flattens HTTP status codes into the error string, so string matching is
+    /// the only classification path available without forking rig's error types.
+    /// Revisit if/when we replace rig.
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains("timed out") {
@@ -3146,6 +3086,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("api key")
         {
             FailureCategory::ProviderAuthError
+        } else if lower.contains("404")
+            || lower.contains("model identifier is invalid")
+            || lower.contains("is not found for api version")
+        {
+            FailureCategory::ProviderNotFound
         } else {
             FailureCategory::AgentError
         }
@@ -3164,7 +3109,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         failures.iter().all(|f| {
             matches!(
                 f.category,
-                FailureCategory::ProviderOverloaded | FailureCategory::ProviderAuthError
+                FailureCategory::ProviderOverloaded
+                    | FailureCategory::ProviderAuthError
+                    | FailureCategory::ProviderNotFound
             )
         })
     }
@@ -3258,8 +3205,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Top-level orchestration entry point: route → loop.
     ///
-    /// Uses `plan_with_routing()` for the initial routing decision, then
-    /// dispatches based on the `PlanningResponse` variant:
+    /// Creates a single coordinator agent for the entire orchestration request,
+    /// then uses `plan_with_routing()` for routing decisions. The coordinator's
+    /// conversation grows monotonically across planning and continuation turns.
+    ///
+    /// Dispatches based on the `PlanningResponse` variant:
     /// - `Direct` → emit event, return response
     /// - `Clarification` → emit event, return question
     /// - `StepsPlan` → delegate to `run_orchestration_loop()`
@@ -3295,10 +3245,31 @@ Assign tasks to the worker whose tools best match the required operations."#,
             default_turn_depth,
         );
 
+        // Create coordinator once for the entire orchestration request.
+        // Recon tools registered unconditionally — the persistent conversation
+        // means we can't vary the tool set between calls, and the conversation
+        // context guides usage (coordinator won't call list_tools on continuation).
+        let routing_toolset = RoutingToolSet::new();
+        let routing_decision = routing_toolset.decision.clone();
+        let AgentWithPreamble {
+            agent: coordinator,
+            preamble: coordinator_preamble,
+            ..
+        } = self
+            .create_coordinator(routing_toolset, true)
+            .await?;
+
+        let mut coordinator_state = CoordinatorState {
+            agent: coordinator,
+            preamble: coordinator_preamble,
+            conversation: Vec::new(),
+            routing_decision,
+        };
+
         // Set iteration for initial planning (journal reads this via AtomicUsize)
         self.current_iteration.store(1, Ordering::Relaxed);
         let (response, _prompt, _coordinator_text) = self
-            .plan_with_routing(query, &chat_history, None, Some(&event_tx))
+            .plan_with_routing(query, &chat_history, &mut coordinator_state, None, Some(&event_tx))
             .await?;
 
         let result = match response {
@@ -3359,6 +3330,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     query,
                     plan,
                     chat_history,
+                    &mut coordinator_state,
                     event_tx,
                     orchestration_start,
                 )
@@ -3387,6 +3359,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         query: &str,
         initial_plan: Plan,
         chat_history: Vec<rig::completion::Message>,
+        coordinator_state: &mut CoordinatorState,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
     ) -> Result<String, StreamError> {
@@ -3404,6 +3377,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     query,
                     plan,
                     &chat_history,
+                    coordinator_state,
                     previous_context.as_ref(),
                     &event_tx,
                     orchestration_start,
@@ -3442,6 +3416,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         query: &str,
         mut plan: Plan,
         chat_history: &[rig::completion::Message],
+        coordinator_state: &mut CoordinatorState,
         previous_context: Option<&IterationContext>,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
@@ -3595,11 +3570,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // build_raw_task_results ships the worker output the user already
         // paid for instead of an empty response.
         // ----------------------------------------------------------------
-        let tool_traces = if self.config.show_tool_reasoning_in_continuation() {
-            self.load_tool_traces_for_plan(&plan).await
-        } else {
-            std::collections::HashMap::new()
-        };
+        let tool_traces = self.load_tool_traces_for_plan(&plan).await;
         let post_execute_ctx = IterationContext::new(
             iteration,
             plan.clone(),
@@ -3610,7 +3581,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self
-            .plan_with_routing(query, chat_history, Some(&post_execute_ctx), Some(event_tx))
+            .plan_with_routing(query, chat_history, coordinator_state, Some(&post_execute_ctx), Some(event_tx))
             .await;
 
         let decision_latency = decision_start.elapsed().as_secs_f64();
@@ -3700,10 +3671,31 @@ Assign tasks to the worker whose tools best match the required operations."#,
             Ok((resp @ PlanningResponse::StepsPlan { .. }, _, _)) => {
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "create_plan");
-                // Budget is enforced structurally: `plan_with_routing` strips
-                // `create_plan` from the tool set on the final iteration, so
-                // reaching this arm means the budget still permits another
-                // iteration.
+
+                if iteration >= self.config.max_planning_cycles {
+                    tracing::warn!(
+                        "Coordinator chose create_plan on final iteration {} (max={}). \
+                         Returning raw task results instead of looping.",
+                        iteration,
+                        self.config.max_planning_cycles,
+                    );
+                    let raw = Self::build_raw_task_results(
+                        &plan,
+                        "Replan budget exhausted: coordinator requested another iteration but max_planning_cycles reached",
+                    );
+                    Self::emit_event(
+                        event_tx,
+                        OrchestratorEvent::IterationComplete {
+                            iteration,
+                            will_replan: false,
+                            reasoning: "Replan budget exhausted".to_string(),
+                            gaps: vec![],
+                        },
+                    )
+                    .await;
+                    self.write_run_manifest(&plan, iteration).await;
+                    return Ok(IterationOutcome::FinalResult(raw));
+                }
 
                 let routing_rationale = resp.routing_rationale().to_string();
                 let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
@@ -4123,6 +4115,7 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::types::Task;
 
     #[test]
     fn test_truncate_query_short() {
@@ -4166,371 +4159,6 @@ mod tests {
     fn test_is_context_overflow_error_not_context_error() {
         let error: Box<dyn std::error::Error + Send + Sync> = "network timeout".into();
         assert!(!is_context_overflow_error(error.as_ref()));
-    }
-
-    /// Test helper: Parse plan JSON response without needing an Orchestrator instance.
-    /// Does NOT validate worker assignments (for backward compatibility with existing tests).
-    fn parse_plan_json(response: &str, original_query: &str) -> Result<Plan, String> {
-        parse_plan_json_with_config(response, original_query, &OrchestrationConfig::default())
-    }
-
-    /// Test helper: Parse plan JSON with config for worker validation.
-    fn parse_plan_json_with_config(
-        response: &str,
-        original_query: &str,
-        config: &OrchestrationConfig,
-    ) -> Result<Plan, String> {
-        let json_str = extract_json_object(response);
-
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_str).map_err(|e| format!("JSON parse error: {}", e))?;
-
-        let goal = parsed["goal"]
-            .as_str()
-            .unwrap_or(original_query)
-            .to_string();
-
-        let mut plan = Plan::new(goal);
-
-        // Get valid worker names for validation
-        let valid_workers: std::collections::HashSet<&str> =
-            config.available_worker_names().into_iter().collect();
-
-        let tasks = parsed["tasks"].as_array().ok_or("Missing 'tasks' array")?;
-
-        for task_value in tasks {
-            let id = task_value["id"].as_u64().ok_or("Task missing 'id'")? as usize;
-            let description = task_value["description"]
-                .as_str()
-                .ok_or("Task missing 'description'")?
-                .to_string();
-
-            // Rationale is required
-            let rationale = task_value["rationale"]
-                .as_str()
-                .ok_or_else(|| format!("Task {} missing required 'rationale' field", id))?
-                .to_string();
-
-            let mut task = Task::new(id, description, rationale);
-
-            if let Some(deps) = task_value["dependencies"].as_array() {
-                for dep in deps {
-                    if let Some(dep_id) = dep.as_u64() {
-                        task = task.with_dependency(dep_id as usize);
-                    }
-                }
-            }
-
-            // Parse worker assignment (if present)
-            if let Some(worker_name) = task_value["worker"].as_str()
-                && config.has_workers()
-            {
-                if !valid_workers.contains(worker_name) {
-                    return Err(format!(
-                        "Task {} assigned to unknown worker '{}'. Valid workers: {:?}",
-                        id,
-                        worker_name,
-                        valid_workers.iter().collect::<Vec<_>>()
-                    ));
-                }
-                task = task.with_worker(worker_name);
-            }
-
-            plan.add_task(task);
-        }
-
-        if plan.tasks.is_empty() {
-            return Err("Plan has no tasks".to_string());
-        }
-
-        Ok(plan)
-    }
-
-    #[test]
-    fn test_parse_plan_simple() {
-        let response = r#"{"goal": "Calculate sum", "tasks": [{"id": 0, "description": "Add 2+2", "rationale": "Direct arithmetic operation", "dependencies": []}]}"#;
-        let plan = parse_plan_json(response, "What is 2+2?").unwrap();
-
-        assert_eq!(plan.goal, "Calculate sum");
-        assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].id, 0);
-        assert_eq!(plan.tasks[0].description, "Add 2+2");
-        assert_eq!(plan.tasks[0].rationale, "Direct arithmetic operation");
-        assert!(plan.tasks[0].dependencies.is_empty());
-    }
-
-    #[test]
-    fn test_parse_plan_with_dependencies() {
-        let response = r#"{
-            "goal": "Multi-step task",
-            "tasks": [
-                {"id": 0, "description": "First step", "rationale": "Initial data gathering", "dependencies": []},
-                {"id": 1, "description": "Second step", "rationale": "Process data from first step", "dependencies": [0]}
-            ]
-        }"#;
-        let plan = parse_plan_json(response, "complex query").unwrap();
-
-        assert_eq!(plan.tasks.len(), 2);
-        assert!(plan.tasks[0].dependencies.is_empty());
-        assert_eq!(plan.tasks[1].dependencies, vec![0]);
-        assert_eq!(plan.tasks[0].rationale, "Initial data gathering");
-        assert_eq!(plan.tasks[1].rationale, "Process data from first step");
-    }
-
-    #[test]
-    fn test_parse_plan_missing_rationale_fails() {
-        let response = r#"{"goal": "Test", "tasks": [{"id": 0, "description": "No rationale", "dependencies": []}]}"#;
-        let result = parse_plan_json(response, "test");
-
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("missing required 'rationale' field")
-        );
-    }
-
-    #[test]
-    fn test_parse_plan_with_markdown_wrapper() {
-        let response = r#"```json
-{"goal": "Test goal", "tasks": [{"id": 0, "description": "Do thing", "rationale": "Test rationale", "dependencies": []}]}
-```"#;
-        let plan = parse_plan_json(response, "test").unwrap();
-
-        assert_eq!(plan.goal, "Test goal");
-        assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].rationale, "Test rationale");
-    }
-
-    #[test]
-    fn test_parse_plan_missing_goal_uses_fallback() {
-        let response = r#"{"tasks": [{"id": 0, "description": "Task", "rationale": "Fallback rationale", "dependencies": []}]}"#;
-        let plan = parse_plan_json(response, "original query").unwrap();
-
-        assert_eq!(plan.goal, "original query");
-    }
-
-    #[test]
-    fn test_parse_plan_invalid_json() {
-        let response = "not valid json";
-        let result = parse_plan_json(response, "test");
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("JSON parse error"));
-    }
-
-    #[test]
-    fn test_parse_plan_missing_tasks() {
-        let response = r#"{"goal": "No tasks"}"#;
-        let result = parse_plan_json(response, "test");
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing 'tasks' array"));
-    }
-
-    #[test]
-    fn test_parse_plan_empty_tasks() {
-        let response = r#"{"goal": "Empty", "tasks": []}"#;
-        let result = parse_plan_json(response, "test");
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Plan has no tasks"));
-    }
-
-    #[test]
-    fn test_build_task_context_no_dependencies() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "standalone task", "no deps rationale"));
-
-        // Simulate the context building
-        let task = &plan.tasks[0];
-        assert!(task.dependencies.is_empty());
-    }
-
-    #[test]
-    fn test_build_task_context_with_results() {
-        let mut plan = Plan::new("test");
-        plan.add_task(Task::new(0, "first", "first task rationale"));
-        plan.add_task(Task::new(1, "second", "depends on first").with_dependency(0));
-        plan.get_task_mut(0).unwrap().complete("First result");
-
-        let task = &plan.tasks[1];
-        assert_eq!(task.dependencies, vec![0]);
-        assert_eq!(task.rationale, "depends on first");
-
-        let TaskState::Complete { ref result } = plan.tasks[0].state else {
-            panic!("expected Complete");
-        };
-        assert_eq!(result, "First result");
-    }
-
-    // ========================================================================
-    // Worker Assignment Tests
-    // ========================================================================
-
-    fn create_config_with_workers() -> OrchestrationConfig {
-        use super::super::config::WorkerConfig;
-        use std::collections::HashMap;
-
-        let mut workers = HashMap::new();
-        workers.insert(
-            "operations".to_string(),
-            WorkerConfig {
-                description: "For logs and pipelines".to_string(),
-                preamble: "Operations specialist.".to_string(),
-                mcp_filter: vec!["mezmo_*".to_string()],
-                vector_stores: vec![],
-                turn_depth: None,
-                llm: None,
-                scratchpad: None,
-            },
-        );
-        workers.insert(
-            "knowledge".to_string(),
-            WorkerConfig {
-                description: "For documentation".to_string(),
-                preamble: "Knowledge specialist.".to_string(),
-                mcp_filter: vec![],
-                vector_stores: vec![],
-                turn_depth: None,
-                llm: None,
-                scratchpad: None,
-            },
-        );
-
-        OrchestrationConfig {
-            enabled: true,
-            workers,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_parse_plan_with_valid_worker() {
-        let config = create_config_with_workers();
-        let response = r#"{
-            "goal": "Multi-worker task",
-            "tasks": [
-                {"id": 0, "description": "Check logs", "rationale": "Investigate log patterns", "dependencies": [], "worker": "operations"},
-                {"id": 1, "description": "Look up docs", "rationale": "Reference documentation for context", "dependencies": [0], "worker": "knowledge"}
-            ]
-        }"#;
-
-        let plan = parse_plan_json_with_config(response, "test", &config).unwrap();
-
-        assert_eq!(plan.tasks.len(), 2);
-        assert_eq!(plan.tasks[0].worker, Some("operations".to_string()));
-        assert_eq!(plan.tasks[1].worker, Some("knowledge".to_string()));
-    }
-
-    #[test]
-    fn test_parse_plan_with_invalid_worker() {
-        let config = create_config_with_workers();
-        let response = r#"{
-            "goal": "Invalid worker task",
-            "tasks": [
-                {"id": 0, "description": "Do something", "rationale": "Test rationale", "dependencies": [], "worker": "nonexistent"}
-            ]
-        }"#;
-
-        let result = parse_plan_json_with_config(response, "test", &config);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("unknown worker 'nonexistent'"));
-        assert!(err.contains("Task 0"));
-    }
-
-    #[test]
-    fn test_parse_plan_worker_ignored_when_no_workers_configured() {
-        // Default config has no workers
-        let config = OrchestrationConfig::default();
-        let response = r#"{
-            "goal": "Worker in response but no workers configured",
-            "tasks": [
-                {"id": 0, "description": "Task", "rationale": "Test rationale", "dependencies": [], "worker": "anything"}
-            ]
-        }"#;
-
-        // Should succeed and ignore the worker field
-        let plan = parse_plan_json_with_config(response, "test", &config).unwrap();
-
-        assert_eq!(plan.tasks.len(), 1);
-        // Worker should be None because workers aren't configured
-        assert!(plan.tasks[0].worker.is_none());
-    }
-
-    #[test]
-    fn test_parse_plan_mixed_worker_assignment() {
-        let config = create_config_with_workers();
-        let response = r#"{
-            "goal": "Mixed workers",
-            "tasks": [
-                {"id": 0, "description": "Assigned task", "rationale": "Ops task rationale", "dependencies": [], "worker": "operations"},
-                {"id": 1, "description": "Unassigned task", "rationale": "Follow-up rationale", "dependencies": [0]}
-            ]
-        }"#;
-
-        let plan = parse_plan_json_with_config(response, "test", &config).unwrap();
-
-        assert_eq!(plan.tasks.len(), 2);
-        assert_eq!(plan.tasks[0].worker, Some("operations".to_string()));
-        assert!(plan.tasks[1].worker.is_none());
-    }
-
-    #[test]
-    fn test_task_with_worker_builder() {
-        let task = Task::new(0, "Test task", "test rationale")
-            .with_worker("operations")
-            .with_dependency(1);
-
-        assert_eq!(task.worker, Some("operations".to_string()));
-        assert_eq!(task.dependencies, vec![1]);
-    }
-
-    // ========================================================================
-    // JSON Extraction Tests
-    // ========================================================================
-
-    #[test]
-    fn test_extract_json_objects_single() {
-        let objects = extract_json_objects(r#"{"key": "value"}"#);
-        assert_eq!(objects, vec![r#"{"key": "value"}"#]);
-    }
-
-    #[test]
-    fn test_extract_json_objects_multiple() {
-        let input = r#"{"a": 1}
-{"b": 2}"#;
-        let objects = extract_json_objects(input);
-        assert_eq!(objects, vec![r#"{"a": 1}"#, r#"{"b": 2}"#]);
-    }
-
-    #[test]
-    fn test_extract_json_objects_nested_braces() {
-        let input = r#"{"outer": {"inner": 1}}"#;
-        let objects = extract_json_objects(input);
-        assert_eq!(objects, vec![r#"{"outer": {"inner": 1}}"#]);
-    }
-
-    #[test]
-    fn test_extract_json_objects_braces_in_strings() {
-        let input = r#"{"msg": "use {braces} here"}"#;
-        let objects = extract_json_objects(input);
-        assert_eq!(objects, vec![r#"{"msg": "use {braces} here"}"#]);
-    }
-
-    #[test]
-    fn test_extract_json_objects_code_fences() {
-        let input = "```json\n{\"score\": 0.9}\n```";
-        let objects = extract_json_objects(input);
-        assert_eq!(objects, vec![r#"{"score": 0.9}"#]);
-    }
-
-    #[test]
-    fn test_extract_json_objects_empty() {
-        assert!(extract_json_objects("no json here").is_empty());
-        assert!(extract_json_objects("").is_empty());
     }
 
     // ========================================================================
@@ -5558,6 +5186,31 @@ mod tests {
     }
 
     #[test]
+    fn test_categorize_provider_not_found() {
+        // Gemini 404 — rig formats as "Invalid status code 404 Not Found with message: ..."
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 404 Not Found with message: models/gemini-3.1-pro is not found"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        // Bedrock invalid model identifier
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: The provided model identifier is invalid."
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        // Gemini "not found for API version" variant
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "models/foo is not found for API version v1beta"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+    }
+
+    #[test]
     fn test_categorize_failure_context_overflow_token_patterns() {
         assert_eq!(
             Orchestrator::categorize_failure_error("token limit reached"),
@@ -5595,10 +5248,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_short_circuit_both_provider_categories() {
+    fn test_should_short_circuit_all_provider_categories() {
         let failures = vec![
             make_failure("Rate limit exceeded"),
             make_failure("Authentication failed"),
+            make_failure("CompletionError: ProviderError: Invalid status code 404 Not Found"),
         ];
         assert!(Orchestrator::should_short_circuit_provider_errors(
             &failures, 0

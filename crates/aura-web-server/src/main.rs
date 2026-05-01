@@ -97,8 +97,9 @@ struct Args {
     /// Maximum time to wait for the first chunk from the LLM provider before
     /// treating the connection as hung. Protects against non-streaming error
     /// responses that leave the connection open. Set to 0 to disable.
-    /// Default: 30 seconds (much shorter than the full streaming timeout).
-    #[arg(long, env = "FIRST_CHUNK_TIMEOUT_SECS", default_value = "30")]
+    /// Default: 90 seconds. Allows for slower providers (Gemini, local
+    /// models) and extended-thinking warm-up time.
+    #[arg(long, env = "FIRST_CHUNK_TIMEOUT_SECS", default_value = "90")]
     first_chunk_timeout_secs: u64,
 
     /// Graceful shutdown timeout in seconds.

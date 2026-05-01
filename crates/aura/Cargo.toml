@@ -51,6 +51,7 @@ uuid = { workspace = true }
 
 regex = "1"
 async-stream = "0.3"
+strum = { workspace = true }
 
 # Tokenization for scratchpad context budget
 tiktoken-rs = "0.9.1"
