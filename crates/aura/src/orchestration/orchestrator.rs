@@ -4938,6 +4938,7 @@ mod tests {
         let output = tool
             .call(super::super::tools::read_artifact::ReadArtifactArgs {
                 filename: "task-0-research-iter-1-result.txt".to_string(),
+                run_id: None,
             })
             .await
             .unwrap();
@@ -5006,6 +5007,7 @@ mod tests {
             let output = tool
                 .call(super::super::tools::read_artifact::ReadArtifactArgs {
                     filename: name.to_string(),
+                    run_id: None,
                 })
                 .await
                 .unwrap();

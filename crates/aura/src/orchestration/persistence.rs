@@ -599,6 +599,64 @@ impl ExecutionPersistence {
         fs::read_to_string(&artifact_path).await
     }
 
+    /// Read an artifact from a different run in the same session.
+    ///
+    /// Resolves against `{session_dir}/{run_id}/artifacts/{filename}` where
+    /// `session_dir` is the parent of the current run directory. Both `run_id`
+    /// and `filename` are validated to prevent path traversal.
+    pub async fn read_artifact_cross_run(
+        &self,
+        filename: &str,
+        run_id: &str,
+    ) -> io::Result<String> {
+        if !self.enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Persistence is disabled",
+            ));
+        }
+
+        fn is_safe_component(s: &str) -> bool {
+            !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+        }
+
+        if !is_safe_component(run_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid run_id for cross-run artifact read",
+            ));
+        }
+        if !is_safe_component(filename) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid artifact filename",
+            ));
+        }
+
+        let session_dir = self
+            .base_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No parent directory"))?;
+
+        let artifact_path = session_dir.join(run_id).join("artifacts").join(filename);
+
+        // Defense-in-depth: resolved path must be under the session directory
+        let canonical_session = session_dir
+            .canonicalize()
+            .unwrap_or_else(|_| session_dir.to_path_buf());
+        let canonical_artifact = artifact_path
+            .canonicalize()
+            .map_err(|e| io::Error::new(e.kind(), format!("Artifact not found: {e}")))?;
+        if !canonical_artifact.starts_with(&canonical_session) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cross-run artifact path escapes session directory",
+            ));
+        }
+
+        fs::read_to_string(&artifact_path).await
+    }
+
     /// List all artifact filenames.
     pub async fn list_artifacts(&self) -> io::Result<Vec<String>> {
         if !self.enabled {
@@ -1075,6 +1133,51 @@ mod tests {
         for bad_name in &["../secret.txt", "foo/bar.txt", "..\\secret", ""] {
             let result = persistence.read_artifact(bad_name).await;
             assert!(result.is_err(), "Should reject: {:?}", bad_name);
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_cross_run_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let memory_dir = temp_dir.path().join("memory");
+        let session_id = "session_xrun".to_string();
+
+        // Create run A and write an artifact
+        let run_a = ExecutionPersistence::new(&memory_dir, Some(session_id.clone()))
+            .await
+            .unwrap();
+        let run_a_id = run_a.run_id().to_string();
+        run_a
+            .write_result_artifact(0, Some("sre"), 1, "prior run content")
+            .await
+            .unwrap();
+
+        // Create run B
+        let run_b = ExecutionPersistence::new(&memory_dir, Some(session_id))
+            .await
+            .unwrap();
+
+        // Read run A's artifact from run B
+        let content = run_b
+            .read_artifact_cross_run("task-0-sre-iter-1-result.txt", &run_a_id)
+            .await
+            .unwrap();
+        assert_eq!(content, "prior run content");
+    }
+
+    #[tokio::test]
+    async fn test_read_artifact_cross_run_invalid_run_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        for bad_id in &["../escape", "foo/bar", "..\\win", ""] {
+            let result = persistence
+                .read_artifact_cross_run("task-0-default-iter-1-result.txt", bad_id)
+                .await;
+            assert!(result.is_err(), "Should reject run_id: {:?}", bad_id);
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
         }
     }
