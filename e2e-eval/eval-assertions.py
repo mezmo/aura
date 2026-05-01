@@ -248,6 +248,73 @@ BUILTIN_ASSERTIONS_SRE_SCRATCHPAD = {
 }
 
 
+# ── Hard SRE assertions (needle-in-haystack + category survival) ─────
+
+BUILTIN_ASSERTIONS_SRE_HARD = {
+    "probe-paths": {
+        # Requires digging into containers[].readinessProbe.httpGet.path
+        # inside full workload objects (~14K tokens for production).
+        "answer_contains": [
+            "/actuator/health",
+            "/healthz",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 500,
+    },
+    "restart-investigation": {
+        # Cross-domain: prometheus restart counts + alertmanager alerts.
+        # notification-service has 7 restarts, payment-service-staging has 12.
+        "answer_contains": [
+            "notification-service",
+            "PodCrashLoopBackOff",
+        ],
+        "scratchpad_intercepted": True,
+    },
+    "security-audit": {
+        # Deep nested: securityContext + env[].valueFrom.secretKeyRef.
+        # payment-service has readOnlyRootFilesystem=true and STRIPE_API_KEY secret.
+        "answer_contains": [
+            "readOnlyRootFilesystem",
+            "STRIPE_API_KEY",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 1000,
+    },
+    "multi-category-findings": {
+        # Category survival test inspired by Tony's 2026-04-14 evidence.
+        # 6+ categories must survive through orchestration + synthesis.
+        "answer_contains": [
+            "HighErrorRate",
+            "CertExpiringSoon",
+            "PodCrashLoopBackOff",
+            "RabbitMQQueueDepth",
+            "PostgresReplicationLag",
+        ],
+        "category_markers": [
+            "HighErrorRate",
+            "CertExpiringSoon",
+            "NodeDiskPressure",
+            "PodCrashLoopBackOff",
+            "RabbitMQQueueDepth",
+            "PostgresReplicationLag",
+            "HighMemoryUsage",
+            "HighLatencyP99",
+            "PodRestartLoop",
+        ],
+        "category_min": 6,
+    },
+    "sidecar-infrastructure": {
+        # Sidecar containers are in sidecarContainers[] — never in summaries.
+        "answer_contains": [
+            "istio-proxy",
+            "log-forwarder",
+        ],
+        "scratchpad_intercepted": True,
+        "scratchpad_extracted_min": 500,
+    },
+}
+
+
 @dataclass
 class AssertionResult:
     """Result of a single assertion check."""
@@ -408,6 +475,20 @@ def check_scratchpad_extracted_min(
     return AssertionResult(prompt, "scratchpad_extracted_min", passed, detail)
 
 
+def check_category_count(
+    prompt: str, parsed: dict, markers: list[str], min_count: int,
+) -> AssertionResult:
+    """Assert that at least N distinct category markers appear in the answer."""
+    answer = parsed.get("answer_text", "")
+    found = [m for m in markers if m in answer]
+    passed = len(found) >= min_count
+    detail = f"found {len(found)}/{len(markers)} categories: {', '.join(found) if found else '(none)'}"
+    if not passed:
+        missing = [m for m in markers if m not in answer]
+        detail += f" (missing: {', '.join(missing[:5])})"
+    return AssertionResult(prompt, "category_count", passed, detail)
+
+
 def check_completed(prompt: str, parsed: dict) -> AssertionResult:
     """Assert that the response completed (finish_reason: stop)."""
     passed = parsed.get("completed", False)
@@ -458,6 +539,14 @@ def run_assertions(
     if "scratchpad_extracted_min" in assertion_spec:
         results.append(check_scratchpad_extracted_min(
             prompt, parsed, assertion_spec["scratchpad_extracted_min"],
+        ))
+
+    # Category count (for multi-category-findings prompts)
+    if "category_markers" in assertion_spec and "category_min" in assertion_spec:
+        results.append(check_category_count(
+            prompt, parsed,
+            assertion_spec["category_markers"],
+            assertion_spec["category_min"],
         ))
 
     return results
@@ -528,9 +617,14 @@ def detect_prompt_set(prompt_labels: set[str]) -> str:
     if any(label.startswith("sp-") for label in prompt_labels):
         return "scratchpad"
 
+    sre_hard_labels = set(BUILTIN_ASSERTIONS_SRE_HARD.keys())
     sre_labels = set(BUILTIN_ASSERTIONS_SRE.keys())
     independent_labels = set(BUILTIN_ASSERTIONS.keys())
     dependent_labels = set(BUILTIN_ASSERTIONS_DEPENDENT.keys())
+
+    sre_hard_overlap = prompt_labels & sre_hard_labels
+    if len(sre_hard_overlap) >= 2:
+        return "sre-hard"
 
     independent_overlap = prompt_labels & independent_labels
     dependent_overlap = prompt_labels & dependent_labels
@@ -565,7 +659,7 @@ def main():
     )
     parser.add_argument(
         "--prompt-set",
-        choices=["independent", "dependent", "scratchpad", "sre", "sre-scratchpad", "auto"],
+        choices=["independent", "dependent", "scratchpad", "sre", "sre-scratchpad", "sre-hard", "auto"],
         default="auto",
         help="Which built-in assertion set to use (default: auto-detect)",
     )
@@ -597,6 +691,8 @@ def main():
 
         if prompt_set == "scratchpad":
             assertions = BUILTIN_ASSERTIONS_SCRATCHPAD
+        elif prompt_set == "sre-hard":
+            assertions = BUILTIN_ASSERTIONS_SRE_HARD
         elif prompt_set == "sre-scratchpad":
             assertions = BUILTIN_ASSERTIONS_SRE_SCRATCHPAD
         elif prompt_set == "sre":

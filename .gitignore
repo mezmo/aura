@@ -103,6 +103,7 @@ configs/example-cluster-orchestrator.toml
 e2e-eval/results-*/
 e2e-eval/session-results-*/
 e2e-eval/sre-results-*/
+e2e-eval/sre-hard-results-*/
 e2e-eval/baselines/
 e2e-eval/eval-*.json
 e2e-eval/*.log
