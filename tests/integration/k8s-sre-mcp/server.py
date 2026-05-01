@@ -345,6 +345,8 @@ def k8s_list_namespaces() -> str:
 def k8s_list_workloads(namespace: str) -> str:
     """List workloads (Deployments, StatefulSets) in a namespace with summary info."""
     workloads = WORKLOADS.get(namespace, [])
+    if VERBOSE_MODE:
+        return json.dumps({"namespace": namespace, "workloads": workloads})
     summary = []
     for w in workloads:
         metrics_ports = []
