@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
+    /// Coordinator answered directly without task execution.
+    DirectAnswer,
     /// Coordinator classified query to a single worker.
     Routed,
     /// Full orchestration — multi-task DAG execution.

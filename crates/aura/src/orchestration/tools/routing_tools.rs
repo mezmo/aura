@@ -68,6 +68,9 @@ pub struct RespondDirectlyArgs {
     pub response: String,
     /// Why this query can be answered directly.
     pub routing_rationale: String,
+    /// Short summary of the response for session history (1-2 sentences).
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +108,10 @@ impl Tool for RespondDirectlyTool {
                     "routing_rationale": {
                         "type": "string",
                         "description": "Brief explanation of why this query can be answered directly"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "1-2 sentence summary of your response for session history. Provide when the response is longer than a few sentences."
                     }
                 },
                 "required": ["response", "routing_rationale"]
@@ -122,6 +129,7 @@ impl Tool for RespondDirectlyTool {
         *guard = Some(PlanningResponse::Direct {
             response: args.response,
             routing_rationale: args.routing_rationale,
+            response_summary: args.summary,
         });
         Ok(RespondDirectlyOutput {
             status: "Direct response recorded.".to_string(),
@@ -372,6 +380,7 @@ mod tests {
             .call(RespondDirectlyArgs {
                 response: "42".to_string(),
                 routing_rationale: "Simple arithmetic".to_string(),
+                summary: None,
             })
             .await
             .unwrap();
@@ -383,6 +392,7 @@ mod tests {
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
+                ..
             } => {
                 assert_eq!(response, "42");
                 assert_eq!(routing_rationale, "Simple arithmetic");
@@ -467,6 +477,7 @@ mod tests {
             .call(RespondDirectlyArgs {
                 response: "First".to_string(),
                 routing_rationale: "Test".to_string(),
+                summary: None,
             })
             .await
             .unwrap();

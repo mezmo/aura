@@ -1376,6 +1376,7 @@ impl Orchestrator {
             PlanningResponse::Direct {
                 response: answer,
                 routing_rationale,
+                ..
             } if !allow_direct_answers => {
                 tracing::info!(
                     "Config override: converting direct answer to orchestrated plan (allow_direct_answers=false)"
@@ -3051,6 +3052,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
+                response_summary,
             } => {
                 span.record("orchestration.routing", "direct");
                 Self::emit_event(
@@ -3059,6 +3061,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         response: response.clone(),
                         routing_rationale,
                     },
+                )
+                .await;
+                self.write_direct_response_manifest(
+                    query,
+                    &response,
+                    response_summary.as_deref(),
                 )
                 .await;
                 Ok(response)
@@ -3359,6 +3367,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 PlanningResponse::Direct {
                     response,
                     routing_rationale,
+                    response_summary,
                 },
                 _,
                 _,
@@ -3389,7 +3398,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest(&plan, iteration).await;
+                self.write_run_manifest_with_summary(
+                    &plan,
+                    iteration,
+                    response_summary,
+                )
+                .await;
                 Ok(IterationOutcome::FinalResult(response))
             }
             Ok((
@@ -3581,7 +3595,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
-    async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
+    async fn write_run_manifest(
+        &self,
+        plan: &Plan,
+        iterations: usize,
+    ) {
+        self.write_run_manifest_with_summary(plan, iterations, None)
+            .await;
+    }
+
+    async fn write_run_manifest_with_summary(
+        &self,
+        plan: &Plan,
+        iterations: usize,
+        response_summary: Option<String>,
+    ) {
         use super::persistence::{
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary,
             ToolOutcome, ToolTraceEntry,
@@ -3693,6 +3721,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let artifact_paths = artifacts_meta.into_iter().map(|(name, _)| name).collect();
 
+        let completed = plan.completed_count();
+        let total = plan.tasks.len();
+        let outcome = if total == 0 {
+            None
+        } else if all_complete {
+            Some(format!("{total}/{total} tasks completed"))
+        } else {
+            Some(format!("{completed}/{total} tasks completed"))
+        };
+
         let manifest = RunManifest {
             run_id: persistence.run_id().to_string(),
             session_id: persistence.session_id().map(|s| s.to_string()),
@@ -3701,12 +3739,50 @@ Assign tasks to the worker whose tools best match the required operations."#,
             status,
             iterations,
             routing_mode: Some(super::events::RoutingMode::for_plan(plan.tasks.len())),
+            outcome,
+            response_summary,
             task_summaries,
             artifact_paths,
         };
 
         if let Err(e) = persistence.write_manifest(&manifest).await {
             tracing::warn!("Failed to write run manifest: {}", e);
+        }
+    }
+
+    async fn write_direct_response_manifest(
+        &self,
+        query: &str,
+        response: &str,
+        summary: Option<&str>,
+    ) {
+        use super::persistence::{RunManifest, RunStatus};
+        use crate::string_utils::safe_truncate;
+
+        let persistence = self.persistence.lock().await;
+
+        let response_summary = Some(
+            summary
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| safe_truncate(response, 200).0.to_string()),
+        );
+
+        let manifest = RunManifest {
+            run_id: persistence.run_id().to_string(),
+            session_id: persistence.session_id().map(|s| s.to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            goal: query.to_string(),
+            status: RunStatus::Success,
+            iterations: 0,
+            routing_mode: Some(super::events::RoutingMode::DirectAnswer),
+            outcome: Some("Answered directly".to_string()),
+            response_summary,
+            task_summaries: vec![],
+            artifact_paths: vec![],
+        };
+
+        if let Err(e) = persistence.write_manifest(&manifest).await {
+            tracing::warn!("Failed to write direct response manifest: {}", e);
         }
     }
 }
@@ -4499,6 +4575,7 @@ mod tests {
         let response = PlanningResponse::Direct {
             response: "42".to_string(),
             routing_rationale: "Simple math".to_string(),
+            response_summary: None,
         };
         assert!(response.into_plan().is_none());
     }
@@ -4556,6 +4633,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "42".to_string(),
             routing_rationale: "trivial".to_string(),
+            response_summary: None,
         };
         let out = Orchestrator::enforce_routing_config(direct, "what is 6*7?", true, true);
         assert!(matches!(out, PlanningResponse::Direct { .. }));
@@ -4576,6 +4654,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "the meaning of life is 42".to_string(),
             routing_rationale: "trivial answer".to_string(),
+            response_summary: None,
         };
         let out = Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
 
@@ -4680,6 +4759,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "hello".to_string(),
             routing_rationale: "greeting".to_string(),
+            response_summary: None,
         };
         let json = serde_json::to_string(&direct).unwrap();
         let parsed: PlanningResponse = serde_json::from_str(&json).unwrap();

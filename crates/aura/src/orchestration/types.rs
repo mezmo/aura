@@ -538,6 +538,8 @@ pub enum PlanningResponse {
     Direct {
         response: String,
         routing_rationale: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_summary: Option<String>,
     },
     /// The query requires orchestration, expressed as ordered steps.
     ///
@@ -1774,6 +1776,7 @@ mod tests {
         let response = PlanningResponse::Direct {
             response: "The answer is 42.".to_string(),
             routing_rationale: "Simple arithmetic".to_string(),
+            response_summary: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"response_type\":\"direct\""));
@@ -1784,6 +1787,7 @@ mod tests {
             PlanningResponse::Direct {
                 response,
                 routing_rationale,
+                ..
             } => {
                 assert_eq!(response, "The answer is 42.");
                 assert_eq!(routing_rationale, "Simple arithmetic");
@@ -1839,6 +1843,7 @@ mod tests {
         let response = PlanningResponse::Direct {
             response: "42".to_string(),
             routing_rationale: "Simple".to_string(),
+            response_summary: None,
         };
         assert!(response.into_plan().is_none());
     }
@@ -1858,6 +1863,7 @@ mod tests {
         let direct = PlanningResponse::Direct {
             response: "x".to_string(),
             routing_rationale: "reason_d".to_string(),
+            response_summary: None,
         };
         assert_eq!(direct.routing_rationale(), "reason_d");
 

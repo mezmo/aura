@@ -94,6 +94,12 @@ pub struct RunManifest {
     /// How the coordinator routed this query.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_mode: Option<RoutingMode>,
+    /// Human-readable outcome description (e.g. "Answered directly", "3/4 tasks completed").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Coordinator's summary of the final response (from respond_directly or synthesis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_summary: Option<String>,
     /// Summary of each task in the plan.
     pub task_summaries: Vec<TaskSummary>,
     /// Relative paths to large artifact files.
@@ -1084,6 +1090,8 @@ mod tests {
             status: RunStatus::Success,
             iterations: 2,
             routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![
                 TaskSummary {
                     task_id: 0,
@@ -1146,6 +1154,8 @@ mod tests {
             status: RunStatus::PartialSuccess,
             iterations: 1,
             routing_mode: Some(RoutingMode::Routed),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![],
             artifact_paths: vec![],
         };
@@ -1171,6 +1181,8 @@ mod tests {
             status: RunStatus::Failed,
             iterations: 0,
             routing_mode: None,
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![],
             artifact_paths: vec![],
         };
@@ -1204,6 +1216,8 @@ mod tests {
             status: RunStatus::Success,
             iterations: 1,
             routing_mode: Some(RoutingMode::Routed),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![TaskSummary {
                 task_id: 0,
                 description: "Compute mean".to_string(),
@@ -1412,6 +1426,8 @@ mod tests {
             status: RunStatus::Failed,
             iterations: 1,
             routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: None,
+            response_summary: None,
             task_summaries: vec![TaskSummary {
                 task_id: 0,
                 description: "Bad task".to_string(),
@@ -1622,6 +1638,8 @@ mod tests {
         assert!(ts.artifacts.is_empty());
         assert!(ts.failure_category.is_none());
         assert!(ts.confidence.is_none());
+        assert!(manifest.outcome.is_none());
+        assert!(manifest.response_summary.is_none());
     }
 
     #[test]
@@ -1636,6 +1654,8 @@ mod tests {
             status: RunStatus::PartialSuccess,
             iterations: 2,
             routing_mode: Some(RoutingMode::Orchestrated),
+            outcome: Some("1/2 tasks completed".to_string()),
+            response_summary: None,
             task_summaries: vec![
                 TaskSummary {
                     task_id: 0,
