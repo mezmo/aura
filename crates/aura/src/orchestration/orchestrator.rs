@@ -370,14 +370,25 @@ pub struct Orchestrator {
     pub(super) usage_state: crate::UsageState,
 }
 
-/// Worker identity for reasoning attribution in `stream_and_forward`.
+/// Stream context for reasoning attribution in `stream_and_forward`.
 ///
 /// When `Some`, reasoning items are wrapped as `OrchestratorEvent::WorkerReasoning`
 /// with proper task/worker attribution. When `None`, reasoning is forwarded raw
 /// (coordinator context — attributed as `agent_id: "main"` by handlers).
-struct WorkerIdentity<'a> {
+struct StreamContext<'a> {
     task_id: usize,
-    worker_name: &'a str,
+    worker_id: &'a str,
+}
+
+/// Shared parameters for streaming LLM calls (`stream_and_forward` / `stream_and_collect`).
+///
+/// Groups the per-call prompt payload and event routing — the data that every streaming
+/// variant needs regardless of ReAct depth or reasoning attribution mode.
+struct StreamCallParams<'a> {
+    prompt: &'a str,
+    history: Vec<rig::completion::Message>,
+    phase: &'a str,
+    event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
 }
 
 impl Orchestrator {
@@ -726,17 +737,16 @@ impl Orchestrator {
     async fn stream_and_forward(
         &self,
         agent: &Agent,
-        prompt: &str,
-        history: Vec<rig::completion::Message>,
-        phase: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-        worker: Option<WorkerIdentity<'_>>,
+        params: StreamCallParams<'_>,
+        stream_context: Option<StreamContext<'_>>,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
-        use crate::provider_agent::{CompletionResponse, StreamedAssistantContent};
+        use crate::provider_agent::{CompletionResponse, StreamedAssistantContent, StreamedUserContent};
         use futures::StreamExt;
         use rig::completion::Usage;
 
+        let StreamCallParams { prompt, history, phase, event_tx } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let mut stream = agent.stream_chat(prompt, history).await;
@@ -756,12 +766,12 @@ impl Orchestrator {
                         StreamedAssistantContent::ReasoningDelta { delta, .. },
                     )) => {
                         if let Some(tx) = event_tx {
-                            if let Some(ref w) = worker {
+                            if let Some(ref ctx) = stream_context {
                                 let _ = tx
                                     .send(Ok(StreamItem::OrchestratorEvent(
                                         OrchestratorEvent::WorkerReasoning {
-                                            task_id: w.task_id,
-                                            worker_id: w.worker_name.to_string(),
+                                            task_id: ctx.task_id,
+                                            worker_id: ctx.worker_id.to_string(),
                                             content: delta,
                                         },
                                     )))
@@ -796,7 +806,24 @@ impl Orchestrator {
                         usage.total_tokens += turn.total_tokens;
                     }
                     Err(e) => return Err(e),
-                    _ => {} // ToolCall, ToolCallDelta, ToolResult — rig handles execution
+                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                        tracing::debug!(
+                            "{}: tool result received (id={}, call_id={})",
+                            phase,
+                            tr.id,
+                            tr.call_id.as_deref().unwrap_or("-")
+                        );
+                        if decision_ready().await {
+                            tracing::debug!("{}: decision captured, reading turn usage", phase);
+                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
+                                usage.input_tokens += turn.input_tokens;
+                                usage.output_tokens += turn.output_tokens;
+                                usage.total_tokens += turn.total_tokens;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {} // ToolCall, ToolCallDelta — rig handles execution
                 }
             }
 
@@ -841,10 +868,7 @@ impl Orchestrator {
     async fn stream_and_collect(
         &self,
         agent: &Agent,
-        prompt: &str,
-        history: Vec<rig::completion::Message>,
-        phase: &str,
-        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        params: StreamCallParams<'_>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
@@ -854,6 +878,7 @@ impl Orchestrator {
         use futures::StreamExt;
         use rig::completion::Usage;
 
+        let StreamCallParams { prompt, history, phase, event_tx } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let mut stream = agent.stream_chat_with_depth(prompt, history, 1).await;
@@ -1120,10 +1145,12 @@ impl Orchestrator {
             let response = match self
                 .stream_and_collect(
                     &coordinator,
-                    &planning_prompt,
-                    chat_history.to_vec(),
-                    "Planning",
-                    event_tx,
+                    StreamCallParams {
+                        prompt: &planning_prompt,
+                        history: chat_history.to_vec(),
+                        phase: "Planning",
+                        event_tx,
+                    },
                     || {
                         let rd = rd.clone();
                         Box::pin(async move { rd.lock().await.is_some() })
@@ -2701,17 +2728,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
         );
 
         // Execute the task (workers get context from the task prompt, not conversation history)
+        let srd = submit_result_decision.clone();
         let result = self
             .stream_and_forward(
                 &worker,
-                &worker_prompt,
-                vec![],
-                "Worker task",
-                event_tx,
-                worker_name.map(|name| WorkerIdentity {
+                StreamCallParams {
+                    prompt: &worker_prompt,
+                    history: vec![],
+                    phase: "Worker task",
+                    event_tx,
+                },
+                worker_name.map(|name| StreamContext {
                     task_id,
-                    worker_name: name,
+                    worker_id: name,
                 }),
+                || {
+                    let srd = srd.clone();
+                    Box::pin(async move { srd.lock().await.is_some() })
+                },
             )
             .await;
         let duration_ms = start_time.elapsed().as_millis() as u64;
