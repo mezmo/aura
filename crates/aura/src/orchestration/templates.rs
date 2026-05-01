@@ -455,7 +455,8 @@ Do not try to compute results yourself — delegate to workers.";
             "PHASE: COORDINATOR SYSTEM PROMPT (routing / continuation)"
         );
         let _ = writeln!(out, "{separator}\n");
-        let coordinator_preamble = config.build_coordinator_preamble(agent_system_prompt, true, false);
+        let coordinator_preamble =
+            config.build_coordinator_preamble(agent_system_prompt, true, false);
         let _ = writeln!(out, "{coordinator_preamble}");
 
         // ================================================================

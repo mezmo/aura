@@ -190,3 +190,4 @@ make lint           # Run clippy + fmt check
 - `docs/request-lifecycle.md` - Request flow, lifecycle, timeout, cancellation, and shutdown
 - `docs/rig-tool-execution-order.md` - Tool execution order analysis
 - `docs/rig-fork-changes.md` - Rig fork changes and rationale
+- `docs/orchestration-tickets.md` - Epic ticket table, dependency graph, research references, implementation plan

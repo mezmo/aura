@@ -18,9 +18,9 @@ use async_trait::async_trait;
 use rig::tool::ToolError;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use super::persistence::{ExecutionPersistence, ToolCallRecord};
@@ -218,10 +218,7 @@ impl ToolWrapper for PersistenceWrapper {
             task_id, worker, self.iteration, tool, call_idx
         );
 
-        let footer = format!(
-            "\n\n[Tool output saved to artifact: {}]",
-            filename
-        );
+        let footer = format!("\n\n[Tool output saved to artifact: {}]", filename);
         TransformOutputResult::new(format!("{}{}", output, footer))
     }
 
@@ -270,7 +267,11 @@ impl ToolWrapper for PersistenceWrapper {
             .rfind("\n\n[Tool output saved to artifact: ")
             .map(|pos| &output_text[..pos])
             .unwrap_or(output_text);
-        let should_promote = match (output_clean.len(), self.size_threshold, self.duration_threshold_ms) {
+        let should_promote = match (
+            output_clean.len(),
+            self.size_threshold,
+            self.duration_threshold_ms,
+        ) {
             (_, 0, _) => true,
             (len, thresh, _) if len > thresh => true,
             (_, _, 0) => false,
@@ -1051,8 +1052,11 @@ mod tests {
         let outcome = CallOutcome::Success(String::new());
         let long_output = "x".repeat(20);
 
-        let result = wrapper.transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted));
-        assert!(result.output.contains("[Tool output saved to artifact: task-0-sre-iter-2-log-search-0-output.txt]"));
+        let result =
+            wrapper.transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted));
+        assert!(result.output.contains(
+            "[Tool output saved to artifact: task-0-sre-iter-2-log-search-0-output.txt]"
+        ));
         assert!(result.output.starts_with(&long_output));
     }
 
@@ -1064,7 +1068,8 @@ mod tests {
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result = wrapper.transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted));
+        let result =
+            wrapper.transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted));
         assert_eq!(result.output, "short output");
         assert!(!result.output.contains("[Tool output saved to artifact"));
     }
@@ -1078,7 +1083,9 @@ mod tests {
         let outcome = CallOutcome::Success(String::new());
 
         let result = wrapper.transform_output("tiny".to_string(), &outcome, &ctx, Some(&extracted));
-        assert!(result.output.contains("[Tool output saved to artifact: task-3-default-iter-1-my-tool-0-output.txt]"));
+        assert!(result.output.contains(
+            "[Tool output saved to artifact: task-3-default-iter-1-my-tool-0-output.txt]"
+        ));
     }
 
     #[test]
@@ -1102,19 +1109,25 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        let wrapper = enabled_wrapper(persistence.clone(), Some("research".to_string()), 10, 5000).await;
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("research".to_string()), 10, 5000).await;
 
         let ctx = ToolCallContext::new("kb_search").with_task_context(0, "research".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
         let long_output = "x".repeat(50);
 
-        wrapper.on_complete(&ctx, Some(&extracted), Ok(&long_output), 100).await;
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok(&long_output), 100)
+            .await;
 
         let p = persistence.lock().await;
         let artifacts = p.list_artifacts().await.unwrap();
         assert!(artifacts.contains(&"task-0-research-iter-1-kb-search-0-output.txt".to_string()));
 
-        let content = p.read_artifact("task-0-research-iter-1-kb-search-0-output.txt").await.unwrap();
+        let content = p
+            .read_artifact("task-0-research-iter-1-kb-search-0-output.txt")
+            .await
+            .unwrap();
         assert_eq!(content.len(), 50);
     }
 
@@ -1131,7 +1144,9 @@ mod tests {
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
-        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 200).await;
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok("short"), 200)
+            .await;
 
         let p = persistence.lock().await;
         let artifacts = p.list_artifacts().await.unwrap();
@@ -1146,12 +1161,15 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        let wrapper = enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
 
         let ctx = ToolCallContext::new("simple_tool").with_task_context(0, "worker".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
-        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 100).await;
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok("short"), 100)
+            .await;
 
         let p = persistence.lock().await;
         let artifacts = p.list_artifacts().await.unwrap();
@@ -1166,12 +1184,15 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        let wrapper = enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 0).await;
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 0).await;
 
         let ctx = ToolCallContext::new("slow_tool").with_task_context(0, "worker".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
-        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 999999).await;
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok("short"), 999999)
+            .await;
 
         let p = persistence.lock().await;
         let artifacts = p.list_artifacts().await.unwrap();
@@ -1207,8 +1228,13 @@ mod tests {
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result = wrapper.transform_output("output".to_string(), &outcome, &ctx, Some(&extracted));
-        assert!(result.output.contains("task-0-sre-ops-worker-iter-1-my-search-tool-0-output.txt"));
+        let result =
+            wrapper.transform_output("output".to_string(), &outcome, &ctx, Some(&extracted));
+        assert!(
+            result
+                .output
+                .contains("task-0-sre-ops-worker-iter-1-my-search-tool-0-output.txt")
+        );
     }
 
     #[test]
@@ -1219,7 +1245,12 @@ mod tests {
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result = wrapper.transform_output("big output here".to_string(), &outcome, &ctx, Some(&extracted));
+        let result = wrapper.transform_output(
+            "big output here".to_string(),
+            &outcome,
+            &ctx,
+            Some(&extracted),
+        );
         assert_eq!(result.output, "big output here");
         assert!(!result.output.contains("[Tool output saved to artifact"));
     }
@@ -1232,12 +1263,15 @@ mod tests {
                 .await
                 .unwrap(),
         ));
-        let wrapper = enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
+        let wrapper =
+            enabled_wrapper(persistence.clone(), Some("worker".to_string()), 500, 5000).await;
 
         let ctx = ToolCallContext::new("simple_tool").with_task_context(0, "worker".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
 
-        wrapper.on_complete(&ctx, Some(&extracted), Ok("short"), 100).await;
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok("short"), 100)
+            .await;
 
         let p = persistence.lock().await;
         let iter_path = p.run_path().join("iteration-1");
@@ -1262,7 +1296,9 @@ mod tests {
         let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
         let long_output = "x".repeat(50);
 
-        wrapper.on_complete(&ctx, Some(&extracted), Ok(&long_output), 100).await;
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok(&long_output), 100)
+            .await;
 
         let p = persistence.lock().await;
         let iter_path = p.run_path().join("iteration-1");

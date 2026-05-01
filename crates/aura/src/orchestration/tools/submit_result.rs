@@ -111,10 +111,7 @@ impl Tool for SubmitResultTool {
         }
     }
 
-    async fn call(
-        &self,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let mut guard = self.decision.lock().await;
         if guard.is_some() {
             return Ok(SubmitResultToolOutput {

@@ -32,8 +32,8 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::Notify;
@@ -217,6 +217,26 @@ pub struct ToolCallRecord {
     /// Artifact filename if tool output was promoted to an artifact file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_filename: Option<String>,
+}
+
+impl From<&ToolCallRecord> for ToolTraceEntry {
+    fn from(r: &ToolCallRecord) -> Self {
+        Self {
+            tool: r.tool.clone(),
+            reasoning: r.reasoning.clone(),
+            duration_ms: r.duration_ms,
+            outcome: if let Some(ref err) = r.error {
+                ToolOutcome::Error {
+                    message: err.clone(),
+                }
+            } else {
+                ToolOutcome::Success {
+                    output_bytes: r.output.as_ref().map(|o| o.len() as u64).unwrap_or(0),
+                }
+            },
+            artifact_filename: r.artifact_filename.clone(),
+        }
+    }
 }
 
 /// Summary of a worker's execution for a task.
@@ -706,10 +726,7 @@ impl ExecutionPersistence {
     ///
     /// Scans `iteration-*/task-{task_id}.attempt-*.tool-calls.json` under the
     /// run directory. Returns an empty vec on file-not-found (graceful for old runs).
-    pub async fn load_tool_records_for_task(
-        &self,
-        task_id: usize,
-    ) -> Vec<ToolCallRecord> {
+    pub async fn load_tool_records_for_task(&self, task_id: usize) -> Vec<ToolCallRecord> {
         if !self.enabled {
             return Vec::new();
         }
@@ -986,10 +1003,13 @@ fn render_task_summary(task: &TaskSummary, out: &mut String) {
             if let Some(error) = &task.error {
                 out.push_str(&format!("    Error: {}\n", error));
             }
-            if let Some(ctx) = &task.error_context
-                && let Some(partial) = &ctx.partial_result
-            {
-                out.push_str(&format!("    Partial progress: {}\n", partial));
+            if let Some(ctx) = &task.error_context {
+                if let Some(tool) = &ctx.last_tool_call {
+                    out.push_str(&format!("    Last tool: {}\n", tool));
+                }
+                if let Some(partial) = &ctx.partial_result {
+                    out.push_str(&format!("    Partial progress: {}\n", partial));
+                }
             }
         }
         _ => {
@@ -1785,10 +1805,9 @@ mod tests {
 
         assert!(result.contains("FAILED (agent_timeout)"));
         assert!(result.contains("Error: Timed out after 30s"));
+        assert!(result.contains("Last tool: execute_sql"));
         assert!(result.contains("Partial progress: Retrieved 50 of 500 rows"));
-        assert!(result.contains(
-            "Tool chain: execute_sql (15.0s) → execute_sql (FAILED: timeout)"
-        ));
+        assert!(result.contains("Tool chain: execute_sql (15.0s) → execute_sql (FAILED: timeout)"));
     }
 
     #[test]
@@ -1927,7 +1946,10 @@ mod tests {
             .write_tool_output_artifact(2, "SRE/Ops", 1, "My Search Tool", 3, "data")
             .await
             .unwrap();
-        assert_eq!(filename, "task-2-sre-ops-iter-1-my-search-tool-3-output.txt");
+        assert_eq!(
+            filename,
+            "task-2-sre-ops-iter-1-my-search-tool-3-output.txt"
+        );
     }
 
     #[tokio::test]
@@ -2045,15 +2067,17 @@ mod tests {
                     failure_category: None,
                     error: None,
                     error_context: None,
-                    tool_trace: vec![
-                        ToolTraceEntry {
-                            tool: "log_search".to_string(),
-                            reasoning: "Searching for errors".to_string(),
-                            duration_ms: 8200,
-                            outcome: ToolOutcome::Success { output_bytes: 48291 },
-                            artifact_filename: Some("task-0-sre-iter-1-log-search-0-output.txt".to_string()),
+                    tool_trace: vec![ToolTraceEntry {
+                        tool: "log_search".to_string(),
+                        reasoning: "Searching for errors".to_string(),
+                        duration_ms: 8200,
+                        outcome: ToolOutcome::Success {
+                            output_bytes: 48291,
                         },
-                    ],
+                        artifact_filename: Some(
+                            "task-0-sre-iter-1-log-search-0-output.txt".to_string(),
+                        ),
+                    }],
                     artifacts: vec![
                         ArtifactEntry {
                             filename: "task-0-sre-iter-1-result.txt".to_string(),
@@ -2063,7 +2087,9 @@ mod tests {
                         ArtifactEntry {
                             filename: "task-0-sre-iter-1-log-search-0-output.txt".to_string(),
                             size_bytes: 48291,
-                            kind: ArtifactKind::ToolOutput { tool_name: "log-search".to_string() },
+                            kind: ArtifactKind::ToolOutput {
+                                tool_name: "log-search".to_string(),
+                            },
                         },
                     ],
                 },
@@ -2094,7 +2120,9 @@ mod tests {
                             tool: "get_deployments".to_string(),
                             reasoning: "Checking prod".to_string(),
                             duration_ms: 30200,
-                            outcome: ToolOutcome::Error { message: "403 Forbidden".to_string() },
+                            outcome: ToolOutcome::Error {
+                                message: "403 Forbidden".to_string(),
+                            },
                             artifact_filename: None,
                         },
                     ],
@@ -2112,15 +2140,26 @@ mod tests {
         let t0 = &deserialized.task_summaries[0];
         assert_eq!(t0.tool_trace.len(), 1);
         assert_eq!(t0.tool_trace[0].tool, "log_search");
-        assert!(matches!(t0.tool_trace[0].outcome, ToolOutcome::Success { output_bytes: 48291 }));
+        assert!(matches!(
+            t0.tool_trace[0].outcome,
+            ToolOutcome::Success {
+                output_bytes: 48291
+            }
+        ));
         assert_eq!(t0.artifacts.len(), 2);
         assert!(matches!(t0.artifacts[0].kind, ArtifactKind::Result));
 
         let t1 = &deserialized.task_summaries[1];
         assert_eq!(t1.error.as_deref(), Some("403 Forbidden"));
-        assert_eq!(t1.error_context.as_ref().unwrap().last_tool_call.as_deref(), Some("get_deployments"));
+        assert_eq!(
+            t1.error_context.as_ref().unwrap().last_tool_call.as_deref(),
+            Some("get_deployments")
+        );
         assert_eq!(t1.tool_trace.len(), 2);
-        assert!(matches!(t1.tool_trace[1].outcome, ToolOutcome::Error { .. }));
+        assert!(matches!(
+            t1.tool_trace[1].outcome,
+            ToolOutcome::Error { .. }
+        ));
     }
 
     #[test]
@@ -2129,9 +2168,14 @@ mod tests {
         let json = serde_json::to_string(&success).unwrap();
         assert!(json.contains("output_bytes"));
         let deserialized: ToolOutcome = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, ToolOutcome::Success { output_bytes: 1234 }));
+        assert!(matches!(
+            deserialized,
+            ToolOutcome::Success { output_bytes: 1234 }
+        ));
 
-        let error = ToolOutcome::Error { message: "timeout".to_string() };
+        let error = ToolOutcome::Error {
+            message: "timeout".to_string(),
+        };
         let json = serde_json::to_string(&error).unwrap();
         let deserialized: ToolOutcome = serde_json::from_str(&json).unwrap();
         assert!(matches!(deserialized, ToolOutcome::Error { .. }));
@@ -2143,11 +2187,15 @@ mod tests {
         let json = serde_json::to_string(&result_kind).unwrap();
         assert_eq!(json, "\"result\"");
 
-        let tool_kind = ArtifactKind::ToolOutput { tool_name: "log_search".to_string() };
+        let tool_kind = ArtifactKind::ToolOutput {
+            tool_name: "log_search".to_string(),
+        };
         let json = serde_json::to_string(&tool_kind).unwrap();
         assert!(json.contains("tool_name"));
         let deserialized: ArtifactKind = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, ArtifactKind::ToolOutput { tool_name } if tool_name == "log_search"));
+        assert!(
+            matches!(deserialized, ArtifactKind::ToolOutput { tool_name } if tool_name == "log_search")
+        );
     }
 
     #[tokio::test]
@@ -2201,5 +2249,4 @@ mod tests {
         assert_eq!(meta[1].0, "task-1-sre-iter-1-result.txt");
         assert_eq!(meta[1].1, 20); // "a longer result here" = 20 bytes
     }
-
 }
