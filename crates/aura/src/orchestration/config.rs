@@ -480,14 +480,25 @@ impl OrchestrationConfig {
         &self,
         agent_system_prompt: &str,
         include_recon_tools: bool,
+        include_history_tools: bool,
     ) -> String {
-        let tools_section = if include_recon_tools {
-            "You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`), \
-             two **reconnaissance tools** (`list_tools`, `inspect_tool_params`), and one **artifact tool** \
-             (`read_artifact`). Call exactly one routing tool per query."
+        let artifact_tools = if include_history_tools {
+            "two **artifact/history tools** (`read_artifact`, `list_prior_runs`)"
         } else {
-            "You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`) \
-             and one **artifact tool** (`read_artifact`). Call exactly one routing tool per query."
+            "one **artifact tool** (`read_artifact`)"
+        };
+
+        let tools_section = if include_recon_tools {
+            format!(
+                "You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`), \
+                 two **reconnaissance tools** (`list_tools`, `inspect_tool_params`), and {artifact_tools}. \
+                 Call exactly one routing tool per query."
+            )
+        } else {
+            format!(
+                "You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`) \
+                 and {artifact_tools}. Call exactly one routing tool per query."
+            )
         };
 
         let recon_guidance = if include_recon_tools {
@@ -514,7 +525,7 @@ impl OrchestrationConfig {
 
         let mut preamble = ORCHESTRATOR_PREAMBLE_TEMPLATE
             .replace("{{orchestration_system_prompt}}", agent_system_prompt)
-            .replace("{{tools_section}}", tools_section)
+            .replace("{{tools_section}}", &tools_section)
             .replace("{{recon_guidance}}", recon_guidance);
 
         // AURA_ESCAPE_HATCH=false strips the "Resolve tool gaps" directive for A/B testing
@@ -810,7 +821,7 @@ mod tests {
     #[test]
     fn test_coordinator_preamble_injects_agent_system_prompt() {
         let config = OrchestrationConfig::default();
-        let preamble = config.build_coordinator_preamble("Focus on thorough testing.", true);
+        let preamble = config.build_coordinator_preamble("Focus on thorough testing.", true, false);
 
         // Framework instructions present
         assert!(preamble.contains("respond_directly"));
@@ -824,7 +835,7 @@ mod tests {
     #[test]
     fn test_coordinator_preamble_with_empty_system_prompt() {
         let config = OrchestrationConfig::default();
-        let preamble = config.build_coordinator_preamble("", true);
+        let preamble = config.build_coordinator_preamble("", true, false);
 
         // Framework instructions still present
         assert!(preamble.contains("create_plan"));
@@ -843,7 +854,7 @@ mod tests {
     #[test]
     fn test_coordinator_preamble_without_recon_tools() {
         let config = OrchestrationConfig::default();
-        let preamble = config.build_coordinator_preamble("Test prompt.", false);
+        let preamble = config.build_coordinator_preamble("Test prompt.", false, false);
 
         // Should have routing tools but NOT recon tools
         assert!(preamble.contains("routing tools"));
@@ -858,11 +869,31 @@ mod tests {
     #[test]
     fn test_coordinator_preamble_with_recon_tools() {
         let config = OrchestrationConfig::default();
-        let preamble = config.build_coordinator_preamble("Test prompt.", true);
+        let preamble = config.build_coordinator_preamble("Test prompt.", true, false);
 
         assert!(preamble.contains("reconnaissance tools"));
         assert!(preamble.contains("## Reconnaissance Guidance"));
         assert!(preamble.contains("inspect_tool_params"));
+    }
+
+    #[test]
+    fn test_coordinator_preamble_with_history_tools() {
+        let config = OrchestrationConfig::default();
+        let preamble = config.build_coordinator_preamble("Test prompt.", true, true);
+
+        assert!(preamble.contains("artifact/history tools"));
+        assert!(preamble.contains("list_prior_runs"));
+        assert!(preamble.contains("read_artifact"));
+    }
+
+    #[test]
+    fn test_coordinator_preamble_without_history_tools() {
+        let config = OrchestrationConfig::default();
+        let preamble = config.build_coordinator_preamble("Test prompt.", false, false);
+
+        assert!(preamble.contains("artifact tool"));
+        assert!(!preamble.contains("list_prior_runs"));
+        assert!(preamble.contains("read_artifact"));
     }
 
     // ========================================================================

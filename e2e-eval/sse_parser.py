@@ -188,12 +188,19 @@ def parse_sse_file(path: Path) -> dict:
     event_data_pairs = _parse_event_data_pairs(text)
     events = [e for e, _ in event_data_pairs]
 
-    # Tool calls: orchestrator-level and worker-level
-    orch_tools = sum(1 for e in events if e == "aura.orchestrator.tool_call_completed")
-    worker_tools = sum(1 for e in events if e == "aura.tool_complete")
-    tool_calls = orch_tools + worker_tools
-
-    # Loop detection + per-worker tool call attribution
+    # Tool calls: orchestrator-level and worker-level.
+    #
+    # Worker MCP tool calls flow through aura.orchestrator.tool_call_started /
+    # aura.orchestrator.tool_call_completed and carry a non-empty worker_id.
+    # Coordinator routing tools (create_plan, respond_directly, etc.) never
+    # emit these events — they surface as plan_created, direct_answer, etc.
+    # The bare aura.tool_complete event does not exist in the SSE stream.
+    #
+    # Split on worker_id presence inside tool_call_completed payload:
+    #   worker_id present  → worker MCP tool call
+    #   worker_id absent   → coordinator-issued tool (future-proof; currently 0)
+    orch_tools = 0
+    worker_tools = 0
     duplicate_tool_calls = 0
     failed_tool_calls = 0
     call_id_to_worker = {}
@@ -208,21 +215,28 @@ def parse_sse_file(path: Path) -> dict:
                     call_id_to_worker[cid] = worker
             except (json.JSONDecodeError, TypeError):
                 pass
-        elif event_name in ("aura.orchestrator.tool_call_completed", "aura.tool_complete") and data:
+        elif event_name == "aura.orchestrator.tool_call_completed" and data:
             try:
                 payload = json.loads(data)
                 cid = payload.get("tool_call_id", "")
-                worker = call_id_to_worker.get(cid) or payload.get("tool_initiator_id") or payload.get("worker_id") or "unknown"
-                tools_by_worker[worker]["total"] += 1
+                worker = call_id_to_worker.get(cid) or payload.get("tool_initiator_id") or payload.get("worker_id") or ""
+                if worker:
+                    worker_tools += 1
+                    tools_by_worker[worker]["total"] += 1
+                else:
+                    orch_tools += 1
                 if not payload.get("success", True):
                     failed_tool_calls += 1
-                    tools_by_worker[worker]["failed"] += 1
+                    if worker:
+                        tools_by_worker[worker]["failed"] += 1
                     result = payload.get("result", "")
                     if "DUPLICATE TOOL CALL" in result:
                         duplicate_tool_calls += 1
-                        tools_by_worker[worker]["dupes"] += 1
+                        if worker:
+                            tools_by_worker[worker]["dupes"] += 1
             except (json.JSONDecodeError, TypeError):
                 pass
+    tool_calls = orch_tools + worker_tools
 
     # Completion
     completed = '"finish_reason":"stop"' in text or '"finish_reason": "stop"' in text

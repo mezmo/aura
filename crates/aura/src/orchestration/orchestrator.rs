@@ -124,6 +124,7 @@ struct CoordinatorTools {
     /// `respond_directly` or `request_clarification`.
     allow_create_plan: bool,
     read_artifact: Option<ReadArtifactTool>,
+    list_prior_runs: Option<super::tools::ListPriorRunsTool>,
 }
 
 // ============================================================================
@@ -1781,6 +1782,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
+        if let Some(list_prior_runs) = tools.list_prior_runs {
+            state = state.add_tool(list_prior_runs);
+        }
         state.build()
     }
 
@@ -1824,9 +1828,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
 
         // Build coordinator preamble: orchestration framework template + user system prompt
+        let include_history_tools = self.config.memory_dir().is_some()
+            && self.persistence.lock().await.session_id().is_some();
         let mut preamble = self.config.build_coordinator_preamble(
             self.agent_config.effective_preamble(),
             include_recon_tools,
+            include_history_tools,
         );
         let temperature = self.agent_config.llm.temperature();
 
@@ -1908,6 +1915,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_tools,
             allow_create_plan,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
+            list_prior_runs: if include_history_tools {
+                Some(super::tools::ListPriorRunsTool::new(
+                    self.persistence.clone(),
+                    std::path::PathBuf::from(self.config.memory_dir().unwrap()),
+                ))
+            } else {
+                None
+            },
         };
 
         let provider_agent = self
