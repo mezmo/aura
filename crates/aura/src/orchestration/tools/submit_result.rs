@@ -117,10 +117,21 @@ impl Tool for SubmitResultTool {
     ) -> Result<Self::Output, Self::Error> {
         let mut guard = self.decision.lock().await;
         if guard.is_some() {
+            tracing::warn!(
+                summary = %args.summary,
+                "submit_result called again (duplicate, first submission kept)"
+            );
             return Ok(SubmitResultToolOutput {
                 status: "Result already submitted (first submission kept).".to_string(),
             });
         }
+
+        tracing::info!(
+            summary = %args.summary,
+            confidence = %args.confidence,
+            result_len = args.result.len(),
+            "submit_result called (first submission accepted)"
+        );
 
         let confidence = match args.confidence.to_lowercase().as_str() {
             "high" => Confidence::High,
