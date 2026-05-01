@@ -680,7 +680,7 @@ impl McpManager {
     /// Returns Ok(()) if successful, or Err(reason) if schema is invalid and should be rejected.
     fn sanitize_schema_for_openai(schema: &mut serde_json::Value) -> Result<(), String> {
         use crate::schema_sanitize::{
-            fix_empty_root_required, recursive_set_additional_properties_false,
+            fix_empty_root_required, inline_refs, recursive_set_additional_properties_false,
         };
 
         // VALIDATION: OpenAI requires tool schemas to have type: "object" at root level
@@ -694,6 +694,9 @@ impl McpManager {
                     This is an MCP server bug - the server is returning a type definition as a tool."
             ));
         }
+
+        // Step 0: Inline $ref/$defs so subsequent passes process the full schema
+        inline_refs(schema);
 
         // Step 1: Fix incomplete required arrays (makes optional fields nullable)
         fix_empty_root_required(schema);

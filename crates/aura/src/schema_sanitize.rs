@@ -1,4 +1,130 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
+use tracing::warn;
+
+/// Inlines all `$ref` pointers by replacing them with the referenced `$defs` definitions,
+/// then strips `$defs` and `$schema` from the root.
+///
+/// Only handles local refs of the form `#/$defs/Name`. External or unresolvable refs
+/// are left in place. Circular reference chains are detected and left unresolved.
+///
+/// When a `$ref` has sibling properties (e.g. `description`), the sibling takes precedence
+/// over the same key in the inlined definition (JSON Schema 2020-12 semantics).
+pub fn inline_refs(schema: &mut Value) -> &mut Value {
+    let defs = match extract_defs(schema) {
+        Some(d) => d,
+        None => {
+            strip_schema_noise(schema);
+            return schema;
+        }
+    };
+
+    let mut visited = HashSet::new();
+    resolve_refs_recursive(schema, &defs, &mut visited);
+
+    strip_schema_noise(schema);
+    schema
+}
+
+fn extract_defs(schema: &Value) -> Option<serde_json::Map<String, Value>> {
+    schema
+        .as_object()
+        .and_then(|map| map.get("$defs"))
+        .and_then(|v| v.as_object())
+        .cloned()
+}
+
+fn resolve_refs_recursive(
+    node: &mut Value,
+    defs: &serde_json::Map<String, Value>,
+    visited: &mut HashSet<String>,
+) {
+    let map = match node.as_object_mut() {
+        Some(m) => m,
+        None => return,
+    };
+
+    if let Some(ref_val) = map.get("$ref").and_then(|v| v.as_str().map(String::from)) {
+        let name = match ref_val.strip_prefix("#/$defs/") {
+            Some(n) => n.to_string(),
+            None => return, // external ref — leave in place
+        };
+
+        if visited.contains(&name) {
+            warn!("Circular $ref detected for '{name}', leaving unresolved");
+            return;
+        }
+
+        let definition = match defs.get(&name) {
+            Some(d) => d.clone(),
+            None => return, // missing def — leave in place
+        };
+
+        // Resolve nested refs within the definition itself
+        let mut resolved_def = definition;
+        visited.insert(name.clone());
+        resolve_refs_recursive(&mut resolved_def, defs, visited);
+        visited.remove(&name);
+
+        // Collect sibling keys (everything except $ref) — these win on conflict
+        let siblings: serde_json::Map<String, Value> = map
+            .iter()
+            .filter(|(k, _)| k.as_str() != "$ref")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Start with the inlined definition, overlay siblings
+        if let Some(def_map) = resolved_def.as_object_mut() {
+            for (k, v) in &siblings {
+                def_map.insert(k.clone(), v.clone());
+            }
+            *map = def_map.clone();
+        }
+
+        return;
+    }
+
+    // No $ref — recurse into sub-schemas
+    let keys_with_arrays: Vec<String> = ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .filter(|k| map.contains_key(**k))
+        .map(|k| k.to_string())
+        .collect();
+
+    for key in keys_with_arrays {
+        if let Some(Value::Array(arr)) = map.get_mut(&key) {
+            for item in arr.iter_mut() {
+                resolve_refs_recursive(item, defs, visited);
+            }
+        }
+    }
+
+    let prop_keys: Vec<String> = map
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default();
+
+    for key in prop_keys {
+        if let Some(Value::Object(properties)) = map.get_mut("properties")
+            && let Some(prop_schema) = properties.get_mut(&key)
+        {
+            resolve_refs_recursive(prop_schema, defs, visited);
+        }
+    }
+
+    if let Some(items) = map.get_mut("items") {
+        resolve_refs_recursive(items, defs, visited);
+    }
+}
+
+fn strip_schema_noise(schema: &mut Value) {
+    if let Some(map) = schema.as_object_mut() {
+        map.remove("$defs");
+        map.remove("$schema");
+    }
+}
 
 /// Recursively sets `additionalProperties: false` on all object schemas in a JSON Schema.
 ///
@@ -130,11 +256,25 @@ pub fn recursive_set_additional_properties_false(schema: &mut Value) -> &mut Val
             map.insert("additionalProperties".to_string(), Value::Bool(false));
         }
 
-        // Recursively check 'anyOf', 'properties', and 'items' if they exist
+        // Recursively check combinators, properties, and items
 
         // Process anyOf - iterate through array of schemas
         if let Some(Value::Array(any_of_array)) = map.get_mut("anyOf") {
             for sub_schema in any_of_array.iter_mut() {
+                recursive_set_additional_properties_false(sub_schema);
+            }
+        }
+
+        // Process oneOf - iterate through array of schemas
+        if let Some(Value::Array(one_of_array)) = map.get_mut("oneOf") {
+            for sub_schema in one_of_array.iter_mut() {
+                recursive_set_additional_properties_false(sub_schema);
+            }
+        }
+
+        // Process allOf - iterate through array of schemas
+        if let Some(Value::Array(all_of_array)) = map.get_mut("allOf") {
+            for sub_schema in all_of_array.iter_mut() {
                 recursive_set_additional_properties_false(sub_schema);
             }
         }
@@ -1435,6 +1575,7 @@ mod tests {
         recursive_set_additional_properties_false(&mut schema);
 
         // Expected behavior for OpenAI: should have both properties and additionalProperties
+        // Note: $schema is NOT stripped by recursive_set_additional_properties_false (that's inline_refs' job)
         let expected = json!({
             "type": "object",
             "properties": {},
@@ -1444,5 +1585,361 @@ mod tests {
             "description": "This is commonly used for representing empty objects in MCP messages."
         });
         assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_oneof_traversal_in_additional_properties() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "agg": {
+                    "oneOf": [
+                        {"type": "string", "enum": ["count"]},
+                        {
+                            "type": "object",
+                            "properties": {"avg": {"type": "string"}},
+                            "required": ["avg"]
+                        }
+                    ]
+                }
+            },
+            "required": ["agg"]
+        });
+
+        recursive_set_additional_properties_false(&mut schema);
+
+        // The object variant inside oneOf must get additionalProperties: false
+        assert_eq!(
+            schema["properties"]["agg"]["oneOf"][1]["additionalProperties"],
+            false
+        );
+    }
+
+    // ==================== inline_refs tests ====================
+
+    #[test]
+    fn test_inline_refs_basic() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {"$ref": "#/$defs/Mode"}
+            },
+            "required": ["mode"],
+            "$defs": {
+                "Mode": {"type": "string", "enum": ["fast", "slow"]}
+            }
+        });
+
+        inline_refs(&mut schema);
+
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["fast", "slow"]}
+            },
+            "required": ["mode"]
+        });
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_inline_refs_with_sibling_description() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "agg": {
+                    "$ref": "#/$defs/Agg",
+                    "description": "Local description wins"
+                }
+            },
+            "required": ["agg"],
+            "$defs": {
+                "Agg": {
+                    "oneOf": [
+                        {"type": "string", "enum": ["count"]},
+                        {"type": "object", "properties": {"avg": {"type": "string"}}, "required": ["avg"]}
+                    ],
+                    "description": "Definition description loses"
+                }
+            }
+        });
+
+        inline_refs(&mut schema);
+
+        assert_eq!(
+            schema["properties"]["agg"]["description"],
+            "Local description wins"
+        );
+        assert!(schema["properties"]["agg"]["oneOf"].is_array());
+        assert!(schema.get("$defs").is_none());
+    }
+
+    #[test]
+    fn test_inline_refs_sibling_no_conflict() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "field": {
+                    "$ref": "#/$defs/MyType",
+                    "description": "Added at ref site"
+                }
+            },
+            "required": ["field"],
+            "$defs": {
+                "MyType": {"type": "string", "enum": ["a", "b"]}
+            }
+        });
+
+        inline_refs(&mut schema);
+
+        assert_eq!(schema["properties"]["field"]["description"], "Added at ref site");
+        assert_eq!(schema["properties"]["field"]["type"], "string");
+        assert_eq!(schema["properties"]["field"]["enum"], json!(["a", "b"]));
+    }
+
+    #[test]
+    fn test_inline_refs_nested() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "outer": {"$ref": "#/$defs/Outer"}
+            },
+            "required": ["outer"],
+            "$defs": {
+                "Outer": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {"$ref": "#/$defs/Inner"}
+                    },
+                    "required": ["inner"]
+                },
+                "Inner": {"type": "string", "enum": ["x", "y"]}
+            }
+        });
+
+        inline_refs(&mut schema);
+
+        assert_eq!(schema["properties"]["outer"]["properties"]["inner"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["outer"]["properties"]["inner"]["enum"],
+            json!(["x", "y"])
+        );
+        assert!(schema.get("$defs").is_none());
+    }
+
+    #[test]
+    fn test_inline_refs_circular() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "node": {"$ref": "#/$defs/A"}
+            },
+            "required": ["node"],
+            "$defs": {
+                "A": {
+                    "type": "object",
+                    "properties": {"child": {"$ref": "#/$defs/B"}},
+                    "required": ["child"]
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"back": {"$ref": "#/$defs/A"}},
+                    "required": ["back"]
+                }
+            }
+        });
+
+        // Should not panic
+        inline_refs(&mut schema);
+
+        // A is resolved, B is resolved, but the circular back-ref in B stays as $ref
+        assert!(schema["properties"]["node"]["properties"]["child"]["properties"]["back"]
+            .get("$ref")
+            .is_some());
+    }
+
+    #[test]
+    fn test_inline_refs_no_defs() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
+        });
+        let original = schema.clone();
+
+        inline_refs(&mut schema);
+
+        assert_eq!(schema, original);
+    }
+
+    #[test]
+    fn test_inline_refs_missing_def() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "field": {"$ref": "#/$defs/DoesNotExist"}
+            },
+            "required": ["field"],
+            "$defs": {}
+        });
+
+        inline_refs(&mut schema);
+
+        // $ref left in place when definition is missing
+        assert_eq!(
+            schema["properties"]["field"]["$ref"],
+            "#/$defs/DoesNotExist"
+        );
+    }
+
+    #[test]
+    fn test_inline_refs_external_ref() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "field": {"$ref": "https://example.com/schema.json#/Foo"}
+            },
+            "required": ["field"],
+            "$defs": {}
+        });
+
+        inline_refs(&mut schema);
+
+        // External ref left in place
+        assert_eq!(
+            schema["properties"]["field"]["$ref"],
+            "https://example.com/schema.json#/Foo"
+        );
+    }
+
+    #[test]
+    fn test_inline_refs_strips_schema_annotation() {
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"]
+        });
+
+        inline_refs(&mut schema);
+
+        assert!(schema.get("$schema").is_none());
+    }
+
+    #[test]
+    fn test_inline_refs_multiple_refs_to_same_def() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "a": {"$ref": "#/$defs/Metric", "description": "First use"},
+                "b": {"$ref": "#/$defs/Metric", "description": "Second use"}
+            },
+            "required": ["a", "b"],
+            "$defs": {
+                "Metric": {"type": "string", "enum": ["p50", "p95", "p99"]}
+            }
+        });
+
+        inline_refs(&mut schema);
+
+        assert_eq!(schema["properties"]["a"]["description"], "First use");
+        assert_eq!(schema["properties"]["b"]["description"], "Second use");
+        assert_eq!(schema["properties"]["a"]["enum"], json!(["p50", "p95", "p99"]));
+        assert_eq!(schema["properties"]["b"]["enum"], json!(["p50", "p95", "p99"]));
+    }
+
+    #[test]
+    fn test_inline_refs_inside_items() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/Entry"}
+                }
+            },
+            "required": ["entries"],
+            "$defs": {
+                "Entry": {
+                    "type": "object",
+                    "properties": {"msg": {"type": "string"}},
+                    "required": ["msg"]
+                }
+            }
+        });
+
+        inline_refs(&mut schema);
+
+        assert_eq!(schema["properties"]["entries"]["items"]["type"], "object");
+        assert_eq!(
+            schema["properties"]["entries"]["items"]["properties"]["msg"]["type"],
+            "string"
+        );
+        assert!(schema.get("$defs").is_none());
+    }
+
+    #[test]
+    fn test_inline_refs_full_pipeline_group_logs() {
+        // Real-world group_logs_by_field aggregation schema through all 3 passes
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "GroupLogsByFieldArgs",
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "description": "Field to group by"},
+                "aggregation": {
+                    "$ref": "#/$defs/Aggregation",
+                    "description": "Aggregation metric. Examples:\n- \"count\" for counting"
+                },
+                "query": {"type": ["string", "null"], "default": null}
+            },
+            "required": ["field", "aggregation"],
+            "$defs": {
+                "Aggregation": {
+                    "oneOf": [
+                        {"type": "string", "enum": ["count"]},
+                        {
+                            "type": "object",
+                            "properties": {"avg": {"type": "string"}},
+                            "required": ["avg"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"p95": {"type": "string"}},
+                            "required": ["p95"],
+                            "additionalProperties": false
+                        }
+                    ]
+                }
+            }
+        });
+
+        // Run full pipeline
+        inline_refs(&mut schema);
+        fix_empty_root_required(&mut schema);
+        recursive_set_additional_properties_false(&mut schema);
+
+        // $ref and $defs gone
+        assert!(schema.get("$defs").is_none());
+        assert!(schema.get("$schema").is_none());
+        assert!(schema["properties"]["aggregation"].get("$ref").is_none());
+
+        // oneOf is inlined with description preserved
+        let agg = &schema["properties"]["aggregation"];
+        assert!(agg["oneOf"].is_array());
+        assert_eq!(agg["oneOf"].as_array().unwrap().len(), 3);
+        assert!(agg["description"].as_str().unwrap().contains("Aggregation metric"));
+
+        // Object variants inside oneOf got additionalProperties: false
+        assert_eq!(agg["oneOf"][1]["additionalProperties"], false);
+        assert_eq!(agg["oneOf"][2]["additionalProperties"], false);
+
+        // Root got additionalProperties: false
+        assert_eq!(schema["additionalProperties"], false);
+
+        // query (optional) was made nullable + required
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("query")));
     }
 }
