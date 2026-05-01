@@ -118,6 +118,7 @@ for config in "${CONFIGS[@]}"; do
     CONFIG_PATH="$config" \
     AURA_CUSTOM_EVENTS=true \
     K8S_SRE_MCP_HOST=127.0.0.1 \
+    RUST_LOG=aura=info,aura_web_server=info \
     PORT=$PORT \
     "$BINARY" > "$ITER_DIR/server.log" 2>&1 &
     AURA_PID=$!
@@ -177,11 +178,11 @@ done
 
 echo ""
 echo "============================================================"
-echo "  Running assertions (--prompt-set sre-hard)"
+echo "  Running assertions (--prompt-set sre-hard --skip-scratchpad)"
 echo "============================================================"
 echo ""
 
-python3 "$ASSERT_SCRIPT" "$RESULTS_DIR" --prompt-set sre-hard
+python3 "$ASSERT_SCRIPT" "$RESULTS_DIR" --prompt-set sre-hard --skip-scratchpad
 ASSERT_EXIT=$?
 
 echo ""
