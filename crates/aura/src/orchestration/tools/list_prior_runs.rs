@@ -130,10 +130,9 @@ mod tests {
         temp_dir: &TempDir,
         session_id: &str,
     ) -> Arc<Mutex<ExecutionPersistence>> {
-        let persistence =
-            ExecutionPersistence::new(temp_dir.path(), Some(session_id.to_string()))
-                .await
-                .unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path(), Some(session_id.to_string()))
+            .await
+            .unwrap();
         Arc::new(Mutex::new(persistence))
     }
 
