@@ -850,12 +850,9 @@ impl IterationContext {
     /// repeated-failure detection, and a conditional reuse hint. Uses the
     /// `.md` template in `crates/aura/src/prompts/continuation_prompt.md`.
     ///
-    /// Per-task completed results are included inline, truncated to 500 bytes
-    /// so the coordinator can route with full context. When a completed result
-    /// was spilled to an artifact, the
-    /// `[Full result (N chars) saved to artifact: task-N-worker-iter-M-result.txt]` footer
-    /// is re-appended after truncation so the coordinator can discover the
-    /// artifact via `read_artifact`.
+    /// Per-task completed results are inlined fully when no artifact was
+    /// created (result ≤ threshold). When the result was spilled to an
+    /// artifact, shows summary + artifact pointer instead.
     pub fn build_continuation_prompt(&self, max_iterations: usize) -> String {
         use super::templates::{ContinuationVars, render_continuation_prompt};
 
@@ -868,20 +865,31 @@ impl IterationContext {
         for t in &self.previous_plan.tasks {
             match &t.state {
                 TaskState::Complete { result } => {
-                    if let Some(ref so) = t.structured_output {
-                        let footer = extract_artifact_footer(result)
-                            .map(|f| format!(" {}", f))
+                    let has_artifact = extract_artifact_footer(result).is_some();
+                    if has_artifact {
+                        // Result exceeded threshold — artifact on disk.
+                        // Show summary/preview + artifact pointer.
+                        let confidence = t.structured_output.as_ref()
+                            .map(|so| format!(" (confidence: {})", so.confidence))
                             .unwrap_or_default();
-                        let detail = preserve_artifact_footer(&so.summary, 500);
+                        let body = if let Some(ref so) = t.structured_output {
+                            let footer = extract_artifact_footer(result).unwrap();
+                            format!("    {}\n    {}", so.summary, footer)
+                        } else {
+                            indent_lines(&preserve_artifact_footer(result, 2000))
+                        };
                         completed_lines.push(format!(
-                            "- Task {}: {} → {} (confidence: {}){}",
-                            t.id, t.description, detail, so.confidence, footer
+                            "- Task {}: {}{}\n{}",
+                            t.id, t.description, confidence, body
                         ));
                     } else {
-                        let detail = preserve_artifact_footer(result, 500);
+                        // Result fits in context — inline it fully.
+                        let confidence = t.structured_output.as_ref()
+                            .map(|so| format!(" (confidence: {})", so.confidence))
+                            .unwrap_or_default();
                         completed_lines.push(format!(
-                            "- Task {}: {} → {}",
-                            t.id, t.description, detail
+                            "- Task {}: {}{}\n{}",
+                            t.id, t.description, confidence, indent_lines(result)
                         ));
                     }
                     for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
@@ -894,11 +902,19 @@ impl IterationContext {
                         (FailureCategory::SoftFailure, Some(so))
                             if !so.summary.is_empty() =>
                         {
-                            let detail = preserve_artifact_footer(&so.summary, 500);
-                            format!(
-                                "- Task {}: {} → soft_failure ({} confidence): {}",
-                                t.id, t.description, so.confidence, detail
-                            )
+                            let has_artifact = extract_artifact_footer(error).is_some();
+                            if has_artifact {
+                                let footer = extract_artifact_footer(error).unwrap();
+                                format!(
+                                    "- Task {}: {} → soft_failure ({} confidence)\n    {}\n    {}",
+                                    t.id, t.description, so.confidence, so.summary, footer
+                                )
+                            } else {
+                                format!(
+                                    "- Task {}: {} → soft_failure ({} confidence)\n{}",
+                                    t.id, t.description, so.confidence, indent_lines(&so.summary)
+                                )
+                            }
                         }
                         (cat, _) => format!(
                             "- Task {}: {} → failed [{}]: {}",
@@ -1083,6 +1099,14 @@ fn preserve_artifact_footer(result: &str, budget: usize) -> String {
             }
         }
     }
+}
+
+/// Indent each line of `text` by 4 spaces for nesting under a task header.
+fn indent_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Render condensed tool chain + artifact ref lines from pre-loaded traces.
@@ -1600,24 +1624,20 @@ mod tests {
     }
 
     #[test]
-    fn test_continuation_prompt_truncation() {
-        let mut plan = Plan::new("Test truncation");
+    fn test_continuation_prompt_inlines_small_result() {
+        let mut plan = Plan::new("Test inline");
         let mut task = Task::new(0, "Big result", "Produce output");
-        // 600-char result exceeds 500-byte truncation limit
+        // 600-char result has no artifact footer → inlined fully
         let long_result = "x".repeat(600);
-        task.complete(long_result);
+        task.complete(long_result.clone());
         plan.add_task(task);
 
         let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
         let prompt = ctx.build_continuation_prompt(3);
 
-        // Should contain truncated result with "..." suffix
         assert!(prompt.contains("COMPLETED TASKS"));
-        assert!(prompt.contains("..."));
-        // Should NOT contain the full 600-char string
-        assert!(!prompt.contains(&"x".repeat(600)));
-        // But should contain 500 chars worth
-        assert!(prompt.contains(&"x".repeat(500)));
+        // Full result inlined — no truncation when no artifact exists
+        assert!(prompt.contains(&"x".repeat(600)));
     }
 
     #[test]

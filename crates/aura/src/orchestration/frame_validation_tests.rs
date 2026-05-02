@@ -301,16 +301,17 @@ fn test_continuation_mixed_structured_and_raw() {
     let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
     let prompt = ctx.build_continuation_prompt(3);
 
-    // Structured path: shows summary + confidence
-    assert!(prompt.contains("Concise structured summary"), "structured summary");
+    // Structured path with no artifact: inlines full result, not summary
+    assert!(prompt.contains("Full detailed result from structured output"), "full result inlined");
     assert!(prompt.contains("confidence: medium"), "confidence from structured");
+    // Summary is NOT shown when result fits inline (no artifact)
+    assert!(!prompt.contains("Concise structured summary"), "summary not shown when no artifact");
 
-    // Raw path: shows truncated result directly
+    // Raw path: shows full result directly
     assert!(prompt.contains("Raw unstructured worker output"), "raw output");
     // Raw path should NOT contain "confidence:"
-    let raw_line = prompt.lines().find(|l| l.contains("raw") && l.contains("Raw unstructured"));
-    assert!(raw_line.is_some(), "raw task line exists");
-    assert!(!raw_line.unwrap().contains("confidence:"), "no confidence on raw task");
+    let raw_section = prompt.lines().any(|l| l.contains("Raw unstructured") && !l.contains("confidence:"));
+    assert!(raw_section, "no confidence on raw task");
 }
 
 // ========================================================================
