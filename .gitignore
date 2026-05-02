@@ -80,7 +80,6 @@ tui/
 
 # Development documentation (keep local only)
 docs/architecture-decisions/
-docs/internal/
 docs/planning/
 docs/*-internal.md
 docs/archive/

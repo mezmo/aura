@@ -76,6 +76,21 @@ pub enum StreamTermination {
     Shutdown,
 }
 
+/// Map stream termination reasons to the error taxonomy.
+/// Callers should guard against `Complete` (success case) before using this —
+/// the `Internal` mapping for `Complete` is defensive and should never be recorded as an error.
+impl From<&StreamTermination> for aura::ErrorCategory {
+    fn from(term: &StreamTermination) -> Self {
+        match term {
+            StreamTermination::Complete => aura::ErrorCategory::Internal,
+            StreamTermination::StreamError(_) => aura::ErrorCategory::LlmError,
+            StreamTermination::Disconnected => aura::ErrorCategory::Cancelled,
+            StreamTermination::Timeout => aura::ErrorCategory::LlmTimeout,
+            StreamTermination::Shutdown => aura::ErrorCategory::ServiceUnavailable,
+        }
+    }
+}
+
 /// User-facing message when context overflow is detected.
 const CONTEXT_OVERFLOW_MESSAGE: &str = "My tools returned more data than I can work with at once.\n\n\
     **To help me out, try:**\n\
@@ -690,14 +705,10 @@ fn handle_tool_call(
         (tool_call.name.clone(), state.tool_call_index),
     );
 
-    // Track tool start time for duration calculation in tool_complete event
-    // Note: aura.tool_requested is emitted via StreamingRequestHook → tool_event_rx channel (not here)
-    // to avoid duplication and maintain proper correlation with tool_call_id via FIFO queue
-    if config.emit_custom_events {
-        state
-            .tool_start_times
-            .insert(tool_call.id.clone(), std::time::Instant::now());
-    }
+    // Track tool start time for duration calculation (always — used for metrics and custom events)
+    state
+        .tool_start_times
+        .insert(tool_call.id.clone(), std::time::Instant::now());
 
     // Determine arguments based on tool result mode
     let arguments = match config.tool_result_mode {
@@ -755,24 +766,43 @@ fn handle_tool_result(
     let mut output = Vec::with_capacity(2);
     state.needs_separator = true;
 
+    // Calculate tool duration (always, for metrics even when custom events are off)
+    let duration_ms = state
+        .tool_start_times
+        .remove(&tool_result.id)
+        .map(|start| start.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+
+    let tool_name_for_metrics = state
+        .tool_call_map
+        .get(&tool_result.id)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Parse result text once (used for both metrics and custom events)
+    let result_text = serde_json::from_str::<String>(&tool_result.result)
+        .unwrap_or_else(|_| tool_result.result.clone());
+
+    // Detect tool errors once (shared between metrics and custom events)
+    let tool_status = detect_tool_error(&result_text);
+    let is_tool_error = matches!(tool_status, ToolResultStatus::Error(_));
+
+    // Record tool duration metric (always, regardless of custom events)
+    crate::metrics::record_tool_duration(
+        "default",
+        &tool_name_for_metrics,
+        if is_tool_error { "error" } else { "ok" },
+        duration_ms as f64 / 1000.0,
+    );
+
+    // Record tool-level error in error counter
+    if is_tool_error {
+        crate::metrics::record_error(aura::ErrorCategory::McpToolError.as_label());
+    }
+
     // Emit aura.tool_complete custom event (if enabled)
     if config.emit_custom_events {
-        let duration_ms = state
-            .tool_start_times
-            .remove(&tool_result.id)
-            .map(|start| start.elapsed().as_millis() as u64)
-            .unwrap_or(0);
-
-        let tool_name = state
-            .tool_call_map
-            .get(&tool_result.id)
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Aura's ToolResult has result as a plain String
-        // Try to unescape JSON-quoted strings for error detection
-        let result_text = serde_json::from_str::<String>(&tool_result.result)
-            .unwrap_or_else(|_| tool_result.result.clone());
+        let tool_name = tool_name_for_metrics.clone();
 
         tracing::debug!(
             "Tool '{}' result_text (first 200 chars): {}",
@@ -784,7 +814,7 @@ fn handle_tool_result(
             }
         );
 
-        let status = detect_tool_error(&result_text);
+        let status = tool_status;
         let event = match status {
             ToolResultStatus::Error(ref err) => {
                 tracing::warn!(
@@ -1027,6 +1057,30 @@ mod tests {
         assert!(
             output_str.contains("tool_calls"),
             "OpenAI tool_calls chunk should still be emitted"
+        );
+    }
+
+    #[test]
+    fn test_stream_termination_maps_to_error_category() {
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Complete),
+            aura::ErrorCategory::Internal,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::StreamError("err".to_string())),
+            aura::ErrorCategory::LlmError,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Disconnected),
+            aura::ErrorCategory::Cancelled,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Timeout),
+            aura::ErrorCategory::LlmTimeout,
+        );
+        assert_eq!(
+            aura::ErrorCategory::from(&StreamTermination::Shutdown),
+            aura::ErrorCategory::ServiceUnavailable,
         );
     }
 
