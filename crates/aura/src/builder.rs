@@ -2,6 +2,7 @@ use crate::{
     config::{AgentConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
+    passthrough_tool::PassthroughTool,
     provider_agent::{
         BuilderState, CompletionResponse, ProviderAgent, StreamError, StreamItem,
         StreamedAssistantContent,
@@ -13,6 +14,7 @@ use crate::{
 use futures::StreamExt;
 use rig::client::CompletionClient;
 use rig::completion::Usage;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,12 +100,29 @@ pub struct Agent {
     /// Configured context window size in tokens (from TOML config).
     /// Used for usage percentage reporting in streaming events.
     context_window: Option<u32>,
+    /// Names of client-side tools (passthrough tools). When the LLM calls one of these,
+    /// the stream is terminated with `finish_reason: "tool_calls"` so the client can
+    /// execute locally and send results back.
+    client_tool_names: HashSet<String>,
+}
+
+/// A client-side tool definition passed in from the request.
+/// Used to register passthrough tools with the agent.
+pub struct ClientTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
 }
 
 impl Agent {
     /// Create a new agent from configuration.
+    ///
+    /// If `client_tools` is provided, they are registered as passthrough tools —
+    /// the LLM can call them, but they return a marker string instead of executing.
+    /// The streaming layer detects this and yields the call back to the client.
     pub async fn new(
         config: &AgentConfig,
+        client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Initialize MCP manager first (shared across all providers)
         let mcp_manager = if let Some(mcp_config) = &config.mcp {
@@ -212,6 +231,11 @@ impl Agent {
 
                 // Add tools using the BuilderState helper
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
                     Self::add_all_tools(builder_state, config, &mcp_manager).await?;
                 let agent = builder_state.build();
@@ -252,6 +276,11 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
                     Self::add_all_tools(builder_state, config, &mcp_manager).await?;
                 let agent = builder_state.build();
@@ -306,6 +335,11 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
                     Self::add_all_tools(builder_state, config, &mcp_manager).await?;
                 let agent = builder_state.build();
@@ -341,6 +375,11 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
                     Self::add_all_tools(builder_state, config, &mcp_manager).await?;
                 let agent = builder_state.build();
@@ -385,6 +424,11 @@ impl Agent {
                 }
 
                 let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
                 let builder_state =
                     Self::add_all_tools(builder_state, config, &mcp_manager).await?;
                 let agent = builder_state.build();
@@ -392,6 +436,11 @@ impl Agent {
                 ProviderAgent::Ollama(agent)
             }
         };
+
+        let client_tool_names = client_tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
 
         Ok(Agent {
             inner: provider_agent,
@@ -401,7 +450,29 @@ impl Agent {
             fallback_tool_parsing,
             fallback_tool_names,
             context_window: config.agent.context_window,
+            client_tool_names,
         })
+    }
+
+    /// Add passthrough tools for client-side tool execution.
+    fn add_passthrough_tools<M>(
+        builder_state: BuilderState<M>,
+        client_tools: &[ClientTool],
+    ) -> BuilderState<M>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+    {
+        let mut state = builder_state;
+        for tool in client_tools {
+            tracing::info!("  Adding passthrough tool: {}", tool.name);
+            let passthrough = PassthroughTool::new(
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.parameters.clone(),
+            );
+            state = state.add_tool(passthrough);
+        }
+        state
     }
 
     /// Add all tools to a builder state (shared across all providers)
@@ -693,7 +764,13 @@ impl Agent {
     ) {
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_prompt_with_timeout(query, self.max_depth, timeout, request_id)
+            .stream_prompt_with_timeout(
+                query,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.client_tool_names.clone(),
+            )
             .await;
         (
             self.maybe_wrap_with_fallback(stream),
@@ -730,7 +807,14 @@ impl Agent {
     ) {
         let (stream, cancel_tx, usage_state) = self
             .inner
-            .stream_chat_with_timeout(query, chat_history, self.max_depth, timeout, request_id)
+            .stream_chat_with_timeout(
+                query,
+                chat_history,
+                self.max_depth,
+                timeout,
+                request_id,
+                self.client_tool_names.clone(),
+            )
             .await;
         (
             self.maybe_wrap_with_fallback(stream),
@@ -1071,7 +1155,7 @@ impl AgentBuilder {
     pub async fn build_agent(&self) -> BuilderResult<Agent> {
         tracing::info!("=== Building Agent ===");
 
-        let agent = Agent::new(&self.config)
+        let agent = Agent::new(&self.config, None)
             .await
             .map_err(|e| BuilderError::AgentError(e.to_string()))?;
 

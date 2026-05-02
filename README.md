@@ -118,6 +118,7 @@ Core server options:
 | `--tool-result-mode`         | `TOOL_RESULT_MODE`         | `none`        | Tool result streaming: none, open-web-ui, aura |
 | `--tool-result-max-length`   | `TOOL_RESULT_MAX_LENGTH`   | `100`         | Max chars before truncation (aura events) |
 | `--shutdown-timeout-secs`    | `SHUTDOWN_TIMEOUT_SECS`    | `30`          | Graceful shutdown window            |
+| `--enable-client-tools`      | `ENABLE_CLIENT_TOOLS`      | `false`       | Enable client-side tool execution   |
 
 Tool result modes:
 
@@ -149,6 +150,59 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
+
+### Client-Side Tool Execution
+
+By default, Aura executes all tools server-side via MCP. When `ENABLE_CLIENT_TOOLS=true`, clients can also define their own tools in the request using the OpenAI `tools` field. The LLM can call these tools, but instead of executing server-side, the stream terminates with `finish_reason: "tool_calls"` so the client can execute the tool locally and send results back in a follow-up request.
+
+```bash
+ENABLE_CLIENT_TOOLS=true cargo run --bin aura-web-server
+```
+
+```bash
+# 1. Send a request with client-side tool definitions
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What time is it?"}],
+    "stream": true,
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "Get the current time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }]
+  }'
+
+# 2. Stream ends with finish_reason: "tool_calls" and a tool_calls delta.
+#    Client executes the tool locally, then sends results back:
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "What time is it?"},
+      {"role": "assistant", "content": null, "tool_calls": [
+        {"id": "call_abc", "type": "function", "function": {"name": "get_current_time", "arguments": "{}"}}
+      ]},
+      {"role": "tool", "tool_call_id": "call_abc", "content": "2025-03-18T14:30:00Z"}
+    ],
+    "stream": true,
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_current_time",
+        "description": "Get the current time",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    }]
+  }'
+```
+
+Client-side and server-side (MCP) tools can coexist in the same agent. The LLM sees all available tools and chooses which to call. Server-side tools execute automatically; client-side tools pause the stream for client execution.
+
+For the full streaming protocol and event details, see [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
 
