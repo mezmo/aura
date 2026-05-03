@@ -42,6 +42,9 @@ logs/
 /output/
 node_modules/
 .commitlint
+.bin/
+.npm/
+node_modules/
 
 # Generated documentation
 /doc/
