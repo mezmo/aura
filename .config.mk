@@ -1,3 +1,3 @@
 # Make Variable overrides go here
-ENABLE_DOCKER=false
+APP_NAME = aura
 SOURCE_DIR=deployment/kubernetes

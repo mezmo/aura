@@ -240,7 +240,7 @@ spec:
             metadata:
               labels:
                 app: aura-api
-                version: ${RELEASE_VERSION}
+                version: "${RELEASE_VERSION}"
             spec:
               serviceAccountName: aura-api
               containers:

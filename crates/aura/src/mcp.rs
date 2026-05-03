@@ -29,6 +29,7 @@ impl std::error::Error for ToolExecutionError {}
 
 impl From<String> for ToolExecutionError {
     fn from(message: String) -> Self {
+        let x = 4;
         Self { message }
     }
 }

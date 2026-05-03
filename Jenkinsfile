@@ -31,6 +31,7 @@ def withReport(checkName, command) {
     sh "rm -f ${logFile}"
   }
 }
+
 pipeline {
   agent {
     node {
@@ -67,7 +68,8 @@ pipeline {
     always {
       script {
         jiraSendBuildInfo site: 'logdna.atlassian.net'
-
+        archiveArtifacts allowEmptyArchive: true, artifacts: 'target/ci/reports/**', caseSensitive: false, followSymlinks: false
+        sh: 'make clean'
         if (env.SANITY_BUILD == 'true') {
           notifySlack(
             currentBuild.currentResult,
@@ -97,19 +99,56 @@ pipeline {
 
     stage('Setup') {
       steps{
-        sh 'npm install'
+        sh 'make setup'
       }
-    }
+    } // end setup
 
-    stage('Validate') {
-      stages {
-        stage("commitlint") {
+    stage('ChangeSet Validation') {
+      parallel {
+        stage("Convention Commit Check") {
           steps {
-            sh "npm run commitlint"
+            // Fixme - update commitlint for better output formatting
+            withReport('commitlint', 'make lint-commits')
           }
-        }
-      }
-    }
+        } // End Commitlint
+
+        stage("Style Check") {
+          steps {
+            withChecks('rustfmt') {
+              sh "make fmt-rust"
+              recordIssues( // needs to be in the same block as withChecks
+                tool: checkStyle(name: 'rustfmt', pattern: 'target/ci/reports/rustfmt.xml'),
+                id: 'rustfmt',
+                name: 'rustfmt',
+                enabledForFailure: true,
+                sourceDirectories: [[path: '.']],
+                qualityGates: [[threshold: 1, type: 'TOTAL', criticality: 'FAILURE']]
+              )
+            }
+          }
+        } // end rustfmt
+
+        stage("Rust Lint") {
+          steps {
+            withChecks('clippy') {
+              sh "make lint-rust || true"
+              recordIssues( // needs to be in same block as withChecks
+                tool: cargo(pattern: 'target/ci/reports/clippy.json'),
+                id: 'clippy',
+                name: 'clippy lint',
+                enabledForFailure: true,
+                sourceDirectories: [[path: '.']],
+                qualityGates: [[
+                  threshold: 1,
+                  type: 'TOTAL',
+                  criticality: 'FAILURE'
+                ]]
+              )
+            }
+          }
+        } // End Clippy
+      } // End Parallel
+    } // End Validate
 
     stage('Test Suite') {
       when {
