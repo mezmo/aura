@@ -117,12 +117,7 @@ struct CoordinatorTools {
     list_tools: Option<ListToolsTool>,
     inspect_tool_params: Option<InspectToolParamsTool>,
     vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
-    routing_tools: Option<RoutingToolSet>,
-    /// When `false`, the `create_plan` tool is omitted from the coordinator's
-    /// tool set. Used on the final iteration's post-execute call to enforce
-    /// the replan budget structurally — the coordinator must pick
-    /// `respond_directly` or `request_clarification`.
-    allow_create_plan: bool,
+    routing_tools: RoutingToolSet,
     read_artifact: Option<ReadArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
 }
@@ -506,7 +501,12 @@ impl Orchestrator {
         // Build tool wrapper: observer + duplicate guard + persistence
         let (in_flight, drain_notify, iteration, persistence_enabled) = {
             let p = self.persistence.lock().await;
-            (p.in_flight_counter(), p.drain_notify(), p.current_iteration(), p.is_enabled())
+            (
+                p.in_flight_counter(),
+                p.drain_notify(),
+                p.current_iteration(),
+                p.is_enabled(),
+            )
         };
         let persistence_wrapper = Arc::new(PersistenceWrapper::new(
             super::persistence_wrapper::PersistenceWrapperParams {
@@ -623,8 +623,7 @@ impl Orchestrator {
         worker_config.orchestration_persistence = Some(self.persistence.clone());
 
         // Give workers the submit_result tool for structured output
-        let submit_result_decision: super::tools::SubmitResultDecision =
-            Arc::new(Mutex::new(None));
+        let submit_result_decision: super::tools::SubmitResultDecision = Arc::new(Mutex::new(None));
         worker_config.orchestration_submit_result = Some(submit_result_decision.clone());
 
         // Disable orchestration in worker config to avoid nested orchestration
@@ -742,11 +741,18 @@ impl Orchestrator {
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
-        use crate::provider_agent::{CompletionResponse, StreamedAssistantContent, StreamedUserContent};
+        use crate::provider_agent::{
+            CompletionResponse, StreamedAssistantContent, StreamedUserContent,
+        };
         use futures::StreamExt;
         use rig::completion::Usage;
 
-        let StreamCallParams { prompt, history, phase, event_tx } = params;
+        let StreamCallParams {
+            prompt,
+            history,
+            phase,
+            event_tx,
+        } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let mut stream = agent.stream_chat(prompt, history).await;
@@ -878,7 +884,12 @@ impl Orchestrator {
         use futures::StreamExt;
         use rig::completion::Usage;
 
-        let StreamCallParams { prompt, history, phase, event_tx } = params;
+        let StreamCallParams {
+            prompt,
+            history,
+            phase,
+            event_tx,
+        } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
             let mut stream = agent.stream_chat_with_depth(prompt, history, 1).await;
@@ -1059,21 +1070,12 @@ impl Orchestrator {
         // already happened, so list_tools / inspect_tool_params have no
         // legitimate use at the decision point.
         let include_recon = previous.is_none();
-        // On the final iteration's post-execute call, omit `create_plan` from
-        // the tool set: the replan budget is exhausted, so the coordinator
-        // must pick `respond_directly` or `request_clarification`. The
-        // `(FINAL ATTEMPT)` urgency in the continuation prompt signals intent;
-        // stripping the tool makes it structural.
-        let allow_create_plan = match previous {
-            None => true,
-            Some(ctx) => ctx.iteration < self.config.max_planning_cycles,
-        };
         let AgentWithPreamble {
             agent: coordinator,
             preamble: coordinator_preamble,
             ..
         } = self
-            .create_coordinator(Some(routing_toolset), include_recon, allow_create_plan)
+            .create_coordinator(routing_toolset, include_recon)
             .await?;
 
         // Build prompt components (planning phase only; continuation phase
@@ -1369,6 +1371,17 @@ impl Orchestrator {
             for failure in &plan_errors {
                 tracing::warn!("  {}", failure);
             }
+        }
+
+        // In post-execute context, returning a fallback StepsPlan would loop
+        // forever (the same provider error repeats each iteration). Return Err
+        // so the raw-results bailout in run_iteration fires.
+        if previous.is_some() {
+            return Err(format!(
+                "All {} post-execute planning attempts failed (coordinator could not route)",
+                max_plan_parse_retries,
+            )
+            .into());
         }
 
         let response = PlanningResponse::StepsPlan {
@@ -1799,13 +1812,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for tool in tools.vector_tools {
             state = state.add_tool(tool);
         }
-        if let Some(routing) = tools.routing_tools {
-            state = state.add_tool(routing.respond_directly);
-            if tools.allow_create_plan {
-                state = state.add_tool(routing.create_plan);
-            }
-            state = state.add_tool(routing.request_clarification);
-        }
+        state = state.add_tool(tools.routing_tools.respond_directly);
+        state = state.add_tool(tools.routing_tools.create_plan);
+        state = state.add_tool(tools.routing_tools.request_clarification);
         if let Some(artifact_tool) = tools.read_artifact {
             state = state.add_tool(artifact_tool);
         }
@@ -1824,13 +1833,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - `list_tools`: Returns all available tool names
     /// - `inspect_tool_params`: Returns parameter schema for a specific tool
     ///
-    /// When `routing_tools` is `Some`, the three routing tools are also added to the
+    /// The three routing tools are also added to the
     /// coordinator agent, enabling structured routing decisions via tool calling.
     async fn create_coordinator(
         &self,
-        routing_tools: Option<RoutingToolSet>,
+        routing_tools: RoutingToolSet,
         allow_recon_tools: bool,
-        allow_create_plan: bool,
     ) -> Result<AgentWithPreamble, Box<dyn std::error::Error + Send + Sync>> {
         use crate::vector_dynamic::DynamicVectorSearchTool;
         use crate::vector_store::VectorStoreManager;
@@ -1940,7 +1948,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
             vector_tools,
             routing_tools,
-            allow_create_plan,
             read_artifact: Some(ReadArtifactTool::new(self.persistence.clone())),
             list_prior_runs: if include_history_tools {
                 Some(super::tools::ListPriorRunsTool::new(
@@ -2841,9 +2848,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 summary: structured_output.as_ref().map(|s| s.summary.clone()),
                 error: error_str,
                 duration_ms,
-                confidence: structured_output
-                    .as_ref()
-                    .map(|s| s.confidence.to_string()),
+                confidence: structured_output.as_ref().map(|s| s.confidence.to_string()),
                 orchestrator_notes: None,
             };
 
@@ -3120,12 +3125,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     },
                 )
                 .await;
-                self.write_direct_response_manifest(
-                    query,
-                    &response,
-                    response_summary.as_deref(),
-                )
-                .await;
+                self.write_direct_response_manifest(query, &response, response_summary.as_deref())
+                    .await;
                 Ok(response)
             }
             PlanningResponse::Clarification {
@@ -3300,9 +3301,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // MutexGuard before entering drain. on_complete tasks hold the original
         // Arc<Mutex<...>> and need the lock for file I/O.
         {
-            let drain_timeout = std::time::Duration::from_millis(
-                self.config.persistence_drain_timeout_ms(),
-            );
+            let drain_timeout =
+                std::time::Duration::from_millis(self.config.persistence_drain_timeout_ms());
             let persistence = self.persistence.lock().await.clone();
             if !persistence.drain(drain_timeout).await {
                 tracing::warn!("Persistence drain timed out — tool output refs may be incomplete");
@@ -3461,12 +3461,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest_with_summary(
-                    &plan,
-                    iteration,
-                    response_summary,
-                )
-                .await;
+                self.write_run_manifest_with_summary(&plan, iteration, response_summary)
+                    .await;
                 Ok(IterationOutcome::FinalResult(response))
             }
             Ok((
@@ -3513,10 +3509,31 @@ Assign tasks to the worker whose tools best match the required operations."#,
             Ok((resp @ PlanningResponse::StepsPlan { .. }, _, _)) => {
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "create_plan");
-                // Budget is enforced structurally: `plan_with_routing` strips
-                // `create_plan` from the tool set on the final iteration, so
-                // reaching this arm means the budget still permits another
-                // iteration.
+
+                if iteration >= self.config.max_planning_cycles {
+                    tracing::warn!(
+                        "Coordinator chose create_plan on final iteration {} (max={}). \
+                         Returning raw task results instead of looping.",
+                        iteration,
+                        self.config.max_planning_cycles,
+                    );
+                    let raw = Self::build_raw_task_results(
+                        &plan,
+                        "Replan budget exhausted: coordinator requested another iteration but max_planning_cycles reached",
+                    );
+                    Self::emit_event(
+                        event_tx,
+                        OrchestratorEvent::IterationComplete {
+                            iteration,
+                            will_replan: false,
+                            reasoning: "Replan budget exhausted".to_string(),
+                            gaps: vec![],
+                        },
+                    )
+                    .await;
+                    self.write_run_manifest(&plan, iteration).await;
+                    return Ok(IterationOutcome::FinalResult(raw));
+                }
 
                 let routing_rationale = resp.routing_rationale().to_string();
                 let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
@@ -3672,8 +3689,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             if records.is_empty() {
                 continue;
             }
-            let entries: Vec<ToolTraceEntry> =
-                records.iter().map(ToolTraceEntry::from).collect();
+            let entries: Vec<ToolTraceEntry> = records.iter().map(ToolTraceEntry::from).collect();
             traces.insert(t.id, entries);
         }
 
@@ -3682,11 +3698,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
-    async fn write_run_manifest(
-        &self,
-        plan: &Plan,
-        iterations: usize,
-    ) {
+    async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
         self.write_run_manifest_with_summary(plan, iterations, None)
             .await;
     }
