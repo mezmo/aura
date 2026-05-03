@@ -1,0 +1,11 @@
+[store]
+dir = "target"
+
+[profile.ci]
+fail-fast = false
+slow-timeout = "60s"
+
+[profile.ci.junit]
+path = 'reports/junit.xml'
+store-success-output = true
+store-failure-output = true

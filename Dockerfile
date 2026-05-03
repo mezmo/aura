@@ -1,4 +1,25 @@
-# Stage 0: linting & testing
+### 0001 Runner
+FROM rust:1.93.1 AS runner
+RUN groupadd --gid 1000 aura \
+  && useradd --uid 1000 --gid aura --shell /bin/bash --create-home aura
+
+ENV PATH="${PATH}:/home/aura/.bin"
+WORKDIR /home/aura
+
+RUN <<EOR
+  apt-get update && apt-get install -y ca-certificates libssl3 curl nodejs npm
+  rm -rf /var/lib/apt/lists/*
+EOR
+
+USER 1000
+
+RUN <<EOR
+  rustup component add rustfmt clippy llvm-tools
+  rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+EOR
+
+
+# 0002: linting & testing
 FROM rust:1.93.1 AS release-lint-test
 
 WORKDIR /usr/src/app
@@ -18,7 +39,7 @@ RUN cargo fmt --all -- --check
 RUN cargo clippy --all-targets --all-features -- -D warnings
 RUN cargo test --workspace --lib
 
-# Stage 1: release-build - Release compilation
+# 0003: release-build - Release compilation
 FROM rust:1.93.1 AS release-build
 
 WORKDIR /usr/src/app
