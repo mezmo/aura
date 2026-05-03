@@ -62,8 +62,8 @@ mkdir -p "$RESULTS_DIR"
 PROMPTS=(
   "What are the readiness probe HTTP paths for each production workload that has one configured?"
   "Which pods have restart counts above 5? For each, identify the alert rule that would fire and the pod name."
-  "Audit the security posture of production workloads. For each, report whether it runs as non-root, has readOnlyRootFilesystem, and list any environment variables that reference Kubernetes secrets."
-  "Perform a comprehensive health check across the cluster. Report ALL findings organized by category: workload health, certificate status, disk pressure, queue depths, replication lag, and any firing alerts with their affected resources."
+  "Audit the security posture of production workloads. For each, report whether it runs as non-root, has readOnlyRootFilesystem, and list the exact name of every environment variable that references a Kubernetes secret."
+  "Perform a comprehensive health check across the cluster. Report ALL findings organized by category: workload health, certificate status, disk pressure, queue depths, replication lag, and firing alerts. For each finding include the exact alert rule name and affected resource name."
   "List all production workloads that have sidecar containers. For each sidecar, report its name, image, and resource limits."
 )
 LABELS=(
