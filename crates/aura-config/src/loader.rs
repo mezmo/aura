@@ -239,6 +239,7 @@ mod tests {
 
     #[test]
     fn test_standard_loader() {
+        let _env_lock = crate::test_env_lock::lock();
         // Set some test environment variables
         unsafe {
             std::env::set_var("RIG_LLM_PROVIDER", "test_provider");
