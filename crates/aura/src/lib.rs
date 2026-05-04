@@ -105,3 +105,6 @@ pub use vector_dynamic::DynamicVectorSearchTool;
 // Fallback tool parser and stream wrapper for Ollama
 pub use fallback_tool_parser::{ParsedToolCall, parse_fallback_tool_calls};
 pub use fallback_tool_stream::FallbackToolExecutor;
+
+#[cfg(test)]
+mod test_env_lock;

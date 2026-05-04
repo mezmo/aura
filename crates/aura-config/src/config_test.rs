@@ -321,6 +321,7 @@ model = "gpt-4"
 
     #[test]
     fn test_environment_variable_placeholders() {
+        let _env_lock = crate::test_env_lock::lock();
         println!("\n=== TEST_ENVIRONMENT_VARIABLE_PLACEHOLDERS ===");
         let env_config = r#"
 [[vector_stores]]
@@ -537,6 +538,7 @@ top_p = 0.9
 
     #[test]
     fn test_ollama_additional_params_env_resolution() {
+        let _env_lock = crate::test_env_lock::lock();
         println!("\n=== TEST_OLLAMA_ADDITIONAL_PARAMS_ENV_RESOLUTION ===");
         // Set up test env var
         unsafe {
