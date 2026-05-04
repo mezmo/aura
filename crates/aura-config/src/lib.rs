@@ -7,6 +7,9 @@ pub mod loader;
 #[cfg(test)]
 mod config_test;
 
+#[cfg(test)]
+mod test_env_lock;
+
 pub use builder::RigBuilder;
 pub use config::*;
 pub use env::resolve_env_vars;
