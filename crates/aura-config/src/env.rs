@@ -129,6 +129,7 @@ host = "{{ env.TEST_HOST_NONEXISTENT | default: 'localhost' }}"
 
     #[test]
     fn test_default_value_when_env_set() {
+        let _env_lock = crate::test_env_lock::lock();
         unsafe {
             env::set_var("TEST_HOST_EXISTS", "myhost");
         }

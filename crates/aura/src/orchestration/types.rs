@@ -1116,6 +1116,7 @@ mod tests {
 
     #[test]
     fn test_iteration_context_reflection_prompt() {
+        let _env_lock = crate::test_env_lock::lock();
         // Ensure enriched mode is active (env may leak from other tests in parallel)
         unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
 
@@ -1150,6 +1151,7 @@ mod tests {
 
     #[test]
     fn test_iteration_context_reflection_prompt_no_gaps() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Simple query");
         let mut task = Task::new(0, "Execute", "Run query");
         task.complete("Done".to_string());
@@ -1168,6 +1170,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_with_failure_history() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Debug the issue");
         let mut task = Task::new(0, "Gather logs", "Collect logs");
         task.fail("Timeout contacting service");
@@ -1194,6 +1197,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_with_repeated_failures() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Debug the issue");
         let mut task = Task::new(0, "Fetch data", "Get data");
         task.fail("Connection refused");
@@ -1226,6 +1230,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_enriched_truncation() {
+        let _env_lock = crate::test_env_lock::lock();
         // Ensure enriched mode is active (env may leak from other tests in parallel)
         unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "true") };
 
@@ -1253,7 +1258,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_legacy_mode() {
-        // SAFETY: tests run with --test-threads=1 per project convention
+        let _env_lock = crate::test_env_lock::lock();
         unsafe { std::env::set_var("AURA_ENRICH_REPLAN", "false") };
 
         let mut plan = Plan::new("Test legacy");
@@ -1275,6 +1280,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_urgency_final_attempt() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
         task.fail("error");
@@ -1290,6 +1296,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_no_urgency_early_iteration() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
         task.fail("error");
@@ -1304,6 +1311,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_includes_reuse_guidance() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Completed task", "Done");
         task.complete("Some result");
@@ -1318,6 +1326,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_no_reuse_guidance_when_all_failed() {
+        let _env_lock = crate::test_env_lock::lock();
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Failed task", "Tried");
         task.fail("error");
@@ -1332,6 +1341,7 @@ mod tests {
 
     #[test]
     fn test_reflection_prompt_mixed_categories() {
+        let _env_lock = crate::test_env_lock::lock();
         unsafe { std::env::remove_var("AURA_ENRICH_REPLAN") };
 
         let mut plan = Plan::new("Mixed results");
