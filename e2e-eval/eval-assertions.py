@@ -127,7 +127,7 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
         "routing_mode": "orchestrated",
         "answer_contains": [
             "notification-service",
-            "PodCrashLoopBackOff",
+            "pod-restart-loop",
         ],
         "scratchpad_intercepted": True,
     },

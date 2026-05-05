@@ -76,7 +76,7 @@ memory_dir = "/tmp/aura-sre-hard-e2e"
 
 [orchestration.worker.k8s-discovery]
 description = "Kubernetes workload and service discovery: list namespaces, workloads, services, and inspect details"
-turn_depth = 8
+turn_depth = 12
 mcp_filter = [
   "k8s_list_namespaces",
   "k8s_list_workloads",
@@ -92,7 +92,7 @@ Report workload names, kinds, replicas, labels, ports, and annotations.
 
 [orchestration.worker.prometheus-analyst]
 description = "Observability analysis: query Prometheus metrics, check target health, inspect metric metadata, check firing alerts and alert rules"
-turn_depth = 8
+turn_depth = 12
 mcp_filter = [
   "prometheus_query",
   "prometheus_targets",
@@ -112,7 +112,7 @@ severity, and affected resources.
 
 [orchestration.worker.monitoring-engineer]
 description = "Monitoring configuration: create ServiceMonitors, apply manifests, create alerting rules"
-turn_depth = 8
+turn_depth = 12
 mcp_filter = [
   "k8s_apply_manifest",
   "k8s_list_service_monitors",

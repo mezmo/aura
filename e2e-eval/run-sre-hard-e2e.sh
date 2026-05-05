@@ -24,7 +24,7 @@ ITERATIONS="$1"; shift
 CONFIGS=("$@")
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BINARY="$PROJECT_DIR/target/release/aura-web-server"
+BINARY="${BINARY:-$PROJECT_DIR/target/release/aura-web-server}"
 ASSERT_SCRIPT="$PROJECT_DIR/e2e-eval/eval-assertions.py"
 RESULTS_DIR="$PROJECT_DIR/e2e-eval/sre-hard-results-$(date +%Y%m%d-%H%M%S)"
 PORT=8090
