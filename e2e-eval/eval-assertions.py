@@ -116,38 +116,66 @@ BUILTIN_ASSERTIONS_DEPENDENT = {
 BUILTIN_ASSERTIONS_SRE_HARD = {
     "probe-paths": {
         "routing_mode": "orchestrated",
-        "answer_contains": [
-            "/actuator/health",
-            "/healthz",
+        "workers": ["k8s-discovery"],
+        "tool_names": ["k8s_list_workloads"],
+        "tool_args_contains": [
+            {"tool": "k8s_list_workloads", "arg": "namespace", "value": "production"},
         ],
-        "scratchpad_intercepted": True,
-        "scratchpad_extracted_min": 500,
+        "tools_not_called": ["alertmanager_get_alerts", "prometheus_query"],
+        "answer_contains": [
+            "/healthz/ready",
+            "/actuator/health/ready",
+        ],
+        # Scratchpad assertions (enable after PR #32)
+        # "scratchpad_intercepted": True,
+        # "scratchpad_extracted_min": 500,
     },
     "restart-investigation": {
         "routing_mode": "orchestrated",
+        "workers": ["prometheus-analyst"],
+        "tool_names": ["prometheus_query", "alertmanager_get_alerts"],
+        "tool_args_contains": [
+            {"tool": "prometheus_query", "arg": "query", "substring": "restart"},
+        ],
+        "tools_not_called": ["k8s_apply_manifest", "alertmanager_create_rule"],
         "answer_contains": [
             "notification-service",
-            "pod-restart-loop",
         ],
-        "scratchpad_intercepted": True,
+        "answer_contains_any": [
+            ["pod-restart-loop", "PodRestartLoop"],
+        ],
+        "answer_not_contains": [
+            "celery-worker",
+        ],
+        # Scratchpad assertions (enable after PR #32)
+        # "scratchpad_intercepted": True,
     },
     "security-audit": {
         "routing_mode": "orchestrated",
+        "workers": ["k8s-discovery"],
+        "tool_names": ["k8s_list_workloads"],
+        "tool_args_contains": [
+            {"tool": "k8s_list_workloads", "arg": "namespace", "value": "production"},
+        ],
+        "tools_not_called": ["prometheus_query", "alertmanager_get_alerts"],
         "answer_contains": [
             "readOnlyRootFilesystem",
             "STRIPE_API_KEY",
+            "DB_PASSWORD",
         ],
-        "scratchpad_intercepted": True,
-        "scratchpad_extracted_min": 1000,
+        # Scratchpad assertions (enable after PR #32)
+        # "scratchpad_intercepted": True,
+        # "scratchpad_extracted_min": 1000,
     },
     "multi-category-findings": {
         "routing_mode": "orchestrated",
+        "workers": ["k8s-discovery", "prometheus-analyst"],
+        "tool_names": ["k8s_list_workloads", "alertmanager_get_alerts"],
+        "tools_not_called": ["k8s_apply_manifest", "alertmanager_create_rule"],
         "answer_contains": [
             "HighErrorRate",
             "CertExpiringSoon",
             "PodCrashLoopBackOff",
-            "RabbitMQQueueDepth",
-            "PostgresReplicationLag",
         ],
         "category_markers": [
             "HighErrorRate",
@@ -160,16 +188,24 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
             "HighLatencyP99",
             "PodRestartLoop",
         ],
-        "category_min": 6,
+        "category_min": 7,
     },
     "sidecar-infrastructure": {
         "routing_mode": "orchestrated",
+        "workers": ["k8s-discovery"],
+        "tool_names": ["k8s_list_workloads"],
+        "tool_args_contains": [
+            {"tool": "k8s_list_workloads", "arg": "namespace", "value": "production"},
+        ],
+        "tools_not_called": ["prometheus_query", "alertmanager_get_alerts"],
         "answer_contains": [
             "istio-proxy",
             "log-forwarder",
+            "proxyv2",
         ],
-        "scratchpad_intercepted": True,
-        "scratchpad_extracted_min": 500,
+        # Scratchpad assertions (enable after PR #32)
+        # "scratchpad_intercepted": True,
+        # "scratchpad_extracted_min": 500,
     },
 }
 
@@ -393,6 +429,146 @@ def check_no_task_failures(prompt: str, parsed: dict) -> AssertionResult:
     return AssertionResult(prompt, "no_task_failures", False, summary)
 
 
+def check_tool_args_contains(
+    prompt: str, parsed: dict, specs: list[dict],
+) -> list[AssertionResult]:
+    """Verify a specific tool was called with expected argument values or substrings.
+
+    Each spec dict has:
+      - "tool": tool name to match
+      - "arg": argument key to check
+      - "value": exact match (mutually exclusive with "substring")
+      - "substring": substring match (mutually exclusive with "value")
+    """
+    results = []
+    tasks = parsed.get("tasks", [])
+    all_tool_calls = [tc for t in tasks for tc in t.get("tool_calls", [])]
+
+    for spec in specs:
+        tool_name = spec["tool"]
+        arg_key = spec["arg"]
+        exact_value = spec.get("value")
+        substring = spec.get("substring")
+
+        matching_calls = [tc for tc in all_tool_calls if tc.get("tool_name") == tool_name]
+        if not matching_calls:
+            results.append(AssertionResult(
+                prompt, f"tool_args:{tool_name}.{arg_key}",
+                False, f"tool {tool_name} was never called",
+            ))
+            continue
+
+        found = False
+        for tc in matching_calls:
+            args = tc.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+            arg_val = args.get(arg_key, "")
+            if exact_value is not None and str(arg_val) == str(exact_value):
+                found = True
+                break
+            if substring is not None and substring in str(arg_val):
+                found = True
+                break
+
+        check_label = f"tool_args:{tool_name}.{arg_key}"
+        if exact_value is not None:
+            expected_desc = f"value={exact_value!r}"
+        else:
+            expected_desc = f"substring={substring!r}"
+
+        if found:
+            results.append(AssertionResult(
+                prompt, check_label, True, f"found ({expected_desc})",
+            ))
+        else:
+            actual_vals = []
+            for tc in matching_calls:
+                args = tc.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                actual_vals.append(str(args.get(arg_key, "<missing>")))
+            results.append(AssertionResult(
+                prompt, check_label, False,
+                f"expected {expected_desc}, actual values: {actual_vals}",
+            ))
+    return results
+
+
+def check_tools_not_called(
+    prompt: str, parsed: dict, tool_names: list[str],
+) -> list[AssertionResult]:
+    """Verify specific tools were NOT invoked."""
+    results = []
+    actual_tools = set(parsed.get("tool_names", []))
+
+    for tool in tool_names:
+        if tool not in actual_tools:
+            results.append(AssertionResult(
+                prompt, f"tool_not_called:{tool}", True, "correctly absent",
+            ))
+        else:
+            results.append(AssertionResult(
+                prompt, f"tool_not_called:{tool}", False,
+                f"was called but should not have been",
+            ))
+    return results
+
+
+def check_answer_contains_any(
+    prompt: str, parsed: dict, groups: list[list[str]],
+) -> list[AssertionResult]:
+    """Assert that the answer contains at least one alternative from each group."""
+    results = []
+    answer = parsed.get("answer_text", "")
+
+    for group in groups:
+        found_alt = None
+        for alt in group:
+            if alt in answer:
+                found_alt = alt
+                break
+
+        label = f"answer_contains_any:{'/'.join(group)}"
+        if found_alt:
+            results.append(AssertionResult(
+                prompt, label, True, f"found {found_alt!r}",
+            ))
+        else:
+            preview = answer[:100] + "..." if len(answer) > 100 else answer
+            results.append(AssertionResult(
+                prompt, label, False,
+                f"none of {group} found in: {preview!r}",
+            ))
+    return results
+
+
+def check_answer_not_contains(
+    prompt: str, parsed: dict, strings: list[str],
+) -> list[AssertionResult]:
+    """Assert that the answer does NOT contain specific strings."""
+    results = []
+    answer = parsed.get("answer_text", "")
+
+    for s in strings:
+        if s not in answer:
+            results.append(AssertionResult(
+                prompt, f"answer_not_contains:{s}", True, "correctly absent",
+            ))
+        else:
+            results.append(AssertionResult(
+                prompt, f"answer_not_contains:{s}", False,
+                f"found {s!r} in answer but expected it absent",
+            ))
+    return results
+
+
 def run_assertions(
     prompt: str,
     parsed: dict,
@@ -420,6 +596,30 @@ def run_assertions(
     # Answer contains
     if "answer_contains" in assertion_spec:
         results.extend(check_answer_contains(prompt, parsed, assertion_spec["answer_contains"]))
+
+    # Tool argument assertions
+    if "tool_args_contains" in assertion_spec:
+        results.extend(check_tool_args_contains(
+            prompt, parsed, assertion_spec["tool_args_contains"],
+        ))
+
+    # Negative tool assertions
+    if "tools_not_called" in assertion_spec:
+        results.extend(check_tools_not_called(
+            prompt, parsed, assertion_spec["tools_not_called"],
+        ))
+
+    # Answer contains any (alternative groups)
+    if "answer_contains_any" in assertion_spec:
+        results.extend(check_answer_contains_any(
+            prompt, parsed, assertion_spec["answer_contains_any"],
+        ))
+
+    # Answer must not contain
+    if "answer_not_contains" in assertion_spec:
+        results.extend(check_answer_not_contains(
+            prompt, parsed, assertion_spec["answer_not_contains"],
+        ))
 
     # Scratchpad assertions (skippable via --skip-scratchpad)
     if not skip_scratchpad:

@@ -37,12 +37,14 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 model_name_from_config() {
-  local base
+  local base orig
   base="$(basename "$1" .toml)"
+  orig="$base"
   base="${base#sre-orchestration-with-}"
   base="${base#sre-orchestration-}"
   base="${base#sre-scratchpad-}"
-  echo "$base"
+  base="${base#sre-hard-e2e-}"
+  echo "${base:-$orig}"
 }
 
 cleanup() {
@@ -85,11 +87,13 @@ docker run -d --name "$SRE_CONTAINER_NAME" \
   -e VERBOSE_MODE=true \
   k8s-sre-mcp:local >/dev/null
 
+MCP_INIT_BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}'
 echo -n "Waiting for k8s-sre-mcp..."
 for i in $(seq 1 30); do
   if curl -sf "http://127.0.0.1:$SRE_MCP_PORT/mcp" -X POST \
        -H "Content-Type: application/json" \
-       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' \
+       -H "Accept: application/json, text/event-stream" \
+       -d "$MCP_INIT_BODY" \
        >/dev/null 2>&1; then
     echo " ready"
     break
@@ -97,6 +101,14 @@ for i in $(seq 1 30); do
   sleep 1
   echo -n "."
 done
+if ! curl -sf "http://127.0.0.1:$SRE_MCP_PORT/mcp" -X POST \
+     -H "Content-Type: application/json" \
+     -H "Accept: application/json, text/event-stream" \
+     -d "$MCP_INIT_BODY" \
+     >/dev/null 2>&1; then
+  echo " FAILED (timeout after 30s)"
+  exit 1
+fi
 
 # ── Run E2E ──────────────────────────────────────────────────────
 
@@ -137,6 +149,10 @@ for config in "${CONFIGS[@]}"; do
       sleep 1
       echo -n "."
     done
+    if ! curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+      echo " FAILED (timeout after 30s)"
+      exit 1
+    fi
 
     for idx in "${!PROMPTS[@]}"; do
       prompt="${PROMPTS[$idx]}"
