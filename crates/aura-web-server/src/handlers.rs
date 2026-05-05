@@ -1,9 +1,14 @@
-use actix_web::{HttpResponse, web};
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
     tool_event_subscribe, tool_usage_subscribe,
 };
 use aura_config::RigBuilder;
+use axum::Json;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,7 +98,7 @@ enum DeliveryMode {
     },
     /// Streaming SSE: send chunks via mpsc.
     Sse {
-        chunk_tx: mpsc::Sender<Result<actix_web::web::Bytes, String>>,
+        chunk_tx: mpsc::Sender<Result<Bytes, String>>,
         heartbeat_interval: std::time::Duration,
     },
 }
@@ -116,19 +121,18 @@ struct ResponseContext {
 async fn build_agent_for_request(
     config: &aura_config::Config,
     req_headers: &HashMap<String, String>,
-) -> Result<Arc<aura::Agent>, HttpResponse> {
+) -> Result<Arc<aura::Agent>, Response> {
     let builder = RigBuilder::new(config.clone());
     let agent = builder
         .build_agent_with_headers(Some(req_headers))
         .await
         .map_err(|e| {
             error!("Failed to build agent: {}", e);
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Failed to build agent: {e}"),
-                    error_type: "internal_error".to_string(),
-                },
-            })
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build agent: {e}"),
+                "internal_error",
+            )
         })?;
     Ok(Arc::new(agent))
 }
@@ -148,29 +152,27 @@ struct RequestSetup {
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
 async fn prepare_request(
-    data: &web::Data<AppState>,
+    data: &Arc<AppState>,
     req: &mut ChatCompletionRequest,
     chat_session_id: &str,
     req_headers_map: &HashMap<String, String>,
-) -> Result<RequestSetup, HttpResponse> {
+) -> Result<RequestSetup, Response> {
     // Pop the last message as the query — the remainder becomes chat history
     let query = match req.messages.pop() {
         Some(msg) if msg.role == Role::User => msg.content,
         Some(msg) => {
-            return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: format!("Last message must be from user, got: {}", msg.role),
-                    error_type: "invalid_request_error".to_string(),
-                },
-            }));
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Last message must be from user, got: {}", msg.role),
+                "invalid_request_error",
+            ));
         }
         None => {
-            return Err(HttpResponse::BadRequest().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "messages array is empty".to_string(),
-                    error_type: "invalid_request_error".to_string(),
-                },
-            }));
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "messages array is empty",
+                "invalid_request_error",
+            ));
         }
     };
 
@@ -189,12 +191,20 @@ async fn prepare_request(
             .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
             .cloned()
             .ok_or_else(|| {
-                HttpResponse::NotFound().json(ChatCompletionErrorResponse::ModelNotFound(
-                    model_name.to_string(),
-                ))
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ChatCompletionErrorResponse::ModelNotFound(
+                        model_name.to_string(),
+                    )),
+                )
+                    .into_response()
             })?
     } else {
-        return Err(HttpResponse::BadRequest().json(ChatCompletionErrorResponse::ModelNotProvided));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ChatCompletionErrorResponse::ModelNotProvided),
+        )
+            .into_response());
     };
 
     // Build the appropriate agent type based on orchestration config
@@ -209,12 +219,11 @@ async fn prepare_request(
             .await
             .map_err(|e| {
                 error!("Failed to build streaming agent: {}", e);
-                HttpResponse::InternalServerError().json(ErrorResponse {
-                    error: ErrorDetail {
-                        message: format!("Failed to build streaming agent: {e}"),
-                        error_type: "internal_error".to_string(),
-                    },
-                })
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to build streaming agent: {e}"),
+                    "internal_error",
+                )
             })?
     } else {
         // Standard path: build Agent, coerce to Arc<dyn StreamingAgent>
@@ -239,20 +248,19 @@ async fn prepare_request(
 }
 
 /// Handle chat completions endpoint
-#[tracing::instrument(name = "chat_completions", skip(data, req, http_req), fields(otel.kind = "server"))]
+#[tracing::instrument(name = "chat_completions", skip(state, req, headers), fields(otel.kind = "server"))]
 pub async fn chat_completions(
-    data: web::Data<AppState>,
-    req: web::Json<ChatCompletionRequest>,
-    http_req: actix_web::HttpRequest,
-) -> HttpResponse {
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(mut req): Json<ChatCompletionRequest>,
+) -> Response {
     // Validate we have messages
     if req.messages.is_empty() {
-        return HttpResponse::BadRequest().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "No messages provided".to_string(),
-                error_type: "invalid_request_error".to_string(),
-            },
-        });
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "No messages provided",
+            "invalid_request_error",
+        );
     }
 
     // Extract or generate chat_session_id
@@ -263,38 +271,35 @@ pub async fn chat_completions(
         .and_then(|m| m.get("chat_session_id"))
         .cloned()
         .or_else(|| {
-            http_req
-                .headers()
+            headers
                 .get("X-Chat-Session-Id")
-                .or_else(|| http_req.headers().get("x-openwebui-chat-id"))
+                .or_else(|| headers.get("x-openwebui-chat-id"))
                 .and_then(|h| h.to_str().ok())
                 .map(String::from)
         })
         .unwrap_or_else(generate_chat_session_id);
 
-    // Convert actix HeaderMap to HashMap for framework-agnostic passing
-    let req_headers_map: HashMap<String, String> = http_req
-        .headers()
+    // Convert HeaderMap to HashMap for framework-agnostic passing
+    let req_headers_map: HashMap<String, String> = headers
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
         .collect();
 
-    let mut req = req.into_inner();
-    let setup = match prepare_request(&data, &mut req, &chat_session_id, &req_headers_map).await {
+    let setup = match prepare_request(&state, &mut req, &chat_session_id, &req_headers_map).await {
         Ok(s) => s,
         Err(response) => return response,
     };
 
     if req.stream == Some(true) {
-        handle_streaming_completion(data, setup, req.max_tokens).await
+        handle_streaming_completion(state, setup, req.max_tokens).await
     } else {
-        handle_non_streaming_completion(&data, setup, req.max_tokens).await
+        handle_non_streaming_completion(&state, setup, req.max_tokens).await
     }
 }
 
 /// Build configuration for the spawned completion task from AppState and RequestSetup.
 fn build_completion_config(
-    data: &web::Data<AppState>,
+    data: &Arc<AppState>,
     setup: &RequestSetup,
     max_tokens: Option<u32>,
     emit_custom_events: bool,
@@ -483,7 +488,7 @@ fn build_json_response(
     response_ctx: ResponseContext,
     max_tokens: Option<u32>,
     collected: CollectedResult,
-) -> HttpResponse {
+) -> Response {
     // Get usage: prefer stream outcome (from Final), fall back to UsageState from hook
     let (prompt_tokens, completion_tokens, total_tokens) = collected
         .outcome
@@ -528,15 +533,15 @@ fn build_json_response(
         metadata: Some(response_metadata),
     };
 
-    HttpResponse::Ok().json(chat_response)
+    Json(chat_response).into_response()
 }
 
 #[tracing::instrument(name = "non_streaming_completion", skip_all, fields(session.id = %setup.chat_session_id))]
 async fn handle_non_streaming_completion(
-    data: &web::Data<AppState>,
+    data: &Arc<AppState>,
     setup: RequestSetup,
     max_tokens: Option<u32>,
-) -> HttpResponse {
+) -> Response {
     let config = build_completion_config(data, &setup, max_tokens, false, false);
 
     {
@@ -562,12 +567,11 @@ async fn handle_non_streaming_completion(
         Ok(collected) => build_json_response(response_ctx, max_tokens, collected),
         Err(_) => {
             error!("Completion task panicked or was dropped");
-            HttpResponse::InternalServerError().json(ErrorResponse {
-                error: ErrorDetail {
-                    message: "Internal error during completion".to_string(),
-                    error_type: "internal_error".to_string(),
-                },
-            })
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error during completion",
+                "internal_error",
+            )
         }
     }
 }
@@ -575,10 +579,10 @@ async fn handle_non_streaming_completion(
 /// Handle streaming completion using Server-Sent Events.
 #[tracing::instrument(name = "streaming_completion", skip_all, fields(session.id = %setup.chat_session_id))]
 async fn handle_streaming_completion(
-    data: web::Data<AppState>,
+    data: Arc<AppState>,
     setup: RequestSetup,
     max_tokens: Option<u32>,
-) -> HttpResponse {
+) -> Response {
     let config = build_completion_config(
         &data,
         &setup,
@@ -594,8 +598,7 @@ async fn handle_streaming_completion(
 
     let chat_session_id = setup.chat_session_id.clone();
 
-    let (chunk_tx, rx) =
-        mpsc::channel::<Result<actix_web::web::Bytes, String>>(data.streaming_buffer_size);
+    let (chunk_tx, rx) = mpsc::channel::<Result<Bytes, String>>(data.streaming_buffer_size);
 
     let heartbeat_interval = std::time::Duration::from_secs(15);
 
@@ -613,14 +616,16 @@ async fn handle_streaming_completion(
 
     use futures_util::TryStreamExt;
     let response_stream =
-        ReceiverStream::new(rx).map_err(actix_web::error::ErrorInternalServerError);
+        ReceiverStream::new(rx).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-    HttpResponse::Ok()
-        .content_type("text/event-stream")
-        .insert_header(("Cache-Control", "no-cache"))
-        .insert_header(("X-Accel-Buffering", "no"))
-        .insert_header(("X-Chat-Session-Id", chat_session_id))
-        .streaming(response_stream)
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .header("X-Chat-Session-Id", chat_session_id.as_str())
+        .body(Body::from_stream(response_stream))
+        .unwrap()
 }
 
 /// Convert OpenAI-format chat messages to Rig messages, sanitizing the history:
@@ -652,16 +657,17 @@ fn convert_chat_messages(messages: &[ChatMessage]) -> Vec<aura::Message> {
 }
 
 /// Health check endpoint
-pub async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
+pub async fn health() -> Response {
+    Json(serde_json::json!({
         "status": "healthy"
     }))
+    .into_response()
 }
 
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
-pub async fn list_models(data: web::Data<AppState>) -> HttpResponse {
-    let models: Vec<serde_json::Value> = data
+pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
+    let models: Vec<serde_json::Value> = state
         .configs
         .iter()
         .map(|config| {
@@ -680,15 +686,28 @@ pub async fn list_models(data: web::Data<AppState>) -> HttpResponse {
         })
         .collect();
 
-    HttpResponse::Ok().json(serde_json::json!({
+    Json(serde_json::json!({
         "object": "list",
         "data": models
     }))
+    .into_response()
 }
 
 /// Generate a chat session ID (simple GUID)
 fn generate_chat_session_id() -> String {
     format!("cs_{}", Uuid::new_v4().simple())
+}
+
+fn error_response(status: StatusCode, message: impl Into<String>, error_type: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message: message.into(),
+                error_type: error_type.into(),
+            },
+        }),
+    ).into_response()
 }
 
 #[cfg(test)]
@@ -841,8 +860,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_json_response_normal_stop() {
+    #[tokio::test]
+    async fn test_build_json_response_normal_stop() {
         let collected = CollectedResult {
             outcome: StreamOutcome {
                 content: "Hello!".to_string(),
@@ -858,9 +877,8 @@ mod tests {
         let resp = build_json_response(make_response_ctx(), None, collected);
         assert_eq!(resp.status(), 200);
 
-        let body = actix_web::body::to_bytes(resp.into_body());
-        let body = futures_util::FutureExt::now_or_never(body)
-            .unwrap()
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
@@ -874,8 +892,8 @@ mod tests {
         assert_eq!(json["metadata"]["chat_session_id"], "cs_test");
     }
 
-    #[test]
-    fn test_build_json_response_finish_reason_length() {
+    #[tokio::test]
+    async fn test_build_json_response_finish_reason_length() {
         let collected = CollectedResult {
             outcome: StreamOutcome {
                 content: "truncated response".to_string(),
@@ -890,17 +908,16 @@ mod tests {
 
         // max_tokens = 50, completion_tokens = 50 -> finish_reason = "length"
         let resp = build_json_response(make_response_ctx(), Some(50), collected);
-        let body =
-            futures_util::FutureExt::now_or_never(actix_web::body::to_bytes(resp.into_body()))
-                .unwrap()
-                .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["choices"][0]["finish_reason"], "length");
     }
 
-    #[test]
-    fn test_build_json_response_usage_fallback_to_usage_state() {
+    #[tokio::test]
+    async fn test_build_json_response_usage_fallback_to_usage_state() {
         // When outcome.usage is None, build_json_response falls back to usage_state.
         // A fresh UsageState returns (0, 0, 0) from get_final_usage().
         let collected = CollectedResult {
@@ -912,10 +929,9 @@ mod tests {
         };
 
         let resp = build_json_response(make_response_ctx(), None, collected);
-        let body =
-            futures_util::FutureExt::now_or_never(actix_web::body::to_bytes(resp.into_body()))
-                .unwrap()
-                .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Falls back to UsageState::new() which returns all zeros
