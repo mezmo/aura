@@ -26,6 +26,7 @@ LOCAL_OUTPUTS := $(patsubst $(OUTPUT_DIR)/%,$(RENDERED_DIR)/%,$(OUTPUTS))
 build:: render
 lint:: render lint-k8s lint-yaml ## Run all linting rules
 publish:: publish-s3
+clean:: clean-k8s
 
 .PHONY:.check-env
 .check-env: .check-env-render .check-env-publish
@@ -75,3 +76,7 @@ publish-s3: .check-env render
 ifeq ("$(PUBLISH_LATEST)", "true")
 	$(S3_SYNC_COMMAND) $(OUTPUT_DIR) $(S3_TARGET_PATH)/latest
 endif
+
+.PHONY:clean-k8s
+clean-k8s: ## Clean up kubernetes rendering artifacts
+	-rm -rf *.backup $(TMP_DIR) $(OUTPUT_DIR)

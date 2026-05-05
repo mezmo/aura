@@ -82,6 +82,7 @@ There are many ways to contribute beyond writing code:
 - **Rust (nightly)** — Aura requires the nightly toolchain. The repo includes a `rust-toolchain.toml` that handles this automatically.
 - **Docker and Docker Compose** — Required for integration tests and containerized builds.
 - **Git** — For version control and contributing via pull requests.
+- **Node.js (22+)** -- *Optional* Used in various CI processes (commit linting, release generation, etc)
 
 ### Getting Started
 
@@ -293,8 +294,7 @@ cargo test --package aura-web-server --features integration-streaming --no-fail-
 
 ## Commit Message Convention
 
-This project uses [Conventional Commits](https://www.conventionalcommits.org/) and enforces them via CI. **Every commit** on `main` must follow this format because we use rebase merging to maintain a linear history.
-
+This project uses [Conventional Commits](https://www.conventionalcommits.org/) and enforces them via CI. **Every commit** on `main` must follow this format because we use rebase merging to maintain a linear history. 
 ### Format
 
 The first line, which includes the type and description, must be entirely lowercase. The body
@@ -372,6 +372,10 @@ Update your config.toml files accordingly.
    ```
 
 3. **Ensure all commits follow** the [Conventional Commits](#commit-message-convention) format.
+
+```bash
+> make lint-commits
+```
 
 4. **Update documentation** if your change affects user-facing behavior, configuration, or APIs.
 

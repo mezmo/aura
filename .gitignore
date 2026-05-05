@@ -9,6 +9,8 @@
 *.swp
 *.swo
 *~
+Session.vim
+.viminspector.json
 
 # OS
 .DS_Store
@@ -37,6 +39,9 @@ logs/
 *.bk
 *.bak
 /tmp/
+/output/
+node_modules/
+.commitlint
 
 # Generated documentation
 /doc/
@@ -57,9 +62,6 @@ compose/env/.env*
 
 # Rig source code (external dependency for research)
 /rig-source/
-
-# Vim session files
-Session.vim
 
 # Claude Code (keep local only)
 .claude/
