@@ -78,6 +78,10 @@ pub(super) const STREAM_CHUNK_SIZE: usize = 50;
 /// Allows: 1 recon tool (list_tools) + 1 routing tool + 1 spare.
 const PLANNING_COORDINATOR_MAX_DEPTH: usize = 3;
 
+/// Maximum attempts for a worker task before giving up.
+/// Attempt 1 = normal execution. Attempt 2 = retry with correction prompt.
+const MAX_WORKER_ATTEMPTS: usize = 2;
+
 // ============================================================================
 // Helper Structs
 // ============================================================================
@@ -2714,158 +2718,283 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        // Create worker with persistence context (attempt 1 for now - retry logic is Phase 2+)
-        let attempt = 1;
-        let start_time = std::time::Instant::now();
-        let AgentWithPreamble {
-            agent: worker,
-            preamble: worker_preamble,
-            escalation_flag,
-            submit_result_decision,
-        } = self.create_worker(task_id, attempt, *worker_name).await?;
-
-        // Build the worker prompt — task-first, no original query (prevents scope creep)
+        // Build the base worker prompt once — reused across retry attempts
         let context_str = task_context
             .as_ref()
             .map(|c| format!("{}\n\n", c))
             .unwrap_or_default();
-        let worker_prompt =
+        let base_worker_prompt =
             super::templates::render_worker_task_prompt(&super::templates::WorkerTaskVars {
                 orchestration_goal: plan_goal,
                 context: &context_str,
                 your_task: task_description,
             });
 
-        // Record in prompt journal
-        self.journal_record(
-            JournalPhase::Worker {
-                task_id,
-                worker_name: *worker_name,
-                attempt,
-            },
-            &worker_preamble,
-            &worker_prompt,
-        );
+        let start_time = std::time::Instant::now();
+        let mut last_usage = rig::completion::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        };
+        let mut last_raw_response = String::new();
+        let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
-        // Execute the task (workers get context from the task prompt, not conversation history)
-        let srd = submit_result_decision.clone();
-        let result = self
-            .stream_and_forward(
-                &worker,
-                StreamCallParams {
-                    prompt: &worker_prompt,
-                    history: vec![],
-                    phase: "Worker task",
-                    event_tx,
-                },
-                worker_name.map(|name| StreamContext {
+        for attempt in 1..=MAX_WORKER_ATTEMPTS {
+            let is_final_attempt = attempt == MAX_WORKER_ATTEMPTS;
+
+            let AgentWithPreamble {
+                agent: worker,
+                preamble: worker_preamble,
+                escalation_flag,
+                submit_result_decision,
+            } = self.create_worker(task_id, attempt, *worker_name).await?;
+
+            // Build prompt for this attempt
+            let (prompt, history) = if attempt == 1 {
+                (base_worker_prompt.clone(), vec![])
+            } else {
+                // Retry: append correction to previous conversation
+                let correction = "[SYSTEM CORRECTION] You did not call the submit_result tool in your previous response. \
+You MUST call submit_result to complete this task. Please try again.".to_string();
+                let history = vec![
+                    rig::completion::Message::user(base_worker_prompt.clone()),
+                    rig::completion::Message::assistant(last_raw_response.clone()),
+                ];
+                (correction, history)
+            };
+
+            // Record in prompt journal
+            self.journal_record(
+                JournalPhase::Worker {
                     task_id,
-                    worker_id: name,
-                }),
-                || {
-                    let srd = srd.clone();
-                    Box::pin(async move { srd.lock().await.is_some() })
+                    worker_name: *worker_name,
+                    attempt,
                 },
-            )
-            .await;
-        let duration_ms = start_time.elapsed().as_millis() as u64;
-
-        // Record token usage on the orchestration.worker span
-        if let Ok(ref response) = result {
-            let span = tracing::Span::current();
-            crate::logging::set_token_usage(
-                &span,
-                response.usage.input_tokens,
-                response.usage.output_tokens,
-                response.usage.total_tokens,
-                0,
+                &worker_preamble,
+                &prompt,
             );
-            self.usage_state
-                .accumulate_usage(response.usage.input_tokens, response.usage.output_tokens);
-        }
 
-        // Detect context overflow in worker and provide actionable message
-        let result = match result {
-            Ok(r) => Ok(r.content),
-            Err(e) if is_context_overflow_error(e.as_ref()) => {
-                let suggestion = context_overflow_suggestion("worker");
-                Err(format!(
-                    "Worker context limit exceeded for task {}. {}",
-                    task_id, suggestion
+            // Execute the task
+            let srd = submit_result_decision.clone();
+            let stream_result = self
+                .stream_and_forward(
+                    &worker,
+                    StreamCallParams {
+                        prompt: &prompt,
+                        history,
+                        phase: "Worker task",
+                        event_tx,
+                    },
+                    worker_name.map(|name| StreamContext {
+                        task_id,
+                        worker_id: name,
+                    }),
+                    || {
+                        let srd = srd.clone();
+                        Box::pin(async move { srd.lock().await.is_some() })
+                    },
                 )
-                .into())
-            }
-            Err(e) => Err(e),
-        };
+                .await;
 
-        // Check escalation flag: guard detected a duplicate call loop but
-        // rig reported Ok. Convert to Err so the task is marked Failed and
-        // dependents are blocked in the DAG.
-        let result: Result<String, StreamError> = match result {
-            Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
-                let processed = self
-                    .maybe_create_artifact(task_id, *worker_name, worker_output)
-                    .await;
-                Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
+            // Track token usage per attempt.
+            // usage_state tracks TOTAL cost across all attempts (each is a separate API call).
+            // Span metrics capture only the final attempt's usage (what produced the result).
+            if let Ok(ref response) = stream_result {
+                self.usage_state.accumulate_usage(
+                    response.usage.input_tokens,
+                    response.usage.output_tokens,
+                );
+                last_usage = response.usage;
             }
-            other => other,
-        };
 
-        // Extract structured output from submit_result. Workers are required
-        // to call submit_result; failure to do so is treated as a task failure
-        // (SoftFailure category — worker produced output but didn't follow protocol).
-        let (result, structured_output): (
-            Result<String, StreamError>,
-            Option<super::types::StructuredTaskOutput>,
-        ) = match result {
-            Ok(raw_response) => {
-                let structured = submit_result_decision.lock().await.take();
-                match structured {
-                    Some(output) => (
-                        Ok(output.result),
-                        Some(super::types::StructuredTaskOutput {
-                            summary: output.summary,
-                            confidence: output.confidence,
-                        }),
-                    ),
-                    None => {
-                        tracing::warn!(
-                            "Worker did not call submit_result for task {}. Preserving raw output via artifact flow.",
-                            task_id
-                        );
-                        (Ok(raw_response), None)
+            // Detect context overflow and other errors — don't retry hard errors
+            let result = match stream_result {
+                Ok(r) => Ok(r.content),
+                Err(e) if is_context_overflow_error(e.as_ref()) => {
+                    let suggestion = context_overflow_suggestion("worker");
+                    Err(format!(
+                        "Worker context limit exceeded for task {}. {}",
+                        task_id, suggestion
+                    )
+                    .into())
+                }
+                Err(e) => Err(e),
+            };
+
+            // Check escalation flag (duplicate call loop)
+            let result: Result<String, StreamError> = match result {
+                Ok(worker_output)
+                    if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    let processed = self
+                        .maybe_create_artifact(task_id, *worker_name, worker_output)
+                        .await;
+                    Err(format!("Worker blocked by duplicate call loop.\n{processed}").into())
+                }
+                other => other,
+            };
+
+            // Extract structured output from submit_result
+            match result {
+                Ok(raw_response) => {
+                    let structured = submit_result_decision.lock().await.take();
+                    match structured {
+                        Some(output) => {
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            self.set_worker_span_usage(
+                                last_usage.input_tokens,
+                                last_usage.output_tokens,
+                                last_usage.total_tokens,
+                            );
+                            self.persist_worker_execution(
+                                task_id,
+                                task_description,
+                                attempt,
+                                duration_ms,
+                                Ok(&output.result),
+                                Some(&super::types::StructuredTaskOutput {
+                                    summary: output.summary.clone(),
+                                    confidence: output.confidence,
+                                }),
+                                &prompt,
+                            )
+                            .await;
+                            return Ok(TaskExecutionResult {
+                                result: output.result,
+                                structured_output: Some(super::types::StructuredTaskOutput {
+                                    summary: output.summary,
+                                    confidence: output.confidence,
+                                }),
+                            });
+                        }
+                        None if is_final_attempt => {
+                            tracing::warn!(
+                                "Worker did not call submit_result for task {} after {} attempts. Preserving raw output via artifact flow.",
+                                task_id, attempt
+                            );
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            self.set_worker_span_usage(
+                                last_usage.input_tokens,
+                                last_usage.output_tokens,
+                                last_usage.total_tokens,
+                            );
+                            self.persist_worker_execution(
+                                task_id,
+                                task_description,
+                                attempt,
+                                duration_ms,
+                                Ok(&raw_response),
+                                None,
+                                &prompt,
+                            )
+                            .await;
+                            return Ok(TaskExecutionResult {
+                                result: raw_response,
+                                structured_output: None,
+                            });
+                        }
+                        None => {
+                            tracing::info!(
+                                "Worker attempt {} for task {} did not call submit_result. Retrying with correction.",
+                                attempt, task_id
+                            );
+                            last_raw_response = raw_response;
+                            continue;
+                        }
                     }
                 }
+                Err(e) => {
+                    last_error = Some(e);
+                    break; // Hard errors are not retried
+                }
             }
-            Err(e) => (Err(e), None),
+        }
+
+        // All attempts exhausted or hard error occurred
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        self.set_worker_span_usage(
+            last_usage.input_tokens,
+            last_usage.output_tokens,
+            last_usage.total_tokens,
+        );
+        if let Some(ref e) = last_error {
+            self.persist_worker_execution(
+                task_id,
+                task_description,
+                MAX_WORKER_ATTEMPTS,
+                duration_ms,
+                Err(e.as_ref()),
+                None,
+                &base_worker_prompt,
+            )
+            .await;
+            Err(format!(
+                "Worker failed task {} after {} attempts: {}",
+                task_id, MAX_WORKER_ATTEMPTS, e
+            )
+            .into())
+        } else {
+            // Should not reach here — final attempt should have returned above
+            self.persist_worker_execution(
+                task_id,
+                task_description,
+                MAX_WORKER_ATTEMPTS,
+                duration_ms,
+                Ok(&last_raw_response),
+                None,
+                &base_worker_prompt,
+            )
+            .await;
+            Ok(TaskExecutionResult {
+                result: last_raw_response,
+                structured_output: None,
+            })
+        }
+    }
+
+    /// Set token usage metrics on the current orchestration.worker span.
+    /// usage_state is already updated per-attempt in the retry loop.
+    fn set_worker_span_usage(&self, input: u64, output: u64, total: u64) {
+        let span = tracing::Span::current();
+        crate::logging::set_token_usage(&span, input, output, total, 0);
+    }
+
+    /// Persist a single worker execution attempt to the journal and persistence store.
+    async fn persist_worker_execution(
+        &self,
+        task_id: usize,
+        task_description: &str,
+        attempt: usize,
+        duration_ms: u64,
+        result: Result<&str, &(dyn std::error::Error + Send + Sync)>,
+        structured_output: Option<&super::types::StructuredTaskOutput>,
+        worker_prompt: &str,
+    ) {
+        let (result_str, error_str) = match result {
+            Ok(r) => (Some(r.to_string()), None),
+            Err(e) => (None, Some(e.to_string())),
         };
 
-        // Persist the worker execution
+        let record = super::persistence::TaskExecutionRecord {
+            task_id,
+            description: task_description.to_string(),
+            attempt,
+            approach: "Direct task execution via worker agent".to_string(),
+            result: result_str.clone(),
+            summary: structured_output.map(|s| s.summary.clone()),
+            error: error_str,
+            duration_ms,
+            confidence: structured_output.map(|s| s.confidence.to_string()),
+            orchestrator_notes: None,
+        };
+
         {
             let persistence = self.persistence.lock().await;
-            let (result_str, error_str) = match &result {
-                Ok(r) => (Some(r.clone()), None),
-                Err(e) => (None, Some(e.to_string())),
-            };
-
-            let record = super::persistence::TaskExecutionRecord {
-                task_id,
-                description: task_description.to_string(),
-                attempt,
-                approach: "Direct task execution via worker agent".to_string(),
-                result: result_str.clone(),
-                summary: structured_output.as_ref().map(|s| s.summary.clone()),
-                error: error_str,
-                duration_ms,
-                confidence: structured_output.as_ref().map(|s| s.confidence.to_string()),
-                orchestrator_notes: None,
-            };
-
             if let Err(e) = persistence
                 .write_task_execution(
                     task_id,
                     attempt,
-                    &worker_prompt,
+                    worker_prompt,
                     result_str.as_deref().unwrap_or("(error)"),
                     &record,
                 )
@@ -2877,15 +3006,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         {
             let span = tracing::Span::current();
-            match &result {
+            match result {
                 Ok(_) => crate::logging::set_span_ok(&span),
                 Err(e) => crate::logging::set_span_error(&span, e.to_string()),
             }
         }
-        result.map(|r| TaskExecutionResult {
-            result: r,
-            structured_output,
-        })
     }
 
     /// Build a summary of task execution statuses for replan context.
