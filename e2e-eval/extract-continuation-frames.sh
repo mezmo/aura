@@ -10,11 +10,11 @@ echo "# Continuation Frames Report" > "$REPORT"
 echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$REPORT"
 echo "" >> "$REPORT"
 
-for model_dir in "$RESULTS_DIR"/iter-1/*; do
+for model_dir in "$RESULTS_DIR"/*/; do
   [ -d "$model_dir" ] || continue
   model=$(basename "$model_dir")
-  
-  for sse_file in "$model_dir"/*.sse; do
+
+  for sse_file in "$model_dir"/iter-1/*.sse; do
     [ -f "$sse_file" ] || continue
     label=$(basename "$sse_file" .sse)
     

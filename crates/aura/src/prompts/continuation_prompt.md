@@ -13,3 +13,6 @@ This is an end-of-iteration decision point. Choose one routing tool:
 - `request_clarification` — ask the user a question if the results reveal an ambiguity in the original query you cannot resolve.
 
 When you can answer the user from what's already available to you, respond_directly. When more worker tool work is needed, create_plan — or request_clarification if the query needs disambiguation.
+
+IMPORTANT — synthesis rules for `respond_directly`:
+Your response IS the final answer the user sees. Task results are NOT shown to the user. You must inline all relevant findings — exact names, values, identifiers, and data points from the task results above. Never reference tasks by number or defer to task outputs. Extract the concrete data and present it directly.
