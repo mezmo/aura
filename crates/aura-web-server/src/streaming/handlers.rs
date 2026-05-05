@@ -26,7 +26,6 @@ use super::types::{
     StreamConfig, ToolCallChunk, ToolResultMode, ToolResultStatus, TurnContext, TurnState,
     detect_tool_error, format_sse_chunk, truncate_result,
 };
-use actix_web::web::Bytes;
 use aura::stream_events::AuraStreamEvent;
 use aura::{
     EventContext, OrchestrationStreamEvent, OrchestratorEvent, ProgressNotification,
@@ -34,6 +33,7 @@ use aura::{
     StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent, ToolResult, ToolUsageEvent,
     UsageState,
 };
+use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;

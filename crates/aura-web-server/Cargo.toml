@@ -9,8 +9,9 @@ repository.workspace = true
 [dependencies]
 aura = { path = "../aura" }
 aura-config = { path = "../aura-config" }
-actix-web = "4.4"
-actix-web-lab = "0.22"
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.6", features = ["trace"] }
+bytes = "1"
 async-stream = "0.3"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"

@@ -1,8 +1,17 @@
-use actix_web::{App, HttpResponse, HttpServer, middleware, web};
 use aura_config::load_config;
+use axum::Json;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::{
+    Router, middleware,
+    routing::{get, post},
+};
 use clap::Parser;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 mod handlers;
@@ -107,25 +116,26 @@ struct Args {
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
 async fn shutdown_guard(
-    data: web::Data<AppState>,
-    req: actix_web::dev::ServiceRequest,
-    next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
-) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
-    if data.shutdown_token.is_cancelled() {
-        let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "Server is shutting down".to_string(),
-                error_type: "service_unavailable".to_string(),
-            },
-        });
-        return Ok(req.into_response(response).map_into_right_body());
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.shutdown_token.is_cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: ErrorDetail {
+                    message: "Server is shutting down".to_string(),
+                    error_type: "service_unavailable".to_string(),
+                },
+            }),
+        )
+            .into_response();
     }
-    next.call(req)
-        .await
-        .map(actix_web::dev::ServiceResponse::map_into_left_body)
+    next.run(request).await
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     let result = run().await;
     aura::logging::shutdown_tracer().await;
@@ -188,8 +198,7 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
-    // Create app state
-    let app_state = web::Data::new(AppState {
+    let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
@@ -209,28 +218,23 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
-    // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(app_state.clone())
-            .wrap(middleware::from_fn(shutdown_guard))
-            .wrap(middleware::Logger::default())
-            .route("/health", web::get().to(handlers::health))
-            .route("/v1/models", web::get().to(handlers::list_models))
-            .route(
-                "/v1/chat/completions",
-                web::post().to(handlers::chat_completions),
-            )
-    })
-    .bind((args.host.as_str(), args.port))?
-    .disable_signals()
-    // Buffer for Phase 2 cleanup ([DONE] send + MCP cancellation) after grace period
-    .shutdown_timeout(10)
-    .run();
+    let app = Router::new()
+        .route("/health", get(handlers::health))
+        .route("/v1/models", get(handlers::list_models))
+        .route("/v1/chat/completions", post(handlers::chat_completions))
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            shutdown_guard,
+        ))
+        .with_state(app_state);
+
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    let server_handle = server.handle();
     tokio::spawn({
         let shutdown_token = shutdown_token.clone();
         let stream_shutdown_token = stream_shutdown_token.clone();
@@ -264,9 +268,13 @@ async fn run() -> std::io::Result<()> {
             // Phase 2: terminate remaining streams ([DONE] → MCP cleanup)
             stream_shutdown_token.cancel();
 
-            server_handle.stop(true).await;
+            let _ = shutdown_tx.send(());
         }
     });
 
-    server.await
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            shutdown_rx.await.ok();
+        })
+        .await
 }
