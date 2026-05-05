@@ -133,7 +133,7 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
     "restart-investigation": {
         "routing_mode": "orchestrated",
         "workers": ["prometheus-analyst"],
-        "tool_names": ["prometheus_query", "alertmanager_get_alerts"],
+        "tool_names": ["prometheus_query", "alertmanager_get_rules"],
         "tool_args_contains": [
             {"tool": "prometheus_query", "arg": "query", "substring": "restart"},
         ],
