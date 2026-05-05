@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::string_utils::safe_truncate;
-
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
 /// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
@@ -863,7 +861,7 @@ impl IterationContext {
                             let footer = extract_artifact_footer(result).unwrap();
                             format!("    {}\n    {}", so.summary, footer)
                         } else {
-                            indent_lines(&preserve_artifact_footer(result, 2000))
+                            indent_lines(result)
                         };
                         completed_lines.push(format!(
                             "- Task {}: {}{}\n{}",
@@ -1046,46 +1044,6 @@ impl IterationContext {
 fn extract_artifact_footer(result: &str) -> Option<&str> {
     const FOOTER_PREFIX: &str = "[Full result (";
     result.rfind(FOOTER_PREFIX).map(|idx| &result[idx..])
-}
-
-/// Truncate `result` to `budget` bytes while preserving any trailing
-/// artifact footer (`[Full result (N chars) saved to artifact: FILE]`)
-/// that `maybe_create_artifact` appended past the budget. Without this,
-/// a naive truncation would slice off the artifact pointer and the
-/// coordinator would lose the ability to `read_artifact` the full content.
-fn preserve_artifact_footer(result: &str, budget: usize) -> String {
-    // Detect the artifact-footer marker appended by maybe_create_artifact.
-    const FOOTER_PREFIX: &str = "[Full result (";
-    let footer_start = result.rfind(FOOTER_PREFIX);
-
-    match footer_start {
-        Some(idx) => {
-            // Everything before the footer is the body; footer keeps its full text.
-            let body = &result[..idx];
-            let footer = &result[idx..];
-            let (truncated_body, was_truncated) = safe_truncate(body, budget);
-            let body_str = if was_truncated {
-                format!("{truncated_body}...")
-            } else {
-                truncated_body.to_string()
-            };
-            // Re-join truncated body with full footer. Artifact footer is
-            // what lets the coordinator discover the artifact via read_artifact.
-            if body_str.is_empty() {
-                footer.to_string()
-            } else {
-                format!("{body_str} {footer}")
-            }
-        }
-        None => {
-            let (truncated, was_truncated) = safe_truncate(result, budget);
-            if was_truncated {
-                format!("{truncated}...")
-            } else {
-                truncated.to_string()
-            }
-        }
-    }
 }
 
 /// Indent each line of `text` by 4 spaces for nesting under a task header.

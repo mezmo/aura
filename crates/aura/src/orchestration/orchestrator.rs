@@ -2497,15 +2497,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             )
                             .await;
                         let result_for_event = final_result.clone();
+                        let success = exec_result.structured_output.is_some();
                         if let Some(t) = plan.get_task_mut(task_id) {
-                            t.complete(final_result);
+                            if success {
+                                t.complete(final_result);
+                            } else {
+                                t.fail(final_result, FailureCategory::SoftFailure);
+                            }
                             t.structured_output = exec_result.structured_output;
                         }
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
                                 OrchestratorEvent::TaskCompleted {
                                     task_id,
-                                    success: true,
+                                    success,
                                     duration_ms,
                                     orchestrator_id: self.orchestrator_id.clone(),
                                     worker_id: worker_name
@@ -2515,7 +2520,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 },
                             )))
                             .await;
-                        tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
+                        if success {
+                            tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
+                        } else {
+                            tracing::warn!(
+                                "Task {} did not call submit_result (SoftFailure) after {}ms",
+                                task_id,
+                                duration_ms
+                            );
+                        }
                     }
                     Err(e) => {
                         let err_str = e.to_string();
@@ -2816,15 +2829,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }),
                     ),
                     None => {
-                        let (preview, _) = safe_truncate(&raw_response, 200);
-                        (
-                            Err(format!(
-                                "Worker did not call submit_result for task {}. Raw output: {}",
-                                task_id, preview,
-                            )
-                            .into()),
-                            None,
-                        )
+                        tracing::warn!(
+                            "Worker did not call submit_result for task {}. Preserving raw output via artifact flow.",
+                            task_id
+                        );
+                        (Ok(raw_response), None)
                     }
                 }
             }

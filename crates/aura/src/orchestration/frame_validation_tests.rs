@@ -881,7 +881,7 @@ fn test_continuation_clean_success_no_failure_sections() {
 }
 
 #[test]
-fn test_continuation_preserve_artifact_footer_no_footer() {
+fn test_continuation_short_result_no_artifact() {
     let mut plan = Plan::new("Test goal");
     let mut t = Task::new(0, "short result task", "Task with short result");
     t.complete("Short result, no artifact needed".to_string());
