@@ -115,6 +115,7 @@ BUILTIN_ASSERTIONS_DEPENDENT = {
 
 BUILTIN_ASSERTIONS_SRE_HARD = {
     "probe-paths": {
+        "routing_mode": "orchestrated",
         "answer_contains": [
             "/actuator/health",
             "/healthz",
@@ -123,6 +124,7 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
         "scratchpad_extracted_min": 500,
     },
     "restart-investigation": {
+        "routing_mode": "orchestrated",
         "answer_contains": [
             "notification-service",
             "PodCrashLoopBackOff",
@@ -130,6 +132,7 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
         "scratchpad_intercepted": True,
     },
     "security-audit": {
+        "routing_mode": "orchestrated",
         "answer_contains": [
             "readOnlyRootFilesystem",
             "STRIPE_API_KEY",
@@ -138,6 +141,7 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
         "scratchpad_extracted_min": 1000,
     },
     "multi-category-findings": {
+        "routing_mode": "orchestrated",
         "answer_contains": [
             "HighErrorRate",
             "CertExpiringSoon",
@@ -159,6 +163,7 @@ BUILTIN_ASSERTIONS_SRE_HARD = {
         "category_min": 6,
     },
     "sidecar-infrastructure": {
+        "routing_mode": "orchestrated",
         "answer_contains": [
             "istio-proxy",
             "log-forwarder",
@@ -352,6 +357,42 @@ def check_artifact_created(prompt: str, parsed: dict) -> AssertionResult:
     return AssertionResult(prompt, "artifact_created", passed, detail)
 
 
+def check_coordinator_routed(prompt: str, parsed: dict) -> AssertionResult | None:
+    """Assert the coordinator called a routing tool (not text-parse fallback or silence).
+
+    Returns None (skip) when all task failures are provider-level errors
+    (not_found, auth, overloaded) — the coordinator couldn't route because
+    the LLM was unreachable, not because of tool-calling discipline.
+    """
+    provider_categories = {"provider_not_found", "provider_auth_error", "provider_overloaded"}
+    failure_cats = set(parsed.get("failure_categories", {}).keys())
+    if failure_cats and failure_cats <= provider_categories:
+        return None
+
+    routed = parsed.get("coordinator_routed", False)
+    fallback = parsed.get("text_parse_fallback", False)
+    if not routed:
+        return AssertionResult(prompt, "coordinator_routed", False,
+                               "coordinator never called a routing tool")
+    if fallback:
+        return AssertionResult(prompt, "coordinator_routed", False,
+                               "coordinator used text-parse fallback")
+    return AssertionResult(prompt, "coordinator_routed", True, "routing tool called")
+
+
+def check_no_task_failures(prompt: str, parsed: dict) -> AssertionResult:
+    """Assert all tasks completed successfully."""
+    failures = parsed.get("task_failures", [])
+    if not failures:
+        tasks = parsed.get("tasks", [])
+        count = len([t for t in tasks if t.get("success") is True])
+        return AssertionResult(prompt, "no_task_failures", True,
+                               f"{count} task(s) succeeded")
+    categories = parsed.get("failure_categories", {})
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(categories.items()))
+    return AssertionResult(prompt, "no_task_failures", False, summary)
+
+
 def run_assertions(
     prompt: str,
     parsed: dict,
@@ -402,6 +443,16 @@ def run_assertions(
             assertion_spec["category_markers"],
             assertion_spec["category_min"],
         ))
+
+    # Infrastructure diagnostics — always run for orchestrated prompts
+    expected_mode = assertion_spec.get("routing_mode")
+    is_orchestrated = (expected_mode == "orchestrated"
+                       or (isinstance(expected_mode, list) and "orchestrated" in expected_mode))
+    if is_orchestrated:
+        routed = check_coordinator_routed(prompt, parsed)
+        if routed is not None:
+            results.append(routed)
+        results.append(check_no_task_failures(prompt, parsed))
 
     return results
 

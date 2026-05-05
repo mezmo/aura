@@ -166,15 +166,53 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
                 tasks[tid]["duration_ms"] = payload.get("duration_ms")
                 tasks[tid]["result"] = payload.get("result")
 
-    # Post-process: extract artifact references from task results
+    # Post-process: extract artifact references and failure categories
     artifact_pattern = re.compile(r"\[Full result \(\d+ chars\) saved to artifact: (.+?)\]")
     for tid in tasks:
         result = tasks[tid].get("result") or ""
         match = artifact_pattern.search(result)
         tasks[tid]["artifact_ref"] = match.group(1) if match else None
+        tasks[tid]["failure_category"] = _categorize_task_failure(tasks[tid])
 
     # Return in task_id order
     return [tasks[tid] for tid in sorted(tasks.keys())]
+
+
+def _categorize_task_failure(task: dict) -> str | None:
+    """Categorize a task failure from its result string.
+
+    Mirrors orchestrator.rs categorize_failure_error() priority order and
+    case-insensitive matching. All matched strings are deterministic error
+    messages from our rig fork (mezmo/rig @ d7e9d92) or our own orchestrator
+    code — never non-deterministic model output. Rig's
+    CompletionError::ProviderError(String) flattens HTTP status codes into
+    the error string, so string matching is the only classification path
+    available without forking rig's error types. Revisit if/when we replace rig.
+
+    Returns None if task succeeded.
+    """
+    if task.get("success") is not False:
+        return None
+    lower = (task.get("result") or "").lower()
+    if "timed out" in lower:
+        return "timeout"
+    if ("context" in lower
+            and any(w in lower for w in ("limit", "overflow", "exceeded", "length"))):
+        return "context_overflow"
+    if "maxdeptherror" in lower or "reached limit" in lower:
+        return "max_depth"
+    if "duplicate call loop" in lower:
+        return "loop_detected"
+    if "did not call submit_result" in lower:
+        return "no_submit_result"
+    if any(w in lower for w in ("rate limit", "429", "503", "502", "too many requests")):
+        return "provider_overloaded"
+    if any(w in lower for w in ("authentication", "unauthorized", "403", "401", "api key")):
+        return "provider_auth_error"
+    if any(w in lower for w in ("404", "model identifier is invalid",
+                                 "is not found for api version")):
+        return "provider_not_found"
+    return "agent_error"
 
 
 def parse_sse_file(path: Path) -> dict:
@@ -379,11 +417,36 @@ def parse_sse_file(path: Path) -> dict:
                 pass
             break
 
+    # Coordinator routing diagnostics: did the coordinator call a routing tool?
+    # These events only fire when a routing tool (create_plan, respond_directly,
+    # request_clarification) was actually called. Absence means text-parse fallback
+    # or total coordinator failure.
+    routing_events = {"aura.orchestrator.plan_created",
+                      "aura.orchestrator.direct_answer",
+                      "aura.orchestrator.clarification_needed"}
+    coordinator_routed = bool(routing_events & set(event_counts.keys()))
+    text_parse_fallback = (routing_rationale or "").startswith("Fallback:")
+    replan_budget_exhausted = any(
+        it.get("reasoning") == "Replan budget exhausted"
+        or (not it.get("will_replan") and it.get("reasoning", "").startswith("Replan budget"))
+        for it in iterations
+    )
+
     # New fields: answer_text, tool_names, worker_ids, tasks
     answer_text = _extract_answer_text(text)
     tool_names = _extract_tool_names(event_data_pairs)
     worker_ids = _extract_worker_ids(event_data_pairs)
     tasks = _extract_tasks(event_data_pairs)
+
+    # Task failure diagnostics
+    task_failures = [
+        {"task_id": t["task_id"], "category": t["failure_category"],
+         "result_preview": (t.get("result") or "")[:200]}
+        for t in tasks if t.get("failure_category")
+    ]
+    failure_categories = defaultdict(int)
+    for f in task_failures:
+        failure_categories[f["category"]] += 1
 
     return {
         "tool_calls": tool_calls,
@@ -413,6 +476,12 @@ def parse_sse_file(path: Path) -> dict:
         "worker_ids": worker_ids,
         "tasks": tasks,
         "artifact_count": sum(1 for t in tasks if t.get("artifact_ref")),
+        "coordinator_routed": coordinator_routed,
+        "text_parse_fallback": text_parse_fallback,
+        "replan_budget_exhausted": replan_budget_exhausted,
+        "task_failures": task_failures,
+        "failure_categories": dict(failure_categories),
+        "soft_failure_count": failure_categories.get("no_submit_result", 0),
         "scratchpad_tokens_intercepted": scratchpad_tokens_intercepted,
         "scratchpad_tokens_extracted": scratchpad_tokens_extracted,
         "scratchpad_savings_pct": scratchpad_savings_pct,
