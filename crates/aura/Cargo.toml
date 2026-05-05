@@ -48,6 +48,7 @@ uuid = { workspace = true }
 
 regex = "1"
 async-stream = "0.3"
+strum = { workspace = true }
 
 [features]
 default = ["otel"]

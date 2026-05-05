@@ -450,8 +450,9 @@ pub enum TaskStatus {
 
 /// Structured classification of why a task failed, surfaced in the
 /// continuation prompt so the coordinator can make informed replan decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, strum::Display)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum FailureCategory {
     /// Worker timed out before completing.
     AgentTimeout,
@@ -465,6 +466,8 @@ pub enum FailureCategory {
     ProviderOverloaded,
     /// LLM credentials or auth failed (401/403).
     ProviderAuthError,
+    /// LLM model not found or invalid model identifier (404).
+    ProviderNotFound,
     /// Upstream dependency task failed.
     DependencyFailed,
     /// Worker completed but reported unable to produce a result.
@@ -472,22 +475,6 @@ pub enum FailureCategory {
     /// Unclassified worker failure.
     #[default]
     AgentError,
-}
-
-impl std::fmt::Display for FailureCategory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AgentTimeout => write!(f, "agent_timeout"),
-            Self::ContextOverflow => write!(f, "context_overflow"),
-            Self::DepthExhausted => write!(f, "depth_exhausted"),
-            Self::LoopDetected => write!(f, "loop_detected"),
-            Self::ProviderOverloaded => write!(f, "provider_overloaded"),
-            Self::ProviderAuthError => write!(f, "provider_auth_error"),
-            Self::DependencyFailed => write!(f, "dependency_failed"),
-            Self::SoftFailure => write!(f, "soft_failure"),
-            Self::AgentError => write!(f, "agent_error"),
-        }
-    }
 }
 
 /// Rich state of a task, making invalid states unrepresentable.

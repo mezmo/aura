@@ -2918,6 +2918,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     }
 
     /// Classify a task failure error string into a structured category.
+    ///
+    /// These are deterministic string matches against error messages produced by
+    /// our rig fork (mezmo/rig @ d7e9d92) and our own orchestrator code — never
+    /// against non-deterministic model output. Rig's `CompletionError::ProviderError(String)`
+    /// flattens HTTP status codes into the error string, so string matching is
+    /// the only classification path available without forking rig's error types.
+    /// Revisit if/when we replace rig.
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains("timed out") {
@@ -2955,6 +2962,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("api key")
         {
             FailureCategory::ProviderAuthError
+        } else if lower.contains("404")
+            || lower.contains("model identifier is invalid")
+            || lower.contains("is not found for api version")
+        {
+            FailureCategory::ProviderNotFound
         } else {
             FailureCategory::AgentError
         }
@@ -2973,7 +2985,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         failures.iter().all(|f| {
             matches!(
                 f.category,
-                FailureCategory::ProviderOverloaded | FailureCategory::ProviderAuthError
+                FailureCategory::ProviderOverloaded
+                    | FailureCategory::ProviderAuthError
+                    | FailureCategory::ProviderNotFound
             )
         })
     }
@@ -5380,6 +5394,31 @@ mod tests {
     }
 
     #[test]
+    fn test_categorize_provider_not_found() {
+        // Gemini 404 — rig formats as "Invalid status code 404 Not Found with message: ..."
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 404 Not Found with message: models/gemini-3.1-pro is not found"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        // Bedrock invalid model identifier
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: The provided model identifier is invalid."
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        // Gemini "not found for API version" variant
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "models/foo is not found for API version v1beta"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+    }
+
+    #[test]
     fn test_categorize_failure_context_overflow_token_patterns() {
         assert_eq!(
             Orchestrator::categorize_failure_error("token limit reached"),
@@ -5417,10 +5456,11 @@ mod tests {
     }
 
     #[test]
-    fn test_should_short_circuit_both_provider_categories() {
+    fn test_should_short_circuit_all_provider_categories() {
         let failures = vec![
             make_failure("Rate limit exceeded"),
             make_failure("Authentication failed"),
+            make_failure("CompletionError: ProviderError: Invalid status code 404 Not Found"),
         ];
         assert!(Orchestrator::should_short_circuit_provider_errors(
             &failures, 0
