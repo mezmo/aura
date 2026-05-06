@@ -274,7 +274,7 @@ fn count_leaf_steps(steps: &[StepInput]) -> usize {
 
 fn count_one(step: &StepInput) -> usize {
     match step {
-        StepInput::LeafTask { .. } | StepInput::ReuseTask { .. } => 1,
+        StepInput::LeafTask { .. } => 1,
         StepInput::ParallelGroup { items } => count_leaf_steps(items),
         StepInput::SubChain { steps } => count_leaf_steps(steps),
     }

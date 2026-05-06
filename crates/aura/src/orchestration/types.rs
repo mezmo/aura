@@ -30,9 +30,6 @@ pub enum StepInput {
         #[serde(default)]
         worker: Option<String>,
     },
-    /// Reuse a result from a previous iteration without re-executing.
-    #[serde(rename = "reuse")]
-    ReuseTask { reuse_result_from: usize },
 }
 
 /// Convert a list of `StepInput` into a flat `Vec<Task>` with auto-assigned IDs
@@ -85,15 +82,6 @@ fn flatten_one(
             let mut t = Task::new(id, task.clone(), String::new());
             t.dependencies = frontier.to_vec();
             t.worker = worker.clone();
-            tasks.push(t);
-            Ok(vec![id])
-        }
-        StepInput::ReuseTask { reuse_result_from } => {
-            let id = *counter;
-            *counter += 1;
-            let mut t = Task::new(id, String::new(), String::new());
-            t.dependencies = frontier.to_vec();
-            t.reuse_result_from = Some(*reuse_result_from);
             tasks.push(t);
             Ok(vec![id])
         }
@@ -282,9 +270,6 @@ pub struct Task {
     pub worker: Option<String>,
     /// Why this task exists and how it advances the goal.
     pub rationale: String,
-    /// When set, this task reuses the result from the specified task ID
-    /// in the previous iteration's plan (set by `apply_result_reuse()`).
-    pub reuse_result_from: Option<usize>,
     /// Structured output from `submit_result` tool. When present, `summary`
     /// is used as the inline preview in continuation prompts and manifests.
     /// Top-level because it's orthogonal to pass/fail — workers can submit
@@ -314,9 +299,6 @@ impl Serialize for Task {
             map.serialize_entry("worker", w)?;
         }
         map.serialize_entry("rationale", &self.rationale)?;
-        if let Some(reuse) = self.reuse_result_from {
-            map.serialize_entry("reuse_result_from", &reuse)?;
-        }
         if let Some(ref so) = self.structured_output {
             map.serialize_entry("structured_output", so)?;
         }
@@ -342,8 +324,6 @@ impl<'de> Deserialize<'de> for Task {
             #[serde(default)]
             rationale: String,
             #[serde(default)]
-            reuse_result_from: Option<usize>,
-            #[serde(default)]
             structured_output: Option<StructuredTaskOutput>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
@@ -365,7 +345,6 @@ impl<'de> Deserialize<'de> for Task {
             state,
             worker: h.worker,
             rationale: h.rationale,
-            reuse_result_from: h.reuse_result_from,
             structured_output: h.structured_output,
         })
     }
@@ -389,7 +368,6 @@ impl Task {
             state: TaskState::Pending,
             worker: None,
             rationale: rationale.into(),
-            reuse_result_from: None,
             structured_output: None,
         }
     }
@@ -450,7 +428,9 @@ pub enum TaskStatus {
 
 /// Structured classification of why a task failed, surfaced in the
 /// continuation prompt so the coordinator can make informed replan decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, strum::Display)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, strum::Display,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum FailureCategory {
@@ -629,11 +609,6 @@ pub struct TaskJson {
     pub dependencies: Option<Vec<usize>>,
     #[serde(default)]
     pub worker: Option<String>,
-    /// When set, this task reuses the result from the specified task ID
-    /// in the previous iteration's plan. The coordinator sets this to
-    /// carry forward results that don't need re-execution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reuse_result_from: Option<usize>,
 }
 
 /// Summary of task failures during an iteration.
@@ -738,7 +713,11 @@ impl IterationContext {
     /// Per-task completed results are inlined fully when no artifact was
     /// created (result ≤ threshold). When the result was spilled to an
     /// artifact, shows summary + artifact pointer instead.
-    pub fn build_continuation_prompt(&self, max_iterations: usize, show_tool_chain: bool) -> String {
+    pub fn build_continuation_prompt(
+        &self,
+        max_iterations: usize,
+        show_tool_chain: bool,
+    ) -> String {
         use super::templates::{ContinuationVars, render_continuation_prompt};
 
         // Categorize tasks
@@ -754,7 +733,9 @@ impl IterationContext {
                     if has_artifact {
                         // Result exceeded threshold — artifact on disk.
                         // Show summary/preview + artifact pointer.
-                        let confidence = t.structured_output.as_ref()
+                        let confidence = t
+                            .structured_output
+                            .as_ref()
                             .map(|so| format!(" (confidence: {})", so.confidence))
                             .unwrap_or_default();
                         let body = if let Some(ref so) = t.structured_output {
@@ -769,12 +750,17 @@ impl IterationContext {
                         ));
                     } else {
                         // Result fits in context — inline it fully.
-                        let confidence = t.structured_output.as_ref()
+                        let confidence = t
+                            .structured_output
+                            .as_ref()
                             .map(|so| format!(" (confidence: {})", so.confidence))
                             .unwrap_or_default();
                         completed_lines.push(format!(
                             "- Task {}: {}{}\n{}",
-                            t.id, t.description, confidence, indent_lines(result)
+                            t.id,
+                            t.description,
+                            confidence,
+                            indent_lines(result)
                         ));
                     }
                     for line in render_artifact_lines(self.tool_traces.get(&t.id)) {
@@ -789,9 +775,7 @@ impl IterationContext {
                 TaskState::Failed { error, category } => {
                     has_failed_tasks = true;
                     let line = match (category, &t.structured_output) {
-                        (FailureCategory::SoftFailure, Some(so))
-                            if !so.summary.is_empty() =>
-                        {
+                        (FailureCategory::SoftFailure, Some(so)) if !so.summary.is_empty() => {
                             let has_artifact = extract_artifact_footer(error).is_some();
                             if has_artifact {
                                 let footer = extract_artifact_footer(error).unwrap();
@@ -802,7 +786,10 @@ impl IterationContext {
                             } else {
                                 format!(
                                     "- Task {}: {} → soft_failure ({} confidence)\n{}",
-                                    t.id, t.description, so.confidence, indent_lines(&so.summary)
+                                    t.id,
+                                    t.description,
+                                    so.confidence,
+                                    indent_lines(&so.summary)
                                 )
                             }
                         }
@@ -825,32 +812,36 @@ impl IterationContext {
             }
         }
 
+        use super::prompt_constants::continuation as hdr;
+
         let completed_section = if completed_lines.is_empty() {
             String::new()
         } else {
-            format!("COMPLETED TASKS:\n{}\n\n", completed_lines.join("\n"))
+            format!(
+                "{}\n{}\n\n",
+                hdr::COMPLETED_TASKS,
+                completed_lines.join("\n")
+            )
         };
 
         let blocked_section = if blocked_lines.is_empty() {
             String::new()
         } else {
-            format!(
-                "BLOCKED TASKS (dependencies failed):\n{}\n\n",
-                blocked_lines.join("\n")
-            )
+            format!("{}\n{}\n\n", hdr::BLOCKED_TASKS, blocked_lines.join("\n"))
         };
 
         let redesign_section = if redesign_lines.is_empty() {
             String::new()
         } else {
-            format!("FAILED TASKS:\n{}\n\n", redesign_lines.join("\n"))
+            format!("{}\n{}\n\n", hdr::FAILED_TASKS, redesign_lines.join("\n"))
         };
 
-        // Failure summary — only when there were failures in this iteration.
         let failure_section = match &self.failure_summary {
             Some(fs) => format!(
-                "FAILURE SUMMARY:\n{}\n\nAREAS NEEDING ATTENTION:\n{}\n\n",
+                "{}\n{}\n\n{}\n{}\n\n",
+                hdr::FAILURE_SUMMARY,
                 fs.reasoning,
+                hdr::AREAS_NEEDING_ATTENTION,
                 fs.gaps_as_bullets(),
             ),
             None => String::new(),
@@ -860,7 +851,7 @@ impl IterationContext {
         let failure_history = if self.failure_history.is_empty() {
             String::new()
         } else {
-            let mut fh = String::from("FAILURE HISTORY:");
+            let mut fh = String::from(hdr::FAILURE_HISTORY);
             for record in &self.failure_history {
                 let worker_info = record
                     .worker
@@ -891,11 +882,14 @@ impl IterationContext {
                 .filter(|(_, count)| *count > 1)
                 .collect();
             if !repeated.is_empty() {
-                fh.push_str("\n\nOBSERVED PATTERNS:");
+                fh.push_str(&format!("\n\n{}:", hdr::OBSERVED_PATTERNS));
                 for ((desc, cat), count) in &repeated {
                     fh.push_str(&format!(
-                        "\n- \"{}\" has failed {} times with [{}] — consider a fundamentally different approach",
-                        desc, count, cat,
+                        "\n- \"{}\" has failed {} times with [{}]{}",
+                        desc,
+                        count,
+                        cat,
+                        hdr::REPEATED_FAILURE_SUFFIX,
                     ));
                 }
             }
@@ -905,7 +899,7 @@ impl IterationContext {
 
         // Urgency header
         let urgency = if self.iteration + 1 >= max_iterations {
-            " (FINAL ATTEMPT)".to_string()
+            hdr::FINAL_ATTEMPT.to_string()
         } else {
             String::new()
         };
@@ -917,11 +911,8 @@ impl IterationContext {
         let succeeded_str = succeeded.to_string();
         let total_str = total.to_string();
 
-        // Only surface reuse guidance when there are failed tasks to
-        // selectively retry; surfacing on clean success teaches the model
-        // the no-op reuse-only plan pattern.
         let reuse_guidance = if has_failed_tasks && succeeded > 0 {
-            "To carry forward a completed task's result when retrying failed tasks, set \"reuse_result_from\" to the original task ID.\n\n"
+            super::prompt_constants::guidance::RESULT_FORWARDING
         } else {
             ""
         };
@@ -963,9 +954,7 @@ fn indent_lines(text: &str) -> String {
 ///
 /// Always rendered in the continuation prompt so the coordinator has a
 /// deterministic list of filenames available via `read_artifact`.
-fn render_artifact_lines(
-    traces: Option<&Vec<super::persistence::ToolTraceEntry>>,
-) -> Vec<String> {
+fn render_artifact_lines(traces: Option<&Vec<super::persistence::ToolTraceEntry>>) -> Vec<String> {
     use super::persistence::ToolOutcome;
 
     let traces = match traces.filter(|v| !v.is_empty()) {
@@ -1562,40 +1551,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reuse_result_from_carries_structured_output() {
-        use super::super::tools::submit_result::Confidence;
-        use crate::orchestration::orchestrator::Orchestrator;
-
-        let mut previous = Plan::new("Previous goal");
-        let mut prev_task = Task::new(0, "Compute mean", "stats");
-        prev_task.complete("42".to_string());
-        prev_task.structured_output = Some(StructuredTaskOutput {
-            summary: "Mean is 42".to_string(),
-            confidence: Confidence::High,
-        });
-        previous.add_task(prev_task);
-
-        let response = PlanningResponse::StepsPlan {
-            goal: "New goal".into(),
-            steps: vec![StepInput::ReuseTask {
-                reuse_result_from: 0,
-            }],
-            routing_rationale: "test".into(),
-            planning_summary: "test".into(),
-        };
-        let mut plan = response.into_plan().unwrap();
-        Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
-
-        let TaskState::Complete { ref result } = plan.tasks[0].state else {
-            panic!("expected Complete");
-        };
-        assert_eq!(result, "42");
-        let so = plan.tasks[0].structured_output.as_ref().unwrap();
-        assert_eq!(so.summary, "Mean is 42");
-        assert_eq!(so.confidence, Confidence::High);
-    }
-
-    #[test]
     fn test_continuation_prompt_urgency_final_attempt() {
         let mut plan = Plan::new("Goal");
         let mut task = Task::new(0, "Task", "Do it");
@@ -1631,63 +1586,55 @@ mod tests {
     }
 
     #[test]
-    fn test_continuation_prompt_reuse_guidance_only_with_failed_tasks() {
-        // Reuse guidance must only appear when there are failed tasks to
-        // selectively retry. Surfacing on succeeded > 0 alone teaches the
-        // model the no-op reuse-only plan pattern.
-        //
-        // This test exercises the "completed tasks but no failures" path:
-        // reuse_guidance must NOT appear.
-        let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Completed task", "Done");
-        task.complete("Some result");
-        plan.add_task(task);
+    fn test_continuation_prompt_result_forwarding_guidance() {
+        let guidance_marker = "Workers cannot see prior iteration results";
 
-        let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, false);
-
-        assert!(!prompt.contains("reuse_result_from"));
-    }
-
-    #[test]
-    fn test_continuation_prompt_reuse_guidance_when_mixed() {
-        // Mixed path: some completed + some failed → reuse guidance present
-        // to let the coordinator retry failures while carrying completed
-        // results forward.
-        let mut plan = Plan::new("Goal");
+        // Mixed (completed + failed): guidance present
+        let mut mixed_plan = Plan::new("Goal");
         let mut completed = Task::new(0, "Completed task", "Done");
         completed.complete("Some result");
-        plan.add_task(completed);
-
+        mixed_plan.add_task(completed);
         let mut failed = Task::new(1, "Failed task", "Broken");
         failed.fail("boom", FailureCategory::AgentError);
-        plan.add_task(failed);
-
+        mixed_plan.add_task(failed);
         let fs = FailureSummary {
             reasoning: "Partial".into(),
             gaps: vec![],
         };
-        let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
+        let ctx = IterationContext::new(1, mixed_plan, Some(fs), vec![], HashMap::new());
         let prompt = ctx.build_continuation_prompt(3, false);
+        assert!(
+            prompt.contains(guidance_marker),
+            "result forwarding guidance should appear on mixed success/failure"
+        );
 
-        assert!(prompt.contains("reuse_result_from"));
-    }
+        // All completed: guidance absent
+        let mut all_ok = Plan::new("Goal");
+        let mut t = Task::new(0, "Completed task", "Done");
+        t.complete("Some result");
+        all_ok.add_task(t);
+        let ctx = IterationContext::new(1, all_ok, None, vec![], HashMap::new());
+        let prompt = ctx.build_continuation_prompt(3, false);
+        assert!(
+            !prompt.contains(guidance_marker),
+            "result forwarding guidance should NOT appear on clean success"
+        );
 
-    #[test]
-    fn test_continuation_prompt_no_reuse_guidance_when_all_failed() {
-        let mut plan = Plan::new("Goal");
-        let mut task = Task::new(0, "Failed task", "Tried");
-        task.fail("error", FailureCategory::AgentError);
-        plan.add_task(task);
-
+        // All failed: guidance absent
+        let mut all_fail = Plan::new("Goal");
+        let mut t = Task::new(0, "Failed task", "Tried");
+        t.fail("error", FailureCategory::AgentError);
+        all_fail.add_task(t);
         let fs = FailureSummary {
             reasoning: "All failed".into(),
             gaps: vec![],
         };
-        let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
+        let ctx = IterationContext::new(1, all_fail, Some(fs), vec![], HashMap::new());
         let prompt = ctx.build_continuation_prompt(3, false);
-
-        assert!(!prompt.contains("reuse_result_from"));
+        assert!(
+            !prompt.contains(guidance_marker),
+            "result forwarding guidance should NOT appear when all failed"
+        );
     }
 
     #[test]
@@ -2117,114 +2064,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_task_json_reuse_result_from_serde_roundtrip() {
-        let task = TaskJson {
-            id: 1,
-            description: "Compute sum".into(),
-            rationale: Some("Needed for total".into()),
-            dependencies: Some(vec![0]),
-            worker: Some("math".into()),
-            reuse_result_from: Some(3),
-        };
-        let json = serde_json::to_string(&task).unwrap();
-        let deserialized: TaskJson = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.id, 1);
-        assert_eq!(deserialized.reuse_result_from, Some(3));
-        assert_eq!(deserialized.worker, Some("math".into()));
-    }
-
-    #[test]
-    fn test_task_json_reuse_result_from_absent_defaults_none() {
-        let json = r#"{"id": 0, "description": "Do thing"}"#;
-        let task: TaskJson = serde_json::from_str(json).unwrap();
-        assert_eq!(task.reuse_result_from, None);
-        assert_eq!(task.dependencies, None);
-        assert_eq!(task.worker, None);
-    }
-
-    #[test]
-    fn test_into_plan_preserves_reuse_result_from() {
-        let response = PlanningResponse::StepsPlan {
-            goal: "Test reuse".into(),
-            steps: vec![
-                StepInput::LeafTask {
-                    task: "Fresh task".into(),
-                    worker: None,
-                },
-                StepInput::ReuseTask {
-                    reuse_result_from: 5,
-                },
-            ],
-            routing_rationale: "test".into(),
-            planning_summary: "test".into(),
-        };
-        let plan = response.into_plan().unwrap();
-        assert_eq!(plan.tasks.len(), 2);
-        assert_eq!(plan.tasks[0].reuse_result_from, None);
-        assert_eq!(plan.tasks[1].reuse_result_from, Some(5));
-    }
-
-    #[test]
-    fn test_into_plan_then_apply_reuse_pipeline() {
-        use crate::orchestration::orchestrator::Orchestrator;
-
-        let mut previous = Plan::new("Previous goal");
-        let mut prev_task = Task::new(0, "Compute mean", "stats");
-        prev_task.complete("42".to_string());
-        previous.add_task(prev_task);
-
-        let response = PlanningResponse::StepsPlan {
-            goal: "New goal".into(),
-            steps: vec![StepInput::ReuseTask {
-                reuse_result_from: 0,
-            }],
-            routing_rationale: "test".into(),
-            planning_summary: "test".into(),
-        };
-        let mut plan = response.into_plan().unwrap();
-        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
-
-        Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
-
-        let TaskState::Complete { ref result } = plan.tasks[0].state else {
-            panic!("expected Complete");
-        };
-        assert_eq!(result, "42");
-    }
-
-    #[test]
-    fn test_flatten_steps_propagates_reuse_result_from() {
-        let steps = vec![
-            StepInput::ReuseTask {
-                reuse_result_from: 2,
-            },
-            StepInput::LeafTask {
-                task: "Fresh analysis".into(),
-                worker: Some("analytics".into()),
-            },
-        ];
-        let tasks = flatten_steps(&steps).unwrap();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].reuse_result_from, Some(2));
-        assert_eq!(tasks[1].reuse_result_from, None);
-    }
-
-    #[test]
-    fn test_reuse_task_serde_roundtrip() {
-        let json = r#"{"type": "reuse", "reuse_result_from": 3}"#;
-        let step: StepInput = serde_json::from_str(json).unwrap();
-        match &step {
-            StepInput::ReuseTask { reuse_result_from } => {
-                assert_eq!(*reuse_result_from, 3);
-            }
-            other => panic!("Expected ReuseTask, got {:?}", other),
-        }
-        let serialized = serde_json::to_string(&step).unwrap();
-        let deserialized: StepInput = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(step, deserialized);
-    }
-
-    #[test]
     fn test_leaf_task_serde_roundtrip() {
         let json = r#"{"type": "task", "task": "Fresh work", "worker": "ops"}"#;
         let step: StepInput = serde_json::from_str(json).unwrap();
@@ -2236,43 +2075,8 @@ mod tests {
             other => panic!("Expected LeafTask, got {:?}", other),
         }
         let serialized = serde_json::to_string(&step).unwrap();
-        assert!(!serialized.contains("reuse_result_from"));
-    }
-
-    #[test]
-    fn test_steps_plan_reuse_into_plan_pipeline() {
-        use crate::orchestration::orchestrator::Orchestrator;
-
-        let mut previous = Plan::new("Previous goal");
-        let mut prev_task = Task::new(0, "Fetch logs", "observability");
-        prev_task.complete("log data here".to_string());
-        previous.add_task(prev_task);
-
-        let response = PlanningResponse::StepsPlan {
-            goal: "Analyze logs".into(),
-            steps: vec![
-                StepInput::ReuseTask {
-                    reuse_result_from: 0,
-                },
-                StepInput::LeafTask {
-                    task: "Analyze fetched logs".into(),
-                    worker: Some("analytics".into()),
-                },
-            ],
-            routing_rationale: "replan".into(),
-            planning_summary: "Reuse fetch, fresh analysis".into(),
-        };
-        let mut plan = response.into_plan().unwrap();
-        assert_eq!(plan.tasks[0].reuse_result_from, Some(0));
-        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
-
-        Orchestrator::apply_result_reuse(&mut plan, Some(&previous));
-
-        let TaskState::Complete { ref result } = plan.tasks[0].state else {
-            panic!("expected Complete");
-        };
-        assert_eq!(result, "log data here");
-        assert!(matches!(plan.tasks[1].state, TaskState::Pending));
+        let deserialized: StepInput = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(step, deserialized);
     }
 
     #[test]
