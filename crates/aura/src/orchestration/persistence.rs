@@ -597,7 +597,7 @@ impl ExecutionPersistence {
         let artifact_path = artifacts_dir.join(&filename);
         fs::write(&artifact_path, result).await?;
 
-        tracing::debug!(
+        tracing::info!(
             "Written result artifact ({} chars) to: {}",
             result.len(),
             artifact_path.display()
@@ -634,7 +634,7 @@ impl ExecutionPersistence {
         let artifact_path = artifacts_dir.join(&filename);
         fs::write(&artifact_path, output).await?;
 
-        tracing::debug!(
+        tracing::info!(
             "Written tool output artifact ({} chars) to: {}",
             output.len(),
             artifact_path.display()

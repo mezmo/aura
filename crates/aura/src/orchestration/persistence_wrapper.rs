@@ -166,7 +166,7 @@ impl ToolWrapper for PersistenceWrapper {
             .unwrap_or("");
 
         if reasoning.trim().is_empty() {
-            tracing::warn!(
+            tracing::debug!(
                 tool = %ctx.tool_name,
                 "Tool call with empty _aura_reasoning (allowed, reasoning is optional)"
             );

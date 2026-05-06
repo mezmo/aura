@@ -309,7 +309,7 @@ pub struct Orchestrator {
     current_iteration: AtomicUsize,
 
     /// Accumulated token usage across all LLM calls in this orchestration run
-    /// (planning, workers, synthesis, evaluation).
+    /// (planning, workers, continuation routing).
     ///
     /// Cloned from a handle owned by `OrchestratorFactory::stream_with_timeout`
     /// so the streaming handler can read the final totals and emit `aura.usage`.
@@ -767,7 +767,7 @@ impl Orchestrator {
     /// Execute a blocking chat call with timeout — for **worker tasks only**.
     ///
     /// Workers need the full ReAct loop for sequential MCP tool chains.
-    /// Coordinator phases (planning, evaluation) use `stream_and_collect()`
+    /// Coordinator phases (planning, continuation routing) use `stream_and_collect()`
     /// for early exit after one-shot tool decisions and reasoning forwarding.
     ///
     /// Returns `Err` with a timeout message if the call exceeds `per_call_timeout_secs`.
@@ -832,7 +832,12 @@ impl Orchestrator {
         use rig::completion::Usage;
         use std::collections::HashMap;
 
-        let StreamCallParams { prompt, history, phase, event_tx } = params;
+        let StreamCallParams {
+            prompt,
+            history,
+            phase,
+            event_tx,
+        } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
@@ -896,7 +901,7 @@ impl Orchestrator {
                     // double-emit.
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
                         ref tc,
-                    ))) if emit_scratchpad_events && scratchpad::is_scratchpad_tool(&tc.name) => {
+                    ))) if emit_scratchpad_events && scratchpad::is_internal_tool(&tc.name) => {
                         if let Some(tx) = event_tx {
                             scratchpad_tool_starts.insert(tc.id.clone(), std::time::Instant::now());
                             let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
@@ -958,7 +963,8 @@ impl Orchestrator {
                         usage.input_tokens += turn.input_tokens;
                         usage.output_tokens += turn.output_tokens;
                         usage.total_tokens += turn.total_tokens;
-                        // Feed LLM ground-truth into the worker's per-agent scratchpad budget
+                        self.usage_state
+                            .accumulate_usage(turn.input_tokens, turn.output_tokens);
                         if let Some(ref budget) = agent.scratchpad_budget {
                             budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
                         }
@@ -1012,7 +1018,7 @@ impl Orchestrator {
 
     /// Stream a coordinator call with early exit and optional reasoning forwarding.
     ///
-    /// Replaces `chat_with_timeout` for one-shot tool phases (planning, evaluation).
+    /// Replaces `chat_with_timeout` for one-shot tool phases (planning, continuation routing).
     /// Workers MUST NOT use this — they need the full ReAct loop for MCP tool chains.
     ///
     /// Key behaviors:
@@ -1036,10 +1042,17 @@ impl Orchestrator {
         use futures::StreamExt;
         use rig::completion::Usage;
 
-        let StreamCallParams { prompt, history, phase, event_tx } = params;
+        let StreamCallParams {
+            prompt,
+            history,
+            phase,
+            event_tx,
+        } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
         let stream_future = async {
-            let mut stream = agent.stream_chat_with_depth(prompt, history, agent.max_depth).await;
+            let mut stream = agent
+                .stream_chat_with_depth(prompt, history, agent.max_depth)
+                .await;
             let mut content = String::new();
             let mut usage = Usage {
                 input_tokens: 0,
@@ -1082,13 +1095,12 @@ impl Orchestrator {
                         );
                         if decision_ready().await {
                             tracing::debug!("{}: decision captured, reading turn usage", phase);
-                            // Read one more item to capture per-turn token usage
-                            // before dropping the stream. With the always-yield-Final
-                            // fix in Rig, TurnUsage is the next item after ToolResult.
                             if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
                                 usage.input_tokens += turn.input_tokens;
                                 usage.output_tokens += turn.output_tokens;
                                 usage.total_tokens += turn.total_tokens;
+                                self.usage_state
+                                    .accumulate_usage(turn.input_tokens, turn.output_tokens);
                             }
                             break;
                         }
@@ -1103,6 +1115,8 @@ impl Orchestrator {
                         usage.input_tokens += turn.input_tokens;
                         usage.output_tokens += turn.output_tokens;
                         usage.total_tokens += turn.total_tokens;
+                        self.usage_state
+                            .accumulate_usage(turn.input_tokens, turn.output_tokens);
                     }
                     Ok(StreamItem::FinalMarker) => break,
                     // MaxDepthError: success if decision was captured, error otherwise
@@ -1212,11 +1226,7 @@ impl Orchestrator {
 
         // Build the primary user message based on call phase.
         let planning_prompt = match previous {
-            None => Self::build_planning_wrapper(
-                query,
-                &worker_section,
-                &worker_guidelines,
-            ),
+            None => Self::build_planning_wrapper(query, &worker_section, &worker_guidelines),
             Some(ctx) => Self::build_continuation_wrapper(
                 ctx,
                 self.config.max_planning_cycles,
@@ -1241,7 +1251,7 @@ impl Orchestrator {
             let prompt = if attempt == 1 {
                 planning_prompt.clone()
             } else {
-                "You must call one of the routing tools (respond_directly, create_plan, or request_clarification). Do not respond with text — call a tool.".to_string()
+                super::prompt_constants::corrections::ROUTING_TOOL_REQUIRED.to_string()
             };
 
             tracing::info!(
@@ -1290,8 +1300,6 @@ impl Orchestrator {
                         r.usage.total_tokens,
                         0,
                     );
-                    self.usage_state
-                        .accumulate_usage(r.usage.input_tokens, r.usage.output_tokens);
                     r
                 }
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
@@ -1302,41 +1310,32 @@ impl Orchestrator {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    // Record the failed user turn in conversation for context
-                    coordinator_state.conversation.push(
-                        rig::completion::Message::user(&prompt),
-                    );
-                    if err_str.contains("timed out") {
+                    coordinator_state
+                        .conversation
+                        .push(rig::completion::Message::user(&prompt));
+                    if is_transient_planning_error(&err_str) {
                         tracing::warn!(
-                            "Planning attempt {} timed out after {:.1}s",
-                            attempt,
-                            attempt_start.elapsed().as_secs_f64(),
-                        );
-                    } else if err_str.contains("MaxDepthError")
-                        || err_str.contains("reached limit")
-                    {
-                        tracing::warn!(
-                            "Planning attempt {} exhausted depth after {:.1}s: {}",
+                            "Planning attempt {} transient error after {:.1}s, retrying: {}",
                             attempt,
                             attempt_start.elapsed().as_secs_f64(),
                             err_str,
                         );
-                    } else {
-                        tracing::warn!(
-                            "Planning attempt {} error after {:.1}s: {}",
-                            attempt,
-                            attempt_start.elapsed().as_secs_f64(),
-                            err_str,
-                        );
+                        continue;
                     }
+                    tracing::warn!(
+                        "Planning attempt {} failed after {:.1}s: {}",
+                        attempt,
+                        attempt_start.elapsed().as_secs_f64(),
+                        err_str,
+                    );
                     return Err(format!("Planning failed: {}", err_str).into());
                 }
             };
 
             // Grow conversation: user turn
-            coordinator_state.conversation.push(
-                rig::completion::Message::user(&prompt),
-            );
+            coordinator_state
+                .conversation
+                .push(rig::completion::Message::user(&prompt));
 
             // Check if a routing tool was called
             let decision = coordinator_state.routing_decision.lock().await.take();
@@ -1350,9 +1349,9 @@ impl Orchestrator {
                 };
 
                 // Grow conversation: assistant turn (serialized routing decision)
-                coordinator_state.conversation.push(
-                    rig::completion::Message::assistant(&response_text),
-                );
+                coordinator_state
+                    .conversation
+                    .push(rig::completion::Message::assistant(&response_text));
 
                 // Persist planning phase artifacts
                 {
@@ -1394,9 +1393,9 @@ impl Orchestrator {
 
             // No routing tool called — record assistant response and try correction
             let response_text = response.content.clone();
-            coordinator_state.conversation.push(
-                rig::completion::Message::assistant(&response_text),
-            );
+            coordinator_state
+                .conversation
+                .push(rig::completion::Message::assistant(&response_text));
 
             {
                 let persistence = self.persistence.lock().await;
@@ -1448,7 +1447,11 @@ impl Orchestrator {
         let (query_preview, _) = safe_truncate(query, 100);
         tracing::info!("Created fallback single-task plan for: {}", query_preview);
 
-        Ok((fallback, final_prompt.unwrap_or_default(), final_response.unwrap_or_default()))
+        Ok((
+            fallback,
+            final_prompt.unwrap_or_default(),
+            final_response.unwrap_or_default(),
+        ))
     }
 
     /// Enforce config flags on a routing decision.
@@ -2024,7 +2027,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // Coordinator depth budget allows recon + read_artifact + routing within one
         // stream_and_collect call. The decision_ready early-exit is the primary guard;
         // max_depth is defense-in-depth. GPT 5.2 observed using read_artifact during
-        // post-execute synthesis (13 calls in 5-prompt E2E suite).
+        // post-execute continuation routing (13 calls in 5-prompt E2E suite).
         let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
         Ok(AgentWithPreamble {
@@ -2399,7 +2402,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             if ready_tasks.is_empty() {
                 // No ready tasks but not finished - this shouldn't happen with valid plans
-                tracing::warn!("No ready tasks but plan not finished - possible cycle");
+                tracing::warn!(
+                    "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
+                );
                 break;
             }
 
@@ -2706,8 +2711,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
         let mut last_raw_response = String::new();
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        let mut actual_attempts: usize = 0;
 
         for attempt in 1..=MAX_WORKER_ATTEMPTS {
+            actual_attempts = attempt;
             let is_final_attempt = attempt == MAX_WORKER_ATTEMPTS;
 
             let AgentWithPreamble {
@@ -2722,8 +2729,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 (base_worker_prompt.clone(), vec![])
             } else {
                 // Retry: append correction to previous conversation
-                let correction = "[SYSTEM CORRECTION] You did not call the submit_result tool in your previous response. \
-You MUST call submit_result to complete this task. Please try again.".to_string();
+                let correction =
+                    super::prompt_constants::corrections::WORKER_SUBMIT_RESULT.to_string();
                 let history = vec![
                     rig::completion::Message::user(base_worker_prompt.clone()),
                     rig::completion::Message::assistant(last_raw_response.clone()),
@@ -2786,14 +2793,10 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
                 }
             }
 
-            // Track token usage per attempt.
-            // usage_state tracks TOTAL cost across all attempts (each is a separate API call).
-            // Span metrics capture only the final attempt's usage (what produced the result).
+            // Track per-attempt usage for span metrics.
+            // Cumulative usage_state is now updated eagerly per TurnUsage inside
+            // stream_and_forward, so failed attempts also contribute.
             if let Ok(ref response) = stream_result {
-                self.usage_state.accumulate_usage(
-                    response.usage.input_tokens,
-                    response.usage.output_tokens,
-                );
                 last_usage = response.usage;
             }
 
@@ -2813,9 +2816,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
 
             // Check escalation flag (duplicate call loop)
             let result: Result<String, StreamError> = match result {
-                Ok(worker_output)
-                    if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) =>
-                {
+                Ok(worker_output) if escalation_flag.load(std::sync::atomic::Ordering::SeqCst) => {
                     let processed = self
                         .maybe_create_artifact(task_id, *worker_name, worker_output)
                         .await;
@@ -2860,7 +2861,8 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
                         None if is_final_attempt => {
                             tracing::warn!(
                                 "Worker did not call submit_result for task {} after {} attempts. Preserving raw output via artifact flow.",
-                                task_id, attempt
+                                task_id,
+                                attempt
                             );
                             let duration_ms = start_time.elapsed().as_millis() as u64;
                             self.set_worker_span_usage(
@@ -2886,7 +2888,8 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
                         None => {
                             tracing::info!(
                                 "Worker attempt {} for task {} did not call submit_result. Retrying with correction.",
-                                attempt, task_id
+                                attempt,
+                                task_id
                             );
                             last_raw_response = raw_response;
                             continue;
@@ -2911,7 +2914,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
             self.persist_worker_execution(
                 task_id,
                 task_description,
-                MAX_WORKER_ATTEMPTS,
+                actual_attempts,
                 duration_ms,
                 Err(e.as_ref()),
                 None,
@@ -2920,7 +2923,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
             .await;
             Err(format!(
                 "Worker failed task {} after {} attempts: {}",
-                task_id, MAX_WORKER_ATTEMPTS, e
+                task_id, actual_attempts, e
             )
             .into())
         } else {
@@ -2928,7 +2931,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
             self.persist_worker_execution(
                 task_id,
                 task_description,
-                MAX_WORKER_ATTEMPTS,
+                actual_attempts,
                 duration_ms,
                 Ok(&last_raw_response),
                 None,
@@ -2950,6 +2953,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
     }
 
     /// Persist a single worker execution attempt to the journal and persistence store.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_worker_execution(
         &self,
         task_id: usize,
@@ -3161,48 +3165,6 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
         (Some(context), Plan::new(""))
     }
 
-    /// Apply result reuse from a previous plan to the new plan.
-    ///
-    /// When the coordinator sets `reuse_result_from` on a task in the new plan,
-    /// this function finds the referenced task in the previous plan and copies
-    /// its result, marking the task as Complete so `ready_tasks()` skips it.
-    pub(crate) fn apply_result_reuse(plan: &mut Plan, previous: Option<&Plan>) {
-        let previous = match previous {
-            Some(p) => p,
-            None => return,
-        };
-
-        for task in &mut plan.tasks {
-            if let Some(reuse_id) = task.reuse_result_from {
-                if let Some(prev_task) = previous.tasks.iter().find(|t| t.id == reuse_id) {
-                    if let TaskState::Complete { ref result } = prev_task.state {
-                        tracing::info!(
-                            "Task {} reusing result from previous task {} ({})",
-                            task.id,
-                            reuse_id,
-                            prev_task.description
-                        );
-                        task.complete(result.clone());
-                        task.structured_output = prev_task.structured_output.clone();
-                    } else {
-                        tracing::warn!(
-                            "Task {} requested reuse from task {} but it was not complete (status: {:?})",
-                            task.id,
-                            reuse_id,
-                            TaskStatus::from(&prev_task.state)
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        "Task {} requested reuse from task {} but it was not found in previous plan",
-                        task.id,
-                        reuse_id
-                    );
-                }
-            }
-        }
-    }
-
     /// Top-level orchestration entry point: route → loop.
     ///
     /// Creates a single coordinator agent for the entire orchestration request,
@@ -3255,9 +3217,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
             agent: coordinator,
             preamble: coordinator_preamble,
             ..
-        } = self
-            .create_coordinator(routing_toolset, true)
-            .await?;
+        } = self.create_coordinator(routing_toolset, true).await?;
 
         let mut coordinator_state = CoordinatorState {
             agent: coordinator,
@@ -3269,7 +3229,13 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
         // Set iteration for initial planning (journal reads this via AtomicUsize)
         self.current_iteration.store(1, Ordering::Relaxed);
         let (response, _prompt, _coordinator_text) = self
-            .plan_with_routing(query, &chat_history, &mut coordinator_state, None, Some(&event_tx))
+            .plan_with_routing(
+                query,
+                &chat_history,
+                &mut coordinator_state,
+                None,
+                Some(&event_tx),
+            )
             .await?;
 
         let result = match response {
@@ -3581,7 +3547,13 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
         Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self
-            .plan_with_routing(query, chat_history, coordinator_state, Some(&post_execute_ctx), Some(event_tx))
+            .plan_with_routing(
+                query,
+                chat_history,
+                coordinator_state,
+                Some(&post_execute_ctx),
+                Some(event_tx),
+            )
             .await;
 
         let decision_latency = decision_start.elapsed().as_secs_f64();
@@ -3699,8 +3671,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
 
                 let routing_rationale = resp.routing_rationale().to_string();
                 let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
-                let mut new_plan = resp.into_plan().expect("StepsPlan always converts to plan");
-                Self::apply_result_reuse(&mut new_plan, Some(&plan));
+                let new_plan = resp.into_plan().expect("StepsPlan always converts to plan");
 
                 Self::emit_event(
                     event_tx,
@@ -3754,7 +3725,7 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
                 // The coordinator already produced new_plan; we discard the
                 // empty plan returned by trigger_replan but keep its
                 // IterationContext so the next iteration can persist
-                // previous_plan cleanly (reuse_result_from resolution, etc.)
+                // previous_plan cleanly.
                 Ok(IterationOutcome::Continue {
                     new_plan,
                     previous_context: new_previous_context,
@@ -3768,19 +3739,18 @@ You MUST call submit_result to complete this task. Please try again.".to_string(
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "coordinator_error");
                 let err_str = e.to_string();
-                let note = if err_str.contains("timed out") {
-                    format!("Post-execute coordinator call timed out: {}", err_str)
-                } else if err_str.contains("MaxDepthError") || err_str.contains("reached limit") {
-                    format!(
-                        "Post-execute coordinator exhausted its turn budget without routing: {}",
-                        err_str
-                    )
-                } else {
-                    // Plan-parse errors are absorbed upstream in
-                    // plan_with_routing's all-attempts-failed single-task
-                    // path. An Err bubbling up here is an upstream failure
-                    // (provider error, connection drop, etc.).
-                    format!("Post-execute coordinator call failed: {}", err_str)
+                let category = Self::categorize_failure_error(&err_str);
+                let note = match category {
+                    FailureCategory::AgentTimeout => {
+                        format!("Post-execute coordinator call timed out: {}", err_str)
+                    }
+                    FailureCategory::DepthExhausted => {
+                        format!(
+                            "Post-execute coordinator exhausted its turn budget without routing: {}",
+                            err_str
+                        )
+                    }
+                    _ => format!("Post-execute coordinator call failed: {}", err_str),
                 };
                 tracing::warn!("{}", note);
                 let raw = Self::build_raw_task_results(&plan, &note);
@@ -4083,39 +4053,37 @@ fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
 
 /// Check if an error indicates a context length/token limit exceeded.
 ///
-/// Providers return various error messages for context overflow:
-/// - OpenAI: "maximum context length", "token limit"
-/// - Anthropic: "maximum number of tokens", "context length"
-/// - Generic: "context", "tokens exceeded"
+/// True when the error indicates context window overflow. Delegates to
+/// `categorize_failure_error` so classification stays in one place.
 fn is_context_overflow_error(error: &dyn std::error::Error) -> bool {
-    let msg = error.to_string().to_lowercase();
+    matches!(
+        Orchestrator::categorize_failure_error(&error.to_string()),
+        FailureCategory::ContextOverflow
+    )
+}
 
-    // Check for common context overflow patterns
-    (msg.contains("context") && (msg.contains("length") || msg.contains("exceeded")))
-        || msg.contains("maximum context")
-        || msg.contains("token limit")
-        || msg.contains("tokens exceeded")
-        || msg.contains("maximum number of tokens")
-        || (msg.contains("too") && msg.contains("long") && msg.contains("token"))
+/// True for errors worth retrying in the planning loop. Delegates to
+/// `categorize_failure_error` so classification stays in one place.
+fn is_transient_planning_error(error: &str) -> bool {
+    matches!(
+        Orchestrator::categorize_failure_error(error),
+        FailureCategory::ProviderOverloaded | FailureCategory::AgentTimeout
+    )
 }
 
 /// Get a user-friendly suggestion for recovering from context overflow.
 fn context_overflow_suggestion(phase: &str) -> String {
+    use super::prompt_constants::context_overflow;
     match phase {
-        "planning" => {
-            "Query too complex. Consider breaking into smaller, focused questions.".to_string()
-        }
-        "worker" => {
-            "Task context too large. The plan may need smaller, more focused tasks.".to_string()
-        }
-        _ => "Request exceeded context limits. Reduce query complexity.".to_string(),
+        "planning" => context_overflow::PLANNING.to_string(),
+        "worker" => context_overflow::WORKER.to_string(),
+        _ => context_overflow::DEFAULT.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::types::Task;
 
     #[test]
     fn test_truncate_query_short() {
@@ -4966,81 +4934,6 @@ mod tests {
         assert_eq!(result.count, 1);
         assert_eq!(result.messages[0].role, "user");
         assert!(result.messages[0].content.contains("2+2"));
-    }
-
-    // ========================================================================
-    // apply_result_reuse tests
-    // ========================================================================
-
-    #[test]
-    fn test_apply_result_reuse_carries_forward() {
-        // Previous plan with a completed task
-        let mut prev = Plan::new("prev");
-        let mut t = Task::new(0, "Fetch data", "Get data");
-        t.complete("data result".to_string());
-        prev.add_task(t);
-
-        // New plan references previous task 0
-        let mut new_plan = Plan::new("new");
-        let mut new_task = Task::new(0, "Fetch data (reused)", "Reuse");
-        new_task.reuse_result_from = Some(0);
-        new_plan.add_task(new_task);
-        new_plan.add_task(Task::new(1, "Analyze data", "New work"));
-
-        Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
-
-        // Task 0 should be marked complete with the previous result
-        let TaskState::Complete { ref result } = new_plan.tasks[0].state else {
-            panic!("expected Complete");
-        };
-        assert_eq!(result, "data result");
-        // Task 1 should be unchanged
-        assert!(matches!(new_plan.tasks[1].state, TaskState::Pending));
-    }
-
-    #[test]
-    fn test_apply_result_reuse_ignores_failed_tasks() {
-        let mut prev = Plan::new("prev");
-        let mut t = Task::new(0, "Bad task", "Failed");
-        t.fail("error", FailureCategory::AgentError);
-        prev.add_task(t);
-
-        let mut new_plan = Plan::new("new");
-        let mut new_task = Task::new(0, "Retry", "Retry");
-        new_task.reuse_result_from = Some(0);
-        new_plan.add_task(new_task);
-
-        Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
-
-        // Should NOT carry forward since previous task was failed
-        assert!(matches!(new_plan.tasks[0].state, TaskState::Pending));
-    }
-
-    #[test]
-    fn test_apply_result_reuse_no_previous_plan() {
-        let mut plan = Plan::new("new");
-        let mut t = Task::new(0, "Task", "Work");
-        t.reuse_result_from = Some(0);
-        plan.add_task(t);
-
-        // Should not panic with None previous
-        Orchestrator::apply_result_reuse(&mut plan, None);
-        assert!(matches!(plan.tasks[0].state, TaskState::Pending));
-    }
-
-    #[test]
-    fn test_apply_result_reuse_missing_task_id() {
-        let mut prev = Plan::new("prev");
-        prev.add_task(Task::new(0, "Only task", "Single"));
-
-        let mut new_plan = Plan::new("new");
-        let mut t = Task::new(0, "Reuse", "Reuse");
-        t.reuse_result_from = Some(99); // doesn't exist
-        new_plan.add_task(t);
-
-        Orchestrator::apply_result_reuse(&mut new_plan, Some(&prev));
-        // Should not carry forward — task 99 doesn't exist
-        assert!(matches!(new_plan.tasks[0].state, TaskState::Pending));
     }
 
     // ========================================================================

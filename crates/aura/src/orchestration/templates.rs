@@ -592,7 +592,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             redesign_section: "FAILED TASKS:\n- Task 1: List files in /data using list_files → failed: Connection refused\n\n",
             failure_section: "FAILURE SUMMARY:\nArithmetic task completed correctly, but file listing failed due to connection error.\n\nAREAS NEEDING ATTENTION:\n- File listing task needs retry or alternative approach\n\n",
             failure_history: "FAILURE HISTORY:\n- Iteration 1: \"List files in /data using list_files\" (worker: data) — Connection refused\n\n",
-            reuse_guidance: "To carry forward a completed task's result without re-executing it, set \"reuse_result_from\" to the original task ID.\n\n",
+            reuse_guidance: crate::orchestration::prompt_constants::guidance::RESULT_FORWARDING,
         });
         let _ = writeln!(out, "{continuation}");
 
