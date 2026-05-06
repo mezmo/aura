@@ -195,17 +195,6 @@ pipeline {
           , args: [RELEASE_VERSION: FEATURE_TAG]
           , docker_repo: DOCKER_REPO
           )
-
-          withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws',
-            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-          ]]) {
-            sh script: 'make clean'
-            sh script: "make render RELEASE_VERSION=${FEATURE_TAG}", label: "Generate feature branch k8s Artifacts"
-            sh script: "make publish RELEASE_VERSION=${FEATURE_TAG}", label: "Publish feature branch k8s Artifacts"
-          }
         }
       }
     }
@@ -240,17 +229,6 @@ pipeline {
             buildx {
               withReport('Release', 'npm run release')
             }
-          }
-
-          withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws',
-            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-          ]]) {
-            sh script: 'make clean'
-            sh script: "make render RELEASE_VERSION=${RELEASE_VERSION_PATCH}", label: "Generate k8s Artifacts"
-            sh script: "make publish RELEASE_VERSION=${RELEASE_VERSION_PATCH}", label: "Publish k8s Artifacts"
           }
         }
       }
