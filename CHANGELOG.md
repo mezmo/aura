@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.19.3](https://github.com/mezmo/aura/compare/v1.19.2...v1.19.3) (2026-05-06)
+
+
+### Bug Fixes
+
+* **internal**: remove stale k8s artifacts [89aac80](https://github.com/mezmo/aura/commit/89aac80865fcec48d6fd906add905a131d8e80d1) - Phil Ciampini
+
+### Documentation
+
+* reframe readme intro as sre agentic harness [e6eb139](https://github.com/mezmo/aura/commit/e6eb13971d1e5aa6607949c752ff8919e448f436) - Andre Elizondo [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
 ## [1.19.2](https://github.com/mezmo/aura/compare/v1.19.1...v1.19.2) (2026-05-01)
 
 
