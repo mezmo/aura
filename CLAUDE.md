@@ -106,10 +106,9 @@ aura/
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution
 - Per-worker LLM overrides: workers inherit `[agent.llm]` by default; `[orchestration.worker.<name>.llm]` overrides it (different model, same provider config). Resolved inline at worker construction (`worker.llm.as_ref().unwrap_or(&agent.llm)`)
-- Dependency-aware multi-wave execution with quality evaluation
-- Iterative re-planning loops (`quality_threshold`, `max_planning_cycles`)
+- Dependency-aware multi-wave execution with iterative re-planning (`max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
-- 11 `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
+- `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
 
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence

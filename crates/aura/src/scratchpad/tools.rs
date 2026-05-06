@@ -1579,6 +1579,25 @@ pub fn is_scratchpad_tool(tool_name: &str) -> bool {
     SCRATCHPAD_TOOL_NAME_SET.contains(tool_name)
 }
 
+/// Orchestration-internal tool names that are not MCP tools and therefore
+/// not covered by `ObserverWrapper`. Used alongside `is_scratchpad_tool`
+/// to gate event emission in `stream_and_forward`.
+static ORCHESTRATION_INTERNAL_TOOLS: &[&str] = &[
+    "read_artifact",
+    "submit_result",
+    "list_prior_runs",
+    "get_conversation_context",
+];
+
+/// True for any tool that is NOT an MCP tool — scratchpad exploration tools
+/// and orchestration-internal tools. These are not wrapped by
+/// `ObserverWrapper` and need explicit event forwarding in
+/// `stream_and_forward` when `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` is enabled.
+pub fn is_internal_tool(tool_name: &str) -> bool {
+    SCRATCHPAD_TOOL_NAME_SET.contains(tool_name)
+        || ORCHESTRATION_INTERNAL_TOOLS.contains(&tool_name)
+}
+
 /// Cached `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` flag, parsed via the canonical
 /// boolean env-var vocabulary in [`crate::env_flags`]. Read once on first
 /// access; default `false`.

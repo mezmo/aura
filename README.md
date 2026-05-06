@@ -10,7 +10,7 @@ Key capabilities:
 - RAG pipeline integration with in-memory and external vector stores
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
-- Dependency-aware multi-wave execution with quality evaluation and iterative re-planning loops
+- Dependency-aware multi-wave execution with iterative re-planning loops
 
 > **Open Alpha** — Aura is under active development. APIs and configuration
 > may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
@@ -333,7 +333,6 @@ memory_dir = "/tmp/orchestration-memory"
 
 [orchestration]
 enabled = true
-quality_threshold = 0.8
 max_planning_cycles = 3
 tools_in_planning = "summary"
 allow_direct_answers = true
@@ -372,14 +371,13 @@ Execution loop:
 
 Workers run with isolated task context windows and filtered MCP/vector-store access based on each worker block.
 
-For a fuller multi-worker example, see [configs/example-workers.toml](configs/example-workers.toml).
+For a fuller multi-worker example, see [configs/example-math-orchestration.toml](configs/example-math-orchestration.toml).
 
 #### Orchestration fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable orchestration mode |
-| `quality_threshold` | float | `0.8` | Minimum quality score (reserved; evaluation removed) |
 | `max_planning_cycles` | int | `3` | Maximum plan→execute→continue iterations |
 | `allow_direct_answers` | bool | `true` | Allow coordinator to answer simple queries directly |
 | `allow_clarification` | bool | `true` | Allow coordinator to ask for clarification |

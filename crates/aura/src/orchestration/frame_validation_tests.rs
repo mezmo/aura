@@ -327,8 +327,11 @@ fn test_continuation_full_scenario() {
     );
     assert!(prompt.contains("has failed 2 times"), "failure count");
 
-    // Reuse guidance (has failures + completions)
-    assert!(prompt.contains("reuse_result_from"), "reuse guidance");
+    // Result forwarding guidance (has failures + completions)
+    assert!(
+        prompt.contains("Workers cannot see prior iteration results"),
+        "result forwarding guidance"
+    );
 
     // Routing tools
     assert!(prompt.contains("respond_directly"), "routing tool");
@@ -375,15 +378,29 @@ fn test_continuation_mixed_structured_and_raw() {
     let prompt = ctx.build_continuation_prompt(3, false);
 
     // Structured path with no artifact: inlines full result, not summary
-    assert!(prompt.contains("Full detailed result from structured output"), "full result inlined");
-    assert!(prompt.contains("confidence: medium"), "confidence from structured");
+    assert!(
+        prompt.contains("Full detailed result from structured output"),
+        "full result inlined"
+    );
+    assert!(
+        prompt.contains("confidence: medium"),
+        "confidence from structured"
+    );
     // Summary is NOT shown when result fits inline (no artifact)
-    assert!(!prompt.contains("Concise structured summary"), "summary not shown when no artifact");
+    assert!(
+        !prompt.contains("Concise structured summary"),
+        "summary not shown when no artifact"
+    );
 
     // Raw path: shows full result directly
-    assert!(prompt.contains("Raw unstructured worker output"), "raw output");
+    assert!(
+        prompt.contains("Raw unstructured worker output"),
+        "raw output"
+    );
     // Raw path should NOT contain "confidence:"
-    let raw_section = prompt.lines().any(|l| l.contains("Raw unstructured") && !l.contains("confidence:"));
+    let raw_section = prompt
+        .lines()
+        .any(|l| l.contains("Raw unstructured") && !l.contains("confidence:"));
     assert!(raw_section, "no confidence on raw task");
 }
 
@@ -788,18 +805,22 @@ fn test_continuation_tool_output_artifacts_visible() {
     // Artifact inventory visible to coordinator for read_artifact calls
     assert!(
         prompt.contains("[Artifact: task-0-sre-iter-1-log_search-0-output.txt"),
-        "log_search artifact ref: {}", prompt
+        "log_search artifact ref: {}",
+        prompt
     );
     assert!(
         prompt.contains("[Artifact: task-0-sre-iter-1-get_metrics-1-output.txt"),
-        "get_metrics artifact ref: {}", prompt
+        "get_metrics artifact ref: {}",
+        prompt
     );
     assert!(prompt.contains("48000 bytes"), "artifact size");
 
     // Tool without artifact should NOT produce an [Artifact:] line
     assert_eq!(
-        prompt.matches("[Artifact:").count(), 2,
-        "exactly 2 artifact refs (not 3): {}", prompt
+        prompt.matches("[Artifact:").count(),
+        2,
+        "exactly 2 artifact refs (not 3): {}",
+        prompt
     );
 }
 
@@ -1007,11 +1028,7 @@ fn test_planning_wrapper_basic_structure() {
 
 #[test]
 fn test_planning_wrapper_no_workers() {
-    let prompt = Orchestrator::build_planning_wrapper(
-        "What is 2+2?",
-        "",
-        "",
-    );
+    let prompt = Orchestrator::build_planning_wrapper("What is 2+2?", "", "");
 
     assert!(prompt.contains("USER QUERY: What is 2+2?"), "query present");
     assert!(!prompt.contains("AVAILABLE WORKERS"), "no worker section");
@@ -1154,8 +1171,8 @@ fn test_continuation_clean_success_no_failure_sections() {
     assert!(!prompt.contains("FAILURE HISTORY"), "no failure history");
     assert!(!prompt.contains("OBSERVED PATTERNS"), "no patterns");
     assert!(
-        !prompt.contains("reuse_result_from"),
-        "no reuse guidance on clean success"
+        !prompt.contains("Workers cannot see prior iteration results"),
+        "no result forwarding guidance on clean success"
     );
 }
 
@@ -1178,7 +1195,7 @@ fn test_continuation_short_result_no_artifact() {
 }
 
 #[test]
-fn test_continuation_reuse_guidance_absent_when_all_failed() {
+fn test_continuation_result_forwarding_absent_when_all_failed() {
     let mut plan = Plan::new("Test goal");
     let mut t = Task::new(0, "failing", "This fails");
     t.fail("error".to_string(), FailureCategory::AgentError);
@@ -1188,8 +1205,8 @@ fn test_continuation_reuse_guidance_absent_when_all_failed() {
     let prompt = ctx.build_continuation_prompt(3, false);
 
     assert!(
-        !prompt.contains("reuse_result_from"),
-        "no reuse when zero succeeded: {}",
+        !prompt.contains("Workers cannot see prior iteration results"),
+        "no result forwarding guidance when zero succeeded: {}",
         prompt
     );
 }
@@ -1476,8 +1493,14 @@ fn test_session_history_current_time_placeholder_replaced() {
     );
 
     let history = build_session_context(&[manifest]);
-    assert!(!history.contains("%%CURRENT_TIME%%"), "template placeholder must not appear");
-    assert!(!history.contains("Current time:"), "current time moved to user messages");
+    assert!(
+        !history.contains("%%CURRENT_TIME%%"),
+        "template placeholder must not appear"
+    );
+    assert!(
+        !history.contains("Current time:"),
+        "current time moved to user messages"
+    );
 }
 
 #[test]
