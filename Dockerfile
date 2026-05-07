@@ -18,6 +18,36 @@ RUN <<EOR
   rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
 EOR
 
+### 0002 test
+FROM rust:1.93.1 AS test
+RUN groupadd --gid 1000 aura \
+  && useradd --uid 1000 --gid aura --shell /bin/bash --create-home aura
+
+WORKDIR /home/aura
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+# needed for make operations
+COPY .git ./.git
+COPY .makefiles ./.makefiles
+COPY .config.mk .config.mk ./
+COPY Makefile Makefile ./
+
+RUN <<EOR
+  apt-get update && apt-get install -y ca-certificates libssl3 curl nodejs npm
+  rm -rf /var/lib/apt/lists/*
+EOR
+
+USER 1000
+
+RUN <<EOR
+  git config --global --add safe.directory /home/aura
+  rustup component add rustfmt clippy llvm-tools
+  rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+  cargo install --locked --force cargo-nextest
+  cargo install --locked grcov
+EOR
 
 # 0002: linting & testing
 FROM rust:1.93.1 AS release-lint-test

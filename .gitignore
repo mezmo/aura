@@ -45,6 +45,7 @@ node_modules/
 .bin/
 .npm/
 node_modules/
+report/
 
 # Generated documentation
 /doc/

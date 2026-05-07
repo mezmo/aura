@@ -1,14 +1,12 @@
 lint:: lint-rust fmt-rust
-clean:: clean-rust clean-node
+clean:: clean-rust clean-node clean-report
 build:: build-rust
 
 CARGO_BIN_DIR ?= .bin
 NEXTEST_BIN = $(CARGO_BIN_DIR)/cargo-nextest
-LLVM_PROFILE_FILE ?= $(COVERAGE_DIR)/profile-%p-%m.profraw
 GRCOV_VERSION ?= v0.10.7
 GRCOV_BIN = $(CARGO_BIN_DIR)/grcov
 PATH := $(CARGO_BIN_DIR):$(PATH)
-RUSTFLAGS=--allow=warnings -Cinstrument-coverage
 AURA_RELEASE :=
 
 $(CARGO_BIN_DIR):
@@ -19,13 +17,29 @@ $(REPORT_DIR):
 
 .PHONY:build-rust
 build-rust: $(DOCKER_ENV) ## Build all rust targets
-	$(RUN) cargo build --workspace $(if $(AURA_RELEASE),--release,)
+	$(RUN) cargo build --workspace $(if $(AURA_RELEASE),--release,) $(if $(IS_CI),--quiet,)
 
 .PHONY:coverage
 coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite with code coverage
-	-$(MAKE) nextest || touch $(TARGET_DIR)/.nextest-failed
-	
-	$(RUN) grcov $(COVERAGE_DIR) . --binary-path $(TARGET_DIR)/debug --output-types cobertura,html --output-path $(REPORT_DIR) --llvm --branch --source-dir . || touch $(TARGET_DIR)/.coverage-failed
+	-$(MAKE) debug-PROJECT_ROOT
+	-export RUSTFLAGS="--allow=warnings -Cinstrument-coverage"; \
+		export LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/build-%p-%m.profraw; \
+		cargo build --all-targets --workspace --frozen; \
+		export LLVM_PROFILE_FILE=$(PROJECT_ROOT)/$(COVERAGE_DIR)/profile-%p-%m.profraw; \
+		$(MAKE) nextest|| touch $(TARGET_DIR)/.nextest-failed
+	$(RUN) grcov $(COVERAGE_DIR) . \
+		--binary-path $(TARGET_DIR)/debug \
+		--ignore-not-existing \
+		--keep-only 'crates/**' \
+		--ignore '/*' \
+		--ignore '/usr/local/cargo/**' \
+		--ignore '*_test.rs' \
+		--output-types cobertura,html \
+		--output-path $(REPORT_DIR) \
+		--llvm \
+		--branch \
+		--source-dir . \
+		|| touch $(TARGET_DIR)/.coverage-failed
 
 	@if [ -f $(TARGET_DIR)/.nextest-failed ] || [ -f $(TARGET_DIR)/.grcov-failed ]; then \
 		rm -f $(TARGET_DIR)/.nextest-failed $(TARGET_DIR)/.grcov-failed; \
@@ -34,7 +48,7 @@ coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite w
 
 .PHONY:nextest
 nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
-	$(RUN) cargo nextest run --workspace --all-targets $(if $(IS_CI),-P ci,)
+	$(RUN) cargo nextest run --workspace --all-targets --features integration $(if $(IS_CI),-P ci,)
 
 .PHONY:lint-rust
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
@@ -43,6 +57,14 @@ lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 .PHONY:clean-rust
 clean-rust: ## Clean up rust build artifacts
 	$(RUN_NO_ENV) cargo clean
+
+.PHONY:clean-report
+clean-report:  ## Clear out the report directory
+	$(RUN_NO_ENV) rm  -rf $(COVERAGE_DIR)/*
+
+.PHONY:clean-profile
+clean-profile: ## Clean artifacts left over from profiling
+	$(RUN_NO_ENV) rm -rf $(COVERAGE_DIR)/*.profraw
 
 .PHONY:clean-bin
 clean-bin: $(DOCKER_ENV) ## Cleanup the binaries added by aura
@@ -61,8 +83,11 @@ fmt-rust:: $(REPORT_DIR)                 ## Format code with rustfmt
 	fi
 
 $(NEXTEST_BIN): $(CARGO_BIN_DIR)
-	@echo "Setting up cargo-nextest in $(CARGO_BIN_DIR)"
-	@case "$$(uname -s)" in \
+	@if [ "$(AURA_AUTO_DOWNLOAD)" != "true" ]; then \
+		exit 0; \
+	fi; \
+	echo "Setting up cargo-nextest in $(CARGO_BIN_DIR)"; \
+	case "$$(uname -s)" in \
 		Darwin) plat="mac";; \
 		Linux) \
 			case "$$(uname -m)" in \
@@ -77,8 +102,11 @@ $(NEXTEST_BIN): $(CARGO_BIN_DIR)
 	touch $@
 
 $(GRCOV_BIN): | $(CARGO_BIN_DIR)
-	@echo "Setting up grcov"
-	@case "$$(uname -s)" in \
+	@if [ "$(AURA_AUTO_DOWNLOAD)" != "true" ]; then \
+		exit 0; \
+	fi; \
+	echo "Setting up grcov"; \
+	case "$$(uname -s)" in \
 		Darwin) \
 			case "$$(uname -m)" in \
 				aarch64|arm64) target="aarch64-apple-darwin";; \

@@ -1,7 +1,3 @@
-# Git
-.git
-.gitignore
-
 # Rust build artifacts
 target/
 **/target/

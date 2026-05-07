@@ -1,7 +1,4 @@
 # Makefile for aura project
-# Adapted from pipeline-assignment-loop
-
-
 
 -include .config.mk
 -include .local.mk
@@ -10,8 +7,10 @@ slugify = $(shell echo '$(1)' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]
 # Provide standard defaults - set overrides in .config.mk
 SHELL=/bin/bash -o pipefail
 TARGET_DIR = target
-COVERAGE_DIR := $(TARGET_DIR)/ci
-REPORT_DIR = $(COVERAGE_DIR)/reports
+COVERAGE_DIR := report
+REPORT_DIR = $(COVERAGE_DIR)/ci
+AURA_AUTO_DOWNLOAD ?= true
+
 CI ?=
 IS_CI := $(if $(filter true, $(CI)), true,)
 ALWAYS_TIMESTAMP_VERSION ?= false
@@ -105,58 +104,6 @@ test::                ## Run all tests targets
 .PHONY:setup
 setup::              ## Setup local depencies for development
 
-.PHONY:test-integration
-test-integration::    ## Run integration tests via Docker Compose
-	@$(MAKE) test-integration-down
-	@echo "Starting integration test environment..."
-	docker compose -p aura-test-$(GIT_SHA1) \
-		-f compose/base.yml \
-		-f compose/test.yml \
-		up --build --force-recreate --exit-code-from aura-integration-test
-	@$(MAKE) test-integration-down
-
-.PHONY:test-integration-down
-test-integration-down:  ## Cleanup integration test containers
-	-docker compose -p aura-test-$(GIT_SHA1) \
-		-f compose/base.yml \
-		-f compose/test.yml \
-		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
-
-.PHONY:test-integration-local-up
-test-integration-local-up::  ## Start local aura infra for testing
-	@echo "Starting local aura infra for testing..."
-	docker compose -f compose/base.yml -f compose/dev.yml up -d --build --force-recreate
-	@echo "Waiting for services to be healthy..."
-	@timeout=90; while [ $$timeout -gt 0 ]; do \
-		mcp_status=$$(docker compose -f compose/base.yml -f compose/dev.yml ps mock-mcp --format '{{.Health}}' 2>/dev/null); \
-		aura_status=$$(docker compose -f compose/base.yml -f compose/dev.yml ps aura-web-server --format '{{.Health}}' 2>/dev/null); \
-		if [ "$$mcp_status" = "healthy" ] && [ "$$aura_status" = "healthy" ]; then \
-			echo "✅ mock-mcp is healthy"; \
-			echo "✅ aura-web-server is healthy"; \
-			exit 0; \
-		fi; \
-		echo "Waiting... mock-mcp: $$mcp_status, aura-web-server: $$aura_status ($$timeout s remaining)"; \
-		sleep 2; \
-		timeout=$$((timeout - 2)); \
-	done; \
-	echo "❌ Timeout waiting for services to become healthy"; \
-	exit 1
-
-.PHONY:test-integration-local-down
-test-integration-local-down::  ## Stop local aura infra
-	@echo "Stopping local aura infra..."
-	docker compose -f compose/base.yml -f compose/dev.yml down
-
-.PHONY:test-integration-local
-test-integration-local::  ## Start local aura infra, run integration tests, then cleanup
-	@$(MAKE) test-integration-local-up
-	@echo "Running integration tests..."
-	@trap '$(MAKE) test-integration-local-down; exit 130' INT TERM; \
-	cargo test --package aura-web-server --features integration --no-fail-fast -- --test-threads=1; \
-	test_exit=$$?; \
-	$(MAKE) test-integration-local-down; \
-	exit $$test_exit
-
 .PHONY:lint
 lint::                ## Apply all lint targets
 
@@ -182,7 +129,7 @@ docker-build-release:: ## Build Docker release stage only
 .PHONY:publish
 publish::             ## Placeholder for publishing artifacts
 
-$(DOCKER_ENV): $(REPORT_DIR) ## Set up docker info
+$(DOCKER_ENV): $(TARGET_DIR) $(REPORT_DIR) ## Set up docker info
 	@env | awk '!/TOKEN|KEY/ && /^(AURA_|CI|LLVM|RUST|GRCOV|CARGO|NEXTEST)/ { print }' | sort > $(@)
 
 
