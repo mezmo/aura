@@ -290,14 +290,6 @@ make build
 make build-release
 ```
 
-Test CI pipeline locally before pushing:
-
-```bash
-./scripts/test-ci.sh
-```
-
-The script mirrors Jenkins checks: format, workspace tests, and clippy with warnings denied.
-
 ## Testing
 
 Web server integration tests live under `crates/aura-web-server/tests/`.
