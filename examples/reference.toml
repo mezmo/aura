@@ -17,6 +17,11 @@
 #   examples/complete/kubernetes-sre.toml             - K8s MCP + Prometheus
 #   examples/complete/devops-assistant.toml           - GitHub MCP
 
+# ── Memory Directory ────────────────────────────────────────────────
+# Top-level directory for scratchpad and orchestration persistence.
+# Required when scratchpad is enabled.
+# memory_dir = "/tmp/aura"
+
 # ── MCP Tool Servers ────────────────────────────────────────────────
 [mcp]
 # Sanitize tool schemas for OpenAI function-calling compatibility.
@@ -48,6 +53,20 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # [mcp.servers.auth_aware_server.headers_from_request]
 # # Maps: outgoing header name = incoming request header name
 # Authorization = "x-user-token"
+
+# ── Per-Server Scratchpad Thresholds ────────────────────────────────
+# Configure per-tool token thresholds for scratchpad interception.
+# Keys are glob patterns matched against tool names; outputs exceeding
+# the threshold are saved to disk instead of filling the context window.
+# Default threshold is 5,120 tokens if omitted.
+#
+# [mcp.servers.example_http.scratchpad]
+# "*_list_*"   = { min_tokens = 512 }    # tools matching *_list_*
+# "get_pods"   = { min_tokens = 256 }    # specific tool override
+# "*"          = { min_tokens = 4096 }   # catch-all for remaining tools
+#
+# When multiple patterns match, the longest (most-specific) wins;
+# ties are broken by smallest threshold.
 
 # ── Vector Stores (RAG) ────────────────────────────────────────────
 # Connects to an external Qdrant instance. The agent gets a
@@ -145,3 +164,15 @@ model = "gpt-5.2"
 # api_key = "{{ env.GOOGLE_API_KEY }}"
 # model = "gemini-2.0-flash"
 
+# ── Scratchpad (Context Window Management) ──────────────────────────
+# Intercept large MCP tool outputs and store them on disk so the agent
+# can explore them selectively via read-only tools (head, slice, grep,
+# schema, item_schema, get_in, iterate_over, read).
+#
+# Requires top-level `memory_dir` to be set. Storage: {memory_dir}/scratchpad/
+#
+# [agent.scratchpad]
+# enabled = true
+# context_safety_margin = 0.20          # reserve 20% of context for reasoning/output
+# max_extraction_tokens = 10_000        # cap per exploration tool call
+# turn_depth_bonus = 6                  # extra ReAct turns when scratchpad is active
