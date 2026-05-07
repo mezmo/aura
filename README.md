@@ -319,6 +319,7 @@ Detailed test guidance: [crates/aura-web-server/README.md#running-integration-te
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
+- [docs/vector-stores.md](docs/vector-stores.md): vector store configuration for RAG with Qdrant, Bedrock Knowledge Bases, and embedding providers.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, and client examples.
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
