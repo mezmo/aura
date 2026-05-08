@@ -35,11 +35,11 @@ temperature = 0.3
 context_window = 200_000
 
 # --- scratchpad config (uncomment after PR #32 rebase) ---
-# [agent.scratchpad]
-# enabled = true
-# context_safety_margin = 0.20
-# max_extraction_tokens = 10_000
-# turn_depth_bonus = 6
+[agent.scratchpad]
+enabled = true
+context_safety_margin = 0.20
+max_extraction_tokens = 10_000
+turn_depth_bonus = 6
 
 [mcp]
 sanitize_schemas = false
@@ -51,11 +51,11 @@ headers = {}
 description = "Kubernetes SRE tools: cluster discovery, Prometheus metrics, Alertmanager rules, and ServiceMonitor management"
 
 # --- scratchpad globs (uncomment after PR #32 rebase) ---
-# [mcp.servers.k8s-sre.scratchpad]
-# "*_list_*" = { min_tokens = 512 }
-# "*_get_*" = { min_tokens = 256 }
-# "prometheus_*" = { min_tokens = 512 }
-# "k8s_list_service_monitors" = { min_tokens = 384 }
+[mcp.servers.k8s-sre.scratchpad]
+"*_list_*" = { min_tokens = 512 }
+"*_get_*" = { min_tokens = 2048 }
+"prometheus_*" = { min_tokens = 512 }
+"k8s_list_service_monitors" = { min_tokens = 384 }
 
 [orchestration]
 enabled = true

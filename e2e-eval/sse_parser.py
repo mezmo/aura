@@ -100,11 +100,16 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
     - success, duration_ms, result (from task_completed)
     - tool_calls: list of {tool_name, tool_call_id, arguments, _aura_reasoning,
                            success, duration_ms, result}
+
+    Replanned iterations reuse task_ids, so we key by a monotonic sequence
+    number and map the *current* task_id to the latest entry for tool_call
+    association.
     """
-    # Index: task_id → record (in-progress)
-    tasks: dict[int, dict] = {}
-    # Track which task a tool_call_id belongs to
-    call_to_task: dict[str, int] = {}
+    # Ordered list of task records; current_task maps live task_id → record
+    all_tasks: list[dict] = []
+    current_task: dict[int, dict] = {}
+    # Track which record a tool_call_id belongs to (by index into all_tasks)
+    call_to_idx: dict[str, int] = {}
 
     for event_name, data in event_data_pairs:
         if not data:
@@ -118,7 +123,7 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
             tid = payload.get("task_id")
             if tid is None:
                 continue
-            tasks[tid] = {
+            rec = {
                 "task_id": tid,
                 "description": payload.get("description", ""),
                 "worker_id": payload.get("worker_id", ""),
@@ -127,14 +132,14 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
                 "result": None,
                 "tool_calls": [],
             }
+            all_tasks.append(rec)
+            current_task[tid] = rec
 
         elif event_name == "aura.orchestrator.tool_call_started":
             tid = payload.get("task_id")
             cid = payload.get("tool_call_id", "")
             args = payload.get("arguments") or {}
             reasoning = args.pop("_aura_reasoning", None) if isinstance(args, dict) else None
-            if cid:
-                call_to_task[cid] = tid
             call_rec = {
                 "tool_name": payload.get("tool_name", ""),
                 "tool_call_id": cid,
@@ -144,14 +149,17 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
                 "duration_ms": None,
                 "result": None,
             }
-            if tid is not None and tid in tasks:
-                tasks[tid]["tool_calls"].append(call_rec)
+            rec = current_task.get(tid)
+            if rec is not None:
+                rec["tool_calls"].append(call_rec)
+                if cid:
+                    call_to_idx[cid] = all_tasks.index(rec)
 
         elif event_name == "aura.orchestrator.tool_call_completed":
             cid = payload.get("tool_call_id", "")
-            tid = call_to_task.get(cid)
-            if tid is not None and tid in tasks:
-                for tc in reversed(tasks[tid]["tool_calls"]):
+            idx = call_to_idx.get(cid)
+            if idx is not None:
+                for tc in reversed(all_tasks[idx]["tool_calls"]):
                     if tc["tool_call_id"] == cid:
                         tc["success"] = payload.get("success", True)
                         tc["duration_ms"] = payload.get("duration_ms")
@@ -161,21 +169,21 @@ def _extract_tasks(event_data_pairs: list[tuple[str, str]]) -> list[dict]:
 
         elif event_name == "aura.orchestrator.task_completed":
             tid = payload.get("task_id")
-            if tid is not None and tid in tasks:
-                tasks[tid]["success"] = payload.get("success", False)
-                tasks[tid]["duration_ms"] = payload.get("duration_ms")
-                tasks[tid]["result"] = payload.get("result")
+            rec = current_task.get(tid)
+            if rec is not None:
+                rec["success"] = payload.get("success", False)
+                rec["duration_ms"] = payload.get("duration_ms")
+                rec["result"] = payload.get("result")
 
     # Post-process: extract artifact references and failure categories
     artifact_pattern = re.compile(r"\[Full result \(\d+ chars\) saved to artifact: (.+?)\]")
-    for tid in tasks:
-        result = tasks[tid].get("result") or ""
+    for task in all_tasks:
+        result = task.get("result") or ""
         match = artifact_pattern.search(result)
-        tasks[tid]["artifact_ref"] = match.group(1) if match else None
-        tasks[tid]["failure_category"] = _categorize_task_failure(tasks[tid])
+        task["artifact_ref"] = match.group(1) if match else None
+        task["failure_category"] = _categorize_task_failure(task)
 
-    # Return in task_id order
-    return [tasks[tid] for tid in sorted(tasks.keys())]
+    return all_tasks
 
 
 def _categorize_task_failure(task: dict) -> str | None:
