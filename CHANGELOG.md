@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.19.4](https://github.com/mezmo/aura/compare/v1.19.3...v1.19.4) (2026-05-08)
+
+
+### Chores
+
+* Rename Aura to AURA [f381444](https://github.com/mezmo/aura/commit/f38144487429cbc955013a4f637d7e4f8e333766) - Gregory Janco [LOG-23836](https://mezmo.atlassian.net/browse/LOG-23836)
+
 ## [1.19.3](https://github.com/mezmo/aura/compare/v1.19.2...v1.19.3) (2026-05-06)
 
 
@@ -211,7 +218,7 @@
 
 ### Documentation
 
-* add quickstart with Docker Compose (Aura + LibreChat + Phoenix) [8081471](https://github.com/mezmo/aura/commit/80814713cc8277b43c11785e40d660002d2024b6) - Gregory Janco [LOG-22815](https://logdna.atlassian.net/browse/LOG-22815)
+* add quickstart with Docker Compose (AURA + LibreChat + Phoenix) [8081471](https://github.com/mezmo/aura/commit/80814713cc8277b43c11785e40d660002d2024b6) - Gregory Janco [LOG-22815](https://logdna.atlassian.net/browse/LOG-22815)
 
 ## [1.14.6](https://github.com/mezmo/aura/compare/v1.14.5...v1.14.6) (2026-03-04)
 
@@ -437,7 +444,7 @@
 
 ### Chores
 
-* add Helm chart for Aura deployment [b81db21](https://github.com/answerbook/aura/commit/b81db213d2ed996cc011d9f51b37d18d554c2de0) - Mike Shearer [LOG-23231](https://logdna.atlassian.net/browse/LOG-23231)
+* add Helm chart for AURA deployment [b81db21](https://github.com/answerbook/aura/commit/b81db213d2ed996cc011d9f51b37d18d554c2de0) - Mike Shearer [LOG-23231](https://logdna.atlassian.net/browse/LOG-23231)
 
 ## [1.11.1](https://github.com/answerbook/aura/compare/v1.11.0...v1.11.1) (2026-02-11)
 

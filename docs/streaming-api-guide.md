@@ -20,7 +20,7 @@ The server supports three streaming modes, configured via CLI or environment var
 |------|----------------|--------------|----------|
 | `none` (default) | Actual JSON | Not streamed | Spec-compliant API clients |
 | `open-web-ui` | Empty `""` | Streamed via tool_calls | OpenWebUI "View Results" support |
-| `aura` | Actual JSON | Via `aura.tool_complete` events | Custom clients with Aura events |
+| `aura` | Actual JSON | Via `aura.tool_complete` events | Custom clients with AURA events |
 
 ```bash
 # Spec-compliant mode (default)
@@ -29,7 +29,7 @@ cargo run --bin aura-web-server
 # OpenWebUI compatibility mode
 cargo run --bin aura-web-server -- --tool-result-mode open-web-ui
 
-# Aura events mode (requires AURA_CUSTOM_EVENTS=true)
+# AURA events mode (requires AURA_CUSTOM_EVENTS=true)
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server -- --tool-result-mode aura
 
 # Via environment variable
@@ -48,9 +48,9 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` events |
 | `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period (seconds) for in-flight streams on shutdown |
 
-## Custom Aura Events (Optional)
+## Custom AURA Events (Optional)
 
-For enhanced client UX, you can enable custom Aura events that provide real-time tool status and timing:
+For enhanced client UX, you can enable custom AURA events that provide real-time tool status and timing:
 
 ```bash
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
