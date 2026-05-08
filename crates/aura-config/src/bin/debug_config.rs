@@ -139,14 +139,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match &store.store {
                 aura_config::VectorStoreType::InMemory { embedding_model } => {
                     println!("  Store {}: {} (in_memory)", i + 1, store.name);
-                    println!("    Embedding Model: {} {}", embedding_model.provider(), embedding_model.model());
+                    println!(
+                        "    Embedding Model: {} {}",
+                        embedding_model.provider(),
+                        embedding_model.model()
+                    );
                 }
-                aura_config::VectorStoreType::Qdrant { embedding_model, .. } => {
+                aura_config::VectorStoreType::Qdrant {
+                    embedding_model, ..
+                } => {
                     println!("  Store {}: {} (qdrant)", i + 1, store.name);
-                    println!("    Embedding Model: {} {}", embedding_model.provider(), embedding_model.model());
+                    println!(
+                        "    Embedding Model: {} {}",
+                        embedding_model.provider(),
+                        embedding_model.model()
+                    );
                 }
                 aura_config::VectorStoreType::BedrockKb { .. } => {
-                    println!("  Store {}: {} (bedrock_kb, managed embeddings)", i + 1, store.name);
+                    println!(
+                        "  Store {}: {} (bedrock_kb, managed embeddings)",
+                        i + 1,
+                        store.name
+                    );
                 }
             }
         }

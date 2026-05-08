@@ -1040,14 +1040,22 @@ impl AgentBuilder {
                         tracing::info!("  Embedding Provider: {}", embedding_model.provider());
                         tracing::info!("  Embedding Model: {}", embedding_model.model());
                     }
-                    VectorStoreType::Qdrant { embedding_model, url, collection_name } => {
+                    VectorStoreType::Qdrant {
+                        embedding_model,
+                        url,
+                        collection_name,
+                    } => {
                         tracing::info!("  Type: qdrant");
                         tracing::info!("  URL: {}", url);
                         tracing::info!("  Collection: {}", collection_name);
                         tracing::info!("  Embedding Provider: {}", embedding_model.provider());
                         tracing::info!("  Embedding Model: {}", embedding_model.model());
                     }
-                    VectorStoreType::BedrockKb { knowledge_base_id, region, .. } => {
+                    VectorStoreType::BedrockKb {
+                        knowledge_base_id,
+                        region,
+                        ..
+                    } => {
                         tracing::info!("  Type: bedrock_kb");
                         tracing::info!("  Knowledge Base ID: {}", knowledge_base_id);
                         tracing::info!("  Region: {}", region);

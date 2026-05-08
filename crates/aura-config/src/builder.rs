@@ -8,13 +8,11 @@ use std::collections::HashMap;
 /// Convert TOML-layer EmbeddingConfig to runtime EmbeddingModelConfig
 fn convert_embedding(em: &crate::config::EmbeddingConfig) -> EmbeddingModelConfig {
     match em {
-        crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
-            EmbeddingModelConfig::OpenAI {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: None,
-            }
-        }
+        crate::config::EmbeddingConfig::OpenAI { api_key, model } => EmbeddingModelConfig::OpenAI {
+            api_key: api_key.clone(),
+            model: model.clone(),
+            base_url: None,
+        },
         crate::config::EmbeddingConfig::Bedrock {
             model,
             region,

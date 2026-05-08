@@ -380,26 +380,27 @@ impl Config {
         // Validate each vector store
         for store in &self.vector_stores {
             match &store.store {
-                VectorStoreType::InMemory { embedding_model } | VectorStoreType::Qdrant { embedding_model, .. } => {
-                    match embedding_model {
-                        EmbeddingConfig::OpenAI { api_key, .. } => {
-                            if api_key.is_empty() {
-                                return Err(crate::ConfigError::Validation(format!(
-                                    "Embedding model API key is required for vector store '{}'",
-                                    store.name
-                                )));
-                            }
-                        }
-                        EmbeddingConfig::Bedrock { region, .. } => {
-                            if region.is_empty() {
-                                return Err(crate::ConfigError::Validation(format!(
-                                    "Embedding model region is required for Bedrock provider in vector store '{}'",
-                                    store.name
-                                )));
-                            }
+                VectorStoreType::InMemory { embedding_model }
+                | VectorStoreType::Qdrant {
+                    embedding_model, ..
+                } => match embedding_model {
+                    EmbeddingConfig::OpenAI { api_key, .. } => {
+                        if api_key.is_empty() {
+                            return Err(crate::ConfigError::Validation(format!(
+                                "Embedding model API key is required for vector store '{}'",
+                                store.name
+                            )));
                         }
                     }
-                }
+                    EmbeddingConfig::Bedrock { region, .. } => {
+                        if region.is_empty() {
+                            return Err(crate::ConfigError::Validation(format!(
+                                "Embedding model region is required for Bedrock provider in vector store '{}'",
+                                store.name
+                            )));
+                        }
+                    }
+                },
                 VectorStoreType::BedrockKb { .. } => {
                     // All required fields are enforced by the enum structure
                 }

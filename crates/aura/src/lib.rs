@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
 pub mod error;
@@ -27,7 +28,6 @@ mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibili
 pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
-pub mod bedrock_embedding;
 pub(crate) mod string_utils;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
