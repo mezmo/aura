@@ -1,9 +1,9 @@
-# Aura Quickstart
+# AURA Quickstart
 
 Spin up a fully working AI agent stack in under a minute:
 
-- **Aura** — the AI agent server
-- **LibreChat** — a ChatGPT-style web UI connected to Aura
+- **AURA** — the AI agent server
+- **LibreChat** — a ChatGPT-style web UI connected to AURA
 - **Phoenix** — an LLM trace viewer for inspecting every tool call, prompt, and token
 
 ## Setup
@@ -42,9 +42,9 @@ docker compose up -d
 |---------|-----|-------------|
 | LibreChat | <http://localhost:3080> | Chat with your agent |
 | Phoenix | <http://localhost:6006> | Inspect LLM traces |
-| Aura API | <http://localhost:3000> | OpenAI-compatible API |
+| AURA API | <http://localhost:3000> | OpenAI-compatible API |
 
-**LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "Aura".
+**LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "AURA".
 
 > **Tip:** Check startup progress with `docker compose logs -f aura`.
 
@@ -105,7 +105,7 @@ See [`examples/reference.toml`](../reference.toml) for all available options.
 │  docker compose                                   │
 │                                                   │
 │  ┌────────────┐     ┌──────────┐    ┌──────────┐  │
-│  │ LibreChat  │────▶│   Aura   │───▶│ Phoenix  │  │
+│  │ LibreChat  │────▶│   AURA   │───▶│ Phoenix  │  │
 │  │   :3080    │     │  :3030   │    │  :6006   │  │
 │  └─────┬──────┘     └────┬─────┘    └──────────┘  │
 │        │                 │          OTel traces   │
@@ -121,16 +121,16 @@ See [`examples/reference.toml`](../reference.toml) for all available options.
                      (OpenAI, etc.)
 ```
 
-- **LibreChat** sends chat requests to Aura's OpenAI-compatible `/v1/chat/completions` endpoint. MongoDB is used by LibreChat internally for user accounts and conversation history — Aura does not use it.
-- **Aura** calls the configured LLM provider, executes MCP tools, and streams responses back
-- **Phoenix** receives OpenTelemetry traces from Aura so you can inspect every step
+- **LibreChat** sends chat requests to AURA's OpenAI-compatible `/v1/chat/completions` endpoint. MongoDB is used by LibreChat internally for user accounts and conversation history — AURA does not use it.
+- **AURA** calls the configured LLM provider, executes MCP tools, and streams responses back
+- **Phoenix** receives OpenTelemetry traces from AURA so you can inspect every step
 
 ## Troubleshooting
 
 **LibreChat shows "no models available"**
-Aura may still be starting. Wait for the health check to pass (`docker compose logs aura --tail 5`) and refresh.
+AURA may still be starting. Wait for the health check to pass (`docker compose logs aura --tail 5`) and refresh.
 
-**"connection refused" in Aura logs**
+**"connection refused" in AURA logs**
 If referencing services on your host, use `host.docker.internal` instead of `localhost` in `config.toml`.
 
 **Reset everything**

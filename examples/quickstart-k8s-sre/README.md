@@ -11,7 +11,7 @@ access to only the tools they need.
                              |
                              v
           +------------------------------------------+
-          |        Aura (Coordinator)                 |
+          |        AURA (Coordinator)                 |
           |  Routes requests to the right specialist  |
           |                                           |
           |  +-------------------+ +----------------+ |
@@ -131,7 +131,7 @@ kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=kubernetes-mcp-
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=prometheus-mcp-server --timeout=120s
 ```
 
-### 4. Deploy Aura
+### 4. Deploy AURA
 
 ```bash
 export OPENAI_API_KEY="sk-..."
@@ -144,7 +144,7 @@ helm install aura ./deployment/helm/aura \
 > **Using a different LLM provider?** Edit `aura-values.yaml` and update the `[llm]`
 > section. See [`examples/reference.toml`](../reference.toml) for all provider options.
 
-Wait for Aura:
+Wait for AURA:
 
 ```bash
 kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=aura --timeout=120s
@@ -152,8 +152,8 @@ kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=aura --timeout=
 
 ### 5. Try it out
 
-Launch [Aura CLI](https://hub.docker.com/r/mezmo/aura-cli) inside the cluster,
-pointed at the Aura service:
+Launch [AURA CLI](https://hub.docker.com/r/mezmo/aura-cli) inside the cluster,
+pointed at the AURA service:
 
 ```bash
 kubectl run -it --rm aura-cli \
@@ -215,7 +215,7 @@ repos:
 - [kubernetes-mcp-server tools](https://github.com/containers/kubernetes-mcp-server) -- core toolset, `read_only = true`
 - [prometheus-mcp-server tools](https://github.com/pab1it0/prometheus-mcp-server) -- all tools
 
-To verify the tools Aura actually discovered at runtime:
+To verify the tools AURA actually discovered at runtime:
 
 ```bash
 kubectl logs -l app.kubernetes.io/name=aura | grep -i "tool"

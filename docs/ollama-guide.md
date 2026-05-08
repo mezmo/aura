@@ -1,6 +1,6 @@
 # Ollama Guide
 
-Aura supports running local models through [Ollama](https://ollama.ai), including fallback parsing for tool-call formats that are emitted as plain text instead of native tool-call structures.
+AURA supports running local models through [Ollama](https://ollama.ai), including fallback parsing for tool-call formats that are emitted as plain text instead of native tool-call structures.
 
 ## Basic Configuration
 
@@ -16,13 +16,13 @@ num_ctx = 32000
 think   = true
 ```
 
-`base_url` defaults to `http://localhost:11434` when omitted. Use `http://host.docker.internal:11434` when Aura runs inside a container and Ollama runs on the host.
+`base_url` defaults to `http://localhost:11434` when omitted. Use `http://host.docker.internal:11434` when AURA runs inside a container and Ollama runs on the host.
 
 All Ollama-specific parameters (`num_ctx`, `num_predict`, `think`, `seed`, `top_k`, `top_p`, etc.) go under `[llm.additional_params]`. See [Ollama model parameters](https://github.com/ollama/ollama/blob/main/docs/modelfile.md#valid-parameters-and-values) for the full list.
 
 ## Fallback Tool Parsing
 
-When `fallback_tool_parsing = true`, Aura tries to detect and execute tool calls from text output patterns commonly produced by local model families.
+When `fallback_tool_parsing = true`, AURA tries to detect and execute tool calls from text output patterns commonly produced by local model families.
 
 Known handled styles include:
 
@@ -40,4 +40,4 @@ This improves tool reliability with local models that do not consistently emit s
 
 ## "Thinking model" Caveat
 
-Thinking model variants have known malformed XML tool-call issues in some builds. Aura's fallback parser handles many of these cases, but reliability still depends on model artifact quality and prompt format constraints.
+Thinking model variants have known malformed XML tool-call issues in some builds. AURA's fallback parser handles many of these cases, but reliability still depends on model artifact quality and prompt format constraints.

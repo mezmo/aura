@@ -1,15 +1,15 @@
-# Aura Orchestration Quickstart — Math MCP
+# AURA Orchestration Quickstart — Math MCP
 
-One command to spin up Aura in **orchestration mode** with a math tool server:
+One command to spin up AURA in **orchestration mode** with a math tool server:
 
-- **Aura** — the AI agent server running in orchestration mode (`mezmo/aura:orchestration`)
+- **AURA** — the AI agent server running in orchestration mode (`mezmo/aura:orchestration`)
 - **Math MCP** — an MCP server providing arithmetic, statistics, and trigonometry tools
-- **LibreChat** — a ChatGPT-style web UI connected to Aura
+- **LibreChat** — a ChatGPT-style web UI connected to AURA
 - **Phoenix** — an LLM trace viewer for inspecting every tool call, prompt, and token
 
 ## How Orchestration Mode Works
 
-In orchestration mode Aura routes each request through a **coordinator** that decides how to respond:
+In orchestration mode AURA routes each request through a **coordinator** that decides how to respond:
 
 - **Direct answer** — simple, single-step requests are answered immediately
 - **Worker dispatch** — complex or multi-step problems are decomposed into a plan and delegated to specialized workers, each with access to a filtered subset of tools
@@ -47,9 +47,9 @@ The `--build` flag is required on first run to build the math MCP image.
 |---------|-----|-------------|
 | LibreChat | <http://localhost:3080> | Chat with your agent |
 | Phoenix | <http://localhost:6006> | Inspect LLM traces |
-| Aura API | <http://localhost:3000> | OpenAI-compatible API |
+| AURA API | <http://localhost:3000> | OpenAI-compatible API |
 
-**LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "Aura".
+**LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "AURA".
 
 ## Try It Out
 
@@ -71,7 +71,7 @@ Watch Phoenix at <http://localhost:6006> to see the full trace of coordinator pl
 
 ## Customize
 
-Edit `config.toml` and restart Aura:
+Edit `config.toml` and restart AURA:
 
 ```bash
 docker compose restart aura
@@ -102,7 +102,7 @@ Each `[orchestration.worker.<name>]` section defines a worker. The `mcp_filter` 
 │  docker compose                                         │
 │                                                         │
 │  ┌────────────┐     ┌──────────────────────────────┐    │
-│  │ LibreChat  │────▶│   Aura (orchestration mode)  │    │
+│  │ LibreChat  │────▶│   AURA (orchestration mode)  │    │
 │  │   :3080    │     │           :3000              │    │
 │  └─────┬──────┘     └──────┬───────────────────────┘    │
 │        │                   │                            │
@@ -117,8 +117,8 @@ Each `[orchestration.worker.<name>]` section defines a worker. The `mcp_filter` 
       Browser                           OTel traces
 ```
 
-- **LibreChat** sends chat requests to Aura's OpenAI-compatible `/v1/chat/completions` endpoint
-- **Aura** runs a coordinator LLM that routes requests, dispatches workers, and streams responses
+- **LibreChat** sends chat requests to AURA's OpenAI-compatible `/v1/chat/completions` endpoint
+- **AURA** runs a coordinator LLM that routes requests, dispatches workers, and streams responses
 - **Math MCP** exposes arithmetic, statistics, and trigonometry tools via the MCP protocol
 - **Phoenix** receives OpenTelemetry traces so you can inspect every coordinator and worker step
 
@@ -128,7 +128,7 @@ Each `[orchestration.worker.<name>]` section defines a worker. The `mcp_filter` 
 The Dockerfile clones `EthanHenrickson/math-mcp` from GitHub. Ensure you have internet access during `docker compose up --build`.
 
 **LibreChat shows "no models available"**
-Aura may still be starting (it waits for math-mcp to be healthy first). Check `docker compose logs aura --tail 5` and refresh.
+AURA may still be starting (it waits for math-mcp to be healthy first). Check `docker compose logs aura --tail 5` and refresh.
 
 **Reset everything**
 

@@ -1,12 +1,12 @@
-# Aura Web Server
+# AURA Web Server
 
-> **Open Alpha** — Aura is under active development. APIs and configuration
+> **Open Alpha** — AURA is under active development. APIs and configuration
 > may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
 > are welcome — we'd love your feedback.
 
-> **Part of the [Aura Project](../../README.md)** - A production-ready framework for building AI agents with declarative TOML configuration.
+> **Part of the [AURA Project](../../README.md)** - A production-ready framework for building AI agents with declarative TOML configuration.
 
-OpenAI-compatible web API server that exposes Aura agents through a standard chat completions endpoint.
+OpenAI-compatible web API server that exposes AURA agents through a standard chat completions endpoint.
 
 ## Features
 
@@ -170,7 +170,7 @@ cargo test --package aura-web-server --test streaming_tests
 
 ## Configuration
 
-The server uses the Aura TOML configuration system. See the [main README](../../README.md#configuration) for:
+The server uses the AURA TOML configuration system. See the [main README](../../README.md#configuration) for:
 - LLM provider configuration (OpenAI, Anthropic)
 - MCP server setup (HTTP, SSE, STDIO)
 - Vector store and RAG integration
