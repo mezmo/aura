@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.19.5](https://github.com/mezmo/aura/compare/v1.19.4...v1.19.5) (2026-05-08)
+
+
+### Chores
+
+* **cla**: Allow promptless PRs [a956848](https://github.com/mezmo/aura/commit/a9568488d7a4d03e1affb5ecd8c74469ab69ac02) - Gregory Janco [LOG-23837](https://mezmo.atlassian.net/browse/LOG-23837)
+
 ## [1.19.4](https://github.com/mezmo/aura/compare/v1.19.3...v1.19.4) (2026-05-08)
 
 
