@@ -1,6 +1,6 @@
-# Aura
+# AURA
 
-Aura is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. Aura provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
+AURA is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
 
@@ -16,7 +16,7 @@ Key capabilities:
 > branch and is currently in **open alpha** — APIs, behavior, and configuration
 > are changing rapidly as we iterate.
 >
-> The `main` branch is Aura's **production-ready single-agent framework**:
+> The `main` branch is AURA's **production-ready single-agent framework**:
 > declarative TOML-driven agents with MCP tool integration, RAG pipelines,
 > multi-provider LLM support, and an OpenAI-compatible streaming API.
 >
@@ -25,7 +25,7 @@ Key capabilities:
 
 ## Table of Contents
 
-- [Aura](#aura)
+- [AURA](#aura)
   - [Table of Contents](#table-of-contents)
   - [Project Structure](#project-structure)
   - [Quick Start](./examples/quickstart/README.md)
@@ -99,7 +99,7 @@ CONFIG_PATH=configs/ cargo run --bin aura-web-server
 # Host/port override
 HOST=0.0.0.0 PORT=3000 cargo run --bin aura-web-server
 
-# Enable Aura custom SSE events
+# Enable AURA custom SSE events
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 ```
 
@@ -156,7 +156,7 @@ For LibreChat/OpenWebUI integration, see [development/README.md](development/REA
 
 ## Configuration
 
-`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
+`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, AURA loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
 ### Multiple Agents
 
@@ -248,17 +248,17 @@ cargo run -p aura-config --bin debug_config
 
 ### Ollama
 
-Aura supports Ollama, including fallback tool-call parsing for model outputs that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
+AURA supports Ollama, including fallback tool-call parsing for model outputs that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
 
 ### Observability
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
+AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes AURA traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Docker Deployment
 
-Aura includes containerized deployment assets at the repo root:
+AURA includes containerized deployment assets at the repo root:
 
 - `Dockerfile`: multi-stage build for the web server.
 - `docker-compose.yml`: local container deployment wiring.
@@ -328,7 +328,7 @@ Detailed test guidance: [crates/aura-web-server/README.md#running-integration-te
 
 ## Architecture
 
-Aura separates concerns across crates:
+AURA separates concerns across crates:
 
 - `aura`: runtime agent building, MCP integration, tool orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.

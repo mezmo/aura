@@ -1,11 +1,11 @@
-# Using Aura within LibreChat and OpenWebUI
+# Using AURA within LibreChat and OpenWebUI
 
-You can use Aura within LibreChat and OpenWebUI because Aura supports an OpenAI-compatible HTTP API.
+You can use AURA within LibreChat and OpenWebUI because AURA supports an OpenAI-compatible HTTP API.
 
 
 ## Pre-requisites
 
-- You have Aura web-server running on docker's host on port 8080.  See [running the web server](../README.md#web-api-server) for help on this.
+- You have AURA web-server running on docker's host on port 8080.  See [running the web server](../README.md#web-api-server) for help on this.
 
 ## Starting LibreChat and OpenWebUI
 
@@ -24,11 +24,11 @@ You can use Aura within LibreChat and OpenWebUI because Aura supports an OpenAI-
 
 If you have MCP's that require authorization tokens you will need to configure LibreChat and
 OpenWebUI to send those tokens as headers and then map those headers to the MCP's using
-Aura MCP header forwarding configuration.
+AURA MCP header forwarding configuration.
 
-### Configuring Aura MCP's to forward specific headers from requests
+### Configuring AURA MCP's to forward specific headers from requests
 
-1. Add headers_from_request configuration to your MCP's listed in Aura's config.toml
+1. Add headers_from_request configuration to your MCP's listed in AURA's config.toml
 
 - This example adds the GitHub MCP server
 
@@ -42,7 +42,7 @@ description = "GitHub MCP for searching and retrieving code and github informati
 "Authorization" = "x-auth-github-token"
 ```
 
-If you're using Mezmo Log Analysis MCP and haven't configured Aura to use a static token for
+If you're using Mezmo Log Analysis MCP and haven't configured AURA to use a static token for
 the Mezmo Log Analysis MCP, you will want to forward the "Authorization" header being
 sent from the chat clients.
 
@@ -64,14 +64,14 @@ Configure LibreChat to send "x-auth-github-token" with chat requests by adding "
 librechat.yaml file.
 
 ```yaml
-# LibreChat Configuration for Aura Server
+# LibreChat Configuration for AURA Server
 # See: https://docs.librechat.ai/install/configuration/custom_config.html
 
 version: 1.1.5
 
 endpoints:
   custom:
-    - name: "Aura"
+    - name: "AURA"
       apiKey: "${MEZMO_API_KEY}" # Use environment variable
       baseURL: "http://host.docker.internal:8080/v1"
       # Add whatever headers you want and they'll be sent with chat requests!
@@ -86,8 +86,8 @@ endpoints:
 2. Click on "Admin Panel".
 3. Click on "Settings" located at the top of the page, to the right.
 4. Click on "Connections" in the left-hand navigation section.
-5. Locate OpenAPI API section, where you've added Aura as an OpenAPI LLM
-6. Click on the configuration cog next to the Aura OpenAPI API connection entry
+5. Locate OpenAPI API section, where you've added AURA as an OpenAPI LLM
+6. Click on the configuration cog next to the AURA OpenAPI API connection entry
 7. Add a JSON blob to the "Headers" section of the connection configuration
 
 ```json

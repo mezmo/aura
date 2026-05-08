@@ -15,11 +15,11 @@ Rig handles tool execution differently depending on the mode:
 | **Streaming** | Sequential | Deterministic (FIFO) |
 | **Non-streaming** | Parallel | Deterministic (preserves order) |
 
-**Aura uses streaming mode exclusively**, so tools execute sequentially. This validates using a simple FIFO queue for tool_call_id correlation.
+**AURA uses streaming mode exclusively**, so tools execute sequentially. This validates using a simple FIFO queue for tool_call_id correlation.
 
 ---
 
-## Streaming Mode Analysis (What Aura Uses)
+## Streaming Mode Analysis (What AURA Uses)
 
 In Rig's streaming implementation (`rig-core/src/agent/prompt_request/streaming.rs`):
 
@@ -97,7 +97,7 @@ Uses `stream::iter().then().collect().await` which:
 
 ---
 
-## Design Implications for Aura
+## Design Implications for AURA
 
 ### Why FIFO Queue Works
 

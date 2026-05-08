@@ -2,7 +2,7 @@
 
 ## Overview
 
-Aura is a TOML-based configuration system for composing Rig.rs AI agents with MCP tools and RAG pipelines.
+AURA is a TOML-based configuration system for composing Rig.rs AI agents with MCP tools and RAG pipelines.
 
 ## Architecture Notes
 
