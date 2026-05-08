@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.19.4](https://github.com/mezmo/aura/compare/v1.19.3...v1.19.4) (2026-05-08)
+
+
+### Chores
+
+* Rename Aura to AURA [f381444](https://github.com/mezmo/aura/commit/f38144487429cbc955013a4f637d7e4f8e333766) - Gregory Janco [LOG-23836](https://mezmo.atlassian.net/browse/LOG-23836)
+
 ## [1.19.3](https://github.com/mezmo/aura/compare/v1.19.2...v1.19.3) (2026-05-06)
 
 
