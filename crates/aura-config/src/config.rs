@@ -284,6 +284,8 @@ pub struct ToolsConfig {
     #[serde(default)]
     pub filesystem: bool,
     #[serde(default)]
+    pub filesystem_write: bool,
+    #[serde(default)]
     pub custom_tools: Vec<String>,
 }
 

@@ -203,11 +203,11 @@ pub struct FilterKV {
 }
 
 /// Parse a string value as JSON (number, boolean, null) or fallback to string
-fn parse_value_str(s: &str) -> Value {
+pub(crate) fn parse_value_str(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
 }
 
-fn default_limit() -> usize {
+pub(crate) fn default_limit() -> usize {
     5
 }
 

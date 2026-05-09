@@ -22,7 +22,7 @@ use tokio::sync::watch;
 pub const DEFAULT_MAX_DEPTH: usize = 8;
 
 /// Check if model supports reasoning_effort parameter
-fn is_reasoning_model(model: &str) -> bool {
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
     model.starts_with("o1")
         || model.starts_with("o3")
         || model.starts_with("o4")
@@ -35,7 +35,7 @@ fn is_reasoning_model(model: &str) -> bool {
 /// JSON object that gets passed to Rig's `additional_params()` method.
 ///
 /// Returns `None` if no parameters are set.
-fn build_ollama_params(
+pub(crate) fn build_ollama_params(
     num_ctx: Option<u32>,
     num_predict: Option<u32>,
     additional_params: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -443,13 +443,17 @@ impl Agent {
         if let Some(tools_config) = &config.tools
             && tools_config.filesystem
         {
-            tracing::info!("Adding filesystem tools");
+            let write_enabled = tools_config.filesystem_write;
+            tracing::info!("Adding filesystem tools (write_access={})", write_enabled);
             let fs_tool = FilesystemTool::new()
-                .with_write_access(false)
+                .with_write_access(write_enabled)
                 .with_max_file_size(1_048_576);
 
             builder_state = builder_state.add_tool(ReadFileTool(fs_tool.clone()));
-            builder_state = builder_state.add_tool(ListDirTool(fs_tool));
+            builder_state = builder_state.add_tool(ListDirTool(fs_tool.clone()));
+            if write_enabled {
+                builder_state = builder_state.add_tool(WriteFileTool(fs_tool));
+            }
         }
 
         // Add vector store tools if configured

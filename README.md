@@ -300,6 +300,44 @@ The script mirrors Jenkins checks: format, workspace tests, and clippy with warn
 
 ## Testing
 
+### Unit tests
+
+```bash
+cargo test --workspace --lib
+```
+
+### AI-assisted test generation
+
+Generate and review unit tests using Aura agents (requires AWS Bedrock credentials or an OpenAI API key):
+
+```bash
+# Generate tests for files changed vs main
+make test-generate
+
+# Generate tests for specific files
+make test-generate FILES="crates/aura/src/tools.rs"
+make test-generate FILES="crates/aura/src/tools.rs crates/aura/src/rag_tools.rs"
+```
+
+The pipeline:
+1. Starts an Aura generator agent that reads source code and writes tests
+2. Runs `cargo test` to validate the generated tests compile and pass
+3. Starts 4 review agents in parallel (correctness, coverage, robustness, style)
+4. Feeds review feedback back to the generator (up to 3 rounds)
+5. Prints a terminal summary
+
+Generated tests are written to `<module>_tests.rs` alongside the source file and registered in `lib.rs`. They are standard Rust unit tests that run with `cargo test` — no LLM required after generation.
+
+**Prerequisites:**
+- AWS credentials (`~/.aws/credentials`) for Bedrock, or `OPENAI_API_KEY` for OpenAI
+- `jq` (`brew install jq`)
+
+**Configuration:** Agent configs are in `configs/test-agents/`. The default LLM is Claude Sonnet 4.5 via Bedrock. To use a different provider, edit the `[llm]` section in each TOML file.
+
+See [docs/aura-self-testing-strategy.md](docs/aura-self-testing-strategy.md) for the full strategy and architecture.
+
+### Integration tests
+
 Web server integration tests live under `crates/aura-web-server/tests/`.
 
 Run web server integration test workflow:
