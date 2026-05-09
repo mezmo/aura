@@ -130,6 +130,7 @@ for config in "${CONFIGS[@]}"; do
     CONFIG_PATH="$config" \
     AURA_CUSTOM_EVENTS=true \
     AURA_REASONING=true \
+    AURA_EMIT_SCRATCHPAD_TOOL_EVENTS=true \
     K8S_SRE_MCP_HOST=127.0.0.1 \
     RUST_LOG=aura=info,aura_web_server=info \
     PORT=$PORT \
