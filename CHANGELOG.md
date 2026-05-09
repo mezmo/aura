@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.19.6](https://github.com/mezmo/aura/compare/v1.19.5...v1.19.6) (2026-05-09)
+
+
+### Chores
+
+* **cla**: Allow Promptess to pass CLA [3a8e790](https://github.com/mezmo/aura/commit/3a8e79006426bb3438e2d825c76c0f83165506f0) - Gregory Janco [LOG-23837](https://mezmo.atlassian.net/browse/LOG-23837)
+
 ## [1.19.5](https://github.com/mezmo/aura/compare/v1.19.4...v1.19.5) (2026-05-08)
 
 
