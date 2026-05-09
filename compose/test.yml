@@ -23,12 +23,12 @@ services:
       dockerfile: Dockerfile
       target: test
     environment:
-      - AURA_SERVER_URL=http://aura-web-server:8080
-      - MCP_SERVER_URL=http://mock-mcp:9998
-      - MCP_MOCK_SERVER_URL=http://mock-mcp:9999
-      - CI=true
-      - ENABLE_DOCKER=false
-      - AURA_AUTO_DOWNLOAD=false
+      AURA_SERVER_URL: http://aura-web-server:8080
+      MCP_SERVER_URL: http://mock-mcp:9998
+      MCP_MOCK_SERVER_URL: http://mock-mcp:9999
+      CI: true
+      ENABLE_DOCKER: false
+      AURA_AUTO_DOWNLOAD: false
     volumes:
       # Shared volume for marker files (written by slow_task, read by tests)
       # Uses /tmp since that's where slow_task writes marker files
@@ -44,5 +44,3 @@ services:
         condition: service_healthy
     # Run integration tests with code coverage
     command: make coverage
-    networks:
-      - aura-test

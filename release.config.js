@@ -18,6 +18,9 @@ module.exports = {
   dockerLogin: false,
   dockerFile: 'Dockerfile',
   dockerVerifyCmd: ['ls'],
+  dockerBuildFlags: {
+    target: 'release'
+  },
   dockerPlatform: [
     'linux/amd64'
   , 'linux/arm64'

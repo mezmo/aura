@@ -6,84 +6,6 @@ def TRIGGER_PATTERN = '.*@triggerbuild.*'
 def DOCKER_REPO = "docker.io/mezmo"
 def BUILD_SLUG = slugify(env.BUILD_TAG)
 
-// Custom exception to signal that a check has already been published manually
-// and withReport should not publish a console output check
-class ManualCheckException extends Exception {
-  ManualCheckException(String message) {
-    super(message)
-  }
-}
-
-/**
- * Execute a command and publish GitHub check results based on the outcome.
- *
- * This function wraps command execution with automatic GitHub check publishing.
- * It captures command output and publishes appropriate check results based on
- * success or failure.
- *
- * @param checkName String - The name of the GitHub check to publish
- * @param command String - The shell command to execute
- * @param callback Closure (optional) - A callback to execute after the command succeeds.
- *                 Used for custom check publishing when structured reports are available.
- *
- * Usage:
- *
- * 1. Simple usage (automatic check publishing):
- *    withReport('My Check', 'make test')
- *    // Publishes SUCCESS check if command succeeds, FAILURE with console output if it fails
- *
- * 2. Custom check publishing (with callback):
- *    withReport('Lint Check', 'make lint', {
- *      def report = readJSON file: 'report.json'
- *      publishChecks(
- *        name: report.name,
- *        summary: report.summary,
- *        conclusion: report.conclusion
- *      )
- *      // To fail the step after publishing a custom check, throw ManualCheckException
- *      if (report.hasErrors) {
- *        throw new ManualCheckException("Check failed with ${report.errorCount} errors")
- *      }
- *    })
- *
- * Error Handling:
- * - If the command fails, publishes a FAILURE check with console output and re-throws
- * - If the callback throws ManualCheckException, re-throws without publishing (check already published)
- * - If the callback throws any other exception, publishes FAILURE check with console output
- *
- * @throws ManualCheckException when callback signals check was already published
- * @throws Exception when command or callback fails
- */
-def withReport(checkName, command, callback = null) {
-  def logFile = "output-${checkName.replaceAll(/[^a-zA-Z0-9]/, "_")}.log"
-  publishChecks(name: checkName, status: 'IN_PROGRESS', title: 'Running...')
-
-  try {
-    sh script: "${command} 2>&1 | tee ${logFile}"
-    if(callback) {
-      callback()
-    } else {
-      publishChecks(name: checkName, conclusion: 'SUCCESS', summary: 'Check passed!')
-    }
-  } catch (ManualCheckException e) {
-    // Check was already published by callback, just re-throw to fail the step
-    throw e
-  } catch (Exception e) {
-    def consoleOutput = readFile(logFile).trim()
-    publishChecks(
-      name: checkName,
-      conclusion: 'FAILURE',
-      summary: "Command failed: ${e.message}",
-      text: "### Console Output\n```\n${consoleOutput}\n```"
-    )
-
-    // throwing will trigger the FAILURE check state
-    throw e
-  } finally {
-    sh "rm -f ${logFile}"
-  }
-}
-
 pipeline {
   agent {
     node {
@@ -368,3 +290,82 @@ pipeline {
     }
   }
 }
+
+// Custom exception to signal that a check has already been published manually
+// and withReport should not publish a console output check
+class ManualCheckException extends Exception {
+  ManualCheckException(String message) {
+    super(message)
+  }
+}
+
+/**
+ * Execute a command and publish GitHub check results based on the outcome.
+ *
+ * This function wraps command execution with automatic GitHub check publishing.
+ * It captures command output and publishes appropriate check results based on
+ * success or failure.
+ *
+ * @param checkName String - The name of the GitHub check to publish
+ * @param command String - The shell command to execute
+ * @param callback Closure (optional) - A callback to execute after the command succeeds.
+ *                 Used for custom check publishing when structured reports are available.
+ *
+ * Usage:
+ *
+ * 1. Simple usage (automatic check publishing):
+ *    withReport('My Check', 'make test')
+ *    // Publishes SUCCESS check if command succeeds, FAILURE with console output if it fails
+ *
+ * 2. Custom check publishing (with callback):
+ *    withReport('Lint Check', 'make lint', {
+ *      def report = readJSON file: 'report.json'
+ *      publishChecks(
+ *        name: report.name,
+ *        summary: report.summary,
+ *        conclusion: report.conclusion
+ *      )
+ *      // To fail the step after publishing a custom check, throw ManualCheckException
+ *      if (report.hasErrors) {
+ *        throw new ManualCheckException("Check failed with ${report.errorCount} errors")
+ *      }
+ *    })
+ *
+ * Error Handling:
+ * - If the command fails, publishes a FAILURE check with console output and re-throws
+ * - If the callback throws ManualCheckException, re-throws without publishing (check already published)
+ * - If the callback throws any other exception, publishes FAILURE check with console output
+ *
+ * @throws ManualCheckException when callback signals check was already published
+ * @throws Exception when command or callback fails
+ */
+def withReport(checkName, command, callback = null) {
+  def logFile = "output-${checkName.replaceAll(/[^a-zA-Z0-9]/, "_")}.log"
+  publishChecks(name: checkName, status: 'IN_PROGRESS', title: 'Running...')
+
+  try {
+    sh script: "${command} 2>&1 | tee ${logFile}"
+    if(callback) {
+      callback()
+    } else {
+      publishChecks(name: checkName, conclusion: 'SUCCESS', summary: 'Check passed!')
+    }
+  } catch (ManualCheckException e) {
+    // Check was already published by callback, just re-throw to fail the step
+    throw e
+  } catch (Exception e) {
+    def consoleOutput = readFile(logFile).trim()
+    publishChecks(
+      name: checkName,
+      conclusion: 'FAILURE',
+      summary: "Command failed: ${e.message}",
+      text: "### Console Output\n```\n${consoleOutput}\n```"
+    )
+
+    // throwing will trigger the FAILURE check state
+    throw e
+  } finally {
+    sh "rm -f ${logFile}"
+  }
+}
+
