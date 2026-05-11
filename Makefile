@@ -12,6 +12,7 @@ REPORT_DIR = $(COVERAGE_DIR)/ci
 AURA_AUTO_DOWNLOAD ?= true
 
 CI ?=
+BUILD_TAG ?= 1
 IS_CI := $(if $(filter true, $(CI)), true,)
 ALWAYS_TIMESTAMP_VERSION ?= false
 APP_NAME ?= $(shell git remote -v | awk '/origin/ && /fetch/ { sub(/\.git/, ""); n=split($$2, origin, "/"); print origin[n]}')
@@ -36,8 +37,8 @@ DOCKER_ENV = $(TARGET_DIR)/aura-env
 RUNNER_CMD = $(DOCKER_RUN) --env-file=$(DOCKER_ENV) $(if $(filter true, $(IS_CI)), ,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 RUNNER_NO_ENV_CMD = $(DOCKER_RUN) $(if $(filter true, $(IS_CI)),,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 DOCKER_RUN_BUILD_ENV := $(RUNNER_CMD)
-BUILD_TAG ?= 1 # this is set by Jenkins and is unique per build
-AURA_RUNNER_IMAGE := local/aura-runner:$(call slugify, $(BUILD_TAG))
+BUILD_SLUG := $(call slugify, $(BUILD_TAG))
+AURA_RUNNER_IMAGE := local/aura-runner:$(BUILD_SLUG)
 
 RUN := $(if $(filter true, $(ENABLE_DOCKER)), $(RUNNER_CMD),)
 RUN_NO_ENV := $(if $(filter true, $(ENABLE_DOCKER)), $(RUNNER_NO_ENV_CMD),)

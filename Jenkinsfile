@@ -75,6 +75,7 @@ pipeline {
     stage('Setup') {
       steps{
         sh 'make setup'
+        sh "echo ${BUILD_TAG}"
       }
     } // end setup
 

@@ -1,21 +1,18 @@
-
-BUILD_TAG ?= 1
-
 .PHONY:start
 start: ## Start the docker compose setup
-	docker compose -p aura-${BUILD_TAG:-1} -f compose/base.yml -f compose/dev.yml up --remove-orphans -d
+	docker compose -p aura-$(BUILD_SLUG) -f compose/base.yml -f compose/dev.yml up --remove-orphans -d
 
 .PHONY:stop
 stop: ## Stop the docker compose setup
-	docker compose -p aura-${BUILD_TAG:-1} -f compose/base.yml -f compose/dev.yml down
+	docker compose -p aura-$(BUILD_SLUG) -f compose/base.yml -f compose/dev.yml down
 
 .PHONY:test-integration
 test-integration: $(REPORT_DIR) ## run CI test suite via docker compose
-	docker compose -p aura-test-${BUILD_TAG:-1} -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test --build
+	docker compose -p aura-test-$(BUILD_SLUG) -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test --build
 
 .PHONY:test-integration-down
 test-integration-down:  ## Cleanup integration test containers
-	-docker compose -p aura-test-${BUILD_TAG:-1} \
+	-docker compose -p aura-test-$(BUILD_SLUG) \
 		-f compose/base.yml \
 		-f compose/test.yml \
 		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
