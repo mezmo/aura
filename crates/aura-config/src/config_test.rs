@@ -997,7 +997,7 @@ name = "Test"
 system_prompt = "Test"
 "#;
 
-        let config = load_config_from_str(&config_str);
+        let config = load_config_from_str(config_str);
         assert!(config.is_err(), "no additional fields allowed");
         assert!(
             config

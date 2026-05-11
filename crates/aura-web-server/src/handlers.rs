@@ -485,7 +485,7 @@ async fn execute_completion(setup: RequestSetup, config: CompletionConfig, deliv
         }
     }
 
-    aura::logging::flush_tracer();
+    aura::logging::flush_tracer().await;
 }
 
 /// Build the final JSON response for non-streaming completions.
