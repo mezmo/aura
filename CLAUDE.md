@@ -1,5 +1,7 @@
 # CLAUDE.md - Project Documentation
 
+> If `CLAUDE.local.md` exists in this directory, read it first — it contains current session state.
+
 ## Overview
 Aura is a TOML-based configuration system for composing Rig.rs AI agents with MCP tools and RAG pipelines.
 
@@ -53,13 +55,12 @@ aura/
 │   ├── aura-web-server/      # OpenAI-compatible API
 │   └── aura-test-utils/      # Shared testing utilities
 ├── compose/                  # Docker Compose (integration + orchestration overlays)
-├── configs/                  # E2E test and orchestration configurations
+├── configs/                  # Integration test and example configurations
 ├── deployment/               # Helm charts and K8s manifests
 ├── development/              # LibreChat and OpenWebUI setup
 ├── docs/                     # Architecture and protocol documentation
 ├── examples/                 # Example and reference configurations
-├── scripts/                  # CI and utility scripts
-└── e2e-eval/                 # E2E eval scripts and results (gitignored)
+└── scripts/                  # CI and utility scripts
 ```
 
 ## Key Features
@@ -178,36 +179,6 @@ make test           # Run all tests
 make docker-build   # Build Docker image
 make lint           # Run clippy + fmt check
 ```
-
-## E2E Eval
-
-The `e2e-eval/` directory contains scripts for running E2E orchestration tests against the math-MCP setup.
-
-```bash
-# Prerequisites: cargo build --release, llama-server on 11435 (for local models)
-
-# Multi-turn session E2E (dependent prompts, session history injection)
-PROMPT_SET=dependent ./e2e-eval/run-session-e2e.sh \
-  configs/math-orchestration-opus-bedrock.toml \
-  configs/math-orchestration-glm.toml
-
-# Single-turn model comparison (multiple iterations, timing stats)
-./e2e-eval/run-model-comparison.sh 3 \
-  configs/math-orchestration-glm.toml \
-  configs/math-orchestration-qwen3.toml
-
-# Analyze session persistence artifacts
-python3 e2e-eval/analyze-session-history-eval.py \
-  --memory-dir /tmp/aura-math-opus-bedrock \
-  --session-id session_e2e_<ts>_opus-bedrock
-
-# Parse SSE captures from comparison runs
-python3 e2e-eval/parse-results.py e2e-eval/results-<timestamp>
-```
-
-Scripts auto-start math-mcp and cycle the aura server per config. Model name derived from config filename. Results output to gitignored `session-results-*/` and `results-*/` dirs.
-
-Per-model configs live in `configs/math-orchestration-*.toml`. Local llama-server model aliases use `-p<N>` suffix for parallel slot profiles (e.g., `glm-64k-p6`, `qwen35-64k-p3`).
 
 ## Documentation
 

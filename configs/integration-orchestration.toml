@@ -1,7 +1,6 @@
 # Integration test configuration for orchestration mode
 # Used by: compose/orchestration.yml → compose/orchestration-test.yml
-# Worker definitions mirror configs/math-orchestration.toml.
-# If you update worker mcp_filter or preambles, update both files.
+# Worker definitions mirror configs/example-math-orchestration.toml.
 
 [agent]
 name = "Math Orchestrator Test"

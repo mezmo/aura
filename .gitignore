@@ -99,10 +99,6 @@ config-*-test.toml
 # Accidentally-committed testing cluster config (belongs on test cluster only)
 configs/example-cluster-orchestrator.toml
 
-# E2E eval output (keep scripts, ignore results)
-e2e-eval/results-*/
-e2e-eval/session-results-*/
-e2e-eval/eval-*.json
-e2e-eval/*.log
-e2e-eval/*.jsonl
-e2e-eval/eval-loop/
+# OpenCode agent state
+.opencode/
+
