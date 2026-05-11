@@ -10,7 +10,7 @@ repository.workspace = true
 aura = { path = "../aura" }
 aura-config = { path = "../aura-config" }
 axum = { version = "0.7", features = ["json"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
 bytes = "1"
 async-stream = "0.3"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -26,6 +26,9 @@ opentelemetry = { workspace = true, optional = true }
 env_logger = "0.11"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
+a2a-rs-server = "1.0.26"
+a2a-rs-core = "1.0.26"
+async-trait = "0.1.89"
 
 [features]
 default = ["otel"]
@@ -43,6 +46,7 @@ integration = [
 ]
 
 # Per-suite flags (can run individually)
+integration-a2a = []                      # invocation of A2A functionality (task execution)
 integration-streaming = []                # streaming_tests, concurrent_streaming_isolation_test
 integration-header-forwarding = []        # header_forwarding_tests
 integration-mcp = []                      # fastmcp_structured_content_test

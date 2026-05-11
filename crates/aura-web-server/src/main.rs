@@ -1,6 +1,8 @@
+use a2a_rs_server::{A2aServer, AuthContext};
 use aura_config::load_config;
 use axum::Json;
 use axum::extract::{Request, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -9,11 +11,13 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use std::sync::Arc;
+use std::env;
+use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
+mod a2a;
 mod handlers;
 mod streaming;
 mod types;
@@ -218,7 +222,75 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
-    let app = Router::new()
+    // A2A server:
+    // JSON-RPC at /a2a/v1/rpc
+    // REST at /a2a/v1/message:send, /a2a/v1/tasks/
+    // REST /.well-known/agent-card.json
+    let event_tx_cell = Arc::new(OnceLock::new());
+    let task_store_cell = Arc::new(OnceLock::new());
+    let a2a_server = A2aServer::new(a2a::AuraMessageHandler::new(
+        app_state.clone(),
+        event_tx_cell.clone(),
+        task_store_cell.clone(),
+    ))
+    .auth_extractor(|headers: &HeaderMap| {
+        // pulling all the headers so they can be incorporated into the
+        // rig build for calling other tools
+        let header_map: serde_json::Map<String, serde_json::Value> = headers
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|val| (k.to_string(), serde_json::Value::String(val.to_string())))
+            })
+            .collect();
+
+        let user_id = env::var("A2A_HEADER_USER_ID")
+            .ok()
+            .as_ref()
+            .and_then(|h| headers.get(h))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let access_token = env::var("A2A_HEADER_AUTHORIZATION")
+            .ok()
+            .as_ref()
+            .and_then(|h| headers.get(h))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                if let Some(prefix) = env::var("A2A_HEADER_AUTHORIZATION_STRIP_PREFIX")
+                    .ok()
+                    .as_deref()
+                {
+                    s.strip_prefix(prefix).unwrap_or(s).to_string()
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_default();
+
+        Some(AuthContext {
+            user_id,
+            access_token,
+            metadata: Some(serde_json::Value::Object(header_map)),
+        })
+    })
+    .rpc_path("/a2a/v1/rpc")
+    .rest_prefix(Some("/a2a/v1"));
+
+    let _ = event_tx_cell.set(a2a_server.get_event_sender());
+    let _ = task_store_cell.set(a2a_server.get_task_store());
+    let a2a_router = a2a_server
+        .build_router()
+        .layer(tower_http::timeout::TimeoutLayer::new(
+            std::time::Duration::from_secs(120),
+        ));
+
+    // Our routes take priority. Unmatched requests fall through to a2a_router.
+    // This avoids a duplicate-route conflict on /health: ours is served first,
+    // and the a2a-rs-server's /health is never reached.
+    let aura_router = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
@@ -229,6 +301,7 @@ async fn run() -> std::io::Result<()> {
         ))
         .with_state(app_state);
 
+    let app = aura_router.fallback_service(a2a_router);
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

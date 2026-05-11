@@ -1,3 +1,4 @@
+use a2a_rs_core::PROTOCOL_VERSION;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
     tool_event_subscribe, tool_usage_subscribe,
@@ -659,7 +660,11 @@ fn convert_chat_messages(messages: &[ChatMessage]) -> Vec<aura::Message> {
 /// Health check endpoint
 pub async fn health() -> Response {
     Json(serde_json::json!({
-        "status": "healthy"
+        "status": "healthy",
+        "timestamp": Utc::now().to_rfc3339(),
+        "a2a_server": {
+            "protocol_version": PROTOCOL_VERSION,
+        },
     }))
     .into_response()
 }
@@ -698,7 +703,11 @@ fn generate_chat_session_id() -> String {
     format!("cs_{}", Uuid::new_v4().simple())
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>, error_type: impl Into<String>) -> Response {
+fn error_response(
+    status: StatusCode,
+    message: impl Into<String>,
+    error_type: impl Into<String>,
+) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -707,7 +716,8 @@ fn error_response(status: StatusCode, message: impl Into<String>, error_type: im
                 error_type: error_type.into(),
             },
         }),
-    ).into_response()
+    )
+        .into_response()
 }
 
 #[cfg(test)]

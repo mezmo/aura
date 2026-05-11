@@ -3,6 +3,43 @@
 version = 4
 
 [[package]]
+name = "a2a-rs-core"
+version = "1.0.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c82e1bff75e60f855633832576810216dfb33778ab43cb772f8020f3fffeaf42"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "a2a-rs-server"
+version = "1.0.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66073f44b7c998baac6e26367c9b5541a49cfc2bde0870aaae4dfbcc91c92ecb"
+dependencies = [
+ "a2a-rs-core",
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tower 0.4.13",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -242,7 +279,10 @@ dependencies = [
 name = "aura-web-server"
 version = "1.16.3"
 dependencies = [
+ "a2a-rs-core",
+ "a2a-rs-server",
  "async-stream",
+ "async-trait",
  "aura",
  "aura-config",
  "aura-test-utils",
@@ -4003,6 +4043,7 @@ dependencies = [
  "http-body 1.0.1",
  "iri-string",
  "pin-project-lite",
+ "tokio",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
