@@ -500,20 +500,30 @@ pub fn set_output_attributes(span: &tracing::Span, _text: &str) {
 /// task is polled, which may not happen reliably between requests.  Call this
 /// at the end of each request to guarantee spans are exported promptly.
 ///
+/// Uses `spawn_blocking` so the tokio runtime stays alive while
+/// `TracerProvider::force_flush()` blocks waiting for the `BatchSpanProcessor`
+/// background task. Calling `force_flush()` directly from a tokio worker
+/// thread deadlocks the batch processor (which itself runs on the runtime),
+/// permanently stalling subsequent exports.
+///
 /// No-op when OTel was not initialised or the `otel` feature is disabled.
 #[cfg(feature = "otel")]
-pub fn flush_tracer() {
+pub async fn flush_tracer() {
     if let Some(provider) = TRACER_PROVIDER.get() {
-        for result in provider.force_flush() {
-            if let Err(e) = result {
-                tracing::warn!("OpenTelemetry force_flush error: {e}");
+        let provider = provider.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            for result in provider.force_flush() {
+                if let Err(e) = result {
+                    eprintln!("OpenTelemetry force_flush error: {e}");
+                }
             }
-        }
+        })
+        .await;
     }
 }
 
 #[cfg(not(feature = "otel"))]
-pub fn flush_tracer() {}
+pub async fn flush_tracer() {}
 
 /// Flush and shut down the OpenTelemetry tracer provider.
 ///
