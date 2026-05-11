@@ -5,6 +5,12 @@
 
 use serde_json::Value;
 
+/// Recursion bound for the JSON structure walker. Stops `build_node` (and
+/// `collect_keys` in `tools.rs`) before adversarial / malformed inputs can
+/// blow the stack. `serde_json::from_str`'s implicit 128-frame parse limit
+/// is not a substitute — it's easy to lose if the deserializer is swapped.
+pub(super) const MAX_SCHEMA_DEPTH: usize = 32;
+
 /// A node in the JSON structure tree.
 #[derive(Debug, Clone)]
 pub struct SchemaNode {
@@ -27,7 +33,7 @@ pub fn analyze_json_structure(content: &str) -> Option<SchemaNode> {
 
     // We'll walk the pretty-printed JSON for line mapping since raw JSON
     // may be compact. For the POC, we use the original content's lines.
-    let root = build_node("$", &value, content, &line_offsets, 0);
+    let root = build_node("$", &value, content, &line_offsets, 0, 0);
     Some(root)
 }
 
@@ -83,7 +89,18 @@ fn build_node(
     content: &str,
     line_offsets: &[usize],
     search_from: usize,
+    depth: usize,
 ) -> SchemaNode {
+    if depth >= MAX_SCHEMA_DEPTH {
+        let line = byte_offset_to_line(line_offsets, search_from);
+        return SchemaNode {
+            path: path.to_string(),
+            kind: "...truncated".to_string(),
+            line_start: line,
+            line_end: line,
+            children: vec![],
+        };
+    }
     match value {
         Value::Object(map) => {
             // Find where this object starts in content
@@ -101,7 +118,14 @@ fn build_node(
                 } else {
                     format!("{}.{}", path, key)
                 };
-                let child = build_node(&child_path, val, content, line_offsets, key_offset);
+                let child = build_node(
+                    &child_path,
+                    val,
+                    content,
+                    line_offsets,
+                    key_offset,
+                    depth + 1,
+                );
                 cursor = key_offset + 1;
                 children.push(child);
             }
@@ -129,7 +153,14 @@ fn build_node(
             if !arr.is_empty() {
                 // Show schema of first element as representative
                 let child_path = format!("{}[0]", path);
-                let child = build_node(&child_path, &arr[0], content, line_offsets, arr_start + 1);
+                let child = build_node(
+                    &child_path,
+                    &arr[0],
+                    content,
+                    line_offsets,
+                    arr_start + 1,
+                    depth + 1,
+                );
                 children.push(child);
             }
 
@@ -585,6 +616,38 @@ mod tests {
         assert!(formatted.contains("Groups"));
         // All sections should show line ranges
         assert!(formatted.contains("[L"));
+    }
+
+    #[test]
+    fn test_build_node_truncates_deeply_nested_value() {
+        // Build a 1000-level deep object value programmatically — bypasses
+        // serde_json's 128-frame parse limit so we actually exercise the
+        // walker's own depth guard rather than the parser's. Without the
+        // guard this would stack-overflow on default tokio task stacks.
+        let mut value = Value::Object(serde_json::Map::new());
+        for _ in 0..1000 {
+            let mut outer = serde_json::Map::new();
+            outer.insert("child".to_string(), value);
+            value = Value::Object(outer);
+        }
+
+        // Non-empty `content` avoids an unrelated `content.len() - 1`
+        // underflow in the matching-brace fallback; the bytes themselves
+        // don't matter for what this test is checking.
+        let content = "{}";
+        let root = build_node("$", &value, content, &[0], 0, 0);
+
+        // Walk children and verify the deepest non-truncated node is at
+        // exactly MAX_SCHEMA_DEPTH - 1 (its sole child is the truncation
+        // sentinel). No panic == stack guard worked.
+        let mut node = &root;
+        let mut depth = 0;
+        while let Some(child) = node.children.first() {
+            depth += 1;
+            node = child;
+        }
+        assert_eq!(node.kind, "...truncated");
+        assert_eq!(depth, MAX_SCHEMA_DEPTH);
     }
 
     #[test]
