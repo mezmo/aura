@@ -2,6 +2,8 @@
 /target
 **/target
 *.pdb
+/.cargo/
+/.rustup/
 
 # IDE
 .vscode/
