@@ -1,0 +1,25 @@
+[package]
+name = "impl-more"
+version = "0.1.9"
+description = "Concise, declarative trait implementation macros"
+authors = ["Rob Ede <robjtede@icloud.com>"]
+keywords = ["derive", "implement", "implementations", "no-std"]
+categories = ["development-tools", "no-std"]
+repository = "https://github.com/robjtede/impl-more"
+license = "MIT OR Apache-2.0"
+edition = "2018"
+rust-version = "1.56"
+
+[dependencies]
+
+[dev-dependencies]
+eyre = "0.6"
+rustversion = "1"
+static_assertions = "1.1"
+
+[lints.rust]
+unsafe_code = { level = "forbid", priority = 2 }
+rust_2018_idioms = "deny"
+nonstandard-style = "deny"
+future_incompatible = "deny"
+missing_docs = { level = "warn", priority = -1 }

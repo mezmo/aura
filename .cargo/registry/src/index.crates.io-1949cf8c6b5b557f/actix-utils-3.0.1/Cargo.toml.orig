@@ -1,0 +1,21 @@
+[package]
+name = "actix-utils"
+version = "3.0.1"
+authors = [
+    "Nikolay Kim <fafhrd91@gmail.com>",
+    "Rob Ede <robjtede@icloud.com>",
+]
+description = "Various utilities used in the Actix ecosystem"
+keywords = ["network", "framework", "async", "futures"]
+categories = ["network-programming", "asynchronous"]
+repository = "https://github.com/actix/actix-net"
+license = "MIT OR Apache-2.0"
+edition = "2018"
+
+[lib]
+name = "actix_utils"
+path = "src/lib.rs"
+
+[dependencies]
+pin-project-lite = "0.2"
+local-waker = "0.1"

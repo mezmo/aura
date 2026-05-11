@@ -1,5 +1,20 @@
 ## Changelog
 
+## [1.19.7](https://github.com/mezmo/aura/compare/v1.19.6...v1.19.7) (2026-05-11)
+
+
+### Chores
+
+* **build**: simplify multistage docker setup [d099a49](https://github.com/mezmo/aura/commit/d099a492f722086e4b751b3dfd23e1f6d457a436) - Mike Shearer
+
+### Service
+
+* **setup**: add rich commitlint reporting [10c4cd4](https://github.com/mezmo/aura/commit/10c4cd443f053dbfc019c55919836815c42b3530) - Mike Shearer* **setup**: add strcutured test and coverage reporting [cb233a5](https://github.com/mezmo/aura/commit/cb233a55e259fe0758914cde12ca36cc228f0830) - Mike Shearer* **setup**: docker based test setup via nextest [83a4a7e](https://github.com/mezmo/aura/commit/83a4a7e0d2a3d51eaf9da0c575da8afa90c24e6b) - Mike Shearer [LOG-1791](https://mezmo.atlassian.net/browse/LOG-1791)* **setup**: remove old development directory [db4b760](https://github.com/mezmo/aura/commit/db4b7602bf95ab92fac28e6110d6f76bf0797f9e) - Mike Shearer* **setup**: remove test-ci scripts and reference [2e45520](https://github.com/mezmo/aura/commit/2e455209134c8869486f49031ee0eb96c800cbb9) - Mike Shearer
+
+### Style
+
+* apply cargo fmt [db33c3a](https://github.com/mezmo/aura/commit/db33c3ab0adc33c8bb4e8938101b1618788f7f80) - Mike Shearer
+
 ## [1.19.6](https://github.com/mezmo/aura/compare/v1.19.5...v1.19.6) (2026-05-09)
 
 

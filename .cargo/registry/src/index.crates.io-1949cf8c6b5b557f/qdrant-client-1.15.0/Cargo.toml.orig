@@ -1,0 +1,51 @@
+[package]
+name = "qdrant-client"
+version = "1.15.0"
+edition = "2021"
+authors = ["Qdrant Team <team@qdrant.com>"]
+description = "Rust client for Qdrant Vector Search Engine"
+documentation = "https://docs.rs/qdrant-client"
+homepage = "https://qdrant.tech/"
+license = "Apache-2.0"
+repository = "https://github.com/qdrant/rust-client"
+readme = "README.md"
+categories = ["database", "api-bindings"]
+keywords = ["qdrant", "vector-search", "search-engine", "client", "grpc"]
+
+[dependencies]
+tonic = { version = "0.12.3", features = ["tls", "tls-roots", "gzip"] }
+prost = "0.13.3"
+prost-types = "0.13.3"
+anyhow = "1.0.89"
+serde = { version = "1.0.210", features = ["derive"], optional = true }
+serde_json = { version = "1.0.128", optional = true }
+reqwest = { version = "0.12.8", optional = true, default-features = false, features = ["stream", "rustls-tls", "http2"] }
+futures = { version = "0.3.31" }
+tokio = { version = "1.40.0", features = ["rt-multi-thread"] }
+futures-util = { version = "0.3.31", optional = true }
+derive_builder = { version = "0.20.2" }
+thiserror = "1.0.64"
+semver = "1.0.24"
+uuid = { version = "1.8.2", optional = true }
+
+[dev-dependencies]
+tonic-build = { version = "0.12.3", features = ["prost"] }
+
+[features]
+default = ["download_snapshots", "serde", "generate-snippets"]
+download_snapshots = ["reqwest", "futures-util"]
+serde = ["dep:serde", "dep:serde_json"]
+generate-snippets = []
+uuid = ["dep:uuid"]
+
+[[example]]
+name = "search"
+required-features = ["serde"]
+
+[[example]]
+name = "deprecated_search"
+required-features = ["serde"]
+
+[package.metadata.docs.rs]
+features = ["download_snapshots", "serde"]
+no-default-features = true

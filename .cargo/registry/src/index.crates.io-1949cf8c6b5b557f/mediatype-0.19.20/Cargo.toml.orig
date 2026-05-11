@@ -1,0 +1,28 @@
+[package]
+name = "mediatype"
+version = "0.19.20"
+edition = "2021"
+authors = ["picoHz <picoHz@outlook.com>"]
+description = "MIME Media-type parsing"
+keywords = ["media-type", "media-types", "mime", "media-extensions"]
+categories = [
+    "parser-implementations",
+    "network-programming",
+    "web-programming",
+    "email",
+]
+repository = "https://github.com/picoHz/mediatype"
+homepage = "https://github.com/picoHz/mediatype"
+documentation = "https://docs.rs/mediatype"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+serde = { version = "1.0.144", optional = true }
+
+[dev-dependencies]
+serde_json = "1.0.85"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

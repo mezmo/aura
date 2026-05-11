@@ -1,0 +1,15 @@
+[package]
+name = "as-any"
+version = "0.3.2"
+description = "provide the AsAny trait"
+categories = ["no-std", "rust-patterns"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+repository = "https://codeberg.org/fogti/as-any"
+
+[dependencies]
+
+[features]
+
+[package.metadata.docs.rs]
+all-features = true

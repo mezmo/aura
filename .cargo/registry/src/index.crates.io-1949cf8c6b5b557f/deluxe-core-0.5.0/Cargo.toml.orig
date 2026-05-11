@@ -1,0 +1,24 @@
+[package]
+name = "deluxe-core"
+version = "0.5.0"
+edition = "2021"
+description = "Core traits and helpers for Deluxe procedural macro attribute parser"
+license = "MIT"
+documentation = "https://docs.rs/deluxe-core"
+homepage = "https://github.com/jf2048/deluxe"
+repository = "https://github.com/jf2048/deluxe.git"
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["full", "proc-macro"]
+full = ["syn/full"]
+proc-macro = ["syn/proc-macro"]
+
+[dependencies]
+arrayvec = "0.7.2"
+proc-macro2 = "1.0.38"
+quote = "1.0.25"
+strsim = "0.10.0"
+syn = { version = "2.0.10", features = ["clone-impls", "derive", "extra-traits", "parsing", "printing"], default-features = false }

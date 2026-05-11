@@ -1,0 +1,32 @@
+[package]
+name = "deluxe"
+version = "0.5.0"
+edition = "2021"
+description = "Procedural macro attribute parser"
+license = "MIT"
+documentation = "https://docs.rs/deluxe"
+homepage = "https://github.com/jf2048/deluxe"
+repository = "https://github.com/jf2048/deluxe.git"
+readme = "README.md"
+keywords = ["macros", "derive", "attributes"]
+include = ["/src", "/tests", "/README.md", "/COPYING"]
+resolver = "2"
+
+[features]
+default = ["full", "proc-macro"]
+full = ["deluxe-core/full", "syn/full"]
+proc-macro = ["deluxe-core/proc-macro", "syn/proc-macro"]
+
+[dependencies]
+once_cell = "1.13.0"
+proc-macro2 = "1.0.38"
+syn = { version = "2.0.10", default-features = false }
+deluxe-core = { path = "./core", version = "0.5.0", default-features = false }
+deluxe-macros = { path = "./macros", version = "0.5.0" }
+
+[dev-dependencies]
+quote = "1.0.25"
+deluxe-core = { path = "./core", version = "0.5.0", features = ["full"], default-features = false }
+
+[workspace]
+members = ["core", "macros"]
