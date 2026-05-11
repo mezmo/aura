@@ -533,7 +533,7 @@ pub async fn execute_completion(
         }
     }
 
-    aura::logging::flush_tracer();
+    aura::logging::flush_tracer().await;
 }
 
 /// Build the final JSON response for non-streaming completions.
