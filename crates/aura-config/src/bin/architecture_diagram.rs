@@ -193,17 +193,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("│  │  ┌─────────────────────────────────────────┐    │    │");
             match &store.store {
                 aura_config::VectorStoreType::InMemory { embedding_model }
-                | aura_config::VectorStoreType::Qdrant { embedding_model, .. } => {
+                | aura_config::VectorStoreType::Qdrant {
+                    embedding_model, ..
+                } => {
                     println!("│  │  │        🔤 EMBEDDING MODEL               │    │    │");
                     println!("│  │  │                                         │    │    │");
                     println!(
                         "│  │  │  Provider: {}                │    │    │",
                         embedding_model.provider()
                     );
-                    println!(
-                        "│  │  │  Model: {}    │    │    │",
-                        embedding_model.model()
-                    );
+                    println!("│  │  │  Model: {}    │    │    │", embedding_model.model());
                 }
                 aura_config::VectorStoreType::BedrockKb { .. } => {
                     println!("│  │  │        🔤 MANAGED EMBEDDINGS            │    │    │");

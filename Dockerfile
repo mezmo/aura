@@ -1,4 +1,46 @@
-# Stage 0: linting & testing
+### 000 Rust
+FROM rust:1.93.1 AS core
+
+### 001 Runner
+FROM core AS runner
+
+RUN groupadd --gid 1000 aura \
+  && useradd --uid 1000 --gid aura --shell /bin/bash --create-home aura
+
+ENV PATH="${PATH}:/home/aura/.bin"
+WORKDIR /home/aura
+
+RUN <<EOR
+  apt-get update && apt-get install -y ca-certificates libssl3 curl nodejs npm
+  rm -rf /var/lib/apt/lists/*
+EOR
+
+USER 1000
+
+RUN <<EOR
+  rustup component add rustfmt clippy llvm-tools
+  rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+EOR
+
+### 0002 test
+FROM runner AS test
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+# needed for make operations
+COPY .git ./.git
+COPY .makefiles ./.makefiles
+COPY .config.mk .config.mk ./
+COPY Makefile Makefile ./
+
+RUN <<EOR
+  git config --global --add safe.directory /home/aura
+  cargo install --locked --force cargo-nextest
+  cargo install --locked grcov
+EOR
+
+# 003: linting & testing
 FROM rust:1.93.1 AS release-lint-test
 
 WORKDIR /usr/src/app
@@ -18,8 +60,8 @@ RUN cargo fmt --all -- --check
 RUN cargo clippy --all-targets --all-features -- -D warnings
 RUN cargo test --workspace --lib
 
-# Stage 1: release-build - Release compilation
-FROM rust:1.93.1 AS release-build
+# 004: release-build - Release compilation
+FROM core AS release-build
 
 WORKDIR /usr/src/app
 
@@ -28,18 +70,19 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
 # Build the web server binary in release mode
-RUN cargo clean
-RUN cargo build --release --bin aura-web-server
+RUN <<EOR
+  cargo clean
+  cargo build --release --bin aura-web-server
+EOR
 
-# Stage 2: release - Runtime stage with newer glibc
-FROM debian:trixie-slim
+# 005: release - Runtime stage with newer glibc
+FROM debian:trixie-slim AS release
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN <<EOR
+  apt-get update && apt-get install -y ca-certificates libssl3 curl
+  rm -rf /var/lib/apt/lists/*
+EOR
 
 # Create app user for security
 RUN useradd -r -s /bin/false appuser
