@@ -167,3 +167,42 @@ turn_depth = 5
 # in aura.session_info streaming events. Set this to your model's
 # actual context window.
 # context_window = 200000
+
+# ── Orchestration ───────────────────────────────────────────────────
+# Multi-agent orchestration with coordinator/worker architecture.
+# The coordinator routes requests, decomposes complex queries into
+# task DAGs, and dispatches work to specialized workers.
+#
+# For working examples, see:
+#   examples/quickstart-orchestration-math/  - Math MCP with three workers
+#   examples/quickstart-k8s-sre/             - Kubernetes + Prometheus workers
+#
+# [orchestration]
+# enabled = true
+# max_planning_cycles = 3        # max plan-execute-continue iterations
+# allow_direct_answers = true    # coordinator can answer simple queries directly
+# allow_clarification = true     # coordinator can ask for clarification
+# tools_in_planning = "summary"  # "none", "summary" (names only), "full" (with descriptions)
+#
+# [orchestration.timeouts]
+# per_call_timeout_secs = 0      # per LLM call timeout (0 = disabled)
+#
+# [orchestration.artifacts]
+# memory_dir = "/tmp/aura-orchestration"  # persistence directory for run artifacts
+# result_artifact_threshold = 4000        # char threshold for artifact extraction
+# result_summary_length = 2000            # max chars for result summaries
+# session_history_turns = 3               # prior runs to include in context
+# persistence_drain_timeout_ms = 2000     # timeout for draining writes between phases
+# tool_output_artifact_threshold = 500    # char threshold for tool output artifacts
+# tool_output_duration_threshold_ms = 5000  # duration threshold for artifact promotion
+# show_tool_reasoning_in_continuation = false  # include tool reasoning in prompts
+# max_session_runs = 20                   # max run directories retained per session
+#
+# Workers are defined with [orchestration.worker.<name>] sections.
+# Each worker has access to a filtered subset of MCP tools.
+#
+# [orchestration.worker.example]
+# description = "Worker description for coordinator routing"
+# turn_depth = 5                  # tool-calling depth for this worker
+# mcp_filter = ["tool_a", "tool_b"]  # restrict to specific MCP tools
+# preamble = "Custom system prompt prefix for this worker"

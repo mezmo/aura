@@ -87,8 +87,7 @@ Uncomment the Anthropic block in `config.toml` and set `ANTHROPIC_API_KEY` in `.
 [orchestration]
 allow_direct_answers = true   # set false to always dispatch workers
 allow_clarification = true    # set false to never ask for clarification
-max_planning_cycles = 2       # coordinator retries on low-quality plans
-quality_threshold = 0.7       # minimum plan quality score (0.0–1.0)
+max_planning_cycles = 2       # max plan-execute-continue iterations
 ```
 
 ### Add or modify workers
