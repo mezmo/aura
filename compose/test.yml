@@ -37,6 +37,9 @@ services:
       - $PWD/report:/home/aura/report
       # nextest config
       - $PWD/.config:/home/aura/.config
+      # config and example files needed by test_all_shipped_configs_parse
+      - $PWD/configs:/home/aura/configs:ro
+      - $PWD/examples:/home/aura/examples:ro
     env_file:
       - ./env/test.env
     depends_on:
