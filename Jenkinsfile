@@ -9,7 +9,7 @@ def BUILD_SLUG = slugify(env.BUILD_TAG)
 pipeline {
   agent {
     node {
-      label 'ec2-fleet'
+      label 'ec2-fleet-oss'
       customWorkspace("/tmp/workspace/${BUILD_SLUG}")
     }
   }
@@ -36,6 +36,7 @@ pipeline {
     RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
     CARGO_HOME = "${env.WORKSPACE}/.cargo"
     FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
+    ENABLE_DOCKER = 'true'
   }
 
   post {
@@ -75,7 +76,6 @@ pipeline {
     stage('Setup') {
       steps{
         sh 'make setup'
-        sh "echo ${BUILD_TAG}"
       }
     } // end setup
 
@@ -213,11 +213,22 @@ pipeline {
               }
 
               steps {
-                withCredentials([
-                   string(credentialsId: 'github-api-token', variable: 'GITHUB_TOKEN'),
-                ]) {
-                  buildx {
-                    withReport('Release Test', 'npm run release:dry')
+                script {
+                  docker.withRegistry(
+                      'https://index.docker.io/v1/',
+                      'dockerhub-username-password'
+                  ) {
+                    withCredentials([
+                       usernamePassword(
+                         credentialsId: 'github-app-key-mezmo',
+                         passwordVariable: 'GITHUB_TOKEN',
+                         usernameVariable: 'GITHUB_APP'
+                       )
+                    ]) {
+                      buildx {
+                        withReport('Release Test', 'npm run release:dry')
+                      }
+                    }
                   }
                 }
               }
