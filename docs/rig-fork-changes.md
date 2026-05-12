@@ -8,7 +8,7 @@
 
 ## Why a Fork?
 
-Aura depends on a small set of fixes to rig-core that have not yet been accepted upstream. The fork is a superset of upstream and is intended to be temporary.
+AURA depends on a small set of fixes to rig-core that have not yet been accepted upstream. The fork is a superset of upstream and is intended to be temporary.
 
 ## Changes
 

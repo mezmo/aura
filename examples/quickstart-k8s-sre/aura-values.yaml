@@ -1,0 +1,160 @@
+# Aura Helm values for Kubernetes SRE Orchestration Quickstart
+#
+# Configures Aura in orchestration mode with two specialized workers:
+#   - cluster_inspector: Kubernetes cluster operations
+#   - metrics_analyst:   Prometheus metrics and alerts
+
+replicaCount: 1
+
+image:
+  repository: mezmo/aura
+  tag: "orchestration"
+  pullPolicy: IfNotPresent
+
+server:
+  httpPort: 8080
+  loglevel: info
+  command: ["./aura-web-server"]
+  args: ["--verbose"]
+
+streaming:
+  toolResultMode: "aura"
+  # Truncate tool results to avoid blowing past TPM limits.
+  # Prometheus list_metrics / get_metric_metadata can return hundreds of
+  # metrics from the OTel demo, easily exceeding 200K tokens in one call.
+  toolResultMaxLength: 8000
+  customEvents: true
+  emitReasoning: true
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2
+    memory: 2Gi
+
+config:
+  content: |
+    [llm]
+    provider = "openai"
+    api_key = "{{ env.OPENAI_API_KEY }}"
+    model = "gpt-5.4-mini"
+
+    [mcp]
+    sanitize_schemas = true
+
+    # Kubernetes MCP — cluster inspection tools
+    # Service name and port from: oci://ghcr.io/containers/charts/kubernetes-mcp-server
+    [mcp.servers.kubernetes]
+    transport = "http_streamable"
+    url = "http://kubernetes-mcp-server:8080/mcp"
+    description = "Kubernetes cluster operations: pods, deployments, services, nodes, logs, events"
+
+    # Prometheus MCP — metrics and alerting tools
+    # Service name and port from: oci://ghcr.io/pab1it0/charts/prometheus-mcp-server
+    [mcp.servers.prometheus]
+    transport = "http_streamable"
+    url = "http://prometheus-mcp-server:8080/mcp"
+    description = "Prometheus metrics queries, alerts, and targets"
+
+    [agent]
+    name = "Kubernetes SRE Agent"
+    alias = "kubernetes-sre"
+    system_prompt = """
+    You are a Kubernetes SRE coordinator. Route requests to the appropriate specialist:
+
+    - Use cluster_inspector for pod status, deployments, logs, events, and node health.
+    - Use metrics_analyst for CPU/memory metrics, error rates, alerts, and PromQL queries.
+
+    For questions that span both domains, dispatch to both workers and synthesize
+    their findings into a unified diagnosis. Always specify namespaces explicitly.
+    Prefer read-only operations unless the user explicitly requests changes.
+    """
+    turn_depth = 20
+    max_tokens = 4096
+
+    # ── Orchestration ────────────────────────────────────────────────
+
+    [orchestration]
+    enabled = true
+    max_planning_cycles = 2
+    quality_threshold = 0.7
+    allow_direct_answers = true
+    allow_clarification = false
+    tools_in_planning = "summary"
+
+    [orchestration.timeouts]
+    per_call_timeout_secs = 120
+
+    [orchestration.artifacts]
+    memory_dir = "/tmp/aura-orchestration"
+
+    # ── Workers ──────────────────────────────────────────────────────
+    #
+    # Each worker uses mcp_filter to restrict which tools it can see.
+    # Tool names below match the kubernetes-mcp-server (core toolset,
+    # read-only mode) and prometheus-mcp-server source code.
+    #
+    # To verify the actual tool names discovered at runtime:
+    #   kubectl logs -l app.kubernetes.io/name=aura | grep -i "tool"
+
+    [orchestration.worker.cluster_inspector]
+    description = "Kubernetes cluster inspection: check pod status, read logs, list deployments and services, review events, assess node health"
+    turn_depth = 10
+    # Tool names from: https://github.com/containers/kubernetes-mcp-server
+    # Core toolset with read_only=true (destructive tools like pods_delete are excluded by the server)
+    mcp_filter = [
+      "configuration_view",
+      "events_list",
+      "namespaces_list",
+      "nodes_log",
+      "nodes_stats_summary",
+      "nodes_top",
+      "pods_get",
+      "pods_list",
+      "pods_list_in_namespace",
+      "pods_log",
+      "pods_top",
+      "resources_get",
+      "resources_list",
+    ]
+    preamble = """
+    You are a Kubernetes cluster specialist. Use the available tools to inspect
+    cluster state: check pod health, read logs, list deployments and services,
+    review events, and assess node status.
+
+    Always specify namespaces explicitly. Report findings with specific resource
+    names, namespaces, and status conditions.
+    """
+
+    [orchestration.worker.metrics_analyst]
+    description = "Prometheus metrics analysis: run PromQL queries for CPU, memory, error rates; check alerts, targets, and metric metadata"
+    turn_depth = 10
+    # Tool names from: https://github.com/pab1it0/prometheus-mcp-server
+    mcp_filter = [
+      "execute_query",
+      "execute_range_query",
+      "get_metric_metadata",
+      "get_targets",
+      "health_check",
+      "list_metrics",
+    ]
+    preamble = """
+    You are a Prometheus metrics specialist.
+
+    Workflow:
+    1. Call list_metrics with a filter_pattern for the domain
+       (e.g. "cpu", "http_request", "memory").
+    2. Run execute_query or execute_range_query with the
+       exact metric name from step 1.
+    3. Use get_metric_metadata with a filter_pattern if you
+       need to understand what a metric measures.
+
+    Always pass filter_pattern to list_metrics and
+    get_metric_metadata — filtered results are faster and
+    more relevant.
+
+    Be concise and decisive. Report metric values with
+    units. Flag anomalies with specific numbers.
+    """

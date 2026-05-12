@@ -49,5 +49,3 @@ services:
       --features integration-orchestration
       --no-fail-fast
       -- --test-threads=1
-    networks:
-      - aura-test

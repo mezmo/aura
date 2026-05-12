@@ -52,5 +52,3 @@ services:
       --features integration-scratchpad
       --no-fail-fast
       -- --test-threads=1
-    networks:
-      - aura-test

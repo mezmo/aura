@@ -2,7 +2,7 @@
 
 ## Overview
 
-Aura manages per-request state (cancellation tokens, subscriptions) across streaming SSE connections. This document covers the lifecycle, timeout configuration, and known limitations.
+AURA manages per-request state (cancellation tokens, subscriptions) across streaming SSE connections. This document covers the lifecycle, timeout configuration, and known limitations.
 
 ---
 

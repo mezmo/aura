@@ -3,7 +3,7 @@
 > If `CLAUDE.local.md` exists in this directory, read it first — it contains current session state.
 
 ## Overview
-Aura is a TOML-based configuration system for composing Rig.rs AI agents with MCP tools and RAG pipelines.
+AURA is a TOML-based configuration system for composing Rig.rs AI agents with MCP tools and RAG pipelines.
 
 ## Current Status: Production Ready
 
@@ -57,10 +57,9 @@ aura/
 ├── compose/                  # Docker Compose (integration + orchestration overlays)
 ├── configs/                  # Integration test and example configurations
 ├── deployment/               # Helm charts and K8s manifests
-├── development/              # LibreChat and OpenWebUI setup
 ├── docs/                     # Architecture and protocol documentation
 ├── examples/                 # Example and reference configurations
-└── scripts/                  # CI and utility scripts
+└── .makefiles/               # Modular Make targets (rust, docker, node, aura)
 ```
 
 ## Key Features
@@ -179,6 +178,16 @@ make test           # Run all tests
 make docker-build   # Build Docker image
 make lint           # Run clippy + fmt check
 ```
+
+## Commit and Contribution Rules
+
+- **No AI co-authorship**: Never add `Co-Authored-By` lines for Claude or any AI assistant. Claude cannot accept the CLA.
+- **Sign-off commits as the user**: Always sign off commits as the human user, not as Claude.
+- **Commit message format**: [Conventional Commits](https://www.conventionalcommits.org/). First line must be entirely lowercase, no trailing period, under 72 characters. Use the body to explain **what** and **why**.
+  Format: `<type>(<optional scope>): <description>`
+  Types: `feat`, `fix`, `doc`, `style`, `refactor`, `perf`, `test`, `chore`, `ci`
+  Breaking changes: add `!` after type/scope and include a `BREAKING CHANGE:` footer.
+  If fixing an issue, include `Fixes: #<issue number>` in the footer.
 
 ## Documentation
 

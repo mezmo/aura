@@ -39,8 +39,6 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
-    networks:
-      - aura-test
 
   aura-web-server:
     build:
@@ -48,19 +46,19 @@ services:
       dockerfile: Dockerfile
     environment:
       # API keys (passed from host environment or .env file)
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
       # Server configuration
-      - HOST=0.0.0.0
-      - PORT=8080
-      - CONFIG_PATH=/app/config/test-config.toml
+      HOST: 0.0.0.0
+      PORT: 8080
+      CONFIG_PATH: /app/config/test-config.toml
       # MCP server hostname (Docker service name)
-      - MCP_MOCK_HOST=mock-mcp
+      MCP_MOCK_HOST: mock-mcp
       # Tool result format
-      - TOOL_RESULT_MODE=open-web-ui
+      TOOL_RESULT_MODE: open-web-ui
       # Enable custom aura events for testing
-      - AURA_CUSTOM_EVENTS=true
+      AURA_CUSTOM_EVENTS: true
       # Logging
-      - RUST_LOG=warn
+      RUST_LOG: warn
     env_file:
       - ./env/test.env
     volumes:
@@ -75,12 +73,6 @@ services:
       timeout: 3s
       retries: 10
       start_period: 30s
-    networks:
-      - aura-test
-
-networks:
-  aura-test:
-    driver: bridge
 
 volumes:
   # Shared volume for marker files between mock-mcp and test runner
