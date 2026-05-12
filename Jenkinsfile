@@ -216,7 +216,7 @@ pipeline {
                 script {
                   docker.withRegistry(
                       'https://index.docker.io/v1/',
-                      'dockerhub-username-password'
+                      'dockerhub-token-mezmo'
                   ) {
                     withCredentials([
                        usernamePassword(
@@ -280,21 +280,20 @@ pipeline {
 
       steps {
         script {
-
-          // FIXME: We shouldn't need to do this
-          // once the release version has been updated running make clean render publish
-          // should resolve the right version. I think this can also go
-          // 1.2.3
-          def RELEASE_VERSION_PATCH = sh(
-            returnStdout: true,
-            script: 'cargo metadata -q --no-deps --format-version 1 | jq -r \'.packages[0].version\''
-          ).trim()
-
-          withCredentials([
-             string(credentialsId: 'github-api-token', variable: 'GITHUB_TOKEN'),
-          ]) {
-            buildx {
-              withReport('Release', 'npm run release')
+          docker.withRegistry(
+              'https://index.docker.io/v1/',
+              'dockerhub-token-mezmo'
+          ) {
+            withCredentials([
+               usernamePassword(
+                 credentialsId: 'github-app-key-mezmo',
+                 passwordVariable: 'GITHUB_TOKEN',
+                 usernameVariable: 'GITHUB_APP'
+               )
+            ]) {
+              buildx {
+                withReport('Release Test', 'npm run release')
+              }
             }
           }
         }
