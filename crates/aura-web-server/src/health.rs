@@ -92,13 +92,13 @@ pub struct HealthCheckResult {
 /// Never exposes internal IPs, hostnames, or DNS names.
 fn sanitize_probe_error(err: &reqwest::Error) -> String {
     if err.is_timeout() {
-        "timeout".to_string()
+        "timeout".to_owned()
     } else if err.is_connect() {
-        "connection_refused".to_string()
+        "connection_refused".to_owned()
     } else if err.is_redirect() {
-        "redirect_error".to_string()
+        "redirect_error".to_owned()
     } else {
-        "probe_error".to_string()
+        "probe_error".to_owned()
     }
 }
 
@@ -110,7 +110,7 @@ async fn probe_llm(config: &LlmConfig, agent_name: &str, timeout: Duration) -> L
     let status = match tokio::time::timeout(timeout, probe_llm_inner(config)).await {
         Ok(result) => result,
         Err(_) => SubsystemStatus::Error {
-            message: "timeout".to_string(),
+            message: "timeout".to_owned(),
         },
     };
 
@@ -135,9 +135,9 @@ async fn probe_llm(config: &LlmConfig, agent_name: &str, timeout: Duration) -> L
     }
 
     LlmHealthResult {
-        provider: provider.to_string(),
-        model: model.to_string(),
-        agent: agent_name.to_string(),
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        agent: agent_name.to_owned(),
         status,
         latency_ms,
     }
@@ -163,7 +163,7 @@ async fn probe_llm_inner(config: &LlmConfig) -> SubsystemStatus {
             {
                 Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => {
                     SubsystemStatus::Error {
-                        message: "auth_failed".to_string(),
+                        message: "auth_failed".to_owned(),
                     }
                 }
                 Ok(_) => SubsystemStatus::Ok,
@@ -189,7 +189,7 @@ async fn probe_llm_inner(config: &LlmConfig) -> SubsystemStatus {
             {
                 Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => {
                     SubsystemStatus::Error {
-                        message: "auth_failed".to_string(),
+                        message: "auth_failed".to_owned(),
                     }
                 }
                 Ok(_) => SubsystemStatus::Ok,
@@ -217,7 +217,7 @@ async fn probe_llm_inner(config: &LlmConfig) -> SubsystemStatus {
             {
                 Ok(resp) if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 => {
                     SubsystemStatus::Error {
-                        message: "auth_failed".to_string(),
+                        message: "auth_failed".to_owned(),
                     }
                 }
                 Ok(_) => SubsystemStatus::Ok,
@@ -248,7 +248,7 @@ async fn probe_mcp_server(
         McpServerConfig::Stdio { .. } => (
             "stdio",
             McpHealthResult {
-                transport: "stdio".to_string(),
+                transport: "stdio".to_owned(),
                 status: SubsystemStatus::Ok,
                 latency_ms: None,
             },
@@ -258,14 +258,14 @@ async fn probe_mcp_server(
             let status = match tokio::time::timeout(timeout, probe_mcp_http(url)).await {
                 Ok(result) => result,
                 Err(_) => SubsystemStatus::Error {
-                    message: "timeout".to_string(),
+                    message: "timeout".to_owned(),
                 },
             };
             let latency_ms = Some(start.elapsed().as_millis() as u64);
             (
                 "http_streamable",
                 McpHealthResult {
-                    transport: "http_streamable".to_string(),
+                    transport: "http_streamable".to_owned(),
                     status,
                     latency_ms,
                 },
@@ -288,7 +288,7 @@ async fn probe_mcp_server(
         );
     }
 
-    (server_name.to_string(), result)
+    (server_name.to_owned(), result)
 }
 
 /// Connectivity check only: any HTTP response (200, 404, 405) = reachable.
@@ -314,7 +314,7 @@ async fn probe_vector_store(
         VectorStoreType::InMemory { .. } => (
             "in_memory",
             VectorStoreHealthResult {
-                store_type: "in_memory".to_string(),
+                store_type: "in_memory".to_owned(),
                 status: SubsystemStatus::Ok,
                 latency_ms: None,
             },
@@ -325,14 +325,14 @@ async fn probe_vector_store(
             let status = match tokio::time::timeout(timeout, probe_http_health(&health_url)).await {
                 Ok(result) => result,
                 Err(_) => SubsystemStatus::Error {
-                    message: "timeout".to_string(),
+                    message: "timeout".to_owned(),
                 },
             };
             let latency_ms = Some(start.elapsed().as_millis() as u64);
             (
                 "qdrant",
                 VectorStoreHealthResult {
-                    store_type: "qdrant".to_string(),
+                    store_type: "qdrant".to_owned(),
                     status,
                     latency_ms,
                 },
@@ -350,14 +350,14 @@ async fn probe_vector_store(
             {
                 Ok(result) => result,
                 Err(_) => SubsystemStatus::Error {
-                    message: "timeout".to_string(),
+                    message: "timeout".to_owned(),
                 },
             };
             let latency_ms = Some(start.elapsed().as_millis() as u64);
             (
                 "bedrock_kb",
                 VectorStoreHealthResult {
-                    store_type: "bedrock_kb".to_string(),
+                    store_type: "bedrock_kb".to_owned(),
                     status,
                     latency_ms,
                 },
@@ -380,7 +380,7 @@ async fn probe_vector_store(
         );
     }
 
-    (store_name.to_string(), result)
+    (store_name.to_owned(), result)
 }
 
 async fn probe_http_health(url: &str) -> SubsystemStatus {
@@ -404,7 +404,7 @@ async fn probe_aws_credentials(region: &str, profile: Option<&str>) -> Subsystem
     use aws_credential_types::provider::ProvideCredentials;
 
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_string()));
+        .region(aws_config::Region::new(region.to_owned()));
     if let Some(p) = profile {
         loader = loader.profile_name(p);
     }
@@ -413,11 +413,11 @@ async fn probe_aws_credentials(region: &str, profile: Option<&str>) -> Subsystem
         Some(provider) => match provider.provide_credentials().await {
             Ok(_) => SubsystemStatus::Ok,
             Err(_) => SubsystemStatus::Error {
-                message: "auth_failed".to_string(),
+                message: "auth_failed".to_owned(),
             },
         },
         None => SubsystemStatus::Error {
-            message: "auth_failed".to_string(),
+            message: "auth_failed".to_owned(),
         },
     }
 }
@@ -684,7 +684,7 @@ mod tests {
                 mcp: BTreeMap::from([(
                     "example".to_string(),
                     McpHealthResult {
-                        transport: "http_streamable".to_string(),
+                        transport: "http_streamable".to_owned(),
                         status: SubsystemStatus::Ok,
                         latency_ms: Some(12),
                     },
@@ -692,7 +692,7 @@ mod tests {
                 vector_stores: BTreeMap::from([(
                     "docs".to_string(),
                     VectorStoreHealthResult {
-                        store_type: "qdrant".to_string(),
+                        store_type: "qdrant".to_owned(),
                         status: SubsystemStatus::Ok,
                         latency_ms: Some(8),
                     },
@@ -712,7 +712,7 @@ mod tests {
                     model: "gpt-4o".to_string(),
                     agent: "assistant".to_string(),
                     status: SubsystemStatus::Error {
-                        message: "auth_failed".to_string(),
+                        message: "auth_failed".to_owned(),
                     },
                     latency_ms: Some(100),
                 }],
@@ -770,9 +770,9 @@ mod tests {
         result.checks.mcp.insert(
             "broken".to_string(),
             McpHealthResult {
-                transport: "http_streamable".to_string(),
+                transport: "http_streamable".to_owned(),
                 status: SubsystemStatus::Error {
-                    message: "connection_refused".to_string(),
+                    message: "connection_refused".to_owned(),
                 },
                 latency_ms: Some(50),
             },

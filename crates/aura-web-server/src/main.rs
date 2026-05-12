@@ -105,6 +105,16 @@ struct Args {
     health_check_timeout_secs: u64,
 }
 
+impl Args {
+    fn health_check_cache_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.health_check_cache_ttl_secs)
+    }
+
+    fn health_check_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.health_check_timeout_secs)
+    }
+}
+
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
 /// Exempts /health and /metrics so Kubernetes probes and Prometheus scrapers
 /// continue working during graceful shutdown.
@@ -194,7 +204,8 @@ async fn run() -> std::io::Result<()> {
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
     // Health check configuration
-    if args.health_check_timeout_secs >= 10 {
+    let health_check_timeout = args.health_check_timeout();
+    if health_check_timeout >= std::time::Duration::from_secs(10) {
         tracing::warn!(
             timeout_secs = args.health_check_timeout_secs,
             "Health check timeout is >= 10s, which may exceed K8s probe timeoutSeconds. \
@@ -204,8 +215,8 @@ async fn run() -> std::io::Result<()> {
 
     let health_service = Arc::new(health::HealthCheckService::new(
         configs_arc.clone(),
-        std::time::Duration::from_secs(args.health_check_cache_ttl_secs),
-        std::time::Duration::from_secs(args.health_check_timeout_secs),
+        args.health_check_cache_ttl(),
+        health_check_timeout,
     ));
 
     // Create app state

@@ -7,6 +7,17 @@ use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
+/// Track unique tool names globally to enforce cardinality cap.
+/// If the lock is poisoned (a thread panicked while holding it), we log a warning,
+/// recover the inner data via `into_inner()`, and clear the poison. The HashSet's
+/// internal state remains consistent after a panic (guaranteed by std), and our
+/// operations are single-step inserts with no multi-step invariants to violate.
+static KNOWN_TOOLS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const MAX_UNIQUE_TOOL_LABELS: usize = 100;
+const MAX_TOOL_NAME_LEN: usize = 64;
 
 /// Initialize the Prometheus metrics registry. Returns `None` if disabled via env var.
 pub fn init() -> Option<PrometheusHandle> {
@@ -69,18 +80,20 @@ pub fn record_tokens(token_type: &str, provider: &str, agent: &str, count: u64) 
     }
 }
 
-/// Track unique tool names globally to enforce cardinality cap.
-static KNOWN_TOOLS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
-const MAX_UNIQUE_TOOL_LABELS: usize = 100;
-const MAX_TOOL_NAME_LEN: usize = 64;
-
 /// Record MCP tool call duration with cardinality guards on the tool label.
-pub fn record_tool_duration(server: &str, tool: &str, status: &str, duration_secs: f64) {
-    let tool_label = if tool.len() > MAX_TOOL_NAME_LEN {
+pub fn record_tool_duration(server: &str, tool: &str, status: &str, duration: Duration) {
+    let tool_label = if tool.chars().count() > MAX_TOOL_NAME_LEN {
         "_other"
     } else {
-        let mut known = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut known = match KNOWN_TOOLS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("KNOWN_TOOLS lock was poisoned, recovering");
+                let guard = poisoned.into_inner();
+                KNOWN_TOOLS.clear_poison();
+                guard
+            }
+        };
         if known.contains(tool) || known.len() < MAX_UNIQUE_TOOL_LABELS {
             known.insert(tool.to_string());
             tool
@@ -95,7 +108,7 @@ pub fn record_tool_duration(server: &str, tool: &str, status: &str, duration_sec
         "tool" => tool_label.to_string(),
         "status" => status.to_string(),
     )
-    .record(duration_secs);
+    .record(duration.as_secs_f64());
 }
 
 /// Record an error by taxonomy category label.
@@ -139,7 +152,7 @@ pub fn record_health_check(result: &crate::health::HealthCheckResult) {
         let ok = matches!(mcp.status, crate::health::SubsystemStatus::Ok);
         gauge!("aura_health_subsystem_status",
             "subsystem" => "mcp",
-            "name" => name.clone(),
+            "name" => name.to_owned(),
         )
         .set(if ok { 1.0 } else { 0.0 });
     }
@@ -148,7 +161,7 @@ pub fn record_health_check(result: &crate::health::HealthCheckResult) {
         let ok = matches!(vs.status, crate::health::SubsystemStatus::Ok);
         gauge!("aura_health_subsystem_status",
             "subsystem" => "vector_store",
-            "name" => name.clone(),
+            "name" => name.to_owned(),
         )
         .set(if ok { 1.0 } else { 0.0 });
     }
@@ -179,18 +192,18 @@ mod tests {
 
     #[test]
     fn test_tool_label_cardinality_cap() {
-        let mut known = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut known = KNOWN_TOOLS.lock().unwrap();
         known.clear();
         drop(known);
 
         // Insert exactly MAX_UNIQUE_TOOL_LABELS unique names
         for i in 0..MAX_UNIQUE_TOOL_LABELS {
             let name = format!("tool_{i}");
-            let mut set = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut set = KNOWN_TOOLS.lock().unwrap();
             set.insert(name);
         }
 
-        let set = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        let set = KNOWN_TOOLS.lock().unwrap();
         assert_eq!(set.len(), MAX_UNIQUE_TOOL_LABELS);
         assert!(set.contains("tool_0"));
         assert!(set.contains("tool_99"));
@@ -199,10 +212,10 @@ mod tests {
 
         // Very long tool names get capped regardless of count
         let long_name = "a".repeat(MAX_TOOL_NAME_LEN + 1);
-        assert!(long_name.len() > MAX_TOOL_NAME_LEN);
+        assert!(long_name.chars().count() > MAX_TOOL_NAME_LEN);
 
         // Clean up for other tests
-        let mut known = KNOWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut known = KNOWN_TOOLS.lock().unwrap();
         known.clear();
     }
 }

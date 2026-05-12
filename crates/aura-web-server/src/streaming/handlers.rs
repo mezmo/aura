@@ -767,17 +767,18 @@ fn handle_tool_result(
     state.needs_separator = true;
 
     // Calculate tool duration (always, for metrics even when custom events are off)
-    let duration_ms = state
+    let tool_duration = state
         .tool_start_times
         .remove(&tool_result.id)
-        .map(|start| start.elapsed().as_millis() as u64)
-        .unwrap_or(0);
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
+    let duration_ms = tool_duration.as_millis() as u64;
 
     let tool_name_for_metrics = state
         .tool_call_map
         .get(&tool_result.id)
-        .map(|(name, _)| name.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map(|(name, _)| &**name)
+        .unwrap_or("unknown");
 
     // Parse result text once (used for both metrics and custom events)
     let result_text = serde_json::from_str::<String>(&tool_result.result)
@@ -790,9 +791,9 @@ fn handle_tool_result(
     // Record tool duration metric (always, regardless of custom events)
     crate::metrics::record_tool_duration(
         "default",
-        &tool_name_for_metrics,
+        tool_name_for_metrics,
         if is_tool_error { "error" } else { "ok" },
-        duration_ms as f64 / 1000.0,
+        tool_duration,
     );
 
     // Record tool-level error in error counter
@@ -802,7 +803,7 @@ fn handle_tool_result(
 
     // Emit aura.tool_complete custom event (if enabled)
     if config.emit_custom_events {
-        let tool_name = tool_name_for_metrics.clone();
+        let tool_name = tool_name_for_metrics.to_owned();
 
         tracing::debug!(
             "Tool '{}' result_text (first 200 chars): {}",
