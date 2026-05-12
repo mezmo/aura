@@ -1,3 +1,147 @@
+## Changelog
+
+## [1.19.7](https://github.com/mezmo/aura/compare/v1.19.6...v1.19.7) (2026-05-11)
+
+
+### Chores
+
+* **build**: simplify multistage docker setup [d099a49](https://github.com/mezmo/aura/commit/d099a492f722086e4b751b3dfd23e1f6d457a436) - Mike Shearer
+
+### Service
+
+* **setup**: add rich commitlint reporting [10c4cd4](https://github.com/mezmo/aura/commit/10c4cd443f053dbfc019c55919836815c42b3530) - Mike Shearer* **setup**: add strcutured test and coverage reporting [cb233a5](https://github.com/mezmo/aura/commit/cb233a55e259fe0758914cde12ca36cc228f0830) - Mike Shearer* **setup**: docker based test setup via nextest [83a4a7e](https://github.com/mezmo/aura/commit/83a4a7e0d2a3d51eaf9da0c575da8afa90c24e6b) - Mike Shearer [LOG-1791](https://mezmo.atlassian.net/browse/LOG-1791)* **setup**: remove old development directory [db4b760](https://github.com/mezmo/aura/commit/db4b7602bf95ab92fac28e6110d6f76bf0797f9e) - Mike Shearer* **setup**: remove test-ci scripts and reference [2e45520](https://github.com/mezmo/aura/commit/2e455209134c8869486f49031ee0eb96c800cbb9) - Mike Shearer
+
+### Style
+
+* apply cargo fmt [db33c3a](https://github.com/mezmo/aura/commit/db33c3ab0adc33c8bb4e8938101b1618788f7f80) - Mike Shearer
+
+## [1.19.6](https://github.com/mezmo/aura/compare/v1.19.5...v1.19.6) (2026-05-09)
+
+
+### Chores
+
+* **cla**: Allow Promptess to pass CLA [3a8e790](https://github.com/mezmo/aura/commit/3a8e79006426bb3438e2d825c76c0f83165506f0) - Gregory Janco [LOG-23837](https://mezmo.atlassian.net/browse/LOG-23837)
+
+## [1.19.5](https://github.com/mezmo/aura/compare/v1.19.4...v1.19.5) (2026-05-08)
+
+
+### Chores
+
+* **cla**: Allow promptless PRs [a956848](https://github.com/mezmo/aura/commit/a9568488d7a4d03e1affb5ecd8c74469ab69ac02) - Gregory Janco [LOG-23837](https://mezmo.atlassian.net/browse/LOG-23837)
+
+## [1.19.4](https://github.com/mezmo/aura/compare/v1.19.3...v1.19.4) (2026-05-08)
+
+
+### Chores
+
+* Rename Aura to AURA [f381444](https://github.com/mezmo/aura/commit/f38144487429cbc955013a4f637d7e4f8e333766) - Gregory Janco [LOG-23836](https://mezmo.atlassian.net/browse/LOG-23836)
+
+## [1.19.3](https://github.com/mezmo/aura/compare/v1.19.2...v1.19.3) (2026-05-06)
+
+
+### Bug Fixes
+
+* **internal**: remove stale k8s artifacts [89aac80](https://github.com/mezmo/aura/commit/89aac80865fcec48d6fd906add905a131d8e80d1) - Phil Ciampini
+
+### Documentation
+
+* reframe readme intro as sre agentic harness [e6eb139](https://github.com/mezmo/aura/commit/e6eb13971d1e5aa6607949c752ff8919e448f436) - Andre Elizondo [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
+## [1.19.2](https://github.com/mezmo/aura/compare/v1.19.1...v1.19.2) (2026-05-01)
+
+
+### Chores
+
+* **setup**: rework ci and release setup [a5b7a0d](https://github.com/mezmo/aura/commit/a5b7a0d449481f21184274cb7a469f7bc8dd084e) - Eric Satterwhite [LOG-23601](https://mezmo.atlassian.net/browse/LOG-23601)* **setup**: update commitlint setup [41cab5f](https://github.com/mezmo/aura/commit/41cab5f790ddd08ce65762eba99b2fe92ef5acdc) - Eric Satterwhite [LOG-23601](https://mezmo.atlassian.net/browse/LOG-23601)
+
+### Style
+
+* **lint**: fix deployment yaml to pass lint [4180b87](https://github.com/mezmo/aura/commit/4180b8794798f3c15df39a13e31a314fabed06e6) - Eric Satterwhite [LOG-23601](https://mezmo.atlassian.net/browse/LOG-23601)
+
+## [1.19.1](https://github.com/mezmo/aura/compare/v1.19.0...v1.19.1) (2026-04-23)
+
+
+### Chores
+
+* **deps**: bump rig-core to d7e9d92 [8fc66e7](https://github.com/mezmo/aura/commit/8fc66e7f1e5de9954e2ee839b3a6849de679f38e) - Mike Shearer [LOG-23732](https://logdna.atlassian.net/browse/LOG-23732)
+
+# [1.19.0](https://github.com/mezmo/aura/compare/v1.18.1...v1.19.0) (2026-04-22)
+
+
+### Bug Fixes
+
+* rewrite metrics_analyst preamble to stop loop [224f79f](https://github.com/mezmo/aura/commit/224f79fba8193522c379d0de35f1ee1be68b256f) - Andre Elizondo [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Features
+
+* add Kubernetes SRE orchestration quickstart [ee0f746](https://github.com/mezmo/aura/commit/ee0f74698aeb32911ef0ca46120cf9d313acc833) - Andre Elizondo [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+## [1.18.1](https://github.com/mezmo/aura/compare/v1.18.0...v1.18.1) (2026-04-21)
+
+
+### Documentation
+
+* add commit and contribution rules to claude.md [94e52ad](https://github.com/mezmo/aura/commit/94e52adbf2099ce6033e67e3a4288cc8defd3378) - Andre Elizondo [LOG-000000](https://logdna.atlassian.net/browse/LOG-000000)
+
+# [1.18.0](https://github.com/mezmo/aura/compare/v1.17.3...v1.18.0) (2026-04-20)
+
+
+### Bug Fixes
+
+* **bedrock**: collapse redundant default_ndims branches [01835b3](https://github.com/mezmo/aura/commit/01835b3896477221de204683045a1140a6f52ace) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Code Refactoring
+
+* **config**: replace VectorStoreConfig flat struct with tagged enum [6ff3894](https://github.com/mezmo/aura/commit/6ff3894c3316a96786a4ca86b084681ac27218f6) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Documentation
+
+* document Bedrock embedding and Knowledge Base support [22ad872](https://github.com/mezmo/aura/commit/22ad872947944cbebeb95b700d5b2fcfc7112528) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+
+### Features
+
+* add Bedrock embeddings and Knowledge Base support [9ddcb0c](https://github.com/mezmo/aura/commit/9ddcb0c4e5840ebf12ac416fb30966e4373a30f4) - Mike Shearer [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+* **bedrock**: native embedding path bypassing rig-bedrock [bf3bfcc](https://github.com/mezmo/aura/commit/bf3bfcc2259a25861e6e28c7cdeec05cc1ede8df) - Mike Shearer [LOG-23628](https://logdna.atlassian.net/browse/LOG-23628)
+
+## [1.17.3](https://github.com/mezmo/aura/compare/v1.17.2...v1.17.3) (2026-04-07)
+
+
+### Chores
+
+* **build**: Create custom check [3540da3](https://github.com/mezmo/aura/commit/3540da329e770588eb921bbebedd971812bafeb9) - Gregory Janco [LOG-23558](https://logdna.atlassian.net/browse/LOG-23558)
+
+## [1.17.2](https://github.com/mezmo/aura/compare/v1.17.1...v1.17.2) (2026-04-06)
+
+
+### Chores
+
+* **errors**: add hint to agent name collision [8baac1c](https://github.com/mezmo/aura/commit/8baac1c54779b3abcfcd63c0ea366ca5921fcaca) - Justin Gross [LOG-23571](https://logdna.atlassian.net/browse/LOG-23571)
+
+## [1.17.1](https://github.com/mezmo/aura/compare/v1.17.0...v1.17.1) (2026-04-03)
+
+
+### Continuous Integration
+
+* **deploy**: add multi-config directory support [751129f](https://github.com/mezmo/aura/commit/751129fec9d622b6563374305ceb298c9fc27d47) - Tony Rogers [LOG-23574](https://logdna.atlassian.net/browse/LOG-23574)
+
+# [1.17.0](https://github.com/mezmo/aura/compare/v1.16.4...v1.17.0) (2026-04-03)
+
+
+### Features
+
+* **examples**: add orchestration mode quickstart with math MCP [6ec5f21](https://github.com/mezmo/aura/commit/6ec5f2164e347dc9caef4352702a31ba4d721642) - Gregory Janco [LOG-00000](https://logdna.atlassian.net/browse/LOG-00000)
+
+## [1.16.4](https://github.com/mezmo/aura/compare/v1.16.3...v1.16.4) (2026-04-03)
+
+
+### Bug Fixes
+
+* **build**: change dry run parameters [f9a5b4d](https://github.com/mezmo/aura/commit/f9a5b4d0752c4f7fbf840dec549e0246479e24f8) - Gregory Janco [LOG-23558](https://logdna.atlassian.net/browse/LOG-23558)
+
 ## [1.16.3](https://github.com/mezmo/aura/compare/v1.16.2...v1.16.3) (2026-03-27)
 
 
@@ -103,7 +247,7 @@
 
 ### Documentation
 
-* add quickstart with Docker Compose (Aura + LibreChat + Phoenix) [8081471](https://github.com/mezmo/aura/commit/80814713cc8277b43c11785e40d660002d2024b6) - Gregory Janco [LOG-22815](https://logdna.atlassian.net/browse/LOG-22815)
+* add quickstart with Docker Compose (AURA + LibreChat + Phoenix) [8081471](https://github.com/mezmo/aura/commit/80814713cc8277b43c11785e40d660002d2024b6) - Gregory Janco [LOG-22815](https://logdna.atlassian.net/browse/LOG-22815)
 
 ## [1.14.6](https://github.com/mezmo/aura/compare/v1.14.5...v1.14.6) (2026-03-04)
 
@@ -329,7 +473,7 @@
 
 ### Chores
 
-* add Helm chart for Aura deployment [b81db21](https://github.com/answerbook/aura/commit/b81db213d2ed996cc011d9f51b37d18d554c2de0) - Mike Shearer [LOG-23231](https://logdna.atlassian.net/browse/LOG-23231)
+* add Helm chart for AURA deployment [b81db21](https://github.com/answerbook/aura/commit/b81db213d2ed996cc011d9f51b37d18d554c2de0) - Mike Shearer [LOG-23231](https://logdna.atlassian.net/browse/LOG-23231)
 
 ## [1.11.1](https://github.com/answerbook/aura/compare/v1.11.0...v1.11.1) (2026-02-11)
 

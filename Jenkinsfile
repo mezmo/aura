@@ -2,9 +2,10 @@ library 'magic-butler-catalogue'
 def PROJECT_NAME = 'aura'
 def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
-def TRIGGER_PATTERN = '.*@logdnabot.*'
+def TRIGGER_PATTERN = '.*@triggerbuild.*'
 def DOCKER_REPO = "docker.io/mezmo"
 def BUILD_SLUG = slugify(env.BUILD_TAG)
+
 pipeline {
   agent {
     node {
@@ -12,35 +13,38 @@ pipeline {
       customWorkspace("/tmp/workspace/${BUILD_SLUG}")
     }
   }
+
   parameters {
     string(name: 'SANITY_BUILD', defaultValue: '', description: 'This a scheduled sanity build that skips releasing.')
   }
+
+  tools {
+    nodejs 'NodeJS 24'
+  }
+
   triggers {
     issueCommentTrigger(TRIGGER_PATTERN)
   }
+
   options {
     timeout time: 1, unit: 'HOURS'
     timestamps()
     ansiColor 'xterm'
   }
+
   environment {
-    GITHUB_TOKEN = credentials('github-api-token')
-    NPM_CONFIG_CACHE = '.npm'
-    NPM_CONFIG_USERCONFIG = '.npm/rc'
-    SPAWN_WRAP_SHIM_ROOT = '.npm'
     RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
     CARGO_HOME = "${env.WORKSPACE}/.cargo"
-    PATH = """${sh(
-       returnStdout: true,
-       script: 'echo /opt/rust/cargo/bin:\$PATH'
-    )}
-    """
     FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
   }
+
   post {
     always {
       script {
         jiraSendBuildInfo site: 'logdna.atlassian.net'
+        sh 'ls -alh -R report'
+        archiveArtifacts allowEmptyArchive: true, artifacts: 'report/ci/**', caseSensitive: false, followSymlinks: false
+        sh: 'make clean'
         if (env.SANITY_BUILD == 'true') {
           notifySlack(
             currentBuild.currentResult,
@@ -54,6 +58,7 @@ pipeline {
       }
     }
   }
+
   stages {
     stage('Validate PR Source') {
       when {
@@ -66,95 +71,178 @@ pipeline {
         error("A maintainer needs to approve this PR for CI by commenting")
       }
     }
-    stage('Validate') {
-      tools {
-        nodejs 'NodeJS 20'
+
+    stage('Setup') {
+      steps{
+        sh 'make setup'
+        sh "echo ${BUILD_TAG}"
       }
-      steps {
-        script {
-          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-          npm.auth token: GITHUB_TOKEN
-          sh "npx @answerbook/commitlint-config-logdna"
-        }
-      }
-    }
-    stage('Test') {
+    } // end setup
+
+    stage('ChangeSet Validation') {
+      parallel {
+        stage("Convention Commit Check") {
+          steps {
+            script {
+              // There isn't an actual file in the repo for github to associate errors / annotations with
+              // so we have to report a little more manually for commitlint
+              withReport('Commitlint', 'make lint-commits', {
+                if (fileExists('report/ci/checkstyle.json')) {
+                  def report = readJSON file: 'report/ci/checkstyle.json'
+                  publishChecks(
+                    name: report.name,
+                    title: report.title,
+                    summary: report.summary,
+                    text: report.text,
+                    conclusion: report.conclusion,
+                    status: 'COMPLETED',
+                  )
+
+                  // Fail the Jenkins step if there are any ERROR severity issues
+                  def errorCount = report.issues?.count { it.severity == 'ERROR' } ?: 0
+                  if (errorCount > 0) {
+                    throw new ManualCheckException("Commitlint check failed with ${errorCount} error(s)")
+                  }
+                }
+              })
+            }
+          }
+        } // End Commitlint
+
+        stage("Style Check") {
+          steps {
+            withChecks('rustfmt') {
+              sh "make fmt-rust"
+              recordIssues( // needs to be in the same block as withChecks
+                tool: checkStyle(pattern: 'report/ci/rustfmt.xml'),
+                id: 'rustfmt',
+                name: 'rustfmt',
+                enabledForFailure: true,
+                sourceDirectories: [[path: '.']],
+                checksAnnotationScope: 'ALL',
+                qualityGates: [[threshold: 1, type: 'TOTAL', criticality: 'FAILURE']]
+              )
+            }
+          }
+        } // end rustfmt
+
+        stage("Rust Lint") {
+          steps {
+            withChecks('clippy') {
+              sh script: "make lint-rust", returnStatus: true
+              recordIssues( // needs to be in same block as withChecks
+                tool: cargo(pattern: 'report/ci/clippy.json'),
+                id: 'clippy',
+                name: 'clippy lint',
+                enabledForFailure: true,
+                sourceDirectories: [[path: '.']],
+                checksAnnotationScope: 'ALL',
+                qualityGates: [[
+                  threshold: 1,
+                  type: 'TOTAL',
+                  criticality: 'FAILURE'
+                ]]
+              )
+            }
+          }
+        } // End Clippy
+      } // End Parallel
+    } // End Validate
+
+    stage('Test Suite') {
       when {
         beforeAgent true
         not {
           changelog '\\[skip ci\\]'
         }
       }
-      parallel {
-        stage('Unit Tests') {
-          steps {
-            script {
-              sh(script: 'docker build --target release-build .')
+
+      stages {
+        stage('Test Suite: Parallel') {
+          parallel {
+            stage('Integration Tests') {
+              environment {
+                MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
+              }
+              steps {
+                sh 'mkdir -p report'
+                withCredentials([
+                  string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
+                ]) {
+                  withReport('coverage', 'make test-integration') {
+                    junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
+                    sh 'make clean-profile'
+                    recordCoverage(
+                      tools: [[parser: 'COBERTURA', pattern: 'report/ci/cobertura.xml']],
+                      checksAnnotationScope: 'MODIFIED_LINES',
+                      sourceDirectories: [[path: '.']],
+                      enabledForFailure: true,
+                      ignoreParsingErrors: true,
+                      id: 'coverage',
+                      name: 'coverage'
+                      // qualityGates: [[threshold: 80.0, metric: 'LINE', baseline: 'PROJECT', unstable: false]]
+                    )
+                  }
+                }
+              }
+              post {
+                always {
+                  publishHTML target: [
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: false,
+                    keepAll: true,
+                    reportDir: 'report/ci/html',
+                    reportFiles: '*.html',
+                    reportName: "coverage-${BUILD_TAG}"
+                  ]
+                }
+              }
+            }
+
+            stage('Relese Test') {
+              when {
+                not {
+                  expression { CURRENT_BRANCH == DEFAULT_BRANCH }
+                }
+              }
+
+              environment {
+                 GIT_BRANCH = "${CURRENT_BRANCH}"
+                 BRANCH_NAME = "${CURRENT_BRANCH}"
+                 CHANGE_ID = ''
+              }
+
+              steps {
+                withCredentials([
+                   string(credentialsId: 'github-api-token', variable: 'GITHUB_TOKEN'),
+                ]) {
+                  buildx {
+                    withReport('Release Test', 'npm run release:dry')
+                  }
+                }
+              }
             }
           }
-        }
-        stage('Integration Tests') {
-          environment {
-            MOCK_MCP_IMAGE = 'us.gcr.io/logdna-k8s/aura-mock-mcp:1.0.0'
-          }
-          steps {
-            withCredentials([
-              string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
-            ]) {
-              sh 'make test-integration'
-            }
-          }
+
           post {
             always {
               sh 'make test-integration-down'
             }
           }
         }
-        stage('Release Tests') {
-          when {
-            beforeAgent true
-            not {
-              branch DEFAULT_BRANCH
-            }
-          }
-          environment {
-            GIT_BRANCH = "${CURRENT_BRANCH}"
-            BRANCH_NAME = "${CURRENT_BRANCH}"
-            CHANGE_ID = ""
-          }
-          tools {
-            nodejs 'NodeJS 20'
-          }
-          steps {
-            script {
-              sh "mkdir -p ${NPM_CONFIG_CACHE}"
-              npm.auth token: GITHUB_TOKEN
-              // Trigger rustup to read rust-toolchain.toml and auto-install the specified nightly
-              // Running any cargo command will cause rustup to install the toolchain if not present
-              sh 'echo "Cargo version:" && cargo --version'
-              sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-              sh 'npx semantic-release --dry-run --no-ci --branches=${BRANCH_NAME:-main}'
-            }
-          }
-        }
       }
     }
+
+    // FIXME: This needs to be removed with the removal of razee stuff
     stage('Feature Build') {
       when {
         expression {
-          CURRENT_BRANCH ==~ /feature\/((.*)|aura-next(-.*)?)/
+          CURRENT_BRANCH ==~ /feature\/(([A-Z]{2,5}-\d+.*)|aura-next(-.*)?)/
         }
       }
-      tools {
-        nodejs 'NodeJS 20'
-      }
+
       steps {
         script {
-          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-          npm.auth token: GITHUB_TOKEN
-          sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-          sh 'npx semantic-release'
-          def RELEASE_VERSION = FEATURE_TAG
           buildx.build(
             project: PROJECT_NAME
           , push: true
@@ -163,19 +251,10 @@ pipeline {
           , args: [RELEASE_VERSION: FEATURE_TAG]
           , docker_repo: DOCKER_REPO
           )
-          withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws',
-            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-          ]]) {
-            sh script: 'make clean'
-            sh script: "make render RELEASE_VERSION=${RELEASE_VERSION}", label: "Generate feature branch k8s Artifacts"
-            sh script: "make publish RELEASE_VERSION=${RELEASE_VERSION}", label: "Publish feature branch k8s Artifacts"
-          }
         }
       }
     }
+
     stage('Release') {
       when {
         beforeAgent true
@@ -187,34 +266,107 @@ pipeline {
           }
         }
       }
-      tools {
-        nodejs 'NodeJS 20'
-      }
+
       steps {
         script {
-          sh "mkdir -p ${NPM_CONFIG_CACHE}"
-          npm.auth token: GITHUB_TOKEN
-          sh 'npm install -G semantic-release@^19.0.0 @semantic-release/git@10.0.1 @semantic-release/changelog@6.0.3 @semantic-release/exec@6.0.3 @answerbook/release-config-logdna@2.0.0'
-          sh 'npx semantic-release'
-          def RELEASE_VERSION = sh(
+
+          // FIXME: We shouldn't need to do this
+          // once the release version has been updated running make clean render publish
+          // should resolve the right version. I think this can also go
+          // 1.2.3
+          def RELEASE_VERSION_PATCH = sh(
             returnStdout: true,
             script: 'cargo metadata -q --no-deps --format-version 1 | jq -r \'.packages[0].version\''
           ).trim()
-          def image = gcr.build(PROJECT_NAME)
-          image.push(RELEASE_VERSION)
-          gcr.clean(image.id)
-          withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws',
-            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-          ]]) {
-            sh script: 'make clean'
-            sh script: "make render RELEASE_VERSION=${RELEASE_VERSION}", label: "Generate k8s Artifacts"
-            sh script: "make publish RELEASE_VERSION=${RELEASE_VERSION}", label: "Publish k8s Artifacts"
+
+          withCredentials([
+             string(credentialsId: 'github-api-token', variable: 'GITHUB_TOKEN'),
+          ]) {
+            buildx {
+              withReport('Release', 'npm run release')
+            }
           }
         }
       }
     }
   }
 }
+
+// Custom exception to signal that a check has already been published manually
+// and withReport should not publish a console output check
+class ManualCheckException extends Exception {
+  ManualCheckException(String message) {
+    super(message)
+  }
+}
+
+/**
+ * Execute a command and publish GitHub check results based on the outcome.
+ *
+ * This function wraps command execution with automatic GitHub check publishing.
+ * It captures command output and publishes appropriate check results based on
+ * success or failure.
+ *
+ * @param checkName String - The name of the GitHub check to publish
+ * @param command String - The shell command to execute
+ * @param callback Closure (optional) - A callback to execute after the command succeeds.
+ *                 Used for custom check publishing when structured reports are available.
+ *
+ * Usage:
+ *
+ * 1. Simple usage (automatic check publishing):
+ *    withReport('My Check', 'make test')
+ *    // Publishes SUCCESS check if command succeeds, FAILURE with console output if it fails
+ *
+ * 2. Custom check publishing (with callback):
+ *    withReport('Lint Check', 'make lint', {
+ *      def report = readJSON file: 'report.json'
+ *      publishChecks(
+ *        name: report.name,
+ *        summary: report.summary,
+ *        conclusion: report.conclusion
+ *      )
+ *      // To fail the step after publishing a custom check, throw ManualCheckException
+ *      if (report.hasErrors) {
+ *        throw new ManualCheckException("Check failed with ${report.errorCount} errors")
+ *      }
+ *    })
+ *
+ * Error Handling:
+ * - If the command fails, publishes a FAILURE check with console output and re-throws
+ * - If the callback throws ManualCheckException, re-throws without publishing (check already published)
+ * - If the callback throws any other exception, publishes FAILURE check with console output
+ *
+ * @throws ManualCheckException when callback signals check was already published
+ * @throws Exception when command or callback fails
+ */
+def withReport(checkName, command, callback = null) {
+  def logFile = "output-${checkName.replaceAll(/[^a-zA-Z0-9]/, "_")}.log"
+  publishChecks(name: checkName, status: 'IN_PROGRESS', title: 'Running...')
+
+  try {
+    sh script: "${command} 2>&1 | tee ${logFile}"
+    if(callback) {
+      callback()
+    } else {
+      publishChecks(name: checkName, conclusion: 'SUCCESS', summary: 'Check passed!')
+    }
+  } catch (ManualCheckException e) {
+    // Check was already published by callback, just re-throw to fail the step
+    throw e
+  } catch (Exception e) {
+    def consoleOutput = readFile(logFile).trim()
+    publishChecks(
+      name: checkName,
+      conclusion: 'FAILURE',
+      summary: "Command failed: ${e.message}",
+      text: "### Console Output\n```\n${consoleOutput}\n```"
+    )
+
+    // throwing will trigger the FAILURE check state
+    throw e
+  } finally {
+    sh "rm -f ${logFile}"
+  }
+}
+

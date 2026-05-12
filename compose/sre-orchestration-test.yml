@@ -47,5 +47,3 @@ services:
       --features integration-orchestration-sre
       --no-fail-fast
       -- --test-threads=1
-    networks:
-      - aura-test

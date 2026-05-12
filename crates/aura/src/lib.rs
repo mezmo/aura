@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
 pub mod env_flags;
@@ -45,7 +46,7 @@ pub mod vector_store;
 pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
 pub use config::{
     AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig,
+    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{

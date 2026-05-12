@@ -1,6 +1,6 @@
 # Examples
 
-Example TOML configurations for Aura agents. Each file is a standalone config — pick one and go.
+Example TOML configurations for AURA agents. Each file is a standalone config — pick one and go.
 
 ## Quick Start
 

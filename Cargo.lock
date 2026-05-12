@@ -159,13 +159,14 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "1.16.3"
+version = "1.19.7"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
  "aura-events",
  "aws-config",
+ "aws-sdk-bedrockagentruntime",
  "aws-sdk-bedrockruntime",
  "base64 0.22.1",
  "chrono",
@@ -197,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "aura-cli"
-version = "1.16.3"
+version = "1.19.7"
 dependencies = [
  "anyhow",
  "aura",
@@ -229,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "1.16.3"
+version = "1.19.7"
 dependencies = [
  "anyhow",
  "aura",
@@ -254,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "aura-events"
-version = "1.16.3"
+version = "1.19.7"
 dependencies = [
  "rmcp",
  "serde",
@@ -263,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "1.16.3"
+version = "1.19.7"
 dependencies = [
  "reqwest",
  "serde",
@@ -273,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "1.16.3"
+version = "1.19.7"
 dependencies = [
  "async-stream",
  "aura",
@@ -396,6 +397,31 @@ dependencies = [
  "pin-project-lite",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aws-sdk-bedrockagentruntime"
+version = "1.126.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f20f8d4690582476a0a294e7fda165512fe917cbe1e2a67642329574a0ae9c5c"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]

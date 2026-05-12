@@ -1,12 +1,12 @@
-# Contributing to Aura
+# Contributing to AURA
 
-Thank you for your interest in contributing to Aura! This guide will help you get started, whether you're fixing a bug, adding a feature, improving documentation, or proposing an idea.
+Thank you for your interest in contributing to AURA! This guide will help you get started, whether you're fixing a bug, adding a feature, improving documentation, or proposing an idea.
 
-Aura is in **Open Alpha** — contributions of all kinds are welcome and appreciated.
+Contributions of all kinds are welcome and appreciated.
 
 ## Table of Contents
 
-- [Contributing to Aura](#contributing-to-aura)
+- [Contributing to AURA](#contributing-to-aura)
   - [Table of Contents](#table-of-contents)
   - [Code of Conduct](#code-of-conduct)
   - [Contributor License Agreement](#contributor-license-agreement)
@@ -79,9 +79,10 @@ There are many ways to contribute beyond writing code:
 
 ### Prerequisites
 
-- **Rust (nightly)** — Aura requires the nightly toolchain. The repo includes a `rust-toolchain.toml` that handles this automatically.
+- **Rust (nightly)** — AURA requires the nightly toolchain. The repo includes a `rust-toolchain.toml` that handles this automatically.
 - **Docker and Docker Compose** — Required for integration tests and containerized builds.
 - **Git** — For version control and contributing via pull requests.
+- **Node.js (22+)** -- *Optional* Used in various CI processes (commit linting, release generation, etc)
 
 ### Getting Started
 
@@ -196,10 +197,7 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 | `make ci`            | Run all checks: fmt-check, test, lint |
 | `make clean`         | Clean build artifacts                 |
 
-You can also simulate the full CI pipeline locally:
 
-```bash
-./scripts/test-ci.sh
 ```
 
 ## Code Quality Standards
@@ -250,7 +248,7 @@ Integration tests verify end-to-end behavior through the web server, including L
 If you have an API key and want to run integration tests locally:
 
 ```bash
-# Start local test infrastructure (mock MCP servers + Aura)
+# Start local test infrastructure (mock MCP servers + AURA)
 make test-integration-local-up
 
 # Run the integration test suite
@@ -293,8 +291,7 @@ cargo test --package aura-web-server --features integration-streaming --no-fail-
 
 ## Commit Message Convention
 
-This project uses [Conventional Commits](https://www.conventionalcommits.org/) and enforces them via CI. **Every commit** on `main` must follow this format because we use rebase merging to maintain a linear history.
-
+This project uses [Conventional Commits](https://www.conventionalcommits.org/) and enforces them via CI. **Every commit** on `main` must follow this format because we use rebase merging to maintain a linear history. 
 ### Format
 
 The first line, which includes the type and description, must be entirely lowercase. The body
@@ -314,7 +311,7 @@ and optional footer can use lower and upper casing.
 | ---------- | ------------------------------------------------------- |
 | `feat`     | A new feature                                           |
 | `fix`      | A bug fix                                               |
-| `docs`     | Documentation only changes                              |
+| `doc`      | Documentation only changes                              |
 | `style`    | Formatting, missing semicolons, etc. (no code change)   |
 | `refactor` | Code change that neither fixes a bug nor adds a feature |
 | `perf`     | Performance improvement                                 |
@@ -329,7 +326,7 @@ feat(config): add support for gemini provider
 
 fix(streaming): correct sse event ordering on disconnect
 
-docs: add ollama troubleshooting guide
+doc: add ollama troubleshooting guide
 
 test(mcp): add header forwarding integration tests
 
@@ -372,6 +369,10 @@ Update your config.toml files accordingly.
    ```
 
 3. **Ensure all commits follow** the [Conventional Commits](#commit-message-convention) format.
+
+```bash
+> make lint-commits
+```
 
 4. **Update documentation** if your change affects user-facing behavior, configuration, or APIs.
 
@@ -444,7 +445,7 @@ Good documentation is as valuable as good code. If your change affects any of th
 
 When reporting a bug, please include:
 
-- **Aura version** (`cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="aura") | .version'` or check `Cargo.toml`)
+- **AURA version** (`cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="aura") | .version'` or check `Cargo.toml`)
 - **Rust toolchain version** (`rustc --version`)
 - **Operating system and version**
 - **Steps to reproduce** the issue
@@ -456,4 +457,4 @@ For feature requests, describe the use case and the problem you're trying to sol
 
 ## License
 
-By contributing to Aura, you agree that your contributions will be licensed under the [Apache License, Version 2.0](LICENSE), the same license that covers the project. All contributions are also subject to the [Contributor License Agreement](CLA.md).
+By contributing to AURA, you agree that your contributions will be licensed under the [Apache License, Version 2.0](LICENSE), the same license that covers the project. All contributions are also subject to the [Contributor License Agreement](CLA.md).

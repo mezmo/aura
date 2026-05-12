@@ -7,10 +7,16 @@ metadata:
   labels:
     {{- include "aura.labels" . | nindent 4 }}
 data:
+  {{- if eq (kindOf .Values.config.content) "map" }}
+  {{- range $name, $toml := .Values.config.content }}
+  {{ $name }}: |
+    {{- $toml | nindent 4 }}
+  {{- end }}
+  {{- else if .Values.config.content }}
   config.toml: |
-    {{- if .Values.config.content }}
     {{- .Values.config.content | nindent 4 }}
-    {{- else }}
+  {{- else }}
+  config.toml: |
     {{- include "aura.toml.renderConfig" . | nindent 4 }}
-    {{- end }}
+  {{- end }}
 {{- end }}

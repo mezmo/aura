@@ -64,7 +64,11 @@ spec:
             - name: PORT
               value: {{ .Values.server.httpPort | quote }}
             - name: CONFIG_PATH
-              value: "/etc/aura/config.toml"
+              value: "/etc/aura/"
+            {{- if .Values.server.defaultAgent }}
+            - name: DEFAULT_AGENT
+              value: {{ .Values.server.defaultAgent | quote }}
+            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.server.loglevel | quote }}
             # Streaming configuration
