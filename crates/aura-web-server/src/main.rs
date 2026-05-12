@@ -95,24 +95,21 @@ struct Args {
     /// Health check cache TTL in seconds. Readiness probe results are cached for
     /// this duration to avoid flooding subsystems with probes on every K8s check.
     /// Recommend setting slightly less than K8s periodSeconds.
-    #[arg(long, env = "HEALTH_CHECK_CACHE_TTL_SECS", default_value = "10")]
-    health_check_cache_ttl_secs: u64,
+    #[arg(long, env = "HEALTH_CHECK_CACHE_TTL_SECS", default_value = "10", value_parser = parse_duration_from_secs)]
+    health_check_cache_ttl: std::time::Duration,
 
     /// Health check probe timeout in seconds. Individual subsystem probes that
     /// exceed this timeout are marked as unhealthy. Must be shorter than K8s
     /// probe timeoutSeconds (recommend K8s timeout >= probe timeout + 5s).
-    #[arg(long, env = "HEALTH_CHECK_TIMEOUT_SECS", default_value = "5")]
-    health_check_timeout_secs: u64,
+    #[arg(long, env = "HEALTH_CHECK_TIMEOUT_SECS", default_value = "5", value_parser = parse_duration_from_secs)]
+    health_check_timeout: std::time::Duration,
 }
 
-impl Args {
-    fn health_check_cache_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.health_check_cache_ttl_secs)
-    }
-
-    fn health_check_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.health_check_timeout_secs)
-    }
+fn parse_duration_from_secs(value: &str) -> Result<std::time::Duration, String> {
+    let seconds: u64 = value
+        .parse()
+        .map_err(|error| format!("Could not parse `{value}`: {error}"))?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
@@ -204,10 +201,9 @@ async fn run() -> std::io::Result<()> {
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
     // Health check configuration
-    let health_check_timeout = args.health_check_timeout();
-    if health_check_timeout >= std::time::Duration::from_secs(10) {
+    if args.health_check_timeout >= std::time::Duration::from_secs(10) {
         tracing::warn!(
-            timeout_secs = args.health_check_timeout_secs,
+            timeout_secs = args.health_check_timeout.as_secs(),
             "Health check timeout is >= 10s, which may exceed K8s probe timeoutSeconds. \
              Recommend setting HEALTH_CHECK_TIMEOUT_SECS < K8s timeoutSeconds - 5s."
         );
@@ -215,8 +211,8 @@ async fn run() -> std::io::Result<()> {
 
     let health_service = Arc::new(health::HealthCheckService::new(
         configs_arc.clone(),
-        args.health_check_cache_ttl(),
-        health_check_timeout,
+        args.health_check_cache_ttl,
+        args.health_check_timeout,
     ));
 
     // Create app state
