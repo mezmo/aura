@@ -24,9 +24,48 @@ use crate::logging::{
     ATTR_LLM_TOKEN_PROMPT, ATTR_OUTPUT_VALUE, ATTR_TOOL_NAME, ATTR_TOOL_PARAMETERS,
 };
 use futures::future::BoxFuture;
-use opentelemetry::KeyValue;
+use opentelemetry::{KeyValue, StringValue, Value};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// ---------------------------------------------------------------------------
+// Attribute value length limit
+// ---------------------------------------------------------------------------
+
+/// Default max bytes for any single string attribute value (64 KB).
+/// Keeps individual spans well under the gRPC 4 MB message limit.
+const DEFAULT_ATTRIBUTE_VALUE_LENGTH_LIMIT: usize = 65_536;
+
+static ATTRIBUTE_VALUE_LENGTH_LIMIT: AtomicUsize =
+    AtomicUsize::new(DEFAULT_ATTRIBUTE_VALUE_LENGTH_LIMIT);
+
+fn attribute_value_length_limit() -> usize {
+    ATTRIBUTE_VALUE_LENGTH_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Read `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT` from the environment and cache it.
+/// Called once from `logging::init_logging`.
+pub fn init_attribute_value_length_limit() {
+    if let Ok(val) = std::env::var("OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT")
+        && let Ok(n) = val.parse::<usize>()
+    {
+        ATTRIBUTE_VALUE_LENGTH_LIMIT.store(n, Ordering::Relaxed);
+    }
+}
+
+/// Truncate a string value to `limit` bytes on a UTF-8 char boundary.
+fn truncate_string(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
+        return s.to_string();
+    }
+    let boundary = s.floor_char_boundary(limit);
+    format!(
+        "{}... [truncated, original {} bytes]",
+        &s[..boundary],
+        s.len()
+    )
+}
 
 /// A span exporter that adds OpenInference semantic convention attributes
 /// to every span before delegating to an inner exporter.
@@ -214,7 +253,29 @@ fn transform_span(mut span: SpanData) -> SpanData {
     span.attributes
         .retain(|kv| !kv.key.as_str().starts_with("gen_ai."));
 
+    // Truncate oversized string values in attributes, events, and event names
+    let limit = attribute_value_length_limit();
+    truncate_string_values(&mut span.attributes, limit);
+    for event in &mut span.events.events {
+        if event.name.len() > limit {
+            event.name = std::borrow::Cow::Owned(truncate_string(&event.name, limit));
+        }
+        truncate_string_values(&mut event.attributes, limit);
+    }
+
     span
+}
+
+/// Truncate any `Value::String` entries that exceed `limit` bytes.
+fn truncate_string_values(attrs: &mut [KeyValue], limit: usize) {
+    for kv in attrs.iter_mut() {
+        if let Value::String(ref s) = kv.value {
+            let s_str = s.as_str();
+            if s_str.len() > limit {
+                kv.value = Value::String(StringValue::from(truncate_string(s_str, limit)));
+            }
+        }
+    }
 }
 
 /// Parse a JSON array of `[{"role":"...","content":"..."},...]` and emit
@@ -756,6 +817,78 @@ mod tests {
         assert!(find_attr(&result, "llm.output_messages.0.message.role").is_none());
         // Also verify turn.reasoning is NOT emitted for TOOL spans
         assert!(find_attr(&result, "turn.reasoning").is_none());
+    }
+
+    // -- Attribute value truncation tests ------------------------------------
+
+    #[test]
+    fn test_truncate_string_short() {
+        assert_eq!(truncate_string("hello", 100), "hello");
+    }
+
+    #[test]
+    fn test_truncate_string_over_limit() {
+        let long = "a".repeat(200);
+        let result = truncate_string(&long, 50);
+        assert!(result.starts_with("aaaa"));
+        assert!(result.contains("[truncated, original 200 bytes]"));
+        let prefix_end = result.find("...").unwrap();
+        assert!(prefix_end <= 50);
+    }
+
+    #[test]
+    fn test_truncate_string_utf8_boundary() {
+        let s = "€".repeat(100); // 300 bytes, 3 bytes per char
+        let result = truncate_string(&s, 50);
+        assert!(result.contains("[truncated"));
+        // 50 bytes fits 16 complete '€' chars (48 bytes)
+        assert!(result.starts_with(&"€".repeat(16)));
+    }
+
+    #[test]
+    fn test_transform_span_truncates_oversized_attributes() {
+        ATTRIBUTE_VALUE_LENGTH_LIMIT.store(100, Ordering::Relaxed);
+
+        let huge_result = "x".repeat(500);
+        let span = make_span(
+            "mcp.tool_call",
+            vec![
+                KeyValue::new("tool.name", "search"),
+                KeyValue::new("output.value", huge_result),
+                KeyValue::new("small.attr", "fine"),
+            ],
+        );
+        let result = transform_span(span);
+
+        assert_eq!(
+            find_attr(&result, "small.attr").unwrap().to_string(),
+            "fine"
+        );
+        assert_eq!(
+            find_attr(&result, "tool.name").unwrap().to_string(),
+            "search"
+        );
+
+        let output = find_attr(&result, "output.value").unwrap().to_string();
+        assert!(output.len() < 500);
+        assert!(output.contains("[truncated, original 500 bytes]"));
+    }
+
+    #[test]
+    fn test_transform_span_does_not_truncate_non_string() {
+        ATTRIBUTE_VALUE_LENGTH_LIMIT.store(100, Ordering::Relaxed);
+
+        let span = make_span(
+            "chat",
+            vec![KeyValue::new("gen_ai.usage.input_tokens", 999_999i64)],
+        );
+        let result = transform_span(span);
+        assert_eq!(
+            find_attr(&result, "llm.token_count.prompt")
+                .unwrap()
+                .to_string(),
+            "999999"
+        );
     }
 }
 

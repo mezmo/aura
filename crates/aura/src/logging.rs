@@ -299,6 +299,10 @@ pub fn init_logging(debug: bool, verbose: bool, binary_name: &str) {
     // Read content-recording config once
     init_content_config();
 
+    // Read attribute value length limit from env
+    #[cfg(feature = "otel")]
+    crate::openinference_exporter::init_attribute_value_length_limit();
+
     // Initialise OTel provider once; each branch builds its own typed layer from it
     #[cfg(feature = "otel")]
     let provider = init_otel_provider();
