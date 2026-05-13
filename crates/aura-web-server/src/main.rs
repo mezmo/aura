@@ -6,6 +6,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 mod handlers;
+mod health;
+mod metrics;
 mod streaming;
 mod types;
 
@@ -89,20 +91,44 @@ struct Args {
     /// Not required when only one configuration is loaded via CONFIG_PATH.
     #[arg(long, env = "DEFAULT_AGENT")]
     default_agent: Option<String>,
+
+    /// Health check cache TTL in seconds. Readiness probe results are cached for
+    /// this duration to avoid flooding subsystems with probes on every K8s check.
+    /// Recommend setting slightly less than K8s periodSeconds.
+    #[arg(long, env = "HEALTH_CHECK_CACHE_TTL_SECS", default_value = "10", value_parser = parse_duration_from_secs)]
+    health_check_cache_ttl: std::time::Duration,
+
+    /// Health check probe timeout in seconds. Individual subsystem probes that
+    /// exceed this timeout are marked as unhealthy. Must be shorter than K8s
+    /// probe timeoutSeconds (recommend K8s timeout >= probe timeout + 5s).
+    #[arg(long, env = "HEALTH_CHECK_TIMEOUT_SECS", default_value = "5", value_parser = parse_duration_from_secs)]
+    health_check_timeout: std::time::Duration,
+}
+
+fn parse_duration_from_secs(value: &str) -> Result<std::time::Duration, String> {
+    let seconds: u64 = value
+        .parse()
+        .map_err(|error| format!("Could not parse `{value}`: {error}"))?;
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
+/// Exempts /health and /metrics so Kubernetes probes and Prometheus scrapers
+/// continue working during graceful shutdown.
 async fn shutdown_guard(
     data: web::Data<AppState>,
     req: actix_web::dev::ServiceRequest,
     next: actix_web::middleware::Next<impl actix_web::body::MessageBody + 'static>,
 ) -> Result<actix_web::dev::ServiceResponse<impl actix_web::body::MessageBody>, actix_web::Error> {
-    if data.shutdown_token.is_cancelled() {
+    let path = req.path();
+    let is_exempt = path == "/health" || path.starts_with("/health/") || path == "/metrics";
+    if data.shutdown_token.is_cancelled() && !is_exempt {
         let response = HttpResponse::ServiceUnavailable().json(ErrorResponse {
-            error: ErrorDetail {
-                message: "Server is shutting down".to_string(),
-                error_type: "service_unavailable".to_string(),
-            },
+            error: ErrorDetail::classified(
+                "service_unavailable",
+                aura::ErrorCategory::ServiceUnavailable,
+                "Server is shutting down",
+            ),
         });
         return Ok(req.into_response(response).map_into_right_body());
     }
@@ -174,6 +200,21 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
+    // Health check configuration
+    if args.health_check_timeout >= std::time::Duration::from_secs(10) {
+        tracing::warn!(
+            timeout_secs = args.health_check_timeout.as_secs(),
+            "Health check timeout is >= 10s, which may exceed K8s probe timeoutSeconds. \
+             Recommend setting HEALTH_CHECK_TIMEOUT_SECS < K8s timeoutSeconds - 5s."
+        );
+    }
+
+    let health_service = Arc::new(health::HealthCheckService::new(
+        configs_arc.clone(),
+        args.health_check_cache_ttl,
+        args.health_check_timeout,
+    ));
+
     // Create app state
     let app_state = web::Data::new(AppState {
         configs: configs_arc,
@@ -188,6 +229,7 @@ async fn run() -> std::io::Result<()> {
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
+        health_service,
     });
 
     info!(
@@ -195,18 +237,31 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
+    // Initialize Prometheus metrics (None if disabled via AURA_METRICS_ENABLED=false)
+    let metrics_handle = metrics::init();
+
     // Custom signal handling: CancellationToken bridges Actix and SSE stream lifecycles
     let server = HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(app_state.clone())
             .wrap(middleware::from_fn(shutdown_guard))
             .wrap(middleware::Logger::default())
             .route("/health", web::get().to(handlers::health))
+            .route("/health/live", web::get().to(health::liveness))
+            .route("/health/ready", web::get().to(health::readiness))
             .route("/v1/models", web::get().to(handlers::list_models))
             .route(
                 "/v1/chat/completions",
                 web::post().to(handlers::chat_completions),
-            )
+            );
+
+        if let Some(handle) = &metrics_handle {
+            app = app
+                .app_data(web::Data::new(handle.clone()))
+                .route("/metrics", web::get().to(metrics::handler));
+        }
+
+        app
     })
     .bind((args.host.as_str(), args.port))?
     .disable_signals()

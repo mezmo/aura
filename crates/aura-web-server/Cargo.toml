@@ -12,8 +12,11 @@ aura-config = { path = "../aura-config" }
 actix-web = "4.4"
 actix-web-lab = "0.22"
 async-stream = "0.3"
+aws-config = { workspace = true }
+aws-credential-types = "1.2"
 clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -25,6 +28,8 @@ opentelemetry = { workspace = true, optional = true }
 env_logger = "0.11"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 [features]
 default = ["otel"]
@@ -39,6 +44,7 @@ integration = [
     "integration-events",
     "integration-cancellation",
     "integration-progress",
+    "integration-metrics",
 ]
 
 # Per-suite flags (can run individually)
@@ -48,6 +54,7 @@ integration-mcp = []                      # fastmcp_structured_content_test
 integration-events = []                   # aura_events_test, proactive_tool_ui_tests
 integration-cancellation = []             # cancellation_test, cancellation_notification_test
 integration-progress = []                 # mcp_progress_test, progress_disconnect_test
+integration-metrics = []                  # metrics_test
 
 # Optional - requires Qdrant (separate epic)
 integration-vector = []         # vector_label_filter_tests
