@@ -1191,9 +1191,11 @@ impl Orchestrator {
         ctx: &IterationContext,
         max_iterations: usize,
         show_tool_chain: bool,
+        content_max_length: usize,
     ) -> String {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let base = ctx.build_continuation_prompt(max_iterations, show_tool_chain);
+        let base =
+            ctx.build_continuation_prompt(max_iterations, show_tool_chain, content_max_length);
         format!("Current time: {timestamp}\n\n{base}")
     }
 
@@ -1231,6 +1233,7 @@ impl Orchestrator {
                 ctx,
                 self.config.max_planning_cycles,
                 self.config.show_tool_reasoning_in_continuation(),
+                self.config.result_summary_length(),
             ),
         };
 
@@ -3021,7 +3024,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         format!("✓ complete ({} chars)", result.len())
                     }
                     TaskState::Failed { error, .. } => {
-                        format!("✗ failed: {}", error)
+                        let (truncated, was_truncated) =
+                            safe_truncate(error, self.config.result_summary_length());
+                        let suffix = if was_truncated { " [truncated]" } else { "" };
+                        format!("✗ failed: {}{}", truncated, suffix)
                     }
                     TaskState::Pending => {
                         let blocked_by = t.dependencies.iter().any(|dep_id| {
@@ -3060,13 +3066,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         } else if (lower.contains("context")
             && (lower.contains("limit")
                 || lower.contains("overflow")
-                || lower.contains("exceeded")
+                || lower.contains("exceed")
                 || lower.contains("length")))
             || lower.contains("maximum context")
             || lower.contains("token limit")
             || lower.contains("tokens exceeded")
             || lower.contains("maximum number of tokens")
             || (lower.contains("too") && lower.contains("long") && lower.contains("token"))
+            || lower.contains("string_above_max_length")
+            || (lower.contains("string") && lower.contains("too long"))
+            || lower.contains("prompt is too long")
+            || lower.contains("input is too long")
         {
             FailureCategory::ContextOverflow
         } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
@@ -5119,6 +5129,54 @@ mod tests {
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("Input too long for token window"),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_openai_string_too_long() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "messages[7].content: string too long (12839884 > 10485760)"
+            ),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_string_above_max_length() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "string_above_max_length: messages[7].content exceeds maximum length"
+            ),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_anthropic_prompt_too_long() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "prompt is too long: 208310 tokens > 200000 maximum"
+            ),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_bedrock_input_too_long() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Input is too long for requested model"),
+            FailureCategory::ContextOverflow
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_anthropic_exceed_context_limit() {
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "input length and max_tokens exceed context limit: 100000 + 8192 > 100000"
+            ),
             FailureCategory::ContextOverflow
         );
     }
