@@ -3,6 +3,7 @@ pub mod aura_dir;
 pub mod backend;
 pub mod cli;
 pub mod config;
+pub mod logging;
 pub mod oneshot;
 pub mod permissions;
 pub mod repl;

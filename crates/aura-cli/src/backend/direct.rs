@@ -17,6 +17,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use aura_web_server::handlers::{self, CollectedResult, DeliveryMode};
 use aura_web_server::streaming::ToolResultMode;
@@ -260,14 +261,17 @@ impl DirectBackend {
             mpsc::channel::<Result<bytes::Bytes, String>>(self.app_state.streaming_buffer_size);
         let heartbeat_interval = Duration::from_secs(15);
 
-        tokio::spawn(handlers::execute_completion(
-            setup,
-            config,
-            DeliveryMode::Sse {
-                chunk_tx,
-                heartbeat_interval,
-            },
-        ));
+        tokio::spawn(
+            handlers::execute_completion(
+                setup,
+                config,
+                DeliveryMode::Sse {
+                    chunk_tx,
+                    heartbeat_interval,
+                },
+            )
+            .instrument(tracing::info_span!(parent: None, "agent.stream")),
+        );
 
         // Convert the mpsc receiver into an eventsource stream.
         // Each chunk from execute_completion is a complete SSE-formatted message
@@ -331,11 +335,10 @@ impl DirectBackend {
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<CollectedResult>();
 
-        tokio::spawn(handlers::execute_completion(
-            setup,
-            config,
-            DeliveryMode::Collect { result_tx },
-        ));
+        tokio::spawn(
+            handlers::execute_completion(setup, config, DeliveryMode::Collect { result_tx })
+                .instrument(tracing::info_span!(parent: None, "agent.stream.summarize")),
+        );
 
         match result_rx.await {
             Ok(collected) => {

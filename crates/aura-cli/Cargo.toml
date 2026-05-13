@@ -38,6 +38,8 @@ rustyline = "17"
 dirs = "6"
 libc = "0.2"
 signal-hook = "0.3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # Standalone mode: build agents in-process from TOML config (no HTTP server needed)
 aura = { path = "../aura", optional = true }
