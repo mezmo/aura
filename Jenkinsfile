@@ -183,7 +183,7 @@ pipeline {
               }
             }
 
-            stage('Relese Test') {
+            stage('Release Test') {
               when {
                 not {
                   expression { CURRENT_BRANCH == DEFAULT_BRANCH }
@@ -228,7 +228,6 @@ pipeline {
       }
     }
 
-    // FIXME: This needs to be removed with the removal of razee stuff
     stage('Feature Build') {
       when {
         expression {
@@ -242,14 +241,22 @@ pipeline {
               'https://index.docker.io/v1/',
               'dockerhub-token-mezmo'
           ) {
-            buildx.build(
-              project: PROJECT_NAME
-            , push: true
-            , tags: [FEATURE_TAG]
-            , dockerfile: "Dockerfile"
-            , args: [RELEASE_VERSION: FEATURE_TAG]
-            , docker_repo: DOCKER_REPO
-            )
+            withReport('Feature Container Build', null, {
+              buildx.build(
+                  project: PROJECT_NAME
+                , push: true
+                , tags: [FEATURE_TAG]
+                , dockerfile: "Dockerfile"
+                , args: [RELEASE_VERSION: FEATURE_TAG]
+                , docker_repo: DOCKER_REPO
+                , tooling: true
+              )
+              publishChecks(
+                  name: 'Feature Container Build'
+                , conclusion: 'SUCCESS'
+                , summary: 'Publish succeeded!'
+              )
+            })
           }
         }
       }
@@ -280,7 +287,11 @@ pipeline {
                  usernameVariable: 'GITHUB_APP'
                )
             ]) {
-              buildx {
+              buildx(
+                tooling: true,
+                project: PROJECT_NAME,
+                versionFn: { -> npm.semver().version }
+              ) {
                 withReport('Release Test', 'npm run release')
               }
             }
@@ -344,7 +355,9 @@ def withReport(checkName, command, callback = null) {
   publishChecks(name: checkName, status: 'IN_PROGRESS', title: 'Running...')
 
   try {
-    sh script: "${command} 2>&1 | tee ${logFile}"
+    if (command) {
+      sh script: "${command} 2>&1 | tee ${logFile}"
+    }
     if(callback) {
       callback()
     } else {
@@ -368,4 +381,3 @@ def withReport(checkName, command, callback = null) {
     sh "rm -f ${logFile}"
   }
 }
-
