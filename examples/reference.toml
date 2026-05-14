@@ -106,8 +106,13 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # context_prefix = "Company documentation"
 
 # ── Tools ───────────────────────────────────────────────────────────
+# Built-in tool configurations.
 [tools]
+# Enable filesystem tools (read_file, list_dir).
 filesystem = false
+# Enable write_file tool. Requires filesystem = true.
+# Only enable for agents that need to modify files (e.g., test generators).
+filesystem_write = false
 custom_tools = []
 
 # ── Agent ───────────────────────────────────────────────────────────
