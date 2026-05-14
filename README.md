@@ -1,44 +1,53 @@
 # Aura
 
-A production-ready framework for composing AI agents and multi-agent workflows from declarative TOML configuration, with MCP tool integration, RAG pipelines, and an OpenAI-compatible web API. Built on [Rig.rs](https://github.com/0xPlaygrounds/rig) with reliability and operability enhancements.
+Aura is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. Aura provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
 
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
-- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery across HTTP, SSE, and STDIO transports
+- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP Streamable transport
 - Automatic schema sanitization for OpenAI function-calling compatibility
-- RAG pipeline integration with in-memory and external vector stores
+- RAG pipeline integration with in-memory, Qdrant, and AWS Bedrock Knowledge Base vector stores
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
 - Dependency-aware multi-wave execution with iterative re-planning loops
 
-> **Open Alpha** — Aura is under active development. APIs and configuration
-> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
-> are welcome — we'd love your feedback.
-
 ## Table of Contents
 
-- [Aura](#aura)
-  - [Table of Contents](#table-of-contents)
-  - [Project Structure](#project-structure)
-  - [Quick Start](./examples/quickstart/README.md)
-  - [Developer Setup](#setup)
-  - [Usage](#usage)
-    - [Web API Server](#web-api-server)
-  - [Configuration](#configuration)
-    - [Multiple Agents](#multiple-agents)
-    - [Configuration Sections](#configuration-sections)
-    - [Orchestration](#orchestration)
-      - [Orchestration fields](#orchestration-fields)
-      - [Worker fields (`[orchestration.worker.<name>]`)](#worker-fields-orchestrationworkername)
-    - [Ollama](#ollama)
-    - [Observability](#observability)
-  - [Docker Deployment](#docker-deployment)
-  - [Development and Testing](#development-and-testing)
-  - [Testing](#testing)
-  - [Documentation](#documentation)
-  - [Architecture](#architecture)
-  - [License](#license)
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [Setup](#setup)
+- [Usage](#usage)
+  - [Web API Server](#web-api-server)
+  - [Client-Side Tools](#client-side-tools)
+- [Configuration](#configuration)
+  - [Multiple Agents](#multiple-agents)
+  - [Configuration Sections](#configuration-sections)
+  - [Orchestration](#orchestration)
+  - [Scratchpad (Context Window Management)](#scratchpad-context-window-management)
+  - [Ollama](#ollama)
+  - [Observability](#observability)
+- [Development and Testing](#development-and-testing)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [Architecture](#architecture)
+
+## Quick Start
+
+```bash
+cp .env.example .env          # set your LLM provider, model, and API key
+docker compose up -d           # starts Aura + LibreChat + Phoenix
+```
+
+Open <http://localhost:3080> to chat, <http://localhost:6006> to inspect traces.
+
+**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling RAG, serving multiple agents, and troubleshooting.
+
+### More Quickstarts
+
+- **[Orchestration — Math MCP](examples/quickstart-orchestration-math/README.md)** — Multi-agent orchestration with coordinator/worker architecture
+- **[Kubernetes SRE](examples/quickstart-k8s-sre/README.md)** — AI-powered SRE agent on KIND with Kubernetes and Prometheus MCP servers
+- **[Example Configs](examples/README.md)** — Minimal per-provider configs and complete agent compositions
 
 ## Project Structure
 
@@ -456,23 +465,6 @@ OpenTelemetry support is enabled by default via the `otel` feature in both `aura
 
 Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
-## Docker Deployment
-
-Aura includes containerized deployment assets at the repo root:
-
-- `Dockerfile`: multi-stage build for the web server.
-- `docker-compose.yml`: local container deployment wiring.
-
-Run with Docker Compose:
-
-```bash
-docker compose up --build
-```
-
-Default container port mapping is `3030:3030` in `docker-compose.yml`. Ensure your config path and API key environment variables are set for the container runtime.
-
-Orchestration testing overlays are available in `compose/` (for example `compose/orchestration.yml` and `compose/orchestration-test.yml`).
-
 ## Development and Testing
 
 Quick commands:
@@ -530,6 +522,7 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 
 ## Documentation
 
+- [docs/quickstart.md](docs/quickstart.md): getting started guide — setup, customization, architecture, and troubleshooting.
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
