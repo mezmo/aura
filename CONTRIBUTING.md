@@ -143,8 +143,7 @@ aura/
 │   ├── reference.toml       # Complete annotated configuration
 │   ├── minimal/             # Bare minimum per-provider configs
 │   └── complete/            # Full agent composition examples
-├── scripts/                 # CI and utility scripts
-└── development/             # LibreChat and OpenWebUI integration
+└── scripts/                 # CI and utility scripts
 ```
 
 **Key architectural docs** to read before diving into the code:
@@ -196,9 +195,6 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 | `make test`          | Run cargo tests + integration tests   |
 | `make ci`            | Run all checks: fmt-check, test, lint |
 | `make clean`         | Clean build artifacts                 |
-
-
-```
 
 ## Code Quality Standards
 
