@@ -924,7 +924,7 @@ seed = 42
     #[test]
     fn test_bedrock_embedding_config_parsing() {
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -970,7 +970,7 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_embedding_without_profile() {
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1008,7 +1008,7 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_embedding_missing_region_fails_validation() {
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1038,7 +1038,7 @@ system_prompt = "Test"
     fn test_openai_embedding_still_requires_api_key() {
         // Ensure existing OpenAI validation still works after Bedrock changes
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "openai"
 api_key = "test_key"
 model = "gpt-4"
@@ -1065,7 +1065,7 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_kb_config_parsing() {
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1107,7 +1107,7 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_kb_missing_knowledge_base_id_fails() {
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"
@@ -1133,7 +1133,7 @@ system_prompt = "Test"
     #[test]
     fn test_bedrock_kb_missing_region_fails() {
         let config_str = r#"
-[llm]
+[agent.llm]
 provider = "bedrock"
 model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 region = "us-east-1"

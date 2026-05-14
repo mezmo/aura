@@ -1,9 +1,11 @@
 use crate::{Config, ConfigError};
 use aura::{
-    Agent, AgentBuilder, AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig,
-    McpServerConfig, ReasoningEffort, ToolsConfig, VectorStoreConfig, VectorStoreType,
+    Agent, AgentConfig, AgentSettings, EmbeddingModelConfig, McpConfig, McpServerConfig,
+    OrchestrationConfig, StreamingAgent, ToolsConfig, VectorStoreConfig, VectorStoreType,
+    orchestration::ToolVisibility as AuraToolVisibility,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Convert TOML-layer EmbeddingConfig to runtime EmbeddingModelConfig
 fn convert_embedding(em: &crate::config::EmbeddingConfig) -> EmbeddingModelConfig {
@@ -40,83 +42,17 @@ impl RigBuilder {
     }
 
     fn to_agent_config(&self) -> Result<AgentConfig, ConfigError> {
-        let llm = match &self.config.llm {
-            crate::config::LlmConfig::OpenAI {
-                api_key,
-                model,
-                base_url,
-            } => LlmConfig::OpenAI {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Anthropic {
-                api_key,
-                model,
-                base_url,
-            } => LlmConfig::Anthropic {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Bedrock {
-                model,
-                region,
-                profile,
-            } => LlmConfig::Bedrock {
-                model: model.clone(),
-                region: region.clone(),
-                profile: profile.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Gemini {
-                api_key,
-                model,
-                base_url,
-            } => LlmConfig::Gemini {
-                api_key: api_key.clone(),
-                model: model.clone(),
-                base_url: base_url.clone(),
-                max_tokens: None,
-            },
-            crate::config::LlmConfig::Ollama {
-                model,
-                base_url,
-                fallback_tool_parsing,
-                num_ctx,
-                num_predict,
-                additional_params,
-            } => LlmConfig::Ollama {
-                model: model.clone(),
-                base_url: Some(base_url.clone()),
-                max_tokens: None,
-                fallback_tool_parsing: *fallback_tool_parsing,
-                num_ctx: *num_ctx,
-                num_predict: *num_predict,
-                additional_params: additional_params.clone(),
-            },
-        };
-
-        let reasoning_effort = self.config.agent.reasoning_effort.map(|r| match r {
-            crate::config::ReasoningEffort::Minimal => ReasoningEffort::Minimal,
-            crate::config::ReasoningEffort::Low => ReasoningEffort::Low,
-            crate::config::ReasoningEffort::Medium => ReasoningEffort::Medium,
-            crate::config::ReasoningEffort::High => ReasoningEffort::High,
-        });
+        let llm = self.config.agent.llm.clone();
 
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
             context: self.config.agent.context.clone(),
-            temperature: self.config.agent.temperature,
-            reasoning_effort,
-            max_tokens: self.config.agent.max_tokens,
             turn_depth: self.config.agent.turn_depth,
-            context_window: self.config.agent.context_window,
-            additional_params: self.config.agent.additional_params.clone(),
             mcp_filter: self.config.agent.mcp_filter.clone(),
+            scratchpad: self.config.agent.scratchpad.clone(),
+            enable_client_tools: self.config.agent.enable_client_tools,
+            client_tool_filter: self.config.agent.client_tool_filter.clone(),
         };
 
         let vector_stores: Vec<VectorStoreConfig> = self
@@ -168,22 +104,26 @@ impl RigBuilder {
                             args,
                             env,
                             description,
+                            scratchpad,
                         } => McpServerConfig::Stdio {
                             cmd: cmd.first().unwrap_or(&String::new()).clone(),
                             args: args.clone(),
                             env: env.clone(),
                             description: description.clone(),
+                            scratchpad: scratchpad.clone(),
                         },
                         crate::config::McpServerConfig::HttpStreamable {
                             url,
                             headers,
                             description,
                             headers_from_request,
+                            scratchpad,
                         } => McpServerConfig::HttpStreamable {
                             url: url.clone(),
                             headers: headers.clone(),
                             description: description.clone(),
                             headers_from_request: headers_from_request.clone(),
+                            scratchpad: scratchpad.clone(),
                         },
                     };
                     (name.clone(), converted_server)
@@ -201,34 +141,129 @@ impl RigBuilder {
             custom_tools: tools_config.custom_tools.clone(),
         });
 
+        // Convert orchestration config
+        let orchestration = self.config.orchestration.as_ref().map(|orch| {
+            let workers = orch
+                .workers
+                .iter()
+                .map(|(name, worker)| {
+                    (
+                        name.clone(),
+                        aura::orchestration::WorkerConfig {
+                            description: worker.description.clone(),
+                            preamble: worker.preamble.clone(),
+                            mcp_filter: worker.mcp_filter.clone(),
+                            vector_stores: worker.vector_stores.clone(),
+                            turn_depth: worker.turn_depth,
+                            llm: worker.llm.clone(),
+                            scratchpad: worker.scratchpad.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+            let tools_in_planning = match orch.tools_in_planning {
+                crate::ToolVisibility::None => AuraToolVisibility::None,
+                crate::ToolVisibility::Summary => AuraToolVisibility::Summary,
+                crate::ToolVisibility::Full => AuraToolVisibility::Full,
+            };
+
+            OrchestrationConfig {
+                enabled: orch.enabled,
+                max_planning_cycles: orch.max_planning_cycles,
+                max_plan_parse_retries: orch.max_plan_parse_retries,
+                worker_system_prompt: orch.worker_system_prompt.clone(),
+                workers,
+                coordinator_vector_stores: orch.coordinator_vector_stores.clone(),
+                tools_in_planning,
+                max_tools_per_worker: orch.max_tools_per_worker,
+                allow_direct_answers: orch.allow_direct_answers,
+                allow_clarification: orch.allow_clarification,
+                duplicate_call_nudge_threshold: orch.duplicate_call_nudge_threshold,
+                duplicate_call_block_threshold: orch.duplicate_call_block_threshold,
+                timeouts: aura::orchestration::TimeoutsConfig {
+                    per_call_timeout_secs: orch.timeouts.per_call_timeout_secs,
+                },
+                artifacts: aura::orchestration::ArtifactsConfig {
+                    memory_dir: orch.artifacts.memory_dir.clone(),
+                    result_artifact_threshold: orch.artifacts.result_artifact_threshold,
+                    result_summary_length: orch.artifacts.result_summary_length,
+                    session_history_turns: orch.artifacts.session_history_turns,
+                    persistence_drain_timeout_ms: orch.artifacts.persistence_drain_timeout_ms,
+                    tool_output_artifact_threshold: orch.artifacts.tool_output_artifact_threshold,
+                    tool_output_duration_threshold_ms: orch
+                        .artifacts
+                        .tool_output_duration_threshold_ms,
+                    show_tool_reasoning_in_continuation: orch
+                        .artifacts
+                        .show_tool_reasoning_in_continuation,
+                    max_session_runs: orch.artifacts.max_session_runs,
+                },
+            }
+        });
+
         Ok(AgentConfig {
             llm,
             agent,
             vector_stores,
             mcp,
             tools,
+            memory_dir: self.config.memory_dir.clone(),
+            orchestration,
+            // Extension fields default to None (set by orchestrator for workers)
+            tool_wrapper: None,
+            tool_context_factory: None,
+            preamble_override: None,
+            mcp_filter: None,
+            orchestration_persistence: None,
+            orchestration_chat_history: None,
+            orchestration_submit_result: None,
+            session_id: None,
+            scratchpad_tools_config: None,
         })
     }
 
-    pub async fn build_agent(&self) -> Result<Agent, ConfigError> {
-        let agent_config = self.to_agent_config()?;
-        self.build_from_config(agent_config).await
-    }
-
-    pub async fn build_agent_with_headers(
+    /// Build an agent with optional request headers, additional tools, and client-side tools.
+    ///
+    /// - `req_headers`: HTTP headers for MCP `headers_from_request` resolution. Pass `None` when not in an HTTP context.
+    /// - `additional_tools`: Extra rig tools the agent will execute itself (e.g. CLI/library-supplied tools). Pass `vec![]` when none needed.
+    /// - `client_tools`: Passthrough tools the LLM may call but the *client* executes. Pass `None` when client-side tools are not in use.
+    pub async fn build_agent(
         &self,
         req_headers: Option<&HashMap<String, String>>,
+        additional_tools: Vec<Box<dyn aura::ToolDyn>>,
+        client_tools: Option<Vec<aura::builder::ClientTool>>,
     ) -> Result<Agent, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
-        self.build_from_config(agent_config).await
-    }
-
-    async fn build_from_config(&self, agent_config: AgentConfig) -> Result<Agent, ConfigError> {
-        AgentBuilder::new(agent_config)
-            .build_agent()
+        Agent::new(&agent_config, additional_tools, client_tools)
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build agent: {e}")))
+    }
+
+    /// Build a streaming agent with optional dynamic MCP headers and client-side tools.
+    ///
+    /// Returns either:
+    /// - An `Orchestrator` wrapped as `Arc<dyn StreamingAgent>` if `orchestration.enabled = true`
+    /// - A standard `Agent` wrapped as `Arc<dyn StreamingAgent>` otherwise
+    ///
+    /// `client_tools` is the request-supplied passthrough tool definitions. The orchestrator
+    /// attaches them only to the coordinator / workers whose TOML config sets
+    /// `enable_client_tools = true`, filtered by `client_tool_filter`. In single-agent mode,
+    /// callers should attach client tools via `build_agent` instead.
+    pub async fn build_streaming_agent_with_headers(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+        session_id: Option<String>,
+        client_tools: Option<Vec<aura::builder::ClientTool>>,
+    ) -> Result<Arc<dyn StreamingAgent>, ConfigError> {
+        let mut agent_config = self.to_agent_config()?;
+        resolve_mcp_headers(&mut agent_config, req_headers);
+        agent_config.session_id = session_id;
+
+        aura::build_streaming_agent(&agent_config, client_tools)
+            .await
+            .map_err(|e| ConfigError::Validation(format!("Failed to build streaming agent: {e}")))
     }
 }
 
@@ -304,6 +339,7 @@ mod tests {
                 headers: static_headers,
                 description: None,
                 headers_from_request,
+                scratchpad: HashMap::new(),
             },
         );
 
