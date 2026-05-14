@@ -2,7 +2,6 @@ library 'magic-butler-catalogue'
 def PROJECT_NAME = 'aura'
 def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
-def TRIGGER_PATTERN = '.*@triggerbuild.*'
 def DOCKER_REPO = "docker.io/mezmo"
 def BUILD_SLUG = slugify(env.BUILD_TAG)
 
@@ -20,10 +19,6 @@ pipeline {
 
   tools {
     nodejs 'NodeJS 24'
-  }
-
-  triggers {
-    issueCommentTrigger(TRIGGER_PATTERN)
   }
 
   options {
@@ -254,14 +249,19 @@ pipeline {
 
       steps {
         script {
-          buildx.build(
-            project: PROJECT_NAME
-          , push: true
-          , tags: [FEATURE_TAG]
-          , dockerfile: "Dockerfile"
-          , args: [RELEASE_VERSION: FEATURE_TAG]
-          , docker_repo: DOCKER_REPO
-          )
+          docker.withRegistry(
+              'https://index.docker.io/v1/',
+              'dockerhub-token-mezmo'
+          ) {
+            buildx.build(
+              project: PROJECT_NAME
+            , push: true
+            , tags: [FEATURE_TAG]
+            , dockerfile: "Dockerfile"
+            , args: [RELEASE_VERSION: FEATURE_TAG]
+            , docker_repo: DOCKER_REPO
+            )
+          }
         }
       }
     }
