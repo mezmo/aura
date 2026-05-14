@@ -143,8 +143,7 @@ aura/
 │   ├── reference.toml       # Complete annotated configuration
 │   ├── minimal/             # Bare minimum per-provider configs
 │   └── complete/            # Full agent composition examples
-├── scripts/                 # CI and utility scripts
-└── development/             # LibreChat and OpenWebUI integration
+└── scripts/                 # CI and utility scripts
 ```
 
 **Key architectural docs** to read before diving into the code:
