@@ -539,6 +539,7 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 ## Documentation
 
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
+- [docs/cli-guide.md](docs/cli-guide.md): CLI installation, HTTP and standalone modes, local tools, permissions, and conversation persistence.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
