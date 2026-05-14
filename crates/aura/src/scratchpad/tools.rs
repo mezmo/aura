@@ -5,7 +5,8 @@
 
 use super::context_budget::ContextBudget;
 use super::schema::{
-    analyze_json_structure, analyze_markdown_structure, format_markdown_schema, format_schema,
+    MAX_SCHEMA_DEPTH, analyze_json_structure, analyze_markdown_structure, format_markdown_schema,
+    format_schema,
 };
 use super::storage::ScratchpadStorage;
 use rig::completion::ToolDefinition;
@@ -1169,7 +1170,7 @@ impl Tool for ItemSchemaTool {
 
         for item in items {
             if let Some(obj) = item.as_object() {
-                collect_keys(obj, "", &mut key_info);
+                collect_keys(obj, "", &mut key_info, 0);
             }
         }
 
@@ -1212,11 +1213,32 @@ struct KeyInfo {
 }
 
 /// Recursively collect keys from an object, tracking types and counts.
+///
+/// `depth` short-circuits past `MAX_SCHEMA_DEPTH` so adversarial / malformed
+/// inputs can't blow the stack — `serde_json`'s parse-time 128-frame limit is
+/// not a substitute (easy to lose if the deserializer is swapped).
 fn collect_keys(
     obj: &serde_json::Map<String, serde_json::Value>,
     prefix: &str,
     info: &mut std::collections::BTreeMap<String, KeyInfo>,
+    depth: usize,
 ) {
+    if depth >= MAX_SCHEMA_DEPTH {
+        // Mirror build_node: surface a sentinel rather than silently dropping
+        // keys past the cap, so the LLM can tell substructure exists below.
+        let key = if prefix.is_empty() {
+            "<...truncated>".to_string()
+        } else {
+            format!("{}.<...truncated>", prefix)
+        };
+        let entry = info.entry(key).or_insert_with(|| KeyInfo {
+            types: std::collections::BTreeSet::new(),
+            count: 0,
+        });
+        entry.types.insert("...truncated".to_string());
+        entry.count += 1;
+        return;
+    }
     for (key, value) in obj {
         let full_key = if prefix.is_empty() {
             key.clone()
@@ -1242,7 +1264,7 @@ fn collect_keys(
 
         // Recurse into nested objects
         if let serde_json::Value::Object(nested) = value {
-            collect_keys(nested, &full_key, info);
+            collect_keys(nested, &full_key, info, depth + 1);
         }
     }
 }
@@ -2444,6 +2466,36 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn test_collect_keys_terminates_on_deeply_nested_value() {
+        // Build a 1000-level deep nested object programmatically — bypasses
+        // serde_json's 128-frame parse limit so we actually stress the
+        // walker's own depth guard rather than the parser's.
+        let mut value = serde_json::Value::Object(serde_json::Map::new());
+        for _ in 0..1000 {
+            let mut outer = serde_json::Map::new();
+            outer.insert("child".to_string(), value);
+            value = serde_json::Value::Object(outer);
+        }
+        let outer = value.as_object().unwrap();
+
+        let mut info: std::collections::BTreeMap<String, KeyInfo> =
+            std::collections::BTreeMap::new();
+        collect_keys(outer, "", &mut info, 0);
+
+        // No panic == stack guard worked. Collected keys are the first
+        // MAX_SCHEMA_DEPTH frames of `child.child.…` plus the truncation
+        // sentinel emitted on the next frame.
+        assert_eq!(info.len(), MAX_SCHEMA_DEPTH + 1);
+        let deepest_key = "child.".repeat(MAX_SCHEMA_DEPTH - 1) + "child";
+        assert!(info.contains_key(&deepest_key));
+        let sentinel_key = "child.".repeat(MAX_SCHEMA_DEPTH) + "<...truncated>";
+        let sentinel = info
+            .get(&sentinel_key)
+            .expect("expected truncation sentinel at MAX_SCHEMA_DEPTH");
+        assert!(sentinel.types.contains("...truncated"));
     }
 
     #[test]
