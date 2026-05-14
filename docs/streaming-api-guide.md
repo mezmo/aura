@@ -353,7 +353,7 @@ flowchart TD
     H --> I["iteration_complete<br/>Quality scored (quality_score, quality_threshold,<br/>will_replan, evaluation_skipped, reasoning, gaps)"]
 
     I -->|will_replan = false| Z([Done])
-    I -->|will_replan = true| J["replan_started<br/>trigger: 'quality' | 'failure'"]
+    I -->|will_replan = true| J["replan_started<br/>trigger: 'coordinator' | 'failure'"]
     J -->|loop back to plan_created| B
 ```
 
@@ -531,13 +531,13 @@ data:
 ```json
 {
   "iteration": 2,
-  "trigger": "quality",
+  "trigger": "coordinator",
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
 
-Triggers: `"quality"` (score below threshold) or `"failure"` (worker task failures forced a replan).
+Triggers: `"coordinator"` (coordinator routed back to planning) or `"failure"` (worker task failures forced a replan).
 
 **Synthesizing** (consolidating task results for coordinator decision):
 ```
