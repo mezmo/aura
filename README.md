@@ -393,6 +393,16 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
 
+##### Duplicate call guard
+
+Workers can get stuck calling the same tool with identical arguments repeatedly, especially with smaller or quantized models. The duplicate call guard handles this with two-stage escalation:
+
+1. **Nudge threshold** (`duplicate_call_nudge_threshold`, default 3): After this many consecutive identical calls, a guidance annotation is appended to the tool output suggesting the worker use the result, try different arguments, or take a different approach. The worker still has turn budget remaining.
+
+2. **Block threshold** (`duplicate_call_block_threshold`, default 5): After this many consecutive identical calls, an abort annotation is appended and the task is marked failed. Dependent tasks in the DAG are blocked.
+
+The guard tracks each (tool name, arguments) pair independently — alternating between two different calls does not trigger the guard. General tool errors (timeouts, server errors) do not increment the counter since retries may succeed; schema validation errors do increment since they indicate a persistent problem with the call.
+
 #### Worker fields (`[orchestration.worker.<name>]`)
 
 | Field | Type | Default | Description |
