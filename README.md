@@ -542,6 +542,7 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
+- [docs/scratchpad-tools-reference.md](docs/scratchpad-tools-reference.md): parameters and behavior for scratchpad exploration tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`).
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
 - [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
