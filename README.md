@@ -405,6 +405,8 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
 | `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
 
+**Worker naming rules:** The `<name>` in `[orchestration.worker.<name>]` must be non-empty and unique case-insensitively. Names like `Alpha` and `alpha` are rejected because they collide on case-insensitive filesystems (macOS APFS, Windows NTFS) where Aura persists worker artifacts.
+
 ### Scratchpad (Context Window Management)
 
 Scratchpad intercepts large MCP tool outputs and stores them on disk so the LLM can selectively explore them via eight read-only tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) rather than pushing the entire payload into context.
