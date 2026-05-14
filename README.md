@@ -288,7 +288,7 @@ mcp-proxy --port=8081 --host=127.0.0.1 npx your-mcp-server
 
 Then point your config at the HTTP/SSE endpoint instead.
 
-`headers_from_request` can forward incoming request headers to MCP servers for per-request auth. See the [quickstart guide](examples/quickstart/README.md) for practical examples.
+`headers_from_request` can forward incoming request headers to MCP servers for per-request auth. See [`examples/reference.toml`](examples/reference.toml) for a practical example.
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
