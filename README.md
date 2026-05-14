@@ -1,5 +1,10 @@
 # Aura
 
+[![License: Apache 2.0](https://img.shields.io/github/license/mezmo/aura.svg?color=blue)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/mezmo/aura?sort=semver)](https://github.com/mezmo/aura/releases)
+[![GitHub Discussions](https://img.shields.io/github/discussions/mezmo/aura)](https://github.com/mezmo/aura/discussions)
+[![GitHub stars](https://img.shields.io/github/stars/mezmo/aura?style=social)](https://github.com/mezmo/aura/stargazers)
+
 A production-ready framework for composing AI agents and multi-agent workflows from declarative TOML configuration, with MCP tool integration, RAG pipelines, and an OpenAI-compatible web API. Built on [Rig.rs](https://github.com/0xPlaygrounds/rig) with reliability and operability enhancements.
 
 Key capabilities:
