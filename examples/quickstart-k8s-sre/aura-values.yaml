@@ -36,11 +36,6 @@ resources:
 
 config:
   content: |
-    [llm]
-    provider = "openai"
-    api_key = "{{ env.OPENAI_API_KEY }}"
-    model = "gpt-5.4-mini"
-
     [mcp]
     sanitize_schemas = true
 
@@ -73,6 +68,11 @@ config:
     """
     turn_depth = 20
     max_tokens = 4096
+
+    [agent.llm]
+    provider = "openai"
+    api_key = "{{ env.OPENAI_API_KEY }}"
+    model = "gpt-5.4-mini"
 
     # ── Orchestration ────────────────────────────────────────────────
 

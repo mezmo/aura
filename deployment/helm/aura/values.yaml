@@ -91,26 +91,26 @@ config:
   # As a string: used verbatim as config.toml.
   # As a map: each key becomes a file in /etc/aura/ (config directory pattern).
   # When empty, structured sections below are rendered into config.toml.
-  # NOTE: At minimum, [llm] and [agent] sections are required for a valid config.
+  # NOTE: At minimum, [agent] and [agent.llm] sections are required for a valid config.
   content: ""
   # Multi-config example:
   #   content:
   #     sre-agent.toml: |
-  #       [llm]
-  #       provider = "openai"
-  #       model = "gpt-4o"
-  #       api_key = "{{ env.OPENAI_API_KEY }}"
   #       [agent]
   #       name = "SRE Agent"
   #       system_prompt = "You are an SRE assistant."
+  #       [agent.llm]
+  #       provider = "openai"
+  #       model = "gpt-4o"
+  #       api_key = "{{ env.OPENAI_API_KEY }}"
   #     incident-response.toml: |
-  #       [llm]
-  #       provider = "anthropic"
-  #       model = "claude-sonnet-4-5-20250929"
-  #       api_key = "{{ env.ANTHROPIC_API_KEY }}"
   #       [agent]
   #       name = "Incident Response"
   #       system_prompt = "You are an incident response assistant."
+  #       [agent.llm]
+  #       provider = "anthropic"
+  #       model = "claude-sonnet-4-5-20250929"
+  #       api_key = "{{ env.ANTHROPIC_API_KEY }}"
 
   # -----------------------------------------------------------------------
   # Structured sections — rendered to TOML when config.content is empty.
@@ -118,30 +118,28 @@ config:
   # are rendered. Set config.content to a raw TOML string to bypass these.
   # -----------------------------------------------------------------------
 
-  # -- LLM provider configuration → [llm]
-  llm: {}
-  #   provider: openai
-  #   api_key: "{{ env.OPENAI_API_KEY }}"
-  #   model: gpt-4o
-  #   base_url: ""               # optional
-  #   temperature: 0.7
-  #   max_tokens: 2000
-  #   region: ""                  # bedrock only
-  #   profile: ""                 # bedrock only
-  #   fallback_tool_parsing: false  # ollama only
-  #   additional_params:           # → [llm.additional_params]
-  #     seed: 42
-  #     top_k: 40
-  #     top_p: 0.9
-  #     num_ctx: 0                  # ollama only
-  #     num_predict: 0              # ollama only
-
   # -- Agent configuration → [agent]
   agent: {}
   #   name: "My Agent"
   #   system_prompt: "You are a helpful assistant."
   #   context: []
   #   turn_depth: 6
+  #   llm:                           # → [agent.llm]
+  #     provider: openai
+  #     api_key: "{{ env.OPENAI_API_KEY }}"
+  #     model: gpt-4o
+  #     base_url: ""               # optional
+  #     temperature: 0.7
+  #     max_tokens: 2000
+  #     region: ""                  # bedrock only
+  #     profile: ""                 # bedrock only
+  #     fallback_tool_parsing: false  # ollama only
+  #     additional_params:           # → [agent.llm.additional_params]
+  #       seed: 42
+  #       top_k: 40
+  #       top_p: 0.9
+  #       num_ctx: 0                  # ollama only
+  #       num_predict: 0              # ollama only
 
   # -- Vector stores → [[vector_stores]]
   vector_stores: []

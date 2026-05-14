@@ -141,7 +141,7 @@ helm install aura ./deployment/helm/aura \
   --set secrets.openaiApiKey="$OPENAI_API_KEY"
 ```
 
-> **Using a different LLM provider?** Edit `aura-values.yaml` and update the `[llm]`
+> **Using a different LLM provider?** Edit `aura-values.yaml` and update the `[agent.llm]`
 > section. See [`examples/reference.toml`](../reference.toml) for all provider options.
 
 Wait for AURA:
