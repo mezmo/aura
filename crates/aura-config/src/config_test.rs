@@ -1412,7 +1412,7 @@ context_window = 200000
     }
 
     #[test]
-    fn test_legacy_top_level_llm_produces_migration_error() {
+    fn test_legacy_top_level_llm_migrated_with_warning() {
         let legacy_config = r#"
 [llm]
 provider = "openai"
@@ -1423,16 +1423,105 @@ model = "gpt-4o"
 name = "Test"
 system_prompt = "Test"
 "#;
-        let err = load_config_from_str(legacy_config)
-            .expect_err("legacy top-level [llm] should be rejected");
+        let config = load_config_from_str(legacy_config)
+            .expect("legacy top-level [llm] should be auto-migrated");
+        // Verify the LLM values were moved into agent.llm.
+        match &config.agent.llm {
+            aura::LlmConfig::OpenAI { api_key, model, .. } => {
+                assert_eq!(api_key, "test_key");
+                assert_eq!(model, "gpt-4o");
+            }
+            other => panic!("expected OpenAI LLM config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_legacy_llm_migrates_all_fields() {
+        let legacy_config = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+context_window = 128000
+temperature = 0.7
+max_tokens = 4096
+
+[llm.additional_params.thinking]
+type = "enabled"
+budget_tokens = 8000
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config = load_config_from_str(legacy_config)
+            .expect("legacy [llm] with additional_params should migrate");
+        match &config.agent.llm {
+            aura::LlmConfig::OpenAI {
+                api_key,
+                model,
+                context_window,
+                temperature,
+                max_tokens,
+                additional_params,
+                ..
+            } => {
+                assert_eq!(api_key, "test_key");
+                assert_eq!(model, "gpt-4o");
+                assert_eq!(*context_window, Some(128000));
+                assert_eq!(*temperature, Some(0.7));
+                assert_eq!(*max_tokens, Some(4096));
+                let params = additional_params
+                    .as_ref()
+                    .expect("additional_params should survive migration");
+                let thinking = params.get("thinking").expect("thinking key should exist");
+                assert_eq!(thinking.get("type").unwrap(), "enabled");
+                assert_eq!(thinking.get("budget_tokens").unwrap(), 8000);
+            }
+            other => panic!("expected OpenAI LLM config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_both_top_level_and_agent_llm_errors() {
+        let ambiguous_config = r#"
+[llm]
+provider = "openai"
+api_key = "old_key"
+model = "gpt-4o"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "new_key"
+model = "gpt-4o"
+"#;
+        let err = load_config_from_str(ambiguous_config)
+            .expect_err("both [llm] and [agent.llm] should be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("legacy top-level [llm]"),
-            "error should mention legacy top-level [llm]: {msg}"
+            msg.contains("both a top-level [llm]"),
+            "error should mention ambiguous [llm]: {msg}"
         );
+    }
+
+    #[test]
+    fn test_legacy_llm_without_agent_errors() {
+        let no_agent_config = r#"
+[llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+"#;
+        let err = load_config_from_str(no_agent_config)
+            .expect_err("[llm] without [agent] should be rejected");
+        let msg = err.to_string();
         assert!(
-            msg.contains("[agent.llm]"),
-            "error should tell the user to move it under [agent.llm]: {msg}"
+            msg.contains("no [agent] section"),
+            "error should mention missing [agent]: {msg}"
         );
     }
 

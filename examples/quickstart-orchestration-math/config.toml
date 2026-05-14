@@ -7,18 +7,6 @@
 # This config connects to the math-mcp service defined in docker-compose.yml.
 # For all available options, see: examples/reference.toml
 
-# ── LLM Provider ────────────────────────────────────────────────────
-
-[llm]
-provider = "openai"
-api_key = "{{ env.OPENAI_API_KEY }}"
-model = "gpt-5.4-mini"
-
-# Anthropic:
-# provider = "anthropic"
-# api_key = "{{ env.ANTHROPIC_API_KEY }}"
-# model = "claude-sonnet-4-20250514"
-
 # ── Agent (Coordinator) ─────────────────────────────────────────────
 # In orchestration mode the [agent] system_prompt is given to the
 # coordinator. It provides routing guidance and domain context.
@@ -37,6 +25,16 @@ ROUTING GUIDANCE:
 IMPORTANT: Always delegate calculations to workers — do not compute results yourself.
 """
 turn_depth = 5
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.4-mini"
+
+# Anthropic:
+# provider = "anthropic"
+# api_key = "{{ env.ANTHROPIC_API_KEY }}"
+# model = "claude-sonnet-4-20250514"
 
 # ── MCP Tool Server ──────────────────────────────────────────────────
 # Points at the math-mcp container defined in docker-compose.yml.
