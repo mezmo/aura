@@ -38,4 +38,5 @@ for toml in crates/*/Cargo.toml; do
     fi
 done
 
+cargo update --quiet --workspace
 echo "Version update complete"

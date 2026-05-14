@@ -26,7 +26,7 @@ EOR
 FROM runner AS test
 
 # Copy workspace files
-COPY Cargo.toml Cargo.lock ./
+COPY --chown=aura:aura Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 # needed for make operations
 COPY .git ./.git
