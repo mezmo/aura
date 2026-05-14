@@ -197,9 +197,6 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 | `make ci`            | Run all checks: fmt-check, test, lint |
 | `make clean`         | Clean build artifacts                 |
 
-
-```
-
 ## Code Quality Standards
 
 ### Formatting
