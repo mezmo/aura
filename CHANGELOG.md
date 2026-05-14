@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.20.1](https://github.com/mezmo/aura/compare/v1.20.0...v1.20.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* make sure to regenerate cargo lock file during release [c1de102](https://github.com/mezmo/aura/commit/c1de1029dc1f2a0171782a872986139cc9ae9f5f) - Eric Satterwhite [#137](https://github.com/mezmo/aura/issues/137)
+
+### Service
+
+* **setup**: remove build trigger gate [0eccd5d](https://github.com/mezmo/aura/commit/0eccd5db0a4702091d7902cbd1486276d0bbb146) - Eric Satterwhite
+
 # [1.20.0](https://github.com/mezmo/aura/compare/v1.19.8...v1.20.0) (2026-05-14)
 
 
