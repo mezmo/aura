@@ -1,8 +1,7 @@
-use a2a_rs_server::{A2aServer, AuthContext};
+use a2a_rs_server::A2aServer;
 use aura_config::load_config;
 use axum::Json;
 use axum::extract::{Request, State};
-use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -11,7 +10,6 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use std::env;
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
@@ -202,6 +200,12 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
+    // The broadcast sender and task store live inside `A2aServer`, which we construct below.
+    // Both the message handler and the local override handlers need to see the same channel,
+    // so we share `OnceLock` cells and populate them after the server is built.
+    let event_tx_cell = Arc::new(OnceLock::new());
+    let task_store_cell = Arc::new(OnceLock::new());
+
     let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
@@ -215,6 +219,8 @@ async fn run() -> std::io::Result<()> {
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
+        a2a_event_tx: event_tx_cell.clone(),
+        a2a_task_store: task_store_cell.clone(),
     });
 
     info!(
@@ -226,56 +232,12 @@ async fn run() -> std::io::Result<()> {
     // JSON-RPC at /a2a/v1/rpc
     // REST at /a2a/v1/message:send, /a2a/v1/tasks/
     // REST /.well-known/agent-card.json
-    let event_tx_cell = Arc::new(OnceLock::new());
-    let task_store_cell = Arc::new(OnceLock::new());
     let a2a_server = A2aServer::new(a2a::AuraMessageHandler::new(
         app_state.clone(),
         event_tx_cell.clone(),
         task_store_cell.clone(),
     ))
-    .auth_extractor(|headers: &HeaderMap| {
-        // pulling all the headers so they can be incorporated into the
-        // rig build for calling other tools
-        let header_map: serde_json::Map<String, serde_json::Value> = headers
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|val| (k.to_string(), serde_json::Value::String(val.to_string())))
-            })
-            .collect();
-
-        let user_id = env::var("A2A_HEADER_USER_ID")
-            .ok()
-            .as_ref()
-            .and_then(|h| headers.get(h))
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let access_token = env::var("A2A_HEADER_AUTHORIZATION")
-            .ok()
-            .as_ref()
-            .and_then(|h| headers.get(h))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                if let Some(prefix) = env::var("A2A_HEADER_AUTHORIZATION_STRIP_PREFIX")
-                    .ok()
-                    .as_deref()
-                {
-                    s.strip_prefix(prefix).unwrap_or(s).to_string()
-                } else {
-                    s.to_string()
-                }
-            })
-            .unwrap_or_default();
-
-        Some(AuthContext {
-            user_id,
-            access_token,
-            metadata: Some(serde_json::Value::Object(header_map)),
-        })
-    })
+    .auth_extractor(a2a::extract_auth_context)
     .rpc_path("/a2a/v1/rpc")
     .rest_prefix(Some("/a2a/v1"));
 
@@ -290,10 +252,23 @@ async fn run() -> std::io::Result<()> {
     // Our routes take priority. Unmatched requests fall through to a2a_router.
     // This avoids a duplicate-route conflict on /health: ours is served first,
     // and the a2a-rs-server's /health is never reached.
+    //
+    // The `/a2a/v1/message:stream` and `/a2a/v1/tasks/{id}:subscribe` routes are local
+    // overrides for buggy upstream handlers — see `a2a/overrides.rs` for the race they fix.
+    // They MUST be registered before `fallback_service(a2a_router)` so axum matches them
+    // before delegating to the upstream router.
     let aura_router = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route(
+            "/a2a/v1/message:stream",
+            post(a2a::overrides::send_streaming_message),
+        )
+        .route(
+            "/a2a/v1/tasks/{id}:subscribe",
+            get(a2a::overrides::subscribe_to_task),
+        )
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),

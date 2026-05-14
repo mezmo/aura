@@ -428,7 +428,10 @@ async fn test_list_task_get_details() {
         .expect("Failed to read response");
     let response_body: Value = serde_json::from_str(&body).expect("Response was not valid JSON");
 
-    println!("Tool invocation (/a2a/v1/message:send) response body: {}", body);
+    println!(
+        "Tool invocation (/a2a/v1/message:send) response body: {}",
+        body
+    );
 
     let task = response_body
         .get("task")
@@ -568,11 +571,7 @@ async fn test_list_task_get_details() {
     let state = status
         .get("state")
         .expect("Status did not contain 'state' field");
-    assert_eq!(
-        state.is_string(),
-        true,
-        "Task state should be TASK_STATE_WORKING"
-    );
+    assert!(state.is_string(), "Task state should be TASK_STATE_WORKING");
 
     let timestamp = status
         .get("timestamp")

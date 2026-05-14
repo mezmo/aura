@@ -42,16 +42,15 @@ impl AuraMessageHandler {
     }
 
     fn resolve_config(&self) -> Option<aura_config::Config> {
-        if let Some(ref name) = self.app_state.default_agent {
-            if let Some(agent_config) = self
+        if let Some(ref name) = self.app_state.default_agent
+            && let Some(agent_config) = self
                 .app_state
                 .configs
                 .iter()
                 .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name)
                 .cloned()
-            {
-                return Some(agent_config);
-            }
+        {
+            return Some(agent_config);
         }
 
         self.app_state.configs.first().cloned()

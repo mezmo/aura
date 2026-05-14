@@ -1,8 +1,12 @@
+use a2a_rs_core::StreamResponse;
+use a2a_rs_server::TaskStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::streaming::ToolResultMode;
@@ -69,6 +73,15 @@ pub struct AppState {
     pub active_requests: Arc<ActiveRequestTracker>,
     /// Default agent name or alias, used when `model` is omitted from the request
     pub default_agent: Option<String>,
+    /// Broadcast channel sender for A2A streaming events.
+    ///
+    /// Populated lazily after the `A2aServer` is constructed (the channel lives inside the
+    /// server). The local A2A override handlers (`a2a/overrides.rs`) read this cell to subscribe
+    /// *before* invoking the handler — that ordering is what avoids the upstream race where
+    /// terminal events emitted between snapshot read and subscribe were silently dropped.
+    pub a2a_event_tx: Arc<OnceLock<broadcast::Sender<StreamResponse>>>,
+    /// Shared A2A task store (cloned out of the `A2aServer` after construction).
+    pub a2a_task_store: Arc<OnceLock<TaskStore>>,
 }
 
 /// OpenAI-compatible message role

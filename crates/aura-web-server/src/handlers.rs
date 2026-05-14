@@ -616,8 +616,7 @@ async fn handle_streaming_completion(
     );
 
     use futures_util::TryStreamExt;
-    let response_stream =
-        ReceiverStream::new(rx).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+    let response_stream = ReceiverStream::new(rx).map_err(std::io::Error::other);
 
     Response::builder()
         .status(StatusCode::OK)
