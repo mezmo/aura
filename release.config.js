@@ -11,7 +11,6 @@ module.exports = {
 
   // https://github.com/semantic-release/exec
   prepareCmd: './scripts/set-version.sh ${nextRelease.version}; sleep 2',
-
   // https://github.com/esatterwhite/semantic-release-docker
   dockerProject: 'mezmo',
   dockerImage: 'aura',
