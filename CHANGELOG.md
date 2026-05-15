@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.20.2](https://github.com/mezmo/aura/compare/v1.20.1...v1.20.2) (2026-05-15)
+
+
+### Bug Fixes
+
+* **build**: update magic butler catalog for improved functions [5068cdc](https://github.com/mezmo/aura/commit/5068cdc1e2ec581c09bfa4911c038910f972ed45) - Phil Ciampini* **scratchpad**: bound recursive json walkers with depth cap [c1f5ad0](https://github.com/mezmo/aura/commit/c1f5ad05252faa72697f289151bda368b1943acb) - Justin Gross [LOG-23842](https://mezmo.atlassian.net/browse/LOG-23842)
+
+### Service
+
+* **setup**: remove trigger build stage [a416786](https://github.com/mezmo/aura/commit/a416786537cebf6652a1e02819dea89040b6a849) - Eric Satterwhite
+
 ## [1.20.1](https://github.com/mezmo/aura/compare/v1.20.0...v1.20.1) (2026-05-14)
 
 
