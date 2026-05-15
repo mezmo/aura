@@ -331,7 +331,7 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 | `aura.orchestrator.task_started` | Worker began executing a task |
 | `aura.orchestrator.task_completed` | Worker finished task (success/failure with duration) |
 | `aura.orchestrator.worker_reasoning` | Worker reasoning content with task/worker attribution |
-| `aura.orchestrator.iteration_complete` | Iteration finished with quality score, threshold, replan decision |
+| `aura.orchestrator.iteration_complete` | Iteration finished with replan decision and reasoning |
 | `aura.orchestrator.replan_started` | Replan cycle triggered (coordinator-routed or task failures) |
 | `aura.orchestrator.synthesizing` | Coordinator merging worker results (includes iteration number) |
 | `aura.orchestrator.tool_call_started` | Tool execution began within a worker task |
@@ -341,23 +341,36 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 
 ```mermaid
 flowchart TD
-    A([User query received]) --> B
+    A([User query received]) --> R{Coordinator routing}
 
-    B["plan_created<br/>(goal, tasks, routing_mode, routing_rationale)"]
+    R -->|orchestrated / routed| B["plan_created<br/>(goal, tasks, routing_mode, routing_rationale)"]
+    R -->|simple query| DA["direct_answer<br/>(response, routing_rationale)"]
+    R -->|ambiguous| CL["clarification_needed<br/>(question, options, routing_rationale)"]
+
+    DA --> Z([Done])
+    CL --> Z
+
     B --> C["task_started<br/>Worker assigned (task_id, worker_id, orchestrator_id)"]
     C --> D["worker_reasoning<br/>Worker thinking (task_id, worker_id, content)"]
     D --> E["tool_call_started<br/>Worker calls MCP tool (tool_call_id, tool_name, worker_id)"]
     E --> F["tool_call_completed<br/>Tool result (duration_ms, success)"]
     F --> G["task_completed<br/>Worker finished (duration_ms, success, result)"]
     G --> H["synthesizing<br/>Coordinator merging results (iteration)"]
-    H --> I["iteration_complete<br/>Quality scored (quality_score, quality_threshold,<br/>will_replan, evaluation_skipped, reasoning, gaps)"]
 
-    I -->|will_replan = false| Z([Done])
-    I -->|will_replan = true| J["replan_started<br/>trigger: 'quality' | 'failure'"]
-    J -->|loop back to plan_created| B
+    H --> PE{Post-execute routing}
+    PE -->|respond| DA2["direct_answer<br/>(response, routing_rationale)"]
+    PE -->|clarify| CL2["clarification_needed<br/>(question, options, routing_rationale)"]
+    PE -->|replan| J["replan_started<br/>trigger: 'post_execute_create_plan'"]
+
+    DA2 --> I["iteration_complete<br/>(will_replan: false)"]
+    CL2 --> I
+    J --> I2["iteration_complete<br/>(will_replan: true)"]
+    I2 -->|loop back| B
+
+    I --> Z
 ```
 
-**Alternative routing**: The coordinator may emit `direct_answer` (simple queries) or `clarification_needed` (ambiguous queries) instead of `plan_created`, skipping the orchestration loop entirely.
+**Routing decisions happen twice**: once on initial query (before any work) and again post-execute (after workers finish). Both paths can produce `direct_answer`, `clarification_needed`, or a new plan. The initial routing has no `iteration_complete`; the post-execute routing always emits one.
 
 ### Orchestration Event Formats
 
@@ -503,7 +516,7 @@ data:
 }
 ```
 
-**Iteration complete** (quality evaluation with replan decision):
+**Iteration complete** (replan decision after execution):
 ```
 event: aura.orchestrator.iteration_complete
 data:
@@ -511,17 +524,14 @@ data:
 ```json
 {
   "iteration": 1,
-  "quality_score": 0.85,
-  "quality_threshold": 0.7,
   "will_replan": false,
-  "evaluation_skipped": false,
-  "reasoning": "Response is complete and accurate",
+  "reasoning": "All tasks completed successfully",
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
 
-The `evaluation_skipped` field is `true` when a single-task plan completes successfully — the quality evaluation LLM call is skipped and `quality_score` defaults to `1.0`. The `gaps` field is included only when non-empty.
+The `reasoning` and `gaps` fields are included only when non-empty (i.e., when replanning is triggered).
 
 **Replan started** (new planning cycle triggered):
 ```
@@ -531,13 +541,13 @@ data:
 ```json
 {
   "iteration": 2,
-  "trigger": "quality",
+  "trigger": "post_execute_create_plan",
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
 
-Triggers: `"quality"` (score below threshold) or `"failure"` (worker task failures forced a replan).
+Triggers: `"post_execute_create_plan"` (coordinator routed back to planning after evaluating worker results).
 
 **Synthesizing** (consolidating task results for coordinator decision):
 ```
