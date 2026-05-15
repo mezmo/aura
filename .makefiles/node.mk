@@ -3,7 +3,7 @@ clean:: clean-node
 
 .PHONY:setup-node
 setup-node:  ## Setup node environment and dependencies
-	@if [ -z "$$(stat node_modules)" ]; then \
+	@if [ ! -d node_modules ]; then \
 		$(RUN_NO_ENV) npm install; \
 	fi
 
