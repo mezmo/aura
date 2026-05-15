@@ -112,19 +112,37 @@ There are many ways to contribute beyond writing code:
 
    Edit `.env` with your API keys. At minimum, you'll need an `OPENAI_API_KEY` if you plan to run the server or integration tests.
 
-5. **Build the project:**
+5. **Setup the environment:**
 
    ```bash
-   cargo build --workspace
+   make setup
    ```
 
-6. **Verify everything works:**
+6. **Build the project:**
 
    ```bash
-   cargo test --workspace
+   make build
+   ```
+
+7. **Verify everything works:**
+
+   ```bash
+   make test
    ```
 
    This runs unit tests across the workspace.
+
+8. **Lint the code:**
+
+   ```bash
+   make lint
+   ```
+
+9. **More make target for development:**
+
+   ```bash
+   make help
+   ```
 
 ## Project Structure
 
@@ -175,6 +193,7 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
    git pull origin main
    git checkout -b feat/your-feature-name
    ```
+See [Types](#types) for a complete list of branch name prefixes.
 
 2. **Make your changes**, keeping commits focused and atomic.
 
@@ -182,7 +201,7 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 
    ```bash
    make fmt-check
-   cargo test --workspace
+   make test
    ```
 
 4. **Push your branch** and open a pull request.
@@ -191,6 +210,8 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 
 | Command              | Description                           |
 | -------------------- | ------------------------------------- |
+| `make help`          | List all make targets                 |
+| `make setup`         | Set up development dependencies       |
 | `make build`         | Build all workspace crates            |
 | `make fmt`           | Format code with rustfmt              |
 | `make fmt-check`     | Check formatting (CI mode)            |
@@ -206,7 +227,7 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 All code must be formatted with `rustfmt`:
 
 ```bash
-cargo fmt --all
+make fmt-check
 ```
 
 CI will reject unformatted code. Run `make fmt` before committing.
@@ -216,7 +237,7 @@ CI will reject unformatted code. Run `make fmt` before committing.
 All code must pass `clippy` with warnings treated as errors:
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+make lint
 ```
 
 ### General Guidelines
@@ -235,7 +256,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 All contributors must run tests before submitting a PR:
 
 ```bash
-cargo test --workspace
+make test
 ```
 
 Unit tests don't require any external services or API keys.
@@ -247,6 +268,11 @@ Integration tests verify end-to-end behavior through the web server, including L
 If you have an API key and want to run integration tests locally:
 
 ```bash
+# Start full test run in a docker image
+make test-integration
+
+# or...
+
 # Start local test infrastructure (mock MCP servers + AURA)
 make test-integration-local-up
 
@@ -373,7 +399,7 @@ Update your config.toml files accordingly.
 2. **Run tests locally:**
 
    ```bash
-   cargo test --workspace
+   make test
    ```
 
 3. **Ensure all commits follow** the [Conventional Commits](#commit-message-convention) format.

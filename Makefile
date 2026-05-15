@@ -99,6 +99,9 @@ help:                 ## Show this help, includes list of all actions.
 .PHONY:build
 build:: $(BUILD_ENV)  ## Build all workspace binaries
 
+.PHONY:build-release
+build-release:: $(BUILD_ENV)  ## Build all workspace binaries in release mode
+
 .PHONY:test
 test::                ## Run all tests targets
 
