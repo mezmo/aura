@@ -62,7 +62,7 @@ See the [CLI README](../crates/aura-cli/README.md) for the full feature set.
 
 ## Customize Your Agent
 
-Edit `quickstart.toml` to change agent behavior, add tools, or enable RAG.
+Edit `quickstart.toml` to change agent behavior, add tools, or enable vector search.
 Edit `.env` to switch LLM providers. Then apply changes:
 
 ```bash
@@ -123,7 +123,7 @@ url = "http://host.docker.internal:9000/mcp"
 
 Use `host.docker.internal` to reach services running on your host machine.
 
-### Add RAG (vector search)
+### Add vector search
 
 Uncomment the `[[vector_stores]]` section in `quickstart.toml`. Options:
 
@@ -184,7 +184,7 @@ You are a knowledge specialist completing one assigned task.
 Search available documentation to answer the question.
 """
 mcp_filter = []
-vector_stores = ["docs"]       # this worker uses RAG instead of MCP tools
+vector_stores = ["docs"]       # this worker uses vector search instead of MCP tools
 turn_depth = 5
 ```
 

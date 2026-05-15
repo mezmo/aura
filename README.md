@@ -7,16 +7,16 @@ Key capabilities:
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
 - Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP Streamable transport
 - Automatic schema sanitization for OpenAI function-calling compatibility
-- RAG pipeline integration with in-memory, Qdrant, and AWS Bedrock Knowledge Base vector stores
+- Vector search integration with Qdrant and AWS Bedrock Knowledge Base
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
-- Dependency-aware multi-wave execution with iterative re-planning loops
+- Dependency-aware multi-wave execution with plan/execute loops
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
-- [Setup](#setup)
+- [Development Setup](#development-setup)
 - [Usage](#usage)
   - [Web API Server](#web-api-server)
   - [Client-Side Tools](#client-side-tools)
@@ -41,7 +41,7 @@ docker compose up -d           # starts Aura + LibreChat + Phoenix
 
 Open <http://localhost:3080> to chat, <http://localhost:6006> to inspect traces.
 
-**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling RAG, serving multiple agents, and troubleshooting.
+**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
 
 ### More Quickstarts
 
@@ -69,7 +69,7 @@ aura/
 └── tests/                   # Integration test fixtures and helpers
 ```
 
-## Setup
+## Development Setup
 
 1. Install Rust if needed:
    ```bash
@@ -84,9 +84,9 @@ aura/
    ```bash
    export OPENAI_API_KEY="your-api-key"
    ```
-4. Build:
+4. Build and run:
    ```bash
-   cargo build --release
+   cargo run --bin aura-web-server
    ```
 
 Security: keep secrets in environment variables and reference them in TOML using `{{ env.VAR_NAME }}`.
@@ -95,7 +95,7 @@ Security: keep secrets in environment variables and reference them in TOML using
 
 ### Web API Server
 
-Run the server:
+Run the web server:
 
 ```bash
 # Default: reads config.toml
@@ -112,6 +112,15 @@ HOST=0.0.0.0 PORT=3000 cargo run --bin aura-web-server
 
 # Enable Aura custom SSE events
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
+
+# Kitchen sink: all options
+CONFIG_PATH=configs/ \
+  HOST=0.0.0.0 PORT=8080 \
+  AURA_CUSTOM_EVENTS=true \
+  AURA_EMIT_REASONING=true \
+  TOOL_RESULT_MODE=aura \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  cargo run --bin aura-web-server -- --verbose
 ```
 
 Core server options:
@@ -280,22 +289,14 @@ Configuration sections:
 
 - `[agent]`: identity, system prompt, and runtime behavior.
 - `[agent.llm]`: provider and model configuration for the agent.
-- `[[vector_stores]]`: optional RAG/vector store configuration.
+- `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
 Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
 
-Supported MCP transports:
+Supported MCP transport:
 
-- `http_streamable` (recommended for production)
-- `sse`
-- `stdio` - for local processes. In production, bridge through [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) to avoid Rig.rs STDIO lifecycle issues:
-
-```bash
-mcp-proxy --port=8081 --host=127.0.0.1 npx your-mcp-server
-```
-
-Then point your config at the HTTP/SSE endpoint instead.
+- `http_streamable`
 
 `headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
 
@@ -565,7 +566,7 @@ Orchestrator components and loop:
 - Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
 - Worker agents: per-task instances with filtered MCP tools and vector stores.
 - Persistence/event layers: track plan state, task outcomes, and stream orchestration events.
-- Loop: Plan -> Execute (dependency waves) -> Continue (respond / replan / clarify).
+- Loop: Plan -> Execute (dependency waves) -> Continue (respond / plan again / clarify).
 
 Request execution and cancellation flow are documented in [docs/request-lifecycle.md](docs/request-lifecycle.md).
 
