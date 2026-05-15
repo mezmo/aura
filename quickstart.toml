@@ -38,8 +38,8 @@ model = "{{ env.LLM_MODEL }}"
 # url = "http://host.docker.internal:9000/mcp"
 # description = "My MCP tool server"
 
-# ── Vector Stores / RAG (optional) ──────────────────────────────────
-# Uncomment to enable retrieval-augmented generation with Qdrant.
+# ── Vector Search (optional) ─────────────────────────────────────────
+# Uncomment to enable vector search with Qdrant.
 #
 # [[vector_stores]]
 # name = "docs"
