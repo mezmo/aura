@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.20.3](https://github.com/mezmo/aura/compare/v1.20.2...v1.20.3) (2026-05-16)
+
+
+### Chores
+
+* set mezmobot as author of release commits [b375945](https://github.com/mezmo/aura/commit/b375945acfa52e61dc44d2bdcc9279758d904e45) - Eric Satterwhite
+
+### Service
+
+* **setup**: add allcontributors bot to cla allow list [9749bf7](https://github.com/mezmo/aura/commit/9749bf760bb0ee928306d61c6ad00c7fa33dfd1d) - Eric Satterwhite
+
 ## [1.20.2](https://github.com/mezmo/aura/compare/v1.20.1...v1.20.2) (2026-05-15)
 
 
