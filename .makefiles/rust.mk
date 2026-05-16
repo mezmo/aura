@@ -1,6 +1,10 @@
+fmt-check::fmt-rust
 lint:: lint-rust fmt-rust
 clean:: clean-rust clean-node clean-report
 build:: build-rust
+build-release:: AURA_RELEASE=1
+build-release:: build-rust
+test:: test-rust
 
 CARGO_BIN_DIR ?= .bin
 NEXTEST_BIN = $(CARGO_BIN_DIR)/cargo-nextest
@@ -18,6 +22,10 @@ $(REPORT_DIR):
 .PHONY:build-rust
 build-rust: $(DOCKER_ENV) ## Build all rust targets
 	$(RUN) cargo build --workspace $(if $(AURA_RELEASE),--release,) $(if $(IS_CI),--quiet,)
+
+.PHONY:test-rust
+test-rust: $(DOCKER_ENV) ## Test all rust targets
+	$(RUN) cargo test --workspace
 
 .PHONY:coverage
 coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite with code coverage
