@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.20.4](https://github.com/mezmo/aura/compare/v1.20.3...v1.20.4) (2026-05-17)
+
+
+### Bug Fixes
+
+* **toolchain**: add rust-analyzer to components [ea04dbc](https://github.com/mezmo/aura/commit/ea04dbce69f6d04ab5c9e8dcdcf68dcc299c54a0) - Mike Shearer [#151](https://github.com/mezmo/aura/issues/151)
+
 ## [1.20.3](https://github.com/mezmo/aura/compare/v1.20.2...v1.20.3) (2026-05-16)
 
 
