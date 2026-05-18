@@ -536,15 +536,9 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
-<<<<<<< HEAD
-- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
-- [examples/quickstart/README.md](examples/quickstart/README.md): LibreChat and Phoenix setup with Docker Compose.
-||||||| 7376bd4
-- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
-=======
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
 - [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
->>>>>>> main
+- [examples/quickstart/README.md](examples/quickstart/README.md): LibreChat and Phoenix setup with Docker Compose.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
