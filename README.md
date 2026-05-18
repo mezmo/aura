@@ -46,16 +46,18 @@ Key capabilities:
 aura/
 ├── crates/
 │   ├── aura/                # Core library (agent builder + orchestration)
+│   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
 │   ├── aura-config/         # TOML parser and config loader
-│   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
-│   └── aura-test-utils/     # Shared testing utilities
+│   ├── aura-events/         # Shared SSE event types
+│   ├── aura-test-utils/     # Shared testing utilities
+│   └── aura-web-server/     # OpenAI-compatible HTTP/SSE server
 ├── compose/                 # Docker Compose (integration + orchestration overlays)
 ├── configs/                 # E2E test and orchestration configurations
 ├── deployment/              # Helm charts and K8s manifests
-├── development/             # LibreChat and OpenWebUI setup
 ├── docs/                    # Architecture and protocol documentation
 ├── examples/                # Example and reference configurations
-└── scripts/                 # CI and utility scripts
+├── scripts/                 # CI and utility scripts
+└── tests/                   # Integration test fixtures and helpers
 ```
 
 ## Setup
@@ -151,8 +153,6 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
-
-For LibreChat/OpenWebUI integration, see [development/README.md](development/README.md).
 
 ### Client-Side Tools
 
@@ -288,7 +288,7 @@ mcp-proxy --port=8081 --host=127.0.0.1 npx your-mcp-server
 
 Then point your config at the HTTP/SSE endpoint instead.
 
-`headers_from_request` can forward incoming request headers to MCP servers for per-request auth. See [development/README.md](development/README.md) for practical examples.
+`headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
@@ -489,16 +489,8 @@ make lint
 
 # Build targets
 make build
-make build-release
 ```
 
-Test CI pipeline locally before pushing:
-
-```bash
-./scripts/test-ci.sh
-```
-
-The script mirrors Jenkins checks: format, workspace tests, and clippy with warnings denied.
 
 ## Testing
 
@@ -534,7 +526,7 @@ Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 - SRE orchestration suite: `integration-orchestration-sre` (requires k8s-sre-mcp server config)
 - Optional suite: `integration-vector` (requires external Qdrant setup)
 
-Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web-server/tests/README.md).
+Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-server/README.md).
 
 ## Documentation
 
@@ -544,7 +536,6 @@ Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
-- [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
@@ -566,7 +557,7 @@ Key architectural characteristics:
 
 - Dynamic MCP tool discovery at runtime.
 - Automatic schema sanitization (anyOf, missing types, optional parameters) driven by OpenAI function-calling requirements — MCP tool schemas are transformed at discovery time to conform to OpenAI's strict subset of JSON Schema.
-- Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.
+- Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.  See [examples/reference.toml](examples/reference.toml) for a practical example.
 - Config-driven composition with embeddable Rust core.
 
 Prompt routing and execution model:
