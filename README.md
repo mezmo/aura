@@ -154,14 +154,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
 
-<<<<<<< HEAD
 For LibreChat and Phoenix integration with Docker Compose, see the [quickstart guide](examples/quickstart/README.md).
 
-||||||| f1c9295
-For LibreChat/OpenWebUI integration, see [development/README.md](development/README.md).
-
-=======
->>>>>>> main
 ### Client-Side Tools
 
 > ---
@@ -296,13 +290,7 @@ mcp-proxy --port=8081 --host=127.0.0.1 npx your-mcp-server
 
 Then point your config at the HTTP/SSE endpoint instead.
 
-<<<<<<< HEAD
 `headers_from_request` can forward incoming request headers to MCP servers for per-request auth. See [`examples/reference.toml`](examples/reference.toml) for a practical example.
-||||||| f1c9295
-`headers_from_request` can forward incoming request headers to MCP servers for per-request auth. See [development/README.md](development/README.md) for practical examples.
-=======
-`headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
->>>>>>> main
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
@@ -505,19 +493,6 @@ make lint
 make build
 ```
 
-<<<<<<< HEAD
-||||||| f1c9295
-Test CI pipeline locally before pushing:
-
-```bash
-./scripts/test-ci.sh
-```
-
-The script mirrors Jenkins checks: format, workspace tests, and clippy with warnings denied.
-
-=======
-
->>>>>>> main
 ## Testing
 
 Web server integration tests live under `crates/aura-web-server/tests/`.
@@ -562,12 +537,7 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
-<<<<<<< HEAD
 - [examples/quickstart/README.md](examples/quickstart/README.md): LibreChat and Phoenix setup with Docker Compose.
-||||||| f1c9295
-- [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
-=======
->>>>>>> main
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
