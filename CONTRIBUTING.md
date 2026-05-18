@@ -124,7 +124,7 @@ There are many ways to contribute beyond writing code:
    cargo test --workspace
    ```
 
-   This runs formatting checks, unit tests, and clippy in one command.
+   This runs unit tests across the workspace.
 
 ## Project Structure
 
@@ -133,18 +133,21 @@ Understanding the crate layout will help you navigate the codebase:
 ```text
 aura/
 ├── crates/
-│   ├── aura/                # Core agent builder library
+│   ├── aura/                # Core agent builder library and orchestration
+│   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
 │   ├── aura-config/         # TOML parser and config loader
+│   ├── aura-events/         # Shared SSE event types (lightweight, no agent deps)
 │   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
 │   └── aura-test-utils/     # Shared testing utilities
 ├── compose/                 # Docker Compose files for testing
+├── configs/                 # Integration test and example configurations
+├── deployment/              # Helm charts and K8s manifests
 ├── docs/                    # Architecture and protocol documentation
 ├── examples/                # Example TOML configurations
 │   ├── reference.toml       # Complete annotated configuration
 │   ├── minimal/             # Bare minimum per-provider configs
 │   └── complete/            # Full agent composition examples
-├── scripts/                 # CI and utility scripts
-└── development/             # LibreChat and OpenWebUI integration
+└── scripts/                 # CI and utility scripts
 ```
 
 **Key architectural docs** to read before diving into the code:
@@ -189,16 +192,12 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
 | Command              | Description                           |
 | -------------------- | ------------------------------------- |
 | `make build`         | Build all workspace crates            |
-| `make build-release` | Build in release mode                 |
 | `make fmt`           | Format code with rustfmt              |
 | `make fmt-check`     | Check formatting (CI mode)            |
 | `make lint`          | Run clippy with warnings as errors    |
 | `make test`          | Run cargo tests + integration tests   |
 | `make ci`            | Run all checks: fmt-check, test, lint |
 | `make clean`         | Clean build artifacts                 |
-
-
-```
 
 ## Code Quality Standards
 
@@ -259,6 +258,15 @@ make test-integration-local-down
 
 # Or do it all in one command:
 make test-integration-local
+
+# Orchestration integration tests
+make test-integration-orchestration-local
+
+# SRE orchestration integration tests
+make test-integration-sre-orchestration-local
+
+# Scratchpad integration tests
+make test-integration-scratchpad-local
 ```
 
 Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate limits.
