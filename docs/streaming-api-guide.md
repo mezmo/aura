@@ -358,15 +358,6 @@ flowchart TD
     F --> G["task_completed<br/>Worker finished (duration_ms, success, result)"]
     G --> H["synthesizing<br/>Coordinator merging results (iteration)"]
 
-<<<<<<< HEAD
-    I -->|will_replan = false| Z([Done])
-    I -->|will_replan = true| J["replan_started<br/>trigger: 'coordinator' | 'failure'"]
-    J -->|loop back to plan_created| B
-||||||| 7376bd4
-    I -->|will_replan = false| Z([Done])
-    I -->|will_replan = true| J["replan_started<br/>trigger: 'quality' | 'failure'"]
-    J -->|loop back to plan_created| B
-=======
     H --> PE{Post-execute routing}
     PE -->|respond| DA2["direct_answer<br/>(response, routing_rationale)"]
     PE -->|clarify| CL2["clarification_needed<br/>(question, options, routing_rationale)"]
@@ -378,7 +369,6 @@ flowchart TD
     I2 -->|loop back| B
 
     I --> Z
->>>>>>> main
 ```
 
 **Routing decisions happen twice**: once on initial query (before any work) and again post-execute (after workers finish). Both paths can produce `direct_answer`, `clarification_needed`, or a new plan. The initial routing has no `iteration_complete`; the post-execute routing always emits one.
@@ -552,25 +542,13 @@ data:
 ```json
 {
   "iteration": 2,
-<<<<<<< HEAD
-  "trigger": "coordinator",
-||||||| 7376bd4
-  "trigger": "quality",
-=======
   "trigger": "post_execute_create_plan",
->>>>>>> main
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
 
-<<<<<<< HEAD
-Triggers: `"coordinator"` (coordinator routed back to planning) or `"failure"` (worker task failures forced a replan).
-||||||| 7376bd4
-Triggers: `"quality"` (score below threshold) or `"failure"` (worker task failures forced a replan).
-=======
 Triggers: `"post_execute_create_plan"` (coordinator routed back to planning after evaluating worker results).
->>>>>>> main
 
 **Synthesizing** (consolidating task results for coordinator decision):
 ```
