@@ -105,6 +105,14 @@ test::                ## Run all tests targets
 .PHONY:setup
 setup::              ## Setup local depencies for development
 
+.PHONY:fmt
+fmt::                 ## Format code with rustfmt
+	cargo fmt --all
+
+.PHONY:fmt-check
+fmt-check::           ## Check code formatting (CI)
+	cargo fmt --all -- --check
+
 .PHONY:lint
 lint::                ## Apply all lint targets
 
