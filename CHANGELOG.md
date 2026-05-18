@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.20.6](https://github.com/mezmo/aura/compare/v1.20.5...v1.20.6) (2026-05-18)
+
+
+### Chores
+
+* **owners**: add codeowners [9593804](https://github.com/mezmo/aura/commit/95938042165a61f7b32bfbdf6e928781236653cc) - Phil Ciampini
+
 ## [1.20.5](https://github.com/mezmo/aura/compare/v1.20.4...v1.20.5) (2026-05-18)
 
 
