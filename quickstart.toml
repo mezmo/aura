@@ -1,12 +1,11 @@
 # Aura Quickstart Configuration
 #
 # Customize this file to change your agent's behavior, tools, and
-# RAG pipelines. Changes take effect after: docker compose restart aura
+# knowledge bases. Changes take effect after: docker compose restart aura
 #
 # For all available options, see: examples/reference.toml
 
-# ── LLM Provider ────────────────────────────────────────────────────
-# Provider, model, and API key are set in .env — no changes needed here.
+# ── Agent ───────────────────────────────────────────────────────────
 
 [agent]
 name = "Aura Assistant"
@@ -17,6 +16,16 @@ knowledge bases. Use them to provide accurate, grounded answers.
 """
 # Maximum tool-calling rounds per user turn
 turn_depth = 5
+
+# ── LLM Provider ────────────────────────────────────────────────────
+# Provider, model, and API key are set in .env — no changes needed here.
+
+[agent.llm]
+provider = "{{ env.LLM_PROVIDER }}"
+api_key = "{{ env.LLM_API_KEY }}"
+model = "{{ env.LLM_MODEL }}"
+# base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama or llama-server
+# fallback_tool_parsing = true            # Uncomment for Ollama
 
 # ── MCP Tool Servers (optional) ─────────────────────────────────────
 # Uncomment and configure to give your agent access to external tools.
@@ -29,8 +38,8 @@ turn_depth = 5
 # url = "http://host.docker.internal:9000/mcp"
 # description = "My MCP tool server"
 
-# ── Vector Stores / RAG (optional) ──────────────────────────────────
-# Uncomment to enable retrieval-augmented generation with Qdrant.
+# ── Vector Search (optional) ─────────────────────────────────────────
+# Uncomment to enable vector search with Qdrant.
 #
 # [[vector_stores]]
 # name = "docs"
@@ -43,13 +52,3 @@ turn_depth = 5
 # provider = "openai"
 # model = "text-embedding-3-small"
 # api_key = "{{ env.OPENAI_API_KEY }}"
-
-[agent.llm]
-provider = "{{ env.LLM_PROVIDER }}"
-api_key = "{{ env.LLM_API_KEY }}"
-model = "{{ env.LLM_MODEL }}"
-# base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama
-# fallback_tool_parsing = true            # Uncomment for Ollama
-
-# ── Agent ───────────────────────────────────────────────────────────
-
