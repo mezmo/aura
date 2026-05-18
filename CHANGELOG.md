@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.20.5](https://github.com/mezmo/aura/compare/v1.20.4...v1.20.5) (2026-05-18)
+
+
+### Bug Fixes
+
+* **test**: mount quickstart.toml in test container [401d991](https://github.com/mezmo/aura/commit/401d991c75ce1830d03ba1bb7e49851117b889ef) - Eric Lake
+
+### Documentation
+
+* add sane defaults for optional MCP server credentials [b62002c](https://github.com/mezmo/aura/commit/b62002cd4842390cffc17c681c1193fd1200b0d7) - Eric Lake* address inline review feedback [060789f](https://github.com/mezmo/aura/commit/060789f26f088c56982ff9c3f5f01efbe5da5276) - Eric Lake [#139](https://github.com/mezmo/aura/issues/139)* audit fixes, cross-reference consistency, and internal doc cleanup [917134a](https://github.com/mezmo/aura/commit/917134aeec9ca18e09b37faaca405f1fea4274d7) - Eric Lake [#100](https://github.com/mezmo/aura/issues/100)* move quickstart to repo root and streamline onboarding [873880f](https://github.com/mezmo/aura/commit/873880fd89b5f160478f84673957decba88ed4a0) - Eric Lake* **readme**: directory structure and makefiles [7376bd4](https://github.com/mezmo/aura/commit/7376bd42b30cb0c0eaba0a0864a76899e304c0f8) - Dominic McAllister* revert CODE_OF_CONDUCT.md change, defer to separate PR [ce609ae](https://github.com/mezmo/aura/commit/ce609ae25f88e9f214423378185d1fd1b5d07ed4) - Eric Lake* **streaming**: fix stale quality-scoring references and event flow diagram [c2bc7ac](https://github.com/mezmo/aura/commit/c2bc7ac3f0572c3221f88289cf8c0c391eb8fcc9) - Eric Lake [#146](https://github.com/mezmo/aura/issues/146) [#147](https://github.com/mezmo/aura/issues/147)* use env_file for .env loading and document provider-specific keys [f50107b](https://github.com/mezmo/aura/commit/f50107beb23cad3997869178202ff1859c95fda4) - Eric Lake
+
 ## [1.20.4](https://github.com/mezmo/aura/compare/v1.20.3...v1.20.4) (2026-05-17)
 
 
