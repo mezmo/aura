@@ -70,12 +70,14 @@ Client POST /v1/chat/completions
 
 | Setting | Default | Env Variable | Purpose |
 |---------|---------|--------------|---------|
+| First chunk timeout | 30 sec | `FIRST_CHUNK_TIMEOUT_SECS` | Max wait for first provider chunk |
 | Stream timeout | 15 min | `STREAMING_TIMEOUT_SECS` | Max request duration |
 | Shutdown grace period | 30 sec | `SHUTDOWN_TIMEOUT_SECS` | Time for in-flight requests to finish on shutdown |
 | Heartbeat | 15 sec | — | Disconnect detection |
 
 ### Rationale
 
+- **First chunk timeout (30 sec)**: Catches provider connection failures early. If the LLM hasn't sent any data within this window, the request is aborted rather than hanging for the full stream timeout.
 - **Stream timeout (15 min)**: Supports long-running MCP tools. Set to 0 to disable (not recommended).
 - **Heartbeat (15 sec)**: Standard SSE keepalive. Detects disconnect during silent tool execution.
 

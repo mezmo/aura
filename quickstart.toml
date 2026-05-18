@@ -1,7 +1,7 @@
 # Aura Quickstart Configuration
 #
 # Customize this file to change your agent's behavior, tools, and
-# RAG pipelines. Changes take effect after: docker compose restart aura
+# knowledge bases. Changes take effect after: docker compose restart aura
 #
 # For all available options, see: examples/reference.toml
 

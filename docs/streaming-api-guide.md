@@ -43,6 +43,7 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `TOOL_RESULT_MODE` | `none` | `none`, `open-web-ui`, or `aura` |
 | `TOOL_RESULT_MAX_LENGTH` | `1000` | Max chars for tool results (0 = no truncation) |
 | `STREAMING_TIMEOUT_SECS` | `900` | Request timeout in seconds (0 = no timeout) |
+| `FIRST_CHUNK_TIMEOUT_SECS` | `30` | Max seconds to wait for first provider chunk before aborting |
 | `STREAMING_BUFFER_SIZE` | `400` | Chunks to buffer before backpressure |
 | `AURA_CUSTOM_EVENTS` | `false` | Enable custom `aura.*` events |
 | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` events |

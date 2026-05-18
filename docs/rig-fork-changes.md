@@ -3,12 +3,12 @@
 ## Repository
 
 - **Fork**: https://github.com/mezmo/rig
-- **Branch**: `fix/toolserver-span-propagation`
+- **Branch**: `mezmo`
 - **Base**: rig-core 0.28.x
 
 ## Why a Fork?
 
-AURA depends on a small set of fixes to rig-core that have not yet been accepted upstream. The fork is a superset of upstream and is intended to be temporary.
+Aura relies on a small set of enhancements to rig-core required for its streaming architecture. These are maintained in this fork; as Rig evolves, the goal is to converge with upstream or adapt as needed.
 
 ## Changes
 
@@ -33,21 +33,33 @@ Adds `tracing::Instrument` spans around tool server calls so that OpenTelemetry 
 
 Ensures the correct `Content-Type` header is set on provider API requests.
 
+## Tool Execution Order
+
+Aura's streaming event correlation (tool_call_id tracking between hook and MCP execution) relies on Rig's streaming mode executing tools **sequentially**:
+
+```
+tool_call_1 → execute_1 → result_1 → tool_call_2 → execute_2 → result_2 → ...
+```
+
+This is guaranteed by the `.await` on each tool's async block in `rig-core/src/agent/prompt_request/streaming.rs` — each tool completes before the next stream item is processed.
+
+**If upgrading Rig**, verify this sequential guarantee still holds. Look for `FuturesUnordered` or parallel execution patterns in the streaming handler — those would break the FIFO correlation logic used for Aura's streaming event tracking.
+
 ## Usage
 
 ```toml
 # Cargo.toml
 [workspace.dependencies]
-rig-core = { git = "https://github.com/mezmo/rig.git", branch = "fix/toolserver-span-propagation", features = ["rmcp"] }
+rig-core = { git = "https://github.com/mezmo/rig.git", branch = "mezmo", features = ["rmcp"] }
 
 [patch.crates-io]
-rig-core = { git = "https://github.com/mezmo/rig.git", branch = "fix/toolserver-span-propagation" }
+rig-core = { git = "https://github.com/mezmo/rig.git", branch = "mezmo" }
 ```
 
 ## Removing the Fork
 
-When upstream rig-core incorporates these fixes:
+If upstream rig-core incorporates equivalent functionality:
 
 1. Update `rig-core` to the official release version
 2. Remove the `[patch.crates-io]` section
-3. Delete this document
+3. Update this document

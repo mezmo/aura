@@ -71,6 +71,8 @@ aura/
 
 ## Development Setup
 
+For building Aura from source without Docker.
+
 1. Install Rust if needed:
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -248,9 +250,13 @@ When the loaded agent doesn't opt in (the default), any `tools` field on the req
 
 ## Configuration
 
-> **Breaking changes (21 April 2026)**: `[llm]` has moved under `[agent.llm]` and workers may now override the LLM via `[orchestration.worker.<name>.llm]`. See [./docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md).
->
-> **Breaking changes (10 April 2026)**: Several fields moved from `[agent]` to `[llm]` and Ollama-specific fields have been consolidated under `[llm.additional_params]`. See [./docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md).
+<details>
+<summary>Recent breaking changes</summary>
+
+- **21 April 2026**: `[llm]` moved under `[agent.llm]`; workers may override via `[orchestration.worker.<name>.llm]`. See [migration guide](docs/breaking-changes/20260421-llm-under-agent.md).
+- **10 April 2026**: Several fields moved from `[agent]` to `[llm]`; Ollama params consolidated under `[llm.additional_params]`. See [migration guide](docs/breaking-changes/20260410-agent-llm-toml-configuration.md).
+
+</details>
 
 `CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
@@ -398,7 +404,6 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
-| `memory_dir` | string | — | **Legacy** — prefer top-level `memory_dir`. Directory for cross-iteration artifact persistence. Equivalent to `[orchestration.artifacts].memory_dir` |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
@@ -417,7 +422,9 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 
 ### Scratchpad (Context Window Management)
 
-Scratchpad intercepts large MCP tool outputs and stores them on disk so the LLM can selectively explore them via eight read-only tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) rather than pushing the entire payload into context.
+MCP tools can return responses far larger than an LLM's context window — a single Kubernetes workload listing or log export can be tens of thousands of tokens. Without intervention, this fills the context and degrades reasoning quality.
+
+Scratchpad solves this by intercepting large tool outputs and storing them on disk. The LLM gets a summary and eight read-only exploration tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) to selectively pull in only the data it needs.
 
 Scratchpad works in both single-agent and orchestration modes. Configure at `[agent.scratchpad]` (applies to the single agent, or provides defaults for orchestration workers) and optionally override per worker at `[orchestration.worker.<name>.scratchpad]`. Set a top-level `memory_dir` for persistence:
 
@@ -464,7 +471,7 @@ Aura supports Ollama, including fallback tool-call parsing for models that emit 
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
+Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Development and Testing
 
@@ -483,7 +490,6 @@ make lint
 # Build targets
 make build
 ```
-
 
 ## Testing
 
@@ -527,9 +533,9 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
-- [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
-- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
+- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
+- [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
@@ -539,12 +545,14 @@ Aura separates concerns across crates:
 
 - `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.
+- `aura-events`: shared SSE event types (`AuraStreamEvent`, `OrchestrationStreamEvent`) — lightweight, no agent dependencies.
 - `aura-web-server`: OpenAI-compatible REST/SSE serving layer.
+- `aura-cli`: interactive terminal client with HTTP and standalone modes.
 
 This separation means:
 
 - Embeddable core: use `aura` directly in any Rust application without config file dependencies.
-- Flexible config: `aura-config` can be extended to support other formats (JSON, YAML).
+- Shared event types: `aura-events` can be consumed by any Rust client without pulling in the full agent stack.
 - Testable boundaries: each crate has focused responsibilities and clear interfaces.
 
 Key architectural characteristics:
