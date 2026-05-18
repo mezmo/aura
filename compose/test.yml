@@ -40,6 +40,7 @@ services:
       # config and example files needed by test_all_shipped_configs_parse
       - $PWD/configs:/home/aura/configs:ro
       - $PWD/examples:/home/aura/examples:ro
+      - $PWD/quickstart.toml:/home/aura/quickstart.toml:ro
     env_file:
       - ./env/test.env
     depends_on:
