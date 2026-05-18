@@ -7,7 +7,7 @@ endpoints:
   custom:
     - name: "Aura"
       apiKey: "not_used"
-      baseURL: "http://aura:3000/v1"
+      baseURL: "http://aura:8080/v1"
       models:
         default:
           - "Aura Assistant"
