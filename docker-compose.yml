@@ -1,26 +1,18 @@
 services:
-  # ── Aura Agent Server ───────────────────────────────────────────────
+  # ── Aura Agent Server ──────────────────────────────────────────────
   aura:
-    image: mezmo/aura:1
+    image: mezmo/aura:1-latest
     container_name: aura
     command:
       - ./aura-web-server
       - --verbose
     ports:
-      - "3000:3000"
+      - "8080:8080"
+    env_file: .env
     environment:
       HOST: "0.0.0.0"
-      PORT: "3000"
-      CONFIG_PATH: "/app/config/config.toml"  # Can also be a directory for multi-agent serving
-
-      # LLM provider config (from .env)
-      LLM_PROVIDER: "${LLM_PROVIDER:-openai}"
-      LLM_MODEL: "${LLM_MODEL:-gpt-5.2}"
-      LLM_API_KEY: "${LLM_API_KEY:-}"
-      LLM_BASE_URL: "${LLM_BASE_URL:-}"
-
-      # Optional: Mezmo
-      MEZMO_API_KEY: "${MEZMO_API_KEY:-}"
+      PORT: "8080"
+      CONFIG_PATH: "/app/config/quickstart.toml"
 
       # Streaming — custom events disabled because LibreChat's SSE
       # parser doesn't skip unknown event types (aura.session_info, etc.)
@@ -32,9 +24,9 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://phoenix:4317"
       OTEL_RECORD_CONTENT: "true"
     volumes:
-      - ./config.toml:/app/config/config.toml:ro
+      - ./quickstart.toml:/app/config/quickstart.toml:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -43,7 +35,7 @@ services:
     networks:
       - aura-quickstart
 
-  # ── LibreChat (Chat UI) ────────────────────────────────────────────
+  # ── LibreChat (chat UI) ────────────────────────────────────────────
   librechat-mongodb:
     image: mongo:latest
     container_name: aura-qs-mongodb
@@ -76,12 +68,12 @@ services:
       JWT_SECRET: "16f8c0ef4a5d391b26034086c628469d3f9f497f08163ab9b40137092f2909ef"
       JWT_REFRESH_SECRET: "eaa5191f2914e30b9387fd84e254e4ba6fc51b4654968a9b0803b456a54b8418"
     volumes:
-      - ./configs/librechat.yaml:/app/librechat.yaml:ro
+      - ./quickstart/librechat.yaml:/app/librechat.yaml:ro
     restart: unless-stopped
     networks:
       - aura-quickstart
 
-  # ── Phoenix (LLM Trace Viewer) ─────────────────────────────────────
+  # ── Phoenix (LLM trace viewer) ─────────────────────────────────────
   phoenix:
     image: arizephoenix/phoenix:latest
     container_name: aura-qs-phoenix
