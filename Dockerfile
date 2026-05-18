@@ -69,10 +69,11 @@ WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
-# Build the web server binary in release mode
+# Build the web server and CLI binaries in release mode
 RUN <<EOR
   cargo clean
   cargo build --release --bin aura-web-server
+  cargo build --release -p aura-cli --bin aura-cli
 EOR
 
 # 005: release - Runtime stage with newer glibc
@@ -91,8 +92,9 @@ RUN useradd -r -s /bin/false appuser
 WORKDIR /app
 RUN mkdir -p /app/config && chown -R appuser:appuser /app
 
-# Copy binary from release-build stage
+# Copy binaries from release-build stage
 COPY --from=release-build /usr/src/app/target/release/aura-web-server /app/
+COPY --from=release-build /usr/src/app/target/release/aura-cli /app/
 
 # Switch to app user
 USER appuser
