@@ -20,7 +20,7 @@ url = "https://mcp.pagerduty.com/mcp"
 description = "PagerDuty incident management, on-call schedules, and escalation"
 
 [mcp.servers.pagerduty.headers]
-Authorization = "Token {{ env.PAGERDUTY_API_TOKEN }}"
+Authorization = "Token {{ env.PAGERDUTY_API_TOKEN | default: '' }}"
 
 # Datadog — metrics, monitors, and dashboards
 [mcp.servers.datadog]
@@ -29,8 +29,8 @@ url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp"
 description = "Datadog metrics, monitors, dashboards, and APM traces"
 
 [mcp.servers.datadog.headers]
-DD-API-KEY = "{{ env.DD_API_KEY }}"
-DD-APPLICATION-KEY = "{{ env.DD_APPLICATION_KEY }}"
+DD-API-KEY = "{{ env.DD_API_KEY | default: '' }}"
+DD-APPLICATION-KEY = "{{ env.DD_APPLICATION_KEY | default: '' }}"
 
 [agent]
 name = "Incident Response Agent"
