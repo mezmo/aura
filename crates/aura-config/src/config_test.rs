@@ -1377,9 +1377,9 @@ context_window = 200000
             repo_root.join("configs"),
             repo_root.join("examples/minimal"),
             repo_root.join("examples/complete"),
-            repo_root.join("examples/quickstart"),
         ];
         let single_files = [
+            repo_root.join("quickstart.toml"),
             repo_root.join("examples/reference.toml"),
             repo_root.join("crates/aura-web-server/tests/test-config.toml"),
         ];

@@ -19,7 +19,7 @@ url = "https://mcp.pagerduty.com/mcp"
 description = "PagerDuty incident management, on-call schedules, and escalation"
 
 [mcp.servers.pagerduty.headers]
-Authorization = "Token {{ env.PAGERDUTY_API_TOKEN }}"
+Authorization = "Token {{ env.PAGERDUTY_API_TOKEN | default: '' }}"
 
 # Mezmo — log analysis and export
 [mcp.servers.mezmo]
@@ -28,7 +28,7 @@ url = "https://mcp.mezmo.com/mcp"
 description = "Mezmo log analysis, export, and pipeline monitoring"
 
 [mcp.servers.mezmo.headers]
-Authorization = "Bearer {{ env.MEZMO_API_KEY }}"
+Authorization = "Bearer {{ env.MEZMO_API_KEY | default: '' }}"
 
 [agent]
 name = "Incident Response Agent"
