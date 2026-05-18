@@ -154,6 +154,11 @@ Then update `docker-compose.yml` to mount and serve the directory:
 
 Restart with `docker compose up -d`. Clients that support model selection (LibreChat, OpenWebUI, etc.) will show each agent in their model picker via `GET /v1/models`.
 
+> **Note:** The example configs in `examples/` reference provider-specific env vars
+> (e.g. `OPENAI_API_KEY`) rather than the quickstart's `LLM_API_KEY`. Add the
+> appropriate keys to your `.env` — they're automatically loaded into the container
+> via `env_file`. See `.env.example` for the full list.
+
 ### Enable orchestration mode
 
 Orchestration mode routes requests through a **coordinator** that decomposes problems into tasks and dispatches them to **workers** — each with access to a filtered subset of MCP tools.

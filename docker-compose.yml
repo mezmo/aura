@@ -8,19 +8,11 @@ services:
       - --verbose
     ports:
       - "8080:8080"
+    env_file: .env
     environment:
       HOST: "0.0.0.0"
       PORT: "8080"
       CONFIG_PATH: "/app/config/quickstart.toml"
-
-      # LLM provider config (from .env)
-      LLM_PROVIDER: "${LLM_PROVIDER:-openai}"
-      LLM_MODEL: "${LLM_MODEL:-gpt-5.2}"
-      LLM_API_KEY: "${LLM_API_KEY:-}"
-      LLM_BASE_URL: "${LLM_BASE_URL:-}"
-
-      # Optional: Mezmo
-      MEZMO_API_KEY: "${MEZMO_API_KEY:-}"
 
       # Streaming — custom events disabled because LibreChat's SSE
       # parser doesn't skip unknown event types (aura.session_info, etc.)
