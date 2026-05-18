@@ -159,7 +159,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "1.20.8"
+version = "1.21.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -171,6 +171,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "http 1.4.0",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -194,12 +195,13 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "aura-cli"
-version = "1.20.8"
+version = "1.21.0"
 dependencies = [
  "anyhow",
  "aura",
@@ -233,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "1.20.8"
+version = "1.21.0"
 dependencies = [
  "anyhow",
  "aura",
@@ -257,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "aura-events"
-version = "1.20.8"
+version = "1.21.0"
 dependencies = [
  "rmcp",
  "serde",
@@ -266,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "1.20.8"
+version = "1.21.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -276,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "1.20.8"
+version = "1.21.0"
 dependencies = [
  "async-stream",
  "aura",

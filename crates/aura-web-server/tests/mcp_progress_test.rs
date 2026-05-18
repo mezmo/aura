@@ -3,7 +3,7 @@
 //! Integration tests for MCP progress notification forwarding.
 //!
 
-use aura::mcp_streamable_http::StreamableHttpMcpClient;
+use aura::mcp_streamable_http::McpClient;
 use aura::{request_progress_global, request_progress_subscribe, request_progress_unsubscribe};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -12,11 +12,7 @@ use tokio::time::timeout;
 #[tokio::test]
 async fn test_mcp_progress_notifications_received() {
     // Skip if mock server not running
-    let client = match StreamableHttpMcpClient::new(
-        "http://127.0.0.1:9999/mcp".to_string(),
-        &HashMap::new(),
-    )
-    .await
+    let client = match McpClient::new("http://127.0.0.1:9999/mcp".to_owned(), &HashMap::new()).await
     {
         Ok(c) => c,
         Err(_) => {
@@ -111,11 +107,7 @@ async fn test_mcp_progress_notifications_received() {
 #[tokio::test]
 async fn test_call_tool_without_progress_still_works() {
     // Skip if mock server not running
-    let client = match StreamableHttpMcpClient::new(
-        "http://127.0.0.1:9999/mcp".to_string(),
-        &HashMap::new(),
-    )
-    .await
+    let client = match McpClient::new("http://127.0.0.1:9999/mcp".to_owned(), &HashMap::new()).await
     {
         Ok(c) => c,
         Err(_) => {

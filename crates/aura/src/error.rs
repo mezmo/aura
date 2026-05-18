@@ -1,6 +1,27 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+pub enum SseTransportError {
+    #[error("SSE stream error: {0}")]
+    SseStream(#[from] sse_stream::Error),
+
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("Missing Content-Type header from SSE endpoint")]
+    MissingContentType,
+
+    #[error("Unexpected Content-Type: expected 'text/event-stream', got '{0}'")]
+    UnexpectedContentType(String),
+
+    #[error("URL parse error: {0}")]
+    UrlParse(#[from] url::ParseError),
+
+    #[error("SSE endpoint event not received")]
+    MissingEndpointEvent,
+}
+
+#[derive(Error, Debug)]
 pub enum BuilderError {
     #[error("Invalid provider: {0}")]
     InvalidProvider(String),
@@ -25,6 +46,9 @@ pub enum BuilderError {
 
     #[error("RMCP error: {0}")]
     RmcpError(#[from] rmcp::ErrorData),
+
+    #[error("SSE transport error: {0}")]
+    SseTransport(#[from] SseTransportError),
 
     #[error("Other error: {0}")]
     Other(String),
