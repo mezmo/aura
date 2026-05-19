@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.20.8](https://github.com/mezmo/aura/compare/v1.20.7...v1.20.8) (2026-05-19)
+
+
+### Chores
+
+* **config**: remove legacy debug binaries from aura-config [4d24108](https://github.com/mezmo/aura/commit/4d24108690c82c365e4c1d63041087acab3052d2) - Mike Shearer [#161](https://github.com/mezmo/aura/issues/161)
+
 ## [1.20.7](https://github.com/mezmo/aura/compare/v1.20.6...v1.20.7) (2026-05-19)
 
 
