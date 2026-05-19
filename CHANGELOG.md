@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.20.7](https://github.com/mezmo/aura/compare/v1.20.6...v1.20.7) (2026-05-19)
+
+
+### Bug Fixes
+
+* **quickstart**: always pull aura image so new releases land [86ab9a5](https://github.com/mezmo/aura/commit/86ab9a5066733c0db86d8384c364bcd214ecc52d) - Chip Johnson [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
 ## [1.20.6](https://github.com/mezmo/aura/compare/v1.20.5...v1.20.6) (2026-05-18)
 
 
