@@ -335,10 +335,22 @@ url = "http://localhost:8081/mcp"
 headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
 ```
 
-Validate config parsing quickly:
+Validate built-in config examples and tests:
 
 ```bash
-cargo run -p aura-config --bin debug_config
+cargo test -p aura-config
+```
+
+This runs all config validation tests, including `test_all_shipped_configs_parse` which validates every `.toml` file in `configs/`, `examples/`, and `quickstart.toml`.
+
+To validate your own config file, start the web server or CLI — both validate the config immediately and exit with a clear error if parsing fails, before binding to any port or entering the REPL:
+
+```bash
+# Validate via web server (exits on parse error before binding)
+cargo run -p aura-web-server -- --config your-config.toml
+
+# Validate via standalone CLI (exits on parse error before REPL)
+cargo run -p aura-cli --features standalone-cli -- --standalone --config your-config.toml
 ```
 
 ### Orchestration

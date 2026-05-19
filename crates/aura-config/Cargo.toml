@@ -38,17 +38,6 @@ tracing = { workspace = true }
 dotenv = { workspace = true }
 regex = { workspace = true }
 
-# Logging for binaries
-tracing-subscriber = { workspace = true }
-
 [dev-dependencies]
 tempfile = "3"
-
-[[bin]]
-name = "debug_config"
-path = "src/bin/debug_config.rs"
-
-[[bin]]
-name = "architecture_diagram"
-path = "src/bin/architecture_diagram.rs"
 
