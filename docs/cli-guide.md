@@ -278,6 +278,56 @@ Toggle with `/stream` to see raw SSE events in real time. Supported event types:
 
 Events use shared types from the `aura-events` crate, ensuring identical parsing between HTTP and standalone modes.
 
+## Reasoning Output
+
+Models that support extended thinking (Anthropic Claude with extended thinking, OpenAI o-series) stream their reasoning process in real time.
+
+### Single-Agent Mode
+
+Reasoning appears as a top-level block:
+
+```
+● Reasoning
+⎿ Let me analyze the request step by step...
+```
+
+Content streams in real time, updating in place as chunks arrive.
+
+### Orchestration Mode
+
+In multi-agent orchestration, reasoning appears in two places.
+
+**Coordinator reasoning** displays at the top level:
+
+```
+● Reasoning - coordinator
+⎿ I need to decompose this into multiple tasks...
+```
+
+**Worker reasoning** displays inline within the worker's task tree:
+
+```
+● Task 0: Analyze logs [log_worker] - done
+├─ ● ReadFile(path="/var/log/app.log")
+│  ⎿ completed in 0.12s
+└─ ● Reasoning
+   ⎿ Looking at the error patterns in these logs...
+```
+
+### Viewing Full Reasoning
+
+Reasoning content is truncated to fit the terminal width during streaming. Use `/expand` to toggle expanded view and see the complete text with all wire-level fields (agent_id, content, session_id, trace_id).
+
+### Server Requirements
+
+Reasoning events require both environment variables on the server:
+
+```bash
+AURA_CUSTOM_EVENTS=true AURA_EMIT_REASONING=true cargo run --bin aura-web-server
+```
+
+Without these flags, the server does not emit `aura.reasoning` events and the CLI shows no reasoning output.
+
 ## Compatibility
 
 Aura CLI speaks the standard OpenAI Chat Completions API and works with any compatible backend:
