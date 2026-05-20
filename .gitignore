@@ -65,6 +65,7 @@ compose/env/.env*
 # Test artifacts
 /test_output/
 /test_results/
+/output/
 
 # Rig source code (external dependency for research)
 /rig-source/
