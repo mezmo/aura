@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.21.0](https://github.com/mezmo/aura/compare/v1.20.8...v1.21.0) (2026-05-20)
+
+
+### Features
+
+* **cli**: standalone otel + --log-file, raw one-shot output [593661f](https://github.com/mezmo/aura/commit/593661f5d8a89584a2e64c4bf13b6483810803e8) - Justin Gross [--#file](https://github.com/--/issues/file) [--#file](https://github.com/--/issues/file) [--#file](https://github.com/--/issues/file) [--#file](https://github.com/--/issues/file) [LOG-23858](https://mezmo.atlassian.net/browse/LOG-23858)
+
 ## [1.20.8](https://github.com/mezmo/aura/compare/v1.20.7...v1.20.8) (2026-05-19)
 
 

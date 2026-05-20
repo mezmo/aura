@@ -35,6 +35,10 @@ struct FileConfig {
     /// Resolved through [`crate::theme::theme_by_name`] which accepts
     /// these public names plus a few aliases.
     style: Option<String>,
+    /// Persisted log file path. Absent or empty means "no logging".
+    /// **The user is responsible for log rotation / pruning** — the CLI
+    /// opens this path in append mode and never truncates it.
+    log_file: Option<String>,
 }
 
 impl FileConfig {
@@ -52,6 +56,7 @@ impl FileConfig {
                 .enable_final_response_summary
                 .or(self.enable_final_response_summary),
             style: other.style.or(self.style),
+            log_file: other.log_file.or(self.log_file),
         }
     }
 }
@@ -92,6 +97,11 @@ pub struct AppConfig {
     /// default OFF without this flag. Not persisted to `cli.toml` —
     /// callers want each invocation to be explicit.
     pub pretty: bool,
+    /// Resolved log file path. `None` disables logging entirely.
+    /// **Log rotation/pruning is the user's responsibility** — the file is
+    /// opened in append mode and never truncated by the CLI. See
+    /// `crate::logging::init_tracing` for the subscriber setup.
+    pub log_file: Option<String>,
 }
 
 impl AppConfig {
@@ -167,6 +177,17 @@ impl AppConfig {
 
         let style = file_config.style.clone();
 
+        // Precedence: CLI flag / `AURA_LOG_FILE` env > project cli.toml > global
+        // cli.toml > None (no logging). An explicitly empty string is treated as
+        // unset so `AURA_LOG_FILE=` in CI can disable logging without removing
+        // the variable.
+        let log_file = args
+            .log_file
+            .clone()
+            .or(file_config.log_file)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             api_url,
             api_key,
@@ -180,6 +201,7 @@ impl AppConfig {
             enable_final_response_summary,
             style,
             pretty: args.pretty,
+            log_file,
         })
     }
 
@@ -399,6 +421,7 @@ mod tests {
             standalone: false,
             #[cfg(feature = "standalone-cli")]
             agent_config: None,
+            log_file: None,
         }
     }
 
@@ -448,6 +471,7 @@ mod tests {
             standalone: false,
             #[cfg(feature = "standalone-cli")]
             agent_config: None,
+            log_file: None,
         };
         let config = AppConfig::load_with_dirs(&args, cwd.path(), Some(&global)).unwrap();
         assert_eq!(config.api_url, "https://custom.api");
@@ -591,6 +615,66 @@ model = "global-model"
     }
 
     #[test]
+    fn log_file_defaults_to_none() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        assert!(config.log_file.is_none());
+    }
+
+    #[test]
+    fn log_file_from_global_cli_toml() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        fs::write(
+            global.join("cli.toml"),
+            r#"log_file = "/var/log/aura/cli.log""#,
+        )
+        .unwrap();
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        assert_eq!(config.log_file.as_deref(), Some("/var/log/aura/cli.log"));
+    }
+
+    #[test]
+    fn log_file_cli_arg_overrides_cli_toml() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        fs::write(global.join("cli.toml"), r#"log_file = "/tmp/global.log""#).unwrap();
+        let mut args = default_args();
+        args.log_file = Some("/tmp/override.log".to_string());
+        let config = AppConfig::load_with_dirs(&args, cwd.path(), Some(&global)).unwrap();
+        assert_eq!(config.log_file.as_deref(), Some("/tmp/override.log"));
+    }
+
+    #[test]
+    fn log_file_project_overrides_global() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        fs::write(global.join("cli.toml"), r#"log_file = "/tmp/global.log""#).unwrap();
+        let project_aura = cwd.path().join(".aura");
+        fs::create_dir(&project_aura).unwrap();
+        fs::write(
+            project_aura.join("cli.toml"),
+            r#"log_file = "/tmp/project.log""#,
+        )
+        .unwrap();
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        assert_eq!(config.log_file.as_deref(), Some("/tmp/project.log"));
+    }
+
+    #[test]
+    fn log_file_empty_string_treated_as_unset() {
+        // Lets `AURA_LOG_FILE=` (empty) disable logging in CI without
+        // removing the variable.
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        let mut args = default_args();
+        args.log_file = Some("   ".to_string());
+        let config = AppConfig::load_with_dirs(&args, cwd.path(), Some(&global)).unwrap();
+        assert!(config.log_file.is_none());
+    }
+
+    #[test]
     fn chat_completions_url_no_trailing_slash() {
         let config = AppConfig {
             api_url: "http://localhost:8080".to_string(),
@@ -605,6 +689,7 @@ model = "global-model"
             enable_final_response_summary: false,
             style: None,
             pretty: false,
+            log_file: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -627,6 +712,7 @@ model = "global-model"
             enable_final_response_summary: false,
             style: None,
             pretty: false,
+            log_file: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -649,6 +735,7 @@ model = "global-model"
             enable_final_response_summary: false,
             style: None,
             pretty: false,
+            log_file: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
@@ -668,6 +755,7 @@ model = "global-model"
             enable_final_response_summary: false,
             style: None,
             pretty: false,
+            log_file: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
