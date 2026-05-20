@@ -62,6 +62,9 @@ tiktoken-rs = "0.9.1"
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Integration test umbrella (mirrors aura-web-server pattern)
+integration = ["integration-stdio"]
+integration-stdio = []
 
 [dev-dependencies]
 tempfile = "3.23.0"

@@ -5,7 +5,7 @@ AURA is an agentic harness that turns an LLM model into a reliable, autonomous s
 Key capabilities:
 
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
-- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable and SSE transports
+- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
 - Vector search integration with Qdrant and AWS Bedrock Knowledge Base
 - Embeddable Rust core independent from configuration layer
@@ -304,6 +304,7 @@ Supported MCP transports:
 
 - `http_streamable` (recommended for production)
 - `sse`
+- `stdio` — launches a local child process per agent. The [MCP specification](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports) intended this transport for client-side sidecars, not for server deployments. Each request spawns its own process, so high-concurrency deployments should stick with `http_streamable`.
 
 `headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
 

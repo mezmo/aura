@@ -46,6 +46,16 @@ description = "Example SSE MCP server"
 # [mcp.servers.example_sse.headers_from_request]
 # Authorization = "x-user-token"
 
+# ── STDIO transport (local child process) ────────────────────────────
+# Spawns a local child process for each agent instance. By design, STDIO
+# MCP servers are local sidecars for an AI assistant client — they are
+# not remote services. Each agent request creates its own process.
+[mcp.servers.example_stdio]
+transport = "stdio"
+cmd = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+description = "Example STDIO MCP server"
+
 # Static headers sent with every request.
 [mcp.servers.example_http.headers]
 Authorization = "Bearer {{ env.MCP_TOKEN }}"

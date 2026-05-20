@@ -736,7 +736,7 @@ impl Agent {
                         let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
-                            client_arc.clone(),
+                            Arc::clone(&client_arc),
                         );
 
                         // Wrap with tool_wrapper if configured
@@ -769,7 +769,7 @@ impl Agent {
                         let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
-                            client_arc.clone(),
+                            Arc::clone(&client_arc),
                         );
 
                         builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
@@ -822,42 +822,35 @@ impl Agent {
             tracing::info!("All vector stores configured successfully");
         }
 
-        // Add STDIO MCP tools using rmcp_tools
-        if let Some(mcp_manager) = mcp_manager.as_deref()
-            && !mcp_manager.tool_definitions.is_empty()
-        {
-            let filtered_definitions: Vec<_> = mcp_manager
-                .tool_definitions
-                .iter()
-                .filter(|(tool, _)| config.tool_matches_filter(&tool.name))
-                .collect();
-            log_filtered_tools(
-                "",
-                "STDIO",
-                "MCP servers",
-                filtered_definitions.len(),
-                mcp_manager.tool_definitions.len(),
-            );
+        // Add STDIO tools using dynamic adaptors
+        if let Some(mcp_manager) = mcp_manager.as_deref() {
+            for (server_name, client) in &mcp_manager.stdio_clients {
+                if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "STDIO",
+                        server_name,
+                        filtered_tools.len(),
+                        server_tools.len(),
+                    );
 
-            // Group tools by client (rmcp_tools takes Vec<Tool> + one client)
-            use std::collections::HashMap;
-            let mut tools_by_client: HashMap<
-                String,
-                (Vec<rmcp::model::Tool>, rmcp::service::ServerSink),
-            > = HashMap::new();
+                    let client_arc = Arc::new(client.clone());
+                    for mcp_tool in filtered_tools {
+                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
 
-            for (tool, client) in filtered_definitions {
-                let client_key = format!("{client:?}");
-                tools_by_client
-                    .entry(client_key)
-                    .or_insert_with(|| (Vec::new(), client.clone()))
-                    .0
-                    .push(tool.clone());
-            }
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
+                            mcp_tool.clone(),
+                            server_name.clone(),
+                            Arc::clone(&client_arc),
+                        );
 
-            for (_key, (tools, client)) in tools_by_client {
-                tracing::info!("  Adding {} STDIO tools for client group", tools.len());
-                builder_state = builder_state.add_rmcp_tools(tools, client);
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                    }
+                }
             }
         }
 
