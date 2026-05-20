@@ -5,6 +5,14 @@ def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch
 def DOCKER_REPO = "docker.io/mezmo"
 def BUILD_SLUG = slugify(env.BUILD_TAG)
 
+def RELEASE_CREDENTIALS = [
+   usernamePassword(
+     credentialsId: 'github-app-key-mezmo',
+     passwordVariable: 'GITHUB_TOKEN',
+     usernameVariable: 'GITHUB_APP'
+   )
+]
+
 pipeline {
   agent {
     node {
@@ -31,7 +39,12 @@ pipeline {
     RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
     CARGO_HOME = "${env.WORKSPACE}/.cargo"
     FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
+    GIT_AUTHOR_NAME = 'Mezmo Bot'
+    GIT_AUTHOR_EMAIL = 'bot@mezmo.com'
+    GIT_COMMITTER_NAME = 'Mezmo Bot'
+    GIT_COMMITTER_EMAIL = 'bot@mezmo.com'
     ENABLE_DOCKER = 'true'
+    GITHUB_ACTION = 'yes'
   }
 
   post {
@@ -202,13 +215,7 @@ pipeline {
                       'https://index.docker.io/v1/',
                       'dockerhub-token-mezmo'
                   ) {
-                    withCredentials([
-                       usernamePassword(
-                         credentialsId: 'github-app-key-mezmo',
-                         passwordVariable: 'GITHUB_TOKEN',
-                         usernameVariable: 'GITHUB_APP'
-                       )
-                    ]) {
+                    withCredentials(RELEASE_CREDENTIALS) {
                       buildx {
                         withReport('Release Test', 'npm run release:dry')
                       }
@@ -280,19 +287,13 @@ pipeline {
               'https://index.docker.io/v1/',
               'dockerhub-token-mezmo'
           ) {
-            withCredentials([
-               usernamePassword(
-                 credentialsId: 'github-app-key-mezmo',
-                 passwordVariable: 'GITHUB_TOKEN',
-                 usernameVariable: 'GITHUB_APP'
-               )
-            ]) {
+            withCredentials(RELEASE_CREDENTIALS) {
               buildx(
                 tooling: true,
                 project: PROJECT_NAME,
                 versionFn: { -> npm.semver().version }
               ) {
-                withReport('Release Test', 'npm run release')
+                withReport('Release', 'npm run release')
               }
             }
           }

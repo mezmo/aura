@@ -1,5 +1,66 @@
 ## Changelog
 
+## [1.20.8](https://github.com/mezmo/aura/compare/v1.20.7...v1.20.8) (2026-05-19)
+
+
+### Chores
+
+* **config**: remove legacy debug binaries from aura-config [4d24108](https://github.com/mezmo/aura/commit/4d24108690c82c365e4c1d63041087acab3052d2) - Mike Shearer [#161](https://github.com/mezmo/aura/issues/161)
+
+## [1.20.7](https://github.com/mezmo/aura/compare/v1.20.6...v1.20.7) (2026-05-19)
+
+
+### Bug Fixes
+
+* **quickstart**: always pull aura image so new releases land [86ab9a5](https://github.com/mezmo/aura/commit/86ab9a5066733c0db86d8384c364bcd214ecc52d) - Chip Johnson [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
+## [1.20.6](https://github.com/mezmo/aura/compare/v1.20.5...v1.20.6) (2026-05-18)
+
+
+### Chores
+
+* **owners**: add codeowners [9593804](https://github.com/mezmo/aura/commit/95938042165a61f7b32bfbdf6e928781236653cc) - Phil Ciampini
+
+## [1.20.5](https://github.com/mezmo/aura/compare/v1.20.4...v1.20.5) (2026-05-18)
+
+
+### Bug Fixes
+
+* **test**: mount quickstart.toml in test container [401d991](https://github.com/mezmo/aura/commit/401d991c75ce1830d03ba1bb7e49851117b889ef) - Eric Lake
+
+### Documentation
+
+* add sane defaults for optional MCP server credentials [b62002c](https://github.com/mezmo/aura/commit/b62002cd4842390cffc17c681c1193fd1200b0d7) - Eric Lake* address inline review feedback [060789f](https://github.com/mezmo/aura/commit/060789f26f088c56982ff9c3f5f01efbe5da5276) - Eric Lake [#139](https://github.com/mezmo/aura/issues/139)* audit fixes, cross-reference consistency, and internal doc cleanup [917134a](https://github.com/mezmo/aura/commit/917134aeec9ca18e09b37faaca405f1fea4274d7) - Eric Lake [#100](https://github.com/mezmo/aura/issues/100)* move quickstart to repo root and streamline onboarding [873880f](https://github.com/mezmo/aura/commit/873880fd89b5f160478f84673957decba88ed4a0) - Eric Lake* **readme**: directory structure and makefiles [7376bd4](https://github.com/mezmo/aura/commit/7376bd42b30cb0c0eaba0a0864a76899e304c0f8) - Dominic McAllister* revert CODE_OF_CONDUCT.md change, defer to separate PR [ce609ae](https://github.com/mezmo/aura/commit/ce609ae25f88e9f214423378185d1fd1b5d07ed4) - Eric Lake* **streaming**: fix stale quality-scoring references and event flow diagram [c2bc7ac](https://github.com/mezmo/aura/commit/c2bc7ac3f0572c3221f88289cf8c0c391eb8fcc9) - Eric Lake [#146](https://github.com/mezmo/aura/issues/146) [#147](https://github.com/mezmo/aura/issues/147)* use env_file for .env loading and document provider-specific keys [f50107b](https://github.com/mezmo/aura/commit/f50107beb23cad3997869178202ff1859c95fda4) - Eric Lake
+
+## [1.20.4](https://github.com/mezmo/aura/compare/v1.20.3...v1.20.4) (2026-05-17)
+
+
+### Bug Fixes
+
+* **toolchain**: add rust-analyzer to components [ea04dbc](https://github.com/mezmo/aura/commit/ea04dbce69f6d04ab5c9e8dcdcf68dcc299c54a0) - Mike Shearer [#151](https://github.com/mezmo/aura/issues/151)
+
+## [1.20.3](https://github.com/mezmo/aura/compare/v1.20.2...v1.20.3) (2026-05-16)
+
+
+### Chores
+
+* set mezmobot as author of release commits [b375945](https://github.com/mezmo/aura/commit/b375945acfa52e61dc44d2bdcc9279758d904e45) - Eric Satterwhite
+
+### Service
+
+* **setup**: add allcontributors bot to cla allow list [9749bf7](https://github.com/mezmo/aura/commit/9749bf760bb0ee928306d61c6ad00c7fa33dfd1d) - Eric Satterwhite
+
+## [1.20.2](https://github.com/mezmo/aura/compare/v1.20.1...v1.20.2) (2026-05-15)
+
+
+### Bug Fixes
+
+* **build**: update magic butler catalog for improved functions [5068cdc](https://github.com/mezmo/aura/commit/5068cdc1e2ec581c09bfa4911c038910f972ed45) - Phil Ciampini* **scratchpad**: bound recursive json walkers with depth cap [c1f5ad0](https://github.com/mezmo/aura/commit/c1f5ad05252faa72697f289151bda368b1943acb) - Justin Gross [LOG-23842](https://mezmo.atlassian.net/browse/LOG-23842)
+
+### Service
+
+* **setup**: remove trigger build stage [a416786](https://github.com/mezmo/aura/commit/a416786537cebf6652a1e02819dea89040b6a849) - Eric Satterwhite
+
 ## [1.20.1](https://github.com/mezmo/aura/compare/v1.20.0...v1.20.1) (2026-05-14)
 
 
