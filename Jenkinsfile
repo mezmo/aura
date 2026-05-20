@@ -143,6 +143,27 @@ pipeline {
             }
           }
         } // End Clippy
+
+        stage("Docker Lint") {
+          steps {
+            withChecks('hadolint') {
+              sh script: "make lint-docker", returnStatus: true
+              recordIssues( // needs to be in same block as withChecks
+                tool: hadoLint(pattern: 'report/ci/hadolint.json'),
+                id: 'hadolint',
+                name: 'hadolint lint',
+                enabledForFailure: true,
+                sourceDirectories: [[path: '.']],
+                checksAnnotationScope: 'ALL',
+                qualityGates: [[
+                  threshold: 1,
+                  type: 'TOTAL',
+                  criticality: 'FAILURE'
+                ]]
+              )
+            }
+          }
+        }
       } // End Parallel
     } // End Validate
 
