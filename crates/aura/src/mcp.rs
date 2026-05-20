@@ -1,9 +1,6 @@
 use crate::{config::McpServerConfig, error::BuilderError, mcp_streamable_http::McpClient};
 use futures::{StreamExt, stream::BoxStream};
-use rig::tool::rmcp::McpTool;
 use rig::{completion::ToolDefinition, tool::Tool as RigTool};
-use rmcp::ServiceExt;
-use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, Tool};
 use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use serde_json::Value;
 use sse_stream::{Sse, SseStream};
@@ -230,16 +227,16 @@ impl StreamableHttpClient for CustomHttpClient {
 
 /// MCP client for managing connections to MCP servers
 pub struct McpManager {
-    pub tools: Vec<McpTool>,
     pub server_info: HashMap<String, ServerInfo>,
-    /// Store raw tool definitions with their associated client for agent integration
-    pub tool_definitions: Vec<(Tool, rmcp::service::ServerSink)>,
     /// Store streamable HTTP clients for http_streamable transport
     pub streamable_clients: HashMap<String, McpClient>,
     pub streamable_tools: HashMap<String, Vec<rmcp::model::Tool>>,
     /// Store SSE clients for sse transport
     pub sse_clients: HashMap<String, McpClient>,
     pub sse_tools: HashMap<String, Vec<rmcp::model::Tool>>,
+    /// Store STDIO clients for stdio transport
+    pub stdio_clients: HashMap<String, McpClient>,
+    pub stdio_tools: HashMap<String, Vec<rmcp::model::Tool>>,
     /// Whether to sanitize tool schemas for OpenAI compatibility
     pub sanitize_schemas: bool,
 }
@@ -266,13 +263,13 @@ impl McpManager {
 
     pub fn with_sanitization(sanitize_schemas: bool) -> Self {
         Self {
-            tools: Vec::new(),
             server_info: HashMap::new(),
-            tool_definitions: Vec::new(),
             streamable_clients: HashMap::new(),
             streamable_tools: HashMap::new(),
             sse_clients: HashMap::new(),
             sse_tools: HashMap::new(),
+            stdio_clients: HashMap::new(),
+            stdio_tools: HashMap::new(),
             sanitize_schemas,
         }
     }
@@ -332,9 +329,10 @@ impl McpManager {
         }
 
         // Count ALL tools across all transport types
-        let stdio_tools = manager.tools.len();
+        let stdio_tools: usize = manager.stdio_tools.values().map(|v| v.len()).sum();
         let streamable_tools: usize = manager.streamable_tools.values().map(|v| v.len()).sum();
-        let total_tools = stdio_tools + streamable_tools;
+        let sse_tools: usize = manager.sse_tools.values().map(|v| v.len()).sum();
+        let total_tools = stdio_tools + streamable_tools + sse_tools;
         let successful_connections = manager
             .server_info
             .values()
@@ -563,7 +561,7 @@ impl McpManager {
             }
             Err(e) => {
                 warn!("  STDIO MCP connection failed: {}", e);
-                // For now, we'll continue without this server
+                // Continue without this server
                 Ok(0)
             }
         }
@@ -583,28 +581,15 @@ impl McpManager {
         // Build the command
         if cmd.is_empty() {
             return Err(BuilderError::McpInitError(
-                "Empty command for STDIO server".to_string(),
+                "Empty command for STDIO server".to_owned(),
             ));
         }
 
         let mut process = Command::new(&cmd[0]);
 
-        // Add additional command args if present
-        if cmd.len() > 1 {
-            for arg in &cmd[1..] {
-                process.arg(arg);
-            }
-        }
-
-        // Add the specified args
-        for arg in args {
-            process.arg(arg);
-        }
-
-        // Set environment variables
-        for (key, value) in env {
-            process.env(key, value);
-        }
+        process.args(&cmd[1..]);
+        process.args(args);
+        process.envs(env);
 
         debug!("  Spawning process: {:?}", process);
 
@@ -613,62 +598,35 @@ impl McpManager {
             BuilderError::McpInitError(format!("Failed to spawn MCP server process: {e}"))
         })?;
 
-        // Create client info
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "aura-config".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Aura Configuration System".to_string()),
-                website_url: None,
-                icons: None,
-            },
-        };
+        let client = McpClient::from_transport(transport, format!("stdio://{server_name}"))
+            .await
+            .map_err(|e| {
+                BuilderError::McpInitError(format!(
+                    "Failed to establish STDIO MCP connection to '{server_name}': {e}"
+                ))
+            })?;
 
-        // Connect to the server
-        let client = client_info.serve(transport).await.map_err(|e| {
+        info!("  STDIO connection established, discovering tools");
+
+        let tools = client.discover_tools().await.map_err(|e| {
             BuilderError::McpInitError(format!(
-                "Failed to connect to MCP server '{server_name}': {e}"
+                "Failed to discover tools from STDIO server '{server_name}': {e}"
             ))
         })?;
 
-        // Get server info
-        let server_info = client.peer_info();
-        if let Some(init_result) = server_info {
-            info!(
-                "  Connected to MCP server '{}': {} v{}",
-                server_name, init_result.server_info.name, init_result.server_info.version
-            );
-        } else {
-            info!(
-                "  Connected to MCP server '{}' (no server info available)",
-                server_name
-            );
-        }
+        info!(
+            "  Discovered {} tools from STDIO server '{}'",
+            tools.len(),
+            server_name
+        );
 
-        // List available tools
-        let tools_response = client.list_tools(Default::default()).await.map_err(|e| {
-            BuilderError::McpInitError(format!("Failed to list tools from '{server_name}': {e}"))
-        })?;
-
-        let tools = tools_response.tools;
-        info!("  Discovered {} tools from '{}'", tools.len(), server_name);
-
-        // Store tools and their definitions for later integration
         let sanitized_tools =
             Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "STDIO");
+
         let tools_count = sanitized_tools.len();
-
-        for sanitized_tool in sanitized_tools {
-            self.tool_definitions
-                .push((sanitized_tool.clone(), client.clone()));
-            self.tools
-                .push(McpTool::from_mcp_server(sanitized_tool, client.clone()));
-        }
-
-        // Store the client for later use (client is already cloned above)
-        // self.clients.push(client);
+        let owned_name = server_name.to_string();
+        self.stdio_clients.insert(owned_name.clone(), client);
+        self.stdio_tools.insert(owned_name, sanitized_tools);
 
         Ok(tools_count)
     }
@@ -883,13 +841,13 @@ impl McpManager {
             }
         }
         // Count ALL tools across all transport types
-        let total_tools = self.tools.len()
-            + self
-                .streamable_tools
-                .values()
-                .map(|v| v.len())
-                .sum::<usize>()
-            + self.sse_tools.values().map(|v| v.len()).sum::<usize>();
+        let total_tools = self
+            .streamable_tools
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>()
+            + self.sse_tools.values().map(|v| v.len()).sum::<usize>()
+            + self.stdio_tools.values().map(|v| v.len()).sum::<usize>();
         info!("  Total tools available: {}", total_tools);
     }
 
@@ -913,6 +871,17 @@ impl McpManager {
             if cancelled > 0 {
                 info!(
                     "Cancelled {} request(s) on SSE MCP server '{}' for HTTP request {}",
+                    cancelled, server_name, http_request_id
+                );
+            }
+            total_cancelled += cancelled;
+        }
+
+        for (server_name, client) in &self.stdio_clients {
+            let cancelled = client.cancel_all_for_request(http_request_id, reason).await;
+            if cancelled > 0 {
+                info!(
+                    "Cancelled {} request(s) on STDIO MCP server '{}' for HTTP request {}",
                     cancelled, server_name, http_request_id
                 );
             }
@@ -949,6 +918,17 @@ impl McpManager {
             total_cancelled += cancelled;
         }
 
+        for (server_name, client) in &self.stdio_clients {
+            let cancelled = client.cancel_and_close(http_request_id, reason).await;
+            if cancelled > 0 {
+                info!(
+                    "Cancelled {} request(s) and closed STDIO MCP server '{}' for HTTP request {}",
+                    cancelled, server_name, http_request_id
+                );
+            }
+            total_cancelled += cancelled;
+        }
+
         total_cancelled
     }
 
@@ -960,7 +940,11 @@ impl McpManager {
         for client in self.sse_clients.values() {
             client.set_current_request(http_request_id).await;
         }
-        let total_clients = self.streamable_clients.len() + self.sse_clients.len();
+        for client in self.stdio_clients.values() {
+            client.set_current_request(http_request_id).await;
+        }
+        let total_clients =
+            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
         debug!(
             "Set current HTTP request ID on {} MCP client(s): {}",
             total_clients, http_request_id
@@ -974,7 +958,11 @@ impl McpManager {
         for client in self.sse_clients.values() {
             client.clear_current_request().await;
         }
-        let total_clients = self.streamable_clients.len() + self.sse_clients.len();
+        for client in self.stdio_clients.values() {
+            client.clear_current_request().await;
+        }
+        let total_clients =
+            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
         debug!(
             "Cleared current HTTP request ID on {} MCP client(s)",
             total_clients
@@ -1002,8 +990,10 @@ impl McpManager {
         }
 
         // STDIO tools
-        for (tool, _) in &self.tool_definitions {
-            names.push(tool.name.to_string());
+        for tools in self.stdio_tools.values() {
+            for tool in tools {
+                names.push(tool.name.to_string());
+            }
         }
 
         names
@@ -1020,23 +1010,15 @@ impl McpManager {
             .values()
             .flat_map(|tools| tools.iter())
             .chain(self.sse_tools.values().flat_map(|tools| tools.iter()))
-            .chain(self.tool_definitions.iter().map(|(tool, _)| tool))
+            .chain(self.stdio_tools.values().flat_map(|tools| tools.iter()))
     }
 
-    /// Returns a `server_name → tool_names` map for HTTP-streamable servers.
+    /// Returns a `server_name → tool_names` map for all transports.
     ///
     /// Used by the scratchpad layer to resolve per-server `min_tokens`
     /// patterns to concrete tool names at boot time, so the runtime
     /// interception lookup is a server-aware exact match (not a
     /// server-agnostic glob — see `scratchpad::scratchpad_tool_map`).
-    ///
-    /// STDIO tools are intentionally omitted: they're tracked in
-    /// `tool_definitions: Vec<(Tool, ServerSink)>` without a server-name
-    /// field, so we'd need a schema change to carry that through. STDIO
-    /// scratchpad support can be added later by attaching server_name to
-    /// each tool_definitions entry; until then STDIO tools fall through
-    /// the scratchpad interception path (same behavior as before this
-    /// refactor for STDIO).
     pub fn tool_names_per_server(&self) -> HashMap<String, Vec<String>> {
         let mut map: HashMap<String, Vec<String>> = self
             .streamable_tools
@@ -1047,6 +1029,10 @@ impl McpManager {
             })
             .collect();
         for (server_name, tools) in &self.sse_tools {
+            let names = tools.iter().map(|t| t.name.to_string()).collect();
+            map.insert(server_name.clone(), names);
+        }
+        for (server_name, tools) in &self.stdio_tools {
             let names = tools.iter().map(|t| t.name.to_string()).collect();
             map.insert(server_name.clone(), names);
         }
@@ -1103,42 +1089,16 @@ impl McpManager {
             }
         }
 
-        // Try STDIO tools
-        for (tool, client) in &self.tool_definitions {
-            if tool.name.as_ref() == tool_name {
+        // Try STDIO clients
+        for (server_name, client) in &self.stdio_clients {
+            if let Some(tools) = self.stdio_tools.get(server_name)
+                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+            {
                 info!("Executing fallback tool '{}' via STDIO", tool_name);
-
-                // Convert HashMap to serde_json::Map for RMCP API
-                let args_json_map: serde_json::Map<String, Value> = args_map.into_iter().collect();
-
-                let call_request = rmcp::model::CallToolRequestParam {
-                    name: tool.name.clone(),
-                    arguments: Some(args_json_map),
-                };
-
-                let result = client
-                    .call_tool(call_request)
+                return client
+                    .call_tool(tool_name, args_map)
                     .await
-                    .map_err(|e| format!("STDIO tool execution failed: {}", e))?;
-
-                // Format the result - content items are Annotated<RawContent>
-                let content_strs: Vec<String> = result
-                    .content
-                    .iter()
-                    .map(|annotated| match &annotated.raw {
-                        rmcp::model::RawContent::Text(t) => t.text.to_string(),
-                        rmcp::model::RawContent::Image(_) => "[Image content]".to_string(),
-                        rmcp::model::RawContent::Audio(_) => "[Audio content]".to_string(),
-                        rmcp::model::RawContent::Resource(res) => {
-                            crate::mcp_response::extract_resource_contents(&res.resource)
-                        }
-                        rmcp::model::RawContent::ResourceLink(link) => {
-                            format!("[Resource link: {} ({})]", link.name, link.uri)
-                        }
-                    })
-                    .collect();
-
-                return Ok(content_strs.join("\n"));
+                    .map_err(|e| format!("Tool execution failed: {}", e));
             }
         }
 

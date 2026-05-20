@@ -530,22 +530,6 @@ where
         }
     }
 
-    /// Add RMCP tools to the agent builder.
-    pub fn add_rmcp_tools(
-        self,
-        tools: Vec<rmcp::model::Tool>,
-        client: rmcp::service::ServerSink,
-    ) -> BuilderState<M> {
-        match self {
-            BuilderState::Initial(builder) => {
-                BuilderState::WithTools(builder.rmcp_tools(tools, client))
-            }
-            BuilderState::WithTools(builder) => {
-                BuilderState::WithTools(builder.rmcp_tools(tools, client))
-            }
-        }
-    }
-
     /// Add multiple dynamic tools to the agent builder.
     ///
     /// This accepts pre-boxed `ToolDyn` objects, which is useful for adding

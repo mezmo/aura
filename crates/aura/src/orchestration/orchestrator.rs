@@ -1712,9 +1712,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        // Collect from legacy tool definitions (rmcp::model::Tool)
-        for (tool, _) in &mcp_manager.tool_definitions {
-            names.push(tool.name.to_string());
+        // Collect from STDIO tools
+        for tools in mcp_manager.stdio_tools.values() {
+            for tool in tools {
+                names.push(tool.name.to_string());
+            }
         }
 
         // Remove duplicates while preserving order
@@ -1755,10 +1757,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        // Collect from legacy tool definitions (same rmcp::model::Tool type)
-        for (tool, _) in &mcp_manager.tool_definitions {
-            let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
-            schemas.insert(tool.name.to_string(), schema_value);
+        // Collect from STDIO tools
+        for tools in mcp_manager.stdio_tools.values() {
+            for tool in tools {
+                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
+                schemas.insert(tool.name.to_string(), schema_value);
+            }
         }
 
         schemas
@@ -1839,10 +1843,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             }
 
-            // Collect from legacy tool definitions
-            for (tool, _) in &mcp_manager.tool_definitions {
-                if let Some(ref desc) = tool.description {
-                    descriptions.insert(tool.name.to_string(), desc.to_string());
+            // Collect from STDIO tools
+            for tools in mcp_manager.stdio_tools.values() {
+                for tool in tools {
+                    if let Some(ref desc) = tool.description {
+                        descriptions.insert(tool.name.to_string(), desc.to_string());
+                    }
                 }
             }
         }

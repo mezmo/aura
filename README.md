@@ -5,7 +5,7 @@ AURA is an agentic harness that turns an LLM model into a reliable, autonomous s
 Key capabilities:
 
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
-- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable and SSE transports
+- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
 - Vector search integration with Qdrant and AWS Bedrock Knowledge Base
 - Embeddable Rust core independent from configuration layer
@@ -332,6 +332,31 @@ Supported MCP transports:
 
 - `http_streamable` (recommended for production)
 - `sse`
+- `stdio` - launches a local child process per request. The [MCP specification](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports) defines this transport for client-side sidecars, not for server deployments. If you need high concurrency, use `http_streamable`.
+
+STDIO configuration uses `cmd` and `args`, both are lists. `cmd[0]` is the executable. Any additional elements in `cmd` are part of the command itself, such as a script path that needs an interpreter. `args` are passed to the spawned process separately:
+
+```toml
+# Binary with package arguments
+[mcp.servers.my_stdio]
+transport = "stdio"
+cmd = ["npx"]
+args = ["-y", "@modelcontextprotocol/server-everything"]
+
+# Script that needs an interpreter
+[mcp.servers.my_script]
+transport = "stdio"
+cmd = ["python3", "/opt/mcp-servers/weather.py"]
+args = ["--verbose"]
+
+# Direct binary
+[mcp.servers.my_binary]
+transport = "stdio"
+cmd = ["/usr/local/bin/mcp-server"]
+args = ["--config", "/etc/mcp/config.json"]
+```
+
+Tool names are not namespaced by server. If two servers register a tool with the same name, the first one loaded wins silently ([#186](https://github.com/mezmo/aura/issues/186)).
 
 `headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
 
