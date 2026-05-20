@@ -75,12 +75,20 @@ Span kind is inferred from the span name by the custom exporter in
 | **AGENT** | `agent.stream`, `orchestration.worker` |
 | **CHAIN** | `chat_completions`, `streaming_completion`, `orchestration`, `orchestration.planning`, `orchestration.iteration` |
 
+## CLI Standalone Mode
+
+When `aura-cli` is built with `--features standalone-cli` and run with `--standalone`, it produces the same `agent.stream`-rooted trace structure as the web server. The CLI wraps `execute_completion` with `.instrument(info_span!(parent: None, "agent.stream"))` in `crates/aura-cli/src/backend/direct.rs`, so all LLM turns, tool calls, and orchestration spans nest under the same root.
+
+The CLI omits the `chat_completions` / `streaming_completion` HTTP-infrastructure spans because standalone mode has no HTTP layer. HTTP-mode CLIs (connecting to `aura-web-server`) don't emit traces — the server owns OTel in that case.
+
 ## Span parenting
 
 - `agent.stream` is created with `parent: None` to break the link from the
   HTTP handler trace, making it an independent trace root in Phoenix.
 - The `tokio::spawn` in `handlers.rs` is instrumented with `agent.stream` so
   Rig's `agent.turn` becomes a direct child.
+- In standalone CLI mode, the spawned `execute_completion` task in `direct.rs`
+  is instrumented the same way, producing identical trace shapes.
 - In orchestration mode, `Orchestrator::stream()` instruments its spawned task
   with the `agent.stream` span so all orchestration child spans nest under the
   trace root.
