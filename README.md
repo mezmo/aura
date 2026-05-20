@@ -11,6 +11,7 @@ Key capabilities:
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
 - Dependency-aware multi-wave execution with plan/execute loops
+- [A2A protocol](https://github.com/a2a-protocol) support for agent-to-agent interoperability
 
 ## Table of Contents
 
@@ -173,6 +174,28 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
+
+#### A2A Protocol
+
+Aura exposes [A2A protocol](https://github.com/a2a-protocol) endpoints for agent-to-agent interoperability. This allows other A2A-compatible agents and clients to discover and interact with Aura agents using a standardized protocol.
+
+```bash
+# Agent card (capability discovery)
+curl http://localhost:8080/.well-known/agent-card.json
+
+# Send a message via REST
+curl -X POST http://localhost:8080/a2a/v1/message:send \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{"message": {"messageId": "msg-001", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}'
+
+# Send a message via JSON-RPC
+curl -X POST http://localhost:8080/a2a/v1/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "method": "SendMessage", "params": {"message": {"messageId": "msg-002", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}, "id": 1}'
+```
+
+A2A endpoints, transport modes, task lifecycle, and testing examples are documented in [docs/a2a-implementation.md](docs/a2a-implementation.md).
 
 ### Client-Side Tools
 
@@ -550,6 +573,7 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
+- [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
 
 ## Architecture
 
