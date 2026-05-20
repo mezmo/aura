@@ -1,3 +1,4 @@
+use a2a::VERSION;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
     tool_event_subscribe, tool_usage_subscribe,
@@ -868,7 +869,11 @@ fn convert_tool_message(msg: &ChatMessage, client_tools_enabled: bool) -> Option
 /// Health check endpoint
 pub async fn health() -> Response {
     Json(serde_json::json!({
-        "status": "healthy"
+        "status": "healthy",
+        "timestamp": Utc::now().to_rfc3339(),
+        "a2a_server": {
+            "version": VERSION,
+        },
     }))
     .into_response()
 }
