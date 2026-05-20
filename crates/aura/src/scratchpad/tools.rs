@@ -1108,9 +1108,11 @@ impl ItemSchemaTool {
     pub fn tool_definition() -> ToolDefinition {
         ToolDefinition {
             name: "item_schema".to_string(),
-            description: "Show all unique keys found across all items in a JSON array, with their \
+            description: "Show all unique keys found across items in a JSON array, with their \
                           types and how many items contain each key. Use this to discover the full \
-                          schema of array items before using iterate_over to extract fields."
+                          schema of array items before using iterate_over to extract fields. \
+                          Supports optional offset/limit for paginating through large arrays — \
+                          presence counts are window-relative when paginating."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1122,6 +1124,16 @@ impl ItemSchemaTool {
                     "path": {
                         "type": "string",
                         "description": "Dot-separated path to the array (e.g., 'results' or 'data.items')"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Optional: index of the first item to scan (0-indexed, default 0)",
+                        "minimum": 0
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional: max items to scan starting at offset (default: all remaining items)",
+                        "minimum": 1
                     }
                 },
                 "required": ["file", "path"],
@@ -1136,6 +1148,12 @@ pub struct ItemSchemaArgs {
     pub file: String,
     /// Dot-separated path to an array (e.g., "results" or "data.items").
     pub path: String,
+    /// Optional 0-indexed start position within the array. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Optional max number of items to scan from `offset`. Defaults to all remaining items.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 impl Tool for ItemSchemaTool {
@@ -1151,9 +1169,11 @@ impl Tool for ItemSchemaTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         tracing::debug!(
-            "scratchpad item_schema: file={}, path={}",
+            "scratchpad item_schema: file={}, path={}, offset={:?}, limit={:?}",
             args.file,
-            args.path
+            args.path,
+            args.offset,
+            args.limit
         );
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
         let root: serde_json::Value =
@@ -1164,31 +1184,63 @@ impl Tool for ItemSchemaTool {
             ScratchpadToolError::InvalidArg(format!("Value at '{}' is not an array", args.path))
         })?;
 
-        // Collect all keys, their types, and occurrence counts
+        // Window the items per offset/limit. Offset past the end yields an
+        // empty window — the LLM gets a deterministic empty schema rather than
+        // an error, so it can correct course.
+        let total_items = items.len();
+        let offset = args.offset.unwrap_or(0);
+        let window_end = match args.limit {
+            Some(l) => offset.saturating_add(l).min(total_items),
+            None => total_items,
+        };
+        let windowed_items: &[serde_json::Value] = if offset >= total_items {
+            &[]
+        } else {
+            &items[offset..window_end]
+        };
+        let window_size = windowed_items.len();
+        let is_full_scan = offset == 0 && window_size == total_items;
+
+        // Collect all keys, their types, and occurrence counts (within window)
         let mut key_info: std::collections::BTreeMap<String, KeyInfo> =
             std::collections::BTreeMap::new();
 
-        for item in items {
+        for item in windowed_items {
             if let Some(obj) = item.as_object() {
                 collect_keys(obj, "", &mut key_info, 0);
             }
         }
 
-        let total_items = items.len();
-        let mut result = format!(
-            "Item schema for $.{} ({} items):\n\n",
-            args.path, total_items
-        );
+        let mut result = if is_full_scan {
+            format!(
+                "Item schema for $.{} ({} items):\n\n",
+                args.path, total_items
+            )
+        } else {
+            format!(
+                "Item schema for $.{} (window: items [{}..{}) of {} total):\n\n",
+                args.path,
+                offset,
+                offset + window_size,
+                total_items
+            )
+        };
         result.push_str(&format!(
             "{:<40} {:<20} {}\n",
             "KEY", "TYPE(S)", "PRESENT IN"
         ));
         result.push_str(&format!("{}\n", "-".repeat(72)));
 
+        let denom = window_size.max(1);
+        let presence_unit = if is_full_scan {
+            "items"
+        } else {
+            "items in window"
+        };
         for (key, info) in &key_info {
             let types: Vec<&str> = info.types.iter().map(|s| s.as_str()).collect();
             let types_str = types.join("|");
-            let presence = format!("{}/{} items", info.count, total_items);
+            let presence = format!("{}/{} {}", info.count, denom, presence_unit);
             result.push_str(&format!("{:<40} {:<20} {}\n", key, types_str, presence));
         }
 
@@ -1200,7 +1252,31 @@ impl Tool for ItemSchemaTool {
         );
 
         if let Err(e) = check_and_record_budget(&self.budget, &final_output) {
-            return Ok(format_budget_error(e, "item_schema_too_large", json!({})));
+            // Suggest halving the current window (min 10) as a starting point.
+            let suggested_limit = (window_size / 2).max(10);
+            return Ok(format_budget_error(
+                e,
+                "item_schema_too_large",
+                json!({
+                    "requested_file": args.file,
+                    "array_length": total_items,
+                    "window_size": window_size,
+                    "suggestions": [
+                        format!(
+                            "Paginate with a smaller window: item_schema file=\"{}\" path=\"{}\" offset={} limit={}",
+                            args.file, args.path, offset, suggested_limit
+                        ),
+                        format!(
+                            "Spot-check item shapes: get_in file=\"{}\" path=\"{}.0\" (also sample .{} and .{} if items vary)",
+                            args.file, args.path, total_items / 2, total_items.saturating_sub(1)
+                        ),
+                        format!(
+                            "Once fields are known, project them across all items: iterate_over file=\"{}\" path=\"{}\" fields=\"...\"",
+                            args.file, args.path
+                        ),
+                    ]
+                }),
+            ));
         }
         Ok(final_output)
     }
@@ -2226,6 +2302,8 @@ mod tests {
             .call(ItemSchemaArgs {
                 file: "test.json".to_string(),
                 path: "results".to_string(),
+                offset: None,
+                limit: None,
             })
             .await
             .unwrap();
@@ -2254,6 +2332,8 @@ mod tests {
             .call(ItemSchemaArgs {
                 file: "hetero.json".to_string(),
                 path: "items".to_string(),
+                offset: None,
+                limit: None,
             })
             .await
             .unwrap();
@@ -2264,6 +2344,112 @@ mod tests {
         assert!(result.contains("tags"));
         assert!(result.contains("1/3 items")); // tags present in 1 of 3
         assert!(result.contains("extra"));
+    }
+
+    #[tokio::test]
+    async fn test_item_schema_pagination_window() {
+        let (_tmp, storage, budget) = setup().await;
+        // 5 items with varying keys so windowing produces different unions.
+        let json = r#"{
+  "items": [
+    {"id": 1, "alpha": true},
+    {"id": 2, "beta": true},
+    {"id": 3, "gamma": true},
+    {"id": 4, "delta": true},
+    {"id": 5, "epsilon": true}
+  ]
+}"#;
+        storage.write_output("paged", json).await.unwrap();
+
+        let tool = ItemSchemaTool::new(storage, budget);
+        let result = tool
+            .call(ItemSchemaArgs {
+                file: "paged.json".to_string(),
+                path: "items".to_string(),
+                offset: Some(1),
+                limit: Some(2),
+            })
+            .await
+            .unwrap();
+
+        // Window header announces the slice and the total array length.
+        assert!(result.contains("window: items [1..3) of 5 total"));
+        // Window-relative denominator, window-relative label.
+        assert!(result.contains("2/2 items in window")); // id present in both windowed items
+        assert!(result.contains("beta"));
+        assert!(result.contains("gamma"));
+        // Keys outside the window must not appear.
+        assert!(!result.contains("alpha"));
+        assert!(!result.contains("delta"));
+        assert!(!result.contains("epsilon"));
+    }
+
+    #[tokio::test]
+    async fn test_item_schema_pagination_offset_past_end() {
+        let (_tmp, storage, budget) = setup().await;
+        storage.write_output("test", sample_json()).await.unwrap();
+
+        let tool = ItemSchemaTool::new(storage, budget);
+        let result = tool
+            .call(ItemSchemaArgs {
+                file: "test.json".to_string(),
+                path: "results".to_string(),
+                offset: Some(999),
+                limit: Some(10),
+            })
+            .await
+            .unwrap();
+
+        // Empty window — no keys, but the header still reports total.
+        assert!(result.contains("window: items [999..999) of 2 total"));
+    }
+
+    #[tokio::test]
+    async fn test_item_schema_budget_error_suggests_pagination() {
+        let (_tmp, storage, _budget) = setup().await;
+        let counter = TiktokenCounter::default_counter();
+        let tiny_budget = ContextBudget::new(100, 0.20, 0, std::sync::Arc::new(counter));
+
+        // Generate enough items with varied keys to blow a tight budget.
+        let items: Vec<String> = (0..50)
+            .map(|i| format!(r#"{{"id":{i},"k{i}":{i}}}"#))
+            .collect();
+        let json = format!(r#"{{"items":[{}]}}"#, items.join(","));
+        storage.write_output("big", &json).await.unwrap();
+
+        let tool = ItemSchemaTool::new(storage, tiny_budget);
+        let result = tool
+            .call(ItemSchemaArgs {
+                file: "big.json".to_string(),
+                path: "items".to_string(),
+                offset: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["error"], "item_schema_too_large");
+        assert_eq!(parsed["array_length"], 50);
+        let suggestions = parsed["suggestions"].as_array().unwrap();
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("limit=")),
+            "first suggestion should propose a pagination call with a concrete limit"
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("get_in")),
+            "should include a get_in spot-check suggestion"
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("iterate_over")),
+            "should include an iterate_over suggestion"
+        );
     }
 
     #[tokio::test]
