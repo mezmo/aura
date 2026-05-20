@@ -646,6 +646,65 @@ async fn test_cancel_task() {
         "TASK_STATE_CANCELED", response_body["status"]["state"],
         "The task is cancelled"
     );
+
+    // Poll until the task quiesces — same (state, artifact_count) across two
+    // consecutive reads. This is self-tuning (returns immediately on a fast box,
+    // waits only as long as needed on a slow one) and is the actual regression
+    // check: a buggy executor that keeps yielding past cancel will keep growing
+    // the artifact count, never reach stability, and trip the deadline. State
+    // is asserted Canceled on every poll so a Completed-clobber is caught the
+    // instant it happens, not just on the final read.
+    let client = reqwest::Client::new();
+    let get_task = || async {
+        let resp = client
+            .get(format!("{}/a2a/v1/tasks/{}", AURA_SERVER, task_id))
+            .header("A2A-Version", "1.0")
+            .timeout(TEST_TIMEOUT)
+            .send()
+            .await
+            .expect("Failed to GET task after cancel");
+        let body = resp.text().await.expect("Failed to read GetTask body");
+        serde_json::from_str::<Task>(&body).expect("GetTask body not valid JSON")
+    };
+    let artifact_count = |t: &Task| t.artifacts.as_ref().map(|a| a.len()).unwrap_or(0);
+
+    let poll_interval = Duration::from_millis(250);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    let mut prev = get_task().await;
+    assert_eq!(
+        prev.status.state,
+        TaskState::Canceled,
+        "Task state was {:?} on first read after cancel — Completed yield clobbered the cancel",
+        prev.status.state
+    );
+
+    let stable = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Task never quiesced after cancel — executor is still emitting (last state: {:?}, last artifact count: {})",
+            prev.status.state,
+            artifact_count(&prev)
+        );
+        tokio::time::sleep(poll_interval).await;
+        let curr = get_task().await;
+        assert_eq!(
+            curr.status.state,
+            TaskState::Canceled,
+            "Task state regressed to {:?} after cancel — execute() yielded a terminal state past the cancel",
+            curr.status.state
+        );
+        if curr.status.state == prev.status.state && artifact_count(&curr) == artifact_count(&prev)
+        {
+            break curr;
+        }
+        prev = curr;
+    };
+
+    println!(
+        "Task quiesced at {} artifact(s) in Canceled state",
+        artifact_count(&stable)
+    );
 }
 
 // validates that two sequential messages sent with the same contextId result in two tasks
