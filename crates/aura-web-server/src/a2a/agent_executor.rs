@@ -9,7 +9,7 @@ use a2a::{
     TaskStatusUpdateEvent, VERSION,
 };
 use a2a_server::{AgentExecutor, ExecutorContext, TaskStore};
-use aura::{StreamItem, StreamedAssistantContent};
+use aura::{RequestCancellation, StreamItem, StreamedAssistantContent, StreamingAgent};
 use aura_config::RigBuilder;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
@@ -18,14 +18,23 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, event};
 
-use crate::{a2a::SharedTaskStore, types::AppState};
+use crate::{
+    a2a::SharedTaskStore,
+    types::{ActiveRequestGuard, AppState},
+};
 
 const PLAIN_TEXT: &str = "text/plain";
 
 pub struct AuraAgentExecutor {
     app_state: Arc<AppState>,
     task_store: SharedTaskStore,
-    task_cancel_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    task_cancel_state: Arc<Mutex<HashMap<String, TaskCancelEntry>>>,
+}
+
+struct TaskCancelEntry {
+    token: CancellationToken,
+    agent: Arc<dyn StreamingAgent>,
+    request_id: String,
 }
 
 impl AuraAgentExecutor {
@@ -33,7 +42,7 @@ impl AuraAgentExecutor {
         Self {
             app_state,
             task_store,
-            task_cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+            task_cancel_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -114,7 +123,7 @@ impl AgentExecutor for AuraAgentExecutor {
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let config = self.resolve_config();
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
-        let task_cancel_tokens = self.task_cancel_tokens.clone();
+        let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
         let task_store = self.task_store.clone();
         let mut append_tracker: HashMap<(String, String, String), bool> = HashMap::new();
@@ -166,32 +175,49 @@ impl AgentExecutor for AuraAgentExecutor {
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;
 
             let cancel_token = stream_shutdown_token.child_token();
+            // Register with the global cancellation registry for parity with the OpenAI handler
+            // and to let any future code address this request by id.
+            RequestCancellation::register(request_id.clone());
             {
-                // keep track of this cancel token in case the a2a framework
-                // receives a cancel call and we need to propagate
-                let mut cancel_map = task_cancel_tokens.lock().await;
-                cancel_map.insert(task_id.clone(), cancel_token.clone());
+                let mut cancel_map = task_cancel_state.lock().await;
+                cancel_map.insert(task_id.clone(), TaskCancelEntry {
+                    token: cancel_token.clone(),
+                    agent: agent.clone(),
+                    request_id: request_id.clone(),
+                });
             }
 
-            let mut stream = match agent.stream(&text, history, cancel_token, &request_id).await {
+            let mut stream = match agent.stream(&text, history, cancel_token.clone(), &request_id).await {
                 Ok(s) => s,
                 Err(e) => {
-                    // processing never started, so we can remove the cancel token from tracking
-                    let mut cancel_map = task_cancel_tokens.lock().await;
-                    cancel_map.remove(&task_id);
+                    {
+                        let mut cancel_map = task_cancel_state.lock().await;
+                        cancel_map.remove(&task_id);
+                    }
+                    RequestCancellation::unregister(&request_id);
 
                     yield Ok(fail_status(&task_id, &context_id, &e.to_string()));
                     return;
                 }
             };
 
-            // let the main state machinery know we've got a job in progress
-            active_request_tracker.increment();
+            // RAII guard: drop on any generator exit (loop break, early return, panic,
+            // consumer drop) produces exactly one decrement. Replaces the manual
+            // increment/decrement pair that previously raced with cancel() — a fast
+            // cancel before this line, or a cancel mid-loop followed by natural
+            // loop-exit cleanup, could double-decrement and wrap the counter.
+            let _request_guard = ActiveRequestGuard::new(active_request_tracker);
 
             let mut success = true; // assume everything is successful
 
             let mut reasoning_num = 0;
-            while let Some(item) = stream.next().await {
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => break,
+                    next = stream.next() => next,
+                };
+                let Some(item) = next else { break };
                 match item {
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
                         event!(Level::DEBUG, request_id, t, "stream content received");
@@ -360,17 +386,41 @@ impl AgentExecutor for AuraAgentExecutor {
                 }
             }
 
-            // processing done, remove the token from the map, no longer need to track
-            {
-                let mut cancel_map = task_cancel_tokens.lock().await;
-                cancel_map.remove(&task_id);
+            // If cancel_token fired but our entry is still in the map, the cancel came
+            // from the parent stream_shutdown_token (server shutdown), not from our
+            // cancel() hook — cancel() removes its entry before firing the token.
+            // In that case the executor has to drive MCP cleanup itself and emit a
+            // terminal Canceled status (the OpenAI handler does the equivalent in its
+            // Shutdown post-loop arm).
+            let entry_still_present = {
+                let mut cancel_map = task_cancel_state.lock().await;
+                cancel_map.remove(&task_id).is_some()
+            };
+            let shutdown_initiated_cancel = cancel_token.is_cancelled() && entry_still_present;
+            RequestCancellation::unregister(&request_id);
+
+            if shutdown_initiated_cancel {
+                agent
+                    .cancel_and_close_mcp(&request_id, "server shutdown")
+                    .await;
+
+                yield Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: task_id.clone(),
+                    context_id: context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Canceled,
+                        message: None,
+                        timestamp: Some(chrono::Utc::now()),
+                    },
+                    metadata: None,
+                }));
             }
 
-            // let the main state machinery know we've completed this particular job
-            active_request_tracker.decrement();
+            // _request_guard drops at end of generator scope → exactly one decrement.
 
-            // if successful (hit either finalizer), mark the task as such.
-            if success {
+            // Skip Completed if cancel() or the shutdown path already emitted Canceled —
+            // yielding here would clobber it.
+            if success && !cancel_token.is_cancelled() {
                 yield Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                     task_id,
                     context_id,
@@ -388,19 +438,28 @@ impl AgentExecutor for AuraAgentExecutor {
     fn cancel(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let task_id = ctx.task_id.clone();
         let context_id = ctx.context_id.clone();
-        let task_cancel_tokens = self.task_cancel_tokens.clone();
-        let active_request_tracker = self.app_state.active_requests.clone();
+        let task_cancel_state = self.task_cancel_state.clone();
 
         Box::pin(futures_util::stream::once(async move {
-            // a2a got a cancel call, so make sure rig cancels as well
-            // and remove the token from tracking
-            let mut cancel_map = task_cancel_tokens.lock().await;
-            if let Some(token) = cancel_map.remove(&task_id) {
-                token.cancel();
-            }
+            let entry = {
+                let mut cancel_map = task_cancel_state.lock().await;
+                cancel_map.remove(&task_id)
+            };
 
-            // let the main state machinery know this task is effectively complete
-            active_request_tracker.decrement();
+            // Token-cancel wakes execute()'s select! → loop breaks → generator drops
+            // → ActiveRequestGuard drops → exactly one decrement. cancel() never
+            // touches the tracker directly, which closes the prior double-decrement
+            // / underflow race.
+            if let Some(entry) = entry {
+                // Send notifications/cancelled to in-flight MCP tool calls. No-op in
+                // orchestration mode (workers manage their own MCP cancellation).
+                entry
+                    .agent
+                    .cancel_and_close_mcp(&entry.request_id, "A2A cancelTask")
+                    .await;
+                entry.token.cancel();
+                RequestCancellation::unregister(&entry.request_id);
+            }
 
             Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
                 task_id,

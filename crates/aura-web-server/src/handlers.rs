@@ -24,25 +24,6 @@ use crate::streaming::{
 };
 use crate::types::*;
 
-/// RAII guard that increments the active request counter on creation and
-/// decrements it on drop, notifying the shutdown task when the count hits zero.
-struct ActiveRequestGuard {
-    tracker: Arc<ActiveRequestTracker>,
-}
-
-impl ActiveRequestGuard {
-    fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
-        tracker.increment();
-        Self { tracker }
-    }
-}
-
-impl Drop for ActiveRequestGuard {
-    fn drop(&mut self) {
-        self.tracker.decrement();
-    }
-}
-
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
     request_id: String,
