@@ -158,12 +158,12 @@ pub fn replay_event_log_global() {
                 println!(
                     "{} {}",
                     "●".with(random_bullet_color()).attribute(Attribute::Bold),
-                    "Canceled request".attribute(Attribute::Bold),
+                    "Interrupted (user requested)".attribute(Attribute::Bold),
                 );
                 println!(
                     "{} {}",
                     "└─".themed(AuraStyle::Connector),
-                    "User requested.".themed(AuraStyle::Muted),
+                    "what should AURA do next?".themed(AuraStyle::Muted),
                 );
                 println!();
                 i += 1;
