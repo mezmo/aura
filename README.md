@@ -1,44 +1,53 @@
 # Aura
 
-A production-ready framework for composing AI agents and multi-agent workflows from declarative TOML configuration, with MCP tool integration, RAG pipelines, and an OpenAI-compatible web API. Built on [Rig.rs](https://github.com/0xPlaygrounds/rig) with reliability and operability enhancements.
+Aura is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. Aura provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
 
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
-- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery across HTTP, SSE, and STDIO transports
+- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP Streamable transport
 - Automatic schema sanitization for OpenAI function-calling compatibility
-- RAG pipeline integration with in-memory and external vector stores
+- Vector search integration with Qdrant and AWS Bedrock Knowledge Base
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
-- Dependency-aware multi-wave execution with iterative re-planning loops
-
-> **Open Alpha** — Aura is under active development. APIs and configuration
-> may change between releases. [Issues and feature requests](https://github.com/mezmo/aura/issues)
-> are welcome — we'd love your feedback.
+- Dependency-aware multi-wave execution with plan/execute loops
 
 ## Table of Contents
 
-- [Aura](#aura)
-  - [Table of Contents](#table-of-contents)
-  - [Project Structure](#project-structure)
-  - [Quick Start](./examples/quickstart/README.md)
-  - [Developer Setup](#setup)
-  - [Usage](#usage)
-    - [Web API Server](#web-api-server)
-  - [Configuration](#configuration)
-    - [Multiple Agents](#multiple-agents)
-    - [Configuration Sections](#configuration-sections)
-    - [Orchestration](#orchestration)
-      - [Orchestration fields](#orchestration-fields)
-      - [Worker fields (`[orchestration.worker.<name>]`)](#worker-fields-orchestrationworkername)
-    - [Ollama](#ollama)
-    - [Observability](#observability)
-  - [Docker Deployment](#docker-deployment)
-  - [Development and Testing](#development-and-testing)
-  - [Testing](#testing)
-  - [Documentation](#documentation)
-  - [Architecture](#architecture)
-  - [License](#license)
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [Development Setup](#development-setup)
+- [Usage](#usage)
+  - [Web API Server](#web-api-server)
+  - [Client-Side Tools](#client-side-tools)
+- [Configuration](#configuration)
+  - [Multiple Agents](#multiple-agents)
+  - [Configuration Sections](#configuration-sections)
+  - [Orchestration](#orchestration)
+  - [Scratchpad (Context Window Management)](#scratchpad-context-window-management)
+  - [Ollama](#ollama)
+  - [Observability](#observability)
+- [Development and Testing](#development-and-testing)
+- [Testing](#testing)
+- [Documentation](#documentation)
+- [Architecture](#architecture)
+
+## Quick Start
+
+```bash
+cp .env.example .env          # set your LLM provider, model, and API key
+docker compose up -d           # starts Aura + LibreChat + Phoenix
+```
+
+Open <http://localhost:3080> to chat, <http://localhost:6006> to inspect traces.
+
+**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
+
+### More Quickstarts
+
+- **[Orchestration — Math MCP](examples/quickstart-orchestration-math/README.md)** — Multi-agent orchestration with coordinator/worker architecture
+- **[Kubernetes SRE](examples/quickstart-k8s-sre/README.md)** — AI-powered SRE agent on KIND with Kubernetes and Prometheus MCP servers
+- **[Example Configs](examples/README.md)** — Minimal per-provider configs and complete agent compositions
 
 ## Project Structure
 
@@ -46,19 +55,23 @@ Key capabilities:
 aura/
 ├── crates/
 │   ├── aura/                # Core library (agent builder + orchestration)
+│   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
 │   ├── aura-config/         # TOML parser and config loader
-│   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
-│   └── aura-test-utils/     # Shared testing utilities
+│   ├── aura-events/         # Shared SSE event types
+│   ├── aura-test-utils/     # Shared testing utilities
+│   └── aura-web-server/     # OpenAI-compatible HTTP/SSE server
 ├── compose/                 # Docker Compose (integration + orchestration overlays)
 ├── configs/                 # E2E test and orchestration configurations
 ├── deployment/              # Helm charts and K8s manifests
-├── development/             # LibreChat and OpenWebUI setup
 ├── docs/                    # Architecture and protocol documentation
 ├── examples/                # Example and reference configurations
-└── scripts/                 # CI and utility scripts
+├── scripts/                 # CI and utility scripts
+└── tests/                   # Integration test fixtures and helpers
 ```
 
-## Setup
+## Development Setup
+
+For building Aura from source without Docker.
 
 1. Install Rust if needed:
    ```bash
@@ -73,9 +86,9 @@ aura/
    ```bash
    export OPENAI_API_KEY="your-api-key"
    ```
-4. Build:
+4. Build and run:
    ```bash
-   cargo build --release
+   cargo run --bin aura-web-server
    ```
 
 Security: keep secrets in environment variables and reference them in TOML using `{{ env.VAR_NAME }}`.
@@ -84,7 +97,7 @@ Security: keep secrets in environment variables and reference them in TOML using
 
 ### Web API Server
 
-Run the server:
+Run the web server:
 
 ```bash
 # Default: reads config.toml
@@ -101,6 +114,15 @@ HOST=0.0.0.0 PORT=3000 cargo run --bin aura-web-server
 
 # Enable Aura custom SSE events
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
+
+# Kitchen sink: all options
+CONFIG_PATH=configs/ \
+  HOST=0.0.0.0 PORT=8080 \
+  AURA_CUSTOM_EVENTS=true \
+  AURA_EMIT_REASONING=true \
+  TOOL_RESULT_MODE=aura \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  cargo run --bin aura-web-server -- --verbose
 ```
 
 Core server options:
@@ -151,8 +173,6 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
-
-For LibreChat/OpenWebUI integration, see [development/README.md](development/README.md).
 
 ### Client-Side Tools
 
@@ -230,9 +250,13 @@ When the loaded agent doesn't opt in (the default), any `tools` field on the req
 
 ## Configuration
 
-> **Breaking changes (21 April 2026)**: `[llm]` has moved under `[agent.llm]` and workers may now override the LLM via `[orchestration.worker.<name>.llm]`. See [./docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md).
->
-> **Breaking changes (10 April 2026)**: Several fields moved from `[agent]` to `[llm]` and Ollama-specific fields have been consolidated under `[llm.additional_params]`. See [./docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md).
+<details>
+<summary>Recent breaking changes</summary>
+
+- **21 April 2026**: `[llm]` moved under `[agent.llm]`; workers may override via `[orchestration.worker.<name>.llm]`. See [migration guide](docs/breaking-changes/20260421-llm-under-agent.md).
+- **10 April 2026**: Several fields moved from `[agent]` to `[llm]`; Ollama params consolidated under `[llm.additional_params]`. See [migration guide](docs/breaking-changes/20260410-agent-llm-toml-configuration.md).
+
+</details>
 
 `CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
@@ -271,24 +295,16 @@ Configuration sections:
 
 - `[agent]`: identity, system prompt, and runtime behavior.
 - `[agent.llm]`: provider and model configuration for the agent.
-- `[[vector_stores]]`: optional RAG/vector store configuration.
+- `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
 Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
 
-Supported MCP transports:
+Supported MCP transport:
 
-- `http_streamable` (recommended for production)
-- `sse`
-- `stdio` - for local processes. In production, bridge through [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) to avoid Rig.rs STDIO lifecycle issues:
+- `http_streamable`
 
-```bash
-mcp-proxy --port=8081 --host=127.0.0.1 npx your-mcp-server
-```
-
-Then point your config at the HTTP/SSE endpoint instead.
-
-`headers_from_request` can forward incoming request headers to MCP servers for per-request auth. See [development/README.md](development/README.md) for practical examples.
+`headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
@@ -317,10 +333,22 @@ url = "http://localhost:8081/mcp"
 headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
 ```
 
-Validate config parsing quickly:
+Validate built-in config examples and tests:
 
 ```bash
-cargo run -p aura-config --bin debug_config
+cargo test -p aura-config
+```
+
+This runs all config validation tests, including `test_all_shipped_configs_parse` which validates every `.toml` file in `configs/`, `examples/`, and `quickstart.toml`.
+
+To validate your own config file, start the web server or CLI — both validate the config immediately and exit with a clear error if parsing fails, before binding to any port or entering the REPL:
+
+```bash
+# Validate via web server (exits on parse error before binding)
+cargo run -p aura-web-server -- --config your-config.toml
+
+# Validate via standalone CLI (exits on parse error before REPL)
+cargo run -p aura-cli --features standalone-cli -- --standalone --config your-config.toml
 ```
 
 ### Orchestration
@@ -388,7 +416,6 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
-| `memory_dir` | string | — | **Legacy** — prefer top-level `memory_dir`. Directory for cross-iteration artifact persistence. Equivalent to `[orchestration.artifacts].memory_dir` |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
 | `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
@@ -407,7 +434,9 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 
 ### Scratchpad (Context Window Management)
 
-Scratchpad intercepts large MCP tool outputs and stores them on disk so the LLM can selectively explore them via eight read-only tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) rather than pushing the entire payload into context.
+MCP tools can return responses far larger than an LLM's context window — a single Kubernetes workload listing or log export can be tens of thousands of tokens. Without intervention, this fills the context and degrades reasoning quality.
+
+Scratchpad solves this by intercepting large tool outputs and storing them on disk. The LLM gets a summary and eight read-only exploration tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) to selectively pull in only the data it needs.
 
 Scratchpad works in both single-agent and orchestration modes. Configure at `[agent.scratchpad]` (applies to the single agent, or provides defaults for orchestration workers) and optionally override per worker at `[orchestration.worker.<name>.scratchpad]`. Set a top-level `memory_dir` for persistence:
 
@@ -454,24 +483,7 @@ Aura supports Ollama, including fallback tool-call parsing for models that emit 
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Rig-originated `gen_ai.*` attributes are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
-
-## Docker Deployment
-
-Aura includes containerized deployment assets at the repo root:
-
-- `Dockerfile`: multi-stage build for the web server.
-- `docker-compose.yml`: local container deployment wiring.
-
-Run with Docker Compose:
-
-```bash
-docker compose up --build
-```
-
-Default container port mapping is `3030:3030` in `docker-compose.yml`. Ensure your config path and API key environment variables are set for the container runtime.
-
-Orchestration testing overlays are available in `compose/` (for example `compose/orchestration.yml` and `compose/orchestration-test.yml`).
+Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Development and Testing
 
@@ -489,16 +501,7 @@ make lint
 
 # Build targets
 make build
-make build-release
 ```
-
-Test CI pipeline locally before pushing:
-
-```bash
-./scripts/test-ci.sh
-```
-
-The script mirrors Jenkins checks: format, workspace tests, and clippy with warnings denied.
 
 ## Testing
 
@@ -534,17 +537,17 @@ Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
 - SRE orchestration suite: `integration-orchestration-sre` (requires k8s-sre-mcp server config)
 - Optional suite: `integration-vector` (requires external Qdrant setup)
 
-Detailed test guidance: [crates/aura-web-server/tests/README.md](crates/aura-web-server/tests/README.md).
+Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-server/README.md).
 
 ## Documentation
 
+- [docs/quickstart.md](docs/quickstart.md): getting started guide — setup, customization, architecture, and troubleshooting.
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
-- [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md): tool execution ordering analysis.
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
-- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes and rationale.
-- [development/README.md](development/README.md): LibreChat/OpenWebUI setup and header-forwarding examples.
+- [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
+- [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 
@@ -554,19 +557,21 @@ Aura separates concerns across crates:
 
 - `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.
+- `aura-events`: shared SSE event types (`AuraStreamEvent`, `OrchestrationStreamEvent`) — lightweight, no agent dependencies.
 - `aura-web-server`: OpenAI-compatible REST/SSE serving layer.
+- `aura-cli`: interactive terminal client with HTTP and standalone modes.
 
 This separation means:
 
 - Embeddable core: use `aura` directly in any Rust application without config file dependencies.
-- Flexible config: `aura-config` can be extended to support other formats (JSON, YAML).
+- Shared event types: `aura-events` can be consumed by any Rust client without pulling in the full agent stack.
 - Testable boundaries: each crate has focused responsibilities and clear interfaces.
 
 Key architectural characteristics:
 
 - Dynamic MCP tool discovery at runtime.
 - Automatic schema sanitization (anyOf, missing types, optional parameters) driven by OpenAI function-calling requirements — MCP tool schemas are transformed at discovery time to conform to OpenAI's strict subset of JSON Schema.
-- Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.
+- Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.  See [examples/reference.toml](examples/reference.toml) for a practical example.
 - Config-driven composition with embeddable Rust core.
 
 Prompt routing and execution model:
@@ -581,7 +586,7 @@ Orchestrator components and loop:
 - Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
 - Worker agents: per-task instances with filtered MCP tools and vector stores.
 - Persistence/event layers: track plan state, task outcomes, and stream orchestration events.
-- Loop: Plan -> Execute (dependency waves) -> Continue (respond / replan / clarify).
+- Loop: Plan -> Execute (dependency waves) -> Continue (respond / plan again / clarify).
 
 Request execution and cancellation flow are documented in [docs/request-lifecycle.md](docs/request-lifecycle.md).
 

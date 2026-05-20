@@ -12,7 +12,7 @@ OpenAI-compatible web API server that exposes AURA agents through a standard cha
 
 - **OpenAI Compatible**: Implements `/v1/chat/completions` endpoint following OpenAI's API schema
 - **Multi-Turn Conversations**: Maintains conversation context across requests
-- **Full Tool Integration**: Supports all MCP transports (HTTP, SSE, STDIO) and filesystem tools
+- **Full Tool Integration**: Supports all MCP transports (HTTP, SSE, STDIO) and client-side tool passthrough
 - **Health Monitoring**: `/health` endpoint for container health checks
 - **Production Ready**: Stateless processing with pre-built agent, Docker-ready
 
@@ -71,10 +71,10 @@ POST /v1/chat/completions
 Content-Type: application/json
 ```
 
-The `model` field selects which agent handles the request by matching against agent `alias` or `name`. When `model` is omitted, the server resolves the agent in this order:
-1. `DEFAULT_AGENT` environment variable
-2. Automatic selection when only one config is loaded
-3. Returns a 400 error if multiple configs are loaded and no default is set
+The `model` field selects which agent handles the request by matching against agent `alias` or `name`. Agent selection follows this order:
+1. If only one config is loaded, it is always used (the `model` field is ignored)
+2. Otherwise, `model` is matched first, then `DEFAULT_AGENT` if `model` is absent
+3. Returns a 400 error if multiple configs are loaded and neither `model` nor `DEFAULT_AGENT` resolves to a match
 
 Request body:
 ```json
@@ -101,7 +101,11 @@ Response:
     },
     "finish_reason": "stop"
   }],
-  "usage": null
+  "usage": {
+    "prompt_tokens": 42,
+    "completion_tokens": 118,
+    "total_tokens": 160
+  }
 }
 ```
 
@@ -140,33 +144,22 @@ Integration tests verify streaming and tool execution functionality. Tests use a
 
 ### Running Tests
 
-**Automated** (recommended):
 ```bash
-# Runs all tests with automatic setup/teardown
-./crates/aura-web-server/tests/run_tests.sh
-```
-
-**Manual**:
-```bash
-# 1. Start mock MCP server (in one terminal)
-python3 tests/integration/mock_mcp_server.py 9999
-
-# 2. Start the server with test config (in another terminal)
+# 1. Start the server with test config (in one terminal)
 CONFIG_PATH=crates/aura-web-server/tests/test-config.toml \
   cargo run --bin aura-web-server
 
-# 3. Run tests (in a third terminal)
+# 2. Run tests (in another terminal)
 # All integration tests
 cargo test --package aura-web-server --tests
 
-# Or specific test suite
+# Or a specific test suite
 cargo test --package aura-web-server --test streaming_tests
 ```
 
 ### Prerequisites
 
 - `OPENAI_API_KEY` environment variable (for LLM calls during tests)
-- Python 3 (for mock MCP server)
 
 ## Configuration
 
@@ -188,15 +181,23 @@ Example configurations are in the [`examples/`](../../examples/) directory.
 
 ## Deployment
 
-**Docker**: See [DOCKER.md](../../DOCKER.md) for containerized deployment
-
 **Environment Variables**:
-- `CONFIG_PATH` - Path to configuration file or directory (default: `config.toml`)
-- `HOST` - Server bind address (default: `127.0.0.1`)
-- `PORT` - Server port (default: `8080`)
-- `DEFAULT_AGENT` - Default agent name or alias when `model` is omitted from requests. Not required when only one configuration is loaded via `CONFIG_PATH`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONFIG_PATH` | `config.toml` | Path to a config file or directory of configs |
+| `HOST` | `127.0.0.1` | Server bind address |
+| `PORT` | `8080` | Server port |
+| `DEFAULT_AGENT` | *(none)* | Agent name or alias used when `model` is omitted. Not needed when only one config is loaded. |
+| `AURA_CUSTOM_EVENTS` | `false` | Emit `aura.*` SSE events alongside OpenAI-compatible chunks |
+| `AURA_EMIT_REASONING` | `false` | Emit `aura.reasoning` events (requires `AURA_CUSTOM_EVENTS=true`) |
+| `TOOL_RESULT_MODE` | `none` | How tool results are streamed: `none`, `open-web-ui`, or `aura` |
+| `TOOL_RESULT_MAX_LENGTH` | `1000` | Truncation limit for streamed tool results (0 = no truncation) |
+| `STREAMING_TIMEOUT_SECS` | `900` | Max duration for a streaming request before cancellation |
+| `FIRST_CHUNK_TIMEOUT_SECS` | `90` | Max wait for the first LLM chunk before treating the connection as hung (0 = disabled) |
+| `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period for in-flight streams after SIGTERM/SIGINT |
+| `STREAMING_BUFFER_SIZE` | `400` | SSE chunk buffer size; higher values reduce latency but increase memory use |
 
 ## See Also
 
 - [Main Documentation](../../README.md) - Full project setup and features
-- [Docker Guide](../../DOCKER.md) - Container deployment
