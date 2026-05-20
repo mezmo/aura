@@ -60,6 +60,14 @@
 //! the caller's span instead of creating its own `invoke_agent` span,
 //! keeping `agent.turn` as a direct child of `agent.stream`.
 //!
+//! The `aura-cli` standalone backend
+//! (`crates/aura-cli/src/backend/direct.rs`) wraps its
+//! `execute_completion` spawn with the same `agent.stream` instrumentation,
+//! so traces emitted from `aura-cli --standalone` produce the same shape as
+//! the web server's. The CLI does not emit the `chat_completions` /
+//! `streaming_completion` HTTP-infrastructure spans because it has no HTTP
+//! layer; those spans live on a separate trace in the server.
+//!
 //! For orchestration, the spawned task in `Orchestrator::stream()` is
 //! instrumented with the `agent.stream` span so that all orchestration
 //! child spans nest correctly under the trace root.
@@ -154,7 +162,7 @@ pub fn truncate_for_otel(s: &str) -> String {
 }
 
 /// Read content-recording env vars. Called once at the top of `init_logging`.
-fn init_content_config() {
+pub fn init_content_config() {
     RECORD_CONTENT.store(
         crate::env_flags::bool_env("OTEL_RECORD_CONTENT", false),
         Ordering::Relaxed,
@@ -227,8 +235,12 @@ where
 ///
 /// Stores the provider in `TRACER_PROVIDER` for later shutdown and returns it.
 /// Returns `None` when the env var is absent.
+///
+/// Public so binaries that compose their own subscriber stack (e.g.
+/// `aura-cli` in standalone mode) can register the provider before attaching
+/// an `OpenTelemetryLayer`. Subsequent calls reuse the cached provider.
 #[cfg(feature = "otel")]
-fn init_otel_provider() -> Option<&'static TracerProvider> {
+pub fn init_otel_provider() -> Option<&'static TracerProvider> {
     // Presence check only — the OTLP exporter reads the endpoint value itself
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
 
@@ -265,7 +277,7 @@ fn init_otel_provider() -> Option<&'static TracerProvider> {
 /// Called per-branch so the layer's generic `S` parameter matches the
 /// concrete subscriber stack in that branch.
 #[cfg(feature = "otel")]
-fn otel_layer<S>(
+pub fn otel_layer<S>(
     provider: &TracerProvider,
 ) -> tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>
 where
@@ -280,7 +292,7 @@ where
 /// Captures all aura + rig spans for Phoenix/Jaeger regardless of console verbosity.
 /// Override with `OTEL_LOG_LEVEL` env var.
 #[cfg(feature = "otel")]
-fn otel_filter(binary_name: &str) -> EnvFilter {
+pub fn otel_filter(binary_name: &str) -> EnvFilter {
     EnvFilter::try_from_env("OTEL_LOG_LEVEL").unwrap_or_else(|_| {
         format!(
             "warn,aura=trace,aura_config=info,{binary_name}=info,rig::agent::prompt_request=info,rig::completions=info"

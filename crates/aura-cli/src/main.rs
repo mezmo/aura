@@ -22,6 +22,24 @@ fn main() -> Result<()> {
 
     let mut config = AppConfig::load(&args)?;
 
+    #[cfg(feature = "standalone-cli")]
+    let is_standalone = args.standalone;
+    #[cfg(not(feature = "standalone-cli"))]
+    let is_standalone = false;
+
+    // One process-wide tokio runtime, owned by `main` and threaded into
+    // `Backend::from_config`, `run_oneshot`, and `run_repl`.
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Brief `enter` window: `init_otel_provider` reads `Handle::current()`
+    // during the tonic exporter build. Drops as soon as init returns — we
+    // can't `block_on` from inside `_enter`, and `Backend::from_config`
+    // does exactly that.
+    {
+        let _enter = rt.enter();
+        aura_cli::logging::init(config.log_file.as_deref(), is_standalone)?;
+    }
+
     // Make sure `~/.aura/cli.toml` exists and has a `style` line. First-run
     // users get a discoverable file with `style = "normal"` they can edit.
     // Failure is silent — read-only filesystems and weird home setups
@@ -46,12 +64,7 @@ fn main() -> Result<()> {
     // `render_queued_wave` in `ui::animation`.
     aura_cli::ui::prompt::set_pretty(config.pretty);
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
-    let mut backend = Backend::from_config(&config, &args)?;
-
-    #[cfg(feature = "standalone-cli")]
-    let is_standalone = args.standalone;
-    #[cfg(not(feature = "standalone-cli"))]
-    let is_standalone = false;
+    let mut backend = Backend::from_config(&rt, &config, &args)?;
 
     let is_query = config.query.is_some();
 
@@ -107,14 +120,22 @@ fn main() -> Result<()> {
         .or(resume_warnings.model_warning)
         .or(client_tools_warning.clone());
 
-    if is_query {
+    let result = if is_query {
         // One-shot mode skips the REPL panel — surface the warning on stderr
         // so it remains visible in scripted contexts.
         if let Some(msg) = client_tools_warning {
             eprintln!("warning: {msg}");
         }
-        run_oneshot(config, permissions, &backend)
+        run_oneshot(&rt, config, permissions, &backend)
     } else {
-        run_repl(config, permissions, &backend, post_launch_warning)
-    }
+        run_repl(&rt, config, permissions, &backend, post_launch_warning)
+    };
+
+    // Flush any buffered OTel spans before `rt` drops — the
+    // `BatchSpanProcessor` exports on a timer (~5s) and we'd lose the
+    // tail of the trace otherwise.
+    #[cfg(feature = "standalone-cli")]
+    rt.block_on(aura::logging::shutdown_tracer());
+
+    result
 }
