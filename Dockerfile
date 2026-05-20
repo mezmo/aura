@@ -16,6 +16,11 @@ RUN <<EOR
   rm -rf /var/lib/apt/lists/*
 EOR
 
+# Install pinned MCP test fixture for STDIO integration tests.
+# Verified at build time; tests invoke `mcp-server-everything` directly.
+RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
+  && command -v mcp-server-everything
+
 USER 1000
 
 RUN <<EOR
