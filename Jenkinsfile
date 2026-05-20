@@ -33,6 +33,13 @@ pipeline {
     timeout time: 1, unit: 'HOURS'
     timestamps()
     ansiColor 'xterm'
+    disableConcurrentBuilds()
+    buildDiscarder(
+      logRotator(
+        numToKeepStr: env.BRANCH_NAME == DEFAULT_BRANCH ? '30' : '5',
+        artifactNumToKeepStr: env.BRANCH_NAME == DEFAULT_BRANCH ? '30' : '5'
+      )
+    )
   }
 
   environment {
