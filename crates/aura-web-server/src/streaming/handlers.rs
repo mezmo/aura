@@ -1297,7 +1297,8 @@ fn build_final_chunk(ctx: &TurnContext, state: &TurnState) -> Vec<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aura::stream_events::{AgentContext, CorrelationContext, event_names};
+    use aura::stream_events::{AgentContext, CorrelationContext};
+    use aura_events::event_names;
 
     /// Verify handle_tool_call does NOT emit aura.tool_requested events directly.
     /// The aura.tool_requested event is emitted via StreamingRequestHook → tool_event_rx channel

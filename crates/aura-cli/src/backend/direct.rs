@@ -6,7 +6,7 @@
 //! same `process_sse_events` parser used by the HTTP backend. This guarantees
 //! identical behavior whether the CLI connects via HTTP or runs standalone.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use aura_web_server::types::{
     ChatMessageToolCall, ClientFunctionDefinition, ClientToolDefinition, Role,
 };
 
-use crate::api::stream::{StreamResult, process_sse_events};
+use crate::api::stream::{StreamHandler, StreamResult, process_sse_events};
 use crate::api::types::{Message, ToolCallInfo, ToolDefinition};
 use crate::ui::prompt::get_selected_model;
 
@@ -239,13 +239,7 @@ impl DirectBackend {
         tools: Option<&[ToolDefinition]>,
         session_id: &str,
         cancel: Arc<AtomicBool>,
-        on_token: impl FnMut(&str),
-        on_tool_requested: impl FnMut(&str, &str, &BTreeMap<String, serde_json::Value>),
-        on_tool_start: impl FnMut(&str, &str),
-        on_tool_complete: impl FnMut(&str, &str, Duration, Option<&str>),
-        on_usage: impl FnMut(u64, u64),
-        on_raw_event: impl FnMut(&str, &str),
-        on_orchestrator_event: impl FnMut(&str, &serde_json::Value),
+        handler: &mut impl StreamHandler,
     ) -> Result<StreamResult> {
         let selected = get_selected_model();
         let mut req = Self::build_chat_request(messages, tools, selected);
@@ -283,18 +277,7 @@ impl DirectBackend {
         let sse_stream = byte_stream.eventsource();
 
         // Parse SSE events through the same parser used by the HTTP backend
-        process_sse_events(
-            sse_stream,
-            cancel,
-            on_token,
-            on_tool_requested,
-            on_tool_start,
-            on_tool_complete,
-            on_usage,
-            on_raw_event,
-            on_orchestrator_event,
-        )
-        .await
+        process_sse_events(sse_stream, cancel, handler).await
     }
 
     pub async fn summarize(

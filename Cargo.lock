@@ -287,6 +287,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "uuid",
 ]
 
@@ -343,6 +344,7 @@ dependencies = [
  "async-trait",
  "aura",
  "aura-config",
+ "aura-events",
  "aura-test-utils",
  "axum 0.8.9",
  "bytes",

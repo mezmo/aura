@@ -13,6 +13,7 @@
 //! Both enums derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
+pub mod event_names;
 pub mod orchestration;
 
 use serde::{Deserialize, Serialize};
@@ -296,16 +297,16 @@ impl AuraStreamEvent {
     /// Get the SSE event name for this event type.
     pub fn event_name(&self) -> &'static str {
         match self {
-            Self::SessionInfo { .. } => "aura.session_info",
-            Self::ToolRequested { .. } => "aura.tool_requested",
-            Self::ToolStart { .. } => "aura.tool_start",
-            Self::ToolComplete { .. } => "aura.tool_complete",
-            Self::Reasoning { .. } => "aura.reasoning",
-            Self::Progress { .. } => "aura.progress",
-            Self::WorkerPhase { .. } => "aura.worker_phase",
-            Self::ToolUsage { .. } => "aura.tool_usage",
-            Self::Usage { .. } => "aura.usage",
-            Self::ScratchpadUsage { .. } => "aura.scratchpad_usage",
+            Self::SessionInfo { .. } => event_names::SESSION_INFO,
+            Self::ToolRequested { .. } => event_names::TOOL_REQUESTED,
+            Self::ToolStart { .. } => event_names::TOOL_START,
+            Self::ToolComplete { .. } => event_names::TOOL_COMPLETE,
+            Self::Reasoning { .. } => event_names::REASONING,
+            Self::Progress { .. } => event_names::PROGRESS,
+            Self::WorkerPhase { .. } => event_names::WORKER_PHASE,
+            Self::ToolUsage { .. } => event_names::TOOL_USAGE,
+            Self::Usage { .. } => event_names::USAGE,
+            Self::ScratchpadUsage { .. } => event_names::SCRATCHPAD_USAGE,
         }
     }
 
