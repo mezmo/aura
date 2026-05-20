@@ -31,13 +31,16 @@ impl Backend {
     ///
     /// If `--standalone` is set, uses `DirectBackend` with the config from `--config`.
     /// Otherwise, uses `HttpBackend` (HTTP/SSE to aura-web-server).
-    pub fn from_config(config: &AppConfig, _args: &Args) -> Result<Self> {
+    pub fn from_config(
+        _rt: &tokio::runtime::Runtime,
+        config: &AppConfig,
+        _args: &Args,
+    ) -> Result<Self> {
         #[cfg(feature = "standalone-cli")]
         if _args.standalone {
             // validate_standalone_args guarantees --config is present when --standalone is set
             let config_path = _args.agent_config.as_ref().unwrap();
-            let rt = tokio::runtime::Runtime::new()?;
-            let direct = rt.block_on(direct::DirectBackend::from_toml(
+            let direct = _rt.block_on(direct::DirectBackend::from_toml(
                 config_path,
                 config.extra_headers.clone(),
             ))?;

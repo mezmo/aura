@@ -82,6 +82,20 @@ pub struct Args {
     #[cfg(feature = "standalone-cli")]
     #[arg(long = "config")]
     pub agent_config: Option<String>,
+
+    /// Path to a file for diagnostic logs. When unset, the CLI emits no
+    /// log output. When set, `tracing` events are written to this path
+    /// in both REPL and one-shot mode — the file is opened in append
+    /// mode and created if missing.
+    ///
+    /// **Log rotation, truncation, and pruning are the user's
+    /// responsibility.** The CLI will append indefinitely; use `logrotate`,
+    /// `truncate -s 0`, or a shell wrapper if the file grows unbounded.
+    ///
+    /// Precedence: `--log-file` / `AURA_LOG_FILE` > project `cli.toml`
+    /// `log_file` > global `cli.toml` `log_file` > no logging.
+    #[arg(long, env = "AURA_LOG_FILE")]
+    pub log_file: Option<String>,
 }
 
 /// Pre-parse check for `--config` and `--standalone` when the standalone-cli feature is not enabled.
