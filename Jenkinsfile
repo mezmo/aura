@@ -78,7 +78,7 @@ pipeline {
 
     stage('ChangeSet Validation') {
       parallel {
-        stage("Convention Commit Check") {
+        stage("Conventional Commit Check") {
           steps {
             script {
               // There isn't an actual file in the repo for github to associate errors / annotations with
