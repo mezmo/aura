@@ -83,7 +83,7 @@ cargo build -p aura-cli --features standalone-cli
 ## Features
 
 - **Interactive REPL** with conversation history, streaming responses, and markdown rendering
-- **One-shot mode** for scripting and pipelines (`--query`)
+- **One-shot mode** for scripting and pipelines (`--query`) — stdout is the raw assistant response, no markers or markdown rendering
 - **Local tool execution** — the model can read files, search code, list directories, run shell commands, and edit files on your behalf
 - **Standalone mode** — run agents directly from TOML config without a web server (`--standalone --config`)
 - **Conversation persistence** — pick up where you left off with `--resume` or `/resume`
@@ -107,6 +107,7 @@ cargo build -p aura-cli --features standalone-cli
 | `AURA_EXTRA_HEADERS`                  | Additional HTTP headers as comma-separated `key:value` pairs (e.g. `x-chat-session-id:foo,authorization:Bearer …`); overrides the auto-injected `x-chat-session-id` | _(none)_                                              |
 | `AURA_ENABLE_FINAL_RESPONSE_SUMMARY`  | Generate a one-line LLM-based title for each final response (adds an extra round-trip per turn). Set to `true` or `1` to enable.                                    | `false`                                               |
 | `AURA_ENABLE_CLIENT_TOOLS`            | Advertise CLI local tools to the model and execute them locally (see [Client-Side Tools](#client-side-tools))                                                       | `false`                                               |
+| `AURA_LOG_FILE`                       | Path to a file for diagnostic tracing logs. Unset → no logging. Set → events are appended to the file in both REPL and one-shot mode (see [Logging](#logging))      | _(none — no logging)_                                 |
 
 ---
 
@@ -129,6 +130,7 @@ aura-cli [OPTIONS]
 | `--enable-final-response-summary[=<bool>]` | `AURA_ENABLE_FINAL_RESPONSE_SUMMARY` | Generate a one-line LLM title for each final response (adds an extra round-trip per turn; default: disabled) |
 | `--standalone`                             | —                                    | Run in standalone mode (requires `--config`, requires `standalone-cli` feature)                          |
 | `--config <PATH>`                          | —                                    | Path to TOML agent config file or directory (requires `--standalone`)                                    |
+| `--log-file <PATH>`                        | `AURA_LOG_FILE`                      | Append diagnostic tracing logs to this file. Omit for no logging (see [Logging](#logging))               |
 
 **Precedence:** CLI flags > environment variables > project `cli.toml` > global `cli.toml` > defaults.
 
@@ -161,6 +163,7 @@ api_key = "your-api-key"
 model = "gpt-4o"
 system_prompt = "You are a helpful assistant."
 enable_client_tools = true   # opt in to local tool execution; default is false
+log_file = "/tmp/aura-cli.log"  # append-only; see Logging section below
 ```
 
 > **Note on system prompts:** In **HTTP mode**, `--system-prompt` is intended for
@@ -175,6 +178,39 @@ enable_client_tools = true   # opt in to local tool execution; default is false
 > `~/.aura/cli.toml`, in `AURA_API_KEY`, or pass them with `--api-key`.
 
 Any value set here is overridden by environment variables or CLI flags.
+
+---
+
+## One-Shot Mode
+
+`--query <text>` runs a single round of the conversation and exits. The
+output contract is strict: **stdout contains only the raw assistant
+response** — exactly what the model produced, with no bullet markers, no
+themed headers, no tool-execution summaries, no markdown rendering, and no
+trailing response-summary line.
+
+Anything that isn't the response goes to **stderr**:
+
+- Diagnostic logs from `--log-file` / `AURA_LOG_FILE` (file destination
+  unchanged; the file is the same destination in REPL and one-shot mode)
+- Permission prompts for local tools (interactive, on TTY)
+- Errors and warnings (with `error:` / `warning:` prefixes, no markers)
+- The "no result for server tool X — set `AURA_CUSTOM_EVENTS=true`" hint
+
+This means typical pipe usage works without scrubbing:
+
+```bash
+aura-cli --query "summarize the README" > summary.md
+aura-cli --query "list three ideas as JSON" | jq .
+aura-cli --query "what's the version?" 2>/dev/null | tee log.txt
+```
+
+Exit code follows the standard contract: `0` ⇒ stdout is the complete
+response; non-zero ⇒ stderr explains why and stdout is empty.
+
+The REPL retains its rich formatting (bullet markers, markdown rendering,
+tool-call summaries, animated headers). The strict-output rules above
+apply only to `--query` mode.
 
 ---
 
@@ -341,6 +377,71 @@ aura-cli --resume abc123           # from the CLI
 /resume abc123                     # resume by ID prefix
 /rename my chat                    # name the current conversation
 ```
+
+---
+
+## Logging
+
+The CLI is silent by default — no `tracing` events are emitted unless you opt
+in by pointing the CLI at a log file. When set, fmt events are written to that
+path in **both REPL and one-shot mode** so stdout (and any pipe consuming it)
+stays untouched.
+
+Three places can supply the path, in precedence order:
+
+| Source          | Form                                  |
+| --------------- | ------------------------------------- |
+| CLI flag        | `--log-file /tmp/aura-cli.log`        |
+| Environment     | `AURA_LOG_FILE=/tmp/aura-cli.log`     |
+| `cli.toml`      | `log_file = "/tmp/aura-cli.log"`      |
+
+The file is opened in **append mode** and created if missing. The default
+filter mirrors `aura-web-server`'s verbose mode (info-level for aura crates
+and rig request handling); override it with `RUST_LOG` if you need different
+levels.
+
+> **Log rotation, truncation, and pruning are your responsibility.** The
+> CLI appends indefinitely — it never truncates, rotates, or compresses the
+> file. Use `logrotate`, a cron job, `truncate -s 0`, or a shell wrapper to
+> keep the file from growing unbounded.
+
+### Standalone-mode OpenTelemetry
+
+When built with `--features standalone-cli` and run with `--standalone`, the
+CLI runs the agent in-process. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the CLI
+will install an OpenTelemetry layer alongside (or instead of) the file fmt
+layer — the same trace structure (`agent.stream` → `agent.turn` →
+`mcp.tool_call`, with `orchestration.*` between them in orchestration mode)
+that `aura-web-server` exports. The CLI mirrors the server's
+`.instrument(info_span!("agent.stream"))` wrapper around `execute_completion`
+in `crates/aura-cli/src/backend/direct.rs`, so input/output attributes,
+token counts, and tool spans all land in the right place.
+
+The CLI omits the `chat_completions` / `streaming_completion` infrastructure
+spans because there is no HTTP layer in standalone mode — those live on a
+separate trace in the server. HTTP-mode CLIs skip OTel entirely: your
+traces come from the server process.
+
+OTel init is independent of `--log-file`; you can run with traces only
+(no log file), logs only (no OTel endpoint), or both. The CLI builds a
+single tokio runtime in `main` and threads it into `Backend::from_config`,
+`run_oneshot`, and `run_repl` — `logging::init` runs inside that runtime's
+context so the OTLP gRPC exporter can grab `Handle::current()` during
+construction, and the `BatchSpanProcessor` worker lives on the same
+runtime that drives the request loop. `main` flushes via
+`aura::logging::shutdown_tracer()` before the runtime drops so trailing
+spans aren't lost.
+
+Other relevant OTel env vars (read by the `aura` crate, unchanged from the
+server):
+
+| Variable                                | Purpose                                                                                              |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`           | OTLP collector endpoint (gRPC). When unset, no OTel layer is installed even in standalone mode.      |
+| `OTEL_SERVICE_NAME`                     | Resource attribute (defaults to `aura`).                                                             |
+| `OTEL_LOG_LEVEL`                        | Override the OTel layer's filter. Default captures `aura=trace`, `aura_cli=info`, and rig spans.     |
+| `OTEL_RECORD_CONTENT`                   | When `true`, prompt/completion/tool args/results are recorded as span attributes.                    |
+| `OTEL_CONTENT_MAX_LENGTH`               | Max bytes for content attributes (default 1000, rounded down to UTF-8 boundary).                     |
 
 ---
 

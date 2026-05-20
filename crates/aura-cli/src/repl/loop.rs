@@ -39,12 +39,12 @@ use crate::ui::prompt::{
 use crate::ui::welcome::WelcomeState;
 
 pub fn run_repl(
+    rt: &Runtime,
     config: AppConfig,
     mut permissions: crate::permissions::PermissionChecker,
     backend: &Backend,
     post_launch_warning: Option<String>,
 ) -> Result<()> {
-    let rt = Runtime::new()?;
     let mut conversation = ConversationHistory::new(config.system_prompt.as_deref());
 
     // Catch SIGINT so Ctrl-C works even when ISIG is unexpectedly enabled.
