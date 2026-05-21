@@ -1,7 +1,16 @@
 setup:: setup-docker
+lint:: lint-docker
 $(BUILD_ENV):: $(DOCKER_ENV)
 
 WITH_DOCKER_ENV ?= true
+
+SED_INPLACE :=
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+	SED_INPLACE = -i ''
+else
+	SED_INPLACE = -i
+endif
 
 .PHONY:setup-docker
 setup-docker:
@@ -15,3 +24,10 @@ shell: $(DOCKER_ENV)
 
 clean-docker:
 	-@docker rmi $(AURA_RUNNER_IMAGE) -f
+
+.PHONY:lint-docker
+lint-docker: | $(REPORT_DIR)
+	docker run --rm -i hadolint/hadolint hadolint -f json - < Dockerfile > report/ci/hadolint.json; \
+	ret=$$? ; \
+	sed ${SED_INPLACE} 's/"file":"-"/"file":"Dockerfile"/g' report/ci/hadolint.json ; \
+	exit $$ret

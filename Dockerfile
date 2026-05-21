@@ -1,5 +1,6 @@
+# hadolint global ignore=DL3008
 ### 000 Rust
-FROM rust:1.93.1 AS core
+FROM rust:1.95 AS core
 
 ### 001 Runner
 FROM core AS runner
@@ -11,7 +12,7 @@ ENV PATH="${PATH}:/home/aura/.bin"
 WORKDIR /home/aura
 
 RUN <<EOR
-  apt-get update && apt-get install -y ca-certificates libssl3 curl nodejs npm
+  apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl nodejs npm
   rm -rf /var/lib/apt/lists/*
 EOR
 
@@ -41,7 +42,7 @@ RUN <<EOR
 EOR
 
 # 003: linting & testing
-FROM rust:1.93.1 AS release-lint-test
+FROM rust:1.95 AS release-lint-test
 
 WORKDIR /usr/src/app
 
@@ -50,15 +51,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
 # Install rustfmt and clippy
-RUN rustup component add rustfmt clippy
-
 # Run formatting check, tests, and linting
 # Note: These commands will fail the build if any check fails
 # --lib runs only unit tests (in src/), skips integration tests (in tests/ dirs)
 # Integration tests require running servers and are executed separately via run_tests.sh
-RUN cargo fmt --all -- --check
-RUN cargo clippy --all-targets --all-features -- -D warnings
-RUN cargo test --workspace --lib
+RUN <<EOR
+  rustup component add rustfmt clippy
+  cargo fmt --all -- --check
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test --workspace --lib
+EOR
+
 
 # 004: release-build - Release compilation
 FROM core AS release-build
@@ -80,13 +83,12 @@ EOR
 FROM debian:trixie-slim AS release
 
 # Install runtime dependencies
-RUN <<EOR
-  apt-get update && apt-get install -y ca-certificates libssl3 curl
-  rm -rf /var/lib/apt/lists/*
-EOR
-
 # Create app user for security
-RUN useradd -r -s /bin/false appuser
+RUN <<EOR
+  apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl
+  rm -rf /var/lib/apt/lists/*
+  useradd -r -s /bin/false appuser
+EOR
 
 # Create app directory and config directory
 WORKDIR /app
@@ -109,7 +111,7 @@ ENV CONFIG_PATH=/app/config/config.toml
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:3030/health || exit 1
+  CMD curl -f http://localhost:3030/health || exit 1
 
 # Run the web server
 CMD ["./aura-web-server"]
