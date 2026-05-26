@@ -123,6 +123,13 @@ url = "http://host.docker.internal:9000/mcp"
 
 Use `host.docker.internal` to reach services running on your host machine.
 
+**Transport options:**
+
+- `http_streamable`: Recommended for most MCP servers. Uses the current MCP HTTP protocol.
+- `sse`: For MCP servers that only support the legacy SSE protocol (pre-November 2025). Some tools, such as TerminalBench, require this transport.
+
+Both transports support the same authentication options (`headers`, `headers_from_request`) and scratchpad configuration. See [`examples/reference.toml`](../examples/reference.toml) for SSE examples.
+
 ### Add vector search
 
 Uncomment the `[[vector_stores]]` section in `quickstart.toml`. Options:
