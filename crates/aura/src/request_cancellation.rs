@@ -11,7 +11,7 @@ use std::sync::{OnceLock, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
-use crate::mcp_streamable_http::StreamableHttpMcpClient;
+use crate::mcp_streamable_http::McpClient;
 
 pub type RequestId = String;
 
@@ -92,7 +92,7 @@ impl RequestCancellation {
 }
 
 pub async fn call_http_tool_cancellable(
-    client: &StreamableHttpMcpClient,
+    client: &McpClient,
     tool_name: &str,
     args: HashMap<String, Value>,
 ) -> Result<String> {

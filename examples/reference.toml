@@ -31,6 +31,21 @@ transport = "http_streamable"
 url = "http://localhost:8081/mcp"
 description = "Example HTTP MCP server"
 
+# ── SSE transport (legacy MCP servers) ──────────────────────────────
+# For MCP servers that use the pre-2025-11-05 SSE protocol.
+# Supports the same headers, headers_from_request, and scratchpad
+# options as http_streamable.
+[mcp.servers.example_sse]
+transport = "sse"
+url = "http://localhost:8082/sse"
+description = "Example SSE MCP server"
+
+# [mcp.servers.example_sse.headers]
+# Authorization = "Bearer {{ env.SSE_TOKEN }}"
+#
+# [mcp.servers.example_sse.headers_from_request]
+# Authorization = "x-user-token"
+
 # Static headers sent with every request.
 [mcp.servers.example_http.headers]
 Authorization = "Bearer {{ env.MCP_TOKEN }}"

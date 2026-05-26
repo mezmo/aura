@@ -6,20 +6,20 @@ use rig::tool::{Tool as RigTool, ToolError};
 use rmcp::model::Tool as McpTool;
 use serde_json::Value;
 
-use crate::mcp_streamable_http::StreamableHttpMcpClient;
-use crate::mcp_tool_execution::execute_http_mcp_tool;
+use crate::mcp_streamable_http::McpClient;
+use crate::mcp_tool_execution::execute_mcp_tool;
 
-/// Dynamic MCP Tool Adaptor for HTTP Streamable clients
+/// Dynamic MCP Tool Adaptor for MCP clients (transport-agnostic)
 #[derive(Clone)]
-pub struct HttpMcpToolAdaptor {
+pub struct McpToolAdaptor {
     tool: McpTool,
     #[allow(dead_code)]
     server_name: String,
-    client: Arc<StreamableHttpMcpClient>,
+    client: Arc<McpClient>,
 }
 
-impl HttpMcpToolAdaptor {
-    pub fn new(tool: McpTool, server_name: String, client: Arc<StreamableHttpMcpClient>) -> Self {
+impl McpToolAdaptor {
+    pub fn new(tool: McpTool, server_name: String, client: Arc<McpClient>) -> Self {
         Self {
             tool,
             server_name,
@@ -28,7 +28,7 @@ impl HttpMcpToolAdaptor {
     }
 }
 
-impl RigTool for HttpMcpToolAdaptor {
+impl RigTool for McpToolAdaptor {
     type Error = ToolError;
     type Args = Value;
     type Output = String;
@@ -74,7 +74,7 @@ impl RigTool for HttpMcpToolAdaptor {
 
         Box::pin(async move {
             // Use shared execution function for consistent logging and error handling
-            execute_http_mcp_tool(&client, &tool_name, args).await
+            execute_mcp_tool(&client, &tool_name, args).await
         })
     }
 }
