@@ -733,13 +733,45 @@ impl Agent {
                     for mcp_tool in filtered_tools {
                         tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
 
-                        let tool_adaptor = crate::mcp_dynamic::HttpMcpToolAdaptor::new(
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
                             client_arc.clone(),
                         );
 
                         // Wrap with tool_wrapper if configured
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                    }
+                }
+            }
+        }
+
+        // Add SSE tools using dynamic adaptors
+        if let Some(mcp_manager) = mcp_manager.as_deref() {
+            for (server_name, client) in &mcp_manager.sse_clients {
+                if let Some(server_tools) = mcp_manager.sse_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "SSE",
+                        server_name,
+                        filtered_tools.len(),
+                        server_tools.len(),
+                    );
+
+                    let client_arc = Arc::new(client.clone());
+                    for mcp_tool in filtered_tools {
+                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name);
+
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
+                            mcp_tool.clone(),
+                            server_name.clone(),
+                            client_arc.clone(),
+                        );
+
                         builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
                     }
                 }
@@ -1527,6 +1559,24 @@ impl AgentBuilder {
                         ..
                     } => {
                         tracing::info!("MCP Server '{}' (HTTP Streamable):", name);
+                        tracing::info!("  URL: {}", url);
+                        tracing::info!("  Headers: {} defined", headers.len());
+                        if let Some(desc) = description {
+                            tracing::info!("  Description: {}", desc);
+                        }
+                        tracing::info!(
+                            "  Headers from requests: {} to forward",
+                            headers_from_request.len()
+                        );
+                    }
+                    McpServerConfig::Sse {
+                        url,
+                        headers,
+                        description,
+                        headers_from_request,
+                        ..
+                    } => {
+                        tracing::info!("MCP Server '{}' (SSE):", name);
                         tracing::info!("  URL: {}", url);
                         tracing::info!("  Headers: {} defined", headers.len());
                         if let Some(desc) = description {
