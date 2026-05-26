@@ -28,8 +28,8 @@ uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
 async-trait = "0.1.89"
 
-a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.0" }
-a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.0" }
+a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
+a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
 
 [features]
 default = ["otel"]
