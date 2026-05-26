@@ -19,6 +19,8 @@ base64 = "0.22"
 futures = "0.3"
 sse-stream = "0.2"
 reqwest = { version = "0.12", features = ["stream", "json"] }
+http = { workspace = true }
+url = "2"
 
 # Shared event types (lightweight, no agent/MCP deps)
 aura-events = { path = "../aura-events", features = ["rmcp-types"] }

@@ -1607,6 +1607,7 @@ url = "http://localhost:8000/mcp"
         let server = mcp.servers.get("example").expect("server present");
         let thresholds = match server {
             McpServerConfig::HttpStreamable { scratchpad, .. }
+            | McpServerConfig::Sse { scratchpad, .. }
             | McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
         };
         assert_eq!(thresholds.get("*_list_*").unwrap().min_tokens, 512);
