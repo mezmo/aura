@@ -27,7 +27,7 @@ pub enum CliToolError {
 /// A single CLI tool adapted to rig's `Tool` trait.
 ///
 /// Uses dynamic dispatch via `name()` override (same pattern as
-/// `HttpMcpToolAdaptor` and `DynamicVectorSearchTool` in the aura crate).
+/// `McpToolAdaptor` and `DynamicVectorSearchTool` in the aura crate).
 pub struct CliToolAdaptor {
     tool_name: String,
     description: String,
