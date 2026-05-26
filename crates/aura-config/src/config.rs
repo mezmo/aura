@@ -366,6 +366,19 @@ pub enum McpServerConfig {
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
+    #[serde(rename = "sse")]
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad interception thresholds (glob-matched on tool name).
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
+    },
 }
 
 /// Vector store configuration (in-memory, Qdrant, and Bedrock KB)

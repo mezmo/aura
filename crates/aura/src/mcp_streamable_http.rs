@@ -76,7 +76,7 @@ impl InFlightRequests {
 }
 
 /// MCP client for HTTP streamable connections with progress notification support
-pub struct StreamableHttpMcpClient {
+pub struct McpClient {
     client: Arc<RunningService<RoleClient, ProgressEnabledHandler>>,
     server_url: String,
     /// Tracks in-flight MCP requests for cancellation support
@@ -85,7 +85,7 @@ pub struct StreamableHttpMcpClient {
     current_http_request_id: Arc<RwLock<Option<String>>>,
 }
 
-impl Clone for StreamableHttpMcpClient {
+impl Clone for McpClient {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
@@ -96,7 +96,31 @@ impl Clone for StreamableHttpMcpClient {
     }
 }
 
-impl StreamableHttpMcpClient {
+impl McpClient {
+    /// Create an MCP client from any transport implementing `Transport<RoleClient>`.
+    ///
+    /// This is the transport-agnostic constructor used by both HTTP streamable
+    /// and legacy SSE transports.
+    pub(crate) async fn from_transport<T>(transport: T, server_url: String) -> Result<Self>
+    where
+        T: rmcp::transport::Transport<RoleClient> + Send + 'static,
+        T::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let current_http_request_id = Arc::new(RwLock::new(None));
+        let handler = ProgressEnabledHandler::new(Arc::clone(&current_http_request_id));
+
+        let client = serve_client(handler, transport)
+            .await
+            .context("Failed to establish MCP client connection")?;
+
+        Ok(Self {
+            client: Arc::new(client),
+            server_url,
+            in_flight: Arc::new(InFlightRequests::new()),
+            current_http_request_id,
+        })
+    }
+
     pub async fn new(
         server_url: String,
         forwarded_headers: &HashMap<String, String>,
@@ -134,25 +158,14 @@ impl StreamableHttpMcpClient {
             },
         );
 
-        let current_http_request_id = Arc::new(RwLock::new(None));
-
-        let handler = ProgressEnabledHandler::new(current_http_request_id.clone());
-
-        let client = serve_client(handler, transport)
-            .await
-            .context("Failed to establish MCP client connection")?;
+        let client = Self::from_transport(transport, server_url.clone()).await?;
 
         info!(
             "Successfully established streamable HTTP MCP client: {}",
             server_url
         );
 
-        Ok(Self {
-            client: Arc::new(client),
-            server_url,
-            in_flight: Arc::new(InFlightRequests::new()),
-            current_http_request_id,
-        })
+        Ok(client)
     }
 
     /// Set the current HTTP request ID for cancellation tracking.

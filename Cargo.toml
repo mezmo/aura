@@ -80,6 +80,7 @@ base64 = "0.22.1"
 async-stream = "0.3.6"
 schemars = "1.0.4"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+http = "1.0"
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]

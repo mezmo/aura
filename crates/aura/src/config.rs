@@ -58,7 +58,7 @@ pub struct AgentConfig {
     // These allow callers to customize agent building without modifying the builder.
     // The orchestrator uses these to inject tool wrappers and override preambles.
     /// Optional tool wrapper applied to all MCP tools (not serialized).
-    /// When set, all HTTP/SSE MCP tools are wrapped with this wrapper.
+    /// When set, all MCP tools are wrapped with this wrapper.
     #[serde(skip)]
     pub tool_wrapper: Option<Arc<dyn ToolWrapper + Send + Sync>>,
 
@@ -536,10 +536,28 @@ pub enum McpServerConfig {
     #[serde(rename = "http_streamable")]
     HttpStreamable {
         url: String,
+        #[serde(default)]
         headers: HashMap<String, String>,
+        #[serde(default)]
         description: Option<String>,
+        #[serde(default)]
         headers_from_request: HashMap<String, String>,
         /// Per-tool scratchpad interception thresholds, keyed by tool-name glob.
+        /// Parsed from `[mcp.servers.<name>.scratchpad]`.
+        #[serde(default)]
+        scratchpad: HashMap<String, ScratchpadToolEntry>,
+    },
+    #[serde(rename = "sse")]
+    Sse {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        headers_from_request: HashMap<String, String>,
+        /// Per-tool scratchpad interception thresholds, keyed by tool-name glob.
+        /// Parsed from `[mcp.servers.<name>.scratchpad]`.
         #[serde(default)]
         scratchpad: HashMap<String, ScratchpadToolEntry>,
     },
@@ -551,6 +569,7 @@ impl McpServerConfig {
         match self {
             McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
             McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
+            McpServerConfig::Sse { scratchpad, .. } => scratchpad,
         }
     }
 }
