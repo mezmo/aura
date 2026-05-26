@@ -67,7 +67,7 @@ aura/
 ### Configuration System
 - TOML-based declarative configuration
 - Environment variable resolution (`{{ env.VAR }}`)
-- Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama)
+- Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama, OpenRouter)
 - Dynamic tool registration
 
 ### MCP Integration
@@ -141,6 +141,7 @@ aura/
 ```bash
 export OPENAI_API_KEY="your-key"
 export ANTHROPIC_API_KEY="your-key"  # Optional
+export OPENROUTER_API_KEY="your-key" # Optional
 export MEZMO_API_KEY="your-key"       # For Mezmo MCP
 export AWS_PROFILE="your-profile"     # For Knowledge Base
 export AWS_REGION="your-region"       # For Knowledge Base

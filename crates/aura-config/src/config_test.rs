@@ -1455,6 +1455,7 @@ context_window = 200000
             std::env::set_var("PAGERDUTY_API_TOKEN", "test-pagerduty");
             std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", "test-github");
             std::env::set_var("MCP_TOKEN", "test-mcp");
+            std::env::set_var("OPENROUTER_API_KEY", "test-openrouter");
         }
 
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

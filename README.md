@@ -329,7 +329,7 @@ Configuration sections:
 - `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
-Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
+Supported providers: OpenAI, Anthropic, Bedrock, Gemini, Ollama, and OpenRouter.
 
 Supported MCP transports:
 

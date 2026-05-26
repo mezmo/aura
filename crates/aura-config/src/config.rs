@@ -573,6 +573,7 @@ impl Config {
             LlmConfig::Bedrock { model, .. } => ("bedrock", model),
             LlmConfig::Gemini { model, .. } => ("gemini", model),
             LlmConfig::Ollama { model, .. } => ("ollama", model),
+            LlmConfig::OpenRouter { model, .. } => ("openrouter", model),
         }
     }
 
@@ -731,7 +732,8 @@ fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::Co
     match llm {
         LlmConfig::OpenAI { api_key, .. }
         | LlmConfig::Anthropic { api_key, .. }
-        | LlmConfig::Gemini { api_key, .. } => {
+        | LlmConfig::Gemini { api_key, .. }
+        | LlmConfig::OpenRouter { api_key, .. } => {
             if api_key.is_empty() {
                 return Err(crate::ConfigError::Validation(format!(
                     "LLM API key is required for [{location}]"

@@ -32,6 +32,7 @@ pub type BedrockCompletionModel = rig_bedrock::completion::CompletionModel;
 pub type OllamaCompletionModel = rig::providers::ollama::CompletionModel<reqwest::Client>;
 pub type GeminiCompletionModel =
     rig::providers::gemini::completion::CompletionModel<reqwest::Client>;
+pub type OpenRouterCompletionModel = rig::providers::openrouter::CompletionModel<reqwest::Client>;
 
 // Type aliases for provider-specific agents
 pub type OpenAIAgent = rig::agent::Agent<OpenAICompletionModel>;
@@ -39,6 +40,7 @@ pub type AnthropicAgent = rig::agent::Agent<AnthropicCompletionModel>;
 pub type BedrockAgent = rig::agent::Agent<BedrockCompletionModel>;
 pub type OllamaAgent = rig::agent::Agent<OllamaCompletionModel>;
 pub type GeminiAgent = rig::agent::Agent<GeminiCompletionModel>;
+pub type OpenRouterAgent = rig::agent::Agent<OpenRouterCompletionModel>;
 
 /// Provider-specific agent wrapper.
 ///
@@ -51,6 +53,7 @@ pub(crate) enum ProviderAgent {
     Bedrock(BedrockAgent),
     Gemini(GeminiAgent),
     Ollama(OllamaAgent),
+    OpenRouter(OpenRouterAgent),
 }
 
 impl ProviderAgent {
@@ -62,6 +65,7 @@ impl ProviderAgent {
             Self::Bedrock(_) => "bedrock",
             Self::Gemini(_) => "gemini",
             Self::Ollama(_) => "ollama",
+            Self::OpenRouter(_) => "openrouter",
         }
     }
 
@@ -92,6 +96,10 @@ impl ProviderAgent {
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
             Self::Ollama(agent) => {
+                let stream = agent.stream_prompt(query).multi_turn(max_depth).await;
+                Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
+            }
+            Self::OpenRouter(agent) => {
                 let stream = agent.stream_prompt(query).multi_turn(max_depth).await;
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
@@ -135,6 +143,13 @@ impl ProviderAgent {
                 Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
             }
             Self::Ollama(agent) => {
+                let stream = agent
+                    .stream_chat(query, chat_history)
+                    .multi_turn(max_depth)
+                    .await;
+                Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item))
+            }
+            Self::OpenRouter(agent) => {
                 let stream = agent
                     .stream_chat(query, chat_history)
                     .multi_turn(max_depth)
@@ -228,6 +243,18 @@ impl ProviderAgent {
                     usage_state,
                 )
             }
+            Self::OpenRouter(agent) => {
+                let stream = agent
+                    .stream_prompt(query)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
         }
     }
 
@@ -306,6 +333,18 @@ impl ProviderAgent {
                 )
             }
             Self::Ollama(agent) => {
+                let stream = agent
+                    .stream_chat(query, chat_history)
+                    .with_hook(hook)
+                    .multi_turn(max_depth)
+                    .await;
+                (
+                    Box::pin(stream.map::<Result<StreamItem, StreamError>, _>(map_stream_item)),
+                    cancel_tx,
+                    usage_state,
+                )
+            }
+            Self::OpenRouter(agent) => {
                 let stream = agent
                     .stream_chat(query, chat_history)
                     .with_hook(hook)

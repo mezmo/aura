@@ -2212,6 +2212,29 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     tools,
                 )))
             }
+            LlmConfig::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                ..
+            } => {
+                let mut cb = rig::providers::openrouter::Client::<reqwest::Client>::builder()
+                    .api_key(api_key);
+                if let Some(url) = base_url {
+                    cb = cb.base_url(url);
+                }
+                let cm = cb
+                    .build()
+                    .map_err(|e| format!("Failed to build OpenRouter coordinator: {}", e))?
+                    .completion_model(model);
+                Ok(ProviderAgent::OpenRouter(Self::build_agent_with_tools(
+                    cm,
+                    preamble,
+                    temperature,
+                    additional_params,
+                    tools,
+                )))
+            }
         }
     }
 
@@ -2399,6 +2422,37 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = BuilderState::Initial(builder);
                 let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
+            }
+            LlmConfig::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                additional_params,
+                ..
+            } => {
+                let mut cb = rig::providers::openrouter::Client::<reqwest::Client>::builder()
+                    .api_key(api_key);
+                if let Some(url) = base_url {
+                    cb = cb.base_url(url);
+                }
+                let cm = cb
+                    .build()
+                    .map_err(|e| format!("Failed to build OpenRouter worker: {}", e))?
+                    .completion_model(model);
+                let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.preamble(preamble);
+                if let Some(temp) = temperature {
+                    builder = builder.temperature(temp);
+                }
+                if let Some(max) = worker_config.llm.max_tokens() {
+                    builder = builder.max_tokens(max);
+                }
+                if let Some(params) = additional_params {
+                    builder = builder.additional_params(params.clone());
+                }
+                let state = BuilderState::Initial(builder);
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
             }
         }
     }

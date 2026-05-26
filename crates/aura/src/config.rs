@@ -300,6 +300,20 @@ pub enum LlmConfig {
         #[serde(default)]
         additional_params: Option<serde_json::Value>,
     },
+    OpenRouter {
+        api_key: String,
+        model: String,
+        #[serde(default)]
+        base_url: Option<String>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        max_tokens: Option<u64>,
+        #[serde(default, deserialize_with = "lenient_int::deserialize_option_u64")]
+        context_window: Option<u64>,
+        #[serde(default)]
+        temperature: Option<f64>,
+        #[serde(default)]
+        additional_params: Option<serde_json::Value>,
+    },
 }
 
 fn default_ollama_base_url() -> Option<String> {
@@ -343,7 +357,8 @@ impl LlmConfig {
             | LlmConfig::Anthropic { max_tokens, .. }
             | LlmConfig::Bedrock { max_tokens, .. }
             | LlmConfig::Gemini { max_tokens, .. }
-            | LlmConfig::Ollama { max_tokens, .. } => *max_tokens,
+            | LlmConfig::Ollama { max_tokens, .. }
+            | LlmConfig::OpenRouter { max_tokens, .. } => *max_tokens,
         }
     }
 
@@ -354,7 +369,8 @@ impl LlmConfig {
             | LlmConfig::Anthropic { context_window, .. }
             | LlmConfig::Bedrock { context_window, .. }
             | LlmConfig::Gemini { context_window, .. }
-            | LlmConfig::Ollama { context_window, .. } => *context_window,
+            | LlmConfig::Ollama { context_window, .. }
+            | LlmConfig::OpenRouter { context_window, .. } => *context_window,
         }
     }
 
@@ -375,6 +391,9 @@ impl LlmConfig {
             }
             | LlmConfig::Ollama {
                 additional_params, ..
+            }
+            | LlmConfig::OpenRouter {
+                additional_params, ..
             } => additional_params.clone(),
         }
     }
@@ -386,7 +405,8 @@ impl LlmConfig {
             | LlmConfig::Anthropic { model, .. }
             | LlmConfig::Bedrock { model, .. }
             | LlmConfig::Gemini { model, .. }
-            | LlmConfig::Ollama { model, .. } => model,
+            | LlmConfig::Ollama { model, .. }
+            | LlmConfig::OpenRouter { model, .. } => model,
         }
     }
 
@@ -398,6 +418,7 @@ impl LlmConfig {
             LlmConfig::Bedrock { model, .. } => ("bedrock", model),
             LlmConfig::Gemini { model, .. } => ("gemini", model),
             LlmConfig::Ollama { model, .. } => ("ollama", model),
+            LlmConfig::OpenRouter { model, .. } => ("openrouter", model),
         }
     }
 
@@ -408,7 +429,8 @@ impl LlmConfig {
             | LlmConfig::Anthropic { temperature, .. }
             | LlmConfig::Bedrock { temperature, .. }
             | LlmConfig::Gemini { temperature, .. }
-            | LlmConfig::Ollama { temperature, .. } => *temperature,
+            | LlmConfig::Ollama { temperature, .. }
+            | LlmConfig::OpenRouter { temperature, .. } => *temperature,
         }
     }
 }

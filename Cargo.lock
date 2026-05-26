@@ -3744,7 +3744,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.28.0"
-source = "git+https://github.com/mezmo/rig.git?rev=d7e9d92#d7e9d92e8bab870074294b9fb7d0b98c3b6c6d6b"
+source = "git+https://github.com/mezmo/rig.git?rev=890853065c8d46cd886b6f93bca5895a492d750c#890853065c8d46cd886b6f93bca5895a492d750c"
 dependencies = [
  "as-any",
  "async-stream",
