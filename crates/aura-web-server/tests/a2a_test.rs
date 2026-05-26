@@ -920,3 +920,125 @@ async fn test_sequential_tasks_share_context() {
         part_text
     );
 }
+
+// validates the input content to the package also forwards appropriate headers
+// to declared MCPs
+#[tokio::test]
+async fn test_validate_http_headers_forwarded_to_mcps() {
+    let message_id = format!("{}", uuid::Uuid::new_v4());
+    let request_text = format!(
+        "I need to see what HTTP headers you received. Please use the echo_headers tool to show me all
+        the headers that were sent to the MCP server. Make sure to include message_id={} in the tool call
+        so I can correlate it with the headers you received.",
+        message_id
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/a2a/v1/message:send", AURA_SERVER))
+        .header("Content-Type", "application/json")
+        .header("A2A-Version", "1.0")
+        .header("X-Test-Header1", "jello")
+        .header("X-Test-Header2", "pudding")
+        .json(&json!({
+            "message": {
+                "messageId": message_id,
+                "role": "ROLE_USER",
+                "parts": [{
+                    "text": request_text
+                }]
+            }
+        }))
+        .timeout(TEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request - is aura-web-server running? {}", e));
+
+    let body = response
+        .unwrap()
+        .text()
+        .await
+        .expect("Failed to read response");
+    let response_body: Value = serde_json::from_str(&body).expect("Response was not valid JSON");
+
+    let task = response_body
+        .get("task")
+        .expect("Response did not contain 'task' field");
+
+    let task_id = task
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("Task did not contain 'id' field");
+
+    let poll_interval = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+
+    let completed_task = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Task did not reach TASK_STATE_COMPLETED within timeout"
+        );
+
+        let poll_resp = client
+            .get(format!("{}/a2a/v1/tasks/{}", AURA_SERVER, task_id))
+            .header("A2A-Version", "1.0")
+            .timeout(TEST_TIMEOUT)
+            .send()
+            .await
+            .expect("Failed to poll task status");
+
+        let body = poll_resp
+            .text()
+            .await
+            .expect("Failed to read polling response");
+        println!("Poll response was: {}", body.clone());
+
+        let polled: Task =
+            serde_json::from_str(body.as_str()).expect("poll response was not valid JSON");
+
+        match polled.status.state {
+            TaskState::Completed => break polled,
+            TaskState::Failed | TaskState::Canceled => {
+                panic!("Task ended in unexpected state: {:?}", polled.status.state)
+            }
+            _ => tokio::time::sleep(poll_interval).await,
+        }
+    };
+
+    println!(
+        "Completed task response body: {}",
+        serde_json::to_string_pretty(&completed_task).unwrap()
+    );
+
+    let artifacts = completed_task
+        .artifacts
+        .as_ref()
+        .expect("Completed task should have artifacts");
+
+    // The "Final Info" artifact contains the LLM's final text, which should include the echo_headers JSON output.
+    let final_info = artifacts
+        .iter()
+        .find(|a| a.name.as_deref() == Some("Final Info"))
+        .expect("Expected a 'Final Info' artifact");
+
+    let part_text = final_info
+        .parts
+        .iter()
+        .find_map(|p| match &p.content {
+            PartContent::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .expect("'Final Info' artifact has no text part");
+
+    println!("Received headers from MCP: {}", part_text);
+
+    // Verify the forwarded headers are present (case-insensitive keys from echo_headers)
+    assert!(
+        part_text.contains(r#""x-test-header1": "jello""#),
+        "X-Test-Header1 was not forwarded to the MCP server"
+    );
+    assert!(
+        part_text.contains(r#""x-test-header2": "pudding""#),
+        "X-Test-Header2 was not forwarded to the MCP server"
+    );
+}
