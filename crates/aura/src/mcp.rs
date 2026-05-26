@@ -1,6 +1,4 @@
-use crate::{
-    config::McpServerConfig, error::BuilderError, mcp_streamable_http::StreamableHttpMcpClient,
-};
+use crate::{config::McpServerConfig, error::BuilderError, mcp_streamable_http::McpClient};
 use futures::{StreamExt, stream::BoxStream};
 use rig::tool::rmcp::McpTool;
 use rig::{completion::ToolDefinition, tool::Tool as RigTool};
@@ -237,8 +235,11 @@ pub struct McpManager {
     /// Store raw tool definitions with their associated client for agent integration
     pub tool_definitions: Vec<(Tool, rmcp::service::ServerSink)>,
     /// Store streamable HTTP clients for http_streamable transport
-    pub streamable_clients: HashMap<String, StreamableHttpMcpClient>,
+    pub streamable_clients: HashMap<String, McpClient>,
     pub streamable_tools: HashMap<String, Vec<rmcp::model::Tool>>,
+    /// Store SSE clients for sse transport
+    pub sse_clients: HashMap<String, McpClient>,
+    pub sse_tools: HashMap<String, Vec<rmcp::model::Tool>>,
     /// Whether to sanitize tool schemas for OpenAI compatibility
     pub sanitize_schemas: bool,
 }
@@ -270,6 +271,8 @@ impl McpManager {
             tool_definitions: Vec::new(),
             streamable_clients: HashMap::new(),
             streamable_tools: HashMap::new(),
+            sse_clients: HashMap::new(),
+            sse_tools: HashMap::new(),
             sanitize_schemas,
         }
     }
@@ -368,6 +371,9 @@ impl McpManager {
                 self.connect_http_streamable(server_name, url, headers)
                     .await
             }
+            McpServerConfig::Sse { url, headers, .. } => {
+                self.connect_sse(server_name, url, headers).await
+            }
             McpServerConfig::Stdio { cmd, args, env, .. } => {
                 self.connect_stdio(server_name, std::slice::from_ref(cmd), args, env)
                     .await
@@ -398,7 +404,7 @@ impl McpManager {
                     || e.to_string().contains("HTTP status client error (401")
                 {
                     Err(BuilderError::McpInitError(format!(
-                        "HTTP MCP server '{server_name}' authentication failed (401 Unauthorized). This is likely because rmcp does not yet support custom headers for authentication. Your Authorization header cannot be sent."
+                        "HTTP MCP server '{server_name}' authentication failed (401 Unauthorized). Check that your forwarded headers and credentials are correct."
                     )))
                 } else {
                     warn!("  HTTP Streamable MCP connection failed: {}", e);
@@ -409,7 +415,7 @@ impl McpManager {
         }
     }
 
-    /// Attempt to connect to HTTP Streamable MCP server using the new StreamableHttpMcpClient
+    /// Attempt to connect to HTTP Streamable MCP server using McpClient
     async fn try_connect_http_streamable(
         &mut self,
         server_name: &str,
@@ -423,8 +429,8 @@ impl McpManager {
             info!("  Forwarding {} headers to MCP client", headers.len());
         }
 
-        // Use our new StreamableHttpMcpClient
-        let client = StreamableHttpMcpClient::new(url.to_string(), headers)
+        // Use McpClient
+        let client = McpClient::new(url.to_string(), headers)
             .await
             .map_err(|e| {
                 BuilderError::McpInitError(format!(
@@ -461,6 +467,79 @@ impl McpManager {
 
         // Store SANITIZED tools (not raw)
         self.streamable_tools
+            .insert(server_name.to_string(), sanitized_tools.clone());
+
+        Ok(sanitized_tools.len())
+    }
+
+    /// Connect to legacy SSE MCP server
+    async fn connect_sse(
+        &mut self,
+        server_name: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+    ) -> Result<usize, BuilderError> {
+        info!("  Connecting to SSE server at: {}", url);
+
+        match self.try_connect_sse(server_name, url, headers).await {
+            Ok(tools_count) => {
+                info!("  SSE connection successful");
+                Ok(tools_count)
+            }
+            Err(e) => {
+                if e.to_string().contains("401 Unauthorized")
+                    || e.to_string().contains("HTTP status client error (401")
+                {
+                    Err(BuilderError::McpInitError(format!(
+                        "SSE MCP server '{server_name}' authentication failed (401 Unauthorized). Check that your forwarded headers and credentials are correct."
+                    )))
+                } else {
+                    warn!("  SSE MCP connection failed: {}", e);
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    /// Attempt to connect to SSE MCP server
+    async fn try_connect_sse(
+        &mut self,
+        server_name: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+    ) -> Result<usize, BuilderError> {
+        debug!("  Creating SSE client for: {}", url);
+
+        let transport = crate::mcp_sse::SseTransport::connect(url, headers)
+            .await
+            .map_err(BuilderError::SseTransport)?;
+
+        let client = McpClient::from_transport(transport, url.to_string())
+            .await
+            .map_err(|e| {
+                BuilderError::McpInitError(format!(
+                    "Failed to establish SSE MCP connection to '{server_name}': {e}"
+                ))
+            })?;
+
+        info!("  SSE connection established, discovering tools");
+
+        let tools = client.discover_tools().await.map_err(|e| {
+            BuilderError::McpInitError(format!(
+                "Failed to discover tools from SSE server '{server_name}': {e}"
+            ))
+        })?;
+
+        info!(
+            "  Discovered {} tools from SSE server '{}'",
+            tools.len(),
+            server_name
+        );
+
+        let sanitized_tools = Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "SSE");
+
+        self.sse_clients.insert(server_name.to_string(), client);
+        self.sse_tools
             .insert(server_name.to_string(), sanitized_tools.clone());
 
         Ok(sanitized_tools.len())
@@ -782,6 +861,7 @@ impl McpManager {
     fn get_server_description(&self, server_config: &McpServerConfig) -> Option<String> {
         match server_config {
             McpServerConfig::HttpStreamable { description, .. }
+            | McpServerConfig::Sse { description, .. }
             | McpServerConfig::Stdio { description, .. } => description.clone(),
         }
     }
@@ -808,7 +888,8 @@ impl McpManager {
                 .streamable_tools
                 .values()
                 .map(|v| v.len())
-                .sum::<usize>();
+                .sum::<usize>()
+            + self.sse_tools.values().map(|v| v.len()).sum::<usize>();
         info!("  Total tools available: {}", total_tools);
     }
 
@@ -821,6 +902,17 @@ impl McpManager {
             if cancelled > 0 {
                 info!(
                     "Cancelled {} request(s) on MCP server '{}' for HTTP request {}",
+                    cancelled, server_name, http_request_id
+                );
+            }
+            total_cancelled += cancelled;
+        }
+
+        for (server_name, client) in &self.sse_clients {
+            let cancelled = client.cancel_all_for_request(http_request_id, reason).await;
+            if cancelled > 0 {
+                info!(
+                    "Cancelled {} request(s) on SSE MCP server '{}' for HTTP request {}",
                     cancelled, server_name, http_request_id
                 );
             }
@@ -846,6 +938,17 @@ impl McpManager {
             total_cancelled += cancelled;
         }
 
+        for (server_name, client) in &self.sse_clients {
+            let cancelled = client.cancel_and_close(http_request_id, reason).await;
+            if cancelled > 0 {
+                info!(
+                    "Cancelled {} request(s) and closed SSE MCP server '{}' for HTTP request {}",
+                    cancelled, server_name, http_request_id
+                );
+            }
+            total_cancelled += cancelled;
+        }
+
         total_cancelled
     }
 
@@ -854,10 +957,13 @@ impl McpManager {
         for client in self.streamable_clients.values() {
             client.set_current_request(http_request_id).await;
         }
+        for client in self.sse_clients.values() {
+            client.set_current_request(http_request_id).await;
+        }
+        let total_clients = self.streamable_clients.len() + self.sse_clients.len();
         debug!(
             "Set current HTTP request ID on {} MCP client(s): {}",
-            self.streamable_clients.len(),
-            http_request_id
+            total_clients, http_request_id
         );
     }
 
@@ -865,9 +971,13 @@ impl McpManager {
         for client in self.streamable_clients.values() {
             client.clear_current_request().await;
         }
+        for client in self.sse_clients.values() {
+            client.clear_current_request().await;
+        }
+        let total_clients = self.streamable_clients.len() + self.sse_clients.len();
         debug!(
             "Cleared current HTTP request ID on {} MCP client(s)",
-            self.streamable_clients.len()
+            total_clients
         );
     }
 
@@ -879,6 +989,13 @@ impl McpManager {
 
         // HTTP Streamable tools
         for tools in self.streamable_tools.values() {
+            for tool in tools {
+                names.push(tool.name.to_string());
+            }
+        }
+
+        // SSE tools
+        for tools in self.sse_tools.values() {
             for tool in tools {
                 names.push(tool.name.to_string());
             }
@@ -902,6 +1019,7 @@ impl McpManager {
         self.streamable_tools
             .values()
             .flat_map(|tools| tools.iter())
+            .chain(self.sse_tools.values().flat_map(|tools| tools.iter()))
             .chain(self.tool_definitions.iter().map(|(tool, _)| tool))
     }
 
@@ -920,19 +1038,25 @@ impl McpManager {
     /// the scratchpad interception path (same behavior as before this
     /// refactor for STDIO).
     pub fn tool_names_per_server(&self) -> HashMap<String, Vec<String>> {
-        self.streamable_tools
+        let mut map: HashMap<String, Vec<String>> = self
+            .streamable_tools
             .iter()
             .map(|(server_name, tools)| {
                 let names = tools.iter().map(|t| t.name.to_string()).collect();
                 (server_name.clone(), names)
             })
-            .collect()
+            .collect();
+        for (server_name, tools) in &self.sse_tools {
+            let names = tools.iter().map(|t| t.name.to_string()).collect();
+            map.insert(server_name.clone(), names);
+        }
+        map
     }
 
     /// Execute a tool by name (used by Ollama text-to-tool fallback).
     ///
     /// Called by `FallbackToolExecutor` when it detects tool calls in streamed text.
-    /// Routes to the appropriate MCP transport (HTTP Streamable or STDIO).
+    /// Routes to the appropriate MCP transport (HTTP Streamable, SSE, or STDIO).
     ///
     /// Normal Rig tool execution goes through `Tool::call()` trait implementations;
     /// this method exists specifically for the fallback parsing path.
@@ -959,6 +1083,19 @@ impl McpManager {
                     "Executing fallback tool '{}' via HTTP Streamable",
                     tool_name
                 );
+                return client
+                    .call_tool(tool_name, args_map)
+                    .await
+                    .map_err(|e| format!("Tool execution failed: {}", e));
+            }
+        }
+
+        // Try SSE clients
+        for (server_name, client) in &self.sse_clients {
+            if let Some(tools) = self.sse_tools.get(server_name)
+                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+            {
+                info!("Executing fallback tool '{}' via SSE", tool_name);
                 return client
                     .call_tool(tool_name, args_map)
                     .await
@@ -1023,7 +1160,7 @@ macro_rules! create_mcp_tool_struct {
         pub struct $struct_name {
             pub tool_name: String,
             pub server_name: String,
-            pub client: Arc<StreamableHttpMcpClient>,
+            pub client: Arc<McpClient>,
             pub tool_definition: ToolDefinition,
         }
 
@@ -1031,7 +1168,7 @@ macro_rules! create_mcp_tool_struct {
             pub fn new(
                 tool_name: String,
                 server_name: String,
-                client: Arc<StreamableHttpMcpClient>,
+                client: Arc<McpClient>,
                 mcp_tool: rmcp::model::Tool,
                 sanitize_schemas: bool,
             ) -> Option<Self> {
@@ -1118,12 +1255,12 @@ create_mcp_tool_struct!(GetCurrentTimeTool, "get_current_time");
 create_mcp_tool_struct!(GetPipelineTool, "get_pipeline");
 create_mcp_tool_struct!(ListPipelinesTool, "list_pipelines");
 
-/// Generic fallback for unknown tools - A Rig-compatible tool wrapper for StreamableHttpMcpClient tools
+/// Generic fallback for unknown tools - A Rig-compatible tool wrapper for MCP client tools
 #[derive(Clone)]
 pub struct StreamableHttpMcpTool {
     pub tool_name: String,
     pub server_name: String,
-    pub client: Arc<StreamableHttpMcpClient>,
+    pub client: Arc<McpClient>,
     pub tool_definition: ToolDefinition,
 }
 
@@ -1131,7 +1268,7 @@ impl StreamableHttpMcpTool {
     pub fn new(
         tool_name: String,
         server_name: String,
-        client: Arc<StreamableHttpMcpClient>,
+        client: Arc<McpClient>,
         mcp_tool: rmcp::model::Tool,
         sanitize_schemas: bool,
     ) -> Option<Self> {
@@ -1254,7 +1391,7 @@ pub fn create_fallback_http_tool(
     unique_tool_name: String,
     original_tool_name: String,
     server_name: String,
-    client: Arc<StreamableHttpMcpClient>,
+    client: Arc<McpClient>,
     mcp_tool: rmcp::model::Tool,
     sanitize_schemas: bool,
 ) -> Option<FallbackHttpMcpTool> {
@@ -1274,7 +1411,7 @@ pub struct FallbackHttpMcpTool {
     pub unique_name: String,
     pub original_tool_name: String,
     pub server_name: String,
-    pub client: Arc<StreamableHttpMcpClient>,
+    pub client: Arc<McpClient>,
     pub tool_definition: ToolDefinition,
 }
 
@@ -1283,7 +1420,7 @@ impl FallbackHttpMcpTool {
         unique_name: String,
         original_tool_name: String,
         server_name: String,
-        client: Arc<StreamableHttpMcpClient>,
+        client: Arc<McpClient>,
         mcp_tool: rmcp::model::Tool,
         sanitize_schemas: bool,
     ) -> Option<Self> {
