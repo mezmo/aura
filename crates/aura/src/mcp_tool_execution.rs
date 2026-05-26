@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::mcp_streamable_http::StreamableHttpMcpClient;
+use crate::mcp_streamable_http::McpClient;
 use crate::request_cancellation::call_http_tool_cancellable;
 
 // ---------------------------------------------------------------------------
@@ -96,8 +96,8 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 /// 3. Standardized error handling
 /// 4. Per-request cancellation support (when executed within a cancellation context)
 #[tracing::instrument(name = "mcp.tool_call", skip(client, args), fields(tool.name = %tool_name, server.url = %client.server_url()))]
-pub async fn execute_http_mcp_tool(
-    client: &StreamableHttpMcpClient,
+pub async fn execute_mcp_tool(
+    client: &McpClient,
     tool_name: &str,
     args: Value,
 ) -> Result<String, ToolError> {

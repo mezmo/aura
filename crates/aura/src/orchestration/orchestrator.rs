@@ -1705,6 +1705,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
+        // Collect from SSE tools
+        for tools in mcp_manager.sse_tools.values() {
+            for tool in tools {
+                names.push(tool.name.to_string());
+            }
+        }
+
         // Collect from legacy tool definitions (rmcp::model::Tool)
         for (tool, _) in &mcp_manager.tool_definitions {
             names.push(tool.name.to_string());
@@ -1735,6 +1742,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
         for tools in mcp_manager.streamable_tools.values() {
             for tool in tools {
                 // Convert Arc<Map<String, Value>> to serde_json::Value
+                let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
+                schemas.insert(tool.name.to_string(), schema_value);
+            }
+        }
+
+        // Collect from SSE tools
+        for tools in mcp_manager.sse_tools.values() {
+            for tool in tools {
                 let schema_value = serde_json::Value::Object((*tool.input_schema).clone());
                 schemas.insert(tool.name.to_string(), schema_value);
             }
@@ -1808,6 +1823,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(ref mcp_manager) = self.mcp_manager {
             // Collect from streamable HTTP tools (description is Option<Cow<'static, str>>)
             for tools in mcp_manager.streamable_tools.values() {
+                for tool in tools {
+                    if let Some(ref desc) = tool.description {
+                        descriptions.insert(tool.name.to_string(), desc.to_string());
+                    }
+                }
+            }
+
+            // Collect from SSE tools
+            for tools in mcp_manager.sse_tools.values() {
                 for tool in tools {
                     if let Some(ref desc) = tool.description {
                         descriptions.insert(tool.name.to_string(), desc.to_string());

@@ -125,6 +125,19 @@ impl RigBuilder {
                             headers_from_request: headers_from_request.clone(),
                             scratchpad: scratchpad.clone(),
                         },
+                        crate::config::McpServerConfig::Sse {
+                            url,
+                            headers,
+                            description,
+                            headers_from_request,
+                            scratchpad,
+                        } => McpServerConfig::Sse {
+                            url: url.clone(),
+                            headers: headers.clone(),
+                            description: description.clone(),
+                            headers_from_request: headers_from_request.clone(),
+                            scratchpad: scratchpad.clone(),
+                        },
                     };
                     (name.clone(), converted_server)
                 })
@@ -282,17 +295,24 @@ fn resolve_mcp_headers(
     };
 
     for (server_name, server_config) in mcp_config.servers.iter_mut() {
-        let McpServerConfig::HttpStreamable {
-            headers: server_headers,
-            headers_from_request,
-            ..
-        } = server_config
-        else {
-            tracing::debug!(
-                "Server '{}': STDIO transport, skipping header injection",
-                server_name
-            );
-            continue;
+        let (server_headers, headers_from_request) = match server_config {
+            McpServerConfig::HttpStreamable {
+                headers,
+                headers_from_request,
+                ..
+            } => (headers, headers_from_request),
+            McpServerConfig::Sse {
+                headers,
+                headers_from_request,
+                ..
+            } => (headers, headers_from_request),
+            McpServerConfig::Stdio { .. } => {
+                tracing::debug!(
+                    "Server '{}': STDIO transport, skipping header injection",
+                    server_name
+                );
+                continue;
+            }
         };
 
         // Resolve headers_from_request mappings using the incoming request headers.

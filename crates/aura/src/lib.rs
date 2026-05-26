@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod mcp_dynamic;
 pub mod mcp_progress;
 pub mod mcp_response;
+pub mod mcp_sse;
 pub mod mcp_streamable_http;
 pub mod mcp_tool_execution;
 #[cfg(feature = "otel")]
