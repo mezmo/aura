@@ -16,6 +16,11 @@ services:
     attach: false
     logging:
       driver: "none"
+    environment:
+      # Publish the in-network address the test runner reaches us on, so the
+      # A2A agent card carries absolute URLs that resolve inside the compose
+      # network. Must match the test runner's AURA_SERVER_URL below.
+      AURA_SERVER_URL: http://aura-web-server:8080
 
   aura-integration-test:
     build:

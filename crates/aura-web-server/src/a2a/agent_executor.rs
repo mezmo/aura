@@ -60,7 +60,14 @@ impl AuraAgentExecutor {
         self.app_state.configs.first().cloned()
     }
 
-    pub fn build_agent_card(&self) -> AgentCard {
+    /// Build the A2A agent card.
+    ///
+    /// `base_url` is the externally-reachable origin (e.g. `https://aura.example.com`)
+    /// used to make the interface endpoints absolute. The A2A spec requires absolute
+    /// interface URLs — clients pass them straight to their HTTP layer, which rejects
+    /// relative paths.
+    pub fn build_agent_card(&self, base_url: &str) -> AgentCard {
+        let base = base_url.trim_end_matches('/');
         let config = self.resolve_config();
         let name = config
             .as_ref()
@@ -94,8 +101,8 @@ impl AuraAgentExecutor {
                 extended_agent_card: None,
             },
             supported_interfaces: vec![
-                AgentInterface::new("/a2a/v1", TRANSPORT_PROTOCOL_HTTP_JSON),
-                AgentInterface::new("/a2a/v1/rpc", TRANSPORT_PROTOCOL_JSONRPC),
+                AgentInterface::new(format!("{base}/a2a/v1"), TRANSPORT_PROTOCOL_HTTP_JSON),
+                AgentInterface::new(format!("{base}/a2a/v1/rpc"), TRANSPORT_PROTOCOL_JSONRPC),
             ],
             skills: vec![AgentSkill {
                 id: "chat".to_owned(),
