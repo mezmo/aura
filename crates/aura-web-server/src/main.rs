@@ -115,6 +115,33 @@ struct Args {
     /// Not required when only one configuration is loaded via CONFIG_PATH.
     #[arg(long, env = "DEFAULT_AGENT")]
     default_agent: Option<String>,
+
+    /// Canonical, externally-reachable base URL of this server (e.g.
+    /// `https://aura.example.com`). It is published in the A2A agent card's
+    /// interface endpoints — A2A clients require absolute URLs and pass them
+    /// straight to their HTTP layer. When unset, this is derived from
+    /// --host/--port (0.0.0.0 / :: mapped to 127.0.0.1), which is fine for local
+    /// use but should be set explicitly behind a proxy or in K8s. Integration
+    /// tests reuse this same value to know where to reach the server.
+    #[arg(long, env = "AURA_SERVER_URL")]
+    server_url: Option<String>,
+}
+
+/// Resolve the externally-advertised base URL for the A2A agent card.
+///
+/// A2A clients reject relative interface URLs, so the card must carry an absolute
+/// origin. Prefer an explicit `--server-url`; otherwise derive one from the bind
+/// host/port, mapping wildcard binds to a loopback address since `0.0.0.0` is not
+/// a routable destination.
+fn advertised_base_url(server_url: Option<&str>, host: &str, port: u16) -> String {
+    if let Some(url) = server_url {
+        return url.trim_end_matches('/').to_string();
+    }
+    let host = match host {
+        "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    };
+    format!("http://{host}:{port}")
 }
 
 /// Middleware that rejects new requests with 503 when shutdown_token is cancelled.
@@ -230,7 +257,8 @@ async fn run() -> std::io::Result<()> {
     // forcing an in-memory store for now. TBD: a resilient location
     let task_store = SharedTaskStore::new();
     let executor = AuraAgentExecutor::new(app_state.clone(), task_store.clone());
-    let agent_card = executor.build_agent_card();
+    let base_url = advertised_base_url(args.server_url.as_deref(), &args.host, args.port);
+    let agent_card = executor.build_agent_card(&base_url);
     let a2a_handler = Arc::new(AuraRequestHandler::new(executor, task_store));
     let card_producer = Arc::new(StaticAgentCard::new(agent_card));
 

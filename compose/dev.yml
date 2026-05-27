@@ -25,3 +25,6 @@ services:
     environment:
       # More verbose logging for development
       - RUST_LOG=info,aura=debug
+      # Publish the host-reachable origin so the A2A agent card's absolute URLs
+      # match where host-run tests connect (AURA_SERVER default: http://localhost:8080).
+      - AURA_SERVER_URL=http://localhost:8080
