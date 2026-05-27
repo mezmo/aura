@@ -133,6 +133,7 @@ Core server options:
 | `--config`                   | `CONFIG_PATH`              | `config.toml` | Path to TOML config file or directory |
 | `--host`                     | `HOST`                     | `127.0.0.1`   | Bind host                           |
 | `--port`                     | `PORT`                     | `8080`        | Bind port                           |
+| `--server-url`               | `AURA_SERVER_URL`          | host/port     | Canonical public origin published in the A2A agent card (see below) |
 | `--streaming-timeout-secs`   | `STREAMING_TIMEOUT_SECS`   | `900`         | Max SSE request duration            |
 | `--first-chunk-timeout-secs` | `FIRST_CHUNK_TIMEOUT_SECS` | `30`          | Max time to first provider chunk    |
 | `--streaming-buffer-size`    | `STREAMING_BUFFER_SIZE`    | `400`         | SSE backpressure buffer             |
@@ -195,7 +196,9 @@ curl -X POST http://localhost:8080/a2a/v1/rpc \
   -d '{"jsonrpc": "2.0", "method": "SendMessage", "params": {"message": {"messageId": "msg-002", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}, "id": 1}'
 ```
 
-A2A endpoints, transport modes, task lifecycle, and testing examples are documented in [docs/a2a-implementation.md](docs/a2a-implementation.md).
+> **Set `AURA_SERVER_URL` when running behind a proxy, load balancer, or in Kubernetes.** The agent card must advertise **absolute** endpoint URLs, and A2A clients use those URLs directly — a relative or wrong-host URL makes `message:send` fail even though the card itself loads. Aura builds the card's URLs from `AURA_SERVER_URL` (or `--server-url`); set it to the externally-reachable origin clients use (e.g. `https://aura.example.com`). When unset, it falls back to the bind host/port, which is only correct for direct local access.
+
+A2A endpoints, transport modes, the agent card URL, task lifecycle, and testing examples are documented in [docs/a2a-implementation.md](docs/a2a-implementation.md).
 
 ### Client-Side Tools
 

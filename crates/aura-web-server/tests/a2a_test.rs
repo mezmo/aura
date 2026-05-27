@@ -1,4 +1,4 @@
-//#![cfg(feature = "integration-a2a")]
+#![cfg(feature = "integration-a2a")]
 
 //! Integration tests for Aura invocation of A2A tools via the a2a-rs-server crate.
 //!
@@ -35,12 +35,12 @@ async fn test_a2a_agent_card() {
       "version": "1.0",
       "supportedInterfaces": [
         {
-          "url": "/a2a/v1",
+          "url": format!("{}/a2a/v1", AURA_SERVER),
           "protocolBinding": "HTTP+JSON",
           "protocolVersion": "1.0"
         },
         {
-          "url": "/a2a/v1/rpc",
+          "url": format!("{}/a2a/v1/rpc", AURA_SERVER),
           "protocolBinding": "JSONRPC",
           "protocolVersion": "1.0"
         }

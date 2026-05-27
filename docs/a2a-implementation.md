@@ -22,6 +22,35 @@ This module wires the [A2A RC 1.0](https://github.com/a2a-protocol) protocol int
 
 `AuraRequestHandler` forces `return_immediately = true` on every `message:send` request. The HTTP response returns as soon as the task is queued in `Working` state, without waiting for the agent to finish. Poll `GET /a2a/v1/tasks/{id}` or subscribe via `message:stream` / `tasks/{id}:subscribe` to track completion.
 
+## Agent card URL (`AURA_SERVER_URL`)
+
+The agent card's `supportedInterfaces[].url` fields **must be absolute** (per the A2A spec). A2A clients read these URLs from the card and pass them straight to their HTTP layer, which rejects relative paths — so a client that fetches the card successfully will still fail on `message:send` if the advertised URLs are relative.
+
+Aura builds the interface URLs from a single canonical origin, configured via:
+
+| Flag | Env var | Default |
+|------|---------|---------|
+| `--server-url` | `AURA_SERVER_URL` | derived from `--host` / `--port` |
+
+When `AURA_SERVER_URL` is unset, the origin is derived from the bind host/port, with a wildcard bind (`0.0.0.0` / `::`) mapped to `127.0.0.1`. That default is fine for local development but **wrong whenever the server is reached at a different address than it binds** — behind a reverse proxy, load balancer, Kubernetes Service/Ingress, or when the container port is remapped. In those cases set `AURA_SERVER_URL` to the externally-reachable origin clients actually use (scheme + host + optional port, **no path**):
+
+```bash
+AURA_SERVER_URL=https://aura.example.com cargo run --bin aura-web-server
+```
+
+The card then advertises absolute endpoints under that origin:
+
+```jsonc
+{
+  "supportedInterfaces": [
+    { "url": "https://aura.example.com/a2a/v1",     "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0" },
+    { "url": "https://aura.example.com/a2a/v1/rpc", "protocolBinding": "JSONRPC",   "protocolVersion": "1.0" }
+  ]
+}
+```
+
+A trailing slash on `AURA_SERVER_URL` is trimmed before the paths are appended.
+
 ## Testing with curl
 
 Assumes the server is running on `localhost:8080`.

@@ -49,6 +49,13 @@ server:
   host: "0.0.0.0"
   # -- HTTP port for the container
   httpPort: 8080
+  # -- Externally-reachable origin published in the A2A agent card (AURA_SERVER_URL).
+  # A2A clients require absolute interface URLs and use them directly, so set this
+  # to the URL clients reach the server on (via the Service, Ingress, or load
+  # balancer): scheme + host + optional port, no path — e.g. "https://aura.example.com".
+  # When empty, Aura derives it from host/port, which is wrong behind a proxy or
+  # Service (host binds 0.0.0.0). Required for A2A to work from outside the cluster.
+  publicUrl: ""
   # -- Log level
   loglevel: info
   # -- Default agent name or alias when multiple configs are loaded via config.configs.
