@@ -56,10 +56,14 @@ fn main() -> Result<()> {
             aura_telemetry::bootstrap::startup_log_line(tcfg.disable_reason.as_ref())
         );
         let handle = aura_telemetry::init(tcfg);
+        // `config.enable_client_tools` is the fully-resolved value
+        // after CLI args > cli.toml > env > default. Reading from the
+        // raw `args.enable_client_tools.unwrap_or(false)` would lose
+        // every cli.toml opt-in.
         handle.capture(aura_telemetry::events::CliSessionStarted {
             interactive: config.query.is_none(),
             standalone_mode: is_standalone,
-            client_tools_enabled: args.enable_client_tools.unwrap_or(false),
+            client_tools_enabled: config.enable_client_tools,
         });
         handle
     };
@@ -88,7 +92,7 @@ fn main() -> Result<()> {
     // `render_queued_wave` in `ui::animation`.
     aura_cli::ui::prompt::set_pretty(config.pretty);
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
-    let mut backend = Backend::from_config(&rt, &config, &args)?;
+    let mut backend = Backend::from_config(&rt, &config, &args, &telemetry)?;
 
     let is_query = config.query.is_some();
 

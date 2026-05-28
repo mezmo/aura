@@ -35,6 +35,7 @@ impl Backend {
         _rt: &tokio::runtime::Runtime,
         config: &AppConfig,
         _args: &Args,
+        _telemetry: &aura_telemetry::TelemetryHandle,
     ) -> Result<Self> {
         #[cfg(feature = "standalone-cli")]
         if _args.standalone {
@@ -43,6 +44,7 @@ impl Backend {
             let direct = _rt.block_on(direct::DirectBackend::from_toml(
                 config_path,
                 config.extra_headers.clone(),
+                _telemetry.clone(),
             ))?;
             return Ok(Self::Direct(direct));
         }
