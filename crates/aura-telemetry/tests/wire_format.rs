@@ -125,13 +125,13 @@ async fn disabled_mode_writes_to_inspection_log_and_sends_nothing() {
     let first: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(first["event"], "telemetry_opt_out");
     assert_eq!(first["sent"], false);
-    assert_eq!(first["disable_reason"], "DoNotTrack");
+    assert_eq!(first["not_sent_reason"], "DoNotTrack");
     assert_eq!(first["properties"]["reason"], "DoNotTrack");
 
     let second: Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(second["event"], "server_started");
     assert_eq!(second["sent"], false);
-    assert_eq!(second["disable_reason"], "DoNotTrack");
+    assert_eq!(second["not_sent_reason"], "DoNotTrack");
     // Inspection log still records the envelope so the user sees
     // exactly what *would* have been sent.
     assert_eq!(second["properties"]["aura_source"], "web-server");
@@ -147,5 +147,154 @@ async fn active_mode_inspection_log_marks_sent_true() {
     let evt: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(evt["event"], "server_started");
     assert_eq!(evt["sent"], true);
-    assert!(evt["disable_reason"].is_null());
+    assert!(evt["not_sent_reason"].is_null());
+}
+
+/// Regression: the inspection log used to write `sent: true` as soon
+/// as the event was enqueued, which lied to the user when the POST
+/// later failed. The background-task now finalises the row only
+/// after the POST returns, so a 5xx from the endpoint produces an
+/// honest `sent: false` with `not_sent_reason: "PostFailed(...)"`.
+#[tokio::test]
+async fn post_failure_marks_inspection_log_not_sent() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/batch/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let cfg = TelemetryConfig {
+        endpoint: server.uri(),
+        api_key: "phc_test_key".into(),
+        install_id: Uuid::new_v4(),
+        install_id_path: None,
+        session_id: Uuid::new_v4(),
+        source: Source::WebServer,
+        os_family: OsFamily::Linux,
+        deployment_method: DeploymentMethod::Local,
+        aura_version: "9.9.9-test",
+        inspection_log_path: Some(log_path.clone()),
+        disable_reason: None,
+        channel_capacity: 16,
+        batch_size: 1,
+        flush_interval: Duration::from_millis(50),
+        http_client: None,
+    };
+    let handle = init(cfg);
+    handle.capture(ServerStarted {
+        default_agent_set: true,
+    });
+    handle.shutdown(Duration::from_secs(2)).await;
+
+    let contents = std::fs::read_to_string(&log_path).expect("inspection log exists");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 1, "expected one inspection row");
+    let evt: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(evt["event"], "server_started");
+    assert_eq!(
+        evt["sent"], false,
+        "POST failure must surface as sent:false"
+    );
+    let reason = evt["not_sent_reason"]
+        .as_str()
+        .expect("not_sent_reason set on failure");
+    assert!(
+        reason.starts_with("PostFailed(") && reason.ends_with(')'),
+        "expected PostFailed(<category>), got {reason:?}"
+    );
+    // The category for a 500 is `http_5xx` per the sink classifier.
+    assert!(
+        reason.contains("http_5xx"),
+        "expected http_5xx classification for a 500 response, got {reason:?}"
+    );
+}
+
+/// When `capture` outruns the background task, events get dropped at
+/// the channel boundary. The drop must show up in the inspection log
+/// as `sent: false, not_sent_reason: "ChannelFull"`, not as silence —
+/// that is the whole point of the local audit trail.
+#[tokio::test]
+async fn channel_full_drops_record_to_inspection_log() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Block the POST forever so the background task can never drain
+    // the channel; subsequent captures fill the channel and must drop.
+    Mock::given(method("POST"))
+        .and(path("/batch/"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let cfg = TelemetryConfig {
+        endpoint: server.uri(),
+        api_key: "phc_test_key".into(),
+        install_id: Uuid::new_v4(),
+        install_id_path: None,
+        session_id: Uuid::new_v4(),
+        source: Source::WebServer,
+        os_family: OsFamily::Linux,
+        deployment_method: DeploymentMethod::Local,
+        aura_version: "9.9.9-test",
+        inspection_log_path: Some(log_path.clone()),
+        disable_reason: None,
+        channel_capacity: 1,
+        batch_size: 1,
+        // High flush interval — flush is gated by batch_size=1 hitting
+        // and the first event is held in-flight by the wiremock delay.
+        flush_interval: Duration::from_secs(30),
+        http_client: None,
+    };
+    let handle = init(cfg);
+    // First capture takes the slot. Subsequent captures drop until
+    // the bg task starts a flush, which itself is suspended by the
+    // wiremock delay — so all overflow events drop with ChannelFull.
+    for _ in 0..32 {
+        handle.capture(ServerStarted {
+            default_agent_set: true,
+        });
+    }
+    // Give the bg task a moment to dequeue the first event so the
+    // remaining captures definitely see a full channel.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..32 {
+        handle.capture(ServerStarted {
+            default_agent_set: true,
+        });
+    }
+
+    assert!(
+        handle.dropped_count() > 0,
+        "expected at least one channel-full drop"
+    );
+
+    // Best-effort shutdown: the wiremock holds the POST for 30s, so
+    // we cannot wait for it. The inspection log writes for
+    // ChannelFull happen synchronously inside `capture`, so they are
+    // already on disk by now.
+    handle.shutdown(Duration::from_millis(50)).await;
+
+    let contents = std::fs::read_to_string(&log_path).expect("inspection log exists");
+    let drops: Vec<Value> = contents
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["not_sent_reason"] == "ChannelFull")
+        .collect();
+    assert!(
+        !drops.is_empty(),
+        "expected at least one ChannelFull row in inspection log"
+    );
+    for drop in &drops {
+        assert_eq!(drop["sent"], false);
+        assert_eq!(drop["event"], "server_started");
+    }
 }

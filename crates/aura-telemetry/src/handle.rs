@@ -177,9 +177,12 @@ impl TelemetryHandle {
         self.inner.inspection_log_path.as_deref()
     }
 
-    /// Fire-and-forget event capture. Always writes to the inspection
-    /// log (if configured). If telemetry is active, also enqueues for
-    /// the background sink.
+    /// Fire-and-forget event capture. When telemetry is active the
+    /// inspection-log entry is written by the background task **after**
+    /// the POST result is known, so `sent: true` is honest. When
+    /// telemetry is disabled or the channel is full the entry is
+    /// written here, immediately, with `sent: false` and a stable
+    /// `not_sent_reason` (a kill switch name or `ChannelFull`).
     pub fn capture<E: Event>(&self, event: E) {
         let payload = event.into_payload();
         self.capture_payload(payload);
@@ -189,43 +192,62 @@ impl TelemetryHandle {
     /// `EventPayload` (e.g. the synthetic `telemetry_opt_out` first
     /// record). Tests also use this.
     pub fn capture_payload(&self, payload: EventPayload) {
-        let mut sent = false;
-        if self.inner.disable_reason.is_none() {
-            let tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
-            if let Some(tx) = tx_guard.as_ref() {
-                // `try_send` is non-blocking; a full channel means we
-                // are under burst pressure. Drop and increment counter.
-                match tx.try_send(payload.clone()) {
-                    Ok(()) => sent = true,
-                    Err(_) => {
-                        self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
+        // Disabled path: nothing goes on the wire; write the
+        // inspection log entry here with the kill-switch label. No
+        // channel send, no background-task involvement.
+        if let Some(reason) = self.inner.disable_reason.as_ref() {
+            self.append_local(&payload, false, Some(disable_reason_label(reason)));
+            return;
         }
-        if let Some(log) = &self.inner.inspection {
-            let envelope_props =
-                build_event_json(&self.inner.envelope, &payload, &Utc::now().to_rfc3339());
-            let inspected = InspectedEvent {
-                ts: Utc::now(),
-                event: payload.name.to_string(),
-                properties: envelope_props
-                    .get("properties")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                sent,
-                disable_reason: self
-                    .inner
-                    .disable_reason
-                    .as_ref()
-                    .map(disable_reason_label),
-            };
-            // Inspection-log write failures are surfaced at debug
-            // level; we do not want to crash the caller because the
-            // user's disk is full.
-            if let Err(e) = log.append(&inspected) {
-                tracing::debug!(error = %e, "inspection log append failed");
+        // Active path: hand the payload to the background task. The
+        // background task is the only writer that knows the POST
+        // outcome, so it owns the inspection-log append for this
+        // event. We record nothing locally yet.
+        let tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
+        if let Some(tx) = tx_guard.as_ref() {
+            // `try_send` is non-blocking; a full channel means burst
+            // pressure. Drop, increment the counter, AND surface the
+            // drop in the inspection log so a user inspecting "what
+            // happened to my event" sees the truth rather than
+            // silence.
+            if tx.try_send(payload.clone()).is_err() {
+                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                drop(tx_guard);
+                self.append_local(&payload, false, Some("ChannelFull".into()));
             }
+        } else {
+            // No background task (init never created one): treat as a
+            // local record so the user still sees the event in the
+            // inspection log. This branch is reached only in test
+            // fixtures that bypass `init`.
+            drop(tx_guard);
+            self.append_local(&payload, false, Some("NoSink".into()));
+        }
+    }
+
+    /// Append one record to the inspection log with the supplied
+    /// `sent` / `not_sent_reason` pair. Errors are downgraded to
+    /// `tracing::debug!` because the local log is a best-effort audit
+    /// trail and must never crash the caller.
+    fn append_local(&self, payload: &EventPayload, sent: bool, reason: Option<String>) {
+        let Some(log) = self.inner.inspection.as_ref() else {
+            return;
+        };
+        let now = Utc::now();
+        let envelope_props =
+            build_event_json(&self.inner.envelope, payload, &now.to_rfc3339());
+        let inspected = InspectedEvent {
+            ts: now,
+            event: payload.name.to_string(),
+            properties: envelope_props
+                .get("properties")
+                .cloned()
+                .unwrap_or(Value::Null),
+            sent,
+            not_sent_reason: reason,
+        };
+        if let Err(e) = log.append(&inspected) {
+            tracing::debug!(error = %e, "inspection log append failed");
         }
     }
 
@@ -294,6 +316,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
         let envelope_for_task = envelope.clone();
         let batch_size = config.batch_size;
         let flush_interval = config.flush_interval;
+        let inspection_for_task = inspection.clone();
         let handle = tokio::spawn(run_background(BackgroundCtx {
             rx,
             client,
@@ -302,6 +325,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
             envelope: envelope_for_task,
             batch_size,
             flush_interval,
+            inspection: inspection_for_task,
         }));
         (Some(tx), Some(handle))
     } else {
@@ -339,7 +363,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
                 event: "telemetry_opt_out".into(),
                 properties: Value::Object(props),
                 sent: false,
-                disable_reason: Some(label),
+                not_sent_reason: Some(label),
             };
             if let Err(e) = log.append(&inspected) {
                 tracing::debug!(error = %e, "could not record telemetry_opt_out");
@@ -358,10 +382,23 @@ struct BackgroundCtx {
     envelope: Envelope,
     batch_size: usize,
     flush_interval: Duration,
+    /// Inspection-log handle for post-flush writes. `None` when the
+    /// user disabled the log via `AURA_TELEMETRY_LOG_EVENTS=0`.
+    inspection: Option<InspectionLog>,
+}
+
+/// One buffered event awaiting flush. We carry the wire JSON and the
+/// `InspectedEvent` skeleton side by side so the inspection-log row
+/// can be finalised with the actual POST outcome once `flush`
+/// completes — no second build pass, no timestamp drift between the
+/// wire and the local audit trail.
+struct Pending {
+    wire: Value,
+    inspected: InspectedEvent,
 }
 
 async fn run_background(mut ctx: BackgroundCtx) {
-    let mut buf: Vec<Value> = Vec::with_capacity(ctx.batch_size);
+    let mut buf: Vec<Pending> = Vec::with_capacity(ctx.batch_size);
     let mut ticker = tokio::time::interval(ctx.flush_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so we don't try to flush an empty
@@ -374,8 +411,7 @@ async fn run_background(mut ctx: BackgroundCtx) {
             maybe_payload = ctx.rx.recv() => {
                 match maybe_payload {
                     Some(payload) => {
-                        let ts = Utc::now().to_rfc3339();
-                        buf.push(build_event_json(&ctx.envelope, &payload, &ts));
+                        buf.push(build_pending(&ctx.envelope, payload));
                         if buf.len() >= ctx.batch_size {
                             flush(&ctx, &mut buf).await;
                         }
@@ -396,12 +432,52 @@ async fn run_background(mut ctx: BackgroundCtx) {
     }
 }
 
-async fn flush(ctx: &BackgroundCtx, buf: &mut Vec<Value>) {
+fn build_pending(envelope: &Envelope, payload: EventPayload) -> Pending {
+    let ts = Utc::now();
+    let wire = build_event_json(envelope, &payload, &ts.to_rfc3339());
+    let properties = wire
+        .get("properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let inspected = InspectedEvent {
+        ts,
+        event: payload.name.to_string(),
+        properties,
+        // Finalised post-flush. The buffered placeholder is never
+        // observable to a reader because we only call
+        // `inspection.append` after the POST returns.
+        sent: false,
+        not_sent_reason: Some("InFlight".into()),
+    };
+    Pending { wire, inspected }
+}
+
+async fn flush(ctx: &BackgroundCtx, buf: &mut Vec<Pending>) {
     if buf.is_empty() {
         return;
     }
-    if let Err(e) = post_batch(&ctx.client, &ctx.endpoint, &ctx.api_key, buf).await {
+    let wires: Vec<Value> = buf.iter().map(|p| p.wire.clone()).collect();
+    let result = post_batch(&ctx.client, &ctx.endpoint, &ctx.api_key, &wires).await;
+    let (sent, reason) = match &result {
+        Ok(()) => (true, None),
+        Err(e) => (
+            false,
+            Some(format!("PostFailed({})", crate::sink::classify_post_error(e))),
+        ),
+    };
+    if let Err(e) = &result {
         tracing::debug!(error = %e, "telemetry post failed");
     }
-    buf.clear();
+    if let Some(log) = ctx.inspection.as_ref() {
+        for pending in buf.drain(..) {
+            let mut inspected = pending.inspected;
+            inspected.sent = sent;
+            inspected.not_sent_reason = reason.clone();
+            if let Err(e) = log.append(&inspected) {
+                tracing::debug!(error = %e, "inspection log append failed");
+            }
+        }
+    } else {
+        buf.clear();
+    }
 }

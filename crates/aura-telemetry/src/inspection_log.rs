@@ -29,14 +29,24 @@ pub const DEFAULT_ROTATION_LINES: usize = 1000;
 
 /// One record on disk. The schema is part of the user-facing contract;
 /// changes require a doc update in `docs/telemetry.md`.
+///
+/// `sent` is `true` only when the wire-side POST to PostHog
+/// completed successfully. `not_sent_reason` is `Some(_)` whenever
+/// `sent` is `false`, and names why — a kill switch
+/// (`DoNotTrack`, `AuraDisabled`, `Ci(GITHUB_ACTIONS)`, `CargoTest`,
+/// `ConfigDisabled`), a channel-full drop (`ChannelFull`), or a
+/// delivery failure (`PostFailed(<category>)`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InspectedEvent {
     pub ts: DateTime<Utc>,
     pub event: String,
     pub properties: Value,
     pub sent: bool,
-    /// `null` when telemetry is active.
-    pub disable_reason: Option<String>,
+    /// `null` when `sent: true`; otherwise a stable label for the
+    /// reason. Renamed from `disable_reason` to reflect that delivery
+    /// failures land here too.
+    #[serde(default, alias = "disable_reason")]
+    pub not_sent_reason: Option<String>,
 }
 
 /// Render a [`DisableReason`] for the inspection log. Stable strings so
@@ -207,7 +217,7 @@ mod tests {
             event: name.into(),
             properties: json!({"k": "v"}),
             sent,
-            disable_reason: reason.map(str::to_string),
+            not_sent_reason: reason.map(str::to_string),
         }
     }
 
@@ -248,7 +258,21 @@ mod tests {
         let line = fs::read_to_string(&path).unwrap();
         let parsed: InspectedEvent = serde_json::from_str(line.trim()).unwrap();
         assert!(!parsed.sent);
-        assert_eq!(parsed.disable_reason.as_deref(), Some("DoNotTrack"));
+        assert_eq!(parsed.not_sent_reason.as_deref(), Some("DoNotTrack"));
+    }
+
+    /// The `disable_reason` field was renamed to `not_sent_reason` in
+    /// the same commit that started writing delivery-failure reasons
+    /// into it. We keep a `serde(alias = "disable_reason")` so any
+    /// JSONL line written by an earlier build still deserialises (for
+    /// users who have an `events.jsonl` already on disk from a prior
+    /// run).
+    #[test]
+    fn legacy_disable_reason_field_alias_round_trips() {
+        let line = r#"{"ts":"2026-05-28T12:00:00Z","event":"e","properties":{},"sent":false,"disable_reason":"DoNotTrack"}"#;
+        let parsed: InspectedEvent = serde_json::from_str(line).unwrap();
+        assert!(!parsed.sent);
+        assert_eq!(parsed.not_sent_reason.as_deref(), Some("DoNotTrack"));
     }
 
     #[test]

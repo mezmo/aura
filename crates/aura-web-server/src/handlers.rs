@@ -967,7 +967,7 @@ mod telemetry_endpoint_tests {
             event: "server_started".into(),
             properties: json!({"aura_source": "web-server"}),
             sent: true,
-            disable_reason: None,
+            not_sent_reason: None,
         };
         log.append(&evt).unwrap();
 
@@ -988,7 +988,7 @@ mod telemetry_endpoint_tests {
                 event: format!("evt_{i}"),
                 properties: json!({}),
                 sent: true,
-                disable_reason: None,
+                not_sent_reason: None,
             })
             .unwrap();
         }

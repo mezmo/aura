@@ -105,6 +105,31 @@ fn batch_url(endpoint: &str) -> String {
     format!("{base}/batch/")
 }
 
+/// Classify a `reqwest::Error` into one of a small set of stable
+/// labels for the local inspection log. Users debugging "why didn't
+/// PostHog see this event" should see at a glance whether the failure
+/// was the network, a timeout, or a status response — without needing
+/// the full error string (which can leak the endpoint URL into the
+/// audit log, which we want to keep tidy).
+pub fn classify_post_error(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        return "timeout";
+    }
+    if let Some(status) = err.status() {
+        return if status.is_client_error() {
+            "http_4xx"
+        } else if status.is_server_error() {
+            "http_5xx"
+        } else {
+            "http_other"
+        };
+    }
+    if err.is_connect() || err.is_request() {
+        return "network";
+    }
+    "other"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +213,68 @@ mod tests {
         let batch = build_batch("phc_test", &events);
         assert_eq!(batch["api_key"], "phc_test");
         assert_eq!(batch["batch"].as_array().unwrap().len(), 1);
+    }
+
+    mod classify {
+        use super::*;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Drive a real POST against `endpoint` and return the resulting
+        /// error so `classify_post_error` is tested on genuine
+        /// `reqwest::Error`s, not hand-built ones (which can't be).
+        async fn post_error(endpoint: &str, timeout: Duration) -> reqwest::Error {
+            post_batch(&reqwest::Client::new(), endpoint, "phc_test", &[], timeout)
+                .await
+                .expect_err("the POST is set up to fail")
+        }
+
+        async fn server_returning(status: u16) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        #[tokio::test]
+        async fn client_error_status_is_http_4xx() {
+            let server = server_returning(404).await;
+            let err = post_error(&server.uri(), Duration::from_secs(2)).await;
+            assert_eq!(classify_post_error(&err), "http_4xx");
+        }
+
+        #[tokio::test]
+        async fn server_error_status_is_http_5xx() {
+            let server = server_returning(503).await;
+            let err = post_error(&server.uri(), Duration::from_secs(2)).await;
+            assert_eq!(classify_post_error(&err), "http_5xx");
+        }
+
+        #[tokio::test]
+        async fn slow_response_is_timeout() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                // Delay far exceeds the per-request budget below, so the
+                // client times out deterministically before the response.
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+            let err = post_error(&server.uri(), Duration::from_millis(100)).await;
+            assert!(err.is_timeout(), "precondition: timed out, got {err:?}");
+            assert_eq!(classify_post_error(&err), "timeout");
+        }
+
+        #[tokio::test]
+        async fn connection_refused_is_network() {
+            // Port 1 on loopback is not listening -> connect error.
+            let err = post_error("http://127.0.0.1:1", Duration::from_secs(2)).await;
+            assert!(
+                !err.is_timeout() && err.status().is_none(),
+                "precondition: a transport error, not a timeout/status: {err:?}"
+            );
+            assert_eq!(classify_post_error(&err), "network");
+        }
     }
 }

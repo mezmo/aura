@@ -160,7 +160,7 @@ pub(crate) fn format_telemetry_recent(
                 let suffix = if evt.sent {
                     "[sent]".to_string()
                 } else {
-                    match evt.disable_reason {
+                    match evt.not_sent_reason {
                         Some(r) => format!("[not sent — {r}]"),
                         None => "[not sent]".to_string(),
                     }
@@ -261,13 +261,25 @@ mod telemetry_command_tests {
 
     #[tokio::test]
     async fn recent_lists_captured_events_with_sent_marker() {
+        // The active path now writes the inspection-log row from the
+        // background task after the POST result is known, so calling
+        // `capture` then immediately reading would race. The
+        // formatter itself is what we want to lock in here — given an
+        // InspectedEvent with `sent: true`, it renders `[sent]`. We
+        // assert that directly by appending the synthetic row.
         let h = build(None);
-        h.handle.capture(ServerStarted {
-            default_agent_set: true,
-        });
-        // The inspection-log writer runs synchronously inside
-        // `capture_payload`, so the line is on disk by the time
-        // `format_telemetry_recent` reads it back.
+        let log = h
+            .handle
+            .inspection_log()
+            .expect("inspection log present in fixture");
+        log.append(&aura_telemetry::inspection_log::InspectedEvent {
+            ts: chrono::Utc::now(),
+            event: "server_started".into(),
+            properties: serde_json::json!({"aura_source": "cli"}),
+            sent: true,
+            not_sent_reason: None,
+        })
+        .unwrap();
         let out = format_telemetry_recent(&h.handle, 5);
         assert!(out.starts_with("last 1 event(s):"), "got: {out}");
         assert!(out.contains("server_started"));

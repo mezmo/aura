@@ -158,13 +158,29 @@ Each line is one event. The fields are:
   "event": "server_started",
   "properties": { … the same property bag PostHog received … },
   "sent": true,
-  "disable_reason": null
+  "not_sent_reason": null
 }
 ```
 
-When telemetry is disabled, `sent` is `false` and `disable_reason`
-names the kill switch. The line is still written so you can verify
-the kill switch took effect.
+`sent` is `true` only after the wire-side POST to PostHog completed
+successfully. `not_sent_reason` is `null` in that case; otherwise it
+names *why* the event was not delivered — one of:
+
+- A kill-switch label (`DoNotTrack`, `AuraDisabled`,
+  `Ci(GITHUB_ACTIONS)`, `CargoTest`, `ConfigDisabled`) when a kill
+  switch took effect.
+- `ChannelFull` when the background task could not keep up and the
+  event was dropped at the channel boundary.
+- `PostFailed(<category>)` when the POST returned an error.
+  Categories: `timeout`, `network`, `http_4xx`, `http_5xx`,
+  `http_other`, `other`.
+
+The line is written for every captured event — including dropped and
+failed-to-send ones — so you can verify both that the kill switch
+took effect and that the network sink actually delivered. JSONL
+written by an earlier build (which used `disable_reason`) is read
+back transparently via a serde alias; new writes use
+`not_sent_reason`.
 
 The file rotates at 1000 lines; the previous file is kept at
 `events.jsonl.1` (single backup, overwrites on next rotation). To
