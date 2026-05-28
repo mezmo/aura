@@ -47,10 +47,26 @@ const CI_ENV_VARS: &[&str] = &[
     "TRAVIS",
 ];
 
-fn is_truthy(v: &Option<String>) -> bool {
+/// Common false-y values, case-insensitive, that should *not* trigger
+/// a boolean env-var kill switch. Anything not in this set (and not
+/// empty / unset) is treated as "the user enabled the flag", so
+/// `DO_NOT_TRACK=enabled` keeps working even though we don't enumerate
+/// every truthy spelling.
+///
+/// Without this, `DO_NOT_TRACK=false` or `CI=false` (a common
+/// shell-rc pattern for "I'm not in CI today") would silently
+/// suppress all telemetry — the opposite of the user's intent.
+fn is_false_value(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
+}
+
+/// Treat the env var as "the user enabled this kill switch". Unset and
+/// recognized false values do not count.
+fn flag_set(v: &Option<String>) -> bool {
     match v {
         None => false,
-        Some(s) => !s.is_empty() && s != "0",
+        Some(s) => !is_false_value(s),
     }
 }
 
@@ -62,22 +78,25 @@ fn is_truthy(v: &Option<String>) -> bool {
 ///
 /// Returns `Some(reason)` if disabled, `None` if active.
 pub fn decide_disabled(env: &dyn EnvProvider) -> Option<DisableReason> {
-    if is_truthy(&env.var("DO_NOT_TRACK")) {
+    if flag_set(&env.var("DO_NOT_TRACK")) {
         return Some(DisableReason::DoNotTrack);
     }
-    if is_truthy(&env.var("AURA_TELEMETRY_DISABLED")) {
+    if flag_set(&env.var("AURA_TELEMETRY_DISABLED")) {
         return Some(DisableReason::AuraDisabled);
     }
     for name in CI_ENV_VARS {
-        if is_truthy(&env.var(name)) {
+        if flag_set(&env.var(name)) {
             return Some(DisableReason::Ci(name));
         }
     }
     if env.var("CARGO_TARGET_TMPDIR").is_some() || env.var("RUST_TEST_THREADS").is_some() {
         return Some(DisableReason::CargoTest);
     }
+    // `AURA_TELEMETRY_ENABLED` is the inverse of the others: it
+    // disables only when set to a recognized false value. An unset
+    // var or a truthy value leaves telemetry on.
     if let Some(v) = env.var("AURA_TELEMETRY_ENABLED") {
-        if v == "false" || v == "0" {
+        if is_false_value(&v) {
             return Some(DisableReason::ConfigDisabled);
         }
     }
@@ -130,6 +149,95 @@ mod tests {
     fn do_not_track_empty_does_not_disable() {
         let env = MockEnv::new().set("DO_NOT_TRACK", "");
         assert_eq!(decide_disabled(&env), None);
+    }
+
+    /// Regression: `DO_NOT_TRACK=false` used to silently disable
+    /// telemetry because the old `is_truthy` accepted any non-empty
+    /// non-"0" value. The fix parses common false spellings
+    /// (case-insensitive) and treats them as "kill switch not active".
+    #[test]
+    fn do_not_track_false_values_do_not_disable() {
+        for v in [
+            "false", "FALSE", "False", "no", "NO", "off", "OFF", "Off", "0", "",
+        ] {
+            let env = MockEnv::new().set("DO_NOT_TRACK", v);
+            assert_eq!(
+                decide_disabled(&env),
+                None,
+                "DO_NOT_TRACK={v:?} must not disable telemetry"
+            );
+        }
+    }
+
+    /// The complementary case: unrecognised truthy spellings continue
+    /// to disable, so the parser remains permissive on the truthy side
+    /// for backward compatibility with users who set
+    /// `DO_NOT_TRACK=enabled` or `DO_NOT_TRACK=please`.
+    #[test]
+    fn do_not_track_assorted_truthy_values_disable() {
+        for v in ["1", "true", "yes", "on", "enabled", "please", "TRUE"] {
+            let env = MockEnv::new().set("DO_NOT_TRACK", v);
+            assert_eq!(
+                decide_disabled(&env),
+                Some(DisableReason::DoNotTrack),
+                "DO_NOT_TRACK={v:?} should disable telemetry"
+            );
+        }
+    }
+
+    #[test]
+    fn aura_telemetry_disabled_false_values_do_not_disable() {
+        for v in ["false", "FALSE", "no", "off", "0", ""] {
+            let env = MockEnv::new().set("AURA_TELEMETRY_DISABLED", v);
+            assert_eq!(
+                decide_disabled(&env),
+                None,
+                "AURA_TELEMETRY_DISABLED={v:?} must not disable telemetry"
+            );
+        }
+    }
+
+    /// Shell rc files often export `CI=false` on developer machines to
+    /// signal "not in CI" to scripts. We must not interpret that as
+    /// "in CI" and silently suppress telemetry.
+    #[test]
+    fn ci_false_does_not_disable() {
+        for name in CI_ENV_VARS {
+            for v in ["false", "no", "off", "0", ""] {
+                let env = MockEnv::new().set(name, v);
+                assert_eq!(
+                    decide_disabled(&env),
+                    None,
+                    "{name}={v:?} must not be classified as CI"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aura_telemetry_enabled_false_variants_disable() {
+        // The inverse direction: AURA_TELEMETRY_ENABLED is on by
+        // default; explicit false values turn telemetry off.
+        for v in ["false", "FALSE", "no", "off", "0", ""] {
+            let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", v);
+            assert_eq!(
+                decide_disabled(&env),
+                Some(DisableReason::ConfigDisabled),
+                "AURA_TELEMETRY_ENABLED={v:?} must disable telemetry"
+            );
+        }
+    }
+
+    #[test]
+    fn aura_telemetry_enabled_truthy_does_not_disable() {
+        for v in ["true", "yes", "on", "1", "enabled"] {
+            let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", v);
+            assert_eq!(
+                decide_disabled(&env),
+                None,
+                "AURA_TELEMETRY_ENABLED={v:?} should leave telemetry on"
+            );
+        }
     }
 
     #[test]

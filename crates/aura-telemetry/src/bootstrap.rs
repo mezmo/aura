@@ -57,16 +57,27 @@ pub fn resolve_install_id_path(memory_dir: Option<&Path>) -> PathBuf {
 }
 
 /// Resolve the local inspection-log path. Returns `None` when the user
-/// has opted out of the inspection log via `AURA_TELEMETRY_LOG_EVENTS=0`.
+/// has opted out of the inspection log via `AURA_TELEMETRY_LOG_EVENTS`
+/// set to a recognized false value (`0`, `false`, `no`, `off`,
+/// case-insensitive). This matches the parsing rules
+/// [`crate::disable`] applies to the wire-side kill switches so a user
+/// who sets `=false` (or `=off`) sees the same outcome there as here.
 pub fn resolve_inspection_log_path(
     source: Source,
     memory_dir: Option<&Path>,
     env: &dyn EnvProvider,
 ) -> Option<PathBuf> {
-    if env.var("AURA_TELEMETRY_LOG_EVENTS").as_deref() == Some("0") {
-        return None;
+    if let Some(v) = env.var("AURA_TELEMETRY_LOG_EVENTS") {
+        if is_false_value(&v) {
+            return None;
+        }
     }
     Some(default_inspection_log_path(source, memory_dir))
+}
+
+fn is_false_value(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
 }
 
 fn default_inspection_log_path(source: Source, memory_dir: Option<&Path>) -> PathBuf {
@@ -210,6 +221,32 @@ mod tests {
     fn resolve_inspection_log_non_zero_does_not_disable() {
         let env = MockEnv::default().set("AURA_TELEMETRY_LOG_EVENTS", "1");
         assert!(resolve_inspection_log_path(Source::WebServer, None, &env).is_some());
+    }
+
+    /// Same fix as `disable.rs::do_not_track_false_values_do_not_disable`:
+    /// false-y string values disable the inspection log, mirroring the
+    /// wire-side kill-switch parsing. Without this, `=false` would have
+    /// kept the log on (because the old check was exact-match on `=0`).
+    #[test]
+    fn resolve_inspection_log_recognizes_false_values() {
+        for v in ["false", "FALSE", "no", "off", "0", ""] {
+            let env = MockEnv::default().set("AURA_TELEMETRY_LOG_EVENTS", v);
+            assert!(
+                resolve_inspection_log_path(Source::WebServer, None, &env).is_none(),
+                "AURA_TELEMETRY_LOG_EVENTS={v:?} should disable the inspection log"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_inspection_log_truthy_values_leave_log_on() {
+        for v in ["true", "1", "yes", "on", "enabled"] {
+            let env = MockEnv::default().set("AURA_TELEMETRY_LOG_EVENTS", v);
+            assert!(
+                resolve_inspection_log_path(Source::WebServer, None, &env).is_some(),
+                "AURA_TELEMETRY_LOG_EVENTS={v:?} should leave the inspection log on"
+            );
+        }
     }
 
     #[test]
