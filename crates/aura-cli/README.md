@@ -1,6 +1,6 @@
-# Aura CLI
+# AURA CLI
 
-A fast, interactive terminal client for chat completions with tool execution. Built primarily as the command line interface for [Aura by Mezmo](https://mezmo.com/aura), but works with **any OpenAI-compatible API** — plug in your own models, agents, or LLM endpoints.
+A fast, interactive terminal client for chat completions with tool execution. Built primarily as the command line interface for [AURA by Mezmo](https://mezmo.com/aura), but works with **any OpenAI-compatible API** — plug in your own models, agents, or LLM endpoints.
 
 ---
 
@@ -57,12 +57,12 @@ In standalone mode, the CLI builds agents in-process using the same code paths a
 
 ## Backends
 
-Aura CLI supports two backends, selected explicitly via the `--standalone` flag:
+AURA CLI supports two backends, selected explicitly via the `--standalone` flag:
 
 | Backend                 | When                         | Dependencies                             | Tools                                                                            |
 | ----------------------- | ---------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
 | **HTTP** (default)      | No `--standalone` flag       | Lightweight — just HTTP client           | Server-side MCP tools always; CLI local tools when both sides opt in (see below) |
-| **Direct** (standalone) | `--standalone --config path` | Full aura stack (agents, MCP, providers) | MCP tools from TOML config; CLI local tools when `--enable-client-tools` is set  |
+| **Direct** (standalone) | `--standalone --config path` | Full AURA stack (agents, MCP, providers) | MCP tools from TOML config; CLI local tools when `--enable-client-tools` is set  |
 
 Both backends produce identical SSE event streams and share the same stream parser (`process_sse_events`), so all CLI features (stream panel, tool display, orchestration events, etc.) work identically regardless of backend.
 
@@ -153,7 +153,7 @@ wins. `$HOME` is explicitly skipped so the global file is never picked up twice.
 
 > **Renamed from `config.toml`.** Older versions read `~/.aura/config.toml`. The
 > file is still read with a one-time deprecation warning — rename it to `cli.toml`
-> at your convenience. The old name collided with Aura **agent** config TOMLs and
+> at your convenience. The old name collided with AURA **agent** config TOMLs and
 > will stop being read in a future release.
 
 ```toml
@@ -167,8 +167,8 @@ log_file = "/tmp/aura-cli.log"  # append-only; see Logging section below
 ```
 
 > **Note on system prompts:** In **HTTP mode**, `--system-prompt` is intended for
-> OpenAI-compatible backends that support system messages. **Aura's server ignores system
-> role messages** — the CLI will prompt you to confirm whether you're connecting to Aura
+> OpenAI-compatible backends that support system messages. **AURA's server ignores system
+> role messages** — the CLI will prompt you to confirm whether you're connecting to AURA
 > or another service. In **standalone mode**, `--system-prompt` can append to or replace
 > the agent's TOML-configured system prompt (you'll be asked which). In one-shot mode
 > (`--query`), standalone silently appends; HTTP mode requires `--force`.
@@ -285,7 +285,7 @@ In **HTTP mode**, the model list is fetched from the server's `/v1/models` endpo
 >
 > Disabled by default. Opting in is your decision and your responsibility.
 
-By default, Aura CLI is a **pure chat client** — no local tools are advertised to the model and the REPL never executes anything on the host. Pass `--enable-client-tools` (or set `AURA_ENABLE_CLIENT_TOOLS=true`) to opt in to local tool execution, at which point the model can call tools like `Shell`, `Read`, and `Update` and the REPL runs them locally with permission checks.
+By default, AURA CLI is a **pure chat client** — no local tools are advertised to the model and the REPL never executes anything on the host. Pass `--enable-client-tools` (or set `AURA_ENABLE_CLIENT_TOOLS=true`) to opt in to local tool execution, at which point the model can call tools like `Shell`, `Read`, and `Update` and the REPL runs them locally with permission checks.
 
 ```bash
 # Disabled (default) — chat only
@@ -326,7 +326,7 @@ If local tools never fire when you expect them to, check that **both** sides are
 
 ## Permissions
 
-Aura CLI includes a permission system that controls which local tools the model is allowed to execute. Permission rules only matter when client-side tools are enabled (see [Client-Side Tools](#client-side-tools)). Configure permissions by creating a `.aura/permissions.json` file in your project directory:
+AURA CLI includes a permission system that controls which local tools the model is allowed to execute. Permission rules only matter when client-side tools are enabled (see [Client-Side Tools](#client-side-tools)). Configure permissions by creating a `.aura/permissions.json` file in your project directory:
 
 ```json
 {
@@ -460,9 +460,9 @@ Events are shared types from the `aura-events` crate, ensuring identical parsing
 
 ## Compatibility
 
-Aura CLI speaks the standard [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) and works with any compatible backend:
+AURA CLI speaks the standard [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) and works with any compatible backend:
 
-- Aura by Mezmo
+- AURA by Mezmo
 - OpenAI API / Azure OpenAI
 - Local models via Ollama, LM Studio, vLLM, etc.
 - Any service implementing `/v1/chat/completions`
