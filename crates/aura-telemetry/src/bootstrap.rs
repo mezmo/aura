@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::disable::{decide_disabled, DisableReason, EnvProvider, SystemEnv};
 use crate::install_id;
 use crate::properties::{DeploymentMethod, OsFamily, Source};
-use crate::TelemetryConfig;
+use crate::{FileTelemetryConfig, TelemetryConfig};
 
 /// PostHog Cloud US ingest endpoint. Self-hosters override with
 /// `AURA_TELEMETRY_ENDPOINT` or the `[telemetry] endpoint = "…"` config
@@ -92,32 +92,44 @@ fn default_inspection_log_path(source: Source, memory_dir: Option<&Path>) -> Pat
 }
 
 /// Resolve a [`TelemetryConfig`] from the environment + (optional)
-/// `memory_dir` + the disable decision tree. The returned config is
-/// ready to pass to [`crate::init`].
-///
-/// `install_id` is created (or read) at the resolved path; an error
-/// here is non-fatal — we log at `tracing::debug!` and return a config
-/// with a freshly-generated UUID that will not persist. This keeps
-/// telemetry init from ever blocking startup on a filesystem hiccup.
+/// `memory_dir` + the disable decision tree. Equivalent to
+/// `build_config_from_env_and_file(source, memory_dir, None)`.
 pub fn build_config_from_env(source: Source, memory_dir: Option<&Path>) -> TelemetryConfig {
-    let env = SystemEnv;
-    build_config_with_env(source, memory_dir, &env)
+    build_config_from_env_and_file(source, memory_dir, None)
 }
 
-/// Same as [`build_config_from_env`] but takes an explicit env provider
-/// for unit testability.
+/// Resolve a [`TelemetryConfig`] from env vars, an optional
+/// `memory_dir`, and an optional `[telemetry]` block parsed from the
+/// caller's config file. Precedence per `docs/telemetry.md`: env wins
+/// over file wins over built-in defaults. The `enabled = false`
+/// file-config kill switch fires only when no higher-precedence
+/// kill switch (env or auto-disable) already took effect.
+pub fn build_config_from_env_and_file(
+    source: Source,
+    memory_dir: Option<&Path>,
+    file: Option<&FileTelemetryConfig>,
+) -> TelemetryConfig {
+    let env = SystemEnv;
+    build_config_with_env(source, memory_dir, file, &env)
+}
+
+/// Same as [`build_config_from_env_and_file`] but takes an explicit env
+/// provider for unit testability.
 pub fn build_config_with_env(
     source: Source,
     memory_dir: Option<&Path>,
+    file: Option<&FileTelemetryConfig>,
     env: &dyn EnvProvider,
 ) -> TelemetryConfig {
     let endpoint = env
         .var("AURA_TELEMETRY_ENDPOINT")
         .filter(|s| !s.is_empty())
+        .or_else(|| file.and_then(|f| f.endpoint.clone()).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
     let api_key = env
         .var("AURA_TELEMETRY_API_KEY")
         .filter(|s| !s.is_empty())
+        .or_else(|| file.and_then(|f| f.api_key.clone()).filter(|s| !s.is_empty()))
         .unwrap_or_else(|| DEFAULT_API_KEY.to_string());
     let deployment_method =
         DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
@@ -133,7 +145,17 @@ pub fn build_config_with_env(
     };
 
     let inspection_log_path = resolve_inspection_log_path(source, memory_dir, env);
-    let disable_reason = decide_disabled(env);
+
+    // Layer the disable decision: env > auto-disable > file. The file
+    // case is the lowest-precedence kill switch by design (a user with
+    // DO_NOT_TRACK=1 in their shell should see DoNotTrack reflected,
+    // not ConfigDisabled, even if the file also opts out).
+    let mut disable_reason = decide_disabled(env);
+    if disable_reason.is_none() {
+        if let Some(false) = file.and_then(|f| f.enabled) {
+            disable_reason = Some(DisableReason::ConfigDisabled);
+        }
+    }
 
     let mut cfg = TelemetryConfig::default_for(
         source,
@@ -142,6 +164,7 @@ pub fn build_config_with_env(
         api_key,
         inspection_log_path,
     );
+    cfg.install_id_path = Some(install_id_path);
     cfg.deployment_method = deployment_method;
     cfg.os_family = OsFamily::current();
     cfg.disable_reason = disable_reason;
@@ -219,17 +242,19 @@ mod tests {
             .set("AURA_TELEMETRY_ENDPOINT", "https://posthog.example/")
             .set("AURA_TELEMETRY_API_KEY", "phc_unit_test");
         let dir = tempfile::tempdir().unwrap();
-        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), &env);
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), None, &env);
         assert_eq!(cfg.endpoint, "https://posthog.example/");
         assert_eq!(cfg.api_key, "phc_unit_test");
         assert_eq!(cfg.deployment_method, DeploymentMethod::Local);
+        // Audit field is populated even when no env override fired.
+        assert!(cfg.install_id_path.is_some());
     }
 
     #[test]
     fn build_config_picks_up_deployment_method() {
         let env = MockEnv::default().set("AURA_DEPLOYMENT_METHOD", "k8s");
         let dir = tempfile::tempdir().unwrap();
-        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), &env);
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), None, &env);
         assert_eq!(cfg.deployment_method, DeploymentMethod::K8s);
     }
 
@@ -237,11 +262,85 @@ mod tests {
     fn build_config_records_disable_reason_from_env() {
         let env = MockEnv::default().set("DO_NOT_TRACK", "1");
         let dir = tempfile::tempdir().unwrap();
-        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), &env);
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), None, &env);
         assert!(matches!(
             cfg.disable_reason,
             Some(DisableReason::DoNotTrack)
         ));
+    }
+
+    #[test]
+    fn file_enabled_false_records_config_disabled_when_env_silent() {
+        let env = MockEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileTelemetryConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
+        assert!(matches!(
+            cfg.disable_reason,
+            Some(DisableReason::ConfigDisabled)
+        ));
+    }
+
+    #[test]
+    fn env_disable_outranks_file_disable() {
+        // Both env and file opt out — env's DoNotTrack must win so the
+        // recorded reason reflects user intent ("opted out via the
+        // industry-standard env") not configuration state.
+        let env = MockEnv::default().set("DO_NOT_TRACK", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileTelemetryConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
+        assert!(matches!(
+            cfg.disable_reason,
+            Some(DisableReason::DoNotTrack)
+        ));
+    }
+
+    #[test]
+    fn file_endpoint_used_when_env_unset() {
+        let env = MockEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileTelemetryConfig {
+            endpoint: Some("https://self-hosted.example/posthog".into()),
+            api_key: Some("phc_self".into()),
+            ..Default::default()
+        };
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
+        assert_eq!(cfg.endpoint, "https://self-hosted.example/posthog");
+        assert_eq!(cfg.api_key, "phc_self");
+    }
+
+    #[test]
+    fn env_endpoint_outranks_file_endpoint() {
+        let env = MockEnv::default()
+            .set("AURA_TELEMETRY_ENDPOINT", "https://env-wins.example/");
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileTelemetryConfig {
+            endpoint: Some("https://file-loses.example/".into()),
+            ..Default::default()
+        };
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
+        assert_eq!(cfg.endpoint, "https://env-wins.example/");
+    }
+
+    #[test]
+    fn file_enabled_true_is_a_no_op() {
+        // `enabled = true` should not flip the disable reason; the
+        // built-in default is on.
+        let env = MockEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileTelemetryConfig {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
+        assert!(cfg.disable_reason.is_none());
     }
 
     #[test]

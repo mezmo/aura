@@ -1,6 +1,6 @@
 use a2a_server::StaticAgentCard;
 use aura_config::load_config;
-use aura_telemetry::bootstrap::{build_config_from_env, startup_log_line};
+use aura_telemetry::bootstrap::{build_config_from_env_and_file, startup_log_line};
 use aura_telemetry::events::ServerStarted;
 use aura_telemetry::properties::Source;
 use axum::Json;
@@ -238,8 +238,16 @@ async fn run() -> std::io::Result<()> {
         .iter()
         .find_map(|c| c.memory_dir.as_deref())
         .map(std::path::PathBuf::from);
-    let telemetry_config =
-        build_config_from_env(Source::WebServer, telemetry_memory_dir.as_deref());
+    // First-config `[telemetry]` wins when multiple TOMLs are loaded.
+    // Operators running a multi-agent fleet should colocate the
+    // telemetry block in their primary config; cross-config disagreement
+    // is exotic enough to leave undefined.
+    let telemetry_file_cfg = configs.iter().find_map(|c| c.telemetry.as_ref());
+    let telemetry_config = build_config_from_env_and_file(
+        Source::WebServer,
+        telemetry_memory_dir.as_deref(),
+        telemetry_file_cfg,
+    );
     info!("{}", startup_log_line(telemetry_config.disable_reason.as_ref()));
     let telemetry = aura_telemetry::init(telemetry_config);
     telemetry.capture(ServerStarted {
@@ -269,6 +277,7 @@ async fn run() -> std::io::Result<()> {
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
+        telemetry: telemetry.clone(),
     });
 
     info!(
@@ -280,6 +289,10 @@ async fn run() -> std::io::Result<()> {
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        // Telemetry self-inspection endpoint. The handler rejects
+        // non-loopback peers with 403; see `handlers::telemetry_recent`
+        // for the contract.
+        .route("/telemetry/recent", get(handlers::telemetry_recent))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -360,11 +373,19 @@ async fn run() -> std::io::Result<()> {
         }
     });
 
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            shutdown_rx.await.ok();
-        })
-        .await;
+    // `into_make_service_with_connect_info::<SocketAddr>()` makes
+    // axum extract the peer's TCP address for handlers that ask for
+    // `ConnectInfo<SocketAddr>` — which is how
+    // `handlers::telemetry_recent` enforces "localhost-only" as
+    // documented in `docs/telemetry.md`.
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        shutdown_rx.await.ok();
+    })
+    .await;
 
     // Drain telemetry after the HTTP listener has stopped so any events
     // captured during the grace period (last-second tool calls, in-

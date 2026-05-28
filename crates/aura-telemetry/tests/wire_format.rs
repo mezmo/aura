@@ -40,6 +40,7 @@ async fn capture_one_and_get_body(
         endpoint: server.uri(),
         api_key: "phc_test_key".into(),
         install_id,
+        install_id_path: None,
         session_id,
         source: Source::WebServer,
         os_family: OsFamily::Linux,

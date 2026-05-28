@@ -39,6 +39,11 @@ struct FileConfig {
     /// **The user is responsible for log rotation / pruning** — the CLI
     /// opens this path in append mode and never truncates it.
     log_file: Option<String>,
+    /// `[telemetry]` block — opt-out anonymous product analytics. See
+    /// `docs/telemetry.md`. Project file wins over global for the
+    /// shared fields via `merge_over`; env-var kill switches still
+    /// override either.
+    telemetry: Option<aura_telemetry::FileTelemetryConfig>,
 }
 
 impl FileConfig {
@@ -57,7 +62,24 @@ impl FileConfig {
                 .or(self.enable_final_response_summary),
             style: other.style.or(self.style),
             log_file: other.log_file.or(self.log_file),
+            telemetry: merge_telemetry(self.telemetry, other.telemetry),
         }
+    }
+}
+
+fn merge_telemetry(
+    base: Option<aura_telemetry::FileTelemetryConfig>,
+    over: Option<aura_telemetry::FileTelemetryConfig>,
+) -> Option<aura_telemetry::FileTelemetryConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(o)) => Some(o),
+        (Some(b), Some(o)) => Some(aura_telemetry::FileTelemetryConfig {
+            enabled: o.enabled.or(b.enabled),
+            endpoint: o.endpoint.or(b.endpoint),
+            api_key: o.api_key.or(b.api_key),
+        }),
     }
 }
 
@@ -102,6 +124,12 @@ pub struct AppConfig {
     /// opened in append mode and never truncated by the CLI. See
     /// `crate::logging::init_tracing` for the subscriber setup.
     pub log_file: Option<String>,
+    /// Resolved `[telemetry]` block from layered `cli.toml`. Fed into
+    /// `aura_telemetry::bootstrap::build_config_from_env_and_file` so a
+    /// user can disable telemetry via `enabled = false` in their
+    /// `cli.toml` (the kill switch documented in `docs/telemetry.md`)
+    /// without setting an env var.
+    pub telemetry: Option<aura_telemetry::FileTelemetryConfig>,
 }
 
 impl AppConfig {
@@ -188,6 +216,8 @@ impl AppConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let telemetry = file_config.telemetry.clone();
+
         Ok(Self {
             api_url,
             api_key,
@@ -202,6 +232,7 @@ impl AppConfig {
             style,
             pretty: args.pretty,
             log_file,
+            telemetry,
         })
     }
 
@@ -299,6 +330,104 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
     } else {
         let insert_at = first_section_idx.unwrap_or(lines.len());
         lines.insert(insert_at, new_line);
+    }
+
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Persist `[telemetry] enabled = <value>` to the global `cli.toml`.
+///
+/// Backs `/telemetry disable` (and a future `/telemetry enable`). The
+/// upsert is sectioned: it locates `[telemetry]` and either replaces an
+/// existing `enabled = …` line or inserts one immediately under the
+/// header. If the section is missing, it is appended at end-of-file
+/// with a blank-line separator. Other sections, sibling keys, and
+/// comments are preserved.
+pub fn save_telemetry_enabled_to_global_cli_toml(enabled: bool) -> Result<()> {
+    let dir = global_aura_dir().ok_or_else(|| {
+        anyhow::anyhow!("could not determine ~/.aura/ (no home directory available)")
+    })?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(CLI_TOML_FILENAME);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let updated = upsert_section_bool(&existing, "telemetry", "enabled", enabled);
+    let mut f = fs::File::create(&path)?;
+    f.write_all(updated.as_bytes())?;
+    Ok(())
+}
+
+/// Update or insert `key = <bool>` inside the `[section]` block in TOML
+/// source. Designed for `cli.toml`'s flat-section layout; nested
+/// sections / dotted keys are out of scope.
+///
+/// - If `[section]` exists and contains `key = …`, replace the line,
+///   preserving any trailing `# comment`.
+/// - If `[section]` exists but does not contain `key`, insert
+///   `key = <value>` immediately under the section header.
+/// - If `[section]` is missing, append `\n[section]\nkey = <value>` at
+///   end-of-file (a blank line separates it from any prior content).
+fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> String {
+    let val_str = if value { "true" } else { "false" };
+    let new_line = format!("{key} = {val_str}");
+    let section_header = format!("[{section}]");
+
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+
+    let section_idx = lines.iter().position(|l| l.trim() == section_header);
+
+    match section_idx {
+        Some(start) => {
+            // Bound the search to this section: stop at the next
+            // `[other]` header or end-of-file.
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find(|(_, l)| l.trim_start().starts_with('['))
+                .map(|(i, _)| i)
+                .unwrap_or(lines.len());
+
+            let mut found_idx: Option<usize> = None;
+            for i in (start + 1)..end {
+                let trimmed = lines[i].trim_start();
+                let no_comment = trimmed.split('#').next().unwrap_or("").trim();
+                if let Some(rest) = no_comment.strip_prefix(key) {
+                    let rest = rest.trim_start();
+                    if rest.starts_with('=') {
+                        found_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(idx) = found_idx {
+                let original = &lines[idx];
+                let comment = original
+                    .find('#')
+                    .map(|p| original[p..].to_string())
+                    .unwrap_or_default();
+                lines[idx] = if comment.is_empty() {
+                    new_line
+                } else {
+                    format!("{new_line}  {comment}")
+                };
+            } else {
+                lines.insert(start + 1, new_line);
+            }
+        }
+        None => {
+            // Append a fresh section. Blank-line separator improves
+            // round-tripping (matches what `toml` would produce).
+            if !lines.is_empty() && lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
+                lines.push(String::new());
+            }
+            lines.push(section_header);
+            lines.push(new_line);
+        }
     }
 
     let mut out = lines.join("\n");
@@ -690,6 +819,7 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -713,6 +843,7 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -736,6 +867,7 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
@@ -756,7 +888,92 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
+    }
+
+    // ---- upsert_section_bool ----
+
+    #[test]
+    fn upsert_section_bool_empty_input() {
+        let out = upsert_section_bool("", "telemetry", "enabled", false);
+        assert_eq!(out, "[telemetry]\nenabled = false\n");
+    }
+
+    #[test]
+    fn upsert_section_bool_appends_section_after_flat_content() {
+        let input = "style = \"normal\"\nlog_file = \"/tmp/a.log\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        assert!(
+            out.contains("style = \"normal\""),
+            "preserves prior content: {out}"
+        );
+        assert!(out.contains("[telemetry]\nenabled = false\n"));
+        // Blank-line separator between the flat block and the new section.
+        assert!(out.contains("\n\n[telemetry]"), "got: {out}");
+    }
+
+    #[test]
+    fn upsert_section_bool_inserts_key_under_existing_header() {
+        let input = "[telemetry]\nendpoint = \"https://x/\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        // The new key sits right under the header, ahead of siblings.
+        assert!(
+            out.contains("[telemetry]\nenabled = false\nendpoint = \"https://x/\"\n"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn upsert_section_bool_replaces_existing_key() {
+        let input = "[telemetry]\nenabled = true\nendpoint = \"https://x/\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        assert!(out.contains("enabled = false"));
+        assert!(!out.contains("enabled = true"));
+        assert!(out.contains("endpoint = \"https://x/\""));
+    }
+
+    #[test]
+    fn upsert_section_bool_preserves_trailing_comment() {
+        let input = "[telemetry]\nenabled = true  # opt-in\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        assert!(out.contains("enabled = false  # opt-in"), "got: {out}");
+    }
+
+    #[test]
+    fn upsert_section_bool_scoped_to_named_section() {
+        // A key with the same name in a different section must not be
+        // touched.
+        let input = "\
+[other]
+enabled = true
+
+[telemetry]
+endpoint = \"https://x/\"
+";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        // [other].enabled is untouched.
+        assert!(out.contains("[other]\nenabled = true"), "got: {out}");
+        // [telemetry] gains the new key.
+        assert!(
+            out.contains("[telemetry]\nenabled = false\nendpoint = \"https://x/\""),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn upsert_section_bool_round_trips_through_toml_parser() {
+        let input = "style = \"normal\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        // The result must parse and round-trip the values we expect.
+        #[derive(serde::Deserialize)]
+        struct Probe {
+            style: Option<String>,
+            telemetry: Option<aura_telemetry::FileTelemetryConfig>,
+        }
+        let parsed: Probe = toml::from_str(&out).expect("upsert output is valid TOML");
+        assert_eq!(parsed.style.as_deref(), Some("normal"));
+        assert_eq!(parsed.telemetry.and_then(|t| t.enabled), Some(false));
     }
 }

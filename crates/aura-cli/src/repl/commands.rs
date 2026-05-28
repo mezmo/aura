@@ -90,12 +90,25 @@ pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryH
             let n = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
             format_telemetry_recent(telemetry, n)
         }
+        "disable" => format_telemetry_disable_result(
+            crate::config::save_telemetry_enabled_to_global_cli_toml(false),
+        ),
         other => format!(
-            "Unknown /telemetry subcommand: {other}\nAvailable: status, recent [N]"
+            "Unknown /telemetry subcommand: {other}\nAvailable: status, recent [N], disable"
         ),
     };
     println!("{body}");
     redraw_input_frame();
+}
+
+pub(crate) fn format_telemetry_disable_result(result: anyhow::Result<()>) -> String {
+    match result {
+        Ok(()) => "telemetry: persisted [telemetry] enabled = false in ~/.aura/cli.toml. \
+                   The change takes effect on the next launch. Re-enable by removing \
+                   the line, or set `enabled = true`."
+            .to_string(),
+        Err(e) => format!("could not persist /telemetry disable: {e}"),
+    }
 }
 
 pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandle) -> String {
@@ -106,11 +119,26 @@ pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandl
     };
     let mut out = String::new();
     out.push_str(&format!("telemetry: {state}\n"));
+    out.push_str(&format!("endpoint: {}\n", telemetry.endpoint()));
+    out.push_str(&format!(
+        "install-id path: {}\n",
+        telemetry
+            .install_id_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unset)".to_string())
+    ));
+    out.push_str(&format!(
+        "inspection log: {}\n",
+        telemetry
+            .inspection_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(disabled — AURA_TELEMETRY_LOG_EVENTS=0)".to_string())
+    ));
+    out.push_str(&format!("session id: {}\n", telemetry.session_id()));
     out.push_str(&format!(
         "dropped (channel-full): {}\n",
         telemetry.dropped_count()
     ));
-    out.push_str(&format!("session id: {}\n", telemetry.session_id()));
     out.push_str("see docs/telemetry.md for kill switches and the full event table.");
     out
 }
@@ -168,10 +196,12 @@ mod telemetry_command_tests {
     fn build(disable: Option<DisableReason>) -> TestHandle {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
+        let install_path = dir.path().join("install-id");
         let cfg = TelemetryConfig {
             endpoint: "http://127.0.0.1:1/no-such-host".into(),
             api_key: "phc_test".into(),
             install_id: Uuid::new_v4(),
+            install_id_path: Some(install_path),
             session_id: Uuid::new_v4(),
             source: Source::Cli,
             os_family: OsFamily::current(),
@@ -198,6 +228,21 @@ mod telemetry_command_tests {
         assert!(out.contains("dropped (channel-full): 0"));
         assert!(out.contains("session id: "));
         assert!(out.contains("docs/telemetry.md"));
+    }
+
+    #[tokio::test]
+    async fn status_includes_endpoint_install_id_path_and_log_path() {
+        let h = build(None);
+        let out = format_telemetry_status(&h.handle);
+        assert!(out.contains("endpoint: http://127.0.0.1:1/no-such-host"), "got: {out}");
+        assert!(
+            out.contains("install-id path: ") && out.contains("install-id"),
+            "expected install-id path line, got: {out}"
+        );
+        assert!(
+            out.contains("inspection log: ") && out.contains("events.jsonl"),
+            "expected inspection log line, got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -241,6 +286,21 @@ mod telemetry_command_tests {
         assert!(out.contains("telemetry_opt_out"));
         assert!(out.contains("server_started"));
         assert!(out.contains("[not sent — DoNotTrack]"));
+    }
+
+    #[test]
+    fn disable_success_message_explains_next_step() {
+        let out = format_telemetry_disable_result(Ok(()));
+        assert!(out.contains("[telemetry] enabled = false"));
+        assert!(out.contains("~/.aura/cli.toml"));
+        assert!(out.contains("next launch"));
+    }
+
+    #[test]
+    fn disable_failure_message_surfaces_error() {
+        let out = format_telemetry_disable_result(Err(anyhow::anyhow!("disk full")));
+        assert!(out.contains("could not persist"));
+        assert!(out.contains("disk full"));
     }
 }
 

@@ -135,8 +135,13 @@ log, oldest-first. (Phase 1 wires these commands; see task list.)
 curl http://127.0.0.1:8080/telemetry/recent?limit=50
 ```
 
-Localhost-bound by default. Same JSONL records as the CLI command,
-returned as a JSON array.
+Returns `{ "events": [...] }` with the same record shape as the local
+JSONL file. **The endpoint enforces a loopback peer-address check**:
+requests originating from a non-loopback address receive a `403`
+with an explanatory body, regardless of how the server is bound. If
+the inspection log has been disabled via `AURA_TELEMETRY_LOG_EVENTS=0`
+the endpoint returns `503` and an `"error": "inspection log
+disabled …"` body.
 
 ### Reading the file directly
 

@@ -14,7 +14,7 @@
 //! - Network failures are *silent* at `tracing::debug!` level — they
 //!   must never alter Aura's core behaviour.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +37,12 @@ pub struct TelemetryConfig {
     pub endpoint: String,
     pub api_key: String,
     pub install_id: Uuid,
+    /// Where the install UUID is persisted. Surfaced by
+    /// [`TelemetryHandle::install_id_path`] for the `/telemetry status`
+    /// slash command and the docs/telemetry.md "reset" instructions.
+    /// `None` is only used in tests that synthesise a handle without a
+    /// real filesystem location.
+    pub install_id_path: Option<PathBuf>,
     pub session_id: Uuid,
     pub source: Source,
     pub os_family: OsFamily,
@@ -70,6 +76,7 @@ impl TelemetryConfig {
             endpoint,
             api_key,
             install_id,
+            install_id_path: None,
             session_id: Uuid::new_v4(),
             source,
             os_family: OsFamily::current(),
@@ -83,6 +90,33 @@ impl TelemetryConfig {
             http_client: None,
         }
     }
+}
+
+/// File-driven telemetry settings as they appear under a `[telemetry]`
+/// block in the main server config (`config.toml`) or the per-user
+/// `cli.toml`. Every field is optional so partial configs are valid;
+/// the bootstrap layer applies env > file > built-in defaults.
+///
+/// This struct is also where the `enabled = false` user-facing kill
+/// switch documented in `docs/telemetry.md` is wired in. When a caller
+/// passes a file config with `enabled = Some(false)` and no env-level
+/// disable fired first, the bootstrap layer records the disable as
+/// `DisableReason::ConfigDisabled`.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileTelemetryConfig {
+    /// `Some(false)` → ConfigDisabled (lowest-precedence kill switch).
+    /// `Some(true)` and `None` are no-ops (env-level decisions still
+    /// apply, and the built-in default is on).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Override the PostHog endpoint. Env `AURA_TELEMETRY_ENDPOINT`
+    /// still wins.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Override the PostHog API key. Env `AURA_TELEMETRY_API_KEY` still
+    /// wins.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// Cheap clone; the inner state lives behind an `Arc`.
@@ -100,6 +134,13 @@ struct Inner {
     sender: std::sync::Mutex<Option<mpsc::Sender<EventPayload>>>,
     dropped: AtomicUsize,
     bg: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // Audit-surface fields: pure read-only echo of the resolved
+    // settings so `/telemetry status` and `GET /telemetry/recent` can
+    // tell users where their data is going without re-deriving paths
+    // from env vars at the slash-command level.
+    endpoint: String,
+    install_id_path: Option<PathBuf>,
+    inspection_log_path: Option<PathBuf>,
 }
 
 impl TelemetryHandle {
@@ -113,6 +154,27 @@ impl TelemetryHandle {
     /// never sent to PostHog.
     pub fn dropped_count(&self) -> usize {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// PostHog endpoint base URL the sink is targeting. Surfaced by
+    /// `/telemetry status` so users can see at a glance whether they
+    /// are pointed at Mezmo's project, a self-hosted PostHog, or
+    /// something stale from `cli.toml`.
+    pub fn endpoint(&self) -> &str {
+        &self.inner.endpoint
+    }
+
+    /// Where the persisted install-id lives on disk. Surfaced so the
+    /// `rm <path>` reset documented in `docs/telemetry.md` is one
+    /// glance away from the status output.
+    pub fn install_id_path(&self) -> Option<&Path> {
+        self.inner.install_id_path.as_deref()
+    }
+
+    /// Where the local inspection log is being written. `None` when
+    /// the user disabled the log via `AURA_TELEMETRY_LOG_EVENTS=0`.
+    pub fn inspection_log_path(&self) -> Option<&Path> {
+        self.inner.inspection_log_path.as_deref()
     }
 
     /// Fire-and-forget event capture. Always writes to the inspection
@@ -254,6 +316,9 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
             sender: std::sync::Mutex::new(sender),
             dropped: AtomicUsize::new(0),
             bg: tokio::sync::Mutex::new(bg_handle),
+            endpoint: config.endpoint.clone(),
+            install_id_path: config.install_id_path.clone(),
+            inspection_log_path: config.inspection_log_path.clone(),
         }),
     };
 

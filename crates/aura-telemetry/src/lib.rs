@@ -32,7 +32,7 @@ pub mod properties;
 pub mod sink;
 
 pub use disable::{decide_disabled, DisableReason, EnvProvider};
-pub use handle::{init, TelemetryConfig, TelemetryHandle};
+pub use handle::{init, FileTelemetryConfig, TelemetryConfig, TelemetryHandle};
 pub use properties::{IntoTelemetryProperty, Properties, PropertyValue};
 
 pub use aura_telemetry_derive::Event;

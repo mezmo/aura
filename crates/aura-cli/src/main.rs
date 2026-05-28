@@ -46,9 +46,10 @@ fn main() -> Result<()> {
     // resolution so this site and the web-server's stay in sync.
     let telemetry = {
         let _enter = rt.enter();
-        let tcfg = aura_telemetry::bootstrap::build_config_from_env(
+        let tcfg = aura_telemetry::bootstrap::build_config_from_env_and_file(
             aura_telemetry::properties::Source::Cli,
             None,
+            config.telemetry.as_ref(),
         );
         tracing::info!(
             "{}",

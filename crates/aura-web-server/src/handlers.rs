@@ -859,6 +859,150 @@ pub async fn health() -> Response {
     .into_response()
 }
 
+/// Telemetry self-inspection endpoint.
+///
+/// Returns the last `limit` events from the local inspection log
+/// (default 20). The endpoint is the HTTP counterpart of the CLI's
+/// `/telemetry recent` slash command. **Localhost-only by design** —
+/// the handler rejects non-loopback peers with 403 because the log
+/// reveals the kill-switch reason and the event timeline, neither of
+/// which should be reachable from outside the box. Operators who bind
+/// the server to a public interface lose nothing else; only this
+/// endpoint is restricted.
+pub async fn telemetry_recent(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Query(params): axum::extract::Query<TelemetryRecentParams>,
+) -> Response {
+    let (status, body) = build_telemetry_recent_response(
+        addr.ip().is_loopback(),
+        state.telemetry.inspection_log(),
+        params.limit,
+    );
+    (status, Json(body)).into_response()
+}
+
+/// Pure formatting half of [`telemetry_recent`], factored out so the
+/// loopback gate and the log-read paths can be unit-tested without
+/// constructing a full Axum router and AppState.
+pub fn build_telemetry_recent_response(
+    is_loopback: bool,
+    log: Option<&aura_telemetry::inspection_log::InspectionLog>,
+    limit: Option<usize>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    if !is_loopback {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "telemetry inspection endpoint is localhost-only"
+            }),
+        );
+    }
+    let Some(log) = log else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "error": "inspection log disabled (AURA_TELEMETRY_LOG_EVENTS=0)"
+            }),
+        );
+    };
+    let n = limit.unwrap_or(20);
+    match log.recent(n) {
+        Ok(events) => (
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "events": events }),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": format!("could not read log: {e}") }),
+        ),
+    }
+}
+
+/// Query params for [`telemetry_recent`].
+#[derive(serde::Deserialize)]
+pub struct TelemetryRecentParams {
+    pub limit: Option<usize>,
+}
+
+#[cfg(test)]
+mod telemetry_endpoint_tests {
+    use super::*;
+    use aura_telemetry::inspection_log::{InspectedEvent, InspectionLog};
+    use chrono::Utc;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn fresh_log(dir: &std::path::Path) -> InspectionLog {
+        InspectionLog::open(dir.join("events.jsonl"), 1000).unwrap()
+    }
+
+    #[test]
+    fn forbidden_for_non_loopback_peer() {
+        let dir = tempdir().unwrap();
+        let log = fresh_log(dir.path());
+        let (status, body) = build_telemetry_recent_response(false, Some(&log), None);
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("localhost-only"));
+    }
+
+    #[test]
+    fn service_unavailable_when_log_disabled() {
+        let (status, body) = build_telemetry_recent_response(true, None, None);
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("AURA_TELEMETRY_LOG_EVENTS=0")
+        );
+    }
+
+    #[test]
+    fn loopback_returns_recent_events_as_json_array() {
+        let dir = tempdir().unwrap();
+        let log = fresh_log(dir.path());
+        let evt = InspectedEvent {
+            ts: Utc::now(),
+            event: "server_started".into(),
+            properties: json!({"aura_source": "web-server"}),
+            sent: true,
+            disable_reason: None,
+        };
+        log.append(&evt).unwrap();
+
+        let (status, body) = build_telemetry_recent_response(true, Some(&log), Some(5));
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let events = body["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "server_started");
+    }
+
+    #[test]
+    fn default_limit_is_twenty() {
+        let dir = tempdir().unwrap();
+        let log = fresh_log(dir.path());
+        for i in 0..30 {
+            log.append(&InspectedEvent {
+                ts: Utc::now(),
+                event: format!("evt_{i}"),
+                properties: json!({}),
+                sent: true,
+                disable_reason: None,
+            })
+            .unwrap();
+        }
+        let (status, body) = build_telemetry_recent_response(true, Some(&log), None);
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 20);
+        // Oldest-first per InspectionLog::recent contract — the first
+        // returned event is evt_10, the last is evt_29.
+        assert_eq!(events[0]["event"], "evt_10");
+        assert_eq!(events[19]["event"], "evt_29");
+    }
+}
+
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {

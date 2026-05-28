@@ -20,6 +20,12 @@ pub struct Config {
     /// Orchestration mode configuration (multi-agent workflows)
     #[serde(default)]
     pub orchestration: Option<OrchestrationConfig>,
+    /// `[telemetry]` block — opt-out anonymous product analytics. See
+    /// `docs/telemetry.md` for the full contract; the bootstrap layer
+    /// in `aura-telemetry` reads this and lets env-var kill switches
+    /// override it.
+    #[serde(default)]
+    pub telemetry: Option<aura_telemetry::FileTelemetryConfig>,
 }
 
 /// Per-worker configuration for specialized workers.
