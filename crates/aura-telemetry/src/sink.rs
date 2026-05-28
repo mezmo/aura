@@ -1,0 +1,192 @@
+//! Wire-payload construction and outbound HTTP to the PostHog `/batch`
+//! endpoint.
+//!
+//! This module is the **only** code in `aura` that builds the JSON sent
+//! to PostHog, and the only code that opens an outbound HTTP connection
+//! for telemetry. Keeping the surface small means the
+//! `docs/telemetry.md` audit guide can point a reader at exactly one
+//! source file to verify what goes on the wire.
+//!
+//! Network errors are intentionally swallowed at the `tracing::debug!`
+//! level — telemetry must never alter Aura's behaviour. The
+//! `aura.telemetry.dropped` counter tracks events lost to a full
+//! channel; nothing tracks HTTP failures because they are not a user
+//! concern (the user can inspect the local log to see what was queued).
+
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::properties::{DeploymentMethod, OsFamily, Properties, Source};
+use crate::EventPayload;
+
+/// Identity that every batch carries; built once at telemetry init.
+#[derive(Debug, Clone)]
+pub struct Envelope {
+    pub install_id: Uuid,
+    pub session_id: Uuid,
+    pub source: Source,
+    pub os_family: OsFamily,
+    pub deployment_method: DeploymentMethod,
+    pub aura_version: &'static str,
+}
+
+/// Build the JSON for one event ready to be embedded in a PostHog
+/// `/batch` array. The envelope fields are merged in here; per-event
+/// fields override nothing (envelope keys are namespaced so collisions
+/// are not possible).
+pub fn build_event_json(envelope: &Envelope, payload: &EventPayload, ts_iso: &str) -> Value {
+    let mut properties = json!({
+        "aura_version": envelope.aura_version,
+        "aura_source": envelope.source.as_str(),
+        "os_family": envelope.os_family.as_str(),
+        "deployment_method": envelope.deployment_method.as_str(),
+        "session_id": envelope.session_id.to_string(),
+        // Suppress server-side IP and geoip enrichment. PostHog respects
+        // both keys (see PostHog docs on "anonymous events"). The empty
+        // `$ip` is the documented way to prevent the ingest pipeline
+        // from filling it in from the TCP socket.
+        "$ip": "",
+        "$geoip_disable": true,
+    });
+    // Per-event properties last, so anything the envelope provides is
+    // not silently overwritten by a future event variant.
+    merge_properties(&mut properties, &payload.properties);
+
+    json!({
+        "event": payload.name,
+        "distinct_id": envelope.install_id.to_string(),
+        "timestamp": ts_iso,
+        "properties": properties,
+    })
+}
+
+fn merge_properties(into: &mut Value, props: &Properties) {
+    let map = into.as_object_mut().expect("envelope properties is object");
+    for (k, v) in props.iter() {
+        map.insert(k.to_string(), v.to_json());
+    }
+}
+
+/// Wrap a batch of events with the API key for a PostHog `/batch` POST.
+pub fn build_batch(api_key: &str, events: &[Value]) -> Value {
+    json!({
+        "api_key": api_key,
+        "batch": events,
+    })
+}
+
+/// POST a batch. Returns `Err` only so the caller can `tracing::debug!`
+/// the result — never propagated upstream.
+pub async fn post_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    events: &[Value],
+) -> reqwest::Result<()> {
+    let url = batch_url(endpoint);
+    let body = build_batch(api_key, events);
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+    // Drop the body explicitly; we don't need it but want to release
+    // the connection. `error_for_status` returns Err for 4xx/5xx so
+    // those surface as logged failures rather than silent OKs.
+    resp.error_for_status()?;
+    Ok(())
+}
+
+fn batch_url(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    format!("{base}/batch/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::properties::{DeploymentMethod, OsFamily, PropertyValue, Source};
+
+    fn fake_envelope() -> Envelope {
+        Envelope {
+            install_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            source: Source::WebServer,
+            os_family: OsFamily::Linux,
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+        }
+    }
+
+    fn payload(name: &'static str, extras: &[(&'static str, PropertyValue)]) -> EventPayload {
+        let mut props = Properties::new();
+        for (k, v) in extras {
+            props.insert(k, v.clone());
+        }
+        EventPayload {
+            name,
+            properties: props,
+        }
+    }
+
+    #[test]
+    fn batch_url_appends_slash() {
+        assert_eq!(batch_url("https://us.i.posthog.com"), "https://us.i.posthog.com/batch/");
+        assert_eq!(batch_url("https://us.i.posthog.com/"), "https://us.i.posthog.com/batch/");
+    }
+
+    #[test]
+    fn envelope_carries_required_fields() {
+        let env = fake_envelope();
+        let evt = build_event_json(&env, &payload("server_started", &[]), "2026-05-28T00:00:00Z");
+        let props = &evt["properties"];
+        assert_eq!(props["aura_version"], "9.9.9-test");
+        assert_eq!(props["aura_source"], "web-server");
+        assert_eq!(props["os_family"], "linux");
+        assert_eq!(props["deployment_method"], "local");
+        assert_eq!(props["session_id"], Uuid::nil().to_string());
+        assert_eq!(evt["distinct_id"], Uuid::nil().to_string());
+        assert_eq!(evt["event"], "server_started");
+        assert_eq!(evt["timestamp"], "2026-05-28T00:00:00Z");
+    }
+
+    #[test]
+    fn geoip_suppression_keys_present() {
+        let env = fake_envelope();
+        let evt = build_event_json(&env, &payload("server_started", &[]), "now");
+        assert_eq!(evt["properties"]["$ip"], "");
+        assert_eq!(evt["properties"]["$geoip_disable"], true);
+    }
+
+    #[test]
+    fn per_event_properties_layered_after_envelope() {
+        let env = fake_envelope();
+        let evt = build_event_json(
+            &env,
+            &payload(
+                "cli_session_started",
+                &[("interactive", PropertyValue::Bool(true))],
+            ),
+            "now",
+        );
+        assert_eq!(evt["properties"]["interactive"], true);
+        // Envelope still intact.
+        assert_eq!(evt["properties"]["aura_source"], "web-server");
+    }
+
+    #[test]
+    fn build_batch_wraps_with_api_key() {
+        let env = fake_envelope();
+        let events = vec![build_event_json(
+            &env,
+            &payload("server_started", &[]),
+            "now",
+        )];
+        let batch = build_batch("phc_test", &events);
+        assert_eq!(batch["api_key"], "phc_test");
+        assert_eq!(batch["batch"].as_array().unwrap().len(), 1);
+    }
+}

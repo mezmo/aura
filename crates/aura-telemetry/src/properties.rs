@@ -201,8 +201,10 @@ impl IntoTelemetryProperty for SessionUuid {
     }
 }
 
-/// A bag of allow-listed properties for one event.
-#[derive(Debug, Default, Clone)]
+/// A bag of allow-listed properties for one event. `Clone` is
+/// provided so the background-task channel can move owned copies of
+/// the underlying [`EventPayload`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Properties(HashMap<&'static str, PropertyValue>);
 
 impl Properties {
