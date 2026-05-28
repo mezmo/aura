@@ -205,15 +205,22 @@ A single UUID v4, persisted in a single file:
 
 The file is mode `0600` on Unix, written via a `hard_link` race-safe
 publication pattern (see `crates/aura-telemetry/src/install_id.rs` for
-the algorithm and the convergence proof in the tests). To reset your
-install identity:
+the algorithm and the convergence proof in the tests).
+
+**If the file is corrupt** — anything other than a valid UUID v4 —
+Aura **does not auto-recover**. Each run silently falls back to a
+fresh per-run UUID (logged at `tracing::debug!`) without modifying the
+file. Auto-recovery without a cross-process lock cannot guarantee
+convergence, and a botched recovery would split a real install's
+reported identity across multiple PostHog `distinct_id`s. The trade we
+make instead is under-counting that install until you reset:
 
 ```bash
 rm ~/.aura/install-id
 ```
 
-The next Aura launch generates a fresh UUID. You will be counted as a
-new install.
+The next Aura launch generates a fresh persistent UUID. You will be
+counted as a new install.
 
 ---
 
@@ -253,7 +260,7 @@ verify the contract above without running the code:
 | `crates/aura-telemetry/src/properties.rs` | The sealed `PropertyValue` enum and the `IntoTelemetryProperty` trait. No `String`, no `serde_json::Value`, no blanket impl on `PropertyValue` itself — that last one was a deliberate close-up after review feedback so `PropertyValue` cannot be smuggled into an event's property map. |
 | `crates/aura-telemetry/src/events.rs` | One typed struct per event. Adding fields here requires a `PropertyValue` variant first. |
 | `crates/aura-telemetry/src/disable.rs` | The kill-switch decision tree. Tests cover every branch and every precedence pair. |
-| `crates/aura-telemetry/src/install_id.rs` | The race-safe install-UUID persistence. Concurrent-launch tests prove all callers converge on one UUID. |
+| `crates/aura-telemetry/src/install_id.rs` | The race-safe install-UUID persistence. Concurrent first-launch tests prove all callers converge on one UUID; a separate test proves that corrupt files are read-only-fallback (never auto-recovered) so a multi-process race cannot split identity. |
 | `crates/aura-telemetry/src/inspection_log.rs` | The local JSONL writer and rotation. |
 | `crates/aura-telemetry/src/sink.rs` | The **only** code that builds the JSON sent to PostHog and the only outbound HTTP call. The `$ip: ""` and `$geoip_disable: true` lines live here. |
 | `crates/aura-telemetry/src/handle.rs` | `TelemetryHandle::capture`, the fire-and-forget entry point, and the background batching task. |

@@ -6,31 +6,34 @@
 //! [`crate::properties`]) and **never** linked to a user identity:
 //! `TelemetryHandle` exposes no method that accepts a user identifier.
 //!
-//! Deleting the file resets your install identity — that is the
-//! user-facing "reset" path, documented in `docs/telemetry.md`.
+//! ## Three on-disk states
 //!
-//! ## Concurrency
+//! | On-disk state | Behaviour |
+//! |---|---|
+//! | **Missing** | Publish a fresh UUID v4 atomically via [`std::fs::hard_link`]. Concurrent first-launchers all converge on the winner. |
+//! | **Valid UUID** | Return it. |
+//! | **Corrupt** | Return a fresh per-run UUID **without** modifying the file. |
 //!
-//! Two Aura processes can race to populate the install-id on first
-//! launch (e.g. web-server and CLI started simultaneously by a
-//! supervisor on a fresh box). The persistence path is built so every
-//! caller converges on a single UUID:
+//! The corrupt branch is deliberately a no-op on disk. An earlier draft
+//! tried to auto-recover by unlinking and republishing in a retry loop;
+//! review found a multi-process race where one repairer could
+//! `remove_file` after another repairer had already published, leaving
+//! a third caller holding a UUID that the file no longer contained.
+//! Recovery without a cross-process lock cannot guarantee convergence,
+//! and a botched recovery would split a real install's reported
+//! identity. The trade we make instead: a corrupt file under-counts
+//! that install (every run gets a fresh per-run ID) until the user
+//! resets it with `rm <path>` — which is the documented reset
+//! procedure in `docs/telemetry.md` anyway. Identity is never split.
 //!
-//! 1. Each writer creates a uniquely-named tmp file containing its
-//!    candidate UUID, then `sync_all`s it.
-//! 2. The publication step is [`std::fs::hard_link`], which atomically
-//!    attaches the tmp file's inode at the final path **or fails with
-//!    `AlreadyExists`** if another writer got there first. Unlike
-//!    `O_CREAT|O_EXCL` followed by `write`, a racing reader can never
-//!    observe an empty file mid-write.
-//! 3. The losers re-read the final path and return whatever the winner
-//!    wrote.
-//! 4. Tmp files are always cleaned up.
+//! ## Concurrency for the missing case
 //!
-//! Corrupt-file recovery walks the same loop a bounded number of
-//! times: read → if invalid, unlink and retry, up to
-//! [`MAX_RECOVERY_ATTEMPTS`]. Concurrent recoverers each use a
-//! distinct tmp filename and converge through the hard-link gate.
+//! Each writer first creates a uniquely-named tmp file containing its
+//! candidate UUID and `sync_all`s it. The publication step is
+//! [`std::fs::hard_link`], which atomically attaches the tmp file's
+//! inode at the final path **or fails with `AlreadyExists`** if
+//! another writer got there first. Unlike `O_CREAT|O_EXCL` followed by
+//! `write`, a racing reader can never observe an empty file mid-write.
 
 use std::fs;
 use std::io;
@@ -38,9 +41,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-const MAX_RECOVERY_ATTEMPTS: usize = 8;
-
-/// Errors that may arise while resolving or persisting the install ID.
+/// Errors that may arise while resolving the install ID.
 #[derive(Debug, thiserror::Error)]
 pub enum InstallIdError {
     #[error("install-id i/o: {0}")]
@@ -49,19 +50,16 @@ pub enum InstallIdError {
     BadParent(PathBuf),
     #[error("install-id path has no file name: {0}")]
     BadFileName(PathBuf),
-    #[error(
-        "install-id at {path} could not be created or repaired after {MAX_RECOVERY_ATTEMPTS} attempts"
-    )]
-    Unrecoverable { path: PathBuf },
 }
 
-/// Read the install UUID at `path`, creating it if missing or
-/// regenerating it if the file's contents are not a valid UUID.
+/// Read the install UUID at `path`, creating it if missing. Returns a
+/// fresh per-run UUID **without** modifying the file when the file
+/// exists but cannot be parsed.
 ///
-/// Concurrency-safe: many processes (or threads) calling
-/// `read_or_create` against the same path always converge on the same
-/// UUID, and the on-disk file always contains a parseable UUID at the
-/// end of any caller's return.
+/// Concurrency-safe for the missing-file case: many processes calling
+/// `read_or_create` against the same path converge on the same UUID
+/// via [`std::fs::hard_link`]. See the module-level docs for why the
+/// corrupt-file case is deliberately non-converging.
 pub fn read_or_create(path: &Path) -> Result<Uuid, InstallIdError> {
     let parent = path
         .parent()
@@ -72,59 +70,63 @@ pub fn read_or_create(path: &Path) -> Result<Uuid, InstallIdError> {
         .ok_or_else(|| InstallIdError::BadFileName(path.to_path_buf()))?;
     fs::create_dir_all(parent)?;
 
-    for _ in 0..MAX_RECOVERY_ATTEMPTS {
-        if let Some(uuid) = read_existing(path)? {
-            return Ok(uuid);
+    // A single read decides the path forward. Branching on the result
+    // rather than retrying keeps the corrupt-file path off any code
+    // that could race with a peer publisher.
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            return Ok(parse_or_per_run(&contents, path));
         }
-        // Either missing or corrupt. Write a fully-formed tmp file
-        // first; then publish via hard_link, which fails atomically if
-        // another writer got there before us.
-        let candidate = Uuid::new_v4();
-        let tmp = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
-        if let Err(e) = write_private(&tmp, candidate.to_string().as_bytes()) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e.into());
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Fall through to publication.
         }
-        let link_result = fs::hard_link(&tmp, path);
-        // The tmp file is no longer needed in either branch: on success
-        // its inode lives on at `path` via the hard link, and on
-        // failure it's an orphan to clean up. Errors from removal are
-        // ignored — the file is small and the OS will reap it on
-        // next boot at worst.
-        let _ = fs::remove_file(&tmp);
-
-        match link_result {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // Another writer beat us. Re-read; if it's a valid
-                // UUID return it. If it's still corrupt (possible if
-                // the file was already corrupt before we started, and
-                // no one has cleaned it up yet) unlink and loop. The
-                // unlink may race with another recoverer's unlink —
-                // both ignoring the error is fine because the next
-                // iteration's read_existing will either see None and
-                // try to create, or see a valid UUID someone wrote
-                // since.
-                match read_existing(path)? {
-                    Some(uuid) => return Ok(uuid),
-                    None => {
-                        let _ = fs::remove_file(path);
-                    }
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
+        Err(e) => return Err(e.into()),
     }
-    Err(InstallIdError::Unrecoverable {
-        path: path.to_path_buf(),
-    })
+
+    // First-launch publication. Write a fully-formed tmp file, then
+    // attach it at `path` with `hard_link`. The atomic-or-fail
+    // semantic of `hard_link` is exactly what we need: at most one
+    // caller wins; losers re-read what the winner wrote.
+    let candidate = Uuid::new_v4();
+    let tmp = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    if let Err(e) = write_private(&tmp, candidate.to_string().as_bytes()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    let link_result = fs::hard_link(&tmp, path);
+    // The tmp file is no longer needed in either branch: on success it
+    // lives on at `path` via the hard link; on failure it's an orphan.
+    // Either way we delete its directory entry now.
+    let _ = fs::remove_file(&tmp);
+
+    match link_result {
+        Ok(()) => Ok(candidate),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Lost the publication race. Read whatever the winner
+            // wrote; if even that is unparseable (the winner could
+            // have lost their own race to a third party who somehow
+            // wrote garbage) fall back to per-run.
+            match fs::read_to_string(path) {
+                Ok(contents) => Ok(parse_or_per_run(&contents, path)),
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
-fn read_existing(path: &Path) -> Result<Option<Uuid>, InstallIdError> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(Uuid::parse_str(contents.trim()).ok()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+fn parse_or_per_run(contents: &str, path: &Path) -> Uuid {
+    match Uuid::parse_str(contents.trim()) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            tracing::debug!(
+                path = %path.display(),
+                "install-id file is corrupt; using a per-run UUID. \
+                 Reset with `rm {}` per docs/telemetry.md.",
+                path.display()
+            );
+            Uuid::new_v4()
+        }
     }
 }
 
@@ -180,19 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_is_regenerated() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("install-id");
-        fs::write(&path, "not a uuid").unwrap();
-
-        let uuid = read_or_create(&path).expect("regenerate over corrupt");
-        let on_disk = fs::read_to_string(&path).unwrap();
-        let on_disk_uuid = Uuid::parse_str(on_disk.trim()).unwrap();
-        assert_eq!(uuid, on_disk_uuid);
-        assert_ne!(on_disk, "not a uuid");
-    }
-
-    #[test]
     fn trailing_whitespace_is_tolerated() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("install-id");
@@ -233,10 +222,10 @@ mod tests {
 
     /// Many threads racing to create the install-id at a single path
     /// must all return the same UUID, and that UUID must match the
-    /// on-disk file. This catches the historical race where two writers
-    /// using a shared `.install-id.tmp` path could stomp each other,
-    /// and the subsequent O_EXCL-then-write race where a racing reader
-    /// could see an empty file and unlink the winner's in-flight write.
+    /// on-disk file. This covers the historical race where two writers
+    /// using a shared tmp path could stomp each other, and the
+    /// follow-on O_EXCL race where a racing reader could observe an
+    /// empty file mid-write.
     #[test]
     fn concurrent_first_launch_converges_on_one_uuid() {
         let dir = tempdir().unwrap();
@@ -261,13 +250,38 @@ mod tests {
         );
     }
 
-    /// Many threads racing to repair a corrupt file must all converge
-    /// on the same UUID, and no stale tmp files may be left behind.
+    /// Corrupt-file behaviour is **non-converging by design**. Each
+    /// caller returns a fresh per-run UUID; the file is left untouched.
+    /// This is the trade we make to prevent a multi-process recovery
+    /// race from splitting a real install's reported identity. See the
+    /// module-level docs.
     #[test]
-    fn concurrent_corrupt_recovery_converges() {
+    fn corrupt_file_returns_per_run_uuid_without_touching_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("install-id");
+        fs::write(&path, "definitely-not-a-uuid").unwrap();
+
+        let uuid_a = read_or_create(&path).expect("call a");
+        let uuid_b = read_or_create(&path).expect("call b");
+
+        // On-disk content is untouched.
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "definitely-not-a-uuid");
+        // Each call returned a fresh per-run UUID.
+        assert_ne!(uuid_a, uuid_b);
+        assert_eq!(uuid_a.get_version_num(), 4);
+        assert_eq!(uuid_b.get_version_num(), 4);
+    }
+
+    /// Concurrent calls against a corrupt file must not modify the file
+    /// (no race-with-publish that could let a later loop produce a
+    /// second UUID). No `.tmp` files are left behind.
+    #[test]
+    fn concurrent_corrupt_calls_do_not_modify_file() {
         let dir = tempdir().unwrap();
         let path = Arc::new(dir.path().join("install-id"));
-        fs::write(&*path, "totally garbage").unwrap();
+        let original = "totally garbage";
+        fs::write(&*path, original).unwrap();
 
         let mut handles = Vec::with_capacity(16);
         for _ in 0..16 {
@@ -277,13 +291,14 @@ mod tests {
             }));
         }
         let results: Vec<Uuid> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        let on_disk_uuid = Uuid::parse_str(fs::read_to_string(&*path).unwrap().trim()).unwrap();
-        for u in results {
-            assert_eq!(
-                u, on_disk_uuid,
-                "every caller must converge on the on-disk UUID"
-            );
+
+        // File untouched.
+        assert_eq!(fs::read_to_string(&*path).unwrap(), original);
+        // Every caller got a valid v4 UUID, even if they differ.
+        for u in &results {
+            assert_eq!(u.get_version_num(), 4);
         }
+        // No tmp orphans.
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -291,7 +306,7 @@ mod tests {
             .collect();
         assert!(
             leftovers.is_empty(),
-            "no .tmp files should remain after recovery"
+            "no .tmp files should remain after concurrent corrupt-file reads"
         );
     }
 }
