@@ -238,7 +238,8 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         let log = InspectionLog::open(path.clone(), DEFAULT_ROTATION_LINES).unwrap();
         for i in 0..5 {
-            log.append(&sample(&format!("evt_{i}"), true, None)).unwrap();
+            log.append(&sample(&format!("evt_{i}"), true, None))
+                .unwrap();
         }
         let contents = fs::read_to_string(&path).unwrap();
         assert_eq!(contents.lines().count(), 5);
@@ -281,7 +282,8 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         let log = InspectionLog::open(path.clone(), 3).unwrap();
         for i in 0..7 {
-            log.append(&sample(&format!("evt_{i}"), true, None)).unwrap();
+            log.append(&sample(&format!("evt_{i}"), true, None))
+                .unwrap();
         }
         // After the 4th write we rotated once, after the 7th we rotated
         // again. So the .1 file contains entries from the most recent
@@ -299,7 +301,8 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         let log = InspectionLog::open(path.clone(), 2).unwrap();
         for i in 0..6 {
-            log.append(&sample(&format!("evt_{i}"), true, None)).unwrap();
+            log.append(&sample(&format!("evt_{i}"), true, None))
+                .unwrap();
         }
         // Three rotations happened; we still have only one .1 backup.
         assert!(rotated_path(&path).exists());
@@ -314,7 +317,8 @@ mod tests {
         {
             let log = InspectionLog::open(path.clone(), 5).unwrap();
             for i in 0..3 {
-                log.append(&sample(&format!("seed_{i}"), true, None)).unwrap();
+                log.append(&sample(&format!("seed_{i}"), true, None))
+                    .unwrap();
             }
         }
         // Reopen with budget 5 — only 2 more writes allowed before rotation.
@@ -441,10 +445,7 @@ mod tests {
             disable_reason_label(&DisableReason::Ci("GITHUB_ACTIONS")),
             "Ci(GITHUB_ACTIONS)"
         );
-        assert_eq!(
-            disable_reason_label(&DisableReason::CargoTest),
-            "CargoTest"
-        );
+        assert_eq!(disable_reason_label(&DisableReason::CargoTest), "CargoTest");
         assert_eq!(
             disable_reason_label(&DisableReason::ConfigDisabled),
             "ConfigDisabled"

@@ -252,7 +252,10 @@ async fn run() -> std::io::Result<()> {
         telemetry_memory_dir.as_deref(),
         telemetry_file_cfg,
     );
-    info!("{}", startup_log_line(telemetry_config.disable_reason.as_ref()));
+    info!(
+        "{}",
+        startup_log_line(telemetry_config.disable_reason.as_ref())
+    );
     let telemetry = aura_telemetry::init(telemetry_config);
     telemetry.capture(ServerStarted {
         default_agent_set: args.default_agent.is_some(),
@@ -397,9 +400,7 @@ async fn run() -> std::io::Result<()> {
     // 2-second budget mirrors the spec's "telemetry must never block
     // core SRE behavior" rule — if the network sink is hanging we move
     // on.
-    telemetry
-        .shutdown(std::time::Duration::from_secs(2))
-        .await;
+    telemetry.shutdown(std::time::Duration::from_secs(2)).await;
 
     serve_result
 }

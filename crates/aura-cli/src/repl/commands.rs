@@ -87,7 +87,10 @@ pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryH
     let body = match sub {
         "status" => format_telemetry_status(telemetry),
         "recent" => {
-            let n = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+            let n = parts
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(20);
             format_telemetry_recent(telemetry, n)
         }
         "disable" => format_telemetry_disable_result(
@@ -179,6 +182,7 @@ pub(crate) fn format_telemetry_recent(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod telemetry_command_tests {
     use super::*;
     use aura_telemetry::events::ServerStarted;
@@ -235,7 +239,10 @@ mod telemetry_command_tests {
     async fn status_includes_endpoint_install_id_path_and_log_path() {
         let h = build(None);
         let out = format_telemetry_status(&h.handle);
-        assert!(out.contains("endpoint: http://127.0.0.1:1/no-such-host"), "got: {out}");
+        assert!(
+            out.contains("endpoint: http://127.0.0.1:1/no-such-host"),
+            "got: {out}"
+        );
         assert!(
             out.contains("install-id path: ") && out.contains("install-id"),
             "expected install-id path line, got: {out}"

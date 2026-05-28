@@ -255,10 +255,7 @@ mod tests {
             DeploymentMethod::parse(Some("Kubernetes")),
             DeploymentMethod::K8s
         );
-        assert_eq!(
-            DeploymentMethod::parse(Some("k8s")),
-            DeploymentMethod::K8s
-        );
+        assert_eq!(DeploymentMethod::parse(Some("k8s")), DeploymentMethod::K8s);
         assert_eq!(
             DeploymentMethod::parse(Some("standalone-cli")),
             DeploymentMethod::StandaloneCli

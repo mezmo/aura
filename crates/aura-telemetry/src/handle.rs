@@ -244,8 +244,7 @@ impl TelemetryHandle {
             return;
         };
         let now = Utc::now();
-        let envelope_props =
-            build_event_json(&self.inner.envelope, payload, &now.to_rfc3339());
+        let envelope_props = build_event_json(&self.inner.envelope, payload, &now.to_rfc3339());
         let inspected = InspectedEvent {
             ts: now,
             event: payload.name.to_string(),
@@ -320,7 +319,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
         let client = config
             .http_client
             .clone()
-            .unwrap_or_else(|| reqwest::Client::new());
+            .unwrap_or_default();
         let endpoint = config.endpoint.clone();
         let api_key = config.api_key.clone();
         let envelope_for_task = envelope.clone();
@@ -448,10 +447,7 @@ async fn run_background(mut ctx: BackgroundCtx) {
 fn build_pending(envelope: &Envelope, payload: EventPayload) -> Pending {
     let ts = Utc::now();
     let wire = build_event_json(envelope, &payload, &ts.to_rfc3339());
-    let properties = wire
-        .get("properties")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let properties = wire.get("properties").cloned().unwrap_or(Value::Null);
     let inspected = InspectedEvent {
         ts,
         event: payload.name.to_string(),
@@ -482,7 +478,10 @@ async fn flush(ctx: &BackgroundCtx, buf: &mut Vec<Pending>) {
         Ok(()) => (true, None),
         Err(e) => (
             false,
-            Some(format!("PostFailed({})", crate::sink::classify_post_error(e))),
+            Some(format!(
+                "PostFailed({})",
+                crate::sink::classify_post_error(e)
+            )),
         ),
     };
     if let Err(e) = &result {

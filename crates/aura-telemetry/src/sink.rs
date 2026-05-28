@@ -169,14 +169,24 @@ mod tests {
 
     #[test]
     fn batch_url_appends_slash() {
-        assert_eq!(batch_url("https://us.i.posthog.com"), "https://us.i.posthog.com/batch/");
-        assert_eq!(batch_url("https://us.i.posthog.com/"), "https://us.i.posthog.com/batch/");
+        assert_eq!(
+            batch_url("https://us.i.posthog.com"),
+            "https://us.i.posthog.com/batch/"
+        );
+        assert_eq!(
+            batch_url("https://us.i.posthog.com/"),
+            "https://us.i.posthog.com/batch/"
+        );
     }
 
     #[test]
     fn envelope_carries_required_fields() {
         let env = fake_envelope();
-        let evt = build_event_json(&env, &payload("server_started", &[]), "2026-05-28T00:00:00Z");
+        let evt = build_event_json(
+            &env,
+            &payload("server_started", &[]),
+            "2026-05-28T00:00:00Z",
+        );
         let props = &evt["properties"];
         assert_eq!(props["aura_version"], "9.9.9-test");
         assert_eq!(props["aura_source"], "web-server");

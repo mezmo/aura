@@ -21,9 +21,7 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-async fn capture_one_and_get_body(
-    disable: bool,
-) -> (Vec<Request>, PathBuf, tempfile::TempDir) {
+async fn capture_one_and_get_body(disable: bool) -> (Vec<Request>, PathBuf, tempfile::TempDir) {
     let server = MockServer::start().await;
     let captured = Mock::given(method("POST"))
         .and(path("/batch/"))
@@ -103,9 +101,22 @@ async fn server_started_payload_shape_is_correct() {
     // Strictly NO host identifiers in the wire payload — fingerprinty
     // values are forbidden by the spec.
     for forbidden in [
-        "host", "hostname", "ip", "mac", "ipv4", "ipv6", "username", "user",
-        "cwd", "path", "arch", "kernel", "distro", "container",
-        "k8s_namespace", "namespace",
+        "host",
+        "hostname",
+        "ip",
+        "mac",
+        "ipv4",
+        "ipv6",
+        "username",
+        "user",
+        "cwd",
+        "path",
+        "arch",
+        "kernel",
+        "distro",
+        "container",
+        "k8s_namespace",
+        "namespace",
     ] {
         assert!(
             props.get(forbidden).is_none(),
@@ -117,7 +128,10 @@ async fn server_started_payload_shape_is_correct() {
 #[tokio::test]
 async fn disabled_mode_writes_to_inspection_log_and_sends_nothing() {
     let (requests, log_path, _dir) = capture_one_and_get_body(true).await;
-    assert!(requests.is_empty(), "no batches should be sent when disabled");
+    assert!(
+        requests.is_empty(),
+        "no batches should be sent when disabled"
+    );
     let contents = std::fs::read_to_string(&log_path).expect("inspection log exists");
     let lines: Vec<&str> = contents.lines().collect();
     // First line is the synthetic telemetry_opt_out, second is the
@@ -209,11 +223,17 @@ async fn slow_endpoint_does_not_swallow_inspection_log_row() {
 
     let contents = std::fs::read_to_string(&log_path).expect("inspection log exists");
     let lines: Vec<&str> = contents.lines().collect();
-    assert_eq!(lines.len(), 1, "expected the in-flight event to be recorded");
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected the in-flight event to be recorded"
+    );
     let evt: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(evt["event"], "server_started");
     assert_eq!(evt["sent"], false);
-    let reason = evt["not_sent_reason"].as_str().expect("not_sent_reason set");
+    let reason = evt["not_sent_reason"]
+        .as_str()
+        .expect("not_sent_reason set");
     assert!(
         reason.contains("PostFailed(timeout)"),
         "expected PostFailed(timeout) for a request that exceeded post_timeout, got {reason:?}"

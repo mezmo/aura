@@ -147,15 +147,20 @@ pub fn build_config_with_env(
     let endpoint = env
         .var("AURA_TELEMETRY_ENDPOINT")
         .filter(|s| !s.is_empty())
-        .or_else(|| file.and_then(|f| f.endpoint.clone()).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            file.and_then(|f| f.endpoint.clone())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
     let api_key = env
         .var("AURA_TELEMETRY_API_KEY")
         .filter(|s| !s.is_empty())
-        .or_else(|| file.and_then(|f| f.api_key.clone()).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            file.and_then(|f| f.api_key.clone())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| DEFAULT_API_KEY.to_string());
-    let deployment_method =
-        DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
+    let deployment_method = DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
 
     // Layer the disable decision: env > auto-disable > file. The file
     // case is the lowest-precedence kill switch by design (a user with
@@ -191,13 +196,8 @@ pub fn build_config_with_env(
 
     let inspection_log_path = resolve_inspection_log_path(source, memory_dir, env);
 
-    let mut cfg = TelemetryConfig::default_for(
-        source,
-        install_id,
-        endpoint,
-        api_key,
-        inspection_log_path,
-    );
+    let mut cfg =
+        TelemetryConfig::default_for(source, install_id, endpoint, api_key, inspection_log_path);
     cfg.install_id_path = Some(install_id_path);
     cfg.deployment_method = deployment_method;
     cfg.os_family = OsFamily::current();
@@ -378,8 +378,7 @@ mod tests {
 
     #[test]
     fn env_endpoint_outranks_file_endpoint() {
-        let env = MockEnv::default()
-            .set("AURA_TELEMETRY_ENDPOINT", "https://env-wins.example/");
+        let env = MockEnv::default().set("AURA_TELEMETRY_ENDPOINT", "https://env-wins.example/");
         let dir = tempfile::tempdir().unwrap();
         let file = FileTelemetryConfig {
             endpoint: Some("https://file-loses.example/".into()),
@@ -471,7 +470,10 @@ mod tests {
         // The file is NOT created; the path is still surfaced for
         // /telemetry status.
         let expected_path = fake_home.path().join(".aura").join("install-id");
-        assert_eq!(cfg.install_id_path.as_deref(), Some(expected_path.as_path()));
+        assert_eq!(
+            cfg.install_id_path.as_deref(),
+            Some(expected_path.as_path())
+        );
         assert!(
             !expected_path.exists(),
             "disabled run must not create the install-id file"

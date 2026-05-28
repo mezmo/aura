@@ -406,18 +406,19 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
                 .map(|(i, _)| i)
                 .unwrap_or(lines.len());
 
-            let mut found_idx: Option<usize> = None;
-            for i in (start + 1)..end {
-                let trimmed = lines[i].trim_start();
-                let no_comment = trimmed.split('#').next().unwrap_or("").trim();
-                if let Some(rest) = no_comment.strip_prefix(key) {
-                    let rest = rest.trim_start();
-                    if rest.starts_with('=') {
-                        found_idx = Some(i);
-                        break;
+            let found_idx = lines[(start + 1)..end]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, line)| {
+                    let trimmed = line.trim_start();
+                    let no_comment = trimmed.split('#').next().unwrap_or("").trim();
+                    let rest = no_comment.strip_prefix(key)?;
+                    if rest.trim_start().starts_with('=') {
+                        Some(start + 1 + offset)
+                    } else {
+                        None
                     }
-                }
-            }
+                });
 
             if let Some(idx) = found_idx {
                 let original = &lines[idx];
