@@ -79,18 +79,28 @@ pub fn build_batch(api_key: &str, events: &[Value]) -> Value {
 
 /// POST a batch. Returns `Err` only so the caller can `tracing::debug!`
 /// the result — never propagated upstream.
+///
+/// `timeout` is the per-request budget. The default in
+/// `TelemetryConfig::default_for` is intentionally **shorter** than the
+/// 2s shutdown budget callers use in production, so the background
+/// task always reaches its post-flush inspection-log writes before
+/// shutdown cancels it. Callers on slow networks who would rather wait
+/// longer can raise it via `TelemetryConfig::post_timeout` — at the
+/// cost of more events surfacing as `PostFailed(...)` in the local
+/// log on shutdown.
 pub async fn post_batch(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: &str,
     events: &[Value],
+    timeout: Duration,
 ) -> reqwest::Result<()> {
     let url = batch_url(endpoint);
     let body = build_batch(api_key, events);
     let resp = client
         .post(&url)
         .json(&body)
-        .timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .send()
         .await?;
     // Drop the body explicitly; we don't need it but want to release

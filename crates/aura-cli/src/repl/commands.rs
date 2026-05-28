@@ -212,6 +212,7 @@ mod telemetry_command_tests {
             channel_capacity: 16,
             batch_size: 8,
             flush_interval: Duration::from_secs(60),
+            post_timeout: Duration::from_millis(500),
             http_client: None,
         };
         TestHandle {

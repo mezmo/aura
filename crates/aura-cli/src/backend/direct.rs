@@ -440,6 +440,7 @@ mod tests {
             channel_capacity: 4,
             batch_size: 1,
             flush_interval: std::time::Duration::from_secs(60),
+            post_timeout: std::time::Duration::from_millis(500),
             http_client: None,
         };
         let telemetry = aura_telemetry::init(telemetry_cfg);

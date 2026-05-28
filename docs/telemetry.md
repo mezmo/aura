@@ -173,7 +173,14 @@ names *why* the event was not delivered — one of:
   event was dropped at the channel boundary.
 - `PostFailed(<category>)` when the POST returned an error.
   Categories: `timeout`, `network`, `http_4xx`, `http_5xx`,
-  `http_other`, `other`.
+  `http_other`, `other`. The per-request timeout is
+  `TelemetryConfig::post_timeout` (default **1.5 s**) and is bounded
+  intentionally below the **2 s** shutdown drain budget the CLI and
+  server use, so a slow endpoint cannot let an in-flight POST outlive
+  shutdown and skip its inspection-log row. Tune `post_timeout`
+  higher only if you also raise the shutdown budget; the relationship
+  `post_timeout < shutdown_budget` is the contract that makes the
+  "row for every captured event" guarantee hold.
 
 The line is written for every captured event — including dropped and
 failed-to-send ones — so you can verify both that the kill switch

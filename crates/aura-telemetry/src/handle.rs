@@ -59,6 +59,15 @@ pub struct TelemetryConfig {
     pub batch_size: usize,
     /// Flush timer (max time an event sits unsent).
     pub flush_interval: Duration,
+    /// Per-request POST budget. Must be **shorter than the shutdown
+    /// budget** the caller passes to [`TelemetryHandle::shutdown`],
+    /// otherwise an in-flight POST during shutdown will outlive the
+    /// budget and the background task will be cancelled before
+    /// writing its post-flush inspection-log rows — leaving the
+    /// captured event neither delivered nor recorded. Default 1.5s
+    /// pairs with the 2s shutdown budget aura-cli and aura-web-server
+    /// use in production.
+    pub post_timeout: Duration,
     /// Optional pre-built reqwest client; tests inject one with a low
     /// connect timeout.
     pub http_client: Option<reqwest::Client>,
@@ -87,6 +96,7 @@ impl TelemetryConfig {
             channel_capacity: 256,
             batch_size: 25,
             flush_interval: Duration::from_secs(5),
+            post_timeout: Duration::from_millis(1500),
             http_client: None,
         }
     }
@@ -317,6 +327,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
         let batch_size = config.batch_size;
         let flush_interval = config.flush_interval;
         let inspection_for_task = inspection.clone();
+        let post_timeout = config.post_timeout;
         let handle = tokio::spawn(run_background(BackgroundCtx {
             rx,
             client,
@@ -325,6 +336,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
             envelope: envelope_for_task,
             batch_size,
             flush_interval,
+            post_timeout,
             inspection: inspection_for_task,
         }));
         (Some(tx), Some(handle))
@@ -382,6 +394,7 @@ struct BackgroundCtx {
     envelope: Envelope,
     batch_size: usize,
     flush_interval: Duration,
+    post_timeout: Duration,
     /// Inspection-log handle for post-flush writes. `None` when the
     /// user disabled the log via `AURA_TELEMETRY_LOG_EVENTS=0`.
     inspection: Option<InspectionLog>,
@@ -457,7 +470,14 @@ async fn flush(ctx: &BackgroundCtx, buf: &mut Vec<Pending>) {
         return;
     }
     let wires: Vec<Value> = buf.iter().map(|p| p.wire.clone()).collect();
-    let result = post_batch(&ctx.client, &ctx.endpoint, &ctx.api_key, &wires).await;
+    let result = post_batch(
+        &ctx.client,
+        &ctx.endpoint,
+        &ctx.api_key,
+        &wires,
+        ctx.post_timeout,
+    )
+    .await;
     let (sent, reason) = match &result {
         Ok(()) => (true, None),
         Err(e) => (

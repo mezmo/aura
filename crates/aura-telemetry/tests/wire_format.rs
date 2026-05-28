@@ -55,6 +55,7 @@ async fn capture_one_and_get_body(
         channel_capacity: 16,
         batch_size: 1,
         flush_interval: Duration::from_millis(50),
+        post_timeout: Duration::from_millis(500),
         http_client: None,
     };
     let handle = init(cfg);
@@ -150,6 +151,75 @@ async fn active_mode_inspection_log_marks_sent_true() {
     assert!(evt["not_sent_reason"].is_null());
 }
 
+/// Regression: a slow endpoint must not let an in-flight POST outlive
+/// the shutdown budget. If it did, the bg task would be cancelled
+/// before writing its post-flush inspection-log rows, leaving the
+/// captured event neither delivered nor recorded — a violation of the
+/// "line is written for every captured event" contract.
+///
+/// We simulate the bad case with a wiremock that delays its 200
+/// response for longer than the shutdown budget; `post_timeout` is
+/// configured shorter than the budget so the bg task returns Err
+/// from `post_batch`, writes a `PostFailed(timeout)` row, and exits
+/// before the outer shutdown timeout fires.
+#[tokio::test]
+async fn slow_endpoint_does_not_swallow_inspection_log_row() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/batch/"))
+        // 5s delay — much longer than the shutdown budget below.
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("events.jsonl");
+    let cfg = TelemetryConfig {
+        endpoint: server.uri(),
+        api_key: "phc_test_key".into(),
+        install_id: Uuid::new_v4(),
+        install_id_path: None,
+        session_id: Uuid::new_v4(),
+        source: Source::WebServer,
+        os_family: OsFamily::Linux,
+        deployment_method: DeploymentMethod::Local,
+        aura_version: "9.9.9-test",
+        inspection_log_path: Some(log_path.clone()),
+        disable_reason: None,
+        channel_capacity: 16,
+        batch_size: 1,
+        flush_interval: Duration::from_millis(50),
+        // Shorter than the 2s shutdown budget below. The bg task gets
+        // ~300ms to give up on the POST and write the row before
+        // shutdown's timeout fires.
+        post_timeout: Duration::from_millis(300),
+        http_client: None,
+    };
+    let handle = init(cfg);
+    handle.capture(ServerStarted {
+        default_agent_set: true,
+    });
+    // Shutdown budget intentionally larger than post_timeout — the
+    // contract is "post_timeout < shutdown_budget", and this is the
+    // production pairing.
+    handle.shutdown(Duration::from_secs(2)).await;
+
+    let contents = std::fs::read_to_string(&log_path).expect("inspection log exists");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 1, "expected the in-flight event to be recorded");
+    let evt: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(evt["event"], "server_started");
+    assert_eq!(evt["sent"], false);
+    let reason = evt["not_sent_reason"].as_str().expect("not_sent_reason set");
+    assert!(
+        reason.contains("PostFailed(timeout)"),
+        "expected PostFailed(timeout) for a request that exceeded post_timeout, got {reason:?}"
+    );
+}
+
 /// Regression: the inspection log used to write `sent: true` as soon
 /// as the event was enqueued, which lied to the user when the POST
 /// later failed. The background-task now finalises the row only
@@ -184,6 +254,7 @@ async fn post_failure_marks_inspection_log_not_sent() {
         channel_capacity: 16,
         batch_size: 1,
         flush_interval: Duration::from_millis(50),
+        post_timeout: Duration::from_millis(500),
         http_client: None,
     };
     let handle = init(cfg);
@@ -252,6 +323,7 @@ async fn channel_full_drops_record_to_inspection_log() {
         // High flush interval — flush is gated by batch_size=1 hitting
         // and the first event is held in-flight by the wiremock delay.
         flush_interval: Duration::from_secs(30),
+        post_timeout: Duration::from_secs(30),
         http_client: None,
     };
     let handle = init(cfg);
