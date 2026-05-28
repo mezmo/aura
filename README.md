@@ -602,6 +602,7 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
 - [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
+- [docs/telemetry.md](docs/telemetry.md): opt-out anonymous product telemetry — kill switches (including `DO_NOT_TRACK`), full list of what is and isn't collected, install-ID handling, local inspection log, self-hosted sink, and the audit guide pointing at the source and test files that implement each guarantee.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 - [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
