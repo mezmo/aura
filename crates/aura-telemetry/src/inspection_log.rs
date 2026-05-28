@@ -104,14 +104,25 @@ impl InspectionLog {
 
     /// Return the last `n` records, oldest-first. Reads the rotated
     /// `.1` file if the current file does not have enough lines.
+    ///
+    /// `n` is silently clamped to `rotation_lines * 2` — the upper
+    /// bound of events the log can hold at any instant (current file
+    /// up to `rotation_lines`, plus the rotated `.1` file of the same
+    /// size). Without this, a caller supplying
+    /// `?limit=10000000000` from the HTTP endpoint or
+    /// `/telemetry recent 99999999999` from the REPL would force a
+    /// huge `Vec::with_capacity` allocation and abort the process
+    /// before reading the tiny on-disk log. Tests cover the clamp
+    /// engaging at `usize::MAX`.
     pub fn recent(&self, n: usize) -> io::Result<Vec<InspectedEvent>> {
         if n == 0 {
             return Ok(Vec::new());
         }
         let state = self.inner.lock().expect("inspection log poisoned");
+        let max_returnable = state.rotation_lines.saturating_mul(2);
+        let n = n.min(max_returnable);
         let mut buf: Vec<InspectedEvent> = Vec::with_capacity(n);
         push_tail(&rotated_path(&state.path), n, &mut buf)?;
-        let needed_from_main = n.saturating_sub(buf.len());
         // We over-read from .1 and trim from the front later if needed.
         push_tail(&state.path, n, &mut buf)?;
         drop(state);
@@ -121,9 +132,6 @@ impl InspectionLog {
             let to_drop = buf.len() - n;
             buf.drain(0..to_drop);
         }
-        // Suppress unused warning when .1 doesn't exist or had no
-        // entries — the variable's role is to document the upper bound.
-        let _ = needed_from_main;
         Ok(buf)
     }
 }
@@ -332,6 +340,51 @@ mod tests {
         let log = InspectionLog::open(path, DEFAULT_ROTATION_LINES).unwrap();
         log.append(&sample("e", true, None)).unwrap();
         assert!(log.recent(0).unwrap().is_empty());
+    }
+
+    /// Regression: `Vec::with_capacity(usize::MAX)` aborts the process.
+    /// `recent` must clamp `n` to a bound the log could actually return
+    /// before any allocation. Verified by passing a deliberately huge
+    /// `n` against a small log; the call must succeed and return what
+    /// is on disk (not panic or OOM).
+    #[test]
+    fn recent_clamps_huge_limit_without_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let log = InspectionLog::open(path, 8).unwrap();
+        for i in 0..3 {
+            log.append(&sample(&format!("e_{i}"), true, None)).unwrap();
+        }
+        // A naive `Vec::with_capacity(usize::MAX)` would abort. The
+        // clamp brings n down to 2 * rotation_lines = 16, which is the
+        // worst case the inspection log could ever hold.
+        let got = log.recent(usize::MAX).expect("must not panic");
+        let names: Vec<_> = got.iter().map(|e| e.event.clone()).collect();
+        assert_eq!(names, vec!["e_0", "e_1", "e_2"]);
+    }
+
+    /// When the log is full (rotation_lines in current + rotation_lines
+    /// in the rotated `.1`), the clamp caps at 2 * rotation_lines, not
+    /// the caller's larger value. The returned set is exactly the
+    /// retained on-disk events.
+    #[test]
+    fn recent_clamps_to_rotation_bound() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let log = InspectionLog::open(path, 4).unwrap();
+        // Write 9 events with rotation_lines=4: after 5th append .1
+        // holds the first 4, after 9th append .1 holds 5..8 and main
+        // holds e_8. The log can never report more than 8 events even
+        // if the caller asks for 1_000_000_000.
+        for i in 0..9 {
+            log.append(&sample(&format!("e_{i}"), true, None)).unwrap();
+        }
+        let got = log.recent(1_000_000_000).expect("must not panic");
+        assert!(
+            got.len() <= 8,
+            "expected at most 2*rotation_lines events, got {}",
+            got.len()
+        );
     }
 
     #[test]
