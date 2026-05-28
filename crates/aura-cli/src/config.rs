@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -362,17 +362,64 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
 /// header. If the section is missing, it is appended at end-of-file
 /// with a blank-line separator. Other sections, sibling keys, and
 /// comments are preserved.
-pub fn save_telemetry_enabled_to_global_cli_toml(enabled: bool) -> Result<()> {
-    let dir = global_aura_dir().ok_or_else(|| {
-        anyhow::anyhow!("could not determine ~/.aura/ (no home directory available)")
+pub fn save_telemetry_enabled_to_global_cli_toml(
+    enabled: bool,
+) -> std::result::Result<(), TelemetryDisableError> {
+    let dir = global_aura_dir().ok_or(TelemetryDisableError::NoHome)?;
+    fs::create_dir_all(&dir).map_err(|source| TelemetryDisableError::Write {
+        path: dir.clone(),
+        source,
     })?;
-    fs::create_dir_all(&dir)?;
     let path = dir.join(CLI_TOML_FILENAME);
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let updated = upsert_section_bool(&existing, "telemetry", "enabled", enabled);
-    let mut f = fs::File::create(&path)?;
-    f.write_all(updated.as_bytes())?;
+    fs::write(&path, updated).map_err(|source| TelemetryDisableError::Write { path, source })?;
     Ok(())
+}
+
+/// Failure modes of [`save_telemetry_enabled_to_global_cli_toml`].
+///
+/// A typed error rather than `anyhow` so the `/telemetry disable`
+/// renderer can describe *what* failed; the caller appends the env-var
+/// fallback advice (which is the same regardless of variant).
+/// `Display`/`Error` are hand-rolled because `thiserror` is only a
+/// dependency of the `standalone-cli` feature, and this path compiles
+/// in the default build too.
+#[derive(Debug)]
+pub enum TelemetryDisableError {
+    /// No home directory available, so `~/.aura/` can't be located.
+    NoHome,
+    /// Creating `~/.aura/` or writing `cli.toml` failed — typically a
+    /// read-only or sandboxed filesystem.
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for TelemetryDisableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoHome => {
+                write!(
+                    f,
+                    "could not determine ~/.aura/ (no home directory available)"
+                )
+            }
+            Self::Write { path, source } => {
+                write!(f, "could not write {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for TelemetryDisableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoHome => None,
+            Self::Write { source, .. } => Some(source),
+        }
+    }
 }
 
 /// Update or insert `key = <bool>` inside the `[section]` block in TOML

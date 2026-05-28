@@ -128,7 +128,9 @@ pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryH
     redraw_input_frame();
 }
 
-pub(crate) fn format_telemetry_disable_result(result: anyhow::Result<()>) -> String {
+pub(crate) fn format_telemetry_disable_result(
+    result: std::result::Result<(), crate::config::TelemetryDisableError>,
+) -> String {
     match result {
         Ok(()) => "telemetry: persisted [telemetry] enabled = false in ~/.aura/cli.toml. \
                    The change takes effect on the next launch. Re-enable by removing \
@@ -348,9 +350,15 @@ mod telemetry_command_tests {
 
     #[test]
     fn disable_failure_message_surfaces_error() {
-        let out = format_telemetry_disable_result(Err(anyhow::anyhow!("disk full")));
+        let err = crate::config::TelemetryDisableError::Write {
+            path: std::path::PathBuf::from("/ro/.aura/cli.toml"),
+            source: std::io::Error::new(std::io::ErrorKind::ReadOnlyFilesystem, "read-only"),
+        };
+        let out = format_telemetry_disable_result(Err(err));
         assert!(out.contains("could not persist"));
-        assert!(out.contains("disk full"));
+        // The typed error's Display surfaces the offending path + cause.
+        assert!(out.contains("/ro/.aura/cli.toml"));
+        assert!(out.contains("read-only"));
         // Read-only / sandboxed environments can't write cli.toml; the
         // message must point at the no-filesystem env-var fallback.
         assert!(out.contains("DO_NOT_TRACK") || out.contains("AURA_TELEMETRY_DISABLED"));
