@@ -61,6 +61,8 @@ services:
       TOOL_RESULT_MODE: open-web-ui
       # Enable custom aura events for testing
       AURA_CUSTOM_EVENTS: true
+      # Enable A2A endpoints
+      AURA_ENABLE_A2A: true
       # Logging
       RUST_LOG: warn
     env_file:

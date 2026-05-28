@@ -2,6 +2,22 @@
 
 This module wires the [A2A RC 1.0](https://github.com/a2a-protocol) protocol into the Aura web server via [`a2a-rs-server`](https://github.com/a2aproject/a2a-rs).
 
+## Enabling A2A
+
+A2A is **disabled by default**. Enable it with the `--enable-a2a` flag or `AURA_ENABLE_A2A` environment variable:
+
+| Flag | Env var | Default |
+|------|---------|---------|
+| `--enable-a2a` | `AURA_ENABLE_A2A` | `false` |
+
+```bash
+AURA_ENABLE_A2A=true cargo run --bin aura-web-server
+# or
+cargo run --bin aura-web-server -- --enable-a2a
+```
+
+When disabled, the A2A endpoints (`/a2a/v1/*`, `/.well-known/agent-card.json`) are not mounted and return 404.
+
 ## Endpoints
 
 | Method | Path | Transport | Description |

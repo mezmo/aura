@@ -178,6 +178,8 @@ SSE protocol details, event types, custom events, and client handling are docume
 
 #### A2A Protocol
 
+> **Disabled by default.** A2A endpoints are only activated when the server is started with `--enable-a2a` (or `AURA_ENABLE_A2A=true`). Omitting the flag means no A2A routes are registered and the agent card is not served.
+
 Aura exposes [A2A protocol](https://github.com/a2a-protocol) endpoints for agent-to-agent interoperability. This allows other A2A-compatible agents and clients to discover and interact with Aura agents using a standardized protocol.
 
 ```bash

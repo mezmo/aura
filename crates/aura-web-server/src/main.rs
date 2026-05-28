@@ -125,6 +125,12 @@ struct Args {
     /// tests reuse this same value to know where to reach the server.
     #[arg(long, env = "AURA_SERVER_URL")]
     server_url: Option<String>,
+
+    /// Enable the A2A (Agent-to-Agent) server interface.
+    /// Exposes JSON-RPC at /a2a/v1/rpc, REST at /a2a/v1/, and agent card at
+    /// /.well-known/agent-card.json. Disabled by default.
+    #[arg(long, env = "AURA_ENABLE_A2A", action = clap::ArgAction::SetTrue)]
+    enable_a2a: bool,
 }
 
 /// Resolve the externally-advertised base URL for the A2A agent card.
@@ -249,31 +255,6 @@ async fn run() -> std::io::Result<()> {
         args.host, args.port, shutdown_timeout_secs
     );
 
-    // A2A server:
-    // JSON-RPC at /a2a/v1/rpc
-    // REST at /a2a/v1/message:send, /a2a/v1/tasks/
-    // Agent card at /.well-known/agent-card.json
-
-    // forcing an in-memory store for now. TBD: a resilient location
-    let task_store = SharedTaskStore::new();
-    let executor = AuraAgentExecutor::new(app_state.clone(), task_store.clone());
-    let base_url = advertised_base_url(args.server_url.as_deref(), &args.host, args.port);
-    let agent_card = executor.build_agent_card(&base_url);
-    let a2a_handler = Arc::new(AuraRequestHandler::new(executor, task_store));
-    let card_producer = Arc::new(StaticAgentCard::new(agent_card));
-
-    let a2a_router = Router::new()
-        .nest(
-            "/a2a/v1/rpc",
-            a2a_server::jsonrpc::jsonrpc_router(a2a_handler.clone()),
-        )
-        .nest("/a2a/v1", a2a_server::rest::rest_router(a2a_handler))
-        .merge(a2a_server::agent_card::agent_card_router(card_producer))
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(120),
-        ));
-
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
@@ -283,8 +264,37 @@ async fn run() -> std::io::Result<()> {
             app_state.clone(),
             shutdown_guard,
         ))
-        .with_state(app_state)
-        .merge(a2a_router);
+        .with_state(app_state.clone());
+
+    // Build the A2A router only when explicitly enabled.
+    // A2A server:
+    // JSON-RPC at /a2a/v1/rpc
+    // REST at /a2a/v1/message:send, /a2a/v1/tasks/
+    // Agent card at /.well-known/agent-card.json
+    let app = if args.enable_a2a {
+        // forcing an in-memory store for now. TBD: a resilient location
+        let task_store = SharedTaskStore::new();
+        let executor = AuraAgentExecutor::new(app_state.clone(), task_store.clone());
+        let base_url = advertised_base_url(args.server_url.as_deref(), &args.host, args.port);
+        let agent_card = executor.build_agent_card(&base_url);
+        let a2a_handler = Arc::new(AuraRequestHandler::new(executor, task_store));
+        let card_producer = Arc::new(StaticAgentCard::new(agent_card));
+        let a2a_router = Router::new()
+            .nest(
+                "/a2a/v1/rpc",
+                a2a_server::jsonrpc::jsonrpc_router(a2a_handler.clone()),
+            )
+            .nest("/a2a/v1", a2a_server::rest::rest_router(a2a_handler))
+            .merge(a2a_server::agent_card::agent_card_router(card_producer))
+            .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                std::time::Duration::from_secs(120),
+            ));
+
+        app.merge(a2a_router)
+    } else {
+        app
+    };
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
