@@ -1989,4 +1989,83 @@ model = "gpt-4o"
         let built = crate::RigBuilder::new(loaded).get_agent_config();
         assert_eq!(built.effective_memory_dir(), None);
     }
+
+    // ---- Config::effective_memory_dir() ----
+    //
+    // The raw (pre-RigBuilder) view of the same fallback. Consumers
+    // that need the persistence root before building agents — the
+    // telemetry init in aura-web-server is the current example — read
+    // this method, so older configs that only set
+    // `[orchestration.artifacts].memory_dir` still land their
+    // telemetry inspection log under the same root they already use.
+
+    #[test]
+    fn config_effective_memory_dir_prefers_top_level() {
+        let config = r#"
+memory_dir = "/tmp/top"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), Some("/tmp/top"));
+    }
+
+    #[test]
+    fn config_effective_memory_dir_falls_back_to_legacy_artifacts() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), Some("/tmp/legacy"));
+    }
+
+    #[test]
+    fn config_effective_memory_dir_none_when_unset() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), None);
+    }
 }

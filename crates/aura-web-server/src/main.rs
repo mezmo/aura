@@ -234,9 +234,13 @@ async fn run() -> std::io::Result<()> {
     // reason, which mirrors the user-facing contract in
     // `docs/telemetry.md` and satisfies the spec's
     // "the recorded disable_reason must reflect user intent" rule.
+    // `effective_memory_dir()` honors the legacy
+    // `[orchestration.artifacts].memory_dir` fallback so older configs
+    // land their telemetry inspection log under the same root they
+    // already use for scratchpad / orchestration artifacts.
     let telemetry_memory_dir = configs
         .iter()
-        .find_map(|c| c.memory_dir.as_deref())
+        .find_map(|c| c.effective_memory_dir())
         .map(std::path::PathBuf::from);
     // First-config `[telemetry]` wins when multiple TOMLs are loaded.
     // Operators running a multi-agent fleet should colocate the

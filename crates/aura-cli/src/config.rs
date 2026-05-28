@@ -76,10 +76,25 @@ fn merge_telemetry(
         (Some(b), None) => Some(b),
         (None, Some(o)) => Some(o),
         (Some(b), Some(o)) => Some(aura_telemetry::FileTelemetryConfig {
-            enabled: o.enabled.or(b.enabled),
+            enabled: merge_enabled(b.enabled, o.enabled),
             endpoint: o.endpoint.or(b.endpoint),
             api_key: o.api_key.or(b.api_key),
         }),
+    }
+}
+
+/// Merge `enabled` across the global and project layers using a
+/// kill-switch AND. `Some(false)` from **either** layer wins — a user
+/// who ran `/telemetry disable` (which writes `enabled = false` into
+/// the global `cli.toml`) must not have that decision silently
+/// reversed by a project `.aura/cli.toml` that ships
+/// `enabled = true`. Only when no layer asserts `false` do the
+/// "project wins over global" semantics kick in.
+fn merge_enabled(global: Option<bool>, project: Option<bool>) -> Option<bool> {
+    if global == Some(false) || project == Some(false) {
+        Some(false)
+    } else {
+        project.or(global)
     }
 }
 
@@ -960,6 +975,75 @@ endpoint = \"https://x/\"
             out.contains("[telemetry]\nenabled = false\nendpoint = \"https://x/\""),
             "got: {out}"
         );
+    }
+
+    // ---- telemetry-enabled cross-layer merge ----
+
+    #[test]
+    fn merge_enabled_global_false_beats_project_true() {
+        // The bug we are fixing: a user runs `/telemetry disable`,
+        // which writes `[telemetry] enabled = false` into the global
+        // `cli.toml`. Then they `cd` into a project whose
+        // `.aura/cli.toml` ships `[telemetry] enabled = true`. The
+        // user's kill switch must NOT be reversed.
+        assert_eq!(merge_enabled(Some(false), Some(true)), Some(false));
+    }
+
+    #[test]
+    fn merge_enabled_project_false_beats_global_true() {
+        // The other direction: a project owner can also opt out for
+        // everyone working in that repo.
+        assert_eq!(merge_enabled(Some(true), Some(false)), Some(false));
+    }
+
+    #[test]
+    fn merge_enabled_either_layer_can_set_false_alone() {
+        assert_eq!(merge_enabled(Some(false), None), Some(false));
+        assert_eq!(merge_enabled(None, Some(false)), Some(false));
+    }
+
+    #[test]
+    fn merge_enabled_both_silent_remains_silent() {
+        assert_eq!(merge_enabled(None, None), None);
+    }
+
+    #[test]
+    fn merge_enabled_project_true_overrides_global_silence() {
+        assert_eq!(merge_enabled(None, Some(true)), Some(true));
+    }
+
+    #[test]
+    fn merge_enabled_global_true_propagates_when_project_silent() {
+        assert_eq!(merge_enabled(Some(true), None), Some(true));
+    }
+
+    #[test]
+    fn merge_enabled_both_true_remains_true() {
+        assert_eq!(merge_enabled(Some(true), Some(true)), Some(true));
+    }
+
+    #[test]
+    fn merge_telemetry_propagates_kill_switch_through_full_struct() {
+        // End-to-end: file_config layering preserves the AND-merge.
+        let global = aura_telemetry::FileTelemetryConfig {
+            enabled: Some(false),
+            endpoint: Some("https://global/".into()),
+            api_key: None,
+        };
+        let project = aura_telemetry::FileTelemetryConfig {
+            enabled: Some(true),
+            endpoint: Some("https://project/".into()),
+            api_key: Some("phc_project".into()),
+        };
+        let merged = merge_telemetry(Some(global), Some(project)).unwrap();
+        assert_eq!(
+            merged.enabled,
+            Some(false),
+            "global enabled=false must survive project enabled=true"
+        );
+        // Non-kill-switch fields still follow "project wins":
+        assert_eq!(merged.endpoint.as_deref(), Some("https://project/"));
+        assert_eq!(merged.api_key.as_deref(), Some("phc_project"));
     }
 
     #[test]
