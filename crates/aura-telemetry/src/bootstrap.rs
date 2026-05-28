@@ -46,9 +46,15 @@ pub const DEFAULT_API_KEY: &str = match option_env!("AURA_TELEMETRY_BUILD_API_KE
 ///    accounts without `$HOME`).
 /// 3. `.aura/install-id` relative to the current working directory as
 ///    a last resort.
-pub fn resolve_install_id_path(memory_dir: Option<&Path>) -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".aura").join("install-id");
+///
+/// `HOME` is read through the injected [`EnvProvider`] so unit tests
+/// can supply a `MockEnv` and keep their install-id inside a tempdir
+/// instead of writing to the developer's real `~/.aura/install-id`.
+pub fn resolve_install_id_path(memory_dir: Option<&Path>, env: &dyn EnvProvider) -> PathBuf {
+    if let Some(home) = env.var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".aura").join("install-id");
+        }
     }
     if let Some(dir) = memory_dir {
         return dir.join("install-id");
@@ -72,7 +78,7 @@ pub fn resolve_inspection_log_path(
             return None;
         }
     }
-    Some(default_inspection_log_path(source, memory_dir))
+    Some(default_inspection_log_path(source, memory_dir, env))
 }
 
 fn is_false_value(s: &str) -> bool {
@@ -80,7 +86,11 @@ fn is_false_value(s: &str) -> bool {
     matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
 }
 
-fn default_inspection_log_path(source: Source, memory_dir: Option<&Path>) -> PathBuf {
+fn default_inspection_log_path(
+    source: Source,
+    memory_dir: Option<&Path>,
+    env: &dyn EnvProvider,
+) -> PathBuf {
     match source {
         Source::WebServer => {
             // `{memory_dir}/telemetry/events.jsonl` if available;
@@ -91,11 +101,13 @@ fn default_inspection_log_path(source: Source, memory_dir: Option<&Path>) -> Pat
         }
         Source::Cli => {}
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".aura")
-            .join("telemetry")
-            .join("events.jsonl");
+    if let Some(home) = env.var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".aura")
+                .join("telemetry")
+                .join("events.jsonl");
+        }
     }
     PathBuf::from(".aura")
         .join("telemetry")
@@ -145,18 +157,6 @@ pub fn build_config_with_env(
     let deployment_method =
         DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
 
-    let install_id_path = resolve_install_id_path(memory_dir);
-    let install_id = match install_id::read_or_create(&install_id_path) {
-        Ok(uuid) => uuid,
-        Err(e) => {
-            tracing::debug!(error = %e, path = %install_id_path.display(),
-                "could not persist install-id; telemetry will use a one-off UUID");
-            Uuid::new_v4()
-        }
-    };
-
-    let inspection_log_path = resolve_inspection_log_path(source, memory_dir, env);
-
     // Layer the disable decision: env > auto-disable > file. The file
     // case is the lowest-precedence kill switch by design (a user with
     // DO_NOT_TRACK=1 in their shell should see DoNotTrack reflected,
@@ -167,6 +167,29 @@ pub fn build_config_with_env(
             disable_reason = Some(DisableReason::ConfigDisabled);
         }
     }
+
+    // Resolve the install-id path either way (so `/telemetry status`
+    // can show users where it WOULD live), but only `read_or_create`
+    // — i.e. actually touch the filesystem — when telemetry is
+    // active. A disabled run uses an ephemeral per-run UUID; nothing
+    // goes on the wire, the install-id file is never written, and
+    // tests / `cargo test` subprocesses cannot pollute the developer's
+    // real `~/.aura/install-id`.
+    let install_id_path = resolve_install_id_path(memory_dir, env);
+    let install_id = if disable_reason.is_some() {
+        Uuid::new_v4()
+    } else {
+        match install_id::read_or_create(&install_id_path) {
+            Ok(uuid) => uuid,
+            Err(e) => {
+                tracing::debug!(error = %e, path = %install_id_path.display(),
+                    "could not persist install-id; telemetry will use a one-off UUID");
+                Uuid::new_v4()
+            }
+        }
+    };
+
+    let inspection_log_path = resolve_inspection_log_path(source, memory_dir, env);
 
     let mut cfg = TelemetryConfig::default_for(
         source,
@@ -386,6 +409,72 @@ mod tests {
         assert_eq!(
             startup_log_line(Some(&DisableReason::DoNotTrack)),
             "telemetry: disabled (DoNotTrack)"
+        );
+    }
+
+    /// Regression: `resolve_install_id_path` used to read
+    /// `std::env::var_os("HOME")` directly, bypassing the injected
+    /// `EnvProvider`. As a result, unit tests calling
+    /// `build_config_with_env` could touch the developer's real
+    /// `~/.aura/install-id`. The fix routes HOME through the env
+    /// provider; this test pins it by passing a per-test HOME and
+    /// confirming the resolved path roots there.
+    #[test]
+    fn install_id_path_honors_injected_home() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let env = MockEnv::default().set("HOME", &fake_home.path().to_string_lossy());
+        let resolved = resolve_install_id_path(None, &env);
+        assert!(
+            resolved.starts_with(fake_home.path()),
+            "install-id path must root under the injected HOME, got {}",
+            resolved.display()
+        );
+        assert!(resolved.ends_with(".aura/install-id"));
+    }
+
+    #[test]
+    fn install_id_path_falls_back_to_memory_dir_when_home_unset() {
+        let memory = tempfile::tempdir().unwrap();
+        let env = MockEnv::default(); // no HOME
+        let resolved = resolve_install_id_path(Some(memory.path()), &env);
+        assert_eq!(resolved, memory.path().join("install-id"));
+    }
+
+    #[test]
+    fn install_id_path_treats_empty_home_as_unset() {
+        let memory = tempfile::tempdir().unwrap();
+        let env = MockEnv::default().set("HOME", ""); // HOME present but empty
+        let resolved = resolve_install_id_path(Some(memory.path()), &env);
+        // Falls through to memory_dir branch, not the literal empty
+        // prefix. Without this guard `PathBuf::from("").join(".aura")`
+        // would produce a relative path the caller didn't ask for.
+        assert_eq!(resolved, memory.path().join("install-id"));
+    }
+
+    /// The companion guarantee on the wire side: when telemetry is
+    /// disabled by an env-level kill switch, `build_config_with_env`
+    /// must not write the install-id file. Tests that previously
+    /// reached install-id creation via the disabled path (because the
+    /// reorder hadn't happened yet) could end up creating the file
+    /// in the real HOME if HOME wasn't routed through the mock env.
+    #[test]
+    fn disabled_run_does_not_touch_install_id_file() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let env = MockEnv::default()
+            .set("HOME", &fake_home.path().to_string_lossy())
+            .set("DO_NOT_TRACK", "1");
+        let cfg = build_config_with_env(Source::Cli, None, None, &env);
+        assert!(matches!(
+            cfg.disable_reason,
+            Some(DisableReason::DoNotTrack)
+        ));
+        // The file is NOT created; the path is still surfaced for
+        // /telemetry status.
+        let expected_path = fake_home.path().join(".aura").join("install-id");
+        assert_eq!(cfg.install_id_path.as_deref(), Some(expected_path.as_path()));
+        assert!(
+            !expected_path.exists(),
+            "disabled run must not create the install-id file"
         );
     }
 }

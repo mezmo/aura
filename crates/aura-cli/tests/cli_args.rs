@@ -1,7 +1,21 @@
 use std::process::Command;
 
+/// Spawn the CLI binary with telemetry kill-switched off.
+///
+/// `CARGO_BIN_EXE_aura-cli` starts a fresh subprocess that does not
+/// reliably inherit the `CARGO_TARGET_TMPDIR` / `RUST_TEST_THREADS`
+/// markers `decide_disabled` checks, so without this guard a black-box
+/// test run would create `~/.aura/install-id`, append rows to the
+/// developer's real `~/.aura/telemetry/events.jsonl`, and attempt
+/// delivery to whatever endpoint defaults to (the OSS build's empty
+/// API key still triggers a 401 attempt). The explicit
+/// `AURA_TELEMETRY_DISABLED=1` is the canonical kill switch and
+/// guarantees the spawned binary stays out of the user's filesystem
+/// and off the network.
 fn aura_cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_aura-cli"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aura-cli"));
+    cmd.env("AURA_TELEMETRY_DISABLED", "1");
+    cmd
 }
 
 #[test]
