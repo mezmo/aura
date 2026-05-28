@@ -1,20 +1,32 @@
 use std::process::Command;
 
-/// Spawn the CLI binary with telemetry kill-switched off.
+/// Spawn the CLI binary with telemetry fully kill-switched off.
 ///
 /// `CARGO_BIN_EXE_aura-cli` starts a fresh subprocess that does not
 /// reliably inherit the `CARGO_TARGET_TMPDIR` / `RUST_TEST_THREADS`
-/// markers `decide_disabled` checks, so without this guard a black-box
-/// test run would create `~/.aura/install-id`, append rows to the
-/// developer's real `~/.aura/telemetry/events.jsonl`, and attempt
-/// delivery to whatever endpoint defaults to (the OSS build's empty
-/// API key still triggers a 401 attempt). The explicit
-/// `AURA_TELEMETRY_DISABLED=1` is the canonical kill switch and
-/// guarantees the spawned binary stays out of the user's filesystem
-/// and off the network.
+/// markers `decide_disabled` checks, so without these guards a
+/// black-box test run would touch the developer's real
+/// `~/.aura/install-id` and append rows to their
+/// `~/.aura/telemetry/events.jsonl`.
+///
+/// Two env vars together close every write path:
+///
+/// - `AURA_TELEMETRY_DISABLED=1` — canonical wire-side kill switch.
+///   Routes through `decide_disabled` to `DisableReason::AuraDisabled`,
+///   skipping the background sink and the `install_id::read_or_create`
+///   call. Without this the spawned CLI would also attempt a 401-bound
+///   POST against the default PostHog endpoint on every invocation.
+/// - `AURA_TELEMETRY_LOG_EVENTS=0` — local-inspection-log kill switch.
+///   The inspection log is **on** by design even when telemetry is
+///   disabled (that's how a real user proves their kill switch
+///   worked), so the wire-side disable alone still writes
+///   `telemetry_opt_out` and `cli_session_started` rows. This second
+///   flag is what keeps the test's CLI subprocess from appending to
+///   `~/.aura/telemetry/events.jsonl`.
 fn aura_cli() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aura-cli"));
     cmd.env("AURA_TELEMETRY_DISABLED", "1");
+    cmd.env("AURA_TELEMETRY_LOG_EVENTS", "0");
     cmd
 }
 
