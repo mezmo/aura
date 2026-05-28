@@ -81,22 +81,46 @@ pub(crate) fn handle_help() {
 /// [`format_telemetry_recent`] so unit tests can lock the output
 /// shape — terminal side-effects (`println!`, redraw) are confined to
 /// this entry point.
-pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryHandle) {
-    let mut parts = arg.split_whitespace();
-    let sub = parts.next().unwrap_or("status");
-    let body = match sub {
-        "status" => format_telemetry_status(telemetry),
-        "recent" => {
-            let n = parts
-                .next()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(20);
-            format_telemetry_recent(telemetry, n)
+/// Default count for `/telemetry recent` when no `[N]` is supplied.
+const TELEMETRY_RECENT_DEFAULT: usize = 20;
+
+/// Parsed `/telemetry` subcommand. Keeping this an enum (rather than
+/// matching bare strings at the call site) means adding a subcommand is
+/// a compile-checked change in one place, and the `Unknown` arm renders
+/// a consistent help string.
+enum TelemetrySubcommand {
+    Status,
+    Recent(usize),
+    Disable,
+    Unknown(String),
+}
+
+impl TelemetrySubcommand {
+    fn parse(arg: &str) -> Self {
+        let mut parts = arg.split_whitespace();
+        match parts.next() {
+            None | Some("status") => Self::Status,
+            Some("recent") => {
+                let n = parts
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(TELEMETRY_RECENT_DEFAULT);
+                Self::Recent(n)
+            }
+            Some("disable") => Self::Disable,
+            Some(other) => Self::Unknown(other.to_string()),
         }
-        "disable" => format_telemetry_disable_result(
+    }
+}
+
+pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryHandle) {
+    let body = match TelemetrySubcommand::parse(arg) {
+        TelemetrySubcommand::Status => format_telemetry_status(telemetry),
+        TelemetrySubcommand::Recent(n) => format_telemetry_recent(telemetry, n),
+        TelemetrySubcommand::Disable => format_telemetry_disable_result(
             crate::config::save_telemetry_enabled_to_global_cli_toml(false),
         ),
-        other => format!(
+        TelemetrySubcommand::Unknown(other) => format!(
             "Unknown /telemetry subcommand: {other}\nAvailable: status, recent [N], disable"
         ),
     };
@@ -154,26 +178,24 @@ pub(crate) fn format_telemetry_recent(
         return "inspection log is disabled (AURA_TELEMETRY_LOG_EVENTS=0).".to_string();
     };
     match log.recent(n) {
+        Ok(events) if events.is_empty() => "no telemetry events recorded yet.".to_string(),
         Ok(events) => {
-            if events.is_empty() {
-                return "no telemetry events recorded yet.".to_string();
-            }
+            use std::fmt::Write as _;
             let mut out = format!("last {} event(s):", events.len());
             for evt in events {
-                let suffix = if evt.sent {
-                    "[sent]".to_string()
-                } else {
-                    match evt.not_sent_reason {
-                        Some(r) => format!("[not sent — {r}]"),
-                        None => "[not sent]".to_string(),
-                    }
-                };
-                out.push_str(&format!(
-                    "\n  {}  {}  {}",
+                let _ = write!(
+                    out,
+                    "\n  {}  {}  ",
                     evt.ts.format("%Y-%m-%dT%H:%M:%SZ"),
                     evt.event,
-                    suffix
-                ));
+                );
+                match (evt.sent, evt.not_sent_reason) {
+                    (true, _) => out.push_str("[sent]"),
+                    (false, Some(r)) => {
+                        let _ = write!(out, "[not sent — {r}]");
+                    }
+                    (false, None) => out.push_str("[not sent]"),
+                }
             }
             out
         }

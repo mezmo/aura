@@ -392,9 +392,9 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
 
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
 
-    let section_idx = lines.iter().position(|l| l.trim() == section_header);
+    let section_index = lines.iter().position(|l| l.trim() == section_header);
 
-    match section_idx {
+    match section_index {
         Some(start) => {
             // Bound the search to this section: stop at the next
             // `[other]` header or end-of-file.
@@ -402,31 +402,31 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
                 .iter()
                 .enumerate()
                 .skip(start + 1)
-                .find(|(_, l)| l.trim_start().starts_with('['))
-                .map(|(i, _)| i)
+                .find_map(|(i, l)| l.trim_start().starts_with('[').then_some(i))
                 .unwrap_or(lines.len());
 
-            let found_idx = lines[(start + 1)..end]
-                .iter()
-                .enumerate()
-                .find_map(|(offset, line)| {
-                    let trimmed = line.trim_start();
-                    let no_comment = trimmed.split('#').next().unwrap_or("").trim();
-                    let rest = no_comment.strip_prefix(key)?;
-                    if rest.trim_start().starts_with('=') {
-                        Some(start + 1 + offset)
-                    } else {
-                        None
-                    }
-                });
+            let found_index =
+                lines[(start + 1)..end]
+                    .iter()
+                    .enumerate()
+                    .find_map(|(offset, line)| {
+                        let trimmed = line.trim_start();
+                        let no_comment = trimmed.split('#').next().unwrap_or("").trim();
+                        let rest = no_comment.strip_prefix(key)?;
+                        if rest.trim_start().starts_with('=') {
+                            Some(start + 1 + offset)
+                        } else {
+                            None
+                        }
+                    });
 
-            if let Some(idx) = found_idx {
-                let original = &lines[idx];
+            if let Some(index) = found_index {
+                let original = &lines[index];
                 let comment = original
                     .find('#')
                     .map(|p| original[p..].to_string())
                     .unwrap_or_default();
-                lines[idx] = if comment.is_empty() {
+                lines[index] = if comment.is_empty() {
                     new_line
                 } else {
                     format!("{new_line}  {comment}")
@@ -438,7 +438,7 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
         None => {
             // Append a fresh section. Blank-line separator improves
             // round-tripping (matches what `toml` would produce).
-            if !lines.is_empty() && lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
+            if lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
                 lines.push(String::new());
             }
             lines.push(section_header);
