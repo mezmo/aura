@@ -71,6 +71,179 @@ pub(crate) fn handle_help() {
     redraw_input_frame();
 }
 
+/// Handle the `/telemetry` command: `status` prints whether telemetry is
+/// active and the disable reason if not; `recent [N]` prints the last
+/// `N` records from the local inspection log (default 20). The user-
+/// facing contract these commands satisfy is documented in
+/// `docs/telemetry.md`.
+///
+/// Formatting lives in [`format_telemetry_status`] and
+/// [`format_telemetry_recent`] so unit tests can lock the output
+/// shape — terminal side-effects (`println!`, redraw) are confined to
+/// this entry point.
+pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryHandle) {
+    let mut parts = arg.split_whitespace();
+    let sub = parts.next().unwrap_or("status");
+    let body = match sub {
+        "status" => format_telemetry_status(telemetry),
+        "recent" => {
+            let n = parts.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+            format_telemetry_recent(telemetry, n)
+        }
+        other => format!(
+            "Unknown /telemetry subcommand: {other}\nAvailable: status, recent [N]"
+        ),
+    };
+    println!("{body}");
+    redraw_input_frame();
+}
+
+pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandle) -> String {
+    use aura_telemetry::inspection_log::disable_reason_label;
+    let state = match telemetry.disable_reason() {
+        None => "active".to_string(),
+        Some(r) => format!("disabled ({})", disable_reason_label(r)),
+    };
+    let mut out = String::new();
+    out.push_str(&format!("telemetry: {state}\n"));
+    out.push_str(&format!(
+        "dropped (channel-full): {}\n",
+        telemetry.dropped_count()
+    ));
+    out.push_str(&format!("session id: {}\n", telemetry.session_id()));
+    out.push_str("see docs/telemetry.md for kill switches and the full event table.");
+    out
+}
+
+pub(crate) fn format_telemetry_recent(
+    telemetry: &aura_telemetry::TelemetryHandle,
+    n: usize,
+) -> String {
+    let Some(log) = telemetry.inspection_log() else {
+        return "inspection log is disabled (AURA_TELEMETRY_LOG_EVENTS=0).".to_string();
+    };
+    match log.recent(n) {
+        Ok(events) => {
+            if events.is_empty() {
+                return "no telemetry events recorded yet.".to_string();
+            }
+            let mut out = format!("last {} event(s):", events.len());
+            for evt in events {
+                let suffix = if evt.sent {
+                    "[sent]".to_string()
+                } else {
+                    match evt.disable_reason {
+                        Some(r) => format!("[not sent — {r}]"),
+                        None => "[not sent]".to_string(),
+                    }
+                };
+                out.push_str(&format!(
+                    "\n  {}  {}  {}",
+                    evt.ts.format("%Y-%m-%dT%H:%M:%SZ"),
+                    evt.event,
+                    suffix
+                ));
+            }
+            out
+        }
+        Err(e) => format!("could not read inspection log: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod telemetry_command_tests {
+    use super::*;
+    use aura_telemetry::events::ServerStarted;
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{DisableReason, TelemetryConfig};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    struct TestHandle {
+        handle: aura_telemetry::TelemetryHandle,
+        _dir: TempDir,
+    }
+
+    fn build(disable: Option<DisableReason>) -> TestHandle {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let cfg = TelemetryConfig {
+            endpoint: "http://127.0.0.1:1/no-such-host".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            source: Source::Cli,
+            os_family: OsFamily::current(),
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: Some(log_path),
+            disable_reason: disable,
+            channel_capacity: 16,
+            batch_size: 8,
+            flush_interval: Duration::from_secs(60),
+            http_client: None,
+        };
+        TestHandle {
+            handle: aura_telemetry::init(cfg),
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_active_mentions_session_and_docs_link() {
+        let h = build(None);
+        let out = format_telemetry_status(&h.handle);
+        assert!(out.starts_with("telemetry: active\n"), "got: {out}");
+        assert!(out.contains("dropped (channel-full): 0"));
+        assert!(out.contains("session id: "));
+        assert!(out.contains("docs/telemetry.md"));
+    }
+
+    #[tokio::test]
+    async fn status_disabled_names_kill_switch() {
+        let h = build(Some(DisableReason::DoNotTrack));
+        let out = format_telemetry_status(&h.handle);
+        assert!(out.contains("telemetry: disabled (DoNotTrack)"));
+    }
+
+    #[tokio::test]
+    async fn recent_empty_message() {
+        let h = build(None);
+        let out = format_telemetry_recent(&h.handle, 10);
+        assert_eq!(out, "no telemetry events recorded yet.");
+    }
+
+    #[tokio::test]
+    async fn recent_lists_captured_events_with_sent_marker() {
+        let h = build(None);
+        h.handle.capture(ServerStarted {
+            default_agent_set: true,
+        });
+        // The inspection-log writer runs synchronously inside
+        // `capture_payload`, so the line is on disk by the time
+        // `format_telemetry_recent` reads it back.
+        let out = format_telemetry_recent(&h.handle, 5);
+        assert!(out.starts_with("last 1 event(s):"), "got: {out}");
+        assert!(out.contains("server_started"));
+        assert!(out.contains("[sent]"));
+    }
+
+    #[tokio::test]
+    async fn recent_disabled_run_marks_not_sent_with_reason() {
+        let h = build(Some(DisableReason::DoNotTrack));
+        h.handle.capture(ServerStarted {
+            default_agent_set: false,
+        });
+        let out = format_telemetry_recent(&h.handle, 5);
+        // First line is the synthetic telemetry_opt_out, second is the
+        // captured event. Both must show the kill-switch reason.
+        assert!(out.contains("telemetry_opt_out"));
+        assert!(out.contains("server_started"));
+        assert!(out.contains("[not sent — DoNotTrack]"));
+    }
+}
+
 /// Handle the `/expand` command: toggle expanded output and replay the event log.
 pub(crate) fn handle_expand(
     conversation: &ConversationHistory,

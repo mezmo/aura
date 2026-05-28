@@ -22,6 +22,7 @@
 // the macro is used inside this crate's own modules (e.g. `events.rs`).
 extern crate self as aura_telemetry;
 
+pub mod bootstrap;
 pub mod disable;
 pub mod events;
 pub mod handle;

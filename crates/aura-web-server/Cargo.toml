@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 aura = { path = "../aura" }
 aura-config = { path = "../aura-config" }
+aura-telemetry = { path = "../aura-telemetry" }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
 bytes = "1"

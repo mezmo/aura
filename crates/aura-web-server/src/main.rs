@@ -1,5 +1,8 @@
 use a2a_server::StaticAgentCard;
 use aura_config::load_config;
+use aura_telemetry::bootstrap::{build_config_from_env, startup_log_line};
+use aura_telemetry::events::ServerStarted;
+use aura_telemetry::properties::Source;
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -225,6 +228,24 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
+    // Resolve telemetry config from environment + the first config's
+    // `memory_dir` (used as the inspection-log root when set). One
+    // `info!` line on startup names the active state or the disable
+    // reason, which mirrors the user-facing contract in
+    // `docs/telemetry.md` and satisfies the spec's
+    // "the recorded disable_reason must reflect user intent" rule.
+    let telemetry_memory_dir = configs
+        .iter()
+        .find_map(|c| c.memory_dir.as_deref())
+        .map(std::path::PathBuf::from);
+    let telemetry_config =
+        build_config_from_env(Source::WebServer, telemetry_memory_dir.as_deref());
+    info!("{}", startup_log_line(telemetry_config.disable_reason.as_ref()));
+    let telemetry = aura_telemetry::init(telemetry_config);
+    telemetry.capture(ServerStarted {
+        default_agent_set: args.default_agent.is_some(),
+    });
+
     let configs_arc = Arc::new(configs);
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
@@ -339,9 +360,21 @@ async fn run() -> std::io::Result<()> {
         }
     });
 
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown_rx.await.ok();
         })
-        .await
+        .await;
+
+    // Drain telemetry after the HTTP listener has stopped so any events
+    // captured during the grace period (last-second tool calls, in-
+    // flight stream completion) make it onto the wire before exit.
+    // 2-second budget mirrors the spec's "telemetry must never block
+    // core SRE behavior" rule — if the network sink is hanging we move
+    // on.
+    telemetry
+        .shutdown(std::time::Duration::from_secs(2))
+        .await;
+
+    serve_result
 }

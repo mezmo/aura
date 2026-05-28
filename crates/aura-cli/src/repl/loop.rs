@@ -44,6 +44,7 @@ pub fn run_repl(
     mut permissions: crate::permissions::PermissionChecker,
     backend: &Backend,
     post_launch_warning: Option<String>,
+    telemetry: &aura_telemetry::TelemetryHandle,
 ) -> Result<()> {
     let mut conversation = ConversationHistory::new(config.system_prompt.as_deref());
 
@@ -307,6 +308,9 @@ pub fn run_repl(
                     continue;
                 } else if let Some(arg) = input.strip_prefix("/style") {
                     commands::handle_style(arg.trim());
+                    continue;
+                } else if let Some(arg) = input.strip_prefix("/telemetry") {
+                    commands::handle_telemetry(arg.trim(), telemetry);
                     continue;
                 } else if input.starts_with('/') {
                     // Unknown command — don't send to API

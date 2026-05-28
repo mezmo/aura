@@ -40,6 +40,29 @@ fn main() -> Result<()> {
         aura_cli::logging::init(config.log_file.as_deref(), is_standalone)?;
     }
 
+    // Telemetry init runs inside the runtime so the background batch
+    // task can spawn cleanly. See `docs/telemetry.md` for the
+    // user-facing contract; the bootstrap helper centralises env-var
+    // resolution so this site and the web-server's stay in sync.
+    let telemetry = {
+        let _enter = rt.enter();
+        let tcfg = aura_telemetry::bootstrap::build_config_from_env(
+            aura_telemetry::properties::Source::Cli,
+            None,
+        );
+        tracing::info!(
+            "{}",
+            aura_telemetry::bootstrap::startup_log_line(tcfg.disable_reason.as_ref())
+        );
+        let handle = aura_telemetry::init(tcfg);
+        handle.capture(aura_telemetry::events::CliSessionStarted {
+            interactive: config.query.is_none(),
+            standalone_mode: is_standalone,
+            client_tools_enabled: args.enable_client_tools.unwrap_or(false),
+        });
+        handle
+    };
+
     // Make sure `~/.aura/cli.toml` exists and has a `style` line. First-run
     // users get a discoverable file with `style = "normal"` they can edit.
     // Failure is silent — read-only filesystems and weird home setups
@@ -128,8 +151,20 @@ fn main() -> Result<()> {
         }
         run_oneshot(&rt, config, permissions, &backend)
     } else {
-        run_repl(&rt, config, permissions, &backend, post_launch_warning)
+        run_repl(
+            &rt,
+            config,
+            permissions,
+            &backend,
+            post_launch_warning,
+            &telemetry,
+        )
     };
+
+    // Drain telemetry before the runtime drops. Two-second budget
+    // matches the web-server site; if the network sink is hanging we
+    // exit anyway — telemetry must never block user-facing shutdown.
+    rt.block_on(telemetry.shutdown(std::time::Duration::from_secs(2)));
 
     // Flush any buffered OTel spans before `rt` drops — the
     // `BatchSpanProcessor` exports on a timer (~5s) and we'd lose the
