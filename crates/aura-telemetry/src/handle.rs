@@ -405,4 +405,3 @@ async fn flush(ctx: &BackgroundCtx, buf: &mut Vec<Value>) {
     }
     buf.clear();
 }
-
