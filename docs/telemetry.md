@@ -250,6 +250,46 @@ rm ~/.aura/install-id
 The next Aura launch generates a fresh persistent UUID. You will be
 counted as a new install.
 
+### Containerized / read-only deployments
+
+The install-id only stabilises the install count if it lives on
+**persistent storage**. A stateless container has none by default, so
+without a little care every container recreation or image pull looks
+like a brand-new install.
+
+The mechanism is the one production deployments already use:
+**`memory_dir` on a mounted volume.** The install-id (and the local
+inspection log) are rooted there, so persisting `memory_dir` persists
+your install identity — no telemetry-specific knob required. This also
+aligns with what a "production install" *is*: a deployment doing
+sustained real work already persists `memory_dir` for scratchpad and
+orchestration artifacts, so it gets a stable install-id for free.
+A throwaway eval clone that persists nothing gets a fresh id each run
+and naturally does not accumulate as a stable install — which is the
+correct outcome.
+
+- **Docker Compose** (the quickstart): the bundled `docker-compose.yml`
+  already sets `memory_dir` and mounts a named `aura-state` volume
+  there. Nothing to do — the install count is stable out of the box.
+- **Kubernetes / Helm**: mount a small `PersistentVolumeClaim` at your
+  configured `memory_dir`. (Chart support for this is tracked
+  upstream.)
+- **Bare metal / laptop**: `$HOME` is used automatically; no action
+  needed.
+
+If Aura starts with telemetry active but no persistent location for the
+install-id, it logs a single **warning** at startup
+(`telemetry install-id is not on persistent storage …`). That is the
+nudge: set `memory_dir` to a mounted volume. The warning never appears
+when telemetry is disabled (a disabled install is never counted), and
+never on a normal laptop run.
+
+If your container is **fully read-only with no writable volume at all**,
+telemetry still functions — events are sent and the install simply
+reports a fresh id per run. To opt out entirely in that environment,
+use the `DO_NOT_TRACK=1` / `AURA_TELEMETRY_DISABLED=1` env switches,
+which need no filesystem access.
+
 ---
 
 ## How to add a new event

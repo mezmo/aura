@@ -26,6 +26,11 @@ services:
       OTEL_RECORD_CONTENT: "true"
     volumes:
       - ./quickstart.toml:/app/config/quickstart.toml:ro
+      # Persists the anonymous telemetry install-id (and inspection log)
+      # across restarts and image pulls so the install count is stable.
+      # Matches `memory_dir = "/app/state"` in quickstart.toml. See
+      # docs/telemetry.md.
+      - aura-state:/app/state
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -91,3 +96,4 @@ networks:
 
 volumes:
   mongodb-data:
+  aura-state:

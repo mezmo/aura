@@ -134,7 +134,15 @@ pub(crate) fn format_telemetry_disable_result(result: anyhow::Result<()>) -> Str
                    The change takes effect on the next launch. Re-enable by removing \
                    the line, or set `enabled = true`."
             .to_string(),
-        Err(e) => format!("could not persist /telemetry disable: {e}"),
+        // Writing cli.toml can fail in a read-only container or where
+        // ~/.aura is not writable. Point the user at the env-var kill
+        // switches, which need no filesystem access and take effect on
+        // the next launch.
+        Err(e) => format!(
+            "could not persist /telemetry disable: {e}\n\
+             In a read-only or sandboxed environment, set DO_NOT_TRACK=1 or \
+             AURA_TELEMETRY_DISABLED=1 instead — no file write required."
+        ),
     }
 }
 
@@ -343,6 +351,9 @@ mod telemetry_command_tests {
         let out = format_telemetry_disable_result(Err(anyhow::anyhow!("disk full")));
         assert!(out.contains("could not persist"));
         assert!(out.contains("disk full"));
+        // Read-only / sandboxed environments can't write cli.toml; the
+        // message must point at the no-filesystem env-var fallback.
+        assert!(out.contains("DO_NOT_TRACK") || out.contains("AURA_TELEMETRY_DISABLED"));
     }
 }
 

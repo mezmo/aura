@@ -62,6 +62,25 @@ pub fn resolve_install_id_path(memory_dir: Option<&Path>, env: &dyn EnvProvider)
     PathBuf::from(".aura").join("install-id")
 }
 
+/// Whether the install-id resolved for these inputs lands in a
+/// **durable** location — one that survives container recreation and
+/// image pulls.
+///
+/// Mirrors the precedence in [`resolve_install_id_path`]: `$HOME` or an
+/// explicit `memory_dir` are durable; the bare-cwd `.aura` fallback is
+/// not, because in a container that lives in the ephemeral writable
+/// layer (lost on `docker rm` / `compose up` after a pull). When this
+/// returns `false` and telemetry is active, [`build_config_with_env`]
+/// emits a one-time warning so the install-count instability is loud
+/// rather than silent.
+///
+/// Kept adjacent to `resolve_install_id_path` so the two stay in sync;
+/// `install_id_durability_matches_path` locks that with a test.
+fn install_id_is_durable(memory_dir: Option<&Path>, env: &dyn EnvProvider) -> bool {
+    let home_set = env.var("HOME").map(|h| !h.is_empty()).unwrap_or(false);
+    home_set || memory_dir.is_some()
+}
+
 /// Resolve the local inspection-log path. Returns `None` when the user
 /// has opted out of the inspection log via `AURA_TELEMETRY_LOG_EVENTS`
 /// set to a recognized false value (`0`, `false`, `no`, `off`,
@@ -181,11 +200,16 @@ pub fn build_config_with_env(
     // tests / `cargo test` subprocesses cannot pollute the developer's
     // real `~/.aura/install-id`.
     let install_id_path = resolve_install_id_path(memory_dir, env);
+    let durable_location = install_id_is_durable(memory_dir, env);
+    let mut persisted = false;
     let install_id = if disable_reason.is_some() {
         Uuid::new_v4()
     } else {
         match install_id::read_or_create(&install_id_path) {
-            Ok(uuid) => uuid,
+            Ok(uuid) => {
+                persisted = durable_location;
+                uuid
+            }
             Err(e) => {
                 tracing::debug!(error = %e, path = %install_id_path.display(),
                     "could not persist install-id; telemetry will use a one-off UUID");
@@ -193,6 +217,21 @@ pub fn build_config_with_env(
             }
         }
     };
+
+    // When telemetry is active but the install-id won't survive a
+    // restart/recreation, the install count churns (every container
+    // recreation looks like a new install). Warn loudly — this is the
+    // dumb-fix nudge: set `memory_dir` on a persistent volume. A
+    // disabled run never counts, so it doesn't warn.
+    if disable_reason.is_none() && !persisted {
+        tracing::warn!(
+            path = %install_id_path.display(),
+            "telemetry install-id is not on persistent storage; the install \
+             count will be unstable across restarts. Set `memory_dir` to a \
+             mounted volume (or, in a stateless container, persist that path) \
+             to stabilise it. See docs/telemetry.md."
+        );
+    }
 
     let inspection_log_path = resolve_inspection_log_path(source, memory_dir, env);
 
@@ -437,6 +476,61 @@ mod tests {
         let env = MockEnv::default(); // no HOME
         let resolved = resolve_install_id_path(Some(memory.path()), &env);
         assert_eq!(resolved, memory.path().join("install-id"));
+    }
+
+    #[test]
+    fn install_id_durable_with_home() {
+        let env = MockEnv::default().set("HOME", "/home/dev");
+        assert!(install_id_is_durable(None, &env));
+    }
+
+    #[test]
+    fn install_id_durable_with_memory_dir_and_no_home() {
+        let env = MockEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        assert!(install_id_is_durable(Some(dir.path()), &env));
+    }
+
+    #[test]
+    fn install_id_not_durable_with_neither() {
+        // No HOME, no memory_dir → bare-cwd fallback → not durable.
+        let env = MockEnv::default();
+        assert!(!install_id_is_durable(None, &env));
+    }
+
+    #[test]
+    fn install_id_not_durable_with_empty_home() {
+        let env = MockEnv::default().set("HOME", "");
+        assert!(!install_id_is_durable(None, &env));
+    }
+
+    /// Lock the durability predicate against the path resolver so the
+    /// two can't drift: whenever `install_id_is_durable` is true, the
+    /// resolved path must NOT be the bare-cwd fallback, and vice versa.
+    #[test]
+    fn install_id_durability_matches_path() {
+        let cwd_fallback = std::path::PathBuf::from(".aura").join("install-id");
+        let dir = tempfile::tempdir().unwrap();
+        let cases: &[(Option<&std::path::Path>, Option<&str>)] = &[
+            (None, Some("/home/dev")),      // HOME set
+            (Some(dir.path()), None),       // memory_dir set
+            (Some(dir.path()), Some("/h")), // both
+            (None, None),                   // neither → cwd fallback
+            (None, Some("")),               // empty HOME → cwd fallback
+        ];
+        for (memory_dir, home) in cases {
+            let mut env = MockEnv::default();
+            if let Some(h) = home {
+                env = env.set("HOME", h);
+            }
+            let durable = install_id_is_durable(*memory_dir, &env);
+            let path = resolve_install_id_path(*memory_dir, &env);
+            assert_eq!(
+                durable,
+                path != cwd_fallback,
+                "durability/path disagree for memory_dir={memory_dir:?} home={home:?}"
+            );
+        }
     }
 
     #[test]

@@ -316,10 +316,7 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
 
     let (sender, bg_handle) = if config.disable_reason.is_none() {
         let (tx, rx) = mpsc::channel::<EventPayload>(config.channel_capacity);
-        let client = config
-            .http_client
-            .clone()
-            .unwrap_or_default();
+        let client = config.http_client.clone().unwrap_or_default();
         let endpoint = config.endpoint.clone();
         let api_key = config.api_key.clone();
         let envelope_for_task = envelope.clone();
