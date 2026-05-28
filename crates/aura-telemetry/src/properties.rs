@@ -93,8 +93,19 @@ impl DeploymentMethod {
     }
 }
 
-/// The Phase-1 sealed allow-list. Variants are added together with the
-/// docs/telemetry.md row that justifies them.
+/// The Phase-1 sealed allow-list of values that may appear in an event's
+/// **property map** (i.e. the per-event key/value bag that PostHog
+/// receives under `properties`).
+///
+/// Envelope-level values that must never be repeated in the property map
+/// — most importantly the install UUID, which is the top-level
+/// `distinct_id` — live on the (private) envelope type instead. Keeping
+/// them out of `PropertyValue` makes the rule structural: a
+/// `#[derive(Event)]` struct cannot carry an install UUID as a field
+/// because there is no type it could declare to do so.
+///
+/// Variants are added together with the docs/telemetry.md row that
+/// justifies them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertyValue {
     Bool(bool),
@@ -107,10 +118,6 @@ pub enum PropertyValue {
     AuraVersion,
     /// Session UUID — random per-process; not linked to install identity.
     SessionUuid(uuid::Uuid),
-    /// Install UUID — never sent as a property; only as the top-level
-    /// `distinct_id`. Included here because the inspection log records it
-    /// in the envelope for the user's own audit.
-    InstallUuid(uuid::Uuid),
 }
 
 impl PropertyValue {
@@ -124,7 +131,7 @@ impl PropertyValue {
             Self::DeploymentMethod(v) => Value::String(v.as_str().into()),
             Self::Static(s) => Value::String((*s).into()),
             Self::AuraVersion => Value::String(env!("CARGO_PKG_VERSION").into()),
-            Self::SessionUuid(u) | Self::InstallUuid(u) => Value::String(u.to_string()),
+            Self::SessionUuid(u) => Value::String(u.to_string()),
         }
     }
 }
@@ -172,11 +179,15 @@ impl IntoTelemetryProperty for &'static str {
         PropertyValue::Static(self)
     }
 }
-impl IntoTelemetryProperty for PropertyValue {
-    fn into_telemetry_property(self) -> PropertyValue {
-        self
-    }
-}
+
+// IntoTelemetryProperty is deliberately NOT implemented for
+// PropertyValue itself. Allowing it would mean a future `PropertyValue`
+// variant intended only for the envelope (e.g. an install UUID) could
+// be smuggled into an event's property map via a struct field of type
+// `PropertyValue`. Forcing every field to be one of the typed source
+// types keeps the allow-list a structural property of the codebase
+// instead of a convention. The compile_fail test
+// `property_value_field.rs` locks this in.
 
 /// Marker newtype for a session UUID. Use this on event fields to avoid
 /// ambiguity with install UUID (different envelope position, different
