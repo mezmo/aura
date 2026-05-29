@@ -31,6 +31,10 @@ async-trait = "0.1.89"
 a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
 a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
 
+reqwest = { version = "0.12", features = ["json"] }
+thiserror = { workspace = true }
+url = "2.5.8"
+
 [features]
 default = ["otel"]
 otel = ["aura/otel", "dep:tracing-opentelemetry", "dep:opentelemetry"]

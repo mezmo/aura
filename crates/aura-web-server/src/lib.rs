@@ -2,5 +2,6 @@
 
 pub mod a2a;
 pub mod handlers;
+pub mod investigation;
 pub mod streaming;
 pub mod types;

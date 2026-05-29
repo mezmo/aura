@@ -15,10 +15,13 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-use aura_web_server::a2a::{AuraAgentExecutor, AuraRequestHandler, SharedTaskStore};
-use aura_web_server::handlers;
 use aura_web_server::streaming;
 use aura_web_server::types;
+use aura_web_server::{
+    a2a::{AuraAgentExecutor, AuraRequestHandler, SharedTaskStore},
+    investigation,
+};
+use aura_web_server::{handlers, investigation::AiHistoryClient};
 
 use streaming::ToolResultMode;
 use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
@@ -131,6 +134,10 @@ struct Args {
     /// /.well-known/agent-card.json. Disabled by default.
     #[arg(long, env = "AURA_ENABLE_A2A", action = clap::ArgAction::SetTrue)]
     enable_a2a: bool,
+
+    /// Base URL of the ai-history-service.
+    #[arg(long, env = "AI_HISTORY_URL", default_value = "http://localhost:3000")]
+    ai_history_url: url::Url,
 }
 
 /// Resolve the externally-advertised base URL for the A2A agent card.
@@ -234,6 +241,12 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
+    // forcing an in-memory store for now. TBD: a resilient location
+    let task_store = SharedTaskStore::new();
+
+    info!("ai-history-service base URL: {}", args.ai_history_url);
+    let ai_history_client = AiHistoryClient::new(reqwest::Client::new(), args.ai_history_url);
+
     let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
@@ -248,6 +261,8 @@ async fn run() -> std::io::Result<()> {
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
+        ai_history_client,
+        a2a_task_store: task_store.clone(),
     });
 
     info!(
@@ -259,6 +274,10 @@ async fn run() -> std::io::Result<()> {
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route(
+            "/v1/launch_investigation",
+            post(investigation::launch_investigation),
+        )
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -272,8 +291,6 @@ async fn run() -> std::io::Result<()> {
     // REST at /a2a/v1/message:send, /a2a/v1/tasks/
     // Agent card at /.well-known/agent-card.json
     let app = if args.enable_a2a {
-        // forcing an in-memory store for now. TBD: a resilient location
-        let task_store = SharedTaskStore::new();
         let executor = AuraAgentExecutor::new(app_state.clone(), task_store.clone());
         let base_url = advertised_base_url(args.server_url.as_deref(), &args.host, args.port);
         let agent_card = executor.build_agent_card(&base_url);

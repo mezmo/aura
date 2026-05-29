@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::a2a::SharedTaskStore;
+use crate::investigation::AiHistoryClient;
 use crate::streaming::ToolResultMode;
 
 /// Tracks in-flight request count for graceful shutdown.
@@ -99,6 +101,11 @@ pub struct AppState {
     /// Factory for additional tools to register on every agent (e.g., CLI tools in standalone mode).
     /// Called once per request to produce fresh tool instances. Returns empty vec for the web server.
     pub additional_tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
+    /// ai-history-service client used by the investigation webhook.
+    pub ai_history_client: AiHistoryClient,
+    /// Shared A2A task store. Reused by the investigation runner so investigations
+    /// surface through `GET /a2a/v1/tasks/{investigation_id}`.
+    pub a2a_task_store: SharedTaskStore,
 }
 
 /// OpenAI-compatible message role

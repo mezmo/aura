@@ -357,6 +357,7 @@ dependencies = [
  "rig-core",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-test",
@@ -364,6 +365,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
+ "url",
  "uuid",
 ]
 
