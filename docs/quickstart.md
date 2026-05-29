@@ -125,10 +125,11 @@ Use `host.docker.internal` to reach services running on your host machine.
 
 **Transport options:**
 
-- `http_streamable`: Recommended for most MCP servers. Uses the current MCP HTTP protocol.
-- `sse`: For MCP servers that only support the legacy SSE protocol (pre-November 2025). Some tools, such as TerminalBench, require this transport.
+- `http_streamable`: Recommended for production. Uses the current MCP HTTP protocol.
+- `sse`: For MCP servers using the legacy SSE protocol (pre-November 2025). Required by some tools like TerminalBench.
+- `stdio`: Spawns a local child process per request. Designed for client-side sidecars, not server deployments. Use `http_streamable` for high-concurrency deployments.
 
-Both transports support the same authentication options (`headers`, `headers_from_request`) and scratchpad configuration. See [`examples/reference.toml`](../examples/reference.toml) for SSE examples.
+HTTP transports (`http_streamable`, `sse`) support authentication options (`headers`, `headers_from_request`) and scratchpad configuration. STDIO uses `cmd`, `args`, and `env` instead of `url`. See [`examples/reference.toml`](../examples/reference.toml) for examples of all transports.
 
 ### Add vector search
 
