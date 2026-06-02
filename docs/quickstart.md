@@ -2,7 +2,7 @@
 
 Get a fully working AI agent stack running in under a minute — AURA, a chat UI, and a trace viewer — all from the repo root.
 
-**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) and an LLM API key (OpenAI, Anthropic, or a local [Ollama](https://ollama.com) instance).
+**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) and an LLM API key (OpenAI, Anthropic, [OpenRouter](https://openrouter.ai), or a local [Ollama](https://ollama.com) instance).
 
 ## 1. Configure your LLM provider
 
@@ -13,7 +13,7 @@ cp .env.example .env
 Edit `.env` and set your provider, model, and API key:
 
 ```bash
-LLM_PROVIDER=openai          # or: anthropic, ollama
+LLM_PROVIDER=openai          # or: anthropic, openrouter, ollama
 LLM_MODEL=gpt-5.2            # or: claude-sonnet-4-20250514, llama3.1
 LLM_API_KEY=sk-...            # your API key (use "unused" for Ollama/llama-server)
 ```
@@ -82,6 +82,14 @@ Update `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY` in `.env`, then `docker co
 LLM_PROVIDER=anthropic
 LLM_MODEL=claude-sonnet-4-20250514
 LLM_API_KEY=sk-ant-...
+```
+
+**OpenRouter:**
+
+```bash
+LLM_PROVIDER=openrouter
+LLM_MODEL=anthropic/claude-sonnet-4
+LLM_API_KEY=sk-or-...
 ```
 
 **Ollama** (local, no API key):
