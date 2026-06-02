@@ -20,6 +20,8 @@ x-static-header = "static-value-from-config"
 
 [mcp.servers.mock_test_server.headers_from_request]
 "Authorization" = "authorization"
+"X-Test-Header1" = "x-test-header1"
+"X-Test-Header2" = "x-test-header2"
 
 # Cancellation test server (Rust rmcp-based) for cancellation propagation tests
 # Provides: slow_task, slow_task_with_progress tools

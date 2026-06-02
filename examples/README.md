@@ -1,8 +1,8 @@
 # Examples
 
-Example TOML configurations and advanced quickstarts for Aura agents.
+Example TOML configurations and advanced quickstarts for AURA agents.
 
-> **New to Aura?** Start with the [Quick Start](../README.md#quick-start) in the
+> **New to AURA?** Start with the [Quick Start](../README.md#quick-start) in the
 > repo root — it gets a full stack running in under a minute. Come back here when
 > you're ready to customize or try orchestration mode.
 

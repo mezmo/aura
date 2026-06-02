@@ -1,6 +1,6 @@
-# Aura
+# AURA
 
-Aura is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. Aura provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
+AURA is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
 
@@ -11,6 +11,7 @@ Key capabilities:
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
 - Dependency-aware multi-wave execution with plan/execute loops
+- [A2A protocol](https://github.com/a2a-protocol) support for agent-to-agent interoperability
 
 ## Table of Contents
 
@@ -71,7 +72,7 @@ aura/
 
 ## Development Setup
 
-For building Aura from source without Docker.
+For building AURA from source without Docker.
 
 1. Install Rust if needed:
    ```bash
@@ -132,6 +133,7 @@ Core server options:
 | `--config`                   | `CONFIG_PATH`              | `config.toml` | Path to TOML config file or directory |
 | `--host`                     | `HOST`                     | `127.0.0.1`   | Bind host                           |
 | `--port`                     | `PORT`                     | `8080`        | Bind port                           |
+| `--server-url`               | `AURA_SERVER_URL`          | host/port     | Canonical public origin published in the A2A agent card (see below) |
 | `--streaming-timeout-secs`   | `STREAMING_TIMEOUT_SECS`   | `900`         | Max SSE request duration            |
 | `--first-chunk-timeout-secs` | `FIRST_CHUNK_TIMEOUT_SECS` | `30`          | Max time to first provider chunk    |
 | `--streaming-buffer-size`    | `STREAMING_BUFFER_SIZE`    | `400`         | SSE backpressure buffer             |
@@ -174,8 +176,33 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
 
-For LibreChat and Phoenix integration with Docker Compose, see the [quickstart guide](examples/quickstart/README.md).
+#### A2A Protocol
 
+> **Disabled by default.** A2A endpoints are only activated when the server is started with `--enable-a2a` (or `AURA_ENABLE_A2A=true`). Omitting the flag means no A2A routes are registered and the agent card is not served.
+
+Aura exposes [A2A protocol](https://github.com/a2a-protocol) endpoints for agent-to-agent interoperability. This allows other A2A-compatible agents and clients to discover and interact with Aura agents using a standardized protocol.
+
+```bash
+# Agent card (capability discovery)
+curl http://localhost:8080/.well-known/agent-card.json
+
+# Send a message via REST
+curl -X POST http://localhost:8080/a2a/v1/message:send \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{"message": {"messageId": "msg-001", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}'
+
+# Send a message via JSON-RPC
+curl -X POST http://localhost:8080/a2a/v1/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "method": "SendMessage", "params": {"message": {"messageId": "msg-002", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}, "id": 1}'
+```
+
+> **Set `AURA_SERVER_URL` when running behind a proxy, load balancer, or in Kubernetes.** The agent card must advertise **absolute** endpoint URLs, and A2A clients use those URLs directly — a relative or wrong-host URL makes `message:send` fail even though the card itself loads. Aura builds the card's URLs from `AURA_SERVER_URL` (or `--server-url`); set it to the externally-reachable origin clients use (e.g. `https://aura.example.com`). When unset, it falls back to the bind host/port, which is only correct for direct local access.
+
+A2A endpoints, transport modes, the agent card URL, task lifecycle, and testing examples are documented in [docs/a2a-implementation.md](docs/a2a-implementation.md).
+
+For LibreChat and Phoenix integration with Docker Compose, see the [quickstart guide](examples/quickstart/README.md).
 ### Client-Side Tools
 
 > ---
@@ -260,7 +287,7 @@ When the loaded agent doesn't opt in (the default), any `tools` field on the req
 
 </details>
 
-`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
+`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, AURA loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
 ### Multiple Agents
 
@@ -480,13 +507,13 @@ Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`
 
 ### Ollama
 
-Aura supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
+AURA supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
 
 ### Observability
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
+AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes AURA traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Development and Testing
 
@@ -554,10 +581,11 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [examples/quickstart/README.md](examples/quickstart/README.md): LibreChat and Phoenix setup with Docker Compose.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
+- [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
 
 ## Architecture
 
-Aura separates concerns across crates:
+AURA separates concerns across crates:
 
 - `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.

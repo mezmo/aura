@@ -115,13 +115,13 @@ aura/
 - **Two backends:** HTTP mode (default) and standalone mode (`--standalone --config`, builds agents in-process)
 - Standalone mode requires `--features standalone-cli` at build time and explicit `--standalone` flag at runtime
 - `--model` works in both modes: HTTP passes it as starting model; standalone matches against agent.name/agent.alias in configs
-- `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for Aura vs OpenAI-compatible service
+- `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for AURA vs OpenAI-compatible service
 - `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
 - Local tool execution: Shell, Read, ListFiles, Update, SearchFiles, FindFiles, FileInfo
 - CLI advertises local tools to the server with `--enable-client-tools`; the server attaches them only when `[agent].enable_client_tools = true` (filtered by `client_tool_filter` globs). **Single-agent configs only** — orchestrated configs drop the tools with a warning. No server-wide `--enable-client-tools` flag.
 - **USE AT YOUR OWN RISK.** Enabling client-side tools is functionally equivalent to handing the LLM a shell prompt on the client machine — prompt injection, hallucination, and lack of sandboxing are real failure modes. See the prominent warnings in `README.md` and `crates/aura-cli/README.md` before enabling for any user-facing config.
 - Permission system (`.aura/permissions.json`, formerly `settings.json`) with allow/deny glob rules. Discovered by walking up from `$PWD` to find the closest `.aura/`. **Project-scoped only** — no global `~/.aura/permissions.json`. Legacy `settings.json` is still read with a deprecation warning; new rules saved at the prompt land in `permissions.json` and migrate any existing legacy rules forward.
-- CLI preferences live in `~/.aura/cli.toml` (global) and `<project>/.aura/cli.toml` (per-project override, walk-up discovered, merged on top of global per-field). Renamed from `~/.aura/config.toml` to avoid collision with Aura **agent** TOML configs; the old name is still read with a deprecation warning.
+- CLI preferences live in `~/.aura/cli.toml` (global) and `<project>/.aura/cli.toml` (per-project override, walk-up discovered, merged on top of global per-field). Renamed from `~/.aura/config.toml` to avoid collision with AURA **agent** TOML configs; the old name is still read with a deprecation warning.
 - `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
 - Env vars: `AURA_API_URL`, `AURA_API_KEY`, `AURA_MODEL`, `AURA_EXTRA_HEADERS`, `AURA_LOG_FILE`
 - **Diagnostic logs**: opt-in via `--log-file <path>` / `AURA_LOG_FILE` / `cli.toml` `log_file` (precedence: CLI > env > project > global > none). Events are appended to the file (no rotation — user-managed) in **both REPL and one-shot mode**, so stdout stays a clean pipe. Default filter is `warn,aura=info,aura_cli=info,aura_config=info,rig::agent::prompt_request=info`; override with `RUST_LOG`.

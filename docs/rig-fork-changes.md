@@ -8,7 +8,7 @@
 
 ## Why a Fork?
 
-Aura relies on a small set of enhancements to rig-core required for its streaming architecture. These are maintained in this fork; as Rig evolves, the goal is to converge with upstream or adapt as needed.
+AURA relies on a small set of enhancements to rig-core required for its streaming architecture. These are maintained in this fork; as Rig evolves, the goal is to converge with upstream or adapt as needed.
 
 ## Changes
 
@@ -35,7 +35,7 @@ Ensures the correct `Content-Type` header is set on provider API requests.
 
 ## Tool Execution Order
 
-Aura's streaming event correlation (tool_call_id tracking between hook and MCP execution) relies on Rig's streaming mode executing tools **sequentially**:
+AURA's streaming event correlation (tool_call_id tracking between hook and MCP execution) relies on Rig's streaming mode executing tools **sequentially**:
 
 ```
 tool_call_1 → execute_1 → result_1 → tool_call_2 → execute_2 → result_2 → ...
@@ -43,7 +43,7 @@ tool_call_1 → execute_1 → result_1 → tool_call_2 → execute_2 → result_
 
 This is guaranteed by the `.await` on each tool's async block in `rig-core/src/agent/prompt_request/streaming.rs` — each tool completes before the next stream item is processed.
 
-**If upgrading Rig**, verify this sequential guarantee still holds. Look for `FuturesUnordered` or parallel execution patterns in the streaming handler — those would break the FIFO correlation logic used for Aura's streaming event tracking.
+**If upgrading Rig**, verify this sequential guarantee still holds. Look for `FuturesUnordered` or parallel execution patterns in the streaming handler — those would break the FIFO correlation logic used for AURA's streaming event tracking.
 
 ## Usage
 

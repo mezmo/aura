@@ -1,6 +1,6 @@
 # Tracing Span Layout
 
-Aura exports OpenTelemetry spans via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT`
+AURA exports OpenTelemetry spans via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT`
 is set. Spans follow the [OpenInference](https://github.com/Arize-ai/openinference)
 taxonomy so they render correctly in Phoenix, Jaeger, and similar tools.
 
