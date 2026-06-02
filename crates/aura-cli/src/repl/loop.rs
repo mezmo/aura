@@ -712,6 +712,13 @@ pub fn run_repl(
                                     return;
                                 }
 
+                                if event_name == "aura.reasoning" {
+                                    if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
+                                        crate::ui::prompt::set_agent_reasoning(content);
+                                    }
+                                    return;
+                                }
+
                                 let sub = event_name.strip_prefix("aura.orchestrator.").unwrap_or(event_name);
                                 if event_name == "aura.session_info" || sub == event_name {
                                     return;
