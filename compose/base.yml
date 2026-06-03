@@ -50,6 +50,10 @@ services:
       # Server configuration
       HOST: 0.0.0.0
       PORT: 8080
+      # AURA_SERVER_URL (the canonical origin published in the A2A agent card) is
+      # set per-topology in the test.yml / dev.yml overlays so it matches the URL
+      # the test runner actually reaches the server on. Unset here, the server
+      # falls back to http://127.0.0.1:8080 for ad-hoc base-only runs.
       CONFIG_PATH: /app/config/test-config.toml
       # MCP server hostname (Docker service name)
       MCP_MOCK_HOST: mock-mcp
@@ -57,6 +61,8 @@ services:
       TOOL_RESULT_MODE: open-web-ui
       # Enable custom aura events for testing
       AURA_CUSTOM_EVENTS: true
+      # Enable A2A endpoints
+      AURA_ENABLE_A2A: true
       # Logging
       RUST_LOG: warn
     env_file:

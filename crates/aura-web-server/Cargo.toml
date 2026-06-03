@@ -9,8 +9,8 @@ repository.workspace = true
 [dependencies]
 aura = { path = "../aura" }
 aura-config = { path = "../aura-config" }
-axum = { version = "0.7", features = ["json"] }
-tower-http = { version = "0.6", features = ["trace"] }
+axum = { version = "0.8", features = ["json"] }
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
 bytes = "1"
 async-stream = "0.3"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -26,6 +26,10 @@ opentelemetry = { workspace = true, optional = true }
 env_logger = "0.11"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = "0.4"
+async-trait = "0.1.89"
+
+a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
+a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
 
 [features]
 default = ["otel"]
@@ -34,6 +38,7 @@ otel = ["aura/otel", "dep:tracing-opentelemetry", "dep:opentelemetry"]
 # Integration test feature flags
 # Parent flag - enables all integration tests
 integration = [
+    "integration-a2a",
     "integration-streaming",
     "integration-header-forwarding",
     "integration-mcp",
@@ -43,6 +48,7 @@ integration = [
 ]
 
 # Per-suite flags (can run individually)
+integration-a2a = []                      # a2a tests
 integration-streaming = []                # streaming_tests, concurrent_streaming_isolation_test
 integration-header-forwarding = []        # header_forwarding_tests
 integration-mcp = []                      # fastmcp_structured_content_test
