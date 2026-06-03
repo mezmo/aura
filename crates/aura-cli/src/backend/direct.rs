@@ -436,7 +436,9 @@ mod tests {
             deployment_method: aura_telemetry::properties::DeploymentMethod::Local,
             aura_version: "test",
             inspection_log_path: None,
-            disable_reason: Some(aura_telemetry::DisableReason::ConfigDisabled),
+            state: aura_telemetry::TelemetryState::Disabled(
+                aura_telemetry::DisableReason::ConfigDisabled,
+            ),
             channel_capacity: 4,
             batch_size: 1,
             flush_interval: std::time::Duration::from_secs(60),

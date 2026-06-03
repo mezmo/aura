@@ -252,11 +252,16 @@ async fn run() -> std::io::Result<()> {
         telemetry_memory_dir.as_deref(),
         telemetry_file_cfg,
     );
-    info!(
-        "{}",
-        startup_log_line(telemetry_config.disable_reason.as_ref())
-    );
+    // The server is non-interactive — it never presents a notice, so its
+    // state is `Unknown` (held, inspectable but unsent) unless an operator
+    // explicitly opted in via `[telemetry] enabled = true` /
+    // `AURA_TELEMETRY_ENABLED=true`, or an Enabled CLI propagates consent
+    // over the wire (see `handlers::chat_completions`).
+    info!("{}", startup_log_line(&telemetry_config.state));
     let telemetry = aura_telemetry::init(telemetry_config);
+    // `capture_payload` routes Unknown/Disabled to the inspection log
+    // only, so this is safe to call unconditionally: an Unknown server
+    // holds `server_started` and sends it nowhere until enabled.
     telemetry.capture(ServerStarted {
         default_agent_set: args.default_agent.is_some(),
     });

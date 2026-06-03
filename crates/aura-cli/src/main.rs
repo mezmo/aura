@@ -53,19 +53,14 @@ fn main() -> Result<()> {
         );
         tracing::info!(
             "{}",
-            aura_telemetry::bootstrap::startup_log_line(tcfg.disable_reason.as_ref())
+            aura_telemetry::bootstrap::startup_log_line(&tcfg.state)
         );
-        let handle = aura_telemetry::init(tcfg);
-        // `config.enable_client_tools` is the fully-resolved value
-        // after CLI args > cli.toml > env > default. Reading from the
-        // raw `args.enable_client_tools.unwrap_or(false)` would lose
-        // every cli.toml opt-in.
-        handle.capture(aura_telemetry::events::CliSessionStarted {
-            interactive: config.query.is_none(),
-            standalone_mode: is_standalone,
-            client_tools_enabled: config.enable_client_tools,
-        });
-        handle
+        aura_telemetry::init(tcfg)
+        // `cli_session_started` is captured by `run_repl` once the
+        // session is Enabled (either already-recorded preference, or
+        // after the first-run notice + first non-opt-out input). It is
+        // never captured here: that would emit during `Unknown` (held,
+        // no-backfill) and would fire for one-shot `--query` too.
     };
 
     // Make sure `~/.aura/cli.toml` exists and has a `style` line. First-run
@@ -163,6 +158,7 @@ fn main() -> Result<()> {
             &backend,
             post_launch_warning,
             &telemetry,
+            is_standalone,
         )
     };
 

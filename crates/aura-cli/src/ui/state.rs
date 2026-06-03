@@ -220,7 +220,7 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/style", "switch the visual style"),
     (
         "/telemetry",
-        "inspect telemetry: status | recent [N] | disable",
+        "telemetry: status | recent [N] | enable | disable",
     ),
 ];
 

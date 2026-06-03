@@ -91,6 +91,7 @@ const TELEMETRY_RECENT_DEFAULT: usize = 20;
 enum TelemetrySubcommand {
     Status,
     Recent(usize),
+    Enable,
     Disable,
     Unknown(String),
 }
@@ -107,6 +108,7 @@ impl TelemetrySubcommand {
                     .unwrap_or(TELEMETRY_RECENT_DEFAULT);
                 Self::Recent(n)
             }
+            Some("enable") => Self::Enable,
             Some("disable") => Self::Disable,
             Some(other) => Self::Unknown(other.to_string()),
         }
@@ -117,15 +119,71 @@ pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryH
     let body = match TelemetrySubcommand::parse(arg) {
         TelemetrySubcommand::Status => format_telemetry_status(telemetry),
         TelemetrySubcommand::Recent(n) => format_telemetry_recent(telemetry, n),
-        TelemetrySubcommand::Disable => format_telemetry_disable_result(
-            crate::config::save_telemetry_enabled_to_global_cli_toml(false),
-        ),
+        TelemetrySubcommand::Enable => {
+            // Flip the in-memory state for this session (Unknown → Enabled,
+            // or resume a runtime opt-out; held if a startup kill switch
+            // left no sink), then persist the preference for next launch.
+            let outcome = telemetry.enable();
+            let persisted = crate::config::save_telemetry_enabled_to_global_cli_toml(true);
+            format_telemetry_enable_result(outcome, persisted, telemetry)
+        }
+        TelemetrySubcommand::Disable => {
+            telemetry.set_disabled(aura_telemetry::DisableReason::AuraDisabled);
+            format_telemetry_disable_result(
+                crate::config::save_telemetry_enabled_to_global_cli_toml(false),
+            )
+        }
         TelemetrySubcommand::Unknown(other) => format!(
-            "Unknown /telemetry subcommand: {other}\nAvailable: status, recent [N], disable"
+            "Unknown /telemetry subcommand: {other}\n\
+             Available: status, recent [N], enable, disable"
         ),
     };
     println!("{body}");
     redraw_input_frame();
+}
+
+pub(crate) fn format_telemetry_enable_result(
+    outcome: aura_telemetry::EnableOutcome,
+    persisted: std::result::Result<(), crate::config::TelemetryDisableError>,
+    telemetry: &aura_telemetry::TelemetryHandle,
+) -> String {
+    use aura_telemetry::EnableOutcome;
+    match outcome {
+        EnableOutcome::Enabled | EnableOutcome::AlreadyEnabled => match persisted {
+            Ok(()) => "telemetry: enabled for this session and persisted [telemetry] \
+                       enabled = true in ~/.aura/cli.toml. Disable any time with \
+                       /telemetry disable or DO_NOT_TRACK=1."
+                .to_string(),
+            Err(e) => format!(
+                "telemetry: enabled for this session, but the preference could not be \
+                 persisted: {e}"
+            ),
+        },
+        // A startup kill switch (DO_NOT_TRACK / config `enabled = false`)
+        // is holding telemetry off; enabling at runtime cannot resurrect
+        // it. Be honest that it stays off this session, and name the
+        // reason so the user knows what to clear.
+        EnableOutcome::HeldUntilRestart => {
+            let reason = match telemetry.state() {
+                aura_telemetry::TelemetryState::Disabled(r) => {
+                    aura_telemetry::inspection_log::disable_reason_label(&r)
+                }
+                _ => "disabled".to_string(),
+            };
+            match persisted {
+                Ok(()) => format!(
+                    "telemetry: preference saved ([telemetry] enabled = true in \
+                     ~/.aura/cli.toml), but it stays disabled for this session \
+                     ({reason}). It takes effect on the next launch, once that kill \
+                     switch is cleared."
+                ),
+                Err(e) => format!(
+                    "telemetry stays disabled for this session ({reason}), and the \
+                     preference could not be persisted either: {e}"
+                ),
+            }
+        }
+    }
 }
 
 pub(crate) fn format_telemetry_disable_result(
@@ -149,10 +207,12 @@ pub(crate) fn format_telemetry_disable_result(
 }
 
 pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandle) -> String {
+    use aura_telemetry::TelemetryState;
     use aura_telemetry::inspection_log::disable_reason_label;
-    let state = match telemetry.disable_reason() {
-        None => "active".to_string(),
-        Some(r) => format!("disabled ({})", disable_reason_label(r)),
+    let state = match telemetry.state() {
+        TelemetryState::Unknown => "unknown (held — awaiting notice or enable)".to_string(),
+        TelemetryState::Enabled => "active".to_string(),
+        TelemetryState::Disabled(r) => format!("disabled ({})", disable_reason_label(&r)),
     };
     let mut out = String::new();
     out.push_str(&format!("telemetry: {state}\n"));
@@ -219,7 +279,7 @@ mod telemetry_command_tests {
     use super::*;
     use aura_telemetry::events::ServerStarted;
     use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
-    use aura_telemetry::{DisableReason, TelemetryConfig};
+    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryState};
     use std::time::Duration;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -229,7 +289,7 @@ mod telemetry_command_tests {
         _dir: TempDir,
     }
 
-    fn build(disable: Option<DisableReason>) -> TestHandle {
+    fn build(state: TelemetryState) -> TestHandle {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("events.jsonl");
         let install_path = dir.path().join("install-id");
@@ -244,7 +304,7 @@ mod telemetry_command_tests {
             deployment_method: DeploymentMethod::Local,
             aura_version: "9.9.9-test",
             inspection_log_path: Some(log_path),
-            disable_reason: disable,
+            state,
             channel_capacity: 16,
             batch_size: 8,
             flush_interval: Duration::from_secs(60),
@@ -259,7 +319,7 @@ mod telemetry_command_tests {
 
     #[tokio::test]
     async fn status_active_mentions_session_and_docs_link() {
-        let h = build(None);
+        let h = build(TelemetryState::Enabled);
         let out = format_telemetry_status(&h.handle);
         assert!(out.starts_with("telemetry: active\n"), "got: {out}");
         assert!(out.contains("dropped (channel-full): 0"));
@@ -269,7 +329,7 @@ mod telemetry_command_tests {
 
     #[tokio::test]
     async fn status_includes_endpoint_install_id_path_and_log_path() {
-        let h = build(None);
+        let h = build(TelemetryState::Enabled);
         let out = format_telemetry_status(&h.handle);
         assert!(
             out.contains("endpoint: http://127.0.0.1:1/no-such-host"),
@@ -287,14 +347,14 @@ mod telemetry_command_tests {
 
     #[tokio::test]
     async fn status_disabled_names_kill_switch() {
-        let h = build(Some(DisableReason::DoNotTrack));
+        let h = build(TelemetryState::Disabled(DisableReason::DoNotTrack));
         let out = format_telemetry_status(&h.handle);
         assert!(out.contains("telemetry: disabled (DoNotTrack)"));
     }
 
     #[tokio::test]
     async fn recent_empty_message() {
-        let h = build(None);
+        let h = build(TelemetryState::Enabled);
         let out = format_telemetry_recent(&h.handle, 10);
         assert_eq!(out, "no telemetry events recorded yet.");
     }
@@ -307,7 +367,7 @@ mod telemetry_command_tests {
         // formatter itself is what we want to lock in here — given an
         // InspectedEvent with `sent: true`, it renders `[sent]`. We
         // assert that directly by appending the synthetic row.
-        let h = build(None);
+        let h = build(TelemetryState::Enabled);
         let log = h
             .handle
             .inspection_log()
@@ -328,7 +388,7 @@ mod telemetry_command_tests {
 
     #[tokio::test]
     async fn recent_disabled_run_marks_not_sent_with_reason() {
-        let h = build(Some(DisableReason::DoNotTrack));
+        let h = build(TelemetryState::Disabled(DisableReason::DoNotTrack));
         h.handle.capture(ServerStarted {
             default_agent_set: false,
         });
@@ -362,6 +422,36 @@ mod telemetry_command_tests {
         // Read-only / sandboxed environments can't write cli.toml; the
         // message must point at the no-filesystem env-var fallback.
         assert!(out.contains("DO_NOT_TRACK") || out.contains("AURA_TELEMETRY_DISABLED"));
+    }
+
+    /// From Unknown, `/telemetry enable` actually enables for the session
+    /// and says so.
+    #[tokio::test]
+    async fn enable_result_reports_success_from_unknown() {
+        let h = build(TelemetryState::Unknown);
+        let outcome = h.handle.enable();
+        let out = format_telemetry_enable_result(outcome, Ok(()), &h.handle);
+        assert!(out.contains("enabled for this session"), "got: {out}");
+        assert!(out.contains("enabled = true"));
+    }
+
+    /// When a startup kill switch holds telemetry off, `/telemetry enable`
+    /// must NOT claim it is active now — it reports the preference was
+    /// saved but the session stays disabled, naming the reason.
+    #[tokio::test]
+    async fn enable_result_is_honest_when_held_by_kill_switch() {
+        let h = build(TelemetryState::Disabled(DisableReason::DoNotTrack));
+        let outcome = h.handle.enable();
+        assert_eq!(outcome, aura_telemetry::EnableOutcome::HeldUntilRestart);
+        let out = format_telemetry_enable_result(outcome, Ok(()), &h.handle);
+        assert!(
+            out.contains("stays disabled for this session"),
+            "must not falsely claim success; got: {out}"
+        );
+        assert!(
+            out.contains("DoNotTrack"),
+            "should name the reason; got: {out}"
+        );
     }
 }
 
