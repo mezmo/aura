@@ -35,7 +35,7 @@ impl Backend {
         _rt: &tokio::runtime::Runtime,
         config: &AppConfig,
         _args: &Args,
-        _telemetry: &aura_telemetry::TelemetryHandle,
+        telemetry: &aura_telemetry::TelemetryHandle,
     ) -> Result<Self> {
         #[cfg(feature = "standalone-cli")]
         if _args.standalone {
@@ -44,12 +44,26 @@ impl Backend {
             let direct = _rt.block_on(direct::DirectBackend::from_toml(
                 config_path,
                 config.extra_headers.clone(),
-                _telemetry.clone(),
+                telemetry.clone(),
             ))?;
             return Ok(Self::Direct(direct));
         }
 
-        Ok(Self::Http(http::HttpBackend::new(config.clone())))
+        // One-shot `--query` never participates in telemetry (privacy
+        // contract in docs/telemetry.md): withhold the handle so the HTTP
+        // backend cannot propagate `X-Aura-Telemetry-Consent` to the
+        // server even when the user previously opted in. The REPL path
+        // keeps the live handle so an Enabled session still propagates.
+        let backend_telemetry = if config.query.is_some() {
+            None
+        } else {
+            Some(telemetry.clone())
+        };
+
+        Ok(Self::Http(http::HttpBackend::new(
+            config.clone(),
+            backend_telemetry,
+        )))
     }
 
     /// Send a streaming chat completion and process the response,
@@ -173,6 +187,106 @@ impl Backend {
             Self::Direct(direct) => {
                 crate::ui::prompt::seed_model_cache(direct.model_ids());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_propagation_tests {
+    use super::*;
+    use crate::cli::Args;
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{TelemetryConfig, TelemetryState};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn args_with_query(query: Option<&str>) -> Args {
+        Args {
+            api_url: None,
+            api_key: None,
+            model: None,
+            system_prompt: None,
+            query: query.map(str::to_string),
+            resume: None,
+            force: false,
+            pretty: false,
+            enable_client_tools: None,
+            enable_final_response_summary: None,
+            #[cfg(feature = "standalone-cli")]
+            standalone: false,
+            #[cfg(feature = "standalone-cli")]
+            agent_config: None,
+            log_file: None,
+        }
+    }
+
+    /// An `Enabled` handle with no sink (no runtime is current here). The
+    /// consent gate only reads `state()`, so this is enough to prove the
+    /// header would be propagated in REPL mode and withheld in one-shot.
+    fn enabled_handle() -> aura_telemetry::TelemetryHandle {
+        let cfg = TelemetryConfig {
+            endpoint: "http://127.0.0.1:1/no-such-host".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::new_v4(),
+            install_id_path: None,
+            session_id: Uuid::new_v4(),
+            source: Source::Cli,
+            os_family: OsFamily::current(),
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: None,
+            state: TelemetryState::Enabled,
+            channel_capacity: 16,
+            batch_size: 8,
+            flush_interval: Duration::from_secs(60),
+            post_timeout: Duration::from_millis(500),
+            http_client: None,
+        };
+        aura_telemetry::init(cfg)
+    }
+
+    fn load_config(args: &Args) -> AppConfig {
+        let cwd = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir(home.path().join(".aura")).unwrap();
+        let global = home.path().join(".aura");
+        AppConfig::load_with_dirs(args, cwd.path(), Some(&global)).unwrap()
+    }
+
+    #[test]
+    fn repl_backend_carries_telemetry_handle() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = args_with_query(None);
+        let config = load_config(&args);
+        let handle = enabled_handle();
+        let backend = Backend::from_config(&rt, &config, &args, &handle).unwrap();
+        match backend {
+            Backend::Http(b) => assert!(
+                b.has_telemetry(),
+                "REPL backend must keep the telemetry handle so an Enabled session \
+                 propagates consent"
+            ),
+            #[cfg(feature = "standalone-cli")]
+            _ => panic!("expected Http backend"),
+        }
+    }
+
+    #[test]
+    fn one_shot_query_backend_drops_telemetry_handle() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let args = args_with_query(Some("hello"));
+        let config = load_config(&args);
+        let handle = enabled_handle();
+        let backend = Backend::from_config(&rt, &config, &args, &handle).unwrap();
+        match backend {
+            Backend::Http(b) => assert!(
+                !b.has_telemetry(),
+                "one-shot --query must not carry a telemetry handle \
+                 (no X-Aura-Telemetry-Consent header)"
+            ),
+            #[cfg(feature = "standalone-cli")]
+            _ => panic!("expected Http backend"),
         }
     }
 }

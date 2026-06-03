@@ -19,10 +19,18 @@ pub struct HttpBackend {
 }
 
 impl HttpBackend {
-    pub fn new(config: AppConfig) -> Self {
+    pub fn new(config: AppConfig, telemetry: Option<aura_telemetry::TelemetryHandle>) -> Self {
         Self {
-            client: ChatClient::new(config),
+            client: ChatClient::with_telemetry(config, telemetry),
         }
+    }
+
+    /// Whether the backend carries a telemetry handle. One-shot
+    /// `--query` builds with `None` so it never propagates consent;
+    /// exposed for the wiring regression test.
+    #[cfg(test)]
+    pub(crate) fn has_telemetry(&self) -> bool {
+        self.client.has_telemetry()
     }
 
     #[allow(clippy::too_many_arguments)]

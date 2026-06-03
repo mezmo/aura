@@ -37,6 +37,15 @@ pub use properties::{IntoTelemetryProperty, Properties, PropertyValue};
 
 pub use aura_telemetry_derive::Event;
 
+/// HTTP header an **Enabled** CLI attaches to its requests to propagate
+/// the user's telemetry consent to the non-interactive server it drives.
+/// A server in the `Unknown` state honors it (transitions to `Enabled`
+/// at runtime); a `Disabled` server ignores it. See `docs/telemetry.md`.
+pub const CONSENT_HEADER: &str = "x-aura-telemetry-consent";
+
+/// The only value [`CONSENT_HEADER`] is ever sent with.
+pub const CONSENT_HEADER_VALUE: &str = "enabled";
+
 /// The wire-ready property bag for a single event. The macro builds this
 /// from each `#[derive(Event)]` struct. `Clone` is supported so the
 /// background-task channel can move owned copies.
