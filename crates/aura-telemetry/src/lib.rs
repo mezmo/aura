@@ -31,8 +31,8 @@ pub mod install_id;
 pub mod properties;
 pub mod sink;
 
-pub use disable::{decide_disabled, DisableReason, EnvProvider};
-pub use handle::{init, FileTelemetryConfig, TelemetryConfig, TelemetryHandle};
+pub use disable::{decide_state, DisableReason, EnvProvider, TelemetryState};
+pub use handle::{init, EnableOutcome, FileTelemetryConfig, TelemetryConfig, TelemetryHandle};
 pub use properties::{IntoTelemetryProperty, Properties, PropertyValue};
 
 pub use aura_telemetry_derive::Event;

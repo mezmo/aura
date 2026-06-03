@@ -45,10 +45,10 @@ async fn capture_one_and_get_body(disable: bool) -> (Vec<Request>, PathBuf, temp
         deployment_method: DeploymentMethod::Local,
         aura_version: "9.9.9-test",
         inspection_log_path: Some(log_path.clone()),
-        disable_reason: if disable {
-            Some(aura_telemetry::DisableReason::DoNotTrack)
+        state: if disable {
+            aura_telemetry::TelemetryState::Disabled(aura_telemetry::DisableReason::DoNotTrack)
         } else {
-            None
+            aura_telemetry::TelemetryState::Enabled
         },
         channel_capacity: 16,
         batch_size: 1,
@@ -202,7 +202,7 @@ async fn slow_endpoint_does_not_swallow_inspection_log_row() {
         deployment_method: DeploymentMethod::Local,
         aura_version: "9.9.9-test",
         inspection_log_path: Some(log_path.clone()),
-        disable_reason: None,
+        state: aura_telemetry::TelemetryState::Enabled,
         channel_capacity: 16,
         batch_size: 1,
         flush_interval: Duration::from_millis(50),
@@ -270,7 +270,7 @@ async fn post_failure_marks_inspection_log_not_sent() {
         deployment_method: DeploymentMethod::Local,
         aura_version: "9.9.9-test",
         inspection_log_path: Some(log_path.clone()),
-        disable_reason: None,
+        state: aura_telemetry::TelemetryState::Enabled,
         channel_capacity: 16,
         batch_size: 1,
         flush_interval: Duration::from_millis(50),
@@ -337,7 +337,7 @@ async fn channel_full_drops_record_to_inspection_log() {
         deployment_method: DeploymentMethod::Local,
         aura_version: "9.9.9-test",
         inspection_log_path: Some(log_path.clone()),
-        disable_reason: None,
+        state: aura_telemetry::TelemetryState::Enabled,
         channel_capacity: 1,
         batch_size: 1,
         // High flush interval — flush is gated by batch_size=1 hitting

@@ -4,8 +4,25 @@
 //! checks are skipped. The order is intentional and load-bearing — see
 //! `docs/telemetry.md` for the user-facing precedence table.
 
-/// Reason a telemetry run is disabled. `None` (returned by
-/// [`decide_disabled`]) means telemetry is active.
+/// The three telemetry states (spec revision 2026-06-03).
+///
+/// Telemetry is **notice-gated**: it does not send until a preference is
+/// recorded (interactively via the first-run notice, or explicitly via
+/// config/env). See `docs/telemetry.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelemetryState {
+    /// No preference recorded. Telemetry is **held** — events are written
+    /// to the local inspection log only, never queued to the sink, and
+    /// never backfilled after a later transition to `Enabled`.
+    Unknown,
+    /// A first-run notice was presented and not opted out of, or an
+    /// operator explicitly enabled via config/env. Telemetry may be sent.
+    Enabled,
+    /// A kill switch or explicit opt-out is in effect. Telemetry is held.
+    Disabled(DisableReason),
+}
+
+/// Reason a telemetry run is held in the `Disabled` state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisableReason {
     /// `DO_NOT_TRACK` honored (industry-standard cross-tool opt-out).
@@ -70,14 +87,17 @@ fn flag_set(v: &Option<String>) -> bool {
     }
 }
 
-/// Decide whether telemetry is disabled based on environment.
+/// Tier-1 "hard" disables that can never be overridden by an explicit
+/// enable: the industry/Aura opt-out env vars, CI, and cargo-test.
 ///
-/// Precedence: `DO_NOT_TRACK` → `AURA_TELEMETRY_DISABLED` → CI envs →
-/// cargo-test markers → `AURA_TELEMETRY_ENABLED=false`. Config-from-TOML
-/// disable is layered separately by the caller after this returns.
+/// Kept separate from the lower-precedence config enable/disable so a
+/// misconfigured `AURA_TELEMETRY_ENABLED=true` in CI still cannot send —
+/// the spec lists "counts materially influenced by CI/dev/test" as a
+/// failure mode. Precedence within the tier: `DO_NOT_TRACK` →
+/// `AURA_TELEMETRY_DISABLED` → CI envs → cargo-test markers.
 ///
-/// Returns `Some(reason)` if disabled, `None` if active.
-pub fn decide_disabled(env: &dyn EnvProvider) -> Option<DisableReason> {
+/// Returns `Some(reason)` if a hard disable is active, else `None`.
+pub fn decide_hard_disable(env: &dyn EnvProvider) -> Option<DisableReason> {
     if flag_set(&env.var("DO_NOT_TRACK")) {
         return Some(DisableReason::DoNotTrack);
     }
@@ -92,15 +112,39 @@ pub fn decide_disabled(env: &dyn EnvProvider) -> Option<DisableReason> {
     if env.var("CARGO_TARGET_TMPDIR").is_some() || env.var("RUST_TEST_THREADS").is_some() {
         return Some(DisableReason::CargoTest);
     }
-    // `AURA_TELEMETRY_ENABLED` is the inverse of the others: it
-    // disables only when set to a recognized false value. An unset
-    // var or a truthy value leaves telemetry on.
-    if let Some(v) = env.var("AURA_TELEMETRY_ENABLED") {
-        if is_false_value(&v) {
-            return Some(DisableReason::ConfigDisabled);
-        }
-    }
     None
+}
+
+/// Resolve the [`TelemetryState`] from the environment and the recorded
+/// `[telemetry] enabled` preference (`None` = no preference recorded).
+///
+/// Precedence (highest first):
+/// 1. Hard disables ([`decide_hard_disable`]) → `Disabled`, even over an
+///    explicit enable.
+/// 2. `AURA_TELEMETRY_ENABLED` env (non-empty): false-value → `Disabled`,
+///    truthy → `Enabled`. Env wins over the file preference.
+/// 3. File preference: `Some(false)` → `Disabled`, `Some(true)` →
+///    `Enabled`.
+/// 4. Otherwise → `Unknown` (held; awaiting a notice or explicit enable).
+pub fn decide_state(env: &dyn EnvProvider, file_enabled: Option<bool>) -> TelemetryState {
+    if let Some(reason) = decide_hard_disable(env) {
+        return TelemetryState::Disabled(reason);
+    }
+    if let Some(v) = env
+        .var("AURA_TELEMETRY_ENABLED")
+        .filter(|s| !s.trim().is_empty())
+    {
+        return if is_false_value(&v) {
+            TelemetryState::Disabled(DisableReason::ConfigDisabled)
+        } else {
+            TelemetryState::Enabled
+        };
+    }
+    match file_enabled {
+        Some(false) => TelemetryState::Disabled(DisableReason::ConfigDisabled),
+        Some(true) => TelemetryState::Enabled,
+        None => TelemetryState::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -128,220 +172,214 @@ mod tests {
         }
     }
 
+    // ---- decide_hard_disable (tier-1 kill switches) ----
+
     #[test]
-    fn empty_env_means_active() {
-        assert_eq!(decide_disabled(&MockEnv::new()), None);
+    fn hard_empty_env_is_none() {
+        assert_eq!(decide_hard_disable(&MockEnv::new()), None);
     }
 
     #[test]
-    fn do_not_track_disables() {
+    fn hard_do_not_track_disables() {
         let env = MockEnv::new().set("DO_NOT_TRACK", "1");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::DoNotTrack));
+        assert_eq!(decide_hard_disable(&env), Some(DisableReason::DoNotTrack));
     }
 
+    /// Regression: `DO_NOT_TRACK=false` / `CI=false` must NOT trigger a
+    /// kill switch (common shell-rc pattern for "not in CI today").
     #[test]
-    fn do_not_track_zero_does_not_disable() {
-        let env = MockEnv::new().set("DO_NOT_TRACK", "0");
-        assert_eq!(decide_disabled(&env), None);
-    }
-
-    #[test]
-    fn do_not_track_empty_does_not_disable() {
-        let env = MockEnv::new().set("DO_NOT_TRACK", "");
-        assert_eq!(decide_disabled(&env), None);
-    }
-
-    /// Regression: `DO_NOT_TRACK=false` used to silently disable
-    /// telemetry because the old `is_truthy` accepted any non-empty
-    /// non-"0" value. The fix parses common false spellings
-    /// (case-insensitive) and treats them as "kill switch not active".
-    #[test]
-    fn do_not_track_false_values_do_not_disable() {
-        for v in [
-            "false", "FALSE", "False", "no", "NO", "off", "OFF", "Off", "0", "",
-        ] {
-            let env = MockEnv::new().set("DO_NOT_TRACK", v);
-            assert_eq!(
-                decide_disabled(&env),
-                None,
-                "DO_NOT_TRACK={v:?} must not disable telemetry"
-            );
-        }
-    }
-
-    /// The complementary case: unrecognised truthy spellings continue
-    /// to disable, so the parser remains permissive on the truthy side
-    /// for backward compatibility with users who set
-    /// `DO_NOT_TRACK=enabled` or `DO_NOT_TRACK=please`.
-    #[test]
-    fn do_not_track_assorted_truthy_values_disable() {
-        for v in ["1", "true", "yes", "on", "enabled", "please", "TRUE"] {
-            let env = MockEnv::new().set("DO_NOT_TRACK", v);
-            assert_eq!(
-                decide_disabled(&env),
-                Some(DisableReason::DoNotTrack),
-                "DO_NOT_TRACK={v:?} should disable telemetry"
-            );
-        }
-    }
-
-    #[test]
-    fn aura_telemetry_disabled_false_values_do_not_disable() {
-        for v in ["false", "FALSE", "no", "off", "0", ""] {
-            let env = MockEnv::new().set("AURA_TELEMETRY_DISABLED", v);
-            assert_eq!(
-                decide_disabled(&env),
-                None,
-                "AURA_TELEMETRY_DISABLED={v:?} must not disable telemetry"
-            );
-        }
-    }
-
-    /// Shell rc files often export `CI=false` on developer machines to
-    /// signal "not in CI" to scripts. We must not interpret that as
-    /// "in CI" and silently suppress telemetry.
-    #[test]
-    fn ci_false_does_not_disable() {
-        for name in CI_ENV_VARS {
-            for v in ["false", "no", "off", "0", ""] {
-                let env = MockEnv::new().set(name, v);
+    fn hard_false_values_do_not_disable() {
+        for v in ["false", "FALSE", "no", "NO", "off", "0", ""] {
+            for key in ["DO_NOT_TRACK", "AURA_TELEMETRY_DISABLED", "CI"] {
+                let env = MockEnv::new().set(key, v);
                 assert_eq!(
-                    decide_disabled(&env),
+                    decide_hard_disable(&env),
                     None,
-                    "{name}={v:?} must not be classified as CI"
+                    "{key}={v:?} must not be a hard disable"
                 );
             }
         }
     }
 
     #[test]
-    fn aura_telemetry_enabled_false_variants_disable() {
-        // The inverse direction: AURA_TELEMETRY_ENABLED is on by
-        // default; explicit false values turn telemetry off.
-        for v in ["false", "FALSE", "no", "off", "0", ""] {
-            let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", v);
+    fn hard_assorted_truthy_values_disable() {
+        for v in ["1", "true", "yes", "on", "enabled", "please", "TRUE"] {
+            let env = MockEnv::new().set("DO_NOT_TRACK", v);
             assert_eq!(
-                decide_disabled(&env),
-                Some(DisableReason::ConfigDisabled),
-                "AURA_TELEMETRY_ENABLED={v:?} must disable telemetry"
+                decide_hard_disable(&env),
+                Some(DisableReason::DoNotTrack),
+                "DO_NOT_TRACK={v:?} should hard-disable"
             );
         }
     }
 
     #[test]
-    fn aura_telemetry_enabled_truthy_does_not_disable() {
-        for v in ["true", "yes", "on", "1", "enabled"] {
-            let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", v);
-            assert_eq!(
-                decide_disabled(&env),
-                None,
-                "AURA_TELEMETRY_ENABLED={v:?} should leave telemetry on"
-            );
-        }
-    }
-
-    #[test]
-    fn aura_telemetry_disabled_disables() {
+    fn hard_aura_disabled() {
         let env = MockEnv::new().set("AURA_TELEMETRY_DISABLED", "1");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::AuraDisabled));
+        assert_eq!(decide_hard_disable(&env), Some(DisableReason::AuraDisabled));
     }
 
     #[test]
-    fn github_actions_disables() {
-        let env = MockEnv::new().set("GITHUB_ACTIONS", "true");
+    fn hard_each_ci_provider() {
+        for name in CI_ENV_VARS {
+            let env = MockEnv::new().set(name, "true");
+            assert_eq!(
+                decide_hard_disable(&env),
+                Some(DisableReason::Ci(name)),
+                "expected CI provider {name} to hard-disable"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_cargo_markers() {
         assert_eq!(
-            decide_disabled(&env),
-            Some(DisableReason::Ci("GITHUB_ACTIONS"))
+            decide_hard_disable(&MockEnv::new().set("CARGO_TARGET_TMPDIR", "/tmp/x")),
+            Some(DisableReason::CargoTest)
+        );
+        assert_eq!(
+            decide_hard_disable(&MockEnv::new().set("RUST_TEST_THREADS", "1")),
+            Some(DisableReason::CargoTest)
+        );
+    }
+
+    /// `AURA_TELEMETRY_ENABLED=false` is a tier-2 config disable, NOT a
+    /// tier-1 hard disable — it must not appear in `decide_hard_disable`.
+    #[test]
+    fn hard_does_not_include_aura_telemetry_enabled() {
+        let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", "false");
+        assert_eq!(decide_hard_disable(&env), None);
+    }
+
+    #[test]
+    fn hard_precedence() {
+        // DNT beats AuraDisabled beats CI beats cargo; first CI var wins.
+        assert_eq!(
+            decide_hard_disable(
+                &MockEnv::new()
+                    .set("DO_NOT_TRACK", "1")
+                    .set("AURA_TELEMETRY_DISABLED", "1")
+                    .set("CI", "true")
+            ),
+            Some(DisableReason::DoNotTrack)
+        );
+        assert_eq!(
+            decide_hard_disable(
+                &MockEnv::new()
+                    .set("AURA_TELEMETRY_DISABLED", "1")
+                    .set("CI", "true")
+            ),
+            Some(DisableReason::AuraDisabled)
+        );
+        assert_eq!(
+            decide_hard_disable(
+                &MockEnv::new()
+                    .set("CI", "true")
+                    .set("CARGO_TARGET_TMPDIR", "/tmp")
+            ),
+            Some(DisableReason::Ci("CI"))
+        );
+        assert_eq!(
+            decide_hard_disable(
+                &MockEnv::new()
+                    .set("CI", "true")
+                    .set("GITHUB_ACTIONS", "true")
+                    .set("BUILDKITE", "true")
+            ),
+            Some(DisableReason::Ci("CI"))
+        );
+    }
+
+    // ---- decide_state (tri-state resolution) ----
+
+    #[test]
+    fn state_unknown_when_nothing_recorded() {
+        assert_eq!(decide_state(&MockEnv::new(), None), TelemetryState::Unknown);
+    }
+
+    #[test]
+    fn state_file_true_enables() {
+        assert_eq!(
+            decide_state(&MockEnv::new(), Some(true)),
+            TelemetryState::Enabled
         );
     }
 
     #[test]
-    fn generic_ci_disables() {
-        let env = MockEnv::new().set("CI", "true");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::Ci("CI")));
+    fn state_file_false_disables() {
+        assert_eq!(
+            decide_state(&MockEnv::new(), Some(false)),
+            TelemetryState::Disabled(DisableReason::ConfigDisabled)
+        );
     }
 
     #[test]
-    fn each_ci_provider_disables() {
-        for name in CI_ENV_VARS {
-            let env = MockEnv::new().set(name, "true");
+    fn state_env_enabled_truthy() {
+        for v in ["true", "yes", "on", "1", "enabled"] {
+            let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", v);
             assert_eq!(
-                decide_disabled(&env),
-                Some(DisableReason::Ci(name)),
-                "expected CI provider {name} to disable telemetry"
+                decide_state(&env, None),
+                TelemetryState::Enabled,
+                "AURA_TELEMETRY_ENABLED={v:?} should enable"
             );
         }
     }
 
     #[test]
-    fn cargo_target_tmpdir_disables() {
-        let env = MockEnv::new().set("CARGO_TARGET_TMPDIR", "/tmp/whatever");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::CargoTest));
+    fn state_env_enabled_false_disables() {
+        for v in ["false", "FALSE", "no", "off", "0"] {
+            let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", v);
+            assert_eq!(
+                decide_state(&env, None),
+                TelemetryState::Disabled(DisableReason::ConfigDisabled),
+                "AURA_TELEMETRY_ENABLED={v:?} should disable"
+            );
+        }
     }
 
     #[test]
-    fn rust_test_threads_disables() {
-        let env = MockEnv::new().set("RUST_TEST_THREADS", "1");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::CargoTest));
+    fn state_env_empty_falls_through_to_file() {
+        // `AURA_TELEMETRY_ENABLED=` (empty) is treated as unset, so the
+        // file preference (here: none) decides.
+        let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", "");
+        assert_eq!(decide_state(&env, None), TelemetryState::Unknown);
+        assert_eq!(decide_state(&env, Some(true)), TelemetryState::Enabled);
     }
 
     #[test]
-    fn aura_telemetry_enabled_false_disables() {
-        let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", "false");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::ConfigDisabled));
+    fn state_env_wins_over_file() {
+        let enabled = MockEnv::new().set("AURA_TELEMETRY_ENABLED", "true");
+        assert_eq!(decide_state(&enabled, Some(false)), TelemetryState::Enabled);
+        let disabled = MockEnv::new().set("AURA_TELEMETRY_ENABLED", "false");
+        assert_eq!(
+            decide_state(&disabled, Some(true)),
+            TelemetryState::Disabled(DisableReason::ConfigDisabled)
+        );
     }
 
+    /// The load-bearing guarantee: a hard disable beats an explicit
+    /// enable from either env or file. A misconfigured
+    /// `AURA_TELEMETRY_ENABLED=true` in CI must still not send.
     #[test]
-    fn aura_telemetry_enabled_true_does_not_disable() {
-        let env = MockEnv::new().set("AURA_TELEMETRY_ENABLED", "true");
-        assert_eq!(decide_disabled(&env), None);
-    }
-
-    // Precedence tests — critical: each upstream check must short-circuit
-    // before downstream checks fire, so the recorded disable_reason
-    // reflects user intent ("user explicitly opted out") vs. environment
-    // ("we happened to be in CI").
-
-    #[test]
-    fn do_not_track_beats_ci() {
-        let env = MockEnv::new()
+    fn state_hard_disable_beats_explicit_enable() {
+        let dnt_plus_file = MockEnv::new().set("DO_NOT_TRACK", "1");
+        assert_eq!(
+            decide_state(&dnt_plus_file, Some(true)),
+            TelemetryState::Disabled(DisableReason::DoNotTrack)
+        );
+        let dnt_plus_env = MockEnv::new()
             .set("DO_NOT_TRACK", "1")
+            .set("AURA_TELEMETRY_ENABLED", "true");
+        assert_eq!(
+            decide_state(&dnt_plus_env, None),
+            TelemetryState::Disabled(DisableReason::DoNotTrack)
+        );
+        let ci_plus_env = MockEnv::new()
             .set("CI", "true")
-            .set("GITHUB_ACTIONS", "true");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::DoNotTrack));
-    }
-
-    #[test]
-    fn do_not_track_beats_aura_disabled() {
-        let env = MockEnv::new()
-            .set("DO_NOT_TRACK", "1")
-            .set("AURA_TELEMETRY_DISABLED", "1");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::DoNotTrack));
-    }
-
-    #[test]
-    fn aura_disabled_beats_ci() {
-        let env = MockEnv::new()
-            .set("AURA_TELEMETRY_DISABLED", "1")
-            .set("CI", "true");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::AuraDisabled));
-    }
-
-    #[test]
-    fn ci_beats_cargo_test() {
-        let env = MockEnv::new()
-            .set("CI", "true")
-            .set("CARGO_TARGET_TMPDIR", "/tmp");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::Ci("CI")));
-    }
-
-    #[test]
-    fn ci_provider_order_is_deterministic() {
-        // When multiple CI vars are set, the first one in CI_ENV_VARS wins.
-        let env = MockEnv::new()
-            .set("CI", "true")
-            .set("GITHUB_ACTIONS", "true")
-            .set("BUILDKITE", "true");
-        assert_eq!(decide_disabled(&env), Some(DisableReason::Ci("CI")));
+            .set("AURA_TELEMETRY_ENABLED", "true");
+        assert_eq!(
+            decide_state(&ci_plus_env, Some(true)),
+            TelemetryState::Disabled(DisableReason::Ci("CI"))
+        );
     }
 }

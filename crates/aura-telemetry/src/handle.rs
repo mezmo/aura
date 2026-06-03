@@ -24,7 +24,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::disable::DisableReason;
+use crate::disable::{DisableReason, TelemetryState};
 use crate::inspection_log::{disable_reason_label, InspectedEvent, InspectionLog};
 use crate::properties::{DeploymentMethod, OsFamily, Source};
 use crate::sink::{build_event_json, post_batch, Envelope};
@@ -49,9 +49,12 @@ pub struct TelemetryConfig {
     pub deployment_method: DeploymentMethod,
     pub aura_version: &'static str,
     pub inspection_log_path: Option<PathBuf>,
-    /// Pre-computed disable reason (from `disable::decide_disabled`
-    /// plus the caller's own config-disable check).
-    pub disable_reason: Option<DisableReason>,
+    /// The resolved telemetry state (from `disable::decide_state`).
+    /// `Unknown` holds events locally without sending; `Enabled` spawns
+    /// the sink at init; `Disabled` never sends. A handle that inits
+    /// `Unknown` can later transition to `Enabled` at runtime via
+    /// [`TelemetryHandle::enable`].
+    pub state: TelemetryState,
     /// Buffer between `capture` and the background task. Defaults to
     /// 256; full → drop (incremented on the dropped counter).
     pub channel_capacity: usize,
@@ -92,7 +95,7 @@ impl TelemetryConfig {
             deployment_method: DeploymentMethod::Local,
             aura_version: env!("CARGO_PKG_VERSION"),
             inspection_log_path,
-            disable_reason: None,
+            state: TelemetryState::Enabled,
             channel_capacity: 256,
             batch_size: 25,
             flush_interval: Duration::from_secs(5),
@@ -129,21 +132,68 @@ pub struct FileTelemetryConfig {
     pub api_key: Option<String>,
 }
 
+/// Outcome of [`TelemetryHandle::enable`], so callers can report
+/// honestly instead of always claiming success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnableOutcome {
+    /// State is now `Enabled` and the sink is running for this session
+    /// (either a fresh `Unknown → Enabled`, or resuming a runtime
+    /// `/telemetry disable`).
+    Enabled,
+    /// Was already `Enabled`; nothing changed.
+    AlreadyEnabled,
+    /// Could not enable for this session: telemetry was hard-disabled at
+    /// init (a kill switch such as `DO_NOT_TRACK`, or config
+    /// `enabled = false`), so there is no captured sink to start. A
+    /// persisted preference still applies on the next launch — provided
+    /// the kill switch is no longer in force.
+    HeldUntilRestart,
+}
+
 /// Cheap clone; the inner state lives behind an `Arc`.
 #[derive(Clone)]
 pub struct TelemetryHandle {
     inner: Arc<Inner>,
 }
 
+/// Everything `init` stashes so [`TelemetryHandle::enable`] can spawn the
+/// background sink later, when an `Unknown` handle transitions to
+/// `Enabled` mid-process. Present only when the handle is not `Disabled`
+/// at init (a kill switch can never be resurrected) **and** a tokio
+/// runtime was current at init time.
+struct SinkParams {
+    /// Captured at `init` (which runs under the runtime). `enable()` runs
+    /// from the REPL loop body **outside** `rt.enter()`, so a bare
+    /// `tokio::spawn` there would panic; we spawn via this handle.
+    runtime: tokio::runtime::Handle,
+    client: reqwest::Client,
+    endpoint: String,
+    api_key: String,
+    envelope: Envelope,
+    batch_size: usize,
+    flush_interval: Duration,
+    post_timeout: Duration,
+    channel_capacity: usize,
+    inspection: Option<InspectionLog>,
+}
+
 struct Inner {
     envelope: Envelope,
     inspection: Option<InspectionLog>,
-    disable_reason: Option<DisableReason>,
+    /// Runtime-mutable telemetry state. Read by `capture_payload` (sync)
+    /// and flipped by `enable`/`set_disabled` (sync).
+    state: std::sync::Mutex<TelemetryState>,
+    /// `Some` only when the handle may ever send (init state ≠ Disabled
+    /// and a runtime was available). Consumed by `enable()`.
+    sink_params: Option<SinkParams>,
     /// `Mutex` so [`TelemetryHandle::shutdown`] can `take()` the
     /// sender and let the background task observe channel close.
     sender: std::sync::Mutex<Option<mpsc::Sender<EventPayload>>>,
     dropped: AtomicUsize,
-    bg: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `std::sync::Mutex` (not tokio) so `enable()` can populate it from
+    /// a sync context; `shutdown` `take()`s the handle before awaiting,
+    /// so the lock is never held across `.await`.
+    bg: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     // Audit-surface fields: pure read-only echo of the resolved
     // settings so `/telemetry status` and `GET /telemetry/recent` can
     // tell users where their data is going without re-deriving paths
@@ -154,9 +204,67 @@ struct Inner {
 }
 
 impl TelemetryHandle {
-    /// Was the kill switch honored at init time?
-    pub fn disable_reason(&self) -> Option<&DisableReason> {
-        self.inner.disable_reason.as_ref()
+    /// Current telemetry state (`Unknown` / `Enabled` / `Disabled`).
+    /// Cloned out so callers don't hold the lock.
+    pub fn state(&self) -> TelemetryState {
+        self.inner
+            .state
+            .lock()
+            .expect("state mutex poisoned")
+            .clone()
+    }
+
+    /// Transition to `Enabled` at runtime and start (or resume) the sink.
+    ///
+    /// Enables from `Unknown` (the first-input consent gate) **or** from a
+    /// runtime `/telemetry disable` (so `/telemetry enable` is a symmetric,
+    /// immediate undo). Both are possible only when a sink was captured at
+    /// `init` — i.e. init was not a hard `Disabled`. A startup kill switch
+    /// or config `enabled = false` leaves `sink_params` empty and can
+    /// **never** be resurrected in-process; that returns
+    /// [`EnableOutcome::HeldUntilRestart`] and leaves the state `Disabled`.
+    ///
+    /// Idempotent: a second call once the sink exists just flips the state
+    /// flag. Events captured while `Unknown`/`Disabled` were never queued,
+    /// so enabling does **not** backfill them. Spawns via the runtime
+    /// handle captured at `init`.
+    pub fn enable(&self) -> EnableOutcome {
+        {
+            let mut st = self.inner.state.lock().expect("state mutex poisoned");
+            if matches!(*st, TelemetryState::Enabled) {
+                return EnableOutcome::AlreadyEnabled;
+            }
+            // Unknown, or a runtime `set_disabled`. Either can transition,
+            // but only if a sink was captured at init. No sink ⇒ init was
+            // a hard Disabled (kill switch / config), which we never
+            // resurrect: hold until the next launch.
+            if self.inner.sink_params.is_none() {
+                return EnableOutcome::HeldUntilRestart;
+            }
+            *st = TelemetryState::Enabled;
+        }
+        // `sink_params` is Some (checked under the lock above; it is
+        // immutable for the life of the handle).
+        let params = self
+            .inner
+            .sink_params
+            .as_ref()
+            .expect("sink_params present after the Some check");
+        let mut tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
+        if tx_guard.is_none() {
+            let (tx, bg) = spawn_sink(params);
+            *tx_guard = Some(tx);
+            *self.inner.bg.lock().expect("bg mutex poisoned") = Some(bg);
+        }
+        EnableOutcome::Enabled
+    }
+
+    /// Transition to `Disabled` at runtime (the first-input opt-out).
+    /// Future captures are held; any already-spawned sink simply stops
+    /// receiving (no new events are queued). Persisting the preference is
+    /// the caller's responsibility.
+    pub fn set_disabled(&self, reason: DisableReason) {
+        *self.inner.state.lock().expect("state mutex poisoned") = TelemetryState::Disabled(reason);
     }
 
     /// Number of events dropped because the channel was full.
@@ -202,12 +310,22 @@ impl TelemetryHandle {
     /// `EventPayload` (e.g. the synthetic `telemetry_opt_out` first
     /// record). Tests also use this.
     pub fn capture_payload(&self, payload: EventPayload) {
-        // Disabled path: nothing goes on the wire; write the
-        // inspection log entry here with the kill-switch label. No
-        // channel send, no background-task involvement.
-        if let Some(reason) = self.inner.disable_reason.as_ref() {
-            self.append_local(&payload, false, Some(disable_reason_label(reason)));
-            return;
+        // Held paths (Disabled / Unknown): nothing goes on the wire;
+        // write the inspection-log entry here with a stable label so the
+        // user can inspect what was *held* (and, for Unknown, what
+        // *would* be sent). No channel send, no background-task
+        // involvement, and Unknown events are never backfilled because
+        // they are never queued.
+        match self.state() {
+            TelemetryState::Disabled(reason) => {
+                self.append_local(&payload, false, Some(disable_reason_label(&reason)));
+                return;
+            }
+            TelemetryState::Unknown => {
+                self.append_local(&payload, false, Some("Unknown".into()));
+                return;
+            }
+            TelemetryState::Enabled => {}
         }
         // Active path: hand the payload to the background task. The
         // background task is the only writer that knows the POST
@@ -269,8 +387,10 @@ impl TelemetryHandle {
             let mut tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
             tx_guard.take();
         }
-        let mut bg = self.inner.bg.lock().await;
-        if let Some(handle) = bg.take() {
+        // `take()` the JoinHandle out of the std mutex BEFORE awaiting,
+        // so the lock is never held across `.await`.
+        let bg = self.inner.bg.lock().expect("bg mutex poisoned").take();
+        if let Some(handle) = bg {
             let _ = tokio::time::timeout(budget, handle).await;
         }
     }
@@ -314,40 +434,51 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
         }
     });
 
-    let (sender, bg_handle) = if config.disable_reason.is_none() {
-        let (tx, rx) = mpsc::channel::<EventPayload>(config.channel_capacity);
-        let client = config.http_client.clone().unwrap_or_default();
-        let endpoint = config.endpoint.clone();
-        let api_key = config.api_key.clone();
-        let envelope_for_task = envelope.clone();
-        let batch_size = config.batch_size;
-        let flush_interval = config.flush_interval;
-        let inspection_for_task = inspection.clone();
-        let post_timeout = config.post_timeout;
-        let handle = tokio::spawn(run_background(BackgroundCtx {
-            rx,
-            client,
-            endpoint,
-            api_key,
-            envelope: envelope_for_task,
-            batch_size,
-            flush_interval,
-            post_timeout,
-            inspection: inspection_for_task,
-        }));
-        (Some(tx), Some(handle))
+    let state = config.state.clone();
+
+    // Stash everything needed to spawn the sink later, but only when the
+    // handle could ever send (not Disabled) AND a tokio runtime is
+    // current (it always is in production — init runs under rt.enter();
+    // a missing runtime only happens in non-async test fixtures, which
+    // then degrade to local-only inspection writes).
+    let sink_params = if matches!(state, TelemetryState::Disabled(_)) {
+        None
     } else {
-        (None, None)
+        tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|runtime| SinkParams {
+                runtime,
+                client: config.http_client.clone().unwrap_or_default(),
+                endpoint: config.endpoint.clone(),
+                api_key: config.api_key.clone(),
+                envelope: envelope.clone(),
+                batch_size: config.batch_size,
+                flush_interval: config.flush_interval,
+                post_timeout: config.post_timeout,
+                channel_capacity: config.channel_capacity,
+                inspection: inspection.clone(),
+            })
+    };
+
+    // Spawn the sink eagerly only when Enabled at init. Unknown defers
+    // to `enable()`; Disabled never spawns.
+    let (sender, bg_handle) = match (&state, sink_params.as_ref()) {
+        (TelemetryState::Enabled, Some(p)) => {
+            let (tx, bg) = spawn_sink(p);
+            (Some(tx), Some(bg))
+        }
+        _ => (None, None),
     };
 
     let handle = TelemetryHandle {
         inner: Arc::new(Inner {
             envelope,
             inspection,
-            disable_reason: config.disable_reason.clone(),
+            state: std::sync::Mutex::new(state.clone()),
+            sink_params,
             sender: std::sync::Mutex::new(sender),
             dropped: AtomicUsize::new(0),
-            bg: tokio::sync::Mutex::new(bg_handle),
+            bg: std::sync::Mutex::new(bg_handle),
             endpoint: config.endpoint.clone(),
             install_id_path: config.install_id_path.clone(),
             inspection_log_path: config.inspection_log_path.clone(),
@@ -356,8 +487,9 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
 
     // Synthetic first record: when disabled, write a `telemetry_opt_out`
     // line so the user can see in `/telemetry recent` that the kill
-    // switch took effect. Never goes on the wire.
-    if let Some(reason) = &config.disable_reason {
+    // switch took effect. Never goes on the wire. (Unknown writes no
+    // synthetic record — its held events carry the `"Unknown"` label.)
+    if let TelemetryState::Disabled(reason) = &state {
         if let Some(log) = &handle.inner.inspection {
             let label = disable_reason_label(reason);
             let mut props = serde_json::Map::new();
@@ -380,6 +512,25 @@ pub fn init(config: TelemetryConfig) -> TelemetryHandle {
     }
 
     handle
+}
+
+/// Create the channel + spawn the background flush task via the stored
+/// runtime handle. Shared by `init` (Enabled-at-start) and
+/// [`TelemetryHandle::enable`] (Unknown→Enabled at runtime).
+fn spawn_sink(p: &SinkParams) -> (mpsc::Sender<EventPayload>, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<EventPayload>(p.channel_capacity);
+    let bg = p.runtime.spawn(run_background(BackgroundCtx {
+        rx,
+        client: p.client.clone(),
+        endpoint: p.endpoint.clone(),
+        api_key: p.api_key.clone(),
+        envelope: p.envelope.clone(),
+        batch_size: p.batch_size,
+        flush_interval: p.flush_interval,
+        post_timeout: p.post_timeout,
+        inspection: p.inspection.clone(),
+    }));
+    (tx, bg)
 }
 
 struct BackgroundCtx {

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use crate::disable::{decide_disabled, DisableReason, EnvProvider, SystemEnv};
+use crate::disable::{decide_state, EnvProvider, SystemEnv, TelemetryState};
 use crate::install_id;
 use crate::properties::{DeploymentMethod, OsFamily, Source};
 use crate::{FileTelemetryConfig, TelemetryConfig};
@@ -37,48 +37,82 @@ pub const DEFAULT_API_KEY: &str = match option_env!("AURA_TELEMETRY_BUILD_API_KE
     None => "",
 };
 
-/// Resolve the install-id persistence path.
+/// Resolve the install-id persistence path. **Source-aware**, mirroring
+/// [`default_inspection_log_path`] so the install-id and the inspection
+/// log land under the same root.
 ///
-/// Preference order:
-/// 1. `$HOME/.aura/install-id` if `HOME` is set (the path users see
-///    documented in `docs/telemetry.md`).
-/// 2. `{memory_dir}/install-id` when supplied by the server (system
-///    accounts without `$HOME`).
-/// 3. `.aura/install-id` relative to the current working directory as
-///    a last resort.
+/// - [`Source::WebServer`]: prefer `{memory_dir}/install-id`. The server's
+///   durable location is the mounted volume (e.g. `/app/state`); its
+///   `$HOME` is typically the ephemeral container layer, so persisting
+///   the install-id there would churn the install count across container
+///   recreation. Falls back to `$HOME/.aura/install-id`, then cwd.
+/// - [`Source::Cli`]: prefer `$HOME/.aura/install-id` (the path users see
+///   documented in `docs/telemetry.md`); `{memory_dir}` is only a
+///   fallback for system accounts without `$HOME`, then cwd.
 ///
 /// `HOME` is read through the injected [`EnvProvider`] so unit tests
 /// can supply a `MockEnv` and keep their install-id inside a tempdir
 /// instead of writing to the developer's real `~/.aura/install-id`.
-pub fn resolve_install_id_path(memory_dir: Option<&Path>, env: &dyn EnvProvider) -> PathBuf {
-    if let Some(home) = env.var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".aura").join("install-id");
+pub fn resolve_install_id_path(
+    source: Source,
+    memory_dir: Option<&Path>,
+    env: &dyn EnvProvider,
+) -> PathBuf {
+    match source {
+        Source::WebServer => {
+            if let Some(dir) = memory_dir {
+                return dir.join("install-id");
+            }
+            if let Some(p) = home_install_id(env) {
+                return p;
+            }
         }
-    }
-    if let Some(dir) = memory_dir {
-        return dir.join("install-id");
+        Source::Cli => {
+            if let Some(p) = home_install_id(env) {
+                return p;
+            }
+            if let Some(dir) = memory_dir {
+                return dir.join("install-id");
+            }
+        }
     }
     PathBuf::from(".aura").join("install-id")
 }
 
+/// `$HOME/.aura/install-id` when `HOME` is set and non-empty.
+fn home_install_id(env: &dyn EnvProvider) -> Option<PathBuf> {
+    env.var("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|home| PathBuf::from(home).join(".aura").join("install-id"))
+}
+
 /// Whether the install-id resolved for these inputs lands in a
 /// **durable** location — one that survives container recreation and
-/// image pulls.
+/// image pulls. **Source-aware**, matching [`resolve_install_id_path`].
 ///
-/// Mirrors the precedence in [`resolve_install_id_path`]: `$HOME` or an
-/// explicit `memory_dir` are durable; the bare-cwd `.aura` fallback is
-/// not, because in a container that lives in the ephemeral writable
-/// layer (lost on `docker rm` / `compose up` after a pull). When this
-/// returns `false` and telemetry is active, [`build_config_with_env`]
-/// emits a one-time warning so the install-count instability is loud
-/// rather than silent.
+/// - [`Source::WebServer`]: durable **only** when an explicit `memory_dir`
+///   (a mounted volume) is configured. The container's `$HOME` is the
+///   ephemeral writable layer, so a server relying on it churns the
+///   install count across recreation — when telemetry is active and no
+///   `memory_dir` is set, [`build_config_with_env`] emits a one-time
+///   warning nudging the operator to mount one (the documented durable
+///   location for servers in `docs/telemetry.md`). A bare-host server
+///   with a real `$HOME` but no `memory_dir` gets the same nudge; that
+///   mild false positive is acceptable since `memory_dir` is the
+///   sanctioned durable root either way.
+/// - [`Source::Cli`]: durable when `$HOME` is set (the user's home) or
+///   `memory_dir` is supplied; only the bare-cwd `.aura` fallback is not.
 ///
-/// Kept adjacent to `resolve_install_id_path` so the two stay in sync;
-/// `install_id_durability_matches_path` locks that with a test.
-fn install_id_is_durable(memory_dir: Option<&Path>, env: &dyn EnvProvider) -> bool {
-    let home_set = env.var("HOME").map(|h| !h.is_empty()).unwrap_or(false);
-    home_set || memory_dir.is_some()
+/// `install_id_durability_matches_path` locks the CLI predicate against
+/// the path resolver so the two stay in sync.
+fn install_id_is_durable(source: Source, memory_dir: Option<&Path>, env: &dyn EnvProvider) -> bool {
+    match source {
+        Source::WebServer => memory_dir.is_some(),
+        Source::Cli => {
+            let home_set = env.var("HOME").map(|h| !h.is_empty()).unwrap_or(false);
+            home_set || memory_dir.is_some()
+        }
+    }
 }
 
 /// Resolve the local inspection-log path. Returns `None` when the user
@@ -181,28 +215,23 @@ pub fn build_config_with_env(
         .unwrap_or_else(|| DEFAULT_API_KEY.to_string());
     let deployment_method = DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
 
-    // Layer the disable decision: env > auto-disable > file. The file
-    // case is the lowest-precedence kill switch by design (a user with
-    // DO_NOT_TRACK=1 in their shell should see DoNotTrack reflected,
-    // not ConfigDisabled, even if the file also opts out).
-    let mut disable_reason = decide_disabled(env);
-    if disable_reason.is_none() {
-        if let Some(false) = file.and_then(|f| f.enabled) {
-            disable_reason = Some(DisableReason::ConfigDisabled);
-        }
-    }
+    // Resolve the tri-state: hard kill switches + CI/test → Disabled
+    // (even over an explicit enable); `AURA_TELEMETRY_ENABLED` / config
+    // `enabled` → Enabled or Disabled; otherwise Unknown (held until a
+    // notice or explicit enable). The recorded preference is the file's
+    // `[telemetry] enabled` field.
+    let state = decide_state(env, file.and_then(|f| f.enabled));
 
     // Resolve the install-id path either way (so `/telemetry status`
-    // can show users where it WOULD live), but only `read_or_create`
-    // — i.e. actually touch the filesystem — when telemetry is
-    // active. A disabled run uses an ephemeral per-run UUID; nothing
-    // goes on the wire, the install-id file is never written, and
-    // tests / `cargo test` subprocesses cannot pollute the developer's
-    // real `~/.aura/install-id`.
-    let install_id_path = resolve_install_id_path(memory_dir, env);
-    let durable_location = install_id_is_durable(memory_dir, env);
+    // can show users where it WOULD live). Touch the filesystem for
+    // Enabled AND Unknown (Unknown needs a stable id ready for a later
+    // `enable()` transition; the write never implies a send), but never
+    // for Disabled — a disabled run uses an ephemeral per-run UUID so
+    // `cargo test` subprocesses can't pollute `~/.aura/install-id`.
+    let install_id_path = resolve_install_id_path(source, memory_dir, env);
+    let durable_location = install_id_is_durable(source, memory_dir, env);
     let mut persisted = false;
-    let install_id = if disable_reason.is_some() {
+    let install_id = if matches!(state, TelemetryState::Disabled(_)) {
         Uuid::new_v4()
     } else {
         match install_id::read_or_create(&install_id_path) {
@@ -218,12 +247,11 @@ pub fn build_config_with_env(
         }
     };
 
-    // When telemetry is active but the install-id won't survive a
-    // restart/recreation, the install count churns (every container
-    // recreation looks like a new install). Warn loudly — this is the
-    // dumb-fix nudge: set `memory_dir` on a persistent volume. A
-    // disabled run never counts, so it doesn't warn.
-    if disable_reason.is_none() && !persisted {
+    // When telemetry is **Enabled** but the install-id won't survive a
+    // restart/recreation, the install count churns. Warn loudly — the
+    // dumb-fix nudge is to set `memory_dir` on a persistent volume.
+    // Unknown/Disabled never send, so they don't warn.
+    if matches!(state, TelemetryState::Enabled) && !persisted {
         tracing::warn!(
             path = %install_id_path.display(),
             "telemetry install-id is not on persistent storage; the install \
@@ -240,23 +268,28 @@ pub fn build_config_with_env(
     cfg.install_id_path = Some(install_id_path);
     cfg.deployment_method = deployment_method;
     cfg.os_family = OsFamily::current();
-    cfg.disable_reason = disable_reason;
+    cfg.state = state;
     cfg
 }
 
-/// Best-effort label for the disable reason (or "active") suitable for
-/// a single info-level log line at startup.
-pub fn startup_log_line(reason: Option<&DisableReason>) -> String {
+/// Best-effort one-line startup summary of the telemetry state.
+pub fn startup_log_line(state: &TelemetryState) -> String {
     use crate::inspection_log::disable_reason_label;
-    match reason {
-        None => "telemetry: active".to_string(),
-        Some(r) => format!("telemetry: disabled ({})", disable_reason_label(r)),
+    match state {
+        TelemetryState::Unknown => {
+            "telemetry: unknown (held — awaiting notice or explicit enable)".to_string()
+        }
+        TelemetryState::Enabled => "telemetry: active".to_string(),
+        TelemetryState::Disabled(r) => {
+            format!("telemetry: disabled ({})", disable_reason_label(r))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disable::DisableReason;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -358,14 +391,26 @@ mod tests {
     }
 
     #[test]
-    fn build_config_records_disable_reason_from_env() {
+    fn build_config_records_disabled_state_from_env() {
         let env = MockEnv::default().set("DO_NOT_TRACK", "1");
         let dir = tempfile::tempdir().unwrap();
         let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), None, &env);
         assert!(matches!(
-            cfg.disable_reason,
-            Some(DisableReason::DoNotTrack)
+            cfg.state,
+            TelemetryState::Disabled(DisableReason::DoNotTrack)
         ));
+    }
+
+    #[test]
+    fn no_preference_resolves_unknown() {
+        // The behavioural inversion: with nothing recorded, the state is
+        // Unknown (held), not Enabled. install-id is still resolved for
+        // a later transition.
+        let env = MockEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), None, &env);
+        assert!(matches!(cfg.state, TelemetryState::Unknown));
+        assert!(cfg.install_id_path.is_some());
     }
 
     #[test]
@@ -378,26 +423,25 @@ mod tests {
         };
         let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
         assert!(matches!(
-            cfg.disable_reason,
-            Some(DisableReason::ConfigDisabled)
+            cfg.state,
+            TelemetryState::Disabled(DisableReason::ConfigDisabled)
         ));
     }
 
     #[test]
-    fn env_disable_outranks_file_disable() {
-        // Both env and file opt out — env's DoNotTrack must win so the
-        // recorded reason reflects user intent ("opted out via the
-        // industry-standard env") not configuration state.
+    fn env_disable_outranks_file_enable() {
+        // env DoNotTrack must win even over an explicit file enable —
+        // the hard-disable-beats-explicit-enable guarantee.
         let env = MockEnv::default().set("DO_NOT_TRACK", "1");
         let dir = tempfile::tempdir().unwrap();
         let file = FileTelemetryConfig {
-            enabled: Some(false),
+            enabled: Some(true),
             ..Default::default()
         };
         let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
         assert!(matches!(
-            cfg.disable_reason,
-            Some(DisableReason::DoNotTrack)
+            cfg.state,
+            TelemetryState::Disabled(DisableReason::DoNotTrack)
         ));
     }
 
@@ -428,9 +472,10 @@ mod tests {
     }
 
     #[test]
-    fn file_enabled_true_is_a_no_op() {
-        // `enabled = true` should not flip the disable reason; the
-        // built-in default is on.
+    fn file_enabled_true_is_explicit_enable() {
+        // Under the consent model `enabled = true` is the operator's
+        // explicit opt-in → Enabled (not a no-op as in the old opt-out
+        // model where the default was already on).
         let env = MockEnv::default();
         let dir = tempfile::tempdir().unwrap();
         let file = FileTelemetryConfig {
@@ -438,16 +483,20 @@ mod tests {
             ..Default::default()
         };
         let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), Some(&file), &env);
-        assert!(cfg.disable_reason.is_none());
+        assert!(matches!(cfg.state, TelemetryState::Enabled));
     }
 
     #[test]
-    fn startup_log_line_active_and_disabled() {
-        assert_eq!(startup_log_line(None), "telemetry: active");
+    fn startup_log_line_covers_three_states() {
         assert_eq!(
-            startup_log_line(Some(&DisableReason::DoNotTrack)),
+            startup_log_line(&TelemetryState::Enabled),
+            "telemetry: active"
+        );
+        assert_eq!(
+            startup_log_line(&TelemetryState::Disabled(DisableReason::DoNotTrack)),
             "telemetry: disabled (DoNotTrack)"
         );
+        assert!(startup_log_line(&TelemetryState::Unknown).contains("unknown"));
     }
 
     /// Regression: `resolve_install_id_path` used to read
@@ -461,7 +510,7 @@ mod tests {
     fn install_id_path_honors_injected_home() {
         let fake_home = tempfile::tempdir().unwrap();
         let env = MockEnv::default().set("HOME", &fake_home.path().to_string_lossy());
-        let resolved = resolve_install_id_path(None, &env);
+        let resolved = resolve_install_id_path(Source::Cli, None, &env);
         assert!(
             resolved.starts_with(fake_home.path()),
             "install-id path must root under the injected HOME, got {}",
@@ -474,39 +523,98 @@ mod tests {
     fn install_id_path_falls_back_to_memory_dir_when_home_unset() {
         let memory = tempfile::tempdir().unwrap();
         let env = MockEnv::default(); // no HOME
-        let resolved = resolve_install_id_path(Some(memory.path()), &env);
+        let resolved = resolve_install_id_path(Source::Cli, Some(memory.path()), &env);
         assert_eq!(resolved, memory.path().join("install-id"));
+    }
+
+    /// The server's durable location is the mounted `memory_dir`, so it
+    /// wins over `$HOME` (the ephemeral container layer) — mirroring the
+    /// inspection-log resolution. Regression for the bug where a server
+    /// with `$HOME` set wrote its install-id outside the persisted volume
+    /// and silently churned the install count.
+    #[test]
+    fn web_server_install_id_prefers_memory_dir_over_home() {
+        let memory = tempfile::tempdir().unwrap();
+        let env = MockEnv::default().set("HOME", "/home/aura");
+        let resolved = resolve_install_id_path(Source::WebServer, Some(memory.path()), &env);
+        assert_eq!(resolved, memory.path().join("install-id"));
+    }
+
+    #[test]
+    fn web_server_install_id_falls_back_to_home_without_memory_dir() {
+        let env = MockEnv::default().set("HOME", "/home/aura");
+        let resolved = resolve_install_id_path(Source::WebServer, None, &env);
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("/home/aura")
+                .join(".aura")
+                .join("install-id")
+        );
+    }
+
+    /// End-to-end through `build_config_with_env`: even with `$HOME` set
+    /// (the typical container case), a server with a configured
+    /// `memory_dir` roots its install-id under that mounted volume, so it
+    /// survives container recreation.
+    #[test]
+    fn web_server_build_config_roots_install_id_in_memory_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = MockEnv::default().set("HOME", "/home/aura");
+        let cfg = build_config_with_env(Source::WebServer, Some(dir.path()), None, &env);
+        assert_eq!(
+            cfg.install_id_path.as_deref(),
+            Some(dir.path().join("install-id").as_path())
+        );
     }
 
     #[test]
     fn install_id_durable_with_home() {
         let env = MockEnv::default().set("HOME", "/home/dev");
-        assert!(install_id_is_durable(None, &env));
+        assert!(install_id_is_durable(Source::Cli, None, &env));
     }
 
     #[test]
     fn install_id_durable_with_memory_dir_and_no_home() {
         let env = MockEnv::default();
         let dir = tempfile::tempdir().unwrap();
-        assert!(install_id_is_durable(Some(dir.path()), &env));
+        assert!(install_id_is_durable(Source::Cli, Some(dir.path()), &env));
     }
 
     #[test]
     fn install_id_not_durable_with_neither() {
         // No HOME, no memory_dir → bare-cwd fallback → not durable.
         let env = MockEnv::default();
-        assert!(!install_id_is_durable(None, &env));
+        assert!(!install_id_is_durable(Source::Cli, None, &env));
     }
 
     #[test]
     fn install_id_not_durable_with_empty_home() {
         let env = MockEnv::default().set("HOME", "");
-        assert!(!install_id_is_durable(None, &env));
+        assert!(!install_id_is_durable(Source::Cli, None, &env));
     }
 
-    /// Lock the durability predicate against the path resolver so the
-    /// two can't drift: whenever `install_id_is_durable` is true, the
+    /// Server durability hinges on `memory_dir`, not `$HOME`: a server
+    /// relying on its container `$HOME` must be flagged not-durable so the
+    /// warning fires, while a configured `memory_dir` is durable.
+    #[test]
+    fn web_server_durability_requires_memory_dir() {
+        let with_home = MockEnv::default().set("HOME", "/home/aura");
+        assert!(
+            !install_id_is_durable(Source::WebServer, None, &with_home),
+            "server with only $HOME is not durable (warning should fire)"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            install_id_is_durable(Source::WebServer, Some(dir.path()), &with_home),
+            "server with a mounted memory_dir is durable"
+        );
+    }
+
+    /// Lock the **CLI** durability predicate against the path resolver so
+    /// the two can't drift: whenever `install_id_is_durable` is true, the
     /// resolved path must NOT be the bare-cwd fallback, and vice versa.
+    /// (The server predicate intentionally diverges — `$HOME` resolves a
+    /// path but is not durable — so it is covered separately above.)
     #[test]
     fn install_id_durability_matches_path() {
         let cwd_fallback = std::path::PathBuf::from(".aura").join("install-id");
@@ -523,8 +631,8 @@ mod tests {
             if let Some(h) = home {
                 env = env.set("HOME", h);
             }
-            let durable = install_id_is_durable(*memory_dir, &env);
-            let path = resolve_install_id_path(*memory_dir, &env);
+            let durable = install_id_is_durable(Source::Cli, *memory_dir, &env);
+            let path = resolve_install_id_path(Source::Cli, *memory_dir, &env);
             assert_eq!(
                 durable,
                 path != cwd_fallback,
@@ -537,7 +645,7 @@ mod tests {
     fn install_id_path_treats_empty_home_as_unset() {
         let memory = tempfile::tempdir().unwrap();
         let env = MockEnv::default().set("HOME", ""); // HOME present but empty
-        let resolved = resolve_install_id_path(Some(memory.path()), &env);
+        let resolved = resolve_install_id_path(Source::Cli, Some(memory.path()), &env);
         // Falls through to memory_dir branch, not the literal empty
         // prefix. Without this guard `PathBuf::from("").join(".aura")`
         // would produce a relative path the caller didn't ask for.
@@ -558,8 +666,8 @@ mod tests {
             .set("DO_NOT_TRACK", "1");
         let cfg = build_config_with_env(Source::Cli, None, None, &env);
         assert!(matches!(
-            cfg.disable_reason,
-            Some(DisableReason::DoNotTrack)
+            cfg.state,
+            TelemetryState::Disabled(DisableReason::DoNotTrack)
         ));
         // The file is NOT created; the path is still surfaced for
         // /telemetry status.
