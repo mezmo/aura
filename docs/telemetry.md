@@ -1,14 +1,18 @@
 # Telemetry & Privacy
 
-Aura emits **opt-out, anonymous-tier** product telemetry to PostHog so
+Aura emits **anonymous-tier** product telemetry to PostHog so
 maintainers can answer the production-adoption question and prioritise
-work against real usage signal. This document is the canonical
-user-facing contract: every event that is collected, every value that
-is **not** collected, every kill switch, every inspection path. If you
-want to know what your install has been sending, read this file and
-then check `~/.aura/telemetry/events.jsonl` (CLI) or
+work against real usage signal. Telemetry is **notice-gated**: it is
+held until you have been shown a one-time notice (or have explicitly
+enabled it), and it is never sent before then. This document is the
+canonical user-facing contract: every state, every event collected,
+every value **not** collected, every control, every inspection path.
+
+To see what your install has sent — or *would* send — read this file
+and then check `~/.aura/telemetry/events.jsonl` (CLI) or
 `{memory_dir}/telemetry/events.jsonl` (server). Both are written
-locally on every event whether or not telemetry is enabled.
+locally for every captured event regardless of state, so even a held
+(`Unknown`) or disabled install shows you exactly what it is holding.
 
 This contract is also a build artefact, not just prose: the
 **type-level allow-list** in `crates/aura-telemetry/src/properties.rs`
@@ -18,36 +22,98 @@ can read to verify the wire payload yourself.
 
 ---
 
-## TL;DR — kill switches
+## The three states
 
-| Mechanism | What it disables | When to use |
-|-----------|------------------|-------------|
-| `DO_NOT_TRACK=1` | All outbound telemetry | Industry-standard cross-tool opt-out; honored first. |
-| `AURA_TELEMETRY_DISABLED=1` | All outbound telemetry | Aura-specific opt-out. |
-| `AURA_TELEMETRY_ENABLED=false` | All outbound telemetry | Same effect; intended for shell profiles. |
-| `[telemetry] enabled = false` in `cli.toml` or main config | All outbound telemetry | Persistent project-level disable. |
-| `/telemetry disable` (REPL) | All outbound telemetry (per-user) | Convenience; writes `enabled = false` into `~/.aura/cli.toml`. |
-| `AURA_TELEMETRY_LOG_EVENTS=0` | The **local inspection log** only | Stops `events.jsonl` from being written. The wire-side kill switches above do not affect it. |
+Telemetry is always in exactly one state:
 
-Precedence is `DO_NOT_TRACK` → `AURA_TELEMETRY_DISABLED` → CI auto-disable
-→ cargo-test auto-disable → `AURA_TELEMETRY_ENABLED=false` →
-`[telemetry] enabled = false`. The **first match wins**; the reason
-that took effect is recorded in the local inspection log so a user can
-audit what disabled telemetry on any given launch.
+| State | Meaning | Behaviour |
+|---|---|---|
+| **Unknown** | No preference recorded yet. | **Held.** Events are written to the local inspection log (so you can inspect what *would* be sent), but **nothing is sent** and held events are **never backfilled** if you later enable. |
+| **Enabled** | A notice was shown and not opted out of, or you/an operator explicitly enabled. | May send. |
+| **Disabled** | A kill switch or explicit opt-out is in effect. | Held; nothing sent. |
 
-## Auto-disabled environments
+### First-run notice (interactive CLI)
 
-Telemetry is disabled automatically — no env var required — when any of
-the following are set:
+The first time you launch the **interactive REPL** with no recorded
+preference, Aura prints a one-time notice — it states that telemetry is
+collected, links to this document, and tells you how to opt out.
+Telemetry stays **held** until your **first input**:
+
+- any normal input (a prompt, `/help`, …) is treated as consent →
+  telemetry becomes **Enabled** and `[telemetry] enabled = true` is
+  written to `~/.aura/cli.toml`;
+- `/telemetry disable` as your first input → **Disabled** (persisted);
+- quitting immediately (`/quit`) → stays **Unknown**, so you see the
+  notice again next launch.
+
+Nothing is sent during the launch in which the notice first appears
+until that first input — so you always have a chance to opt out before
+any telemetry leaves your machine.
+
+### Non-interactive surfaces
+
+Surfaces that cannot show a notice never enter `Enabled` on their own:
+
+- **One-shot `aura --query …`** never participates: no notice, nothing
+  sent.
+- **The web server** is non-interactive. It stays **Unknown** (holding,
+  inspectable, unsent) unless an operator explicitly sets
+  `[telemetry] enabled = true` / `AURA_TELEMETRY_ENABLED=true`, **or** an
+  Enabled CLI propagates consent over HTTP (see
+  [Consent propagation](#consent-propagation-cli--server)).
+- **CI / test harnesses** are non-interactive and additionally
+  hard-disabled (below), so they never send.
+
+---
+
+## Controls
+
+| Mechanism | Effect | Notes |
+|-----------|--------|-------|
+| `DO_NOT_TRACK=1` | **Disabled** | Industry-standard cross-tool opt-out; beats everything, even an explicit enable. |
+| `AURA_TELEMETRY_DISABLED=1` | **Disabled** | Aura-specific opt-out; same precedence tier. |
+| `AURA_TELEMETRY_ENABLED=true` / `=false` | **Enabled** / **Disabled** | Explicit operator/power-user opt-in or opt-out. |
+| `[telemetry] enabled = true` / `false` in `cli.toml` or main config | **Enabled** / **Disabled** | The recorded preference. Absent ⇒ `Unknown`. |
+| `/telemetry enable` / `/telemetry disable` (REPL) | **Enabled** / **Disabled** | Persists the preference to `~/.aura/cli.toml`. |
+| `AURA_TELEMETRY_LOG_EVENTS=0` | Disables the **local inspection log** only | Does not affect sending; just stops `events.jsonl` from being written. |
+
+**Resolution precedence (highest first):** hard disables
+(`DO_NOT_TRACK`, `AURA_TELEMETRY_DISABLED`, CI, cargo-test) →
+`AURA_TELEMETRY_ENABLED` → `[telemetry] enabled` preference → otherwise
+`Unknown`. A hard disable beats an explicit enable, so a misconfigured
+`AURA_TELEMETRY_ENABLED=true` in CI still cannot send. The state (and,
+when held, the reason) is recorded in the local inspection log so you
+can audit any launch.
+
+Boolean values are parsed leniently: `false`, `no`, `off`, `0`, and
+empty are false; everything else is true. So `DO_NOT_TRACK=false` does
+**not** disable (it means "do track").
+
+## Hard-disabled environments
+
+Regardless of any explicit enable, telemetry is forced to **Disabled**
+when any of these are set:
 
 `CI`, `GITHUB_ACTIONS`, `BUILDKITE`, `JENKINS_URL`, `CIRCLECI`,
 `GITLAB_CI`, `TF_BUILD`, `TEAMCITY_VERSION`, `TRAVIS`,
 `CARGO_TARGET_TMPDIR`, `RUST_TEST_THREADS`.
 
-The first two cover the bulk of OSS CI; the bottom two cover cargo's
-own integration-test and unit-test harnesses. If you run Aura under a
-CI provider not on this list and want auto-disable, set `CI=true` in
-your job environment (the universal convention).
+This keeps CI, contributor, and test environments out of the
+production-install count even if telemetry is mistakenly enabled there.
+
+## Consent propagation (CLI → server)
+
+When you use the CLI in HTTP mode against an Aura server, the CLI — once
+**Enabled** — attaches an `X-Aura-Telemetry-Consent: enabled` header to
+its requests. A server in the **Unknown** state honours that header and
+begins sending for the lifetime of that process (your consent, obtained
+interactively in the CLI, applied to the server acting on your behalf).
+This transition is **not persisted** — it re-establishes per
+connection, which avoids writing the (often read-only) server config. A
+server that is explicitly **Disabled** ignores the header. An operator
+of a shared server who does not want per-user propagation sets
+`[telemetry] enabled = false`. The CLI and server keep separate
+anonymous install IDs; the `aura_source` property distinguishes them.
 
 ---
 
@@ -78,8 +144,14 @@ rollout adds a few more events; this table grows along with them.
 | Event | Trigger | Event-specific properties |
 |---|---|---|
 | `server_started` | Once per `aura-web-server` boot, after logging init. | `default_agent_set: bool` — whether the operator pinned a default agent in config. |
-| `cli_session_started` | Once per `aura-cli` invocation, after `AppConfig::load`. | `interactive: bool`, `standalone_mode: bool`, `client_tools_enabled: bool`. |
-| `telemetry_opt_out` | Once at init **when telemetry is disabled**. Inspection-log only; never sent on the wire. | `reason: string` — names the kill switch that took effect (e.g. `DoNotTrack`, `Ci(GITHUB_ACTIONS)`). |
+| `cli_session_started` | Once per interactive `aura-cli` REPL session, after telemetry becomes **Enabled** (a recorded opt-in, or the first-run notice + first non-opt-out input). Never emitted in one-shot `--query` mode. | `interactive: bool`, `standalone_mode: bool`, `client_tools_enabled: bool`. |
+| `telemetry_opt_out` | Once at init **when telemetry is Disabled**. Inspection-log only; never sent on the wire. | `reason: string` — names the kill switch that took effect (e.g. `DoNotTrack`, `Ci(GITHUB_ACTIONS)`). |
+
+When telemetry is **Unknown** (held), every captured event is written
+to the inspection log with `sent: false` and `not_sent_reason:
+"Unknown"` — these are the "would send" payloads — and `cli_session_started`
+is captured only once the session becomes `Enabled` (so it is never
+emitted while held, and held events are never backfilled).
 
 ---
 
@@ -122,12 +194,22 @@ to hear about it.
 aura> /telemetry status
 aura> /telemetry recent
 aura> /telemetry recent 100
+aura> /telemetry enable
+aura> /telemetry disable
 ```
 
-`status` prints whether telemetry is active, which kill switch (if
-any) silenced it, the endpoint, and the install-id and inspection-log
-paths. `recent N` prints the last `N` records from the inspection
-log, oldest-first. (Phase 1 wires these commands; see task list.)
+`status` prints the current state (`unknown` / `active` /
+`disabled (reason)`), the endpoint, and the install-id and
+inspection-log paths. `recent N` prints the last `N` records from the
+inspection log, oldest-first. `enable` / `disable` record your
+preference in `~/.aura/cli.toml` and take effect immediately for the
+running session — including undoing each other (`/telemetry disable`
+then `/telemetry enable` re-enables this session). The one exception:
+a startup kill switch (`DO_NOT_TRACK`, `AURA_TELEMETRY_DISABLED`, or
+config `enabled = false`) holds telemetry off for the whole process, so
+`/telemetry enable` then only saves the preference for the next launch
+(and only once that kill switch is cleared) — it says so rather than
+claiming the session is active.
 
 ### From the server
 
@@ -166,6 +248,9 @@ Each line is one event. The fields are:
 successfully. `not_sent_reason` is `null` in that case; otherwise it
 names *why* the event was not delivered — one of:
 
+- `Unknown` when the event was **held** because no telemetry preference
+  has been recorded yet. These are the "would send" rows: the full
+  payload is recorded locally but nothing left your machine.
 - A kill-switch label (`DoNotTrack`, `AuraDisabled`,
   `Ci(GITHUB_ACTIONS)`, `CargoTest`, `ConfigDisabled`) when a kill
   switch took effect.
@@ -227,9 +312,13 @@ the source because public PostHog project keys cannot read anything.
 
 A single UUID v4, persisted in a single file:
 
-- CLI: `~/.aura/install-id`
-- Server: `~/.aura/install-id` if `$HOME` is available, otherwise
-  `{memory_dir}/install-id`.
+- CLI: `~/.aura/install-id` (falls back to `{memory_dir}/install-id`,
+  then `.aura/install-id` in the working directory, for accounts without
+  `$HOME`).
+- Server: `{memory_dir}/install-id` when `memory_dir` is configured — the
+  durable, mounted location that survives container recreation — otherwise
+  `$HOME/.aura/install-id`, then `.aura/install-id` in the working
+  directory.
 
 The file is mode `0600` on Unix, written via a `hard_link` race-safe
 publication pattern (see `crates/aura-telemetry/src/install_id.rs` for
@@ -268,20 +357,31 @@ A throwaway eval clone that persists nothing gets a fresh id each run
 and naturally does not accumulate as a stable install — which is the
 correct outcome.
 
+Note that the **server is non-interactive**, so it stays in the
+`Unknown` state and sends nothing until you opt it in — either
+explicitly (`[telemetry] enabled = true` / `AURA_TELEMETRY_ENABLED=true`)
+or by driving it with an Enabled CLI (consent propagation). The
+persistence below is what makes the install count *stable once enabled*;
+it does not by itself cause the server to send.
+
 - **Docker Compose** (the quickstart): the bundled `docker-compose.yml`
-  already sets `memory_dir` and mounts a named `aura-state` volume
-  there. Nothing to do — the install count is stable out of the box.
+  sets `memory_dir` and mounts a named `aura-state` volume there, so
+  *when you enable telemetry* the install id is stable across restarts
+  and image pulls. The server does not send until enabled.
 - **Kubernetes / Helm**: mount a small `PersistentVolumeClaim` at your
   configured `memory_dir`. (Chart support for this is tracked
   upstream.)
-- **Bare metal / laptop**: `$HOME` is used automatically; no action
-  needed.
+- **Bare metal / laptop**: the CLI uses `$HOME` automatically and its id
+  is stable — no action needed. A server run this way keys durability off
+  `memory_dir`, not `$HOME`, so if you enable it without setting
+  `memory_dir` it still emits the one-time nudge below; point `memory_dir`
+  at a persistent path to silence it.
 
-If Aura starts with telemetry active but no persistent location for the
-install-id, it logs a single **warning** at startup
+If Aura is **Enabled** but the install-id has no persistent location, it
+logs a single **warning** at startup
 (`telemetry install-id is not on persistent storage …`). That is the
 nudge: set `memory_dir` to a mounted volume. The warning never appears
-when telemetry is disabled (a disabled install is never counted), and
+while `Unknown` or `Disabled` (neither sends, so neither is counted), and
 never on a normal laptop run.
 
 If your container is **fully read-only with no writable volume at all**,
@@ -327,7 +427,9 @@ verify the contract above without running the code:
 |---|---|
 | `crates/aura-telemetry/src/properties.rs` | The sealed `PropertyValue` enum and the `IntoTelemetryProperty` trait. No `String`, no `serde_json::Value`, no blanket impl on `PropertyValue` itself — that last one was a deliberate close-up after review feedback so `PropertyValue` cannot be smuggled into an event's property map. |
 | `crates/aura-telemetry/src/events.rs` | One typed struct per event. Adding fields here requires a `PropertyValue` variant first. |
-| `crates/aura-telemetry/src/disable.rs` | The kill-switch decision tree. Tests cover every branch and every precedence pair. |
+| `crates/aura-telemetry/src/disable.rs` | `TelemetryState` and `decide_state` — the tri-state resolution (hard disable / explicit enable / preference / Unknown). Tests cover every branch and precedence pair. |
+| `crates/aura-telemetry/src/handle.rs` | `TelemetryHandle::enable` / `set_disabled` and the three-way `capture_payload`. `consent_state.rs` proves Unknown holds, `enable()` sends without backfilling, and a kill switch can't be revived. |
+| `crates/aura-cli/src/repl/telemetry_notice.rs` | The first-run notice text and the first-input consent decision, both unit-tested. |
 | `crates/aura-telemetry/src/install_id.rs` | The race-safe install-UUID persistence. Concurrent first-launch tests prove all callers converge on one UUID; a separate test proves that corrupt files are read-only-fallback (never auto-recovered) so a multi-process race cannot split identity. |
 | `crates/aura-telemetry/src/inspection_log.rs` | The local JSONL writer and rotation. |
 | `crates/aura-telemetry/src/sink.rs` | The **only** code that builds the JSON sent to PostHog and the only outbound HTTP call. The `$ip: ""` and `$geoip_disable: true` lines live here. |
