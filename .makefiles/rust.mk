@@ -82,6 +82,25 @@ fmt-rust:: $(REPORT_DIR)                 ## Format code with rustfmt
 		rm -f $(REPORT_DIR)/rustfmt.xml.bak; \
 	fi
 
+DIST_DIR := $(PROJECT_ROOT)/dist
+
+.PHONY:build-release-binaries
+build-release-binaries: $(DOCKER_ENV) ## Cross-compile release binaries for all platforms
+	@rm -rf $(DIST_DIR) && mkdir -p $(DIST_DIR)
+	$(RUN) cargo build --release --bin aura-web-server -p aura-cli --bin aura-cli
+	cp target/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
+	cp target/release/aura-cli $(DIST_DIR)/aura-cli-linux-amd64
+	$(RUN) bash -c "\
+		rustup target add aarch64-unknown-linux-gnu 2>/dev/null; \
+		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+		cargo build --release --target aarch64-unknown-linux-gnu --bin aura-web-server -p aura-cli --bin aura-cli"
+	cp target/aarch64-unknown-linux-gnu/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
+	cp target/aarch64-unknown-linux-gnu/release/aura-cli $(DIST_DIR)/aura-cli-linux-arm64
+	cp scripts/install.sh $(DIST_DIR)/install.sh
+	cd $(DIST_DIR) && sha256sum aura-* > checksums-sha256.txt
+	@echo "==> Release binaries ready in dist/"
+	@cat $(DIST_DIR)/checksums-sha256.txt
+
 $(NEXTEST_BIN): $(CARGO_BIN_DIR)
 	@if [ "$(AURA_AUTO_DOWNLOAD)" != "true" ]; then \
 		exit 0; \

@@ -10,8 +10,17 @@ module.exports = {
   branches: ['main'],
 
   // https://github.com/semantic-release/exec
-  prepareCmd: './scripts/set-version.sh ${nextRelease.version}; sleep 2',
-  // https://github.com/esatterwhite/semantic-release-docker
+  prepareCmd: './scripts/set-version.sh ${nextRelease.version}; sleep 2; make build-release-binaries',
+  // https://github.com/semantic-release/github
+  assets: [
+    {path: 'dist/aura-web-server-linux-amd64'}
+  , {path: 'dist/aura-web-server-linux-arm64'}
+  , {path: 'dist/aura-cli-linux-amd64'}
+  , {path: 'dist/aura-cli-linux-arm64'}
+  , {path: 'dist/checksums-sha256.txt'}
+  , {path: 'dist/install.sh'}
+  ]
+, // https://github.com/esatterwhite/semantic-release-docker
   dockerProject: 'mezmo',
   dockerImage: 'aura',
   dockerLogin: false,
