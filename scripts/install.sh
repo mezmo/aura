@@ -15,10 +15,12 @@ REPO="mezmo/aura"
 VERSION="${AURA_VERSION:-latest}"
 INSTALL_DIR="${AURA_INSTALL:-${HOME}/.local/bin}"
 COMPONENT="${AURA_COMPONENT:-all}"
+GITHUB_API="https://api.github.com"
 
 main() {
     detect_platform
     resolve_version
+    fetch_release_metadata
 
     echo "Installing AURA ${VERSION} (${OS}/${ARCH}) to ${INSTALL_DIR}"
     mkdir -p "${INSTALL_DIR}"
@@ -26,9 +28,6 @@ main() {
     local tmpdir
     tmpdir=$(mktemp -d)
     trap 'rm -rf "${tmpdir}"' EXIT
-
-    # Download checksums
-    download "${tmpdir}/checksums-sha256.txt" "checksums-sha256.txt"
 
     if [[ "${COMPONENT}" != "cli" ]]; then
         install_binary "${tmpdir}" "aura-web-server"
@@ -71,13 +70,28 @@ detect_platform() {
 resolve_version() {
     if [[ "${VERSION}" == "latest" ]]; then
         VERSION=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${REPO}/releases/latest" \
+            "${GITHUB_API}/repos/${REPO}/releases/latest" \
             | grep -o '"tag_name" *: *"[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
         if [[ -z "${VERSION}" ]]; then
             echo "Error: could not determine latest version."
             exit 1
         fi
     fi
+}
+
+RELEASE_JSON=""
+
+fetch_release_metadata() {
+    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" \
+        "${GITHUB_API}/repos/${REPO}/releases/tags/v${VERSION}")
+}
+
+get_asset_digest() {
+    local asset_name="$1"
+    echo "${RELEASE_JSON}" \
+        | grep -o "\"name\" *: *\"${asset_name}\"[^}]*\"digest\" *: *\"sha256:[a-f0-9]*\"" \
+        | grep -o 'sha256:[a-f0-9]*' \
+        | cut -d: -f2
 }
 
 download() {
@@ -96,9 +110,8 @@ install_binary() {
     echo "  Downloading ${asset_name}..."
     download "${tmpdir}/${asset_name}" "${asset_name}"
 
-    # Verify checksum
     local expected
-    expected=$(grep "${asset_name}$" "${tmpdir}/checksums-sha256.txt" | cut -d' ' -f1)
+    expected=$(get_asset_digest "${asset_name}")
     if [[ -n "${expected}" ]]; then
         local actual
         actual=$(sha256sum "${tmpdir}/${asset_name}" | cut -d' ' -f1)
@@ -110,7 +123,7 @@ install_binary() {
         fi
         echo "  Verified checksum: OK"
     else
-        echo "  Warning: no checksum found for ${asset_name}, skipping verification"
+        echo "  Warning: no digest found for ${asset_name}, skipping verification"
     fi
 
     chmod +x "${tmpdir}/${asset_name}"
