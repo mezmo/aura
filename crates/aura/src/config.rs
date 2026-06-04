@@ -101,6 +101,11 @@ pub struct AgentConfig {
     #[serde(skip)]
     pub scratchpad_tools_config: Option<ScratchpadToolsConfig>,
 
+    /// Request-scoped identifier for SSE subscriptions, cancellation,
+    /// and HITL event routing. Set by the web server or CLI before building.
+    #[serde(skip)]
+    pub request_id: String,
+
     /// HITL configuration for approval gates and callable tool (not serialized).
     #[serde(skip)]
     pub hitl: Option<HitlConfig>,
@@ -133,10 +138,6 @@ pub struct HitlConfig {
     /// When a tool call matches any pattern, the webhook is called before execution.
     #[serde(default)]
     pub require_approval: Vec<String>,
-    /// Per-request ID for SSE event routing (not serialized).
-    /// Set by the web server handler after generating the request ID.
-    #[serde(skip)]
-    pub request_id: Option<String>,
 }
 
 fn default_hitl_timeout_secs() -> u64 {
@@ -163,6 +164,7 @@ impl Clone for AgentConfig {
             orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
+            request_id: self.request_id.clone(),
             hitl: self.hitl.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
         }
@@ -204,6 +206,7 @@ impl std::fmt::Debug for AgentConfig {
                     .map(|h| format!("<{} messages>", h.len())),
             )
             .field("session_id", &self.session_id)
+            .field("request_id", &self.request_id)
             .field(
                 "orchestration_submit_result",
                 &self
@@ -647,6 +650,7 @@ impl Default for AgentConfig {
             orchestration_chat_history: None,
             session_id: None,
             scratchpad_tools_config: None,
+            request_id: String::new(),
             hitl: None,
             orchestration_submit_result: None,
         }

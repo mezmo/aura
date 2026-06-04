@@ -234,6 +234,7 @@ impl RigBuilder {
             orchestration_submit_result: None,
             session_id: None,
             scratchpad_tools_config: None,
+            request_id: String::new(),
         })
     }
 
@@ -247,9 +248,11 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         additional_tools: Vec<Box<dyn aura::ToolDyn>>,
         client_tools: Option<Vec<aura::builder::ClientTool>>,
+        request_id: String,
     ) -> Result<Agent, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
+        agent_config.request_id = request_id;
         Agent::new(&agent_config, additional_tools, client_tools)
             .await
             .map_err(|e| ConfigError::Validation(format!("Failed to build agent: {e}")))
@@ -270,10 +273,12 @@ impl RigBuilder {
         req_headers: Option<&HashMap<String, String>>,
         session_id: Option<String>,
         client_tools: Option<Vec<aura::builder::ClientTool>>,
+        request_id: String,
     ) -> Result<Arc<dyn StreamingAgent>, ConfigError> {
         let mut agent_config = self.to_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
+        agent_config.request_id = request_id;
 
         aura::build_streaming_agent(&agent_config, client_tools)
             .await

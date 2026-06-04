@@ -248,10 +248,10 @@ pub struct HitlContext {
     pub agent_name: String,
     pub run_id: Option<String>,
     pub session_id: Option<String>,
-    /// Per-request ID for publishing SSE events via the tool_event_broker.
-    /// In orchestration mode this is the run_id; in single-agent mode this is
-    /// the HTTP request_id (set on HitlConfig before agent construction).
-    pub request_id: Option<String>,
+    /// Request-scoped identifier for routing SSE events via the tool_event_broker.
+    /// Same value in single-agent and orchestration mode so worker approval
+    /// events reach the client stream the handler subscribed on.
+    pub request_id: String,
 }
 
 impl HitlContext {
@@ -267,19 +267,17 @@ impl HitlContext {
         event_task_id: Option<usize>,
         event_worker_name: Option<String>,
     ) -> Result<ApprovalOutcome, ApprovalError> {
-        if let Some(ref req_id) = self.request_id {
-            let _ = tool_event_broker::publish(
-                req_id,
-                ToolLifecycleEvent::ApprovalRequested {
-                    tool_name: event_tool_name.to_string(),
-                    matched_pattern: event_matched_pattern.clone(),
-                    request_type: request.request_type,
-                    task_id: event_task_id,
-                    worker_name: event_worker_name.clone(),
-                },
-            )
-            .await;
-        }
+        let _ = tool_event_broker::publish(
+            &self.request_id,
+            ToolLifecycleEvent::ApprovalRequested {
+                tool_name: event_tool_name.to_string(),
+                matched_pattern: event_matched_pattern.clone(),
+                request_type: request.request_type,
+                task_id: event_task_id,
+                worker_name: event_worker_name.clone(),
+            },
+        )
+        .await;
 
         let start = std::time::Instant::now();
         let response = self.dispatch.request_approval(&request).await;
@@ -288,43 +286,39 @@ impl HitlContext {
         let (approved, reason) = match &response {
             Ok(resp) => resp.resolve_single(),
             Err(e) => {
-                if let Some(ref req_id) = self.request_id {
-                    let _ = tool_event_broker::publish(
-                        req_id,
-                        ToolLifecycleEvent::ApprovalCompleted {
-                            tool_name: event_tool_name.to_string(),
-                            approved: false,
-                            reason: Some(format!("webhook error: {e}")),
-                            duration_ms,
-                            task_id: event_task_id,
-                        },
-                    )
-                    .await;
-                }
+                let _ = tool_event_broker::publish(
+                    &self.request_id,
+                    ToolLifecycleEvent::ApprovalCompleted {
+                        tool_name: event_tool_name.to_string(),
+                        approved: false,
+                        reason: Some(format!("webhook error: {e}")),
+                        duration_ms,
+                        task_id: event_task_id,
+                    },
+                )
+                .await;
                 return Err(e.clone());
             }
         };
 
-        if let Some(ref req_id) = self.request_id {
-            let reason_for_event = reason.clone().or_else(|| {
-                if !approved {
-                    Some("webhook error".to_string())
-                } else {
-                    None
-                }
-            });
-            let _ = tool_event_broker::publish(
-                req_id,
-                ToolLifecycleEvent::ApprovalCompleted {
-                    tool_name: event_tool_name.to_string(),
-                    approved,
-                    reason: reason_for_event,
-                    duration_ms,
-                    task_id: event_task_id,
-                },
-            )
-            .await;
-        }
+        let reason_for_event = reason.clone().or_else(|| {
+            if !approved {
+                Some("webhook error".to_string())
+            } else {
+                None
+            }
+        });
+        let _ = tool_event_broker::publish(
+            &self.request_id,
+            ToolLifecycleEvent::ApprovalCompleted {
+                tool_name: event_tool_name.to_string(),
+                approved,
+                reason: reason_for_event,
+                duration_ms,
+                task_id: event_task_id,
+            },
+        )
+        .await;
 
         Ok(ApprovalOutcome {
             approved,
@@ -657,7 +651,7 @@ mod tests {
             agent_name: "test-agent".to_string(),
             run_id: Some("run-123".to_string()),
             session_id: Some("sess-456".to_string()),
-            request_id: Some("test-req-123".to_string()),
+            request_id: "test-req-123".to_string(),
         })
     }
 
@@ -757,7 +751,7 @@ mod tests {
             agent_name: "test-agent".to_string(),
             run_id: Some("run-123".to_string()),
             session_id: Some("sess-456".to_string()),
-            request_id: Some("test-req-123".to_string()),
+            request_id: "test-req-123".to_string(),
         });
         let wrapper = HitlApprovalWrapper::new(Arc::from(vec!["scale_*".to_string()]), hitl);
 
@@ -837,17 +831,5 @@ mod tests {
             result.is_ok(),
             "request_approval must bypass glob matching even with wildcard pattern"
         );
-    }
-
-    #[test]
-    fn test_request_id_set_at_construction() {
-        let ctx = HitlContext {
-            dispatch: Arc::new(MockDispatch::approved()) as Arc<dyn ApprovalDispatch>,
-            agent_name: "test-agent".to_string(),
-            run_id: None,
-            session_id: None,
-            request_id: Some("req_abc123".to_string()),
-        };
-        assert_eq!(ctx.request_id.as_deref(), Some("req_abc123"));
     }
 }

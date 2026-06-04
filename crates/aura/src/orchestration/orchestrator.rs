@@ -616,9 +616,9 @@ impl Orchestrator {
                 let hitl_ctx = Arc::new(crate::hitl::HitlContext {
                     dispatch,
                     agent_name: self.agent_config.agent.name.clone(),
-                    run_id: Some(run_id.clone()),
+                    run_id: Some(run_id),
                     session_id: self.agent_config.session_id.clone(),
-                    request_id: Some(run_id),
+                    request_id: self.agent_config.request_id.clone(),
                 });
 
                 if !hitl_config.require_approval.is_empty() {

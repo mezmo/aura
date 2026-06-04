@@ -151,12 +151,18 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
+    request_id: String,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
     let builder = RigBuilder::new(config.clone());
     let agent = builder
-        .build_agent(Some(req_headers), additional_tools, client_tool_defs)
+        .build_agent(
+            Some(req_headers),
+            additional_tools,
+            client_tool_defs,
+            request_id,
+        )
         .await
         .map_err(|e| {
             error!("Failed to build agent: {}", e);
@@ -208,7 +214,7 @@ pub async fn prepare_request(
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
     // Multi-config servers require the model field to match an alias or agent name.
-    let mut config = if data.configs.len() == 1 {
+    let config = if data.configs.len() == 1 {
         data.configs[0].clone()
     } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
         data.configs
@@ -231,14 +237,10 @@ pub async fn prepare_request(
         .as_deref()
         .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
 
-    // Generate request_id early so HITL can use it for SSE routing.
+    // Generate request_id early so HITL and tool event broker can use it
+    // for SSE routing. Passed to the builder so both single-agent and
+    // orchestration workers share the same subscription key.
     let request_id = format!("req_{}", Uuid::new_v4().simple());
-
-    // Inject request_id into HITL config so the approval wrapper can
-    // publish SSE events to the correct subscription.
-    if let Some(ref mut hitl) = config.hitl {
-        hitl.request_id = Some(request_id.clone());
-    }
 
     // Build the appropriate agent type based on orchestration config
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
@@ -250,6 +252,7 @@ pub async fn prepare_request(
                 Some(req_headers_map),
                 Some(chat_session_id.to_string()),
                 client_tools_vec.clone(),
+                request_id.clone(),
             )
             .await
             .map_err(|e| {
@@ -264,8 +267,14 @@ pub async fn prepare_request(
         } else {
             None
         };
-        build_agent_for_request(&config, req_headers_map, additional_tools, client_tools).await?
-            as Arc<dyn StreamingAgent>
+        build_agent_for_request(
+            &config,
+            req_headers_map,
+            additional_tools,
+            client_tools,
+            request_id.clone(),
+        )
+        .await? as Arc<dyn StreamingAgent>
     };
 
     let (provider, model) = streaming_agent.get_provider_info();

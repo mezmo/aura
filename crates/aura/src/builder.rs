@@ -322,7 +322,7 @@ impl Agent {
                 agent_name: config_owned.agent.name.clone(),
                 run_id: None,
                 session_id: config_owned.session_id.clone(),
-                request_id: hitl_config.request_id.clone(),
+                request_id: config_owned.request_id.clone(),
             });
 
             // Add callable tool so the agent can explicitly request approval

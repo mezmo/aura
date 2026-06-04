@@ -163,10 +163,11 @@ impl AgentExecutor for AuraAgentExecutor {
 
             let config = config.ok_or_else(|| A2AError::invalid_params("no agent configuration available"))?;
 
+            let request_id = format!("a2a_{}", task_id);
             let session_id = Some(context_id.clone());
             let builder = RigBuilder::new(config);
             let agent = match builder
-                .build_streaming_agent_with_headers(Some(&req_headers), session_id, None)
+                .build_streaming_agent_with_headers(Some(&req_headers), session_id, None, request_id.clone())
                 .await
             {
                 Ok(a) => a,
@@ -175,8 +176,6 @@ impl AgentExecutor for AuraAgentExecutor {
                     return;
                 }
             };
-
-            let request_id = format!("a2a_{}", task_id);
 
             // build any history for this context that can be used in further aura reasoning
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;
