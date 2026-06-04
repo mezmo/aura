@@ -101,6 +101,10 @@ pub struct AgentConfig {
     #[serde(skip)]
     pub scratchpad_tools_config: Option<ScratchpadToolsConfig>,
 
+    /// HITL configuration for approval gates and callable tool (not serialized).
+    #[serde(skip)]
+    pub hitl: Option<HitlConfig>,
+
     /// Shared decision state for worker `submit_result` tool (not serialized).
     /// When set, workers get the `submit_result` tool for structured output.
     #[serde(skip)]
@@ -113,6 +117,30 @@ pub struct TodoToolsConfig {
     /// Optional directory for persisting plans.
     /// If None, plans are stored in-memory only.
     pub plan_dir: Option<String>,
+}
+
+/// Human-in-the-loop approval configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HitlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// URL of the webhook endpoint that receives approval requests.
+    pub webhook_url: String,
+    /// Timeout in seconds for the webhook call (default: 30).
+    #[serde(default = "default_hitl_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Glob patterns for tool names that require approval.
+    /// When a tool call matches any pattern, the webhook is called before execution.
+    #[serde(default)]
+    pub require_approval: Vec<String>,
+    /// Per-request ID for SSE event routing (not serialized).
+    /// Set by the web server handler after generating the request ID.
+    #[serde(skip)]
+    pub request_id: Option<String>,
+}
+
+fn default_hitl_timeout_secs() -> u64 {
+    30
 }
 
 // Manual Clone implementation because Arc<dyn Trait> fields require special handling
@@ -135,6 +163,7 @@ impl Clone for AgentConfig {
             orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
+            hitl: self.hitl.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
         }
     }
@@ -618,6 +647,7 @@ impl Default for AgentConfig {
             orchestration_chat_history: None,
             session_id: None,
             scratchpad_tools_config: None,
+            hitl: None,
             orchestration_submit_result: None,
         }
     }

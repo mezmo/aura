@@ -57,6 +57,22 @@ pub enum ToolLifecycleEvent {
         tool_name: ToolName,
         progress_token: Option<ProgressToken>,
     },
+    /// Emitted when an HITL approval gate fires for a tool call.
+    ApprovalRequested {
+        tool_name: ToolName,
+        matched_pattern: Option<String>,
+        request_type: aura_events::RequestType,
+        task_id: Option<usize>,
+        worker_name: Option<String>,
+    },
+    /// Emitted when an HITL approval decision is received.
+    ApprovalCompleted {
+        tool_name: ToolName,
+        approved: bool,
+        reason: Option<String>,
+        duration_ms: u64,
+        task_id: Option<usize>,
+    },
 }
 
 impl ToolLifecycleEvent {
@@ -65,6 +81,8 @@ impl ToolLifecycleEvent {
         match self {
             ToolLifecycleEvent::Requested { tool_id, .. } => tool_id,
             ToolLifecycleEvent::Start { tool_id, .. } => tool_id,
+            ToolLifecycleEvent::ApprovalRequested { tool_name, .. }
+            | ToolLifecycleEvent::ApprovalCompleted { tool_name, .. } => tool_name,
         }
     }
 
@@ -73,6 +91,8 @@ impl ToolLifecycleEvent {
         match self {
             ToolLifecycleEvent::Requested { tool_name, .. } => tool_name,
             ToolLifecycleEvent::Start { tool_name, .. } => tool_name,
+            ToolLifecycleEvent::ApprovalRequested { tool_name, .. }
+            | ToolLifecycleEvent::ApprovalCompleted { tool_name, .. } => tool_name,
         }
     }
 }

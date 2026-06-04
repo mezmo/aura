@@ -600,6 +600,49 @@ impl Orchestrator {
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
+
+        // Wire HITL context (for the callable tool) and optionally the
+        // approval wrapper (for config-driven gates). The context is created
+        // when HITL is enabled with a webhook, even if require_approval is
+        // empty — the agent-callable request_approval tool needs it.
+        let hitl_ctx = if let Some(ref hitl_config) = self.agent_config.hitl {
+            if hitl_config.enabled && !hitl_config.webhook_url.is_empty() {
+                let dispatch = Arc::new(crate::hitl::HttpApprovalDispatch::new(
+                    reqwest::Client::new(),
+                    hitl_config.webhook_url.clone(),
+                    hitl_config.timeout_secs,
+                ));
+                let run_id = self.persistence.lock().await.run_id().to_string();
+                let hitl_ctx = Arc::new(crate::hitl::HitlContext {
+                    dispatch,
+                    agent_name: self.agent_config.agent.name.clone(),
+                    run_id: Some(run_id.clone()),
+                    session_id: self.agent_config.session_id.clone(),
+                    request_id: Some(run_id),
+                });
+
+                if !hitl_config.require_approval.is_empty() {
+                    wrappers.insert(
+                        0,
+                        Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                            Arc::from(hitl_config.require_approval.clone()),
+                            hitl_ctx.clone(),
+                        )),
+                    );
+                    tracing::info!(
+                        "Worker {}: HITL approval wrapper active ({} pattern(s)",
+                        task_id,
+                        hitl_config.require_approval.len()
+                    );
+                }
+                Some(hitl_ctx)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
 
         // Configure worker based on assignment
@@ -736,10 +779,20 @@ impl Orchestrator {
             String::new()
         };
 
+        // Build the list of additional Rig tools for this worker.
+        let mut worker_additional_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![];
+        if let Some(ref ctx) = hitl_ctx {
+            worker_additional_tools
+                .push(Box::new(crate::hitl::RequestApprovalTool::new(ctx.clone())));
+            tracing::info!("Worker {}: HITL request_approval tool registered", task_id);
+        }
+
         // Build worker agent using shared MCP connections.
         // Client-side tools are not supported in orchestration mode and are
         // never attached to workers (or the coordinator).
-        let (provider_agent, model_name) = self.build_worker_provider_agent(&worker_config).await?;
+        let (provider_agent, model_name) = self
+            .build_worker_provider_agent(&worker_config, worker_additional_tools)
+            .await?;
 
         let agent = Agent {
             inner: provider_agent,
@@ -2224,6 +2277,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn build_worker_provider_agent(
         &self,
         worker_config: &AgentConfig,
+        additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
         let temperature = worker_config.llm.temperature();
@@ -2272,7 +2326,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, additional_tools)
+                        .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -2303,7 +2359,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, additional_tools)
+                        .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -2342,7 +2400,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, additional_tools)
+                        .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -2370,7 +2430,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, additional_tools)
+                        .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -2397,7 +2459,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, additional_tools)
+                        .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
         }

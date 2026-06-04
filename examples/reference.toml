@@ -143,6 +143,31 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # # profile = "default"  # optional
 # context_prefix = "Company documentation"
 
+# ── Human-in-the-Loop Approval ──────────────────────────────────────
+# Gates tool execution behind an external approval webhook. When a tool
+# call matches a require_approval pattern, Aura POSTs to the webhook
+# and waits for approval before executing.
+#
+# Two approval surfaces:
+#   1. Config-driven gate: tools matching patterns are intercepted
+#      automatically. The LLM does not know about the gate.
+#   2. Agent-callable tool: agents also receive a "request_approval"
+#      tool they can call explicitly (guide via system prompt).
+#
+# See docs/hitl-integration-guide.md for the full webhook contract,
+# response format, and integration patterns.
+#
+# [hitl]
+# enabled = true
+# webhook_url = "https://approval.internal.example.com/api/approve"
+# timeout_secs = 30     # max seconds to wait for webhook response
+# require_approval = [  # glob patterns for tools needing approval
+#   "kubectl_delete_*",
+#   "scale_*",
+#   "restart_*",
+#   "dangerous_*",
+# ]
+
 # ── Tools ───────────────────────────────────────────────────────────
 [tools]
 filesystem = false

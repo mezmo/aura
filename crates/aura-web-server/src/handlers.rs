@@ -176,6 +176,7 @@ pub struct RequestSetup {
     pub model_str: String,
     pub created_timestamp: u64,
     pub chat_session_id: String,
+    pub request_id: String,
     /// Whether the request includes client-side tool definitions and the
     /// server is configured to honor them. The streaming layer uses this to
     /// emit `finish_reason: "tool_calls"` instead of `"stop"` when the LLM
@@ -207,7 +208,7 @@ pub async fn prepare_request(
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
     // Multi-config servers require the model field to match an alias or agent name.
-    let config = if data.configs.len() == 1 {
+    let mut config = if data.configs.len() == 1 {
         data.configs[0].clone()
     } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
         data.configs
@@ -229,6 +230,15 @@ pub async fn prepare_request(
         .tools
         .as_deref()
         .map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
+
+    // Generate request_id early so HITL can use it for SSE routing.
+    let request_id = format!("req_{}", Uuid::new_v4().simple());
+
+    // Inject request_id into HITL config so the approval wrapper can
+    // publish SSE events to the correct subscription.
+    if let Some(ref mut hitl) = config.hitl {
+        hitl.request_id = Some(request_id.clone());
+    }
 
     // Build the appropriate agent type based on orchestration config
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
@@ -272,6 +282,7 @@ pub async fn prepare_request(
         model_str,
         created_timestamp,
         chat_session_id: chat_session_id.to_string(),
+        request_id,
         has_client_tools,
     })
 }
@@ -342,7 +353,7 @@ pub fn build_completion_config(
     } else {
         None
     };
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
     let stream_config = StreamConfig::new(
@@ -415,6 +426,7 @@ pub async fn execute_completion(
         model_str,
         created_timestamp: _,
         chat_session_id,
+        request_id: _,
         has_client_tools: _,
     } = setup;
 

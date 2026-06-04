@@ -302,6 +302,56 @@ impl Agent {
         // Clone so setup_single_agent_scratchpad can mutate extension fields
         // (tool_wrapper, preamble_override, scratchpad_tools_config).
         let mut config_owned = config.clone();
+
+        // Wire HITL approval wrapper and tool if configured.
+        // Runs before scratchpad setup. After scratchpad wraps, the final
+        // order is [scratchpad, hitl, ...] — scratchpad pre_call is a no-op
+        // so HITL's pre_call is the first gate with real behavior.
+        let mut additional_tools = additional_tools;
+        if let Some(ref hitl_config) = config_owned.hitl
+            && hitl_config.enabled
+            && !hitl_config.webhook_url.is_empty()
+        {
+            let dispatch = Arc::new(crate::hitl::HttpApprovalDispatch::new(
+                reqwest::Client::new(),
+                hitl_config.webhook_url.clone(),
+                hitl_config.timeout_secs,
+            ));
+            let hitl_ctx = Arc::new(crate::hitl::HitlContext {
+                dispatch,
+                agent_name: config_owned.agent.name.clone(),
+                run_id: None,
+                session_id: config_owned.session_id.clone(),
+                request_id: hitl_config.request_id.clone(),
+            });
+
+            // Add callable tool so the agent can explicitly request approval
+            additional_tools.push(Box::new(crate::hitl::RequestApprovalTool::new(
+                hitl_ctx.clone(),
+            )));
+            tracing::info!("HITL request_approval tool registered");
+
+            // Add config-driven wrapper if patterns are configured
+            if !hitl_config.require_approval.is_empty() {
+                tracing::info!(
+                    "HITL approval wrapper active: {} pattern(s)",
+                    hitl_config.require_approval.len()
+                );
+                let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                    Arc::from(hitl_config.require_approval.clone()),
+                    hitl_ctx.clone(),
+                ));
+                // Compose as first wrapper so HITL fires before scratchpad/existing
+                config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
+                    Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                        wrapper as Arc<dyn crate::tool_wrapper::ToolWrapper>,
+                        existing,
+                    ])),
+                    None => wrapper,
+                });
+            }
+        }
+
         let agent_scratchpad_budget =
             Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
         let config = &config_owned;

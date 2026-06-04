@@ -223,6 +223,7 @@ impl RigBuilder {
             tools,
             memory_dir: self.config.memory_dir.clone(),
             orchestration,
+            hitl: self.config.hitl.clone(),
             // Extension fields default to None (set by orchestrator for workers)
             tool_wrapper: None,
             tool_context_factory: None,

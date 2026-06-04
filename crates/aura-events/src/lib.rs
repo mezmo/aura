@@ -147,6 +147,16 @@ pub enum WorkerPhase {
     Analyzing,
 }
 
+/// Discriminator for approval request payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestType {
+    /// Pattern-gated tool call awaiting approval.
+    ToolGate,
+    /// Explicit agent-initiated approval request.
+    ApprovalRequest,
+}
+
 /// Aura-specific streaming events sent via SSE `event:` field.
 ///
 /// Derives both `Serialize` (for producing SSE on the server) and
@@ -277,6 +287,26 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted when a tool call requires human approval.
+    ApprovalRequested {
+        tool_name: String,
+        matched_pattern: Option<String>,
+        request_type: RequestType,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worker_name: Option<String>,
+    },
+    /// Emitted when an approval decision is received.
+    ApprovalCompleted {
+        tool_name: String,
+        approved: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        duration_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<usize>,
+    },
     /// Emitted after an agent (single-agent or orchestration worker) completes
     /// with scratchpad activity. Reports how much raw tool output was diverted
     /// to disk vs extracted back into context.
@@ -305,6 +335,8 @@ impl AuraStreamEvent {
             Self::WorkerPhase { .. } => "aura.worker_phase",
             Self::ToolUsage { .. } => "aura.tool_usage",
             Self::Usage { .. } => "aura.usage",
+            Self::ApprovalRequested { .. } => "aura.approval_requested",
+            Self::ApprovalCompleted { .. } => "aura.approval_completed",
             Self::ScratchpadUsage { .. } => "aura.scratchpad_usage",
         }
     }
@@ -464,6 +496,40 @@ impl AuraStreamEvent {
             completion_tokens,
             total_tokens,
             correlation,
+        }
+    }
+
+    /// Create an ApprovalRequested event.
+    pub fn approval_requested(
+        tool_name: impl Into<String>,
+        matched_pattern: Option<String>,
+        request_type: RequestType,
+        task_id: Option<usize>,
+        worker_name: Option<String>,
+    ) -> Self {
+        Self::ApprovalRequested {
+            tool_name: tool_name.into(),
+            matched_pattern,
+            request_type,
+            task_id,
+            worker_name,
+        }
+    }
+
+    /// Create an ApprovalCompleted event.
+    pub fn approval_completed(
+        tool_name: impl Into<String>,
+        approved: bool,
+        reason: Option<String>,
+        duration_ms: u64,
+        task_id: Option<usize>,
+    ) -> Self {
+        Self::ApprovalCompleted {
+            tool_name: tool_name.into(),
+            approved,
+            reason,
+            duration_ms,
+            task_id,
         }
     }
 

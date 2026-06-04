@@ -12,6 +12,7 @@ pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
+pub mod hitl;
 pub mod lenient_int;
 pub mod logging;
 pub mod mcp;
@@ -46,8 +47,9 @@ pub mod vector_store;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
 pub use config::{
-    AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
+    AgentConfig, AgentSettings, EmbeddingModelConfig, HitlConfig, LlmConfig, McpConfig,
+    McpServerConfig, ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig,
+    VectorStoreType,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{

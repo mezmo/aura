@@ -281,6 +281,20 @@ pub trait ToolWrapper: Send + Sync {
         Ok(())
     }
 
+    /// Async hook called after validation but before tool execution.
+    ///
+    /// Use this for async gates that need to run before the tool executes,
+    /// such as approval workflows that call external services.
+    ///
+    /// Returns `Ok(())` to proceed with tool execution, or `Err(ToolError)`
+    /// to reject the call (the error is returned to the LLM).
+    ///
+    /// `on_complete` is still called on pre_call failure so wrappers can
+    /// clean up.
+    async fn pre_call(&self, _args: &Value, _ctx: &ToolCallContext) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     /// Async hook called after tool completion (success or failure).
     ///
     /// Use this for async side effects like:
@@ -430,6 +444,43 @@ where
                 return Err(validation_error);
             }
 
+            // Pre-call gate (async, e.g. HITL approval webhook).
+            // Spawned because async_trait futures are Send but not Sync,
+            // and this outer future must be Send + Sync for Rig's Tool trait.
+            {
+                let pre_wrapper = wrapper.clone();
+                let pre_args = clean_args.clone();
+                let pre_ctx = ctx.clone();
+                let pre_span = tracing::Span::current();
+                let pre_call_result = tokio::spawn(tracing::Instrument::instrument(
+                    async move { pre_wrapper.pre_call(&pre_args, &pre_ctx).await },
+                    pre_span,
+                ))
+                .await
+                .unwrap_or_else(|join_err| Err(ToolError::ToolCallError(join_err.into())));
+
+                if let Err(pre_call_error) = pre_call_result {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let error_msg = pre_call_error.to_string();
+
+                    let wrapper_clone = wrapper.clone();
+                    let ctx_clone = ctx.clone();
+                    let extracted_clone = extracted.clone();
+                    tokio::spawn(async move {
+                        wrapper_clone
+                            .on_complete(
+                                &ctx_clone,
+                                extracted_clone.as_ref(),
+                                Err(&error_msg),
+                                duration_ms,
+                            )
+                            .await;
+                    });
+
+                    return Err(pre_call_error);
+                }
+            }
+
             // Call inner tool (spawn to handle non-Sync futures).
             // Propagate the current span so mcp.tool_call nests under execute_tool.
             let inner_clone = inner.clone();
@@ -568,6 +619,13 @@ impl ToolWrapper for ComposedWrapper {
     ) -> Result<(), ToolError> {
         for wrapper in &self.wrappers {
             wrapper.validate_args(args, extracted, ctx)?;
+        }
+        Ok(())
+    }
+
+    async fn pre_call(&self, args: &Value, ctx: &ToolCallContext) -> Result<(), ToolError> {
+        for wrapper in &self.wrappers {
+            wrapper.pre_call(args, ctx).await?;
         }
         Ok(())
     }

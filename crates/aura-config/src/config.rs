@@ -1,5 +1,5 @@
 use aura::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
-use aura::{LlmConfig, lenient_int};
+use aura::{HitlConfig, LlmConfig, lenient_int};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -20,6 +20,9 @@ pub struct Config {
     /// Orchestration mode configuration (multi-agent workflows)
     #[serde(default)]
     pub orchestration: Option<OrchestrationConfig>,
+    /// Human-in-the-loop approval configuration
+    #[serde(default)]
+    pub hitl: Option<HitlConfig>,
 }
 
 /// Per-worker configuration for specialized workers.

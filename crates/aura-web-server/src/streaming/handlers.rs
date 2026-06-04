@@ -251,6 +251,32 @@ where
                                 ctx.correlation.clone(),
                             )
                         }
+                        ToolLifecycleEvent::ApprovalRequested { tool_name, matched_pattern, request_type, task_id, worker_name } => {
+                            tracing::debug!(
+                                "Emitting aura.approval_requested event: tool_name={}",
+                                tool_name
+                            );
+                            AuraStreamEvent::approval_requested(
+                                &tool_name,
+                                matched_pattern,
+                                request_type,
+                                task_id,
+                                worker_name,
+                            )
+                        }
+                        ToolLifecycleEvent::ApprovalCompleted { tool_name, approved, reason, duration_ms, task_id } => {
+                            tracing::debug!(
+                                "Emitting aura.approval_completed event: tool_name={}, approved={}",
+                                tool_name, approved
+                            );
+                            AuraStreamEvent::approval_completed(
+                                &tool_name,
+                                approved,
+                                reason,
+                                duration_ms,
+                                task_id,
+                            )
+                        }
                     };
                     if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during tool event");
