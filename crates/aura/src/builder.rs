@@ -304,10 +304,11 @@ impl Agent {
         let mut config_owned = config.clone();
 
         // Wire HITL approval wrapper and tool if configured.
-        // Runs before scratchpad setup. After scratchpad wraps, the final
-        // order is [scratchpad, hitl, ...] — scratchpad pre_call is a no-op
-        // so HITL's pre_call is the first gate with real behavior.
+        // The wrapper is created here but NOT attached to config yet —
+        // scratchpad setup runs first, then HITL is prepended so it is
+        // structurally first in the wrapper chain.
         let mut additional_tools = additional_tools;
+        let mut hitl_wrapper: Option<Arc<dyn crate::tool_wrapper::ToolWrapper>> = None;
         if let Some(ref hitl_config) = config_owned.hitl
             && hitl_config.enabled
             && !hitl_config.webhook_url.is_empty()
@@ -331,29 +332,33 @@ impl Agent {
             )));
             tracing::info!("HITL request_approval tool registered");
 
-            // Add config-driven wrapper if patterns are configured
+            // Build config-driven wrapper if patterns are configured
             if !hitl_config.require_approval.is_empty() {
                 tracing::info!(
                     "HITL approval wrapper active: {} pattern(s)",
                     hitl_config.require_approval.len()
                 );
-                let wrapper = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                hitl_wrapper = Some(Arc::new(crate::hitl::HitlApprovalWrapper::new(
                     Arc::from(hitl_config.require_approval.clone()),
-                    hitl_ctx.clone(),
-                ));
-                // Compose as first wrapper so HITL fires before scratchpad/existing
-                config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
-                    Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
-                        wrapper as Arc<dyn crate::tool_wrapper::ToolWrapper>,
-                        existing,
-                    ])),
-                    None => wrapper,
-                });
+                    hitl_ctx,
+                )));
             }
         }
 
         let agent_scratchpad_budget =
             Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
+
+        // Prepend HITL wrapper so it fires first in the chain, before
+        // scratchpad and any caller-supplied wrappers.
+        if let Some(wrapper) = hitl_wrapper {
+            config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
+                Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                    wrapper,
+                    existing,
+                ])),
+                None => wrapper,
+            });
+        }
         let config = &config_owned;
 
         // Scratchpad bonus only applies when scratchpad was actually wired up

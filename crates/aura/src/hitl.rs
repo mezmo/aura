@@ -301,13 +301,7 @@ impl HitlContext {
             }
         };
 
-        let reason_for_event = reason.clone().or_else(|| {
-            if !approved {
-                Some("webhook error".to_string())
-            } else {
-                None
-            }
-        });
+        let reason_for_event = reason.clone();
         let _ = tool_event_broker::publish(
             &self.request_id,
             ToolLifecycleEvent::ApprovalCompleted {

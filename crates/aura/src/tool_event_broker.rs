@@ -76,13 +76,16 @@ pub enum ToolLifecycleEvent {
 }
 
 impl ToolLifecycleEvent {
-    /// Get the tool_id regardless of event variant
-    pub fn tool_id(&self) -> &str {
+    /// Get the LLM-assigned tool_call_id if this event carries one.
+    ///
+    /// Returns `None` for approval events, which do not have an LLM-assigned
+    /// tool_call_id and are identified by `tool_name` instead.
+    pub fn tool_id(&self) -> Option<&str> {
         match self {
-            ToolLifecycleEvent::Requested { tool_id, .. } => tool_id,
-            ToolLifecycleEvent::Start { tool_id, .. } => tool_id,
-            ToolLifecycleEvent::ApprovalRequested { tool_name, .. }
-            | ToolLifecycleEvent::ApprovalCompleted { tool_name, .. } => tool_name,
+            ToolLifecycleEvent::Requested { tool_id, .. } => Some(tool_id),
+            ToolLifecycleEvent::Start { tool_id, .. } => Some(tool_id),
+            ToolLifecycleEvent::ApprovalRequested { .. }
+            | ToolLifecycleEvent::ApprovalCompleted { .. } => None,
         }
     }
 
