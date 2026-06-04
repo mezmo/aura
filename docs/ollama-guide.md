@@ -36,6 +36,8 @@ Known handled styles include:
 
 This improves tool reliability with local models that do not consistently emit structured function-calling payloads.
 
+> **Orchestration limitation.** `fallback_tool_parsing` applies only to single-agent mode (`[orchestration].enabled = false`). In orchestration mode the coordinator and workers are built with fallback parsing **disabled**, so a local model that can't emit native tool calls may fail to drive worker tools. Run such models in single-agent mode, or use a model with reliable native tool-calling for orchestration.
+
 ## Practical Guidance
 
 - Prefer instruction-tuned variants (`*-instruct`) when you need reliable tool execution.
