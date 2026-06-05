@@ -158,6 +158,77 @@ pub fn register_orch_tool(
     }
 }
 
+/// Register a "Reasoning" entry inside a worker's task tree.
+///
+/// Prints `└─ ● Reasoning` plus an initial empty `   ⎿ ` body line, just
+/// like a tool call. The body line number is yielded to the caller via
+/// `on_lines` so subsequent reasoning chunks can rewrite it in place. The
+/// entry is recorded in `ORCH_LAST_TOOL_LINES` so the next tool call's
+/// `upgrade_last_tool_to_mid` upgrades reasoning's connector from `└─` to
+/// `├─` automatically.
+///
+/// `on_lines(bullet_line_num, body_line_num)` runs while the orchestrator
+/// state lock is held — the caller should record the line numbers into its
+/// own `LiveReasoning` state without doing additional terminal I/O.
+pub fn register_orch_reasoning_in_tree(task_id: &str, on_lines: impl FnOnce(u32, u32)) {
+    upgrade_last_tool_to_mid(task_id);
+
+    let display = "Reasoning";
+    let bullet_text = format!("{}● {}", TREE_END_BULLET, display);
+    let bullet_rows = visual_row_count(&bullet_text);
+    let bullet_line = ORCH_SCROLLBACK_COUNTER.fetch_add(bullet_rows, Ordering::Relaxed);
+    println!(
+        "{}{} {}",
+        TREE_END_BULLET.themed(AuraStyle::Connector),
+        "●".themed(AuraStyle::Muted),
+        display.themed(AuraStyle::Primary),
+    );
+
+    // Initial body row: empty. The reasoning callback will rewrite this
+    // in-place as chunks arrive.
+    let body_text = format!("{}⎿ ", TREE_END_DURATION);
+    let body_rows = visual_row_count(&body_text);
+    let body_line = ORCH_SCROLLBACK_COUNTER.fetch_add(body_rows, Ordering::Relaxed);
+    println!(
+        "{}{} ",
+        TREE_END_DURATION.themed(AuraStyle::Connector),
+        "⎿".themed(AuraStyle::Connector),
+    );
+
+    // Insert into the per-task "last entry" map so the next tool registration
+    // upgrades reasoning's `└─` to `├─`. We mirror tool semantics: the
+    // `tool_display` we record is just "Reasoning" (used by
+    // `upgrade_last_tool_to_mid` to repaint the bullet line), and
+    // `duration_text` stays empty initially (the reasoning callback owns
+    // updating it as content streams in).
+    if let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock() {
+        guard.insert(
+            task_id.to_string(),
+            OrchLastToolInfo {
+                bullet_line_num: bullet_line,
+                duration_line_num: body_line,
+                tool_display: display.to_string(),
+                duration_text: String::new(),
+                has_content_below: false,
+            },
+        );
+    }
+
+    on_lines(bullet_line, body_line);
+}
+
+/// Update the recorded `duration_text` of the last entry under a task so
+/// that any subsequent `upgrade_last_tool_to_mid` redraws the line with the
+/// latest reasoning content (otherwise the upgrade would repaint the body
+/// with an empty string, blanking out the live update).
+pub fn update_orch_last_tool_duration_text(task_id: &str, text: &str) {
+    if let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock()
+        && let Some(info) = guard.get_mut(task_id)
+    {
+        info.duration_text = text.to_string();
+    }
+}
+
 /// Update the previous last tool under a task from └─ to ├─.
 fn upgrade_last_tool_to_mid(task_id: &str) {
     let prev = if let Ok(guard) = ORCH_LAST_TOOL_LINES.lock() {

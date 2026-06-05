@@ -77,3 +77,4 @@ rig-core = { workspace = true }
 futures-util = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 aura-test-utils = { path = "../aura-test-utils" }
+aura-events = { path = "../aura-events" }

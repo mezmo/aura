@@ -1243,6 +1243,96 @@ context_window = 200000.0
     }
 
     #[test]
+    fn test_orchestration_rejects_case_insensitive_worker_collision() {
+        // TOML accepts `Alpha` and `alpha` as distinct table headers, but
+        // they collide as filenames on case-insensitive filesystems (macOS
+        // APFS default, Windows NTFS default).
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.Alpha]
+description = "big A"
+preamble = "p"
+
+[orchestration.worker.alpha]
+description = "small a"
+preamble = "p"
+"#;
+        let err = load_config_from_str(config_str)
+            .expect_err("case-collision must be rejected")
+            .to_string();
+        assert!(err.contains("Duplicate worker name"), "got: {}", err);
+        assert!(err.contains("[orchestration.worker.*]"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_orchestration_rejects_exact_duplicate_worker_header() {
+        // Defense-in-depth: the toml parser is expected to reject this at
+        // parse time, but we pin the behavior here so a future parser change
+        // doesn't silently regress.
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.investigator]
+description = "first"
+preamble = "p"
+
+[orchestration.worker.investigator]
+description = "second"
+preamble = "p"
+"#;
+        assert!(load_config_from_str(config_str).is_err());
+    }
+
+    #[test]
+    fn test_orchestration_unique_workers_loads_ok() {
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test_key"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "a"
+preamble = "p"
+
+[orchestration.worker.beta]
+description = "b"
+preamble = "p"
+"#;
+        let config = load_config_from_str(config_str).expect("should parse");
+        let orch = config.orchestration.expect("orchestration present");
+        assert_eq!(orch.workers.len(), 2);
+    }
+
+    #[test]
     fn test_no_additional_properties_on_llm() {
         let config_str = r#"
 [agent]
@@ -1988,5 +2078,65 @@ model = "gpt-4o"
         let loaded = load_config_from_str(config).expect("should parse");
         let built = crate::RigBuilder::new(loaded).get_agent_config();
         assert_eq!(built.effective_memory_dir(), None);
+    }
+
+    // ========================================================================
+    // Worker Name Validation Tests
+    // ========================================================================
+
+    fn orch_with_workers(names: &[&str]) -> crate::config::OrchestrationConfig {
+        use crate::config::{OrchestrationConfig, WorkerConfig};
+        // Only the map keys matter to validate_worker_names; values are minimal.
+        let worker = WorkerConfig {
+            description: "d".to_string(),
+            preamble: "p".to_string(),
+            mcp_filter: Vec::new(),
+            vector_stores: Vec::new(),
+            turn_depth: None,
+            llm: None,
+            scratchpad: None,
+        };
+        let mut orch = OrchestrationConfig::default();
+        for name in names {
+            orch.workers.insert((*name).to_string(), worker.clone());
+        }
+        orch
+    }
+
+    #[test]
+    fn test_validate_worker_names_ok() {
+        let orch = orch_with_workers(&["alpha", "beta"]);
+        assert!(orch.validate_worker_names().is_ok());
+    }
+
+    #[test]
+    fn test_validate_worker_names_rejects_case_insensitive_collision() {
+        // Distinct keys `Alpha` and `alpha` are separate HashMap entries, but
+        // would collide as filenames on macOS APFS or Windows NTFS.
+        let orch = orch_with_workers(&["Alpha", "alpha"]);
+        let err = match orch.validate_worker_names() {
+            Err(crate::ConfigError::Validation(msg)) => msg,
+            other => panic!("expected validation error, got: {other:?}"),
+        };
+        assert!(err.contains("Duplicate worker name"), "got: {err}");
+        assert!(err.contains("Alpha") && err.contains("alpha"), "got: {err}");
+        assert!(err.contains("[orchestration.worker.*]"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_worker_names_rejects_empty() {
+        let orch = orch_with_workers(&[""]);
+        let err = match orch.validate_worker_names() {
+            Err(crate::ConfigError::Validation(msg)) => msg,
+            other => panic!("expected validation error, got: {other:?}"),
+        };
+        assert!(err.contains("Empty worker name"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_worker_names_empty_workers_ok() {
+        // No workers configured at all is fine.
+        let orch = crate::config::OrchestrationConfig::default();
+        assert!(orch.validate_worker_names().is_ok());
     }
 }

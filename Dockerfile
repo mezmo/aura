@@ -12,7 +12,10 @@ ENV PATH="${PATH}:/home/aura/.bin"
 WORKDIR /home/aura
 
 RUN <<EOR
-  apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl nodejs npm
+  dpkg --add-architecture arm64
+  apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl nodejs npm \
+    gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64
   rm -rf /var/lib/apt/lists/*
 EOR
 

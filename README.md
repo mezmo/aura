@@ -36,11 +36,14 @@ Key capabilities:
 ## Quick Start
 
 ```bash
-cp .env.example .env          # set your LLM provider, model, and API key
-docker compose up -d           # starts Aura + LibreChat + Phoenix
+cp .env.example .env            # set your LLM provider, model, and API key
+docker compose up -d            # starts Aura (orchestrator mode) + LibreChat + Phoenix
+docker exec -it aura ./aura-cli # chat with the orchestrator from your terminal
 ```
 
-Open <http://localhost:3080> to chat, <http://localhost:6006> to inspect traces.
+Aura boots in **orchestrator mode**: a coordinator routes each request — answering simple ones directly and decomposing complex ones across specialized workers. The bundled `aura-cli` connects to the in-container server automatically and renders the coordinator's plan and worker activity as it streams.
+
+Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://localhost:6006> to inspect traces in Phoenix.
 
 **[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
 
