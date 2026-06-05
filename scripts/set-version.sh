@@ -38,5 +38,5 @@ for toml in crates/*/Cargo.toml; do
     fi
 done
 
-cargo update --quiet --workspace
+make update-lockfile
 echo "Version update complete"
