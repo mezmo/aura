@@ -44,16 +44,27 @@ Prefer a terminal? The [AURA CLI](../crates/aura-cli/README.md) ships in the sam
 docker exec -it aura ./aura-cli
 ```
 
-Or download a pre-built binary from GitHub Releases:
+Or install via the install script:
 
 ```bash
-# Download the binary for your platform (linux/amd64 or linux/arm64)
-curl -LO https://github.com/mezmo/aura/releases/latest/download/aura-cli-linux-amd64
-chmod +x aura-cli-linux-amd64
-./aura-cli-linux-amd64
+curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-Pre-built binaries are available for `aura-cli` and `aura-web-server` on `linux-amd64` and `linux-arm64`. SHA-256 checksums are published in `checksums-sha256.txt`.
+The script downloads pre-built binaries for your platform, verifies checksums, and installs to `~/.local/bin`. Customize with environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AURA_VERSION` | `latest` | Version to install (e.g. `1.2.0`) |
+| `AURA_INSTALL` | `~/.local/bin` | Install directory |
+| `AURA_COMPONENT` | `all` | Which binaries: `all`, `server`, or `cli` |
+
+Install only the CLI to a custom directory:
+
+```bash
+AURA_INSTALL=/usr/local/bin AURA_COMPONENT=cli curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
+```
+
+**Manual download:** Pre-built binaries (`aura-cli`, `aura-web-server`) for `linux-amd64` and `linux-arm64` are available on the [GitHub Releases](https://github.com/mezmo/aura/releases) page with SHA-256 checksums.
 
 Or build from source and connect to the quickstart server:
 
