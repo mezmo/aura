@@ -67,6 +67,7 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.reasoning` | LLM reasoning content (requires `AURA_EMIT_REASONING=true`) | ✅ Implemented |
 | `aura.progress` | MCP progress notifications during long-running tools | ✅ Implemented |
 | `aura.session_info` | Session metadata (model, context window) emitted at stream start | ✅ Implemented |
+| `aura.mcp_status` | Per-server MCP connection status emitted at stream start (connected/failed/not_attempted, with failure reason) | ✅ Implemented |
 | `aura.worker_phase` | Worker phase transitions in multi-agent mode (planning/executing/analyzing) | ✅ Implemented |
 | `aura.tool_usage` | Usage snapshot after tool execution (associates tool IDs with token counts) | ✅ Implemented |
 | `aura.usage` | Final token usage emitted at stream end (prompt/completion/total) | ✅ Implemented |
@@ -214,6 +215,36 @@ data:
 ```
 
 Note: `aura.session_info` includes only `CorrelationContext` fields (`session_id`, `trace_id`) — no `agent_id`. `model_context_limit` comes from the `context_window` field in the `[agent.llm]` TOML config section (or `[orchestration.worker.<name>.llm]` for per-worker overrides). If `context_window` is not set, `model_context_limit` is omitted from the event.
+
+**MCP status** (emitted once when at least one MCP server is configured — at stream start in single-agent mode, or just after the shared manager connects in orchestration mode):
+```
+event: aura.mcp_status
+data:
+```
+```json
+{
+  "servers": [
+    {
+      "server_name": "mezmo",
+      "transport": "http_streamable",
+      "status": "connected",
+      "tools_count": 7
+    },
+    {
+      "server_name": "pagerduty",
+      "transport": "http_streamable",
+      "status": "failed",
+      "tools_count": 0,
+      "reason": "Connection failed: HTTP MCP server 'pagerduty' authentication failed (401 Unauthorized). Check that your headers, forwarded headers. and/or credentials are correct."
+    }
+  ],
+  "session_id": "sess_xyz"
+}
+```
+
+Note: `status` is one of `connected`, `failed`, or `not_attempted`. This lets a client distinguish a server that is configured but unavailable (`failed`, with a `reason`) from one that connected and legitimately exposes no tools (`connected`, `tools_count: 0`). `reason` is present only for failed servers. The event is omitted entirely when no servers are configured. `aura.mcp_status` includes only `CorrelationContext` fields (`session_id`, `trace_id`) — no `agent_id`.
+
+In orchestration mode all workers share a single `McpManager`, so one `aura.mcp_status` reports the whole run's server status. The wire shape is identical to single-agent mode; it just arrives slightly later (after the manager connects, before planning) rather than at stream start. Requires `AURA_CUSTOM_EVENTS=true` in both modes.
 
 **Worker phase** (phase transitions in multi-agent mode):
 ```

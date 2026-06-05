@@ -150,15 +150,31 @@ impl McpClient {
             .build()
             .context("Failed to build HTTP client")?;
 
+        // Use our own StreamableHttpClient so a failing HTTP status (404/401/…)
+        // is captured at the transport layer. rmcp's worker otherwise collapses
+        // it into a generic "channel closed", losing the actionable detail.
+        let custom_client = crate::mcp::CustomHttpClient::from_reqwest(http_client);
+        let captured_status = custom_client.first_error();
+
         let transport = StreamableHttpClientTransport::with_client(
-            http_client,
+            custom_client,
             StreamableHttpClientTransportConfig {
                 uri: server_url.clone().into(),
                 ..Default::default()
             },
         );
 
-        let client = Self::from_transport(transport, server_url.clone()).await?;
+        let client = match Self::from_transport(transport, server_url.clone()).await {
+            Ok(client) => client,
+            Err(e) => {
+                // Surface the real HTTP status when the transport captured one,
+                // as the outermost context so it leads the rendered chain.
+                if let Some(status) = captured_status.lock().ok().and_then(|mut g| g.take()) {
+                    return Err(e.context(status));
+                }
+                return Err(e);
+            }
+        };
 
         info!(
             "Successfully established streamable HTTP MCP client: {}",

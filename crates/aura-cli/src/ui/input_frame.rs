@@ -14,11 +14,11 @@ use crate::theme::{AuraStyle, Themed};
 use super::animation::render_queued_wave;
 use super::state::{
     CURSOR_ROW, FORCE_REPAINT, FRAME_LINES, INPUT_LINES, LAST_TERM_WIDTH, PROCESSING, QUEUED_INPUT,
-    QUEUED_WAVE_POS, lock_term, status_rows, term_size,
+    QUEUED_WAVE_POS, STATUS_ROWS, lock_term, status_rows, term_size,
 };
 use super::status_bar::{
-    get_effective_status, is_hint_active, print_status_line, set_status_bar,
-    set_status_with_right_text,
+    desired_status_rows, get_effective_status, print_status_line, set_status_bar,
+    set_status_with_right_text, status_is_prestyled,
 };
 use super::stream_panel::{render_stream_panel_in_place, stream_panel_rows};
 
@@ -124,7 +124,7 @@ fn adjust_frame_for_line_change(old_lines: u16, new_lines: u16, old_cursor_row: 
     let _ = execute!(stdout, terminal::Clear(terminal::ClearType::CurrentLine));
     print!("{styled_border}");
 
-    let hint_active = is_hint_active();
+    let hint_active = status_is_prestyled();
 
     for i in 0..sr as usize {
         let _ = execute!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0));
@@ -177,12 +177,16 @@ pub fn redraw_input_frame() {
     LAST_TERM_WIDTH.store(width, Ordering::Relaxed);
     let border: String = "─".repeat(width as usize);
     let styled_border = border.themed(AuraStyle::Connector);
+    // Size the status area to fit any per-turn notices (and hint overlay).
+    // A full repaint, so it's safe to (re)derive and store the row count here;
+    // this is what surfaces notices collected during a turn once it finishes.
+    let sr = desired_status_rows();
+    STATUS_ROWS.store(sr, Ordering::Relaxed);
     let status_lines = get_effective_status();
-    let hint_active = is_hint_active();
+    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
-    let sr = status_rows();
     println!("{styled_border}");
     println!();
     println!("{styled_border}");
@@ -327,7 +331,7 @@ pub fn handle_resize_frame(old_width: u16) {
     print!("{styled_border}");
 
     let status_lines = get_effective_status();
-    let hint_active = is_hint_active();
+    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
@@ -359,7 +363,7 @@ pub fn resize_status_area(old_sr: u16, new_sr: u16) {
     let n = FRAME_LINES.load(Ordering::Relaxed);
     let r = CURSOR_ROW.load(Ordering::Relaxed);
     let status_lines = get_effective_status();
-    let hint_active = is_hint_active();
+    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
@@ -485,7 +489,7 @@ pub(crate) fn collapse_two_lines_above_frame() {
     let border: String = "─".repeat(width as usize);
     let styled_border = border.themed(AuraStyle::Connector);
     let status_lines = get_effective_status();
-    let hint_active = is_hint_active();
+    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 

@@ -18,7 +18,7 @@ use super::state::{
     STREAM_CONV_DIR, STYLE_MATCHES, get_tab_select_index, lock_term, random_bullet_color,
     status_rows, term_size,
 };
-use super::status_bar::update_status_bar;
+use super::status_bar::{notice_status_rows, update_status_bar};
 use crate::theme::{AuraStyle, STYLE_NAMES, Themed, theme};
 
 /// Update the model cache from a successful fetch.
@@ -386,9 +386,11 @@ pub fn update_input_hint(line: &str) {
         }
         vec![]
     };
-    // Compute new status row count and handle resizing
+    // Compute new status row count and handle resizing. When no hint is
+    // showing, fall back to the notice-aware baseline so any per-turn notices
+    // stay visible.
     let new_sr = if hint.is_empty() {
-        3u16
+        notice_status_rows()
     } else {
         (hint.len() as u16 + 1).max(3)
     };
@@ -422,10 +424,13 @@ pub fn clear_input_hint() {
     if let Ok(mut guard) = STATUS_HINT.lock() {
         guard.clear();
     }
-    if old_sr != 3 {
+    // Shrink back to the notice-aware baseline (3 when no notices), so notices
+    // collected this turn reappear once the command hint is dismissed.
+    let target = notice_status_rows();
+    if old_sr != target {
         let _term = lock_term();
-        STATUS_ROWS.store(3, Ordering::Relaxed);
-        resize_status_area(old_sr, 3);
+        STATUS_ROWS.store(target, Ordering::Relaxed);
+        resize_status_area(old_sr, target);
     }
 }
 

@@ -18,7 +18,7 @@ use super::state::{
     AUTO_COMPACT_CEILING, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION,
     CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED,
     CURSOR_ROW, FRAME_LINES, LAST_CTRLC, PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, STATUS_BAR,
-    STATUS_HINT, lock_term, status_rows, term_size,
+    STATUS_HINT, STATUS_ROWS, TURN_NOTICES, lock_term, status_rows, term_size,
 };
 
 /// Format a number with comma separators (e.g. 1234 -> "1,234").
@@ -55,29 +55,107 @@ pub(crate) fn is_hint_active() -> bool {
     STATUS_HINT.lock().map(|g| !g.is_empty()).unwrap_or(false)
 }
 
+/// Whether per-turn notices should currently be shown. Notices are hidden
+/// while a request is processing (the status area shows "esc to stop") and
+/// while a hint overlay is active.
+fn notices_visible() -> bool {
+    !PROCESSING.load(Ordering::Relaxed)
+        && !is_hint_active()
+        && TURN_NOTICES.lock().map(|g| !g.is_empty()).unwrap_or(false)
+}
+
+/// Whether the status lines are already styled (hint overlay or per-turn
+/// notices) and must therefore be printed verbatim rather than re-coloured
+/// `Muted` by the render sites.
+pub(crate) fn status_is_prestyled() -> bool {
+    is_hint_active() || notices_visible()
+}
+
+/// Number of status rows the notices require when idle: token line + a blank
+/// separator + one row per notice + a trailing (reserved) row. Returns the
+/// legacy default of 3 when no notices are visible.
+pub(crate) fn notice_status_rows() -> u16 {
+    let n = if !PROCESSING.load(Ordering::Relaxed) {
+        TURN_NOTICES.lock().map(|g| g.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    if n == 0 { 3 } else { n as u16 + 3 }
+}
+
+/// Desired status-row count given the current hint and notice state. The hint
+/// overlay takes precedence over notices (it replaces the status area).
+pub(crate) fn desired_status_rows() -> u16 {
+    let hint_len = STATUS_HINT.lock().map(|g| g.len()).unwrap_or(0);
+    if hint_len > 0 {
+        return (hint_len as u16 + 1).max(3);
+    }
+    notice_status_rows()
+}
+
 /// Return the lines to display in the status area.
 pub(crate) fn get_effective_status() -> Vec<String> {
     let hint = STATUS_HINT.lock().map(|g| g.clone()).unwrap_or_default();
     if !hint.is_empty() {
         return hint;
     }
-    if PROCESSING.load(Ordering::Relaxed) {
-        return vec!["esc to stop".to_string()];
+
+    let first = if PROCESSING.load(Ordering::Relaxed) {
+        "esc to stop".to_string()
+    } else {
+        let bar = get_status_bar();
+        if !bar.is_empty() {
+            bar
+        } else {
+            "? for help".to_string()
+        }
+    };
+
+    if !notices_visible() {
+        return vec![first];
     }
-    let bar = get_status_bar();
-    if !bar.is_empty() {
-        return vec![bar];
-    }
-    vec!["? for help".to_string()]
+
+    // Notices are present and idle: the whole status area renders verbatim
+    // (status_is_prestyled() is true), so pre-style the leading line as Muted
+    // to match its normal appearance, then a blank separator, then the
+    // already-styled notice lines.
+    let notices = TURN_NOTICES.lock().map(|g| g.clone()).unwrap_or_default();
+    let mut lines = Vec::with_capacity(notices.len() + 2);
+    lines.push(first.themed(AuraStyle::Muted).to_string());
+    lines.push(String::new());
+    lines.extend(notices);
+    lines
 }
 
-/// Print a status line: hints are pre-styled, others get DarkGrey.
-pub(crate) fn print_status_line(line: &str, hint_active: bool) {
-    if hint_active {
+/// Print a status line: pre-styled lines (hints / notices) are emitted as-is,
+/// others get the Muted style.
+pub(crate) fn print_status_line(line: &str, prestyled: bool) {
+    if prestyled {
         print!("{line}");
     } else {
         print!("{}", line.themed(AuraStyle::Muted));
     }
+}
+
+/// Append a per-turn status notice (error/warning) shown below the token line
+/// while idle. The `style` colours the whole line. The notice is data-only
+/// here — it becomes visible the next time the input frame is redrawn (i.e.
+/// once the in-flight request finishes), so this is safe to call mid-stream.
+pub fn add_turn_notice(style: AuraStyle, message: impl AsRef<str>) {
+    let styled = message.as_ref().themed(style).to_string();
+    if let Ok(mut g) = TURN_NOTICES.lock() {
+        g.push(styled);
+    }
+}
+
+/// Clear all per-turn notices and reflow the status area back to its baseline
+/// size. Called at the start of each request, after the previous frame has
+/// already been erased, so a plain store (no in-place reflow) is sufficient.
+pub fn clear_turn_notices() {
+    if let Ok(mut g) = TURN_NOTICES.lock() {
+        g.clear();
+    }
+    STATUS_ROWS.store(notice_status_rows(), Ordering::Relaxed);
 }
 
 /// Update the status bar rows in place (dynamically sized).
@@ -89,7 +167,7 @@ pub fn update_status_bar() {
 /// Inner implementation — caller must already hold `TERM_WRITE`.
 pub(crate) fn update_status_bar_unlocked() {
     let lines = get_effective_status();
-    let hint_active = is_hint_active();
+    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
     let sr = status_rows() as usize;

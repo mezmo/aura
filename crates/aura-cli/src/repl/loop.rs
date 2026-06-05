@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
+use crate::api::mcp_status::McpNotice;
 use crate::api::stream::{StreamHandler, StreamResult};
 use crate::api::types::{DisplayEvent, ShellCallDetail, ToolCallInfo, snake_to_pascal_case};
 use crate::backend::Backend;
@@ -721,6 +722,9 @@ pub fn run_repl(
                 set_processing(true);
                 crate::ui::prompt::clear_agent_reasoning();
                 crate::ui::prompt::reset_orch_tools();
+                // Per-turn status notices (e.g. MCP connection errors/warnings)
+                // are scoped to the current request; clear last turn's set.
+                crate::ui::prompt::clear_turn_notices();
 
                 // Per-turn event recording state
                 let pending_args: Arc<
@@ -2240,6 +2244,74 @@ impl StreamHandler for ReplStreamHandler {
     }
 
     fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
+        // Per-turn MCP connection status. Surfaced two ways:
+        //  1. Persistent status notices below the token line, rendered when
+        //     this turn's frame is redrawn at turn end (data-only).
+        //  2. Immediately in the scrollback, so the user can react — e.g. stop
+        //     a doomed run — without waiting for the turn to finish.
+        if event_name == event_names::MCP_STATUS {
+            let notices = crate::api::mcp_status::notices_from_event(val);
+            if notices.is_empty() {
+                return;
+            }
+
+            // (1) Persistent status section.
+            for notice in &notices {
+                // Prefixes are padded so message text aligns
+                // ("error:   " / "warning: ").
+                let (style, line) = match notice {
+                    McpNotice::Error(message) => (AuraStyle::Error, format!("error:   {message}")),
+                    McpNotice::Warning(message) => {
+                        (AuraStyle::Warning, format!("warning: {message}"))
+                    }
+                };
+                crate::ui::prompt::add_turn_notice(style, line);
+            }
+
+            // (2) Immediate scrollback line(s). Mirror the on_tool_complete
+            // dance: stop the spinner, print above the frame, then restart
+            // "Thinking" so feedback continues until the next event/response.
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                guard.take().map(|(a, _)| a.finish()).is_some()
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+            {
+                let _term = lock_term();
+                erase_input_frame();
+                for notice in &notices {
+                    let (style, label, message) = match notice {
+                        McpNotice::Error(message) => (AuraStyle::Error, "Error", message),
+                        McpNotice::Warning(message) => (AuraStyle::Warning, "Warning", message),
+                    };
+                    // Theme the whole line, not just the marker/label.
+                    let line = format!("⏺ {label} - {message}");
+                    println!("{}", line.themed(style));
+                    crate::ui::prompt::increment_orch_scrollback();
+                }
+                println!();
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            return;
+        }
+
         // Handle aura.progress — prefer to attach the
         // message to the active orchestrator tool whose
         // progress_token matches; fall back to the

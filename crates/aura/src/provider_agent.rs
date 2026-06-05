@@ -400,6 +400,14 @@ pub enum StreamItem {
         /// Tokens extracted from scratchpad back into context.
         tokens_extracted: usize,
     },
+    /// MCP server connection status snapshot.
+    ///
+    /// Emitted once near the start of an orchestration run (after the shared
+    /// `McpManager` is initialized) so clients can see degraded/unavailable
+    /// servers. The web server handler converts this to an `aura.mcp_status`
+    /// SSE event — the same event single-agent mode emits at stream start —
+    /// filling in correlation context from the request.
+    McpStatus(Vec<aura_events::McpServerStatus>),
 }
 
 /// Final response information.
