@@ -5,6 +5,7 @@
 //! namespace.
 
 pub const SESSION_INFO: &str = "aura.session_info";
+pub const MCP_STATUS: &str = "aura.mcp_status";
 pub const TOOL_REQUESTED: &str = "aura.tool_requested";
 pub const TOOL_START: &str = "aura.tool_start";
 pub const TOOL_COMPLETE: &str = "aura.tool_complete";

@@ -76,11 +76,12 @@ aura/
 - **STDIO Transport**: Tool discovery
 - **Header Forwarding**: `headers_from_request` mappings with static TOML `headers` as fallback
 - **Cancellation**: `notifications/cancelled` propagation on client disconnect
+- **Status reporting**: per-server connection state (`Connected`/`Failed(reason)`/`NotAttempted`) is tracked in `McpManager::server_info` and projected to clients via the `aura.mcp_status` SSE event. Transport/auth failures bubble as errors.
 
 ### Streaming
 - OpenAI-compatible SSE streaming (`/v1/chat/completions`)
 - Custom `aura.*` events (opt-in via `AURA_CUSTOM_EVENTS=true`):
-  - `aura.session_info`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.scratchpad_usage`
+  - `aura.session_info`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.scratchpad_usage`
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 

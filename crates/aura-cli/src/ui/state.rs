@@ -45,6 +45,18 @@ pub fn term_size() -> (u16, u16) {
 
 pub(crate) static STATUS_BAR: Mutex<String> = Mutex::new(String::new());
 pub(crate) static STATUS_HINT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Per-turn status notices (pre-styled error/warning lines) shown below the
+/// token line in the status area while the REPL is idle. Populated during a
+/// turn (e.g. from `aura.mcp_status`) and cleared at the start of the next
+/// request. Hidden while a request is processing and while a hint overlay is
+/// active — this is the *persistent* surface that sticks after the turn ends.
+///
+/// For *immediate* visibility during the turn (so the user can react before it
+/// finishes), notices are also printed into the scrollback as `⏺ Error/Warning`
+/// lines when the event arrives — see the `aura.mcp_status` handler in
+/// `repl::loop`. The two surfaces are complementary: scrollback = immediate,
+/// status area = sticky.
+pub(crate) static TURN_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static CUMULATIVE_PROMPT: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_COMPLETION: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_INTERCEPTED: Mutex<u64> = Mutex::new(0);

@@ -343,6 +343,9 @@ impl AgentExecutor for AuraAgentExecutor {
                     Ok(StreamItem::OrchestratorEvent(_)) => {
                         event!(Level::DEBUG, request_id, "orchestration event");
                     }
+                    Ok(StreamItem::McpStatus(_)) => {
+                        event!(Level::DEBUG, request_id, "mcp status");
+                    }
                     Ok(StreamItem::StreamUserItem(_)) => {
                         event!(Level::DEBUG, request_id, "stream user item");
                     }

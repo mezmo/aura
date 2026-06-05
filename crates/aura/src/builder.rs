@@ -1479,6 +1479,13 @@ impl StreamingAgent for Agent {
     fn context_window(&self) -> Option<u64> {
         self.context_window
     }
+
+    fn mcp_server_status(&self) -> Vec<aura_events::McpServerStatus> {
+        self.mcp_manager
+            .as_ref()
+            .map(|m| m.server_status_snapshot())
+            .unwrap_or_default()
+    }
 }
 
 /// Build the appropriate streaming agent based on configuration.

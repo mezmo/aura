@@ -76,9 +76,16 @@ impl OrchestratorFactory {
                 // are visible to the streaming handler (UsageState is Arc-backed).
                 orchestrator.usage_state = usage_state;
 
-                // Set MCP request ID for progress notification routing
+                // Set MCP request ID for progress notification routing, and
+                // surface per-server connection status so degraded/unavailable
+                // MCP servers are visible in orchestration mode too (workers
+                // share this one manager).
                 if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                     mcp_manager.set_current_request(&request_id).await;
+                    let snapshot = mcp_manager.server_status_snapshot();
+                    if !snapshot.is_empty() {
+                        let _ = event_tx.send(Ok(StreamItem::McpStatus(snapshot))).await;
+                    }
                 }
 
                 // Forward tool call events from workers to SSE stream
