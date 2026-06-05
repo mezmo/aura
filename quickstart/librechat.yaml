@@ -10,10 +10,10 @@ endpoints:
       baseURL: "http://aura:8080/v1"
       models:
         default:
-          - "Aura Assistant"
+          - "Aura Orchestrator"
         fetch: true
       titleConvo: true
-      titleModel: "Aura Assistant"
+      titleModel: "Aura Orchestrator"
       summarize: false
       forcePrompt: false
       modelDisplayLabel: "Aura"

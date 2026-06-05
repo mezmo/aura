@@ -5,6 +5,9 @@
 /.cargo/
 /.rustup/
 
+# Release binaries
+/dist/
+
 # IDE
 .vscode/
 .idea/

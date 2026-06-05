@@ -1,7 +1,7 @@
 #![cfg(feature = "integration-orchestration")]
 
 use aura::orchestration::event_names;
-use aura::stream_events::event_names as aura_event_names;
+use aura_events::event_names as aura_event_names;
 use aura_test_utils::server_urls::AURA_SERVER;
 use aura_test_utils::sse::{SseEvent, events_by_type, parse_sse_stream};
 use serde_json::{Value, json};

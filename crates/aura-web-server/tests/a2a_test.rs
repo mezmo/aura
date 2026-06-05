@@ -929,7 +929,9 @@ async fn test_validate_http_headers_forwarded_to_mcps() {
     let request_text = format!(
         "I need to see what HTTP headers you received. Please use the echo_headers tool to show me all
         the headers that were sent to the MCP server. Make sure to include message_id={} in the tool call
-        so I can correlate it with the headers you received.",
+        so I can correlate it with the headers you received. Return the complete, raw JSON output from
+        echo_headers verbatim, including every header name and value exactly as received. Do not
+        summarize, reformat, or omit any header.",
         message_id
     );
 
@@ -1032,13 +1034,18 @@ async fn test_validate_http_headers_forwarded_to_mcps() {
 
     println!("Received headers from MCP: {}", part_text);
 
-    // Verify the forwarded headers are present (case-insensitive keys from echo_headers)
+    // The "Final Info" artifact is the LLM's prose, so its exact wording/JSON shape
+    // is not guaranteed even at temperature 0. Assert deterministically on the data
+    // instead: lower-case the text once (echo_headers normalizes keys to lowercase)
+    // and check each header's key AND value are present independently, rather than
+    // matching an exact JSON fragment.
+    let lower = part_text.to_lowercase();
     assert!(
-        part_text.contains(r#""x-test-header1": "jello""#),
-        "X-Test-Header1 was not forwarded to the MCP server"
+        lower.contains("x-test-header1") && lower.contains("jello"),
+        "X-Test-Header1 was not forwarded to the MCP server. Final Info: {part_text}"
     );
     assert!(
-        part_text.contains(r#""x-test-header2": "pudding""#),
-        "X-Test-Header2 was not forwarded to the MCP server"
+        lower.contains("x-test-header2") && lower.contains("pudding"),
+        "X-Test-Header2 was not forwarded to the MCP server. Final Info: {part_text}"
     );
 }
