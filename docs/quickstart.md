@@ -84,13 +84,15 @@ LLM_MODEL=claude-sonnet-4-20250514
 LLM_API_KEY=sk-ant-...
 ```
 
-**OpenRouter:**
+**[OpenRouter](https://openrouter.ai)** (300+ models via single API key):
 
 ```bash
 LLM_PROVIDER=openrouter
 LLM_MODEL=anthropic/claude-sonnet-4
 LLM_API_KEY=sk-or-...
 ```
+
+The `openrouter` provider is for OpenRouter.ai only. For other OpenAI-compatible APIs (Fireworks, Together, etc.), use `provider = "openai"` with a `base_url` override.
 
 **Ollama** (local, no API key):
 
