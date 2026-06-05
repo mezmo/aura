@@ -47,7 +47,7 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use aura_events::RequestType;
+use aura_events::{ApprovalDecision, RequestType, TaskIdentity};
 
 use crate::config::glob_match;
 use crate::tool_event_broker::{self, ToolLifecycleEvent};
@@ -92,57 +92,68 @@ pub struct ApprovalItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_pattern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_name: Option<String>,
+    pub task: Option<TaskIdentity>,
 }
 
-/// Webhook response. Accepts two shapes:
+/// Wire-format struct for a single per-item decision from the webhook.
 ///
-/// - **Simple:** `{ "approved": true, "reason": "..." }`
-/// - **Batch:**  `{ "decisions": [{ "approved": true, "reason": "..." }] }`
-///
-/// When both `decisions` and `approved` are present, `decisions` takes
-/// precedence and `approved` is ignored.
-///
-/// Fail-closed: if neither `approved` nor `decisions` is present, or if
-/// `decisions` is an empty array, `resolve_single()` returns `(false, reason)`.
+/// Deserialized from `{ "approved": bool, "reason": "..." }` and immediately
+/// converted to the domain [`ApprovalDecision`] enum.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ApprovalResponse {
-    /// Direct single-decision field.
-    pub approved: Option<bool>,
-    /// Optional reason (used with the simple shape).
+pub struct ApprovalDecisionWire {
+    pub approved: bool,
     pub reason: Option<String>,
-    /// Per-item decisions (batch shape).
-    pub decisions: Option<Vec<ApprovalDecision>>,
 }
 
-impl ApprovalResponse {
-    /// Resolve a single approval decision from whichever response shape was
-    /// used. Returns `(approved, reason)`.
-    ///
-    /// Precedence: if `decisions` is present, the first decision wins;
-    /// otherwise falls back to `approved`. Missing or empty decisions are
-    /// treated as rejected.
-    pub fn resolve_single(&self) -> (bool, Option<String>) {
-        if let Some(ref decisions) = self.decisions {
-            decisions
-                .first()
-                .map(|d| (d.approved, d.reason.clone()))
-                .unwrap_or((false, Some("empty decisions array".to_string())))
+impl From<ApprovalDecisionWire> for ApprovalDecision {
+    fn from(w: ApprovalDecisionWire) -> Self {
+        if w.approved {
+            Self::Approved { reason: w.reason }
         } else {
-            (self.approved.unwrap_or(false), self.reason.clone())
+            Self::Denied { reason: w.reason }
         }
     }
 }
 
-/// A single per-item decision within a batch response.
+/// Webhook response. Accepts two shapes; the untagged enum makes the
+/// impossible states (both present, neither present) unrepresentable.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovalDecision {
-    pub approved: bool,
-    pub reason: Option<String>,
+#[serde(untagged)]
+pub enum ApprovalResponse {
+    Simple {
+        approved: bool,
+        reason: Option<String>,
+    },
+    Batch {
+        decisions: Vec<ApprovalDecisionWire>,
+    },
+}
+
+impl ApprovalResponse {
+    /// Resolve a single approval decision from whichever response shape was used.
+    ///
+    /// Fail-closed: missing or empty decisions are treated as rejected.
+    pub fn resolve_single(&self) -> ApprovalDecision {
+        match self {
+            Self::Batch { decisions } => decisions
+                .first()
+                .cloned()
+                .map(ApprovalDecision::from)
+                .unwrap_or_else(|| {
+                    ApprovalDecision::Denied {
+                        reason: Some("empty decisions array".to_string()),
+                    }
+                }),
+            Self::Simple { approved, reason } => {
+                if *approved {
+                    ApprovalDecision::Approved { reason: reason.clone() }
+                } else {
+                    ApprovalDecision::Denied { reason: reason.clone() }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,17 +275,24 @@ impl HitlContext {
         request: ApprovalRequest,
         event_tool_name: &str,
         event_matched_pattern: Option<String>,
-        event_task_id: Option<usize>,
-        event_worker_name: Option<String>,
+        task: Option<TaskIdentity>,
     ) -> Result<ApprovalOutcome, ApprovalError> {
+        if self.request_id.is_empty() {
+            tracing::error!(
+                "HitlContext request_id is empty — approval events will be lost. \
+                 Ensure request_id is set before building the agent."
+            );
+            return Err(ApprovalError::HttpError(
+                "HITL request_id is empty — cannot route approval events".to_string(),
+            ));
+        }
         let _ = tool_event_broker::publish(
             &self.request_id,
             ToolLifecycleEvent::ApprovalRequested {
                 tool_name: event_tool_name.to_string(),
                 matched_pattern: event_matched_pattern.clone(),
                 request_type: request.request_type,
-                task_id: event_task_id,
-                worker_name: event_worker_name.clone(),
+                task: task.clone(),
             },
         )
         .await;
@@ -283,17 +301,18 @@ impl HitlContext {
         let response = self.dispatch.request_approval(&request).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        let (approved, reason) = match &response {
+        let decision = match &response {
             Ok(resp) => resp.resolve_single(),
             Err(e) => {
                 let _ = tool_event_broker::publish(
                     &self.request_id,
                     ToolLifecycleEvent::ApprovalCompleted {
                         tool_name: event_tool_name.to_string(),
-                        approved: false,
-                        reason: Some(format!("webhook error: {e}")),
+                        decision: ApprovalDecision::Denied {
+                            reason: Some(format!("webhook error: {e}")),
+                        },
                         duration_ms,
-                        task_id: event_task_id,
+                        task: task.clone(),
                     },
                 )
                 .await;
@@ -301,22 +320,20 @@ impl HitlContext {
             }
         };
 
-        let reason_for_event = reason.clone();
+        let decision_for_event = decision.clone();
         let _ = tool_event_broker::publish(
             &self.request_id,
             ToolLifecycleEvent::ApprovalCompleted {
                 tool_name: event_tool_name.to_string(),
-                approved,
-                reason: reason_for_event,
+                decision: decision_for_event,
                 duration_ms,
-                task_id: event_task_id,
+                task: task.clone(),
             },
         )
         .await;
 
         Ok(ApprovalOutcome {
-            approved,
-            reason,
+            decision,
             duration_ms,
         })
     }
@@ -325,8 +342,7 @@ impl HitlContext {
 /// Result of an approval dispatch, for callers to map into their own
 /// return types (`Result<(), ToolError>` vs `Result<String, Infallible>`).
 struct ApprovalOutcome {
-    approved: bool,
-    reason: Option<String>,
+    decision: ApprovalDecision,
     duration_ms: u64,
 }
 
@@ -394,12 +410,10 @@ impl ToolWrapper for HitlApprovalWrapper {
                 tool_name: ctx.tool_name.clone(),
                 arguments: args.clone(),
                 matched_pattern: Some(matched_pattern.to_string()),
-                task_id: ctx.task_id,
-                worker_name: if ctx.tool_initiator_id.is_empty() {
-                    None
-                } else {
-                    Some(ctx.tool_initiator_id.clone())
-                },
+                task: ctx.task_id.map(|task_id| TaskIdentity {
+                    task_id,
+                    worker_id: ctx.tool_initiator_id.clone(),
+                }),
             }],
         };
 
@@ -409,27 +423,28 @@ impl ToolWrapper for HitlApprovalWrapper {
                 request,
                 &ctx.tool_name,
                 Some(matched_pattern.to_string()),
-                ctx.task_id,
-                if ctx.tool_initiator_id.is_empty() {
-                    None
-                } else {
-                    Some(ctx.tool_initiator_id.clone())
-                },
+                ctx.task_id.map(|task_id| TaskIdentity {
+                    task_id,
+                    worker_id: ctx.tool_initiator_id.clone(),
+                }),
             )
             .await
             .map_err(ToolError::from)?;
 
-        if outcome.approved {
-            tracing::info!(tool = %ctx.tool_name, duration_ms = outcome.duration_ms, "HITL approved");
-            Ok(())
-        } else {
-            let reason = outcome
-                .reason
-                .unwrap_or_else(|| "no reason provided".to_string());
-            tracing::warn!(tool = %ctx.tool_name, reason = %reason, duration_ms = outcome.duration_ms, "HITL rejected");
-            Err(ToolError::ToolCallError(
-                format!("Tool call rejected by approval gate: {reason}").into(),
-            ))
+        match &outcome.decision {
+            ApprovalDecision::Approved { .. } => {
+                tracing::info!(tool = %ctx.tool_name, duration_ms = outcome.duration_ms, "HITL approved");
+                Ok(())
+            }
+            ApprovalDecision::Denied { reason } => {
+                let reason = reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason provided".to_string());
+                tracing::warn!(tool = %ctx.tool_name, reason = %reason, duration_ms = outcome.duration_ms, "HITL rejected");
+                Err(ToolError::ToolCallError(
+                    format!("Tool call rejected by approval gate: {reason}").into(),
+                ))
+            }
         }
     }
 }
@@ -527,14 +542,13 @@ impl Tool for RequestApprovalTool {
                 tool_name: Self::NAME.to_string(),
                 arguments,
                 matched_pattern: None,
-                task_id: None,
-                worker_name: None,
+                task: None,
             }],
         };
 
         let outcome = match self
             .hitl
-            .dispatch_and_emit(request, Self::NAME, None, None, None)
+            .dispatch_and_emit(request, Self::NAME, None, None)
             .await
         {
             Ok(o) => o,
@@ -550,20 +564,23 @@ impl Tool for RequestApprovalTool {
             }
         };
 
-        if outcome.approved {
-            tracing::info!(action = %args.action_description, duration_ms = outcome.duration_ms, "Approval granted");
-            Ok(format!(
-                "Approved. You may proceed with: {}",
-                args.action_description
-            ))
-        } else {
-            let reason = outcome
-                .reason
-                .unwrap_or_else(|| "no reason provided".to_string());
-            tracing::warn!(action = %args.action_description, reason = %reason, duration_ms = outcome.duration_ms, "Approval rejected");
-            Ok(format!(
-                "Rejected: {reason}. Do not proceed with this action."
-            ))
+        match &outcome.decision {
+            ApprovalDecision::Approved { .. } => {
+                tracing::info!(action = %args.action_description, duration_ms = outcome.duration_ms, "Approval granted");
+                Ok(format!(
+                    "Approved. You may proceed with: {}",
+                    args.action_description
+                ))
+            }
+            ApprovalDecision::Denied { reason } => {
+                let reason = reason
+                    .clone()
+                    .unwrap_or_else(|| "no reason provided".to_string());
+                tracing::warn!(action = %args.action_description, reason = %reason, duration_ms = outcome.duration_ms, "Approval rejected");
+                Ok(format!(
+                    "Rejected: {reason}. Do not proceed with this action."
+                ))
+            }
         }
     }
 }
@@ -581,10 +598,9 @@ mod tests {
     impl MockDispatch {
         fn approved() -> Self {
             Self {
-                response: Mutex::new(Ok(ApprovalResponse {
-                    approved: Some(true),
+                response: Mutex::new(Ok(ApprovalResponse::Simple {
+                    approved: true,
                     reason: None,
-                    decisions: None,
                 })),
                 last_request: Mutex::new(None),
             }
@@ -592,22 +608,17 @@ mod tests {
 
         fn rejected(reason: &str) -> Self {
             Self {
-                response: Mutex::new(Ok(ApprovalResponse {
-                    approved: Some(false),
+                response: Mutex::new(Ok(ApprovalResponse::Simple {
+                    approved: false,
                     reason: Some(reason.to_string()),
-                    decisions: None,
                 })),
                 last_request: Mutex::new(None),
             }
         }
 
-        fn batch_decisions(decisions: Vec<ApprovalDecision>) -> Self {
+        fn batch_decisions(decisions: Vec<ApprovalDecisionWire>) -> Self {
             Self {
-                response: Mutex::new(Ok(ApprovalResponse {
-                    approved: None,
-                    reason: None,
-                    decisions: Some(decisions),
-                })),
+                response: Mutex::new(Ok(ApprovalResponse::Batch { decisions })),
                 last_request: Mutex::new(None),
             }
         }
@@ -706,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_response_approved() {
-        let decisions = vec![ApprovalDecision {
+        let decisions = vec![ApprovalDecisionWire {
             approved: true,
             reason: Some("lgtm".to_string()),
         }];
@@ -721,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_response_rejected() {
-        let decisions = vec![ApprovalDecision {
+        let decisions = vec![ApprovalDecisionWire {
             approved: false,
             reason: Some("not now".to_string()),
         }];
@@ -769,48 +780,39 @@ mod tests {
 
     #[test]
     fn test_resolve_single_simple() {
-        let resp = ApprovalResponse {
-            approved: Some(true),
+        let decision = ApprovalResponse::Simple {
+            approved: true,
             reason: Some("all good".to_string()),
-            decisions: None,
-        };
-        let (approved, reason) = resp.resolve_single();
-        assert!(approved);
-        assert_eq!(reason.as_deref(), Some("all good"));
+        }
+        .resolve_single();
+        assert!(decision.is_approved());
+        assert_eq!(decision.reason(), Some("all good"));
 
-        let resp_rejected = ApprovalResponse {
-            approved: Some(false),
+        let decision = ApprovalResponse::Simple {
+            approved: false,
             reason: Some("nope".to_string()),
-            decisions: None,
-        };
-        let (approved, reason) = resp_rejected.resolve_single();
-        assert!(!approved);
-        assert_eq!(reason.as_deref(), Some("nope"));
+        }
+        .resolve_single();
+        assert!(!decision.is_approved());
+        assert_eq!(decision.reason(), Some("nope"));
     }
 
     #[test]
     fn test_resolve_single_batch() {
-        let resp = ApprovalResponse {
-            approved: None,
-            reason: None,
-            decisions: Some(vec![ApprovalDecision {
+        let decision = ApprovalResponse::Batch {
+            decisions: vec![ApprovalDecisionWire {
                 approved: true,
                 reason: Some("batch ok".to_string()),
-            }]),
-        };
-        let (approved, reason) = resp.resolve_single();
-        assert!(approved);
-        assert_eq!(reason.as_deref(), Some("batch ok"));
+            }],
+        }
+        .resolve_single();
+        assert!(decision.is_approved());
+        assert_eq!(decision.reason(), Some("batch ok"));
 
         // Empty decisions array falls back to rejected
-        let resp_empty = ApprovalResponse {
-            approved: None,
-            reason: None,
-            decisions: Some(vec![]),
-        };
-        let (approved, reason) = resp_empty.resolve_single();
-        assert!(!approved);
-        assert_eq!(reason.as_deref(), Some("empty decisions array"));
+        let decision = ApprovalResponse::Batch { decisions: vec![] }.resolve_single();
+        assert!(!decision.is_approved());
+        assert_eq!(decision.reason(), Some("empty decisions array"));
     }
 
     #[tokio::test]

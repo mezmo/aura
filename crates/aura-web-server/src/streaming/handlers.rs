@@ -251,7 +251,7 @@ where
                                 ctx.correlation.clone(),
                             )
                         }
-                        ToolLifecycleEvent::ApprovalRequested { tool_name, matched_pattern, request_type, task_id, worker_name } => {
+                        ToolLifecycleEvent::ApprovalRequested { tool_name, matched_pattern, request_type, task } => {
                             tracing::debug!(
                                 "Emitting aura.approval_requested event: tool_name={}",
                                 tool_name
@@ -260,21 +260,19 @@ where
                                 &tool_name,
                                 matched_pattern,
                                 request_type,
-                                task_id,
-                                worker_name,
+                                task,
                             )
                         }
-                        ToolLifecycleEvent::ApprovalCompleted { tool_name, approved, reason, duration_ms, task_id } => {
+                        ToolLifecycleEvent::ApprovalCompleted { tool_name, decision, duration_ms, task } => {
                             tracing::debug!(
                                 "Emitting aura.approval_completed event: tool_name={}, approved={}",
-                                tool_name, approved
+                                tool_name, decision.is_approved()
                             );
                             AuraStreamEvent::approval_completed(
                                 &tool_name,
-                                approved,
-                                reason,
+                                decision,
                                 duration_ms,
-                                task_id,
+                                task,
                             )
                         }
                     };

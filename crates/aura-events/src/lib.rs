@@ -157,6 +157,47 @@ pub enum RequestType {
     ApprovalRequest,
 }
 
+/// Result of a single approval decision.
+///
+/// Replaces the `bool + Option<String>` anti-pattern. The enum makes the
+/// approved/denied state unambiguous — if it compiles, it's valid.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approved {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    Denied {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl ApprovalDecision {
+    /// Returns true if this decision is `Approved`.
+    pub fn is_approved(&self) -> bool {
+        matches!(self, Self::Approved { .. })
+    }
+
+    /// Returns the reason, if any, regardless of variant.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Approved { reason } | Self::Denied { reason } => reason.as_deref(),
+        }
+    }
+}
+
+/// Orchestration-scoped identity for a tool call.
+///
+/// Both fields are always present when orchestration context exists.
+/// `None` at the event level means single-agent mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskIdentity {
+    pub task_id: usize,
+    pub worker_id: String,
+}
+
 /// Aura-specific streaming events sent via SSE `event:` field.
 ///
 /// Derives both `Serialize` (for producing SSE on the server) and
@@ -293,19 +334,16 @@ pub enum AuraStreamEvent {
         matched_pattern: Option<String>,
         request_type: RequestType,
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        worker_name: Option<String>,
+        task: Option<TaskIdentity>,
     },
     /// Emitted when an approval decision is received.
     ApprovalCompleted {
         tool_name: String,
-        approved: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
+        #[serde(flatten)]
+        decision: ApprovalDecision,
         duration_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
-        task_id: Option<usize>,
+        task: Option<TaskIdentity>,
     },
     /// Emitted after an agent (single-agent or orchestration worker) completes
     /// with scratchpad activity. Reports how much raw tool output was diverted
@@ -504,32 +542,28 @@ impl AuraStreamEvent {
         tool_name: impl Into<String>,
         matched_pattern: Option<String>,
         request_type: RequestType,
-        task_id: Option<usize>,
-        worker_name: Option<String>,
+        task: Option<TaskIdentity>,
     ) -> Self {
         Self::ApprovalRequested {
             tool_name: tool_name.into(),
             matched_pattern,
             request_type,
-            task_id,
-            worker_name,
+            task,
         }
     }
 
     /// Create an ApprovalCompleted event.
     pub fn approval_completed(
         tool_name: impl Into<String>,
-        approved: bool,
-        reason: Option<String>,
+        decision: ApprovalDecision,
         duration_ms: u64,
-        task_id: Option<usize>,
+        task: Option<TaskIdentity>,
     ) -> Self {
         Self::ApprovalCompleted {
             tool_name: tool_name.into(),
-            approved,
-            reason,
+            decision,
             duration_ms,
-            task_id,
+            task,
         }
     }
 

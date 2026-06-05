@@ -62,16 +62,14 @@ pub enum ToolLifecycleEvent {
         tool_name: ToolName,
         matched_pattern: Option<String>,
         request_type: aura_events::RequestType,
-        task_id: Option<usize>,
-        worker_name: Option<String>,
+        task: Option<aura_events::TaskIdentity>,
     },
     /// Emitted when an HITL approval decision is received.
     ApprovalCompleted {
         tool_name: ToolName,
-        approved: bool,
-        reason: Option<String>,
+        decision: aura_events::ApprovalDecision,
         duration_ms: u64,
-        task_id: Option<usize>,
+        task: Option<aura_events::TaskIdentity>,
     },
 }
 

@@ -620,6 +620,10 @@ impl Orchestrator {
                     session_id: self.agent_config.session_id.clone(),
                     request_id: self.agent_config.request_id.clone(),
                 });
+                debug_assert!(
+                    !hitl_ctx.request_id.is_empty(),
+                    "HitlContext request_id must not be empty"
+                );
 
                 if !hitl_config.require_approval.is_empty() {
                     wrappers.insert(

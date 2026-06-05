@@ -325,6 +325,10 @@ impl Agent {
                 session_id: config_owned.session_id.clone(),
                 request_id: config_owned.request_id.clone(),
             });
+            debug_assert!(
+                !hitl_ctx.request_id.is_empty(),
+                "HitlContext request_id must not be empty"
+            );
 
             // Add callable tool so the agent can explicitly request approval
             additional_tools.push(Box::new(crate::hitl::RequestApprovalTool::new(
