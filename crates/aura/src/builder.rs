@@ -642,6 +642,56 @@ impl Agent {
 
                 ProviderAgent::Ollama(agent)
             }
+            LlmConfig::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                temperature,
+                additional_params,
+                ..
+            } => {
+                tracing::info!("Initializing OpenRouter provider");
+                tracing::debug!("  Model: {}", model);
+
+                let mut client_builder =
+                    rig::providers::openrouter::Client::<reqwest::Client>::builder()
+                        .api_key(api_key);
+
+                if let Some(url) = base_url {
+                    tracing::info!("  Using custom base URL: {}", url);
+                    client_builder = client_builder.base_url(url);
+                }
+
+                let client = client_builder.build()?;
+                tracing::info!("OpenRouter client initialized successfully");
+
+                let completion_model = client.completion_model(model);
+
+                let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
+                }
+                if let Some(max) = config.llm.max_tokens() {
+                    agent_builder = agent_builder.max_tokens(max);
+                }
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
+                }
+
+                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
+                let builder_state =
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
+                let agent = builder_state.build();
+
+                ProviderAgent::OpenRouter(agent)
+            }
         };
 
         let client_tool_names = client_tools
@@ -1516,6 +1566,15 @@ impl AgentBuilder {
                 model, base_url, ..
             } => {
                 tracing::info!("LLM Provider: Ollama");
+                tracing::info!("LLM Model: {}", model);
+                if let Some(url) = base_url {
+                    tracing::info!("Base URL: {}", url);
+                }
+            }
+            LlmConfig::OpenRouter {
+                model, base_url, ..
+            } => {
+                tracing::info!("LLM Provider: OpenRouter");
                 tracing::info!("LLM Model: {}", model);
                 if let Some(url) = base_url {
                     tracing::info!("Base URL: {}", url);

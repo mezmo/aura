@@ -24,7 +24,7 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 use tokio::runtime::Runtime;
 
-use crate::api::stream::StreamResult;
+use crate::api::stream::{NoopHandler, StreamResult};
 use crate::api::types::ToolCallInfo;
 use crate::backend::Backend;
 use crate::config::AppConfig;
@@ -78,10 +78,8 @@ pub fn run_oneshot(
         crate::api::session::SessionKind::Chat,
     );
 
-    // Tool execution loop. All on_* callbacks are deliberately no-ops:
-    // events like tool_requested / tool_complete / usage are REPL
-    // affordances; stdout in one-shot mode is reserved for the final
-    // assistant text.
+    // Tool execution loop. One-shot ignores every stream event — stdout is
+    // reserved for the final assistant text — so a NoopHandler suffices.
     let result: Result<()> = loop {
         let stream_result = rt.block_on(async {
             backend
@@ -90,13 +88,7 @@ pub fn run_oneshot(
                     tool_defs_arg,
                     &chat_session_id,
                     Arc::new(AtomicBool::new(false)),
-                    |_token| {},
-                    |_tool_id, _tool_name, _args| {},
-                    |_tool_id, _tool_name| {},
-                    |_tool_id, _tool_name, _duration, _result: Option<&str>| {},
-                    |_prompt_tokens, _completion_tokens| {},
-                    |_event_name, _event_data| {},
-                    |_event_name, _val| {},
+                    &mut NoopHandler,
                 )
                 .await
         });

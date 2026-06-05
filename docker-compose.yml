@@ -15,9 +15,11 @@ services:
       PORT: "8080"
       CONFIG_PATH: "/app/config/quickstart.toml"
 
-      # Streaming — custom events disabled because LibreChat's SSE
-      # parser doesn't skip unknown event types (aura.session_info, etc.)
-      AURA_CUSTOM_EVENTS: "false"
+      # Streaming — custom events enabled so aura-cli can render the
+      # orchestrator's plan/worker events. Safe for LibreChat as of v0.8.6,
+      # whose SSE parser skips unknown event types (aura.session_info, etc.)
+      # instead of crashing on them (danny-avila/LibreChat#12919).
+      AURA_CUSTOM_EVENTS: "true"
       AURA_EMIT_REASONING: "false"
       TOOL_RESULT_MODE: "none"
 
@@ -52,7 +54,7 @@ services:
       - aura-quickstart
 
   librechat:
-    image: ghcr.io/danny-avila/librechat:v0.7.8
+    image: ghcr.io/danny-avila/librechat:v0.8.6
     container_name: aura-qs-librechat
     ports:
       - "3080:3080"

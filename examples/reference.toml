@@ -10,6 +10,7 @@
 #   examples/minimal/ollama.toml     - local Ollama models, no API key needed
 #   examples/minimal/bedrock.toml    - AWS Bedrock
 #   examples/minimal/gemini.toml     - Google Gemini
+#   examples/minimal/openrouter.toml - OpenRouter (300+ models, or any compatible API)
 #
 # Complete agent configs (LLM + MCP tools + system prompts):
 #   examples/complete/incident-response-mezmo.toml    - PagerDuty + Mezmo
@@ -205,4 +206,13 @@ model = "gpt-5.2"
 # provider = "gemini"
 # api_key = "{{ env.GOOGLE_API_KEY }}"
 # model = "gemini-2.0-flash"
+
+# OpenRouter alternative (300+ models via single key):
+# Uses OpenRouter's reasoning wire format (reasoning + reasoning_details).
+# For other OpenAI-compatible APIs (Fireworks, Together), use provider = "openai"
+# with base_url instead -- those send reasoning_content, not reasoning_details.
+# provider = "openrouter"
+# api_key = "{{ env.OPENROUTER_API_KEY }}"
+# model = "anthropic/claude-sonnet-4"
+# base_url = "https://custom-endpoint/v1"  # optional: OpenRouter-compatible proxies only
 

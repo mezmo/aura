@@ -28,7 +28,7 @@ license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
 [workspace.dependencies]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "d7e9d92", features = ["rmcp"] }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "890853065c8d46cd886b6f93bca5895a492d750c", features = ["rmcp"] }
 # Pinned to exact versions compatible with our rig-core 0.28.x fork.
 # Newer versions pull in rig-core 0.31+ which is semver-incompatible with the fork.
 rig-bedrock = "=0.3.10"
@@ -88,5 +88,5 @@ http = "1.0"
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "d7e9d92" }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "890853065c8d46cd886b6f93bca5895a492d750c" }
 

@@ -33,6 +33,7 @@ aura-events = { path = "../aura-events" }
 aura-telemetry = { path = "../aura-telemetry" }
 eventsource-stream = "0.2"
 futures-util = "0.3"
+unicode-segmentation = "1"
 termimad = "0.34"
 crossterm = "0.29"
 rustyline = "17"

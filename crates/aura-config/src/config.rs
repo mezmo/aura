@@ -596,6 +596,7 @@ impl Config {
             LlmConfig::Bedrock { model, .. } => ("bedrock", model),
             LlmConfig::Gemini { model, .. } => ("gemini", model),
             LlmConfig::Ollama { model, .. } => ("ollama", model),
+            LlmConfig::OpenRouter { model, .. } => ("openrouter", model),
         }
     }
 
@@ -648,6 +649,10 @@ impl Config {
 
         // Scratchpad validation
         self.validate_scratchpad()?;
+
+        if let Some(orch) = &self.orchestration {
+            orch.validate_worker_names()?;
+        }
 
         Ok(())
     }
@@ -702,11 +707,51 @@ impl Config {
     }
 }
 
+impl OrchestrationConfig {
+    /// Validate that worker names are well-formed and unique.
+    ///
+    /// The TOML parser already rejects exact duplicate `[orchestration.worker.X]`
+    /// headers, but several latent gaps remain that downstream code (artifact
+    /// filename namespacing, per-worker LLM resolution, scratchpad budgeting)
+    /// quietly depends on:
+    ///
+    /// - Empty names: TOML allows `[orchestration.worker.""]`.
+    /// - Case-insensitive collisions: `Alpha` and `alpha` are distinct in TOML
+    ///   and in [`HashMap`], but collide as filenames on case-insensitive
+    ///   filesystems (macOS APFS default, Windows NTFS default).
+    pub fn validate_worker_names(&self) -> Result<(), crate::ConfigError> {
+        use std::collections::HashMap;
+
+        let mut seen_lower: HashMap<String, &str> = HashMap::new();
+        for name in self.workers.keys() {
+            if name.trim().is_empty() {
+                return Err(crate::ConfigError::Validation(
+                    "Empty worker name in [orchestration.worker.*]; \
+                     worker section headers must have a non-empty name"
+                        .to_string(),
+                ));
+            }
+            let lower = name.to_lowercase();
+            if let Some(existing) = seen_lower.insert(lower, name.as_str()) {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Duplicate worker name in [orchestration.worker.*]: \
+                     '{}' and '{}' collide (names must be unique \
+                     case-insensitively to avoid filesystem collisions in \
+                     artifact persistence)",
+                    existing, name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_llm_api_key(llm: &LlmConfig, location: &str) -> Result<(), crate::ConfigError> {
     match llm {
         LlmConfig::OpenAI { api_key, .. }
         | LlmConfig::Anthropic { api_key, .. }
-        | LlmConfig::Gemini { api_key, .. } => {
+        | LlmConfig::Gemini { api_key, .. }
+        | LlmConfig::OpenRouter { api_key, .. } => {
             if api_key.is_empty() {
                 return Err(crate::ConfigError::Validation(format!(
                     "LLM API key is required for [{location}]"

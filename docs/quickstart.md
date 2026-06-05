@@ -1,6 +1,6 @@
 # AURA Quickstart
 
-Get a fully working AI agent stack running in under a minute — AURA, a chat UI, and a trace viewer — all from the repo root.
+Get a fully working AI agent stack running in under a minute — AURA in **orchestrator mode**, a chat UI, and a trace viewer — all from the repo root.
 
 **Prerequisites:** [Docker](https://docs.docker.com/get-docker/) and an LLM API key (OpenAI, Anthropic, or a local [Ollama](https://ollama.com) instance).
 
@@ -24,7 +24,21 @@ LLM_API_KEY=sk-...            # your API key (use "unused" for Ollama/llama-serv
 docker compose up -d
 ```
 
-## 3. Open the UIs
+AURA boots in orchestrator mode: a coordinator routes each request — answering simple ones directly and decomposing complex ones across the `researcher` and `writer` workers defined in `quickstart.toml`.
+
+## 3. Chat with your agent
+
+The [AURA CLI](../crates/aura-cli/README.md) ships in the same Docker image and connects to the in-container server automatically. Exec into the running container:
+
+```bash
+docker exec -it aura ./aura-cli
+```
+
+It renders the coordinator's plan and worker activity as the response streams.
+
+> **Tip:** Check startup progress with `docker compose logs -f aura`.
+
+### Or use a browser
 
 | Service | URL | Description |
 |---------|-----|-------------|
@@ -32,19 +46,11 @@ docker compose up -d
 | Phoenix | <http://localhost:6006> | Inspect LLM traces |
 | AURA API | <http://localhost:8080> | OpenAI-compatible API |
 
-**LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "AURA Assistant".
+**LibreChat first-time setup:** Create your user account on the signup page. The agent model is pre-configured as "Aura Orchestrator".
 
-> **Tip:** Check startup progress with `docker compose logs -f aura`.
+### Build the CLI from source
 
-### Use the CLI instead
-
-Prefer a terminal? The [AURA CLI](../crates/aura-cli/README.md) ships in the same Docker image. Exec into the running container:
-
-```bash
-docker exec -it aura ./aura-cli
-```
-
-Or build from source and connect to the quickstart server:
+Prefer to build locally instead of using the bundled binary? Connect to the quickstart server:
 
 ```bash
 cargo build -p aura-cli --release
@@ -62,7 +68,7 @@ See the [CLI README](../crates/aura-cli/README.md) for the full feature set.
 
 ## Customize Your Agent
 
-Edit `quickstart.toml` to change agent behavior, add tools, or enable vector search.
+Edit `quickstart.toml` to change coordinator routing and worker behavior, add tools, or enable vector search.
 Edit `.env` to switch LLM providers. Then apply changes:
 
 ```bash
@@ -93,7 +99,9 @@ LLM_API_KEY=unused
 LLM_BASE_URL=http://host.docker.internal:11434
 ```
 
-Also uncomment the `base_url` and `fallback_tool_parsing` lines in `quickstart.toml`.
+Also uncomment the `base_url` line in `quickstart.toml`.
+
+> **Ollama + orchestration (known issue):** the quickstart defaults to orchestration mode, where `fallback_tool_parsing` is currently *not* applied to the coordinator or workers — a bug tracked in [#193](https://github.com/mezmo/aura/issues/193). Until it's fixed, a local model that relies on fallback parsing (tool calls emitted as text rather than native tool calls) can stall in orchestration. Workaround: run the quickstart in single-agent mode — set `[orchestration].enabled = false` and uncomment `fallback_tool_parsing = true` in `quickstart.toml`. Models with reliable native tool-calling work as-is. See the [Ollama guide](ollama-guide.md) for details.
 
 **[llama-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)** (llama.cpp, local, no API key):
 
@@ -123,12 +131,16 @@ url = "http://host.docker.internal:9000/mcp"
 
 Use `host.docker.internal` to reach services running on your host machine.
 
+Then scope the tools per worker: set `mcp_filter` on each worker that should use them (see [Customize orchestration](#customize-orchestration)). A worker with no `mcp_filter` receives **all** MCP tools, so set it explicitly on every tool-using worker and keep tool-free workers (like the default `writer`) on a non-matching pattern.
+
 ### Add vector search
 
 Uncomment the `[[vector_stores]]` section in `quickstart.toml`. Options:
 
 - **Qdrant** (self-hosted): add a Qdrant instance to the compose file or point at an external one. Embeddings can be generated via OpenAI or AWS Bedrock.
 - **AWS Bedrock Knowledge Base** (managed): set `type = "bedrock_kb"` with a `knowledge_base_id` and `region`. No embedding model needed — the KB manages embeddings internally.
+
+Registering a store under `[[vector_stores]]` only defines it — no agent can query it until you attach it. Add the store's `name` to a worker's `vector_stores` list (e.g. `vector_stores = ["docs"]`), or to `[orchestration].coordinator_vector_stores` to give the coordinator access.
 
 See [`examples/reference.toml`](../examples/reference.toml) for both.
 
@@ -159,11 +171,9 @@ Restart with `docker compose up -d`. Clients that support model selection (Libre
 > appropriate keys to your `.env` — they're automatically loaded into the container
 > via `env_file`. See `.env.example` for the full list.
 
-### Enable orchestration mode
+### Customize orchestration
 
-Orchestration mode routes requests through a **coordinator** that decomposes problems into tasks and dispatches them to **workers** — each with access to a filtered subset of MCP tools.
-
-Add these sections to `quickstart.toml` (below the `[agent]` block):
+`quickstart.toml` ships with orchestration enabled: a coordinator and two tool-free workers (`researcher` and `writer`) that reason with the LLM alone. The coordinator's routing is controlled by the `[orchestration]` block:
 
 ```toml
 [orchestration]
@@ -172,7 +182,11 @@ max_planning_cycles = 2
 allow_direct_answers = true    # simple queries answered without workers
 allow_clarification = true     # vague requests prompt follow-up questions
 tools_in_planning = "summary"  # coordinator sees tool names during planning
+```
 
+Each `[orchestration.worker.<name>]` block defines a worker. Give a worker tools by configuring an MCP server (see [Add MCP tool servers](#add-mcp-tool-servers) above) and listing matching tool globs in its `mcp_filter`, or point it at a vector store via `vector_stores`:
+
+```toml
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
 preamble = """
@@ -188,14 +202,18 @@ preamble = """
 You are a knowledge specialist completing one assigned task.
 Search available documentation to answer the question.
 """
-mcp_filter = []
-vector_stores = ["docs"]       # this worker uses vector search instead of MCP tools
+mcp_filter = ["__none__"]      # non-matching pattern: no MCP tools, vector search only
+vector_stores = ["docs"]
 turn_depth = 5
 ```
 
+> **Note:** a worker whose `mcp_filter` is omitted or empty (`[]`) is granted **every** MCP tool, not none. Set an explicit `mcp_filter` on each worker once an MCP server is configured, and use a non-matching pattern (e.g. `["__none__"]`) for any worker you want to keep tool-free.
+
 Each worker inherits the agent's LLM by default. To run a worker on a different model, add a complete `[orchestration.worker.<name>.llm]` block — see the [orchestration config reference](../README.md#orchestration) for all fields.
 
-Restart with `docker compose restart aura` and try asking a multi-step question. Watch the coordinator plan and dispatch in Phoenix at <http://localhost:6006>.
+Restart with `docker compose restart aura` and try asking a multi-step question. Watch the coordinator plan and dispatch in the CLI's event panel, or in Phoenix at <http://localhost:6006>.
+
+To run a single agent instead of orchestration, set `[orchestration].enabled = false` and configure a single `[agent]` — see [`examples/reference.toml`](../examples/reference.toml).
 
 For a fully self-contained orchestration example with a math MCP server, see the [Orchestration — Math MCP quickstart](../examples/quickstart-orchestration-math/README.md).
 
@@ -216,7 +234,9 @@ Once the basic quickstart is running, try these more advanced setups:
 ```mermaid
 graph TD
     Browser -->|":3080"| LibreChat
+    Terminal -->|"docker exec"| CLI["aura-cli"]
     LibreChat <-->|"/v1/chat/completions"| AURA
+    CLI <-->|"/v1/chat/completions"| AURA
     AURA -->|"OTel gRPC :4317"| Phoenix
     AURA <-->|"API calls"| LLM["LLM Provider<br/>(OpenAI, etc.)"]
     AURA <-->|"MCP"| MCP["MCP Tool Servers"]
@@ -225,15 +245,17 @@ graph TD
 
     subgraph compose["docker compose"]
         LibreChat[":3080 LibreChat"]
-        AURA[":8080 AURA"]
+        AURA[":8080 AURA (orchestrator)"]
         Phoenix[":6006 Phoenix"]
+        CLI
         MongoDB
     end
 ```
 
+- **aura-cli** runs inside the AURA container (`docker exec`) and talks to the same OpenAI-compatible `/v1/chat/completions` endpoint, rendering coordinator and worker events as they stream.
 - **LibreChat** sends chat requests to AURA's OpenAI-compatible `/v1/chat/completions` endpoint. MongoDB is used by LibreChat internally for user accounts and conversation history — AURA does not use it.
-- **AURA** calls the configured LLM provider, executes MCP tools, and streams responses back.
-- **Phoenix** receives OpenTelemetry traces from AURA so you can inspect every step.
+- **AURA** runs the coordinator that routes each request, dispatches workers, executes MCP tools, calls the configured LLM provider, and streams responses back.
+- **Phoenix** receives OpenTelemetry traces from AURA so you can inspect every coordinator and worker step.
 
 ## Troubleshooting
 

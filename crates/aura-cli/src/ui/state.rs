@@ -35,7 +35,7 @@ pub(crate) fn lock_term() -> std::sync::MutexGuard<'static, ()> {
     TERM_WRITE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) fn term_size() -> (u16, u16) {
+pub fn term_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
 

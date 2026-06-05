@@ -1,0 +1,23 @@
+# OpenRouter provider configuration.
+#
+# Routes to 300+ models via a single API key. OpenRouter normalizes
+# reasoning output into its own wire format (reasoning + reasoning_details),
+# so this provider handles that format specifically.
+#
+# For other OpenAI-compatible APIs (Fireworks, Together, etc.), use
+# provider = "openai" with base_url instead -- those services send
+# reasoning_content which the OpenAI provider already handles.
+#
+# Usage:
+#   export OPENROUTER_API_KEY="..."
+#   CONFIG_PATH=examples/minimal/openrouter.toml cargo run --bin aura-web-server
+
+[agent]
+name = "OpenRouter Assistant"
+system_prompt = "You are a helpful assistant."
+
+[agent.llm]
+provider = "openrouter"
+api_key = "{{ env.OPENROUTER_API_KEY }}"
+model = "anthropic/claude-sonnet-4"
+# base_url = "https://custom-endpoint/v1"  # override for OpenRouter-compatible proxies

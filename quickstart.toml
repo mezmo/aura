@@ -1,7 +1,11 @@
 # Aura Quickstart Configuration
 #
-# Customize this file to change your agent's behavior, tools, and
-# knowledge bases. Changes take effect after: docker compose restart aura
+# Boots Aura in ORCHESTRATOR mode: a coordinator routes each request —
+# answering simple ones directly, decomposing complex ones across the
+# workers defined below, or asking for clarification when a request is vague.
+#
+# Customize this file to change routing, workers, tools, and knowledge
+# bases. Changes take effect after: docker compose restart aura
 #
 # For all available options, see: examples/reference.toml
 
@@ -13,30 +17,88 @@
 # docs/telemetry.md.
 memory_dir = "/app/state"
 
-# ── Agent ───────────────────────────────────────────────────────────
+# ── Coordinator ─────────────────────────────────────────────────────
+# In orchestration mode, [agent].system_prompt is the COORDINATOR prompt.
+# It provides domain context and routing guidance, not worker behavior.
 
 [agent]
-name = "Aura Assistant"
+name = "Aura Orchestrator"
 # alias = "aura"  # optional: stable identifier for model selection by clients
 system_prompt = """
-You are a helpful assistant with access to external tools and
-knowledge bases. Use them to provide accurate, grounded answers.
+You are a coordinator that turns user requests into results by delegating
+to specialized workers.
+
+ROUTING GUIDANCE:
+- Simple, single-step questions: answer directly.
+- Multi-step or mixed requests: create a plan and delegate to the workers.
+- Vague requests: ask a brief clarifying question.
+
+Delegate research and analysis to the `researcher` worker, and delegate
+drafting and final write-up to the `writer` worker. Consolidate their
+outputs into a single, coherent answer.
 """
-# Maximum tool-calling rounds per user turn
+# Maximum tool-calling rounds per worker turn
 turn_depth = 5
 
 # ── LLM Provider ────────────────────────────────────────────────────
 # Provider, model, and API key are set in .env — no changes needed here.
+# Workers inherit this LLM unless they declare their own [.llm] override.
 
 [agent.llm]
 provider = "{{ env.LLM_PROVIDER }}"
 api_key = "{{ env.LLM_API_KEY }}"
 model = "{{ env.LLM_MODEL }}"
 # base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama or llama-server
-# fallback_tool_parsing = true            # Uncomment for Ollama
+# fallback_tool_parsing = true            # Ollama only. Known issue: currently applied in
+#                                         # single-agent mode ([orchestration].enabled =
+#                                         # false) only, not the orchestration coordinator/
+#                                         # workers — a bug tracked in mezmo/aura#193.
+
+# ── Orchestration ───────────────────────────────────────────────────
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+allow_direct_answers = true
+allow_clarification = true
+tools_in_planning = "summary"
+# Where plan state and worker artifacts are persisted (must be writable).
+memory_dir = "/tmp/aura-orchestration"
+
+# Workers reason with the LLM alone until you enable an MCP server below.
+#
+# IMPORTANT: a worker whose `mcp_filter` is omitted or empty (`[]`) is granted
+# *every* MCP tool. Once you add an MCP server, set an explicit `mcp_filter` on
+# each tool-using worker. The `writer` below ships with a non-matching filter so
+# it stays tool-free; see the per-worker notes for details.
+
+[orchestration.worker.researcher]
+description = "Research and analysis: break a request into parts, gather facts, and reason through the details"
+preamble = """
+You are a Research Specialist. Decompose the task, reason step by step,
+and report clear, well-organized findings for the coordinator to use.
+"""
+# With an MCP server enabled, scope this worker to the tools it needs:
+# mcp_filter = ["my_tool_*"]
+
+[orchestration.worker.writer]
+description = "Drafting and synthesis: turn findings into a clear, well-structured final answer"
+preamble = """
+You are a Writing Specialist. Take the coordinator's goal and any research
+findings and produce a concise, well-structured response.
+"""
+# The writer synthesizes text and needs no tools. This non-matching pattern
+# keeps it tool-free even after you enable an MCP server (an omitted/empty
+# filter would otherwise grant it every tool). Leave it as-is.
+mcp_filter = ["__none__"]
 
 # ── MCP Tool Servers (optional) ─────────────────────────────────────
-# Uncomment and configure to give your agent access to external tools.
+# To give your workers external tools:
+#   1. Uncomment and configure the [mcp] section below.
+#   2. Uncomment `mcp_filter` in the `researcher` block above and set it to the
+#      tools that worker should use. A worker with no `mcp_filter` receives ALL
+#      MCP tools, so scope every tool-using worker explicitly. The `writer`
+#      already has an active no-tool filter and needs no change.
 #
 # [mcp]
 # sanitize_schemas = true
@@ -47,7 +109,8 @@ model = "{{ env.LLM_MODEL }}"
 # description = "My MCP tool server"
 
 # ── Vector Search (optional) ─────────────────────────────────────────
-# Uncomment to enable vector search with Qdrant.
+# Uncomment to enable vector search with Qdrant, then add the store name
+# to a worker's `vector_stores` list.
 #
 # [[vector_stores]]
 # name = "docs"

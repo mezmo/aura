@@ -11,6 +11,7 @@ use reqwest::Response;
 use aura_events::AuraStreamEvent;
 
 use crate::api::types::{AccumulatedToolCall, ChatCompletionChunk};
+use crate::event_names;
 
 /// Result of processing a stream — either a text response or tool calls.
 #[derive(Debug)]
@@ -36,35 +37,76 @@ async fn wait_for_cancel(flag: &AtomicBool) {
     }
 }
 
+/// Sink for the events produced while processing a stream.
+///
+/// Every method defaults to a no-op, so implementors override only the
+/// events they care about; [`NoopHandler`] ignores all of them.
+///
+/// Correlate by `tool_id`, not `tool_name`: a single turn may invoke the
+/// same tool more than once.
+pub trait StreamHandler {
+    /// Called for each content delta (standard chat completions).
+    fn on_token(&mut self, _token: &str) {}
+
+    /// Called when a tool is requested, with (tool_id, tool_name, arguments).
+    fn on_tool_requested(
+        &mut self,
+        _tool_id: &str,
+        _tool_name: &str,
+        _arguments: &BTreeMap<String, serde_json::Value>,
+    ) {
+    }
+
+    /// Called when a tool begins execution, with (tool_id, tool_name).
+    fn on_tool_start(&mut self, _tool_id: &str, _tool_name: &str) {}
+
+    /// Called when a tool finishes, with (tool_id, tool_name, duration, result).
+    fn on_tool_complete(
+        &mut self,
+        _tool_id: &str,
+        _tool_name: &str,
+        _duration: Duration,
+        _result: Option<&str>,
+    ) {
+    }
+
+    /// Called with (prompt_tokens, completion_tokens) from `aura.usage` events.
+    fn on_usage(&mut self, _prompt_tokens: u64, _completion_tokens: u64) {}
+
+    /// Called for `aura.reasoning` events, with (content, agent_id, fields).
+    fn on_reasoning(
+        &mut self,
+        _content: &str,
+        _agent_id: &str,
+        _fields: &BTreeMap<String, serde_json::Value>,
+    ) {
+    }
+
+    /// Called for every named (`aura.*`) SSE event, with (event_name, raw_data).
+    fn on_raw_event(&mut self, _event_name: &str, _data: &str) {}
+
+    /// Called for `aura.orchestrator.*`, `aura.session_info`, `aura.progress`,
+    /// `aura.worker_phase`, and any future events, with (event_name, value).
+    fn on_orchestrator_event(&mut self, _event_name: &str, _value: &serde_json::Value) {}
+}
+
+/// A [`StreamHandler`] that ignores every event. Used by one-shot mode and
+/// tests where only the final [`StreamResult`] matters.
+pub struct NoopHandler;
+
+impl StreamHandler for NoopHandler {}
+
 /// Process an SSE streaming response from an HTTP reqwest::Response.
 ///
 /// Thin wrapper around `process_sse_events` that extracts the byte stream
 /// and converts it to an eventsource stream.
-#[allow(clippy::too_many_arguments)]
 pub async fn process_stream(
     response: Response,
     cancel: Arc<AtomicBool>,
-    on_token: impl FnMut(&str),
-    on_tool_requested: impl FnMut(&str, &str, &BTreeMap<String, serde_json::Value>),
-    on_tool_start: impl FnMut(&str, &str),
-    on_tool_complete: impl FnMut(&str, &str, Duration, Option<&str>),
-    on_usage: impl FnMut(u64, u64),
-    on_raw_event: impl FnMut(&str, &str),
-    on_orchestrator_event: impl FnMut(&str, &serde_json::Value),
+    handler: &mut impl StreamHandler,
 ) -> Result<StreamResult> {
     let stream = response.bytes_stream().eventsource();
-    process_sse_events(
-        stream,
-        cancel,
-        on_token,
-        on_tool_requested,
-        on_tool_start,
-        on_tool_complete,
-        on_usage,
-        on_raw_event,
-        on_orchestrator_event,
-    )
-    .await
+    process_sse_events(stream, cancel, handler).await
 }
 
 /// Process SSE events from any eventsource-compatible stream.
@@ -73,29 +115,13 @@ pub async fn process_stream(
 /// (via `DirectBackend`) to ensure identical event handling.
 ///
 /// - `cancel`: when set to `true`, the stream is abandoned early
-/// - `on_token`: called for each content delta (standard chat completions)
-/// - `on_tool_requested`: called when a tool is requested with (tool_id, tool_name, arguments)
-/// - `on_tool_start`: called when a tool begins execution with (tool_id, tool_name)
-/// - `on_tool_complete`: called when a tool finishes with (tool_id, tool_name, duration, result)
-/// - `on_usage`: called with (prompt_tokens, completion_tokens) from aura.usage events
-/// - `on_orchestrator_event`: called for `aura.orchestrator.*`, `aura.session_info`, and `aura.progress` events
-///
-/// `tool_id` is the per-call identifier emitted by the server. Callers should
-/// use it (not `tool_name`) as the key when correlating arguments with results,
-/// since a single turn may contain multiple invocations of the same tool.
+/// - `handler`: a [`StreamHandler`] whose methods are invoked as events arrive
 ///
 /// Returns a `StreamResult` — either `TextResponse` or `ToolCalls`.
-#[allow(clippy::too_many_arguments)]
 pub async fn process_sse_events<S, E>(
     mut stream: S,
     cancel: Arc<AtomicBool>,
-    mut on_token: impl FnMut(&str),
-    mut on_tool_requested: impl FnMut(&str, &str, &BTreeMap<String, serde_json::Value>),
-    mut on_tool_start: impl FnMut(&str, &str),
-    mut on_tool_complete: impl FnMut(&str, &str, Duration, Option<&str>),
-    mut on_usage: impl FnMut(u64, u64),
-    mut on_raw_event: impl FnMut(&str, &str),
-    mut on_orchestrator_event: impl FnMut(&str, &serde_json::Value),
+    handler: &mut impl StreamHandler,
 ) -> Result<StreamResult>
 where
     S: futures_util::Stream<Item = Result<eventsource_stream::Event, E>> + Unpin,
@@ -142,7 +168,7 @@ where
         // Capture raw SSE events with non-empty event names (aura.* custom events).
         // Standard chat completion chunks have empty event names and would flood the panel.
         if !event_name.is_empty() {
-            on_raw_event(event_name, &event.data);
+            handler.on_raw_event(event_name, &event.data);
         }
 
         // Parse aura-specific events using shared types from aura-events crate.
@@ -150,7 +176,7 @@ where
         // deserialization handles the JSON → enum mapping.
         if event_name.starts_with("aura.") {
             match event_name.as_str() {
-                "aura.tool_requested" => {
+                event_names::TOOL_REQUESTED => {
                     if let Ok(AuraStreamEvent::ToolRequested {
                         tool_id,
                         tool_name,
@@ -164,19 +190,19 @@ where
                             }
                             _ => BTreeMap::new(),
                         };
-                        on_tool_requested(&tool_id, &tool_name, &args);
+                        handler.on_tool_requested(&tool_id, &tool_name, &args);
                     }
                 }
-                "aura.tool_start" => {
+                event_names::TOOL_START => {
                     if let Ok(AuraStreamEvent::ToolStart {
                         tool_id, tool_name, ..
                     }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
                     {
                         tool_timers.insert(tool_id.clone(), Instant::now());
-                        on_tool_start(&tool_id, &tool_name);
+                        handler.on_tool_start(&tool_id, &tool_name);
                     }
                 }
-                "aura.tool_complete" => {
+                event_names::TOOL_COMPLETE => {
                     if let Ok(AuraStreamEvent::ToolComplete {
                         tool_id,
                         tool_name,
@@ -188,7 +214,7 @@ where
                     {
                         let elapsed = Duration::from_millis(duration_ms);
                         tool_timers.remove(&tool_id);
-                        on_tool_complete(&tool_id, &tool_name, elapsed, result.as_deref());
+                        handler.on_tool_complete(&tool_id, &tool_name, elapsed, result.as_deref());
 
                         // Cache server-side result by tool_call_id for hybrid mode.
                         // For failures, cache the error message so the model sees the
@@ -200,24 +226,49 @@ where
                         }
                     }
                 }
-                "aura.usage" => {
+                event_names::USAGE => {
                     if let Ok(AuraStreamEvent::Usage {
                         prompt_tokens,
                         completion_tokens,
                         ..
                     }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
                     {
-                        on_usage(prompt_tokens, completion_tokens);
+                        handler.on_usage(prompt_tokens, completion_tokens);
                     }
                 }
-                "aura.tool_usage" => {
+                event_names::TOOL_USAGE => {
                     // Silently skip — usage is tracked via aura.usage at stream end
+                }
+                event_names::REASONING => {
+                    // Parse the raw payload into a BTreeMap so the consumer
+                    // can render every wire-level field (agent_id, content,
+                    // parent_agent_id, session_id, trace_id, ...) in /expand
+                    // without us having to enumerate them here. Separately
+                    // extract `content` and `agent_id` as named args because
+                    // every consumer wants those for the live block header
+                    // and body.
+                    if let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(&event.data)
+                    {
+                        let content = map
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let agent_id = map
+                            .get("agent_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let fields: BTreeMap<String, serde_json::Value> = map.into_iter().collect();
+                        handler.on_reasoning(&content, &agent_id, &fields);
+                    }
                 }
                 _ => {
                     // aura.orchestrator.*, aura.session_info, aura.progress,
-                    // aura.reasoning, aura.worker_phase, and any future events
+                    // aura.worker_phase, and any future events
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&event.data) {
-                        on_orchestrator_event(event_name, &val);
+                        handler.on_orchestrator_event(event_name, &val);
                     }
                 }
             }
@@ -233,7 +284,7 @@ where
         for choice in &chunk.choices {
             // Accumulate text content
             if let Some(ref content) = choice.delta.content {
-                on_token(content);
+                handler.on_token(content);
                 full_response.push_str(content);
             }
 
@@ -362,8 +413,64 @@ mod tests {
         tools_started: Vec<(String, String)>,
         tools_completed: Vec<(String, String, Option<String>)>,
         usages: Vec<(u64, u64)>,
+        reasoning: Vec<(String, String)>,
         raw_events: Vec<(String, String)>,
         orchestrator_events: Vec<(String, serde_json::Value)>,
+    }
+
+    impl StreamHandler for Captures {
+        fn on_token(&mut self, token: &str) {
+            self.tokens.push(token.to_string());
+        }
+        fn on_tool_requested(
+            &mut self,
+            tool_id: &str,
+            tool_name: &str,
+            arguments: &BTreeMap<String, serde_json::Value>,
+        ) {
+            self.tools_requested.push((
+                tool_id.to_string(),
+                tool_name.to_string(),
+                arguments.clone(),
+            ));
+        }
+        fn on_tool_start(&mut self, tool_id: &str, tool_name: &str) {
+            self.tools_started
+                .push((tool_id.to_string(), tool_name.to_string()));
+        }
+        fn on_tool_complete(
+            &mut self,
+            tool_id: &str,
+            tool_name: &str,
+            _duration: Duration,
+            result: Option<&str>,
+        ) {
+            self.tools_completed.push((
+                tool_id.to_string(),
+                tool_name.to_string(),
+                result.map(|s| s.to_string()),
+            ));
+        }
+        fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+            self.usages.push((prompt_tokens, completion_tokens));
+        }
+        fn on_reasoning(
+            &mut self,
+            content: &str,
+            agent_id: &str,
+            _fields: &BTreeMap<String, serde_json::Value>,
+        ) {
+            self.reasoning
+                .push((content.to_string(), agent_id.to_string()));
+        }
+        fn on_raw_event(&mut self, event_name: &str, data: &str) {
+            self.raw_events
+                .push((event_name.to_string(), data.to_string()));
+        }
+        fn on_orchestrator_event(&mut self, event_name: &str, value: &serde_json::Value) {
+            self.orchestrator_events
+                .push((event_name.to_string(), value.clone()));
+        }
     }
 
     /// Drive process_sse_events with a vec of synthetic events and tracking callbacks.
@@ -377,38 +484,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let mut caps = Captures::default();
-
-        let result = {
-            let tokens = &mut caps.tokens;
-            let tools_requested = &mut caps.tools_requested;
-            let tools_started = &mut caps.tools_started;
-            let tools_completed = &mut caps.tools_completed;
-            let usages = &mut caps.usages;
-            let raw_events = &mut caps.raw_events;
-            let orchestrator_events = &mut caps.orchestrator_events;
-
-            process_sse_events(
-                event_stream,
-                no_cancel(),
-                |t| tokens.push(t.to_string()),
-                |id, name, args| {
-                    tools_requested.push((id.to_string(), name.to_string(), args.clone()))
-                },
-                |id, name| tools_started.push((id.to_string(), name.to_string())),
-                |id, name, _dur, result| {
-                    tools_completed.push((
-                        id.to_string(),
-                        name.to_string(),
-                        result.map(|s| s.to_string()),
-                    ))
-                },
-                |p, c| usages.push((p, c)),
-                |name, data| raw_events.push((name.to_string(), data.to_string())),
-                |name, val| orchestrator_events.push((name.to_string(), val.clone())),
-            )
-            .await
-        };
-
+        let result = process_sse_events(event_stream, no_cancel(), &mut caps).await;
         (result, caps)
     }
 
@@ -568,7 +644,7 @@ mod tests {
             "session_id": "s1"
         });
         let events = vec![
-            sse("aura.tool_requested", &data.to_string()),
+            sse(event_names::TOOL_REQUESTED, &data.to_string()),
             sse("", "[DONE]"),
         ];
         let (_, caps) = run_stream(events).await;
@@ -580,7 +656,7 @@ mod tests {
         assert!(
             caps.raw_events
                 .iter()
-                .any(|(n, _)| n == "aura.tool_requested")
+                .any(|(n, _)| n == event_names::TOOL_REQUESTED)
         );
     }
 
@@ -592,7 +668,10 @@ mod tests {
             "agent_id": "main",
             "session_id": "s1"
         });
-        let events = vec![sse("aura.tool_start", &data.to_string()), sse("", "[DONE]")];
+        let events = vec![
+            sse(event_names::TOOL_START, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
         let (_, caps) = run_stream(events).await;
         assert_eq!(
             caps.tools_started,
@@ -611,7 +690,7 @@ mod tests {
             "session_id": "s1"
         });
         let events = vec![
-            sse("aura.tool_complete", &data.to_string()),
+            sse(event_names::TOOL_COMPLETE, &data.to_string()),
             sse("", "[DONE]"),
         ];
         let (_, caps) = run_stream(events).await;
@@ -635,7 +714,7 @@ mod tests {
             "session_id": "s1"
         });
         let events = vec![
-            sse("aura.tool_complete", &data.to_string()),
+            sse(event_names::TOOL_COMPLETE, &data.to_string()),
             sse(
                 "",
                 &tool_call_chunk(
@@ -672,7 +751,7 @@ mod tests {
             "session_id": "s1"
         });
         let events = vec![
-            sse("aura.tool_complete", &data.to_string()),
+            sse(event_names::TOOL_COMPLETE, &data.to_string()),
             // Now add a tool call with the same id and finish
             sse(
                 "",
@@ -703,7 +782,10 @@ mod tests {
             "total_tokens": 150,
             "session_id": "s1"
         });
-        let events = vec![sse("aura.usage", &data.to_string()), sse("", "[DONE]")];
+        let events = vec![
+            sse(event_names::USAGE, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
         let (_, caps) = run_stream(events).await;
         assert_eq!(caps.usages, vec![(100, 50)]);
     }
@@ -712,36 +794,105 @@ mod tests {
     async fn aura_orchestrator_event_callback() {
         let data = serde_json::json!({"goal": "compute sum"});
         let events = vec![
-            sse("aura.orchestrator.plan_created", &data.to_string()),
+            sse(event_names::PLAN_CREATED, &data.to_string()),
             sse("", "[DONE]"),
         ];
         let (_, caps) = run_stream(events).await;
         assert_eq!(caps.orchestrator_events.len(), 1);
-        assert_eq!(
-            caps.orchestrator_events[0].0,
-            "aura.orchestrator.plan_created"
-        );
+        assert_eq!(caps.orchestrator_events[0].0, event_names::PLAN_CREATED);
     }
 
     #[tokio::test]
     async fn aura_session_info_routed_to_orchestrator() {
         let data = serde_json::json!({"model": "gpt-4o"});
         let events = vec![
-            sse("aura.session_info", &data.to_string()),
+            sse(event_names::SESSION_INFO, &data.to_string()),
             sse("", "[DONE]"),
         ];
         let (_, caps) = run_stream(events).await;
         assert_eq!(caps.orchestrator_events.len(), 1);
-        assert_eq!(caps.orchestrator_events[0].0, "aura.session_info");
+        assert_eq!(caps.orchestrator_events[0].0, event_names::SESSION_INFO);
+    }
+
+    #[tokio::test]
+    async fn aura_reasoning_callback_fires() {
+        let data = serde_json::json!({
+            "content": "Let me think about this problem step by step.",
+            "agent_id": "main",
+            "session_id": "s1"
+        });
+        let events = vec![
+            sse(event_names::REASONING, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
+        let (_, caps) = run_stream(events).await;
+        assert_eq!(caps.reasoning.len(), 1);
+        assert_eq!(
+            caps.reasoning[0].0,
+            "Let me think about this problem step by step."
+        );
+        assert_eq!(caps.reasoning[0].1, "main");
+        // Reasoning should NOT have been routed to the orchestrator fallback
+        assert!(caps.orchestrator_events.is_empty());
+        // But it IS a named event, so raw_event should have captured it
+        assert!(
+            caps.raw_events
+                .iter()
+                .any(|(n, _)| n == event_names::REASONING)
+        );
+    }
+
+    #[tokio::test]
+    async fn aura_reasoning_callback_carries_worker_agent_id() {
+        // In orchestration mode the server emits aura.reasoning with the
+        // worker's agent_id so the CLI can attribute reasoning to a worker.
+        let data = serde_json::json!({
+            "content": "Analyzing the logs.",
+            "agent_id": "log_worker",
+            "parent_agent_id": "coordinator",
+            "session_id": "s1"
+        });
+        let events = vec![
+            sse(event_names::REASONING, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
+        let (_, caps) = run_stream(events).await;
+        assert_eq!(caps.reasoning.len(), 1);
+        assert_eq!(caps.reasoning[0].1, "log_worker");
+    }
+
+    #[tokio::test]
+    async fn aura_reasoning_chunks_accumulate() {
+        let chunk = |c: &str| {
+            serde_json::json!({
+                "content": c,
+                "agent_id": "main",
+                "session_id": "s1"
+            })
+            .to_string()
+        };
+        let events = vec![
+            sse(event_names::REASONING, &chunk("First, ")),
+            sse(event_names::REASONING, &chunk("I'll check ")),
+            sse(event_names::REASONING, &chunk("the inputs.")),
+            sse("", "[DONE]"),
+        ];
+        let (_, caps) = run_stream(events).await;
+        assert_eq!(caps.reasoning.len(), 3);
+        let joined: String = caps.reasoning.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(joined, "First, I'll check the inputs.");
     }
 
     #[tokio::test]
     async fn aura_progress_routed_to_orchestrator() {
         let data = serde_json::json!({"message": "Discovering tools"});
-        let events = vec![sse("aura.progress", &data.to_string()), sse("", "[DONE]")];
+        let events = vec![
+            sse(event_names::PROGRESS, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
         let (_, caps) = run_stream(events).await;
         assert_eq!(caps.orchestrator_events.len(), 1);
-        assert_eq!(caps.orchestrator_events[0].0, "aura.progress");
+        assert_eq!(caps.orchestrator_events[0].0, event_names::PROGRESS);
     }
 
     // -----------------------------------------------------------------------
@@ -752,7 +903,7 @@ mod tests {
     async fn raw_event_only_for_named_events() {
         let events = vec![
             sse(
-                "aura.usage",
+                event_names::USAGE,
                 &serde_json::json!({"prompt_tokens":1,"completion_tokens":1}).to_string(),
             ),
             sse("", &text_chunk("hi", Some("stop"))), // empty event name
@@ -761,7 +912,7 @@ mod tests {
         let (_, caps) = run_stream(events).await;
         // Only the named event should appear in raw_events
         assert_eq!(caps.raw_events.len(), 1);
-        assert_eq!(caps.raw_events[0].0, "aura.usage");
+        assert_eq!(caps.raw_events[0].0, event_names::USAGE);
     }
 
     #[tokio::test]
@@ -794,19 +945,9 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let cancel = Arc::new(AtomicBool::new(true)); // pre-cancelled
-        let result = process_sse_events(
-            event_stream,
-            cancel,
-            |_| {},
-            |_, _, _| {},
-            |_, _| {},
-            |_, _, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |_, _| {},
-        )
-        .await
-        .unwrap();
+        let result = process_sse_events(event_stream, cancel, &mut NoopHandler)
+            .await
+            .unwrap();
         match result {
             StreamResult::TextResponse(text) => assert_eq!(text, ""),
             other => panic!("expected empty TextResponse on cancel, got {:?}", other),
@@ -816,7 +957,10 @@ mod tests {
     #[tokio::test]
     async fn aura_tool_usage_silently_skipped() {
         let data = serde_json::json!({"tool_ids": ["c1"], "prompt_tokens": 10});
-        let events = vec![sse("aura.tool_usage", &data.to_string()), sse("", "[DONE]")];
+        let events = vec![
+            sse(event_names::TOOL_USAGE, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
         let (_, caps) = run_stream(events).await;
         // tool_usage is explicitly skipped — only raw_event should fire
         assert!(caps.usages.is_empty());
@@ -833,7 +977,10 @@ mod tests {
             "total_tokens": 275,
             "session_id": "s1"
         });
-        let events = vec![sse("aura.usage", &data.to_string()), sse("", "[DONE]")];
+        let events = vec![
+            sse(event_names::USAGE, &data.to_string()),
+            sse("", "[DONE]"),
+        ];
         let (_, caps) = run_stream(events).await;
         assert_eq!(caps.usages, vec![(200, 75)]);
     }
