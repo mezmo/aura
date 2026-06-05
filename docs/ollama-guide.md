@@ -36,7 +36,7 @@ Known handled styles include:
 
 This improves tool reliability with local models that do not consistently emit structured function-calling payloads.
 
-> **Orchestration limitation.** `fallback_tool_parsing` applies only to single-agent mode (`[orchestration].enabled = false`). In orchestration mode the coordinator and workers are built with fallback parsing **disabled**, so a local model that can't emit native tool calls may fail to drive worker tools. Run such models in single-agent mode, or use a model with reliable native tool-calling for orchestration.
+> **Known issue (orchestration).** `fallback_tool_parsing` is currently honored only in single-agent mode. In orchestration mode the coordinator and workers are built with fallback parsing **disabled** — a bug, not intended behavior, tracked in [#193](https://github.com/mezmo/aura/issues/193). Until it's fixed, a local model that emits tool calls as text instead of native `tool_calls` can stall in orchestration (the coordinator never registers a routing decision). Workaround: run such models in single-agent mode (`[orchestration].enabled = false`), or use a model with reliable native tool-calling.
 
 ## Practical Guidance
 

@@ -101,7 +101,7 @@ LLM_BASE_URL=http://host.docker.internal:11434
 
 Also uncomment the `base_url` line in `quickstart.toml`.
 
-> **Ollama + orchestration:** the quickstart defaults to orchestration mode, which builds its coordinator and workers *without* `fallback_tool_parsing`. A local model that relies on fallback parsing (tool calls emitted as text rather than native tool calls) may fail to drive the workers. If your model needs it, run the quickstart in single-agent mode — set `[orchestration].enabled = false` and uncomment `fallback_tool_parsing = true` in `quickstart.toml`. Models with reliable native tool-calling work as-is in the default orchestrated mode. See the [Ollama guide](ollama-guide.md) for details.
+> **Ollama + orchestration (known issue):** the quickstart defaults to orchestration mode, where `fallback_tool_parsing` is currently *not* applied to the coordinator or workers — a bug tracked in [#193](https://github.com/mezmo/aura/issues/193). Until it's fixed, a local model that relies on fallback parsing (tool calls emitted as text rather than native tool calls) can stall in orchestration. Workaround: run the quickstart in single-agent mode — set `[orchestration].enabled = false` and uncomment `fallback_tool_parsing = true` in `quickstart.toml`. Models with reliable native tool-calling work as-is. See the [Ollama guide](ollama-guide.md) for details.
 
 **[llama-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)** (llama.cpp, local, no API key):
 

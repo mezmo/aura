@@ -41,9 +41,10 @@ provider = "{{ env.LLM_PROVIDER }}"
 api_key = "{{ env.LLM_API_KEY }}"
 model = "{{ env.LLM_MODEL }}"
 # base_url = "{{ env.LLM_BASE_URL }}"    # Uncomment for Ollama or llama-server
-# fallback_tool_parsing = true            # Ollama only — takes effect in single-agent
-#                                         # mode ([orchestration].enabled = false); it is
-#                                         # NOT applied to orchestration coordinator/workers
+# fallback_tool_parsing = true            # Ollama only. Known issue: currently applied in
+#                                         # single-agent mode ([orchestration].enabled =
+#                                         # false) only, not the orchestration coordinator/
+#                                         # workers — a bug tracked in mezmo/aura#193.
 
 # ── Orchestration ───────────────────────────────────────────────────
 
