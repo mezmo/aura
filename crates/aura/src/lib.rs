@@ -12,7 +12,6 @@ pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
-pub mod lenient_int;
 pub mod logging;
 pub mod mcp;
 pub mod mcp_dynamic;
@@ -30,6 +29,7 @@ mod provider_agent; // Private - internal implementation detail
 pub mod rag_tools;
 pub mod request_cancellation;
 pub mod request_progress;
+pub mod rig_builder;
 mod schema_sanitize; // Private - MCP schema sanitization for OpenAI compatibility
 pub mod scratchpad;
 pub mod stream_events;
@@ -45,9 +45,13 @@ pub mod vector_dynamic;
 pub mod vector_store;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
-pub use config::{
-    AgentConfig, AgentSettings, EmbeddingModelConfig, LlmConfig, McpConfig, McpServerConfig,
-    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType,
+pub use config::{AgentRuntimeConfig, ToolContextFactory};
+// Pure config types are owned by `aura-config` and re-exported here for
+// ergonomic consumption (`aura::LlmConfig`, etc.).
+pub use aura_config::{
+    AgentConfig, AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig,
+    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match,
+    lenient_int,
 };
 pub use error::{BuilderError, BuilderResult};
 pub use orchestration::tools::{
@@ -67,6 +71,7 @@ pub use rig::completion::{Message, ToolDefinition as RigToolDefinition};
 pub use rig::message::{AssistantContent, ToolCall as RigToolCall, ToolResultContent, UserContent};
 pub use rig::one_or_many::OneOrMany;
 pub use rig::tool::{Tool as RigTool, ToolDyn};
+pub use rig_builder::RigBuilder;
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use streaming::StreamingAgent;
 

@@ -27,7 +27,7 @@ pub struct ScratchpadBuildInputs<'a> {
 
 /// Output of `build_scratchpad`: the budget the caller records on its `Agent`
 /// struct, the wrapper it composes into its tool pipeline, the storage handle,
-/// and a ready-to-assign `ScratchpadToolsConfig` for `AgentConfig`.
+/// and a ready-to-assign `ScratchpadToolsConfig` for `AgentRuntimeConfig`.
 pub struct ScratchpadBuild {
     pub budget: ContextBudget,
     pub storage: Arc<ScratchpadStorage>,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// Provides workers with read-only access to the conversation history.
 ///
 /// Follows the same injection pattern as `ReadArtifactTool`:
-/// - `AgentConfig.orchestration_chat_history` holds an `Arc<Vec<Message>>`
+/// - `AgentRuntimeConfig.orchestration_chat_history` holds an `Arc<Vec<Message>>`
 /// - `builder.rs` injects this tool when the field is `Some`
 /// - The orchestrator sets the field before the worker loop
 #[derive(Clone)]
