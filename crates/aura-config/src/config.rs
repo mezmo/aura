@@ -486,6 +486,18 @@ pub struct AgentConfig {
     #[serde(default)]
     pub alias: Option<String>,
     pub system_prompt: String,
+    /// Opt-in bundled workflow preamble. When set, AURA prepends a
+    /// preamble shipped inside the binary to `system_prompt` (separated
+    /// by a horizontal rule). Operators get the universal investigation
+    /// discipline without copy-pasting it into every TOML; they can
+    /// still layer substrate-specific framing in `system_prompt` below.
+    ///
+    /// Supported ids live in `aura::prompts::workflows::SUPPORTED_WORKFLOWS`
+    /// (currently: `"sre"` — substrate-agnostic SRE discipline). Unknown
+    /// values are rejected at config-load time so a typo (`"site-reliability"`,
+    /// `"SRE"`) fails loudly instead of silently dropping the preamble.
+    #[serde(default)]
+    pub workflow: Option<String>,
     #[serde(default)]
     pub context: Vec<String>,
     /// Maximum depth of tool calls per turn (default: 5, set to 0 to disable)
@@ -544,6 +556,7 @@ impl Default for AgentConfig {
             name: "Assistant".to_string(),
             alias: None,
             system_prompt: "You are a helpful assistant.".to_string(),
+            workflow: None,
             context: Vec::new(),
             turn_depth: default_turn_depth(),
             created_at: default_created_at(),

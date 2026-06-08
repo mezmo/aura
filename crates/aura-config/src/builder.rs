@@ -41,12 +41,50 @@ impl RigBuilder {
         self.to_agent_config().expect("Failed to convert config")
     }
 
-    fn to_agent_config(&self) -> Result<AgentConfig, ConfigError> {
+    /// Convert the TOML-layer `Config` into the runtime `AgentConfig`.
+    ///
+    /// Returns a `Result` so callers can react to validation failures
+    /// (e.g. unknown `[agent].workflow` ids) rather than panicking.
+    /// `get_agent_config()` above is the "panic on failure" convenience
+    /// wrapper kept for backward compatibility with existing callers.
+    pub fn to_agent_config(&self) -> Result<AgentConfig, ConfigError> {
         let llm = self.config.agent.llm.clone();
+
+        // Resolve [agent].workflow to its bundled preamble, if set, and
+        // prepend it to the operator's system_prompt. Layered order:
+        //
+        //   [bundled workflow preamble]
+        //   ---
+        //   [operator's system_prompt content from TOML]
+        //
+        // Order is deliberate: bundled discipline first so the LLM
+        // reads "how to investigate" before reading the substrate /
+        // tool-catalog framing the operator added. The horizontal rule
+        // matches the pattern AURA uses elsewhere (orchestrator_preamble
+        // and worker_preamble templates) so the model sees a familiar
+        // section break.
+        let effective_system_prompt = match self.config.agent.workflow.as_deref() {
+            Some(workflow_id) => {
+                let preamble = aura::prompts::workflows::resolve_workflow_preamble(workflow_id)
+                    .ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "unknown [agent].workflow = '{workflow_id}'. Supported: {:?}",
+                            aura::prompts::workflows::SUPPORTED_WORKFLOWS,
+                        ))
+                    })?;
+                if self.config.agent.system_prompt.is_empty() {
+                    // Operator opted purely into the bundled workflow.
+                    preamble.to_string()
+                } else {
+                    format!("{preamble}\n\n---\n\n{}", self.config.agent.system_prompt)
+                }
+            }
+            None => self.config.agent.system_prompt.clone(),
+        };
 
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
-            system_prompt: self.config.agent.system_prompt.clone(),
+            system_prompt: effective_system_prompt,
             context: self.config.agent.context.clone(),
             turn_depth: self.config.agent.turn_depth,
             mcp_filter: self.config.agent.mcp_filter.clone(),

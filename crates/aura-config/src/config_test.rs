@@ -1989,4 +1989,116 @@ model = "gpt-4o"
         let built = crate::RigBuilder::new(loaded).get_agent_config();
         assert_eq!(built.effective_memory_dir(), None);
     }
+
+    // -----------------------------------------------------------------
+    // [agent].workflow — opt-in bundled preamble
+    // -----------------------------------------------------------------
+    //
+    // These tests prove three load-bearing properties:
+    //   1. Backward compat: a config with no `workflow` field still
+    //      produces system_prompt unchanged from the TOML.
+    //   2. SRE workflow: the bundled preamble is prepended (the
+    //      operator's own system_prompt content stays after the rule
+    //      separator).
+    //   3. Unknown workflow ids fail loudly with a clear message
+    //      naming the supported set — typo-defense for operator TOMLs.
+
+    #[test]
+    fn workflow_omitted_preserves_operator_system_prompt_verbatim() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "You are a test assistant."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        assert_eq!(built.agent.system_prompt, "You are a test assistant.");
+    }
+
+    #[test]
+    fn workflow_sre_prepends_bundled_preamble_to_operator_system_prompt() {
+        let config = r#"
+[agent]
+name = "SRE Agent"
+workflow = "sre"
+system_prompt = "Substrate notes: kubectl is namespaced as cluster.*"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        // Bundled preamble landed (verified by spot-checking a load-bearing
+        // section header from sre_workflow_preamble.md).
+        assert!(
+            built.agent.system_prompt.contains("Causal-chain rule"),
+            "expected bundled SRE preamble in system_prompt; got: {}",
+            &built.agent.system_prompt[..200.min(built.agent.system_prompt.len())],
+        );
+        // Operator's own content is preserved BELOW the rule separator.
+        assert!(built.agent.system_prompt.contains("Substrate notes: kubectl is namespaced as cluster.*"));
+        // Rule separator is present between bundled + operator content.
+        assert!(built.agent.system_prompt.contains("\n\n---\n\n"));
+        // Order matters: bundled discipline first, operator notes after.
+        let bundled_idx = built.agent.system_prompt.find("Causal-chain rule").unwrap();
+        let operator_idx = built.agent.system_prompt.find("Substrate notes:").unwrap();
+        assert!(bundled_idx < operator_idx, "bundled preamble must come first");
+    }
+
+    #[test]
+    fn workflow_sre_with_empty_system_prompt_uses_preamble_only() {
+        // Operators who want JUST the bundled preamble (no substrate
+        // notes) can leave system_prompt as an empty string. No rule
+        // separator gets appended when there's nothing to separate from.
+        let config = r#"
+[agent]
+name = "SRE Agent"
+workflow = "sre"
+system_prompt = ""
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let built = crate::RigBuilder::new(loaded).get_agent_config();
+        assert!(built.agent.system_prompt.contains("Causal-chain rule"));
+        // No dangling rule separator when there's no operator content.
+        assert!(!built.agent.system_prompt.ends_with("\n\n---\n\n"));
+    }
+
+    #[test]
+    fn workflow_unknown_id_returns_validation_error_naming_supported_ids() {
+        // Defense against operator typos (e.g. "SRE" vs "sre",
+        // "site-reliability" vs "sre"). Silently falling back to no
+        // preamble would be the worst possible UX — the operator asks
+        // for discipline and gets none. Fail loudly instead.
+        let config = r#"
+[agent]
+name = "Mistyped"
+workflow = "site-reliability"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        let err = crate::RigBuilder::new(loaded)
+            .to_agent_config()
+            .expect_err("unknown workflow id must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown"), "error message should say 'unknown', got: {msg}");
+        assert!(msg.contains("site-reliability"), "error should echo the bad id, got: {msg}");
+        assert!(msg.contains("sre"), "error should list supported ids, got: {msg}");
+    }
 }
