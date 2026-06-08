@@ -455,8 +455,11 @@ Do not try to compute results yourself — delegate to workers.";
             "PHASE: COORDINATOR SYSTEM PROMPT (routing / continuation)"
         );
         let _ = writeln!(out, "{separator}\n");
-        let coordinator_preamble =
-            config.build_coordinator_preamble(agent_system_prompt, true, false);
+        let coordinator_preamble = crate::orchestration::config::build_coordinator_preamble(
+            agent_system_prompt,
+            true,
+            false,
+        );
         let _ = writeln!(out, "{coordinator_preamble}");
 
         // ================================================================
@@ -540,7 +543,11 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             "PHASE: GENERIC WORKER SYSTEM PROMPT (fallback, from template)"
         );
         let _ = writeln!(out, "{separator}\n");
-        let _ = writeln!(out, "{}", config.build_worker_preamble());
+        let _ = writeln!(
+            out,
+            "{}",
+            crate::orchestration::config::build_worker_preamble(&config)
+        );
 
         // ================================================================
         // 5. Worker task user messages

@@ -373,8 +373,7 @@ impl McpManager {
                 self.connect_sse(server_name, url, headers).await
             }
             McpServerConfig::Stdio { cmd, args, env, .. } => {
-                self.connect_stdio(server_name, std::slice::from_ref(cmd), args, env)
-                    .await
+                self.connect_stdio(server_name, cmd, args, env).await
             }
         }
     }

@@ -31,7 +31,7 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
         servers: [(
             "test_stdio".to_string(),
             McpServerConfig::Stdio {
-                cmd: EVERYTHING_BIN.to_string(),
+                cmd: vec![EVERYTHING_BIN.to_string()],
                 args: vec!["stdio".to_string()],
                 env: HashMap::new(),
                 description: Some("Everything MCP server for STDIO testing".to_string()),

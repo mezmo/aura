@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::config::OrchestrationConfig;
+use super::config::build_coordinator_preamble;
 use super::events::RoutingMode;
 use super::orchestrator::Orchestrator;
 use super::persistence::build_session_context;
@@ -634,10 +634,8 @@ fn test_session_history_multi_run_chronological() {
 
 #[test]
 fn test_preamble_dynamic_tool_sections_with_persistence() {
-    let config = OrchestrationConfig::default();
-
     // With history tools (persistence + session_id configured)
-    let preamble_with = config.build_coordinator_preamble("You are an SRE assistant.", false, true);
+    let preamble_with = build_coordinator_preamble("You are an SRE assistant.", false, true);
     assert!(
         preamble_with.contains("read_artifact"),
         "read_artifact in preamble with history"
@@ -648,8 +646,7 @@ fn test_preamble_dynamic_tool_sections_with_persistence() {
     );
 
     // Without history tools
-    let preamble_without =
-        config.build_coordinator_preamble("You are an SRE assistant.", false, false);
+    let preamble_without = build_coordinator_preamble("You are an SRE assistant.", false, false);
     assert!(
         preamble_without.contains("read_artifact"),
         "read_artifact always present"
@@ -1057,8 +1054,7 @@ fn test_planning_wrapper_multi_worker_guidelines() {
 
 #[test]
 fn test_preamble_recon_tools_enabled() {
-    let config = OrchestrationConfig::default();
-    let preamble = config.build_coordinator_preamble("Custom SRE instructions.", true, false);
+    let preamble = build_coordinator_preamble("Custom SRE instructions.", true, false);
 
     assert!(
         preamble.contains("list_tools"),
@@ -1080,8 +1076,7 @@ fn test_preamble_recon_tools_enabled() {
 
 #[test]
 fn test_preamble_recon_and_history_tools_combined() {
-    let config = OrchestrationConfig::default();
-    let preamble = config.build_coordinator_preamble("Domain prompt.", true, true);
+    let preamble = build_coordinator_preamble("Domain prompt.", true, true);
 
     assert!(preamble.contains("list_tools"), "recon tool");
     assert!(preamble.contains("inspect_tool_params"), "recon tool");
@@ -1095,8 +1090,7 @@ fn test_preamble_recon_and_history_tools_combined() {
 
 #[test]
 fn test_preamble_empty_system_prompt() {
-    let config = OrchestrationConfig::default();
-    let preamble = config.build_coordinator_preamble("", false, false);
+    let preamble = build_coordinator_preamble("", false, false);
 
     assert!(
         preamble.contains("read_artifact"),

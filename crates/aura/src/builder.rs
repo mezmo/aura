@@ -1,5 +1,5 @@
 use crate::{
-    config::{AgentConfig, LlmConfig, McpServerConfig, VectorStoreType},
+    config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
     passthrough_tool::PassthroughTool,
@@ -161,7 +161,7 @@ impl Agent {
     /// in `Agent::stream_*_with_timeout`, not here, so this constructor
     /// stays free of request-shape parameters.
     async fn setup_single_agent_scratchpad(
-        config: &mut AgentConfig,
+        config: &mut AgentRuntimeConfig,
         mcp_manager: Option<&Arc<McpManager>>,
     ) -> Result<Option<scratchpad::ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
         if config.orchestration_enabled() {
@@ -285,7 +285,7 @@ impl Agent {
     /// but the streaming layer terminates the stream when one is invoked so the
     /// client can execute the tool locally. Pass `None` to disable.
     pub async fn new(
-        config: &AgentConfig,
+        config: &AgentRuntimeConfig,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -745,7 +745,7 @@ impl Agent {
     /// wrapped tool call.
     pub(crate) async fn add_all_tools<M>(
         mut builder_state: BuilderState<M>,
-        config: &AgentConfig,
+        config: &AgentRuntimeConfig,
         mcp_manager: &Option<Arc<McpManager>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
@@ -960,7 +960,7 @@ impl Agent {
     fn add_mcp_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
-        config: &AgentConfig,
+        config: &AgentRuntimeConfig,
     ) -> BuilderState<M>
     where
         M: rig::completion::CompletionModel + Send + Sync,
@@ -1492,7 +1492,7 @@ impl StreamingAgent for Agent {
 /// with a warning. In single-agent mode, they are attached to the agent only
 /// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
 pub async fn build_streaming_agent(
-    config: &crate::config::AgentConfig,
+    config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
@@ -1529,12 +1529,12 @@ pub async fn build_streaming_agent(
 
 /// Builder for constructing Rig agents from configuration
 pub struct AgentBuilder {
-    config: AgentConfig,
+    config: AgentRuntimeConfig,
 }
 
 impl AgentBuilder {
     /// Create a new builder from configuration
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new(config: AgentRuntimeConfig) -> Self {
         // Log the configuration for debugging
         tracing::info!("=== Agent Configuration ===");
 

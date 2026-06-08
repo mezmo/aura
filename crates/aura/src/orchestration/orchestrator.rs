@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
-use crate::config::{AgentConfig, LlmConfig};
+use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
@@ -288,7 +288,7 @@ pub struct Orchestrator {
     config: OrchestrationConfig,
 
     /// The underlying agent configuration (for creating workers)
-    agent_config: AgentConfig,
+    agent_config: AgentRuntimeConfig,
 
     /// Tool call observer for coordinator visibility into worker tool execution.
     /// Wired to emit OrchestratorEvent for real-time SSE streaming via spawn_tool_event_forwarder.
@@ -345,7 +345,7 @@ struct StreamCallParams<'a> {
 impl Orchestrator {
     /// Create a new orchestrator from configuration.
     pub async fn new(
-        agent_config: AgentConfig,
+        agent_config: AgentRuntimeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
 
@@ -655,7 +655,8 @@ impl Orchestrator {
                 )
             }));
         } else {
-            worker_config.preamble_override = Some(self.config.build_worker_preamble());
+            worker_config.preamble_override =
+                Some(super::config::build_worker_preamble(&self.config));
             let orchestrator_id_copy = self.orchestrator_id.clone();
 
             // Orchestrator provides context factory with task metadata
@@ -1952,7 +1953,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // Build coordinator preamble: orchestration framework template + user system prompt
         let include_history_tools = self.config.memory_dir().is_some()
             && self.persistence.lock().await.session_id().is_some();
-        let mut preamble = self.config.build_coordinator_preamble(
+        let mut preamble = super::config::build_coordinator_preamble(
             self.agent_config.effective_preamble(),
             include_recon_tools,
             include_history_tools,
@@ -2246,7 +2247,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// passthrough tools — see `create_worker` for the rationale.
     async fn build_worker_provider_agent(
         &self,
-        worker_config: &AgentConfig,
+        worker_config: &AgentRuntimeConfig,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
         let temperature = worker_config.llm.temperature();
