@@ -352,7 +352,8 @@ pub fn build_completion_config(
         data.tool_result_max_length,
     )
     .with_fallback_tool_parsing(fallback_tool_parsing)
-    .with_client_tools(setup.has_client_tools);
+    .with_client_tools(setup.has_client_tools)
+    .with_debug_provider_errors(data.debug_provider_errors);
 
     let turn_context = {
         let ctx = TurnContext::new(
