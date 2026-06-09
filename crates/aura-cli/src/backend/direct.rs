@@ -94,8 +94,6 @@ impl DirectBackend {
             streaming_buffer_size: 400,
             aura_custom_events: true,
             aura_emit_reasoning: true,
-            // Standalone CLI runs locally for a single user (not public-facing),
-            // so surface raw upstream provider errors to aid local diagnosis.
             debug_provider_errors: true,
             streaming_timeout_secs: 900,
             first_chunk_timeout_secs: 30,

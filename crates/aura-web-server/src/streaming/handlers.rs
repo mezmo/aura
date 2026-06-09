@@ -1289,16 +1289,9 @@ fn is_context_overflow_error(error_str: &str) -> bool {
         || (lower.contains("context") && lower.contains("exceeded"))
 }
 
-/// Build the user-facing message for an upstream provider error.
-///
-/// `error_str` is the stringified `StreamError` coming off the provider stream
-/// (see `provider_agent::map_stream_item`). Its format is owned by the upstream
-/// provider/rig and not something we control, so we do not parse it.
-///
-/// When `debug` is true (dev-only `AURA_DEBUG_PROVIDER_ERRORS` flag) the raw
-/// error is surfaced verbatim — length-capped — so operators can diagnose the
-/// failure. When false (the default, required for public-facing deployments)
-/// only a generic message is returned; the raw error still reaches logs/OTel.
+/// `error_str`'s format is owned by the provider/rig, so it is surfaced as-is
+/// rather than parsed. `debug` gates whether it reaches the client verbatim or
+/// is replaced by a generic message (see `AURA_DEBUG_PROVIDER_ERRORS`).
 fn build_provider_error_message(model: &str, error_str: &str, debug: bool) -> String {
     if debug {
         format!(
