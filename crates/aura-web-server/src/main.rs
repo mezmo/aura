@@ -88,6 +88,20 @@ struct Args {
     )]
     aura_emit_reasoning: bool,
 
+    /// Dev-only: surface the raw upstream provider error to clients on failure.
+    /// Leave OFF for public-facing deployments — provider error bodies can echo
+    /// request content. When off, clients get a generic message; the raw error
+    /// is always available in server logs/OTel regardless.
+    /// Accepts the canonical boolean vocabulary (1/0, true/false, yes/no, on/off, t/f, y/n).
+    #[arg(
+        long,
+        env = "AURA_DEBUG_PROVIDER_ERRORS",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+    )]
+    debug_provider_errors: bool,
+
     /// SSE streaming request timeout in seconds.
     /// This is the maximum time a streaming request can run before being cancelled.
     /// Set higher for long-running tool operations (e.g., log analysis).
@@ -247,6 +261,7 @@ async fn run() -> std::io::Result<()> {
         streaming_buffer_size: args.streaming_buffer_size,
         aura_custom_events: args.aura_custom_events,
         aura_emit_reasoning: args.aura_emit_reasoning,
+        debug_provider_errors: args.debug_provider_errors,
         streaming_timeout_secs: args.streaming_timeout_secs,
         first_chunk_timeout_secs: args.first_chunk_timeout_secs,
         shutdown_token: shutdown_token.clone(),
