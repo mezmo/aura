@@ -794,6 +794,38 @@ Here are the files I found:
 
 The separator is automatically injected when text chunks resume after a `ToolResult` event.
 
+## Provider Errors
+
+When an upstream provider returns an error during streaming, AURA surfaces the actual error details instead of a generic failure. The error message includes the model identifier and extracted information from the provider's response.
+
+**Error message format:**
+```
+The upstream model provider ({model}) returned an error: {detail}
+```
+
+The `{detail}` portion is constructed from the provider's error response:
+
+| Provider Response | Example Detail |
+|-------------------|----------------|
+| HTTP status + error type + message | `429 requests: Rate limit reached for gpt-4o` |
+| Error type + message | `overloaded_error: Overloaded` |
+| HTTP status only | `503: <raw error>` |
+| Raw error (no structured data) | The full error string verbatim |
+
+**Examples:**
+
+```
+The upstream model provider (openai/gpt-4o) returned an error: 429 requests: Rate limit reached for gpt-4o
+```
+
+```
+The upstream model provider (anthropic/claude-sonnet-4-6) returned an error: overloaded_error: Overloaded
+```
+
+Error detail is capped at 500 characters to prevent large provider error bodies (like HTML gateway pages) from flooding the response stream. Truncated messages end with an ellipsis (…).
+
+The full raw error is always available in logs and OpenTelemetry traces for debugging.
+
 ## Connection Behavior
 
 | Behavior | Description |
