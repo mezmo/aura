@@ -114,11 +114,8 @@ pub mod config {
         /// results are suppressed and the final chunk uses
         /// `finish_reason: "tool_calls"` instead of `"stop"`.
         pub has_client_tools: bool,
-        /// Dev-only flag (`AURA_DEBUG_PROVIDER_ERRORS`). When true, the raw
-        /// upstream provider error is surfaced verbatim to the client (capped
-        /// in length). When false (the default, and required for public-facing
-        /// deployments) only a generic message is returned. Off by default
-        /// because provider error bodies can echo request content.
+        /// Surface raw upstream provider errors to the client (see
+        /// `AURA_DEBUG_PROVIDER_ERRORS`).
         pub debug_provider_errors: bool,
     }
 
