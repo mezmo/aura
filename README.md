@@ -88,6 +88,7 @@ Core server options:
 | `--aura-emit-reasoning`      | `AURA_EMIT_REASONING`      | `false`       | Enable `aura.reasoning`             |
 | `--tool-result-mode`         | `TOOL_RESULT_MODE`         | `none`        | Tool result streaming: none, open-web-ui, aura |
 | `--tool-result-max-length`   | `TOOL_RESULT_MAX_LENGTH`   | `1000`        | Max chars before truncation (aura events) |
+| `--debug-provider-errors`    | `AURA_DEBUG_PROVIDER_ERRORS` | `false`     | **Dev only.** Surface raw upstream provider errors to clients (capped). Keep off when public-facing — error bodies can echo request content. Raw error is always in logs/OTel. |
 | `--shutdown-timeout-secs`    | `SHUTDOWN_TIMEOUT_SECS`    | `30`          | Graceful shutdown window            |
 
 Tool result modes:
