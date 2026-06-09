@@ -586,12 +586,7 @@ fn process_stream_next(
                     return NextItemResult::End(vec![bytes]);
                 }
             } else {
-                let user_message = format!(
-                    "The upstream model provider ({}) returned an error and the request \
-                     could not be completed. Please try again or contact support if the \
-                     issue persists.",
-                    ctx.model_str
-                );
+                let user_message = build_provider_error_message(&ctx.model_str, &error_str);
                 state.accumulated_content.push_str(&user_message);
                 let chunk = build_text_chunk(ctx, &user_message, state.is_first_chunk);
                 if let Ok(bytes) = format_sse_chunk(&chunk) {
@@ -1290,6 +1285,99 @@ fn is_context_overflow_error(error_str: &str) -> bool {
         || (lower.contains("context") && lower.contains("exceeded"))
 }
 
+/// Build a user-facing error message that surfaces the real upstream provider
+/// error instead of a generic "something went wrong".
+///
+/// `error_str` is the stringified `StreamError` coming off the provider stream
+/// (see `provider_agent::map_stream_item`). Across providers it arrives in a few
+/// shapes, e.g.:
+/// - `ProviderError: Invalid status code 429 with message: {"error":{"message":..,"type":..}}`
+/// - `ProviderError: {"type":"error","error":{"type":"overloaded_error","message":..}}`
+/// - `ResponseError: <plain message>`
+///
+/// We extract the HTTP status, the provider error `type`, and `message` when
+/// present, formatting a readable line. Nothing parseable falls back to the raw
+/// error so detail is never silently swallowed.
+fn build_provider_error_message(model: &str, error_str: &str) -> String {
+    let status = extract_status_code(error_str);
+    let (error_type, message) = extract_provider_error_fields(error_str);
+
+    let detail = match message {
+        Some(message) => {
+            let prefix = match (status.as_deref(), error_type.as_deref()) {
+                (Some(status), Some(error_type)) => format!("{status} {error_type}: "),
+                (Some(status), None) => format!("{status}: "),
+                (None, Some(error_type)) => format!("{error_type}: "),
+                (None, None) => String::new(),
+            };
+            format!("{prefix}{message}")
+        }
+        // Nothing structured to extract — surface the raw error verbatim
+        // rather than swallowing it behind a generic message.
+        None => error_str.trim().to_string(),
+    };
+
+    format!(
+        "The upstream model provider ({model}) returned an error: {}",
+        truncate_error_detail(&detail)
+    )
+}
+
+/// Bound the surfaced detail so a giant provider body (e.g. an HTML gateway
+/// error page) can't flood the response stream. Truncates on a char boundary.
+fn truncate_error_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 500;
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    let truncated: String = detail.chars().take(MAX_DETAIL_CHARS).collect();
+    format!("{truncated}…")
+}
+
+/// Extract an HTTP status code that follows a `status code` marker, e.g.
+/// `Invalid status code 429 ...` or `... status code: 503`.
+fn extract_status_code(error_str: &str) -> Option<String> {
+    let lower = error_str.to_lowercase();
+    let marker = lower.find("status code")?;
+    let after = &error_str[marker + "status code".len()..];
+    let digits: String = after
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    (digits.len() == 3).then_some(digits)
+}
+
+/// Extract `(type, message)` from the provider's JSON error body when present.
+///
+/// Handles the common provider envelope `{"error":{"type":..,"message":..}}`
+/// (OpenAI, OpenRouter, Anthropic raw bodies) and falls back to a top-level
+/// `message` field. Returns `(None, None)` when no parseable JSON body is found.
+fn extract_provider_error_fields(error_str: &str) -> (Option<String>, Option<String>) {
+    let (Some(start), Some(end)) = (error_str.find('{'), error_str.rfind('}')) else {
+        return (None, None);
+    };
+    if end < start {
+        return (None, None);
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&error_str[start..=end]) else {
+        return (None, None);
+    };
+
+    let error_obj = value.get("error");
+    let message = error_obj
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .or_else(|| value.get("message").and_then(|m| m.as_str()))
+        .map(str::to_string);
+    let error_type = error_obj
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+
+    (error_type, message)
+}
+
 fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: ctx.completion_id.clone(),
@@ -1635,7 +1723,8 @@ mod tests {
         );
 
         let items: Vec<Result<StreamItem, StreamError>> = vec![Err(
-            "400 Bad Request: temperature is not supported for gpt-5-mini".into(),
+            r#"ProviderError: Invalid status code 429 with message: {"error":{"message":"Rate limit reached for gpt-4o","type":"requests","code":"rate_limit_exceeded"}}"#
+                .into(),
         )];
         let stream = futures_util::stream::iter(items);
 
@@ -1651,16 +1740,71 @@ mod tests {
             "Expected model name in error message, got: {}",
             outcome.content
         );
+        // The real provider detail must be surfaced, not a generic placeholder.
         assert!(
-            outcome.content.contains("could not be completed"),
-            "Expected actionable guidance in error message, got: {}",
+            outcome.content.contains("429")
+                && outcome.content.contains("Rate limit reached for gpt-4o"),
+            "Expected upstream provider detail in error message, got: {}",
             outcome.content
         );
         assert!(
-            matches!(&termination, StreamTermination::StreamError(msg) if msg.contains("temperature")),
+            matches!(&termination, StreamTermination::StreamError(msg) if msg.contains("Rate limit reached")),
             "Expected StreamError termination, got: {:?}",
             termination
         );
+    }
+
+    #[test]
+    fn provider_error_extracts_status_type_and_message_from_openai_json() {
+        let raw = r#"ProviderError: Invalid status code 429 with message: {"error":{"message":"Rate limit reached for gpt-4o","type":"requests","code":"rate_limit_exceeded"}}"#;
+        let msg = build_provider_error_message("openai/gpt-4o", raw);
+        assert!(msg.contains("openai/gpt-4o"), "model missing: {msg}");
+        assert!(msg.contains("429"), "status missing: {msg}");
+        assert!(
+            msg.contains("Rate limit reached for gpt-4o"),
+            "provider message missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn provider_error_extracts_type_and_message_from_anthropic_body() {
+        let raw = r#"ProviderError: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let msg = build_provider_error_message("anthropic/claude-sonnet-4-6", raw);
+        assert!(msg.contains("anthropic/claude-sonnet-4-6"), "model: {msg}");
+        assert!(msg.contains("overloaded_error"), "type: {msg}");
+        assert!(msg.contains("Overloaded"), "message: {msg}");
+    }
+
+    #[test]
+    fn provider_error_falls_back_to_raw_when_no_json_body() {
+        let raw = "ResponseError: model is currently unavailable in your region";
+        let msg = build_provider_error_message("anthropic/claude-sonnet-4-6", raw);
+        assert!(msg.contains("anthropic/claude-sonnet-4-6"), "model: {msg}");
+        assert!(
+            msg.contains("model is currently unavailable in your region"),
+            "raw detail missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn provider_error_caps_long_raw_fallback() {
+        let raw = format!("ResponseError: {}", "x".repeat(2000));
+        let msg = build_provider_error_message("test-model", &raw);
+        assert!(
+            msg.chars().count() < 700,
+            "expected capped length, got {} chars",
+            msg.chars().count()
+        );
+        assert!(msg.contains('…'), "expected ellipsis marker: {msg}");
+        // The prefix and some detail must still be present.
+        assert!(msg.contains("test-model"), "model missing: {msg}");
+    }
+
+    #[test]
+    fn provider_error_includes_status_when_body_absent() {
+        let raw = "ProviderError: SSE Error: Invalid status code: 503";
+        let msg = build_provider_error_message("openrouter/x", raw);
+        assert!(msg.contains("503"), "status missing: {msg}");
     }
 
     #[tokio::test]
