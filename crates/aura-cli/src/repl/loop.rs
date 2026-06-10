@@ -658,7 +658,11 @@ pub fn run_repl(
                     consent_pending = false;
                     if crate::repl::telemetry_notice::first_input_enables_telemetry(&input) {
                         telemetry.enable();
-                        let _ = crate::config::save_telemetry_enabled_to_global_cli_toml(true);
+                        if let Err(e) =
+                            crate::config::save_telemetry_enabled_to_global_cli_toml(true)
+                        {
+                            eprintln!("warning: could not persist telemetry preference: {e}");
+                        }
                         capture_cli_session_started(telemetry, &config, is_standalone);
                     }
                 }

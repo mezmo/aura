@@ -370,10 +370,45 @@ pub fn save_telemetry_enabled_to_global_cli_toml(
         path: dir.clone(),
         source,
     })?;
-    let path = dir.join(CLI_TOML_FILENAME);
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    save_telemetry_enabled_to_cli_toml_at(&dir.join(CLI_TOML_FILENAME), enabled)
+}
+
+/// Path-parameterized body of [`save_telemetry_enabled_to_global_cli_toml`].
+///
+/// Two safety properties beyond the naive read-modify-write:
+/// - A file that exists but cannot be read (permissions, non-UTF-8)
+///   yields [`TelemetryDisableError::Read`] and is left untouched —
+///   never silently replaced by a bare `[telemetry]` section, which
+///   would destroy every other setting in `cli.toml`. Only a missing
+///   file is treated as empty input.
+/// - The write is temp-file + rename in the same directory, so a crash
+///   mid-write cannot leave a truncated `cli.toml` behind.
+fn save_telemetry_enabled_to_cli_toml_at(
+    path: &Path,
+    enabled: bool,
+) -> std::result::Result<(), TelemetryDisableError> {
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(TelemetryDisableError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
     let updated = upsert_section_bool(&existing, "telemetry", "enabled", enabled);
-    fs::write(&path, updated).map_err(|source| TelemetryDisableError::Write { path, source })?;
+
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let write_err = |source| TelemetryDisableError::Write {
+        path: path.to_path_buf(),
+        source,
+    };
+    fs::write(&tmp, updated).map_err(write_err)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+    .map_err(write_err)?;
     Ok(())
 }
 
@@ -389,6 +424,12 @@ pub fn save_telemetry_enabled_to_global_cli_toml(
 pub enum TelemetryDisableError {
     /// No home directory available, so `~/.aura/` can't be located.
     NoHome,
+    /// `cli.toml` exists but could not be read (permissions, non-UTF-8
+    /// content). The file is left untouched rather than overwritten.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Creating `~/.aura/` or writing `cli.toml` failed — typically a
     /// read-only or sandboxed filesystem.
     Write {
@@ -406,6 +447,13 @@ impl std::fmt::Display for TelemetryDisableError {
                     "could not determine ~/.aura/ (no home directory available)"
                 )
             }
+            Self::Read { path, source } => {
+                write!(
+                    f,
+                    "could not read existing {} (left untouched): {source}",
+                    path.display()
+                )
+            }
             Self::Write { path, source } => {
                 write!(f, "could not write {}: {source}", path.display())
             }
@@ -417,7 +465,7 @@ impl std::error::Error for TelemetryDisableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NoHome => None,
-            Self::Write { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
         }
     }
 }
@@ -1107,5 +1155,64 @@ endpoint = \"https://x/\"
         let parsed: Probe = toml::from_str(&out).expect("upsert output is valid TOML");
         assert_eq!(parsed.style.as_deref(), Some("normal"));
         assert_eq!(parsed.telemetry.and_then(|t| t.enabled), Some(false));
+    }
+
+    // ---- save_telemetry_enabled_to_cli_toml_at ----
+
+    #[test]
+    fn telemetry_save_creates_file_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        save_telemetry_enabled_to_cli_toml_at(&path, false).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "[telemetry]\nenabled = false\n");
+    }
+
+    #[test]
+    fn telemetry_save_preserves_existing_settings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        std::fs::write(&path, "style = \"compact\"\nlog_file = \"/tmp/x.log\"\n").unwrap();
+        save_telemetry_enabled_to_cli_toml_at(&path, true).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("style = \"compact\""), "style lost: {written}");
+        assert!(written.contains("log_file = \"/tmp/x.log\""), "log_file lost: {written}");
+        assert!(written.contains("enabled = true"), "telemetry missing: {written}");
+    }
+
+    #[test]
+    fn telemetry_save_refuses_to_clobber_unreadable_file() {
+        // A cli.toml that exists but cannot be read as UTF-8 must produce
+        // an error and remain byte-for-byte intact — not be silently
+        // replaced by a bare [telemetry] section.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        let original: &[u8] = b"style = \"compact\"\n\xff\xfe broken utf8";
+        std::fs::write(&path, original).unwrap();
+
+        let result = save_telemetry_enabled_to_cli_toml_at(&path, true);
+        assert!(
+            matches!(result, Err(TelemetryDisableError::Read { .. })),
+            "expected Read error, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "unreadable cli.toml must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn telemetry_save_leaves_no_temp_file_behind() {
+        // The write goes through temp-file + rename for atomicity; a
+        // successful save must leave exactly cli.toml in the directory.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        save_telemetry_enabled_to_cli_toml_at(&path, false).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(entries, vec!["cli.toml".to_string()], "stray files: {entries:?}");
     }
 }
