@@ -28,11 +28,13 @@ services:
       OTEL_RECORD_CONTENT: "true"
     volumes:
       - ./quickstart.toml:/app/config/quickstart.toml:ro
-      # Persists the anonymous telemetry install-id (and inspection log)
-      # across restarts and image pulls so the install count is stable.
-      # Matches `memory_dir = "/app/state"` in quickstart.toml. See
-      # docs/telemetry.md.
-      - aura-state:/app/state
+      # Persists orchestration run state and the anonymous telemetry
+      # install-id (and inspection log) across restarts and image pulls
+      # so the install count is stable. Matches the top-level
+      # `memory_dir = "/tmp/aura-state"` in quickstart.toml; the image
+      # pre-creates this path owned by appuser so the volume mountpoint
+      # is writable by the non-root server. See docs/telemetry.md.
+      - aura-state:/tmp/aura-state
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s

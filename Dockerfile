@@ -98,9 +98,16 @@ RUN <<EOR
   useradd -r -s /bin/false appuser
 EOR
 
-# Create app directory and config directory
+# Create app directory, config directory, and writable state directories.
+# The state dirs must exist in the image owned by appuser: when docker
+# mounts a fresh named volume at one of these paths, it copies the image
+# directory's ownership into the volume. Without this, the mountpoint is
+# created root-owned and the non-root server cannot write run state
+# (orchestration persistence, telemetry install-id) — every orchestrated
+# request would fail with EACCES.
 WORKDIR /app
-RUN mkdir -p /app/config && chown -R appuser:appuser /app
+RUN mkdir -p /app/config /tmp/aura-state /tmp/aura-orchestration \
+  && chown -R appuser:appuser /app /tmp/aura-state /tmp/aura-orchestration
 
 # Copy binaries from release-build stage
 COPY --from=release-build /usr/src/app/target/release/aura-web-server /app/

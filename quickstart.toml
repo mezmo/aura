@@ -10,12 +10,13 @@
 # For all available options, see: examples/reference.toml
 
 # ── Persistence ─────────────────────────────────────────────────────
-# Root directory for on-disk state (scratchpad, and the anonymous
-# telemetry install-id + local inspection log). The docker-compose file
-# mounts a named volume here so this survives container restarts and
-# image pulls — which keeps the anonymous install count stable. See
-# docs/telemetry.md.
-memory_dir = "/app/state"
+# Root directory for on-disk state: orchestration run persistence,
+# scratchpad, and the anonymous telemetry install-id + local inspection
+# log. The path works both in the container (the docker-compose file
+# mounts a named volume here so state survives restarts and image pulls,
+# keeping the anonymous install count stable) and for the documented
+# host-machine standalone run. See docs/telemetry.md.
+memory_dir = "/tmp/aura-state"
 
 # ── Coordinator ─────────────────────────────────────────────────────
 # In orchestration mode, [agent].system_prompt is the COORDINATOR prompt.
@@ -62,8 +63,8 @@ max_planning_cycles = 2
 allow_direct_answers = true
 allow_clarification = true
 tools_in_planning = "summary"
-# Where plan state and worker artifacts are persisted (must be writable).
-memory_dir = "/tmp/aura-orchestration"
+# Plan state and worker artifacts are persisted under the top-level
+# `memory_dir` (see the Persistence section at the top of this file).
 
 # Workers reason with the LLM alone until you enable an MCP server below.
 #
