@@ -37,18 +37,22 @@ Telemetry is always in exactly one state:
 The first time you launch the **interactive REPL** with no recorded
 preference, Aura prints a one-time notice — it states that telemetry is
 collected, links to this document, and tells you how to opt out.
-Telemetry stays **held** until your **first input**:
+Telemetry stays **held** until you **send your first chat message**:
 
-- any normal input (a prompt, `/help`, …) is treated as consent →
-  telemetry becomes **Enabled** and `[telemetry] enabled = true` is
-  written to `~/.aura/cli.toml`;
-- `/telemetry disable` as your first input → **Disabled** (persisted);
+- sending a message to the agent is treated as consent → telemetry
+  becomes **Enabled** and `[telemetry] enabled = true` is written to
+  `~/.aura/cli.toml`;
+- slash commands never grant consent: `/telemetry disable` →
+  **Disabled** (persisted); `/telemetry status`, `/help`, typos, and
+  unknown commands leave the state **Unknown** (you can inspect first,
+  decide later);
 - quitting immediately (`/quit`) → stays **Unknown**, so you see the
   notice again next launch.
 
 Nothing is sent during the launch in which the notice first appears
-until that first input — so you always have a chance to opt out before
-any telemetry leaves your machine.
+until that first message — so you always have a chance to opt out (or
+inspect with `/telemetry status` / `/telemetry recent`) before any
+telemetry leaves your machine.
 
 ### Non-interactive surfaces
 

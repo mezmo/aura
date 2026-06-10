@@ -9,6 +9,7 @@
 //! non-opt-out input (see the first-input gate in `repl::loop`).
 
 use crate::theme::{AuraStyle, Themed};
+use aura_telemetry::TelemetryState;
 
 /// The documentation URL shown in the notice. The repo path is also
 /// valid for local checkouts; this is the canonical published location.
@@ -21,8 +22,8 @@ pub(crate) fn notice_text() -> String {
         "AURA collects anonymous usage telemetry to help maintainers \
          understand how it is used.\n\
          • What is and isn't collected, and how to control it: {TELEMETRY_DOCS_URL}\n\
-         • It is enabled when you continue. To opt out, run `/telemetry disable` \
-         (or set DO_NOT_TRACK=1) — nothing is sent until you do.",
+         • It is enabled when you send your first message. To opt out, run \
+         `/telemetry disable` (or set DO_NOT_TRACK=1) — nothing is sent until you do.",
     )
 }
 
@@ -32,20 +33,38 @@ pub(crate) fn present_notice() {
     println!();
 }
 
-/// The first-input consent decision: does this first non-empty input
-/// (entered after the notice was shown) enable telemetry?
+/// What the consent gate should do when the user sends their first chat
+/// message after the notice was shown.
+#[derive(Debug)]
+pub(crate) enum FirstMessageConsent {
+    /// No preference recorded yet: enable, persist `enabled = true`, and
+    /// capture the session-start event.
+    EnableAndCapture,
+    /// The user already ran `/telemetry enable` this session — dispatch
+    /// enabled and persisted; only the session-start event is still due.
+    CaptureOnly,
+    /// A kill switch or explicit opt-out is in effect; do nothing.
+    Skip,
+}
+
+/// First-message consent decision, derived from the telemetry *state*
+/// rather than by re-parsing the input string.
 ///
-/// Implied consent — any input that is **not** an explicit opt-out and
-/// **not** an immediate quit enables telemetry. `/telemetry disable`
-/// returns `false` so the state stays held and its normal command
-/// dispatch records `Disabled`. `/quit` / `/exit` return `false` so a
-/// user who bails leaves the state `Unknown` and sees the notice again
-/// next launch (rather than being silently enabled on the way out).
-pub(crate) fn first_input_enables_telemetry(input: &str) -> bool {
-    let trimmed = input.trim();
-    let is_opt_out = trimmed.starts_with("/telemetry disable");
-    let is_quit = trimmed == "/quit" || trimmed == "/exit";
-    !is_opt_out && !is_quit
+/// Implied consent happens only at the point where input is actually
+/// submitted to the agent. Slash commands — including `/telemetry status`,
+/// typos, unknown commands, and `/quit` — never grant consent: they are
+/// dispatched before this gate runs, and whatever state they leave
+/// behind (`Disabled` after `/telemetry disable`, `Enabled` after
+/// `/telemetry enable`, otherwise still `Unknown`) is what decides here.
+/// This keeps the gate from drifting out of sync with the command
+/// dispatcher's parsing, and means a user who only inspects (`status`,
+/// `/help`) or bails (`/quit`) keeps the notice for next launch.
+pub(crate) fn consent_on_first_message(state: &TelemetryState) -> FirstMessageConsent {
+    match state {
+        TelemetryState::Unknown => FirstMessageConsent::EnableAndCapture,
+        TelemetryState::Enabled => FirstMessageConsent::CaptureOnly,
+        TelemetryState::Disabled(_) => FirstMessageConsent::Skip,
+    }
 }
 
 #[cfg(test)]
@@ -63,21 +82,36 @@ mod tests {
     }
 
     #[test]
-    fn normal_first_input_enables() {
-        assert!(first_input_enables_telemetry("what is my cpu usage?"));
-        assert!(first_input_enables_telemetry("/help"));
-        assert!(first_input_enables_telemetry("/telemetry status"));
+    fn unknown_state_enables_and_captures() {
+        assert!(matches!(
+            consent_on_first_message(&TelemetryState::Unknown),
+            FirstMessageConsent::EnableAndCapture
+        ));
     }
 
     #[test]
-    fn explicit_opt_out_does_not_enable() {
-        assert!(!first_input_enables_telemetry("/telemetry disable"));
-        assert!(!first_input_enables_telemetry("  /telemetry disable  "));
+    fn explicitly_enabled_state_captures_only() {
+        // The user ran `/telemetry enable` before their first message;
+        // dispatch already enabled and persisted, so the gate must not
+        // re-enable — but the session-start event is still due.
+        assert!(matches!(
+            consent_on_first_message(&TelemetryState::Enabled),
+            FirstMessageConsent::CaptureOnly
+        ));
     }
 
     #[test]
-    fn quitting_does_not_enable() {
-        assert!(!first_input_enables_telemetry("/quit"));
-        assert!(!first_input_enables_telemetry("/exit"));
+    fn disabled_state_skips() {
+        // An explicit opt-out (`/telemetry disable`, kill switch) before
+        // the first message stands: the gate must never override it.
+        for reason in [
+            aura_telemetry::DisableReason::AuraDisabled,
+            aura_telemetry::DisableReason::DoNotTrack,
+        ] {
+            assert!(matches!(
+                consent_on_first_message(&TelemetryState::Disabled(reason)),
+                FirstMessageConsent::Skip
+            ));
+        }
     }
 }

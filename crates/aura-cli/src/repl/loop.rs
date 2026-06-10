@@ -647,26 +647,6 @@ pub fn run_repl(
                     reset_input_geometry();
                 }
 
-                // First-input consent gate (runs once, on the first
-                // non-empty input after the notice was shown). Implied
-                // consent: any input that is NOT an explicit opt-out and
-                // NOT an immediate quit enables telemetry from here on.
-                // `/telemetry disable` falls through to its normal
-                // dispatch (which records Disabled); quitting leaves the
-                // state Unknown so the notice is shown again next launch.
-                if consent_pending {
-                    consent_pending = false;
-                    if crate::repl::telemetry_notice::first_input_enables_telemetry(&input) {
-                        telemetry.enable();
-                        if let Err(e) =
-                            crate::config::save_telemetry_enabled_to_global_cli_toml(true)
-                        {
-                            eprintln!("warning: could not persist telemetry preference: {e}");
-                        }
-                        capture_cli_session_started(telemetry, &config, is_standalone);
-                    }
-                }
-
                 if input == "/quit" || input == "/exit" {
                     // Save before exiting, or delete if conversation was never started
                     if let Some(ref store) = conv_store {
@@ -726,6 +706,38 @@ pub fn run_repl(
                     println!("Type /help for available commands.");
                     redraw_input_frame();
                     continue;
+                }
+
+                // First-message consent gate (runs once, on the first
+                // input that is actually submitted to the agent after
+                // the notice was shown). Implied consent is tied to the
+                // act of sending a message — slash commands (including
+                // `/telemetry …`, typos, and `/quit`) were dispatched
+                // above and never grant consent. The decision is derived
+                // from the telemetry state those commands left behind,
+                // so the gate cannot drift from the command parser.
+                if consent_pending {
+                    consent_pending = false;
+                    use crate::repl::telemetry_notice::{
+                        consent_on_first_message, FirstMessageConsent,
+                    };
+                    match consent_on_first_message(&telemetry.state()) {
+                        FirstMessageConsent::EnableAndCapture => {
+                            telemetry.enable();
+                            if let Err(e) =
+                                crate::config::save_telemetry_enabled_to_global_cli_toml(true)
+                            {
+                                eprintln!(
+                                    "warning: could not persist telemetry preference: {e}"
+                                );
+                            }
+                            capture_cli_session_started(telemetry, &config, is_standalone);
+                        }
+                        FirstMessageConsent::CaptureOnly => {
+                            capture_cli_session_started(telemetry, &config, is_standalone);
+                        }
+                        FirstMessageConsent::Skip => {}
+                    }
                 }
 
                 // Append compaction hint to user message if pending
