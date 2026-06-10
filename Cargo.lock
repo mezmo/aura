@@ -216,7 +216,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "aura"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "aura-cli"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "anyhow",
  "aura",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "aura-config"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "anyhow",
  "aura",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "aura-events"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "rmcp",
  "serde",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "aura-test-utils"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "aura-web-server"
-version = "1.21.0"
+version = "1.22.0"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",
