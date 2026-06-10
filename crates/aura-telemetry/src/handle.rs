@@ -230,7 +230,7 @@ impl TelemetryHandle {
     /// handle captured at `init`.
     pub fn enable(&self) -> EnableOutcome {
         {
-            let mut st = self.inner.state.lock().expect("state mutex poisoned");
+            let st = self.inner.state.lock().expect("state mutex poisoned");
             if matches!(*st, TelemetryState::Enabled) {
                 return EnableOutcome::AlreadyEnabled;
             }
@@ -241,21 +241,28 @@ impl TelemetryHandle {
             if self.inner.sink_params.is_none() {
                 return EnableOutcome::HeldUntilRestart;
             }
-            *st = TelemetryState::Enabled;
         }
-        // `sink_params` is Some (checked under the lock above; it is
-        // immutable for the life of the handle).
+        // Install the sender BEFORE publishing `Enabled`. `capture_payload`
+        // reads state and sender under separate locks; if the state flipped
+        // first, a concurrent capture could observe `Enabled` with no
+        // sender and silently drop the event to the `NoSink` branch. The
+        // safe ordering means a capture racing this transition sees the
+        // *old* state and is held — never dropped. `sink_params` is Some
+        // (checked above; it is immutable for the life of the handle).
         let params = self
             .inner
             .sink_params
             .as_ref()
             .expect("sink_params present after the Some check");
-        let mut tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
-        if tx_guard.is_none() {
-            let (tx, bg) = spawn_sink(params);
-            *tx_guard = Some(tx);
-            *self.inner.bg.lock().expect("bg mutex poisoned") = Some(bg);
+        {
+            let mut tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
+            if tx_guard.is_none() {
+                let (tx, bg) = spawn_sink(params);
+                *tx_guard = Some(tx);
+                *self.inner.bg.lock().expect("bg mutex poisoned") = Some(bg);
+            }
         }
+        *self.inner.state.lock().expect("state mutex poisoned") = TelemetryState::Enabled;
         EnableOutcome::Enabled
     }
 
@@ -346,8 +353,10 @@ impl TelemetryHandle {
         } else {
             // No background task (init never created one): treat as a
             // local record so the user still sees the event in the
-            // inspection log. This branch is reached only in test
-            // fixtures that bypass `init`.
+            // inspection log. Unreachable through the public API —
+            // `enable()` installs the sender before publishing
+            // `Enabled` — so only test fixtures that bypass `init`
+            // land here.
             drop(tx_guard);
             self.append_local(&payload, false, Some("NoSink".into()));
         }

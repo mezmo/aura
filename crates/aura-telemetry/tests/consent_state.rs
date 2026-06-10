@@ -104,6 +104,41 @@ async fn unknown_holds_and_inspects_would_send() {
     );
 }
 
+/// `enable()` must install the sink sender *before* publishing
+/// `Enabled`. A capture racing the transition may still observe the old
+/// `Unknown` state (held — fine), but must never observe `Enabled` with
+/// no sender: that silently drops the event with a `NoSink` inspection
+/// row. Hammers the transition window across many fresh handles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enable_never_exposes_enabled_without_sink() {
+    for _ in 0..200 {
+        let f = fixture(TelemetryState::Unknown).await;
+        let h = f.handle.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b = barrier.clone();
+        let racer = std::thread::spawn(move || {
+            b.wait();
+            for _ in 0..64 {
+                h.capture(CliSessionStarted {
+                    interactive: true,
+                    standalone_mode: false,
+                    client_tools_enabled: false,
+                });
+            }
+        });
+        barrier.wait();
+        f.handle.enable();
+        racer.join().unwrap();
+        f.handle.shutdown(Duration::from_secs(2)).await;
+
+        let rows = log_lines(&f.log_path);
+        assert!(
+            rows.iter().all(|r| r["not_sent_reason"] != "NoSink"),
+            "a capture raced enable() into the Enabled-without-sink window: {rows:?}"
+        );
+    }
+}
+
 /// The no-backfill guarantee: an event captured while Unknown is NOT
 /// sent after `enable()`; only events captured *after* enabling go out.
 #[tokio::test]
