@@ -242,15 +242,19 @@ async fn run() -> std::io::Result<()> {
         .iter()
         .find_map(|c| c.effective_memory_dir())
         .map(std::path::PathBuf::from);
-    // First-config `[telemetry]` wins when multiple TOMLs are loaded.
-    // Operators running a multi-agent fleet should colocate the
-    // telemetry block in their primary config; cross-config disagreement
-    // is exotic enough to leave undefined.
-    let telemetry_file_cfg = configs.iter().find_map(|c| c.telemetry.as_ref());
+    // Fold `[telemetry]` blocks across every loaded TOML (sorted by
+    // path) through the shared kill-switch merge: `enabled = false`
+    // from ANY config wins — an operator opt-out must never depend on
+    // file ordering. Non-kill-switch fields take the later config's
+    // value when set.
+    let telemetry_file_cfg = configs
+        .iter()
+        .filter_map(|c| c.telemetry.clone())
+        .reduce(|base, over| base.merged_over(over));
     let telemetry_config = build_config_from_env_and_file(
         Source::WebServer,
         telemetry_memory_dir.as_deref(),
-        telemetry_file_cfg,
+        telemetry_file_cfg.as_ref(),
     );
     // The server is non-interactive — it never presents a notice, so its
     // state is `Unknown` (held, inspectable but unsent) unless an operator

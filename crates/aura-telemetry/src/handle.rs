@@ -132,6 +132,35 @@ pub struct FileTelemetryConfig {
     pub api_key: Option<String>,
 }
 
+impl FileTelemetryConfig {
+    /// Merge `over` on top of `self`, returning the combined config.
+    ///
+    /// The kill switch AND-merges: `enabled = Some(false)` from
+    /// **either** layer wins, so an opt-out recorded in one file can
+    /// never be silently reversed by another (a project `cli.toml`
+    /// shipping `enabled = true`, or a second server config loaded from
+    /// a `CONFIG_PATH` directory). Only when no layer asserts `false`
+    /// do the usual "overlay wins" semantics apply. Non-kill-switch
+    /// fields (`endpoint`, `api_key`) take the overlay's value when
+    /// set.
+    ///
+    /// This is the single definition of cross-file telemetry layering;
+    /// both the CLI (global + project `cli.toml`) and the web server
+    /// (multi-TOML `CONFIG_PATH`) fold their configs through it.
+    pub fn merged_over(self, over: FileTelemetryConfig) -> FileTelemetryConfig {
+        let enabled = if self.enabled == Some(false) || over.enabled == Some(false) {
+            Some(false)
+        } else {
+            over.enabled.or(self.enabled)
+        };
+        FileTelemetryConfig {
+            enabled,
+            endpoint: over.endpoint.or(self.endpoint),
+            api_key: over.api_key.or(self.api_key),
+        }
+    }
+}
+
 /// Outcome of [`TelemetryHandle::enable`], so callers can report
 /// honestly instead of always claiming success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -655,5 +684,44 @@ async fn flush(ctx: &BackgroundCtx, buf: &mut Vec<Pending>) {
         }
     } else {
         buf.clear();
+    }
+}
+
+#[cfg(test)]
+mod file_config_merge_tests {
+    use super::FileTelemetryConfig;
+
+    fn cfg(enabled: Option<bool>, endpoint: Option<&str>) -> FileTelemetryConfig {
+        FileTelemetryConfig {
+            enabled,
+            endpoint: endpoint.map(String::from),
+            api_key: None,
+        }
+    }
+
+    #[test]
+    fn enabled_false_from_base_survives_overlay_true() {
+        let merged = cfg(Some(false), None).merged_over(cfg(Some(true), None));
+        assert_eq!(merged.enabled, Some(false), "kill switch must AND-merge");
+    }
+
+    #[test]
+    fn enabled_false_from_overlay_wins() {
+        let merged = cfg(Some(true), None).merged_over(cfg(Some(false), None));
+        assert_eq!(merged.enabled, Some(false));
+    }
+
+    #[test]
+    fn overlay_wins_for_non_kill_switch_fields() {
+        let merged = cfg(None, Some("https://base/")).merged_over(cfg(Some(true), Some("https://over/")));
+        assert_eq!(merged.enabled, Some(true), "overlay sets enabled when base is silent");
+        assert_eq!(merged.endpoint.as_deref(), Some("https://over/"));
+    }
+
+    #[test]
+    fn base_fields_survive_silent_overlay() {
+        let merged = cfg(Some(true), Some("https://base/")).merged_over(cfg(None, None));
+        assert_eq!(merged.enabled, Some(true));
+        assert_eq!(merged.endpoint.as_deref(), Some("https://base/"));
     }
 }

@@ -67,6 +67,13 @@ impl FileConfig {
     }
 }
 
+/// Merge the global and project `[telemetry]` blocks via the shared
+/// kill-switch merge in `aura-telemetry`: `enabled = Some(false)` from
+/// **either** layer wins — a user who ran `/telemetry disable` (which
+/// writes `enabled = false` into the global `cli.toml`) must not have
+/// that decision silently reversed by a project `.aura/cli.toml` that
+/// ships `enabled = true`. Only when no layer asserts `false` do the
+/// "project wins over global" semantics kick in.
 fn merge_telemetry(
     base: Option<aura_telemetry::FileTelemetryConfig>,
     over: Option<aura_telemetry::FileTelemetryConfig>,
@@ -75,26 +82,7 @@ fn merge_telemetry(
         (None, None) => None,
         (Some(b), None) => Some(b),
         (None, Some(o)) => Some(o),
-        (Some(b), Some(o)) => Some(aura_telemetry::FileTelemetryConfig {
-            enabled: merge_enabled(b.enabled, o.enabled),
-            endpoint: o.endpoint.or(b.endpoint),
-            api_key: o.api_key.or(b.api_key),
-        }),
-    }
-}
-
-/// Merge `enabled` across the global and project layers using a
-/// kill-switch AND. `Some(false)` from **either** layer wins — a user
-/// who ran `/telemetry disable` (which writes `enabled = false` into
-/// the global `cli.toml`) must not have that decision silently
-/// reversed by a project `.aura/cli.toml` that ships
-/// `enabled = true`. Only when no layer asserts `false` do the
-/// "project wins over global" semantics kick in.
-fn merge_enabled(global: Option<bool>, project: Option<bool>) -> Option<bool> {
-    if global == Some(false) || project == Some(false) {
-        Some(false)
-    } else {
-        project.or(global)
+        (Some(b), Some(o)) => Some(b.merged_over(o)),
     }
 }
 
@@ -1074,6 +1062,17 @@ endpoint = \"https://x/\"
     }
 
     // ---- telemetry-enabled cross-layer merge ----
+
+    /// Pins the cross-layer `enabled` semantics through the shared
+    /// merge in `aura-telemetry` (the CLI no longer carries its own
+    /// copy of the kill-switch AND rule).
+    fn merge_enabled(global: Option<bool>, project: Option<bool>) -> Option<bool> {
+        let layer = |enabled| aura_telemetry::FileTelemetryConfig {
+            enabled,
+            ..Default::default()
+        };
+        layer(global).merged_over(layer(project)).enabled
+    }
 
     #[test]
     fn merge_enabled_global_false_beats_project_true() {
