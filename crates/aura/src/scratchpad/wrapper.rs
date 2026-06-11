@@ -420,6 +420,40 @@ mod tests {
         assert_eq!(result.output, large_output);
     }
 
+    /// Skill tool outputs must never be diverted to scratchpad: skills are
+    /// loaded specifically to be read in context. The map is built from MCP
+    /// server configs only, so `load_skill` / `read_skill_file` are never
+    /// keys — this pins the passthrough.
+    #[tokio::test]
+    async fn test_wrapper_passes_through_skill_tool_outputs() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-skills")
+                .await
+                .unwrap(),
+        );
+
+        let tools = HashMap::from([("search_knowledge_base".to_string(), 10)]);
+
+        let counter = TiktokenCounter::default_counter();
+        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+
+        let large_output = (0..500).map(|i| format!("line_{} ", i)).collect::<String>();
+        for tool_name in ["load_skill", "read_skill_file"] {
+            let ctx = ToolCallContext::new(tool_name);
+            let result = wrapper.transform_output(large_output.clone(), &ok(), &ctx, None);
+            assert_eq!(
+                result.output, large_output,
+                "{tool_name} output must pass through unintercepted"
+            );
+        }
+        assert!(
+            storage.list_files().await.unwrap().is_empty(),
+            "skill tool outputs must not produce scratchpad files"
+        );
+    }
+
     #[tokio::test]
     async fn test_wrapper_intercepts_at_exact_threshold() {
         let tmp = TempDir::new().unwrap();
