@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.22.2](https://github.com/mezmo/aura/compare/v1.22.1...v1.22.2) (2026-06-11)
+
+
+### Code Refactoring
+
+* **config**: move pure config types into aura-config [537dcb9](https://github.com/mezmo/aura/commit/537dcb9d3a9b7524a22647d9eb7b5e228fb1dd7a) - Justin Gross [#174](https://github.com/mezmo/aura/issues/174)
+
 ## [1.22.1](https://github.com/mezmo/aura/compare/v1.22.0...v1.22.1) (2026-06-11)
 
 
