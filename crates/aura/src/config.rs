@@ -45,6 +45,13 @@ pub struct AgentRuntimeConfig {
     /// Orchestration mode configuration (multi-agent workflows)
     pub orchestration: Option<OrchestrationConfig>,
 
+    /// Discovered per-worker skill overrides keyed by worker name. Populated
+    /// by `RigBuilder` at build time because skill discovery does filesystem
+    /// IO and can fail, so it cannot live on the pure config types. A present
+    /// key overrides `[agent.skills]` for that worker (an empty vec, from
+    /// `skills.local = []`, explicitly disables skills); an absent key inherits.
+    pub worker_skills: std::collections::HashMap<String, Vec<SkillConfig>>,
+
     // === Extension fields ===
     // These allow callers to customize agent building without modifying the builder.
     // The orchestrator uses these to inject tool wrappers and override preambles.
@@ -96,6 +103,7 @@ impl Clone for AgentRuntimeConfig {
             tools: self.tools.clone(),
             memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
+            worker_skills: self.worker_skills.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
             tool_context_factory: self.tool_context_factory.clone(),

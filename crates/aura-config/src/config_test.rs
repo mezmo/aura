@@ -1918,6 +1918,7 @@ max_extraction_tokens = 4000
             turn_depth: None,
             llm: None,
             scratchpad: None,
+            skills: None,
         };
         let mut orch = OrchestrationConfig::default();
         for name in names {
