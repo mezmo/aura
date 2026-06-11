@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.22.1](https://github.com/mezmo/aura/compare/v1.22.0...v1.22.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **ci**: rewrite install script to avoid json parsing [578007d](https://github.com/mezmo/aura/commit/578007d72c42de9f2fcc6112f2542e4a149d52dd) - Tony Rogers
+
 # [1.22.0](https://github.com/mezmo/aura/compare/v1.21.0...v1.22.0) (2026-06-10)
 
 
