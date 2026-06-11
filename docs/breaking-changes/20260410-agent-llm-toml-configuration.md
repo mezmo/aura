@@ -126,4 +126,4 @@ num_predict = 2048
 
 Affected Configs: `deny_unknown_fields` on `AgentConfig` and `LlmConfig`
 
-`aura_config::AgentConfig` and `aura_config::LlmConfig` carry `#[serde(deny_unknown_fields)]`. Any errant or stale field in either section (including the removed fields listed above) will produce a hard parse error instead of being silently ignored, calling attention to the customer.
+Both `aura_config::AgentConfig` and `aura_config::LlmConfig` carry `#[serde(deny_unknown_fields)]`. Any errant or stale field in either section (including the removed fields listed above) will produce a hard parse error instead of being silently ignored, calling attention to the customer.

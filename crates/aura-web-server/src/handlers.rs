@@ -1,9 +1,9 @@
 use a2a::VERSION;
+use aura::RigBuilder;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
     tool_event_subscribe, tool_usage_subscribe,
 };
-use aura_config::RigBuilder;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;

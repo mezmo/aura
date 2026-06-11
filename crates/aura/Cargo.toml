@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Internal crates
+aura-config = { path = "../aura-config" }
+
 # Rig dependencies
 rig-core = { workspace = true }
 rig-bedrock = { workspace = true }

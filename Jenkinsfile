@@ -385,7 +385,7 @@ def withReport(checkName, command, callback = null) {
 
   try {
     if (command) {
-      sh script: "${command} 2>&1 | tee ${logFile}"
+      sh script: "set -o pipefail; ${command} 2>&1 | tee ${logFile}"
     }
     if(callback) {
       callback()

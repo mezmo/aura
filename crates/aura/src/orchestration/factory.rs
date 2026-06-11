@@ -13,7 +13,7 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::AgentConfig;
+use crate::config::AgentRuntimeConfig;
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
@@ -26,11 +26,11 @@ use super::orchestrator::{
 /// Defers `Orchestrator` construction to `stream()` to avoid duplicate resource
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
-    agent_config: AgentConfig,
+    agent_config: AgentRuntimeConfig,
 }
 
 impl OrchestratorFactory {
-    pub fn new(agent_config: AgentConfig) -> Self {
+    pub fn new(agent_config: AgentRuntimeConfig) -> Self {
         Self { agent_config }
     }
 

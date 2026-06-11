@@ -9,8 +9,8 @@ use a2a::{
     TaskStatusUpdateEvent, VERSION,
 };
 use a2a_server::{AgentExecutor, ExecutorContext, TaskStore};
+use aura::RigBuilder;
 use aura::{RequestCancellation, StreamItem, StreamedAssistantContent, StreamingAgent};
-use aura_config::RigBuilder;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use serde_json::Value;
