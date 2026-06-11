@@ -343,6 +343,7 @@ version = "1.21.0"
 dependencies = [
  "aura-telemetry-derive",
  "chrono",
+ "dirs",
  "reqwest",
  "serde",
  "serde_json",

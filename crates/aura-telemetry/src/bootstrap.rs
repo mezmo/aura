@@ -79,11 +79,13 @@ pub fn resolve_install_id_path(
     PathBuf::from(".aura").join("install-id")
 }
 
-/// `$HOME/.aura/install-id` when `HOME` is set and non-empty.
+/// `{home}/.aura/install-id` when a home directory can be resolved.
+/// Home resolution goes through [`EnvProvider::home_dir`], which is
+/// `dirs::home_dir()` in production (Windows-correct) and HOME-based in
+/// tests.
 fn home_install_id(env: &dyn EnvProvider) -> Option<PathBuf> {
-    env.var("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|home| PathBuf::from(home).join(".aura").join("install-id"))
+    env.home_dir()
+        .map(|home| home.join(".aura").join("install-id"))
 }
 
 /// Whether the install-id resolved for these inputs lands in a
@@ -108,10 +110,7 @@ fn home_install_id(env: &dyn EnvProvider) -> Option<PathBuf> {
 fn install_id_is_durable(source: Source, memory_dir: Option<&Path>, env: &dyn EnvProvider) -> bool {
     match source {
         Source::WebServer => memory_dir.is_some(),
-        Source::Cli => {
-            let home_set = env.var("HOME").map(|h| !h.is_empty()).unwrap_or(false);
-            home_set || memory_dir.is_some()
-        }
+        Source::Cli => env.home_dir().is_some() || memory_dir.is_some(),
     }
 }
 
@@ -154,13 +153,8 @@ fn default_inspection_log_path(
         }
         Source::Cli => {}
     }
-    if let Some(home) = env.var("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home)
-                .join(".aura")
-                .join("telemetry")
-                .join("events.jsonl");
-        }
+    if let Some(home) = env.home_dir() {
+        return home.join(".aura").join("telemetry").join("events.jsonl");
     }
     PathBuf::from(".aura")
         .join("telemetry")
@@ -304,6 +298,35 @@ mod tests {
         fn var(&self, key: &str) -> Option<String> {
             self.0.get(key).cloned()
         }
+        /// Models `dirs::home_dir()`: prefer `USERPROFILE` (Windows),
+        /// fall back to `HOME` (Unix). Lets a test model a Windows
+        /// account where `HOME` is unset.
+        fn home_dir(&self) -> Option<std::path::PathBuf> {
+            self.var("USERPROFILE")
+                .or_else(|| self.var("HOME"))
+                .filter(|h| !h.is_empty())
+                .map(std::path::PathBuf::from)
+        }
+    }
+
+    /// Regression: on Windows `HOME` is typically unset (the home dir
+    /// comes from `USERPROFILE`/`dirs::home_dir()`). The resolvers used
+    /// to read `HOME` directly, so a Windows CLI fell through to a
+    /// per-cwd `.aura/install-id` — a fresh install UUID per directory.
+    /// Routing home resolution through `EnvProvider::home_dir` fixes it.
+    #[test]
+    fn install_id_roots_under_home_dir_when_home_env_unset() {
+        let env = MockEnv::default().set("USERPROFILE", "/winhome/user");
+        let resolved = resolve_install_id_path(Source::Cli, None, &env);
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("/winhome/user")
+                .join(".aura")
+                .join("install-id"),
+            "install-id must root under the resolved home dir, not cwd"
+        );
+        // And such a run is durable (a real home), so no churn warning.
+        assert!(install_id_is_durable(Source::Cli, None, &env));
     }
 
     #[test]

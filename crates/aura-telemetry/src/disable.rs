@@ -41,6 +41,19 @@ pub enum DisableReason {
 /// leaks between parallel `cargo test`s).
 pub trait EnvProvider {
     fn var(&self, key: &str) -> Option<String>;
+
+    /// The user's home directory, used to root `~/.aura/install-id` and
+    /// the inspection log. The default reads the `HOME` env var (so test
+    /// providers work without overriding), but [`SystemEnv`] overrides
+    /// this to use `dirs::home_dir()` — which resolves `USERPROFILE` on
+    /// Windows, where `HOME` is typically unset. This keeps telemetry
+    /// state co-located with the rest of the CLI's `~/.aura` (which also
+    /// resolves via `dirs`) instead of scattering a per-cwd install-id.
+    fn home_dir(&self) -> Option<std::path::PathBuf> {
+        self.var("HOME")
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from)
+    }
 }
 
 /// Read-from-the-real-environment provider. Default outside tests.
@@ -49,6 +62,10 @@ pub struct SystemEnv;
 impl EnvProvider for SystemEnv {
     fn var(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    fn home_dir(&self) -> Option<std::path::PathBuf> {
+        dirs::home_dir()
     }
 }
 

@@ -17,6 +17,9 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Resolves the user home dir on every platform (USERPROFILE on Windows,
+# HOME on Unix) so the install-id co-locates with the CLI's ~/.aura.
+dirs = "6"
 
 [dev-dependencies]
 tempfile = "3.10"
