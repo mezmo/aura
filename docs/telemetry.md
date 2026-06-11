@@ -81,6 +81,15 @@ Surfaces that cannot show a notice never enter `Enabled` on their own:
 | `/telemetry enable` / `/telemetry disable` (REPL) | **Enabled** / **Disabled** | Persists the preference to `~/.aura/cli.toml`. |
 | `AURA_TELEMETRY_LOG_EVENTS=0` | Disables the **local inspection log** only | Does not affect sending; just stops `events.jsonl` from being written. |
 
+The following two are **server-only operator switches**. They do not
+change the telemetry state — they gate how the server treats untrusted
+inbound requests, and both default to **off**:
+
+| Mechanism | Effect | Notes |
+|-----------|--------|-------|
+| `--accept-client-consent` / `AURA_TELEMETRY_ACCEPT_CLIENT_CONSENT=1` | Honor an inbound `X-Aura-Telemetry-Consent` header | Off by default — the header is unauthenticated and spoofable. See [Consent propagation](#consent-propagation-cli--server). |
+| `--telemetry-inspect-exposed` / `AURA_TELEMETRY_INSPECT_EXPOSED=1` | Allow `GET /telemetry/recent` from non-loopback peers | Off by default (loopback-only). Needed in docker/proxy topologies; see [From the server](#from-the-server). |
+
 **Resolution precedence (highest first):** hard disables
 (`DO_NOT_TRACK`, `AURA_TELEMETRY_DISABLED`, CI, cargo-test) →
 `AURA_TELEMETRY_ENABLED` → `[telemetry] enabled` preference → otherwise
@@ -433,7 +442,7 @@ verify the contract above without running the code:
 | `crates/aura-telemetry/src/events.rs` | One typed struct per event. Adding fields here requires a `PropertyValue` variant first. |
 | `crates/aura-telemetry/src/disable.rs` | `TelemetryState` and `decide_state` — the tri-state resolution (hard disable / explicit enable / preference / Unknown). Tests cover every branch and precedence pair. |
 | `crates/aura-telemetry/src/handle.rs` | `TelemetryHandle::enable` / `set_disabled` and the three-way `capture_payload`. `consent_state.rs` proves Unknown holds, `enable()` sends without backfilling, and a kill switch can't be revived. |
-| `crates/aura-cli/src/repl/telemetry_notice.rs` | The first-run notice text and the first-input consent decision, both unit-tested. |
+| `crates/aura-cli/src/repl/telemetry_notice.rs` | The first-run notice text and the first-message consent decision, both unit-tested. |
 | `crates/aura-telemetry/src/install_id.rs` | The race-safe install-UUID persistence. Concurrent first-launch tests prove all callers converge on one UUID; a separate test proves that corrupt files are read-only-fallback (never auto-recovered) so a multi-process race cannot split identity. |
 | `crates/aura-telemetry/src/inspection_log.rs` | The local JSONL writer and rotation. |
 | `crates/aura-telemetry/src/sink.rs` | The **only** code that builds the JSON sent to PostHog and the only outbound HTTP call. The `$ip: ""` and `$geoip_disable: true` lines live here. |
