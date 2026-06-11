@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 /// YAML frontmatter parsed from SKILL.md files.
 ///
 /// Follows the Agent Skills specification (<https://agentskills.io/specification>).
+/// Optional spec fields (`license`, `compatibility`, `metadata`, `allowed-tools`)
+/// are intentionally ignored — the catalog only needs `name` and `description`.
 #[derive(Debug, serde::Deserialize)]
 struct SkillFrontmatter {
     /// Required: must match the parent directory name, 1-64 chars,
@@ -334,6 +336,36 @@ mod tests {
         assert!(err.to_string().contains("Failed to parse"));
     }
 
+    // SkillFrontmatter has no deny_unknown_fields; these tests pin that the
+    // optional agentskills.io spec fields stay tolerated (parsed fine, ignored)
+    // so a future refactor can't silently break discovery of spec-complete skills.
+
+    #[test]
+    fn parse_frontmatter_tolerates_all_optional_spec_fields() {
+        let content = r#"---
+name: my-skill
+description: A test skill
+license: Apache-2.0
+compatibility: Requires git and network access
+metadata:
+  author: example-org
+  version: "1.2.0"
+allowed-tools: Bash(git:*) Read
+---
+# Body"#;
+        let fm = parse_skill_frontmatter(content).unwrap();
+        assert_eq!(fm.name, "my-skill");
+        assert_eq!(fm.description, "A test skill");
+    }
+
+    #[test]
+    fn parse_frontmatter_tolerates_allowed_tools_string() {
+        let content = "---\nname: my-skill\ndescription: A skill\nallowed-tools: Bash(git:*) Read\n---\n# Body";
+        let fm = parse_skill_frontmatter(content).unwrap();
+        assert_eq!(fm.name, "my-skill");
+        assert_eq!(fm.description, "A skill");
+    }
+
     // -----------------------------------------------------------------------
     // discover_skills tests
     // -----------------------------------------------------------------------
@@ -382,6 +414,41 @@ mod tests {
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "real-skill");
+    }
+
+    #[test]
+    fn discover_skills_tolerates_optional_spec_fields() {
+        let dir = TempDir::new().unwrap();
+        let skill_dir = dir.path().join("full-spec");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: full-spec
+description: A skill using every optional spec field
+license: MIT
+compatibility: Requires docker
+metadata:
+  author: example-org
+  version: "0.3.1"
+allowed-tools: Bash(git:*) Read
+---
+# full-spec
+Content."#,
+        )
+        .unwrap();
+
+        let sources = vec![LocalSkillSource {
+            source: dir.path().to_string_lossy().to_string(),
+        }];
+        let skills = discover_skills(&sources, None).unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "full-spec");
+        assert_eq!(
+            skills[0].description,
+            "A skill using every optional spec field"
+        );
     }
 
     #[test]
