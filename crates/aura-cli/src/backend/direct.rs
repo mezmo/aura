@@ -7,6 +7,7 @@
 //! identical behavior whether the CLI connects via HTTP or runs standalone.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -43,6 +44,27 @@ use crate::ui::prompt::get_selected_model;
 /// wired into the CLI binary.
 fn additional_tools_factory() -> Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync> {
     Arc::new(Vec::new)
+}
+
+/// Derive the config base directory from the path given to
+/// `aura_config::load_config`, which accepts either a file or a directory.
+///
+/// A directory is its own base. For a file, use its parent directory;
+/// Path::parent() on a bare filename like "config.toml" returns Some("")
+/// (empty path), so we filter that out and fall back to "." for the
+/// current directory.
+///
+/// The path must already exist (callers run `load_config` first) — a
+/// nonexistent directory path would be misclassified as a file here.
+fn config_dir_of(config_path: &Path) -> PathBuf {
+    if config_path.is_dir() {
+        return config_path.to_path_buf();
+    }
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Direct backend — holds AppState with loaded configs and CLI tool factory.
@@ -89,7 +111,7 @@ impl DirectBackend {
 
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
-            config_dir: std::path::PathBuf::from("."),
+            config_dir: config_dir_of(Path::new(config_path)),
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
@@ -424,7 +446,7 @@ mod tests {
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
-            config_dir: std::path::PathBuf::from("."),
+            config_dir: PathBuf::from("."),
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
@@ -451,6 +473,29 @@ mod tests {
         config.agent.alias = alias.map(|a| a.to_string());
         config.agent.system_prompt = system_prompt.to_string();
         config
+    }
+
+    // -----------------------------------------------------------------------
+    // config_dir_of
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_dir_of_file_path_uses_parent() {
+        assert_eq!(
+            config_dir_of(Path::new("configs/agent.toml")),
+            PathBuf::from("configs")
+        );
+    }
+
+    #[test]
+    fn config_dir_of_directory_is_itself() {
+        let dir = std::env::temp_dir();
+        assert_eq!(config_dir_of(&dir), dir);
+    }
+
+    #[test]
+    fn config_dir_of_bare_filename_falls_back_to_cwd() {
+        assert_eq!(config_dir_of(Path::new("agent.toml")), PathBuf::from("."));
     }
 
     // -----------------------------------------------------------------------
