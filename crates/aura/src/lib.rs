@@ -96,7 +96,7 @@ pub use request_progress::{
     subscribe as request_progress_subscribe, unsubscribe as request_progress_unsubscribe,
 };
 pub use rmcp::model::{NumberOrString, ProgressToken};
-pub use skill_tool::LoadSkillTool;
+pub use skill_tool::{LoadSkillTool, ReadSkillFileTool, SkillToolset, render_skill_catalog};
 pub use stream_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, CorrelationContextExt, WorkerPhase,
     format_named_sse,
