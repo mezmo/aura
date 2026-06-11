@@ -137,11 +137,30 @@ struct CoordinatorTools {
     routing_tools: RoutingToolSet,
     read_artifact: Option<ReadArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
+    skill_tools: Option<crate::skill_tool::SkillToolset>,
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Apply the per-worker skill override onto the cloned agent config.
+///
+/// Overrides live in `worker_skills`, keyed by worker name and discovered by
+/// `RigBuilder` at build time: a present key replaces `[agent.skills]` (an
+/// empty vec, from `skills.local = []`, explicitly disables skills); an
+/// absent key inherits.
+fn apply_worker_skills_override(
+    worker_config: &mut crate::config::AgentRuntimeConfig,
+    worker_name: Option<&str>,
+) {
+    if let Some(override_skills) = worker_name
+        .and_then(|name| worker_config.worker_skills.get(name))
+        .cloned()
+    {
+        worker_config.agent.skills = override_skills;
+    }
+}
 
 /// Spawns a task that monitors for external cancellation or timeout,
 /// cancelling the provided token when either occurs.
@@ -491,19 +510,18 @@ impl Orchestrator {
 
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
+        let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
 
         // Resolve per-worker LLM override (falls back to [agent.llm] when absent)
-        if let Some(override_llm) = worker_name
-            .and_then(|name| self.config.workers.get(name))
-            .and_then(|w| w.llm.as_ref())
-        {
+        if let Some(override_llm) = worker_cfg.and_then(|w| w.llm.as_ref()) {
             worker_config.llm = override_llm.clone();
         }
+
+        apply_worker_skills_override(&mut worker_config, worker_name);
 
         // Per-worker scratchpad override falls back to [agent.scratchpad].
         // Each worker gets a FRESH ContextBudget scoped to its effective LLM —
         // workers never share a budget.
-        let worker_cfg = worker_name.and_then(|name| self.config.workers.get(name));
         let effective_scratchpad = worker_cfg
             .and_then(|w| w.scratchpad.as_ref())
             .or(self.agent_config.agent.scratchpad.as_ref())
@@ -713,6 +731,14 @@ impl Orchestrator {
             && let Some(ref mut preamble) = worker_config.preamble_override
         {
             preamble.push_str(scratchpad::SCRATCHPAD_PREAMBLE);
+        }
+
+        // Workers bypass Agent::build's catalog append (their preamble is the
+        // worker template override), so the skill catalog lands here instead.
+        if let Some(catalog) = crate::skill_tool::render_skill_catalog(&worker_config.agent.skills)
+            && let Some(ref mut preamble) = worker_config.preamble_override
+        {
+            preamble.push_str(&catalog);
         }
 
         tracing::debug!(
@@ -1909,6 +1935,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(list_prior_runs) = tools.list_prior_runs {
             state = state.add_tool(list_prior_runs);
         }
+        if let Some(toolset) = tools.skill_tools {
+            state = state.add_tool(toolset.load);
+            state = state.add_tool(toolset.read_file);
+        }
         state.build()
     }
 
@@ -1958,6 +1988,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             include_recon_tools,
             include_history_tools,
         );
+        if let Some(catalog) =
+            crate::skill_tool::render_skill_catalog(&self.agent_config.agent.skills)
+        {
+            preamble.push_str(&catalog);
+        }
         let temperature = self.agent_config.llm.temperature();
 
         // Filter vector stores for coordinator (if any configured)
@@ -2045,6 +2080,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             } else {
                 None
             },
+            skill_tools: crate::skill_tool::SkillToolset::new(&self.agent_config.agent.skills),
         };
 
         let provider_agent = self
@@ -4243,6 +4279,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                skills: None,
             },
         );
         workers.insert(
@@ -4255,6 +4292,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                skills: None,
             },
         );
 
@@ -4319,6 +4357,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                skills: None,
             },
         );
 
@@ -4333,6 +4372,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                skills: None,
             },
         );
 
@@ -4347,6 +4387,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                skills: None,
             },
         );
 
@@ -4480,6 +4521,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                skills: None,
             },
         );
 
@@ -5293,6 +5335,58 @@ mod tests {
         assert!(Orchestrator::should_short_circuit_provider_errors(
             &failures, 0
         ));
+    }
+
+    // ========================================================================
+    // Worker Skills Override Resolution Tests
+    // ========================================================================
+
+    /// Per-worker skills resolution (`apply_worker_skills_override`, called by
+    /// `create_worker`): the cloned AgentRuntimeConfig keeps `[agent.skills]`
+    /// unless the discovered `worker_skills` map carries an entry for the
+    /// worker; an explicit empty entry disables skills.
+    #[test]
+    fn test_worker_skills_override_resolution() {
+        use crate::config::SkillConfig;
+
+        let agent_skill = SkillConfig {
+            name: "agent-skill".to_string(),
+            description: "Inherited from [agent.skills]".to_string(),
+            path: std::path::PathBuf::from("/skills/agent-skill"),
+        };
+        let worker_skill = SkillConfig {
+            name: "worker-skill".to_string(),
+            description: "Worker-specific".to_string(),
+            path: std::path::PathBuf::from("/skills/worker-skill"),
+        };
+
+        let mut agent_config = crate::config::AgentRuntimeConfig::default();
+        agent_config.agent.skills = vec![agent_skill];
+        agent_config
+            .worker_skills
+            .insert("overriding".to_string(), vec![worker_skill]);
+        agent_config
+            .worker_skills
+            .insert("disabling".to_string(), vec![]);
+
+        let resolve = |worker_name: &str| {
+            let mut worker_config = agent_config.clone();
+            super::apply_worker_skills_override(&mut worker_config, Some(worker_name));
+            worker_config.agent.skills
+        };
+
+        // A worker without a map entry inherits [agent.skills]
+        let inherited = resolve("inheriting");
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].name, "agent-skill");
+
+        // A present entry replaces the agent skills entirely
+        let replaced = resolve("overriding");
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].name, "worker-skill");
+
+        // An empty entry disables skills for this worker
+        assert!(resolve("disabling").is_empty());
     }
 
     // ========================================================================
