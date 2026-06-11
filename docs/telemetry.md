@@ -60,11 +60,12 @@ Surfaces that cannot show a notice never enter `Enabled` on their own:
 
 - **One-shot `aura --query …`** never participates: no notice, nothing
   sent.
-- **The web server** is non-interactive. It stays **Unknown** (holding,
-  inspectable, unsent) unless an operator explicitly sets
-  `[telemetry] enabled = true` / `AURA_TELEMETRY_ENABLED=true`, **or** an
-  Enabled CLI propagates consent over HTTP (see
-  [Consent propagation](#consent-propagation-cli--server)).
+- **The web server** is non-interactive. Its own events stay **Unknown**
+  (holding, inspectable, unsent) unless an operator explicitly sets
+  `[telemetry] enabled = true` / `AURA_TELEMETRY_ENABLED=true`. A
+  consenting CLI can additionally authorise telemetry about *its own*
+  requests without changing the server's state — see
+  [Consent propagation](#consent-propagation-cli--server).
 - **CI / test harnesses** are non-interactive and additionally
   hard-disabled (below), so they never send.
 
@@ -81,13 +82,11 @@ Surfaces that cannot show a notice never enter `Enabled` on their own:
 | `/telemetry enable` / `/telemetry disable` (REPL) | **Enabled** / **Disabled** | Persists the preference to `~/.aura/cli.toml`. |
 | `AURA_TELEMETRY_LOG_EVENTS=0` | Disables the **local inspection log** only | Does not affect sending; just stops `events.jsonl` from being written. |
 
-The following two are **server-only operator switches**. They do not
-change the telemetry state — they gate how the server treats untrusted
-inbound requests, and both default to **off**:
+The following is a **server-only operator switch**. It does not change
+the telemetry state and defaults to **off**:
 
 | Mechanism | Effect | Notes |
 |-----------|--------|-------|
-| `--accept-client-consent` / `AURA_TELEMETRY_ACCEPT_CLIENT_CONSENT=1` | Honor an inbound `X-Aura-Telemetry-Consent` header | Off by default — the header is unauthenticated and spoofable. See [Consent propagation](#consent-propagation-cli--server). |
 | `--telemetry-inspect-exposed` / `AURA_TELEMETRY_INSPECT_EXPOSED=1` | Allow `GET /telemetry/recent` from non-loopback peers | Off by default (loopback-only). Needed in docker/proxy topologies; see [From the server](#from-the-server). |
 
 **Resolution precedence (highest first):** hard disables
@@ -118,15 +117,35 @@ production-install count even if telemetry is mistakenly enabled there.
 
 When you use the CLI in HTTP mode against an Aura server, the CLI — once
 **Enabled** — attaches an `X-Aura-Telemetry-Consent: enabled` header to
-its requests. A server in the **Unknown** state honours that header and
-begins sending for the lifetime of that process (your consent, obtained
-interactively in the CLI, applied to the server acting on your behalf).
-This transition is **not persisted** — it re-establishes per
-connection, which avoids writing the (often read-only) server config. A
-server that is explicitly **Disabled** ignores the header. An operator
-of a shared server who does not want per-user propagation sets
-`[telemetry] enabled = false`. The CLI and server keep separate
-anonymous install IDs; the `aura_source` property distinguishes them.
+its requests. That consent is **request-scoped**: it authorises
+telemetry about *that request*, and nothing else.
+
+Propagation is deliberately **not** a global switch. An inbound consent
+header never changes the server's telemetry state and never enables
+sending for other users or for the server's own lifecycle events. The
+header is unauthenticated and trivially spoofable, so binding it to a
+process-wide flip would let any client (curl, a scanner, a proxy
+injecting headers) turn a shared server's telemetry on for everyone —
+the exact failure this design avoids. Because consent rides with the
+request, a forged header can at most cause anonymous telemetry about
+the forger's *own* request to be sent, which is harmless.
+
+Concretely, when a server handles a request carrying a valid consent
+header, the per-request events generated for it are captured through
+[`TelemetryHandle::capture_consented`], which sends without touching the
+server's global `Unknown`/`Enabled` state. An operator opt-out always
+wins: a **Disabled** server holds even consented events and sends
+nothing. The server's own events (e.g. `server_started`) are governed by
+the operator's own decision (`[telemetry] enabled` / env), never by a
+client header. The CLI and server keep separate anonymous install IDs;
+the `aura_source` property distinguishes them.
+
+> **Status:** Phase 1 defines no per-request *server* events, so there
+> is nothing for the server to propagate yet — the CLI already sends the
+> header, and the request-scoped capture path is in place for the
+> per-request server events that Phase 2 introduces.
+
+[`TelemetryHandle::capture_consented`]: ../crates/aura-telemetry/src/handle.rs
 
 ---
 
@@ -231,12 +250,24 @@ curl http://127.0.0.1:8080/telemetry/recent?limit=50
 ```
 
 Returns `{ "events": [...] }` with the same record shape as the local
-JSONL file. **The endpoint enforces a loopback peer-address check**:
-requests originating from a non-loopback address receive a `403`
-with an explanatory body, regardless of how the server is bound. If
-the inspection log has been disabled via `AURA_TELEMETRY_LOG_EVENTS=0`
-the endpoint returns `503` and an `"error": "inspection log
-disabled …"` body.
+JSONL file. **The endpoint enforces a loopback peer-address check by
+default**: requests originating from a non-loopback address receive a
+`403`. If the inspection log has been disabled via
+`AURA_TELEMETRY_LOG_EVENTS=0` the endpoint returns `503`.
+
+In **Docker / Kubernetes** the in-container peer address of a
+host-published request is the bridge gateway, not `127.0.0.1`, so the
+loopback check would `403` even the host operator. Two options:
+
+- Inspect from inside the container, where the peer really is loopback:
+  `docker exec aura curl -s localhost:8080/telemetry/recent`.
+- Or opt into remote access with `--telemetry-inspect-exposed` /
+  `AURA_TELEMETRY_INSPECT_EXPOSED=1`, which lifts the loopback gate.
+
+> ⚠️ The loopback gate is a convenience, not an auth boundary. Behind a
+> same-host reverse proxy every client already appears as `127.0.0.1`,
+> so do not rely on it to keep the event timeline private on an exposed
+> server — restrict the route at your proxy/ingress instead.
 
 ### Reading the file directly
 
@@ -370,10 +401,12 @@ A throwaway eval clone that persists nothing gets a fresh id each run
 and naturally does not accumulate as a stable install — which is the
 correct outcome.
 
-Note that the **server is non-interactive**, so it stays in the
-`Unknown` state and sends nothing until you opt it in — either
-explicitly (`[telemetry] enabled = true` / `AURA_TELEMETRY_ENABLED=true`)
-or by driving it with an Enabled CLI (consent propagation). The
+Note that the **server is non-interactive**, so its own events stay in
+the `Unknown` state and send nothing until an operator opts in
+explicitly (`[telemetry] enabled = true` / `AURA_TELEMETRY_ENABLED=true`).
+A consenting CLI authorises telemetry only about its own requests and
+does not enable the server's own events (see
+[Consent propagation](#consent-propagation-cli--server)). The
 persistence below is what makes the install count *stable once enabled*;
 it does not by itself cause the server to send.
 

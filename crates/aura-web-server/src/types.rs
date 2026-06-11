@@ -104,6 +104,10 @@ pub struct AppState {
     /// `docs/telemetry.md`. Always populated; outbound network may be
     /// disabled at init time via the kill-switch decision tree.
     pub telemetry: aura_telemetry::TelemetryHandle,
+    /// Whether `GET /telemetry/recent` is reachable from non-loopback
+    /// peers. Off by default; operators in docker/proxy topologies set
+    /// `AURA_TELEMETRY_INSPECT_EXPOSED` to opt into remote access.
+    pub telemetry_inspect_exposed: bool,
 }
 
 /// OpenAI-compatible message role

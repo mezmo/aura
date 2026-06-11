@@ -134,6 +134,20 @@ struct Args {
     /// /.well-known/agent-card.json. Disabled by default.
     #[arg(long, env = "AURA_ENABLE_A2A", action = clap::ArgAction::SetTrue)]
     enable_a2a: bool,
+
+    /// Allow `GET /telemetry/recent` from non-loopback peers. By default
+    /// the inspection endpoint is loopback-only, which 403s the host
+    /// operator in docker-compose (the in-container peer is the bridge
+    /// gateway) — set this to reach it through a published port or proxy.
+    /// Note: behind a same-host reverse proxy every client appears
+    /// loopback, so do not rely on the loopback gate as an auth boundary.
+    /// Disabled by default. See docs/telemetry.md.
+    #[arg(
+        long,
+        env = "AURA_TELEMETRY_INSPECT_EXPOSED",
+        action = clap::ArgAction::SetTrue
+    )]
+    telemetry_inspect_exposed: bool,
 }
 
 /// Resolve the externally-advertised base URL for the A2A agent card.
@@ -294,6 +308,7 @@ async fn run() -> std::io::Result<()> {
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
         telemetry: telemetry.clone(),
+        telemetry_inspect_exposed: args.telemetry_inspect_exposed,
     });
 
     info!(

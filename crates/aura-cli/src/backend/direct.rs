@@ -113,6 +113,9 @@ impl DirectBackend {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             telemetry: telemetry.clone(),
+            // Standalone CLI is a local in-process backend with no remote
+            // inspection surface.
+            telemetry_inspect_exposed: false,
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -243,6 +246,7 @@ impl DirectBackend {
             default_agent: old.default_agent.clone(),
             additional_tools: additional_tools_factory(),
             telemetry: self.telemetry.clone(),
+            telemetry_inspect_exposed: old.telemetry_inspect_exposed,
         });
     }
 
@@ -474,6 +478,7 @@ mod tests {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             telemetry: telemetry.clone(),
+            telemetry_inspect_exposed: false,
         });
         DirectBackend {
             app_state,

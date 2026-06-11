@@ -184,6 +184,88 @@ async fn enable_does_not_backfill_unknown_events() {
     );
 }
 
+/// Request-scoped consent (Option A): a consented event is sent even
+/// though the server's global state is `Unknown`, the global state is
+/// **not** flipped, and the server's own non-consented captures stay
+/// held. This is what lets header-driven propagation be safe by
+/// default — a forged header only emits anonymous telemetry about the
+/// forger's own request, never a global switch.
+#[tokio::test]
+async fn capture_consented_sends_without_enabling_globally() {
+    let f = fixture(TelemetryState::Unknown).await;
+
+    // The server's own event (no request consent) must stay held.
+    f.handle.capture(ServerStarted {
+        default_agent_set: true,
+    });
+    // An event carrying the request's consent must be sent.
+    f.handle.capture_consented(CliSessionStarted {
+        interactive: true,
+        standalone_mode: false,
+        client_tools_enabled: false,
+    });
+
+    // Global state is unchanged: the server stays Unknown.
+    assert!(
+        matches!(f.handle.state(), TelemetryState::Unknown),
+        "request-scoped consent must not flip the global state"
+    );
+
+    f.handle.shutdown(Duration::from_secs(2)).await;
+
+    let events: Vec<Value> = f
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            body["batch"].as_array().cloned().unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "only the consented event should be on the wire; got {events:?}"
+    );
+    assert_eq!(events[0]["event"], "cli_session_started");
+    assert!(
+        events.iter().all(|e| e["event"] != "server_started"),
+        "the server's own held event must not be sent"
+    );
+}
+
+/// Request consent never overrides an operator opt-out: a `Disabled`
+/// server holds a consented event (inspection-log only), exactly like a
+/// normal capture.
+#[tokio::test]
+async fn capture_consented_respects_operator_opt_out() {
+    let f = fixture(TelemetryState::Disabled(DisableReason::DoNotTrack)).await;
+
+    f.handle.capture_consented(CliSessionStarted {
+        interactive: true,
+        standalone_mode: false,
+        client_tools_enabled: false,
+    });
+    f.handle.shutdown(Duration::from_secs(2)).await;
+
+    let rows = log_lines(&f.log_path);
+    assert_eq!(
+        rows.last().unwrap()["not_sent_reason"],
+        "DoNotTrack",
+        "a Disabled server must hold even a consented event"
+    );
+    assert!(
+        f.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "operator opt-out must win over request consent"
+    );
+}
+
 /// `set_disabled` from Unknown holds and never sends.
 #[tokio::test]
 async fn set_disabled_holds() {

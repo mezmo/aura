@@ -292,10 +292,16 @@ pub async fn chat_completions(
         );
     }
 
-    // HTTP consent propagation: an Enabled CLI carries the user's
-    // telemetry consent in a header; adopt it if this server is Unknown.
-    // (No-op when the server is Disabled — operator opt-out wins.)
-    apply_consent_header(&state.telemetry, &headers);
+    // HTTP consent propagation is request-scoped: an Enabled CLI carries
+    // its consent in `aura_telemetry::CONSENT_HEADER`, and server-side
+    // per-request events (Phase 2) are captured via
+    // `TelemetryHandle::capture_consented` when `header_grants_consent`
+    // holds for this request. We deliberately do NOT flip the server's
+    // global telemetry state from this header — it is unauthenticated and
+    // spoofable, so a forged header must only ever cause anonymous
+    // telemetry about the forger's own request, never a process-wide
+    // switch. There are no per-request server events yet, so there is
+    // nothing to capture here today.
 
     // Extract or generate chat_session_id
     // Priority: metadata > X-Chat-Session-Id header > x-openwebui-chat-id header > generate new
@@ -879,8 +885,16 @@ pub async fn telemetry_recent(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::Query(params): axum::extract::Query<TelemetryRecentParams>,
 ) -> Response {
+    // The peer-IP loopback test is a weak proxy for "trusted local
+    // operator": it 403s the host operator in the docker-compose
+    // deployment (the in-container peer is the bridge gateway, not
+    // 127.0.0.1) and, conversely, trusts any same-host reverse proxy.
+    // An operator who needs the endpoint reachable in those topologies
+    // sets `--telemetry-inspect-exposed` / `AURA_TELEMETRY_INSPECT_EXPOSED`
+    // to opt out of the loopback restriction explicitly.
+    let access_allowed = addr.ip().is_loopback() || state.telemetry_inspect_exposed;
     let (status, body) = build_telemetry_recent_response(
-        addr.ip().is_loopback(),
+        access_allowed,
         state.telemetry.inspection_log(),
         params.limit,
     );
@@ -888,18 +902,20 @@ pub async fn telemetry_recent(
 }
 
 /// Pure formatting half of [`telemetry_recent`], factored out so the
-/// loopback gate and the log-read paths can be unit-tested without
-/// constructing a full Axum router and AppState.
+/// access gate and the log-read paths can be unit-tested without
+/// constructing a full Axum router and AppState. `access_allowed` is
+/// the resolved gate (loopback peer, or operator-exposed).
 pub fn build_telemetry_recent_response(
-    is_loopback: bool,
+    access_allowed: bool,
     log: Option<&aura_telemetry::inspection_log::InspectionLog>,
     limit: Option<usize>,
 ) -> (axum::http::StatusCode, serde_json::Value) {
-    if !is_loopback {
+    if !access_allowed {
         return (
             axum::http::StatusCode::FORBIDDEN,
             serde_json::json!({
-                "error": "telemetry inspection endpoint is localhost-only"
+                "error": "telemetry inspection endpoint is localhost-only \
+                          (set AURA_TELEMETRY_INSPECT_EXPOSED=1 to allow remote access)"
             }),
         );
     }
@@ -930,29 +946,19 @@ pub struct TelemetryRecentParams {
     pub limit: Option<usize>,
 }
 
-/// Whether an inbound `X-Aura-Telemetry-Consent` header value grants
-/// consent (i.e. equals the one sanctioned value). Pure so the
-/// propagation decision is unit-testable without a request.
+/// Whether an inbound request carries valid telemetry consent — i.e. the
+/// `X-Aura-Telemetry-Consent` header equals the one sanctioned value the
+/// CLI sends ([`aura_telemetry::CONSENT_HEADER_VALUE`]).
+///
+/// This is the server-side half of the CLI↔server wire contract and the
+/// gate for **request-scoped** propagation: when it holds, server-side
+/// per-request events (Phase 2) are captured via
+/// [`aura_telemetry::TelemetryHandle::capture_consented`], which sends
+/// only telemetry about *this* request and never changes the server's
+/// global state. It must never be wired to a global `enable()` — that
+/// was the spoofable path this design replaced.
 pub fn header_grants_consent(value: Option<&str>) -> bool {
     value == Some(aura_telemetry::CONSENT_HEADER_VALUE)
-}
-
-/// Apply an inbound consent header to the server's telemetry handle.
-///
-/// An `Enabled` CLI carries the user's telemetry consent in
-/// [`aura_telemetry::CONSENT_HEADER`]. When this server is `Unknown` (no
-/// explicit operator decision), adopt that consent and start sending for
-/// this process. `enable()` is idempotent and a no-op when the server is
-/// `Disabled`, so an operator opt-out always wins. Factored out of
-/// [`chat_completions`] so the header → consent wiring is unit-testable
-/// without standing up an agent.
-pub fn apply_consent_header(telemetry: &aura_telemetry::TelemetryHandle, headers: &HeaderMap) {
-    let consent = headers
-        .get(aura_telemetry::CONSENT_HEADER)
-        .and_then(|h| h.to_str().ok());
-    if header_grants_consent(consent) {
-        telemetry.enable();
-    }
 }
 
 #[cfg(test)]
@@ -963,45 +969,8 @@ mod telemetry_endpoint_tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
-    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryHandle, TelemetryState, init};
-    use axum::http::HeaderValue;
-    use std::time::Duration;
-
     fn fresh_log(dir: &std::path::Path) -> InspectionLog {
         InspectionLog::open(dir.join("events.jsonl"), 1000).unwrap()
-    }
-
-    /// A telemetry handle in a given state, with no sink network traffic
-    /// (endpoint is unroutable and we never `capture`).
-    fn handle_in(state: TelemetryState) -> TelemetryHandle {
-        init(TelemetryConfig {
-            endpoint: "http://127.0.0.1:1".into(),
-            api_key: "phc_test".into(),
-            install_id: Uuid::nil(),
-            install_id_path: None,
-            session_id: Uuid::nil(),
-            source: Source::WebServer,
-            os_family: OsFamily::Linux,
-            deployment_method: DeploymentMethod::Local,
-            aura_version: "9.9.9-test",
-            inspection_log_path: None,
-            state,
-            channel_capacity: 16,
-            batch_size: 1,
-            flush_interval: Duration::from_millis(50),
-            post_timeout: Duration::from_millis(100),
-            http_client: None,
-        })
-    }
-
-    fn consent_headers(value: &'static str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(
-            aura_telemetry::CONSENT_HEADER,
-            HeaderValue::from_static(value),
-        );
-        h
     }
 
     #[test]
@@ -1010,46 +979,6 @@ mod telemetry_endpoint_tests {
         assert!(!header_grants_consent(Some("true")));
         assert!(!header_grants_consent(Some("")));
         assert!(!header_grants_consent(None));
-    }
-
-    #[tokio::test]
-    async fn consent_header_adopts_consent_on_unknown_server() {
-        let telemetry = handle_in(TelemetryState::Unknown);
-        apply_consent_header(
-            &telemetry,
-            &consent_headers(aura_telemetry::CONSENT_HEADER_VALUE),
-        );
-        assert!(
-            matches!(telemetry.state(), TelemetryState::Enabled),
-            "an Unknown server must adopt a granting consent header"
-        );
-    }
-
-    #[tokio::test]
-    async fn unrelated_header_value_leaves_unknown_untouched() {
-        let telemetry = handle_in(TelemetryState::Unknown);
-        // Wrong value, then no header at all — neither grants consent.
-        apply_consent_header(&telemetry, &consent_headers("true"));
-        apply_consent_header(&telemetry, &HeaderMap::new());
-        assert!(
-            matches!(telemetry.state(), TelemetryState::Unknown),
-            "only the sanctioned value flips Unknown -> Enabled"
-        );
-    }
-
-    #[tokio::test]
-    async fn consent_header_cannot_revive_disabled_server() {
-        // Operator opt-out (e.g. DO_NOT_TRACK) must win over a CLI's
-        // inbound consent: enable() is a no-op for a Disabled handle.
-        let telemetry = handle_in(TelemetryState::Disabled(DisableReason::DoNotTrack));
-        apply_consent_header(
-            &telemetry,
-            &consent_headers(aura_telemetry::CONSENT_HEADER_VALUE),
-        );
-        assert!(
-            matches!(telemetry.state(), TelemetryState::Disabled(_)),
-            "a Disabled server must ignore an inbound consent header"
-        );
     }
 
     #[test]

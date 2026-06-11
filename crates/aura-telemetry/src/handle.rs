@@ -271,28 +271,33 @@ impl TelemetryHandle {
                 return EnableOutcome::HeldUntilRestart;
             }
         }
-        // Install the sender BEFORE publishing `Enabled`. `capture_payload`
-        // reads state and sender under separate locks; if the state flipped
-        // first, a concurrent capture could observe `Enabled` with no
-        // sender and silently drop the event to the `NoSink` branch. The
-        // safe ordering means a capture racing this transition sees the
-        // *old* state and is held — never dropped. `sink_params` is Some
-        // (checked above; it is immutable for the life of the handle).
-        let params = self
-            .inner
-            .sink_params
-            .as_ref()
-            .expect("sink_params present after the Some check");
-        {
-            let mut tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
-            if tx_guard.is_none() {
-                let (tx, bg) = spawn_sink(params);
-                *tx_guard = Some(tx);
-                *self.inner.bg.lock().expect("bg mutex poisoned") = Some(bg);
-            }
-        }
+        // Install the sender BEFORE publishing `Enabled` (see
+        // `ensure_sink`): if the state flipped first, a concurrent capture
+        // could observe `Enabled` with no sender and drop the event.
+        self.ensure_sink();
         *self.inner.state.lock().expect("state mutex poisoned") = TelemetryState::Enabled;
         EnableOutcome::Enabled
+    }
+
+    /// Spawn the background sink if it is not already running. No-op when
+    /// no `sink_params` were captured at init (a hard `Disabled`, or no
+    /// tokio runtime was available) or when a sink already exists.
+    ///
+    /// **Does not change the telemetry state.** Callers that want to
+    /// publish `Enabled` must do so *after* this returns, so a concurrent
+    /// capture never sees `Enabled` with no sender. `capture_consented`
+    /// relies on this to send a request-scoped event while leaving the
+    /// global state untouched.
+    fn ensure_sink(&self) {
+        let Some(params) = self.inner.sink_params.as_ref() else {
+            return;
+        };
+        let mut tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
+        if tx_guard.is_none() {
+            let (tx, bg) = spawn_sink(params);
+            *tx_guard = Some(tx);
+            *self.inner.bg.lock().expect("bg mutex poisoned") = Some(bg);
+        }
     }
 
     /// Transition to `Disabled` at runtime (the first-input opt-out).
@@ -342,6 +347,34 @@ impl TelemetryHandle {
         self.capture_payload(payload);
     }
 
+    /// Capture an event that carries **per-request consent** — e.g. an
+    /// Enabled CLI's `X-Aura-Telemetry-Consent` header on the request
+    /// being handled. Consent rides with the request, so this sends even
+    /// when the server's own global state is `Unknown`, **without**
+    /// changing that state and without any operator-level opt-in.
+    ///
+    /// An operator opt-out still wins: when the global state is
+    /// `Disabled` the event is held (inspection-log only), exactly like
+    /// [`capture`](Self::capture). This is what makes header-driven
+    /// propagation safe by default — a forged header can only emit
+    /// anonymous telemetry about the forger's *own* request; it cannot
+    /// flip a global switch or affect any other user. Server-side
+    /// per-request events route through here, gated on the request's
+    /// consent header.
+    pub fn capture_consented<E: Event>(&self, event: E) {
+        let payload = event.into_payload();
+        // Operator opt-out always wins, even with request consent.
+        if let TelemetryState::Disabled(reason) = self.state() {
+            self.append_local(&payload, false, Some(disable_reason_label(&reason)));
+            return;
+        }
+        // Unknown or Enabled: send. Bring the sink up without touching the
+        // global state, so the server stays Unknown and its own
+        // non-consented captures remain held.
+        self.ensure_sink();
+        self.enqueue_or_record(payload);
+    }
+
     /// Lower-level capture for callers that already have an
     /// `EventPayload` (e.g. the synthetic `telemetry_opt_out` first
     /// record). Tests also use this.
@@ -363,29 +396,34 @@ impl TelemetryHandle {
             }
             TelemetryState::Enabled => {}
         }
-        // Active path: hand the payload to the background task. The
-        // background task is the only writer that knows the POST
-        // outcome, so it owns the inspection-log append for this
-        // event. We record nothing locally yet.
+        // Active path: hand the payload to the background task.
+        self.enqueue_or_record(payload);
+    }
+
+    /// Queue a payload to the background sink, or record it locally as
+    /// not-sent when the channel is full (`ChannelFull`) or no sink
+    /// exists (`NoSink`). The background task is the only writer that
+    /// knows the POST outcome, so it owns the inspection-log append for
+    /// successfully-queued events — nothing is recorded here on the
+    /// happy path. Shared by the `Enabled` global path
+    /// ([`capture_payload`](Self::capture_payload)) and the request-scoped
+    /// path ([`capture_consented`](Self::capture_consented)).
+    fn enqueue_or_record(&self, payload: EventPayload) {
         let tx_guard = self.inner.sender.lock().expect("sender mutex poisoned");
         if let Some(tx) = tx_guard.as_ref() {
             // `try_send` is non-blocking; a full channel means burst
             // pressure. Drop, increment the counter, AND surface the
             // drop in the inspection log so a user inspecting "what
-            // happened to my event" sees the truth rather than
-            // silence.
+            // happened to my event" sees the truth rather than silence.
             if tx.try_send(payload.clone()).is_err() {
                 self.inner.dropped.fetch_add(1, Ordering::Relaxed);
                 drop(tx_guard);
                 self.append_local(&payload, false, Some("ChannelFull".into()));
             }
         } else {
-            // No background task (init never created one): treat as a
-            // local record so the user still sees the event in the
-            // inspection log. Unreachable through the public API —
-            // `enable()` installs the sender before publishing
-            // `Enabled` — so only test fixtures that bypass `init`
-            // land here.
+            // No background task: `ensure_sink`/`enable` could not spawn
+            // one (no `sink_params` — a hard Disabled at init, or no
+            // runtime). Record locally so the user still sees the event.
             drop(tx_guard);
             self.append_local(&payload, false, Some("NoSink".into()));
         }
