@@ -99,6 +99,22 @@ impl RigBuilder {
         agent_config.agent.skills =
             aura_config::skills::discover_skills(&skill_sources, self.config_dir.as_deref())?;
 
+        // Per-worker skill overrides: discover explicit sources only (no
+        // AURA_SKILLS_DIR fallback — that is agent-level only). A worker
+        // without a skills key inherits `[agent.skills]` and stays out of
+        // the map; `skills.local = []` lands as an empty vec (disabled).
+        if let Some(orch) = &self.config.orchestration {
+            for (name, worker) in &orch.workers {
+                if let Some(worker_skills) = &worker.skills {
+                    let discovered = aura_config::skills::discover_skills(
+                        &worker_skills.local,
+                        self.config_dir.as_deref(),
+                    )?;
+                    agent_config.worker_skills.insert(name.clone(), discovered);
+                }
+            }
+        }
+
         Ok(agent_config)
     }
 
@@ -481,5 +497,135 @@ model = "gpt-4o"
         let loaded = load_config_from_str(config).expect("should parse");
         let built = RigBuilder::new(loaded).get_agent_config();
         assert_eq!(built.effective_memory_dir(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // per-worker skills discovery tests
+    // -----------------------------------------------------------------------
+
+    /// Serializes tests that touch the AURA_SKILLS_DIR env var.
+    static SKILLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n# {name}\nContent."),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn worker_skills_toml_round_trip() {
+        let _env_lock = SKILLS_ENV_LOCK.lock().unwrap();
+        // Worker-level discovery must ignore the agent-level AURA_SKILLS_DIR
+        // fallback: a worker without a skills key stays out of the map even
+        // with the env var set.
+        let fallback_dir = tempfile::TempDir::new().unwrap();
+        write_skill(fallback_dir.path(), "fallback-skill", "Agent fallback");
+        unsafe {
+            std::env::set_var("AURA_SKILLS_DIR", fallback_dir.path());
+        }
+
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        write_skill(skills_dir.path(), "alpha", "Alpha skill");
+
+        let config_str = format!(
+            r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.skilled]
+description = "Has its own skills"
+preamble = "You use skills."
+
+[[orchestration.worker.skilled.skills.local]]
+source = '{}'
+
+[orchestration.worker.inheriting]
+description = "No skills key"
+preamble = "You inherit."
+
+[orchestration.worker.disabled]
+description = "Explicitly disabled skills"
+preamble = "You have none."
+skills.local = []
+"#,
+            skills_dir.path().display()
+        );
+
+        let config = aura_config::Config::parse_toml(&config_str).expect("config should parse");
+        let agent_config = RigBuilder::new(config).discovered_agent_config();
+
+        unsafe {
+            std::env::remove_var("AURA_SKILLS_DIR");
+        }
+
+        let agent_config = agent_config.expect("discovery should succeed");
+
+        let skilled = agent_config
+            .worker_skills
+            .get("skilled")
+            .expect("explicit sources should discover skills into the map");
+        assert_eq!(skilled.len(), 1);
+        assert_eq!(skilled[0].name, "alpha");
+
+        assert!(
+            !agent_config.worker_skills.contains_key("inheriting"),
+            "worker without skills key should inherit (absent), even with AURA_SKILLS_DIR set"
+        );
+
+        let disabled = agent_config
+            .worker_skills
+            .get("disabled")
+            .expect("skills.local = [] should be present, not inherit");
+        assert!(
+            disabled.is_empty(),
+            "skills.local = [] should disable skills (empty entry)"
+        );
+
+        // The AURA_SKILLS_DIR fallback applies to [agent.skills] only.
+        assert_eq!(agent_config.agent.skills.len(), 1);
+        assert_eq!(agent_config.agent.skills[0].name, "fallback-skill");
+    }
+
+    #[test]
+    fn worker_skills_nonexistent_source_fails_conversion() {
+        let _env_lock = SKILLS_ENV_LOCK.lock().unwrap();
+        let config_str = r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.broken]
+description = "Bad skill source"
+preamble = "You fail."
+
+[[orchestration.worker.broken.skills.local]]
+source = '/nonexistent/path/to/worker/skills'
+"#;
+        let config = aura_config::Config::parse_toml(config_str).expect("config should parse");
+        let err = RigBuilder::new(config)
+            .discovered_agent_config()
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }
