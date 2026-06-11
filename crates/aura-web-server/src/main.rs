@@ -1,5 +1,8 @@
 use a2a_server::StaticAgentCard;
 use aura_config::load_config;
+use aura_telemetry::bootstrap::{build_config_from_env_and_file, startup_log_line};
+use aura_telemetry::events::ServerStarted;
+use aura_telemetry::properties::Source;
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -225,6 +228,44 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
+    // Resolve telemetry config from environment + the first config's
+    // `memory_dir` (used as the inspection-log root when set). One
+    // `info!` line on startup names the active state or the disable
+    // reason, which mirrors the user-facing contract in
+    // `docs/telemetry.md` and satisfies the spec's
+    // "the recorded disable_reason must reflect user intent" rule.
+    // `effective_memory_dir()` honors the legacy
+    // `[orchestration.artifacts].memory_dir` fallback so older configs
+    // land their telemetry inspection log under the same root they
+    // already use for scratchpad / orchestration artifacts.
+    let telemetry_memory_dir = configs
+        .iter()
+        .find_map(|c| c.effective_memory_dir())
+        .map(std::path::PathBuf::from);
+    // First-config `[telemetry]` wins when multiple TOMLs are loaded.
+    // Operators running a multi-agent fleet should colocate the
+    // telemetry block in their primary config; cross-config disagreement
+    // is exotic enough to leave undefined.
+    let telemetry_file_cfg = configs.iter().find_map(|c| c.telemetry.as_ref());
+    let telemetry_config = build_config_from_env_and_file(
+        Source::WebServer,
+        telemetry_memory_dir.as_deref(),
+        telemetry_file_cfg,
+    );
+    // The server is non-interactive — it never presents a notice, so its
+    // state is `Unknown` (held, inspectable but unsent) unless an operator
+    // explicitly opted in via `[telemetry] enabled = true` /
+    // `AURA_TELEMETRY_ENABLED=true`, or an Enabled CLI propagates consent
+    // over the wire (see `handlers::chat_completions`).
+    info!("{}", startup_log_line(&telemetry_config.state));
+    let telemetry = aura_telemetry::init(telemetry_config);
+    // `capture_payload` routes Unknown/Disabled to the inspection log
+    // only, so this is safe to call unconditionally: an Unknown server
+    // holds `server_started` and sends it nowhere until enabled.
+    telemetry.capture(ServerStarted {
+        default_agent_set: args.default_agent.is_some(),
+    });
+
     let configs_arc = Arc::new(configs);
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
@@ -248,6 +289,7 @@ async fn run() -> std::io::Result<()> {
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
+        telemetry: telemetry.clone(),
     });
 
     info!(
@@ -259,6 +301,10 @@ async fn run() -> std::io::Result<()> {
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        // Telemetry self-inspection endpoint. The handler rejects
+        // non-loopback peers with 403; see `handlers::telemetry_recent`
+        // for the contract.
+        .route("/telemetry/recent", get(handlers::telemetry_recent))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
@@ -339,9 +385,27 @@ async fn run() -> std::io::Result<()> {
         }
     });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            shutdown_rx.await.ok();
-        })
-        .await
+    // `into_make_service_with_connect_info::<SocketAddr>()` makes
+    // axum extract the peer's TCP address for handlers that ask for
+    // `ConnectInfo<SocketAddr>` — which is how
+    // `handlers::telemetry_recent` enforces "localhost-only" as
+    // documented in `docs/telemetry.md`.
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        shutdown_rx.await.ok();
+    })
+    .await;
+
+    // Drain telemetry after the HTTP listener has stopped so any events
+    // captured during the grace period (last-second tool calls, in-
+    // flight stream completion) make it onto the wire before exit.
+    // 2-second budget mirrors the spec's "telemetry must never block
+    // core SRE behavior" rule — if the network sink is hanging we move
+    // on.
+    telemetry.shutdown(std::time::Duration::from_secs(2)).await;
+
+    serve_result
 }

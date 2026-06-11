@@ -3,6 +3,8 @@ members = [
     "crates/aura",
     "crates/aura-config",
     "crates/aura-events",
+    "crates/aura-telemetry",
+    "crates/aura-telemetry-derive",
     "crates/aura-web-server",
     "crates/aura-test-utils",
     "crates/aura-cli",
@@ -11,6 +13,8 @@ default-members = [
     "crates/aura",
     "crates/aura-config",
     "crates/aura-events",
+    "crates/aura-telemetry",
+    "crates/aura-telemetry-derive",
     "crates/aura-web-server",
     "crates/aura-test-utils",
 ]

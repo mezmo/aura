@@ -55,6 +55,12 @@ services:
       OTEL_RECORD_CONTENT: "true"
     volumes:
       - ./config.toml:/app/config/config.toml:ro
+      # Persists orchestration artifacts and the anonymous telemetry
+      # install-id (+ inspection log) across restarts and image pulls,
+      # keeping the install count stable. Matches
+      # `[orchestration.artifacts] memory_dir = "/tmp/aura-orchestration"`
+      # in config.toml. See docs/telemetry.md.
+      - aura-state:/tmp/aura-orchestration
     depends_on:
       math-mcp:
         condition: service_healthy
@@ -123,3 +129,4 @@ networks:
 
 volumes:
   mongodb-data:
+  aura-state:

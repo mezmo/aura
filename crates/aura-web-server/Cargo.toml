@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 aura = { path = "../aura" }
 aura-config = { path = "../aura-config" }
+aura-telemetry = { path = "../aura-telemetry" }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["trace", "timeout"] }
 bytes = "1"
@@ -77,4 +78,6 @@ rig-core = { workspace = true }
 futures-util = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 aura-test-utils = { path = "../aura-test-utils" }
+tempfile = "3"
+chrono = "0.4"
 aura-events = { path = "../aura-events" }

@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `PropertyValue: IntoTelemetryProperty` is not satisfied
+  --> tests/compile_fail/property_value_field.rs:16:10
+   |
+16 | #[derive(Event)]
+   |          ^^^^^ the trait `IntoTelemetryProperty` is not implemented for `PropertyValue`
+   |
+   = help: the following other types implement trait `IntoTelemetryProperty`:
+             &'static str
+             aura_telemetry::properties::DeploymentMethod
+             aura_telemetry::properties::OsFamily
+             aura_telemetry::properties::SessionUuid
+             aura_telemetry::properties::Source
+             bool
+   = note: this error originates in the derive macro `Event` (in Nightly builds, run with -Z macro-backtrace for more info)

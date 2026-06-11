@@ -71,6 +71,390 @@ pub(crate) fn handle_help() {
     redraw_input_frame();
 }
 
+/// Handle the `/telemetry` command: `status` prints whether telemetry is
+/// active and the disable reason if not; `recent [N]` prints the last
+/// `N` records from the local inspection log (default 20). The user-
+/// facing contract these commands satisfy is documented in
+/// `docs/telemetry.md`.
+///
+/// Formatting lives in [`format_telemetry_status`] and
+/// [`format_telemetry_recent`] so unit tests can lock the output
+/// shape — terminal side-effects (`println!`, redraw) are confined to
+/// this entry point.
+/// Default count for `/telemetry recent` when no `[N]` is supplied.
+const TELEMETRY_RECENT_DEFAULT: usize = 20;
+
+/// Parsed `/telemetry` subcommand. Keeping this an enum (rather than
+/// matching bare strings at the call site) means adding a subcommand is
+/// a compile-checked change in one place, and the `Unknown` arm renders
+/// a consistent help string.
+enum TelemetrySubcommand {
+    Status,
+    Recent(usize),
+    Enable,
+    Disable,
+    Unknown(String),
+}
+
+impl TelemetrySubcommand {
+    fn parse(arg: &str) -> Self {
+        let mut parts = arg.split_whitespace();
+        match parts.next() {
+            None | Some("status") => Self::Status,
+            Some("recent") => {
+                let n = parts
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(TELEMETRY_RECENT_DEFAULT);
+                Self::Recent(n)
+            }
+            Some("enable") => Self::Enable,
+            Some("disable") => Self::Disable,
+            Some(other) => Self::Unknown(other.to_string()),
+        }
+    }
+}
+
+pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryHandle) {
+    let body = match TelemetrySubcommand::parse(arg) {
+        TelemetrySubcommand::Status => format_telemetry_status(telemetry),
+        TelemetrySubcommand::Recent(n) => format_telemetry_recent(telemetry, n),
+        TelemetrySubcommand::Enable => {
+            // Flip the in-memory state for this session (Unknown → Enabled,
+            // or resume a runtime opt-out; held if a startup kill switch
+            // left no sink), then persist the preference for next launch.
+            let outcome = telemetry.enable();
+            let persisted = crate::config::save_telemetry_enabled_to_global_cli_toml(true);
+            format_telemetry_enable_result(outcome, persisted, telemetry)
+        }
+        TelemetrySubcommand::Disable => {
+            telemetry.set_disabled(aura_telemetry::DisableReason::AuraDisabled);
+            format_telemetry_disable_result(
+                crate::config::save_telemetry_enabled_to_global_cli_toml(false),
+            )
+        }
+        TelemetrySubcommand::Unknown(other) => format!(
+            "Unknown /telemetry subcommand: {other}\n\
+             Available: status, recent [N], enable, disable"
+        ),
+    };
+    println!("{body}");
+    redraw_input_frame();
+}
+
+pub(crate) fn format_telemetry_enable_result(
+    outcome: aura_telemetry::EnableOutcome,
+    persisted: std::result::Result<(), crate::config::TelemetryDisableError>,
+    telemetry: &aura_telemetry::TelemetryHandle,
+) -> String {
+    use aura_telemetry::EnableOutcome;
+    match outcome {
+        EnableOutcome::Enabled | EnableOutcome::AlreadyEnabled => match persisted {
+            Ok(()) => "telemetry: enabled for this session and persisted [telemetry] \
+                       enabled = true in ~/.aura/cli.toml. Disable any time with \
+                       /telemetry disable or DO_NOT_TRACK=1."
+                .to_string(),
+            Err(e) => format!(
+                "telemetry: enabled for this session, but the preference could not be \
+                 persisted: {e}"
+            ),
+        },
+        // A startup kill switch (DO_NOT_TRACK / config `enabled = false`)
+        // is holding telemetry off; enabling at runtime cannot resurrect
+        // it. Be honest that it stays off this session, and name the
+        // reason so the user knows what to clear.
+        EnableOutcome::HeldUntilRestart => {
+            let reason = match telemetry.state() {
+                aura_telemetry::TelemetryState::Disabled(r) => {
+                    aura_telemetry::inspection_log::disable_reason_label(&r)
+                }
+                _ => "disabled".to_string(),
+            };
+            match persisted {
+                Ok(()) => format!(
+                    "telemetry: preference saved ([telemetry] enabled = true in \
+                     ~/.aura/cli.toml), but it stays disabled for this session \
+                     ({reason}). It takes effect on the next launch, once that kill \
+                     switch is cleared."
+                ),
+                Err(e) => format!(
+                    "telemetry stays disabled for this session ({reason}), and the \
+                     preference could not be persisted either: {e}"
+                ),
+            }
+        }
+    }
+}
+
+pub(crate) fn format_telemetry_disable_result(
+    result: std::result::Result<(), crate::config::TelemetryDisableError>,
+) -> String {
+    match result {
+        Ok(()) => "telemetry: persisted [telemetry] enabled = false in ~/.aura/cli.toml. \
+                   The change takes effect on the next launch. Re-enable by removing \
+                   the line, or set `enabled = true`."
+            .to_string(),
+        // Writing cli.toml can fail in a read-only container or where
+        // ~/.aura is not writable. Point the user at the env-var kill
+        // switches, which need no filesystem access and take effect on
+        // the next launch.
+        Err(e) => format!(
+            "could not persist /telemetry disable: {e}\n\
+             In a read-only or sandboxed environment, set DO_NOT_TRACK=1 or \
+             AURA_TELEMETRY_DISABLED=1 instead — no file write required."
+        ),
+    }
+}
+
+pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandle) -> String {
+    use aura_telemetry::TelemetryState;
+    use aura_telemetry::inspection_log::disable_reason_label;
+    let state = match telemetry.state() {
+        TelemetryState::Unknown => "unknown (held — awaiting notice or enable)".to_string(),
+        TelemetryState::Enabled => "active".to_string(),
+        TelemetryState::Disabled(r) => format!("disabled ({})", disable_reason_label(&r)),
+    };
+    let mut out = String::new();
+    out.push_str(&format!("telemetry: {state}\n"));
+    out.push_str(&format!("endpoint: {}\n", telemetry.endpoint()));
+    out.push_str(&format!(
+        "install-id path: {}\n",
+        telemetry
+            .install_id_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unset)".to_string())
+    ));
+    out.push_str(&format!(
+        "inspection log: {}\n",
+        telemetry
+            .inspection_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(disabled — AURA_TELEMETRY_LOG_EVENTS=0)".to_string())
+    ));
+    out.push_str(&format!("session id: {}\n", telemetry.session_id()));
+    out.push_str(&format!(
+        "dropped (channel-full): {}\n",
+        telemetry.dropped_count()
+    ));
+    out.push_str("see docs/telemetry.md for kill switches and the full event table.");
+    out
+}
+
+pub(crate) fn format_telemetry_recent(
+    telemetry: &aura_telemetry::TelemetryHandle,
+    n: usize,
+) -> String {
+    let Some(log) = telemetry.inspection_log() else {
+        return "inspection log is disabled (AURA_TELEMETRY_LOG_EVENTS=0).".to_string();
+    };
+    match log.recent(n) {
+        Ok(events) if events.is_empty() => "no telemetry events recorded yet.".to_string(),
+        Ok(events) => {
+            use std::fmt::Write as _;
+            let mut out = format!("last {} event(s):", events.len());
+            for evt in events {
+                let _ = write!(
+                    out,
+                    "\n  {}  {}  ",
+                    evt.ts.format("%Y-%m-%dT%H:%M:%SZ"),
+                    evt.event,
+                );
+                match (evt.sent, evt.not_sent_reason) {
+                    (true, _) => out.push_str("[sent]"),
+                    (false, Some(r)) => {
+                        let _ = write!(out, "[not sent — {r}]");
+                    }
+                    (false, None) => out.push_str("[not sent]"),
+                }
+            }
+            out
+        }
+        Err(e) => format!("could not read inspection log: {e}"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod telemetry_command_tests {
+    use super::*;
+    use aura_telemetry::events::ServerStarted;
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryState};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    struct TestHandle {
+        handle: aura_telemetry::TelemetryHandle,
+        _dir: TempDir,
+    }
+
+    fn build(state: TelemetryState) -> TestHandle {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let install_path = dir.path().join("install-id");
+        let cfg = TelemetryConfig {
+            endpoint: "http://127.0.0.1:1/no-such-host".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::new_v4(),
+            install_id_path: Some(install_path),
+            session_id: Uuid::new_v4(),
+            source: Source::Cli,
+            os_family: OsFamily::current(),
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: Some(log_path),
+            state,
+            channel_capacity: 16,
+            batch_size: 8,
+            flush_interval: Duration::from_secs(60),
+            post_timeout: Duration::from_millis(500),
+            http_client: None,
+        };
+        TestHandle {
+            handle: aura_telemetry::init(cfg),
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_active_mentions_session_and_docs_link() {
+        let h = build(TelemetryState::Enabled);
+        let out = format_telemetry_status(&h.handle);
+        assert!(out.starts_with("telemetry: active\n"), "got: {out}");
+        assert!(out.contains("dropped (channel-full): 0"));
+        assert!(out.contains("session id: "));
+        assert!(out.contains("docs/telemetry.md"));
+    }
+
+    #[tokio::test]
+    async fn status_includes_endpoint_install_id_path_and_log_path() {
+        let h = build(TelemetryState::Enabled);
+        let out = format_telemetry_status(&h.handle);
+        assert!(
+            out.contains("endpoint: http://127.0.0.1:1/no-such-host"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("install-id path: ") && out.contains("install-id"),
+            "expected install-id path line, got: {out}"
+        );
+        assert!(
+            out.contains("inspection log: ") && out.contains("events.jsonl"),
+            "expected inspection log line, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_disabled_names_kill_switch() {
+        let h = build(TelemetryState::Disabled(DisableReason::DoNotTrack));
+        let out = format_telemetry_status(&h.handle);
+        assert!(out.contains("telemetry: disabled (DoNotTrack)"));
+    }
+
+    #[tokio::test]
+    async fn recent_empty_message() {
+        let h = build(TelemetryState::Enabled);
+        let out = format_telemetry_recent(&h.handle, 10);
+        assert_eq!(out, "no telemetry events recorded yet.");
+    }
+
+    #[tokio::test]
+    async fn recent_lists_captured_events_with_sent_marker() {
+        // The active path now writes the inspection-log row from the
+        // background task after the POST result is known, so calling
+        // `capture` then immediately reading would race. The
+        // formatter itself is what we want to lock in here — given an
+        // InspectedEvent with `sent: true`, it renders `[sent]`. We
+        // assert that directly by appending the synthetic row.
+        let h = build(TelemetryState::Enabled);
+        let log = h
+            .handle
+            .inspection_log()
+            .expect("inspection log present in fixture");
+        log.append(&aura_telemetry::inspection_log::InspectedEvent {
+            ts: chrono::Utc::now(),
+            event: "server_started".into(),
+            properties: serde_json::json!({"aura_source": "cli"}),
+            sent: true,
+            not_sent_reason: None,
+        })
+        .unwrap();
+        let out = format_telemetry_recent(&h.handle, 5);
+        assert!(out.starts_with("last 1 event(s):"), "got: {out}");
+        assert!(out.contains("server_started"));
+        assert!(out.contains("[sent]"));
+    }
+
+    #[tokio::test]
+    async fn recent_disabled_run_marks_not_sent_with_reason() {
+        let h = build(TelemetryState::Disabled(DisableReason::DoNotTrack));
+        h.handle.capture(ServerStarted {
+            default_agent_set: false,
+        });
+        let out = format_telemetry_recent(&h.handle, 5);
+        // First line is the synthetic telemetry_opt_out, second is the
+        // captured event. Both must show the kill-switch reason.
+        assert!(out.contains("telemetry_opt_out"));
+        assert!(out.contains("server_started"));
+        assert!(out.contains("[not sent — DoNotTrack]"));
+    }
+
+    #[test]
+    fn disable_success_message_explains_next_step() {
+        let out = format_telemetry_disable_result(Ok(()));
+        assert!(out.contains("[telemetry] enabled = false"));
+        assert!(out.contains("~/.aura/cli.toml"));
+        assert!(out.contains("next launch"));
+    }
+
+    #[test]
+    fn disable_failure_message_surfaces_error() {
+        let err = crate::config::TelemetryDisableError::Write {
+            path: std::path::PathBuf::from("/ro/.aura/cli.toml"),
+            source: std::io::Error::new(std::io::ErrorKind::ReadOnlyFilesystem, "read-only"),
+        };
+        let out = format_telemetry_disable_result(Err(err));
+        assert!(out.contains("could not persist"));
+        // The typed error's Display surfaces the offending path + cause.
+        assert!(out.contains("/ro/.aura/cli.toml"));
+        assert!(out.contains("read-only"));
+        // Read-only / sandboxed environments can't write cli.toml; the
+        // message must point at the no-filesystem env-var fallback.
+        assert!(out.contains("DO_NOT_TRACK") || out.contains("AURA_TELEMETRY_DISABLED"));
+    }
+
+    /// From Unknown, `/telemetry enable` actually enables for the session
+    /// and says so.
+    #[tokio::test]
+    async fn enable_result_reports_success_from_unknown() {
+        let h = build(TelemetryState::Unknown);
+        let outcome = h.handle.enable();
+        let out = format_telemetry_enable_result(outcome, Ok(()), &h.handle);
+        assert!(out.contains("enabled for this session"), "got: {out}");
+        assert!(out.contains("enabled = true"));
+    }
+
+    /// When a startup kill switch holds telemetry off, `/telemetry enable`
+    /// must NOT claim it is active now — it reports the preference was
+    /// saved but the session stays disabled, naming the reason.
+    #[tokio::test]
+    async fn enable_result_is_honest_when_held_by_kill_switch() {
+        let h = build(TelemetryState::Disabled(DisableReason::DoNotTrack));
+        let outcome = h.handle.enable();
+        assert_eq!(outcome, aura_telemetry::EnableOutcome::HeldUntilRestart);
+        let out = format_telemetry_enable_result(outcome, Ok(()), &h.handle);
+        assert!(
+            out.contains("stays disabled for this session"),
+            "must not falsely claim success; got: {out}"
+        );
+        assert!(
+            out.contains("DoNotTrack"),
+            "should name the reason; got: {out}"
+        );
+    }
+}
+
 /// Handle the `/expand` command: toggle expanded output and replay the event log.
 pub(crate) fn handle_expand(
     conversation: &ConversationHistory,
