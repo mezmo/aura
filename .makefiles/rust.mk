@@ -111,6 +111,7 @@ build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release b
 .PHONY: build-release-binaries
 build-release-binaries: ## Build release binaries for all platforms
 	$(MAKE) -j2 build-release-binary-amd64 build-release-binary-arm64
+	cd $(DIST_DIR) && sha256sum aura-* > checksums.txt
 
 clean:: clean-dist
 
