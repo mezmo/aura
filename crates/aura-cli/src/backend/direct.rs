@@ -45,6 +45,25 @@ fn additional_tools_factory() -> Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + S
     Arc::new(Vec::new)
 }
 
+/// Whether the loaded agent configs assert a telemetry kill switch.
+///
+/// Folds the `[telemetry]` blocks across every loaded config through the
+/// shared kill-switch merge and reports `true` when the result is
+/// `enabled = false`. The agent TOML can only **disable** telemetry —
+/// never force-enable it — because CLI consent is a per-user decision
+/// (cli.toml + the first-run notice), whereas an `enabled = false` in a
+/// config the operator ships is an explicit opt-out that the web server
+/// already honors. Honoring it here keeps `aura-web-server` and
+/// `aura-cli --standalone` consistent for the same config file.
+fn agent_configs_disable_telemetry(configs: &[aura_config::Config]) -> bool {
+    configs
+        .iter()
+        .filter_map(|c| c.telemetry.clone())
+        .reduce(|base, over| base.merged_over(over))
+        .and_then(|t| t.enabled)
+        == Some(false)
+}
+
 /// Direct backend — holds AppState with loaded configs and CLI tool factory.
 pub struct DirectBackend {
     app_state: Arc<AppState>,
@@ -67,6 +86,16 @@ impl DirectBackend {
             aura_config::load_config(config_path).context("Failed to load agent config")?;
         if configs.is_empty() {
             anyhow::bail!("No agent config found in {}", config_path);
+        }
+
+        // Apply the agent config's telemetry kill switch. The handle was
+        // built from cli.toml + env before the agent config was loaded;
+        // an `[telemetry] enabled = false` in the agent TOML is an
+        // explicit operator opt-out that the web server honors, so the
+        // standalone CLI must honor it too rather than send for the same
+        // config file. Disable-only: never force-enable from the config.
+        if agent_configs_disable_telemetry(&configs) {
+            telemetry.set_disabled(aura_telemetry::DisableReason::ConfigDisabled);
         }
 
         let app_state = Arc::new(AppState {
@@ -460,6 +489,46 @@ mod tests {
         config.agent.alias = alias.map(|a| a.to_string());
         config.agent.system_prompt = system_prompt.to_string();
         config
+    }
+
+    fn config_with_telemetry(enabled: Option<bool>) -> aura_config::Config {
+        let mut config = make_config("Agent", None, "prompt");
+        config.telemetry = Some(aura_telemetry::FileTelemetryConfig {
+            enabled,
+            ..Default::default()
+        });
+        config
+    }
+
+    // -----------------------------------------------------------------------
+    // agent_configs_disable_telemetry (standalone config kill switch)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_enabled_false_disables() {
+        let configs = vec![config_with_telemetry(Some(false))];
+        assert!(agent_configs_disable_telemetry(&configs));
+    }
+
+    #[test]
+    fn config_enabled_false_in_any_config_wins() {
+        let configs = vec![
+            config_with_telemetry(Some(true)),
+            config_with_telemetry(Some(false)),
+        ];
+        assert!(
+            agent_configs_disable_telemetry(&configs),
+            "a disable in any loaded config must win, regardless of order"
+        );
+    }
+
+    #[test]
+    fn config_enabled_true_or_silent_does_not_disable() {
+        // The agent TOML can only disable; enabled=true / no block must
+        // not assert a kill switch (CLI consent is per-user).
+        assert!(!agent_configs_disable_telemetry(&[config_with_telemetry(Some(true))]));
+        assert!(!agent_configs_disable_telemetry(&[config_with_telemetry(None)]));
+        assert!(!agent_configs_disable_telemetry(&[make_config("A", None, "p")]));
     }
 
     // -----------------------------------------------------------------------
