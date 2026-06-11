@@ -6,7 +6,7 @@
 
 The `[llm]` TOML section has been moved from the top level to `[agent.llm]`. LLM configuration is now a property of the agent, not a sibling of it. This unlocks **per-worker LLM overrides** in orchestration mode: each `[orchestration.worker.<name>]` may declare its own `[orchestration.worker.<name>.llm]` to run a different model (or a different provider) than the coordinator, inheriting `[agent.llm]` when omitted.
 
-**NOTE: CONFIGS THAT HAVE NOT BEEN UPDATED WILL FAIL TO PARSE AND THE APP WILL FAIL TO START.** The loader detects a top-level `[llm]` table and emits a migration error pointing to this document. See [Startup Errors](#startup-errors).
+**Update your configs to use `[agent.llm]`.** A temporary auto-migration fallback will move a top-level `[llm]` into `[agent.llm]` at load time and log a deprecation warning, so existing deployments (e.g. auto-updating containers) continue to start. **This fallback will be removed in a future release.** Ambiguous configs (both `[llm]` and `[agent.llm]` present, or `[llm]` without an `[agent]` section) still produce a hard error. See [Startup Behavior](#startup-behavior).
 
 ---
 
@@ -153,22 +153,32 @@ The worker's resolved `context_window` is what the runtime reports in `aura.sess
 
 ---
 
-## Startup Errors
+## Startup Behavior
 
-### Top-level `[llm]` is no longer accepted
+### Auto-migration (temporary fallback)
 
-The loader performs a pre-parse check before deserialization. If it sees a top-level `[llm]` table it fails with:
+The loader runs a pre-parse pass before deserialization. If it finds a top-level `[llm]` table **and** an `[agent]` section **without** an existing `[agent.llm]`, it moves the entire `[llm]` value (including nested tables like `[llm.additional_params]`) into `[agent.llm]` and logs:
 
 ```
-Configuration uses the legacy top-level [llm] table. Move it under
-[agent.llm] (and any [llm.additional_params] under
-[agent.llm.additional_params]). Workers may optionally override the
-LLM via [orchestration.worker.<name>.llm].
+DEPRECATED CONFIG: top-level [llm] was auto-migrated to [agent.llm].
+Please update your TOML to use [agent.llm] directly — this fallback
+will be removed in a future release.
 ```
+
+This keeps pre-existing deployments running after an image update, but **you should update your config files**. The fallback will be removed in a future release.
+
+### Hard errors
+
+The following cases still produce a startup error:
+
+| Condition | Error |
+| --- | --- |
+| Both `[llm]` and `[agent.llm]` present | *"Configuration contains both a top-level [llm] table and [agent.llm]. Remove the top-level [llm] table and keep only [agent.llm]."* |
+| `[llm]` without an `[agent]` section | *"Configuration contains a top-level [llm] table but no [agent] section."* |
 
 ### `deny_unknown_fields` remains
 
-`aura_config::config::AgentConfig` and `aura::config::LlmConfig` still carry `#[serde(deny_unknown_fields)]`. Any stray field in `[agent]` or `[agent.llm]` (including the fields that were moved out of `[agent]` in the 10 April 2026 migration) still produces a hard parse error.
+`aura_config::config::AgentConfig` and `aura::config::LlmConfig` still carry `#[serde(deny_unknown_fields)]`. Any stray field in `[agent]` or `[agent.llm]` (including the fields that were moved out of `[agent]` in the 10 April 2026 migration) still produces a hard parse error. Note that the top-level `Config` struct does **not** use `deny_unknown_fields` — that is why the migration function exists (without it a stale `[llm]` would be silently dropped).
 
 ### Worker LLM fields
 
