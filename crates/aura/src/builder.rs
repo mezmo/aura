@@ -8,7 +8,7 @@ use crate::{
         StreamedAssistantContent,
     },
     scratchpad,
-    skill_tool::LoadSkillTool,
+    skill_tool::{SkillToolset, render_skill_catalog},
     tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
@@ -365,13 +365,8 @@ impl Agent {
 
         // Build effective system prompt, appending skill catalog if skills are configured
         let mut system_prompt = config.effective_preamble().to_string();
-        if !config.agent.skills.is_empty() {
-            system_prompt.push_str(
-                "\n\nAvailable skills (use the `load_skill` tool to load before answering):\n",
-            );
-            for skill in &config.agent.skills {
-                system_prompt.push_str(&format!("- {}: {}\n", skill.name, skill.description));
-            }
+        if let Some(catalog) = render_skill_catalog(&config.agent.skills) {
+            system_prompt.push_str(&catalog);
         }
 
         // Build provider-specific agent with tools
@@ -962,13 +957,15 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        // Add skill loading tool if skills are configured
-        if !config.agent.skills.is_empty() {
+        // Add skill tools if skills are configured
+        if let Some(toolset) = SkillToolset::new(&config.agent.skills) {
             tracing::info!(
-                "Adding load_skill tool with {} skills",
+                "Adding skill tools (load_skill, read_skill_file) with {} skills",
                 config.agent.skills.len(),
             );
-            builder_state = builder_state.add_tool(LoadSkillTool::new(&config.agent.skills));
+            builder_state = builder_state
+                .add_tool(toolset.load)
+                .add_tool(toolset.read_file);
         }
 
         Ok(builder_state)
