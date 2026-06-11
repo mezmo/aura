@@ -54,13 +54,14 @@ It renders the coordinator's plan and worker activity as the response streams.
 curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-The script downloads pre-built binaries for your platform, verifies checksums, and installs to `~/.local/bin`. Customize with environment variables:
+The script downloads pre-built binaries for your platform, verifies checksums when available, and installs to `~/.local/bin`. Customize with environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AURA_VERSION` | `latest` | Version to install (e.g. `1.2.0`) |
 | `AURA_INSTALL` | `~/.local/bin` | Install directory |
 | `AURA_COMPONENT` | `all` | Which binaries: `all`, `server`, or `cli` |
+| `AURA_CHECKSUMS` | — | Path to a local checksums file for verification |
 
 Install only the CLI to a custom directory:
 
