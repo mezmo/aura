@@ -73,9 +73,40 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
+/// Hot-reloadable agent roster.
+///
+/// Every request takes one [`snapshot`](Self::snapshot) and works against
+/// that immutable `Arc<Vec<Config>>` for its whole lifetime; in-flight
+/// streams keep the roster they started with alive until they finish.
+/// [`replace`](Self::replace) swaps the roster for subsequent requests —
+/// used by the bootstrap agent's hot reload after a config write. Writes
+/// are rare (human-driven), so a plain `RwLock` around the `Arc` is plenty.
+pub struct ConfigRegistry {
+    inner: std::sync::RwLock<Arc<Vec<aura_config::Config>>>,
+}
+
+impl ConfigRegistry {
+    pub fn new(configs: Vec<aura_config::Config>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(Arc::new(configs)),
+        }
+    }
+
+    /// The current roster. Brief read lock, then lock-free access.
+    pub fn snapshot(&self) -> Arc<Vec<aura_config::Config>> {
+        self.inner.read().expect("config registry poisoned").clone()
+    }
+
+    /// Swap in a new roster; requests already holding a snapshot are
+    /// unaffected.
+    pub fn replace(&self, configs: Vec<aura_config::Config>) {
+        *self.inner.write().expect("config registry poisoned") = Arc::new(configs);
+    }
+}
+
 /// Application state
 pub struct AppState {
-    pub configs: Arc<Vec<aura_config::Config>>,
+    pub configs: Arc<ConfigRegistry>,
     pub tool_result_mode: ToolResultMode,
     /// Maximum length for tool results (0 = no truncation)
     pub tool_result_max_length: usize,
@@ -321,6 +352,24 @@ pub struct ErrorDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_registry_snapshot_is_isolated_from_replace() {
+        let mut first = aura_config::Config::default();
+        first.agent.name = "first".to_string();
+        let mut second = aura_config::Config::default();
+        second.agent.name = "second".to_string();
+
+        let registry = ConfigRegistry::new(vec![first]);
+        let before = registry.snapshot();
+
+        registry.replace(vec![second]);
+
+        // The pre-replace snapshot still sees the old roster; new snapshots
+        // see the new one.
+        assert_eq!(before[0].agent.name, "first");
+        assert_eq!(registry.snapshot()[0].agent.name, "second");
+    }
 
     #[tokio::test]
     async fn test_active_request_tracker_immediate_drain() {

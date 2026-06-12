@@ -47,17 +47,16 @@ impl AuraAgentExecutor {
     }
 
     fn resolve_config(&self) -> Option<aura_config::Config> {
+        let configs = self.app_state.configs.snapshot();
         if let Some(ref name) = self.app_state.default_agent
-            && let Some(agent_config) = self
-                .app_state
-                .configs
+            && let Some(agent_config) = configs
                 .iter()
                 .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name)
                 .cloned()
         {
             return Some(agent_config);
         }
-        self.app_state.configs.first().cloned()
+        configs.first().cloned()
     }
 
     /// Build the A2A agent card.

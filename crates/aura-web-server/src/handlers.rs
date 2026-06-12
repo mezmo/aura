@@ -204,13 +204,17 @@ pub async fn prepare_request(
     // assistant `tool_calls` and `role: "tool"` follow-up results).
     let (query, chat_history) = convert_chat_messages(&req.messages, has_client_tools)?;
 
+    // One roster snapshot per request: this request (including any stream it
+    // spawns) works against an immutable view, unaffected by hot reloads.
+    let configs = data.configs.snapshot();
+
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
     // Multi-config servers require the model field to match an alias or agent name.
-    let config = if data.configs.len() == 1 {
-        data.configs[0].clone()
+    let config = if configs.len() == 1 {
+        configs[0].clone()
     } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
-        data.configs
+        configs
             .iter()
             .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
             .cloned()
@@ -864,6 +868,7 @@ pub async fn health() -> Response {
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let models: Vec<serde_json::Value> = state
         .configs
+        .snapshot()
         .iter()
         .map(|config| {
             let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);

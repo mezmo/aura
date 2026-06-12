@@ -64,7 +64,7 @@ impl DirectBackend {
         }
 
         let app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
+            configs: Arc::new(aura_web_server::types::ConfigRegistry::new(configs)),
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
@@ -97,6 +97,7 @@ impl DirectBackend {
     pub fn any_agent_enables_client_tools(&self) -> bool {
         self.app_state
             .configs
+            .snapshot()
             .iter()
             .any(|c| !c.orchestration_enabled() && c.agent.enable_client_tools)
     }
@@ -105,6 +106,7 @@ impl DirectBackend {
     pub(crate) fn model_ids(&self) -> Vec<String> {
         self.app_state
             .configs
+            .snapshot()
             .iter()
             .map(|c| {
                 c.agent
@@ -118,7 +120,7 @@ impl DirectBackend {
 
     /// Whether more than one agent config is loaded.
     pub fn has_multiple_configs(&self) -> bool {
-        self.app_state.configs.len() > 1
+        self.app_state.configs.snapshot().len() > 1
     }
 
     /// Check if `model_name` matches any loaded config's agent.name or agent.alias.
@@ -126,7 +128,7 @@ impl DirectBackend {
     /// Returns the canonical effective ID (alias or name) on match.
     pub fn find_matching_model(&self, model_name: &str) -> Option<String> {
         let lower = model_name.to_lowercase();
-        for config in self.app_state.configs.iter() {
+        for config in self.app_state.configs.snapshot().iter() {
             let effective_id = config
                 .agent
                 .alias
@@ -151,9 +153,10 @@ impl DirectBackend {
 
     /// Get the system prompt from the config matching `model` (or first config if None).
     pub fn get_config_system_prompt(&self, model: Option<&str>) -> Option<String> {
+        let configs = self.app_state.configs.snapshot();
         let config = if let Some(model_name) = model {
             let lower = model_name.to_lowercase();
-            self.app_state.configs.iter().find(|c| {
+            configs.iter().find(|c| {
                 let effective = c
                     .agent
                     .alias
@@ -163,15 +166,14 @@ impl DirectBackend {
                 effective == lower
             })
         } else {
-            self.app_state.configs.first()
+            configs.first()
         };
         config.map(|c| c.agent.system_prompt.clone())
     }
 
     /// Replace the system prompt in the config matching `model` (or first config if None).
-    /// Reconstructs AppState since it holds configs behind Arc.
     pub fn override_system_prompt(&mut self, model: Option<&str>, new_prompt: String) {
-        let mut configs: Vec<_> = (*self.app_state.configs).clone();
+        let mut configs: Vec<_> = (*self.app_state.configs.snapshot()).clone();
         let target = if let Some(model_name) = model {
             let lower = model_name.to_lowercase();
             configs.iter_mut().find(|c| {
@@ -189,23 +191,7 @@ impl DirectBackend {
         if let Some(config) = target {
             config.agent.system_prompt = new_prompt;
         }
-
-        let old = &self.app_state;
-        self.app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
-            tool_result_mode: old.tool_result_mode,
-            tool_result_max_length: old.tool_result_max_length,
-            streaming_buffer_size: old.streaming_buffer_size,
-            aura_custom_events: old.aura_custom_events,
-            aura_emit_reasoning: old.aura_emit_reasoning,
-            streaming_timeout_secs: old.streaming_timeout_secs,
-            first_chunk_timeout_secs: old.first_chunk_timeout_secs,
-            shutdown_token: old.shutdown_token.clone(),
-            stream_shutdown_token: old.stream_shutdown_token.clone(),
-            active_requests: old.active_requests.clone(),
-            default_agent: old.default_agent.clone(),
-            additional_tools: additional_tools_factory(),
-        });
+        self.app_state.configs.replace(configs);
     }
 
     /// Convert CLI messages to web server ChatMessage format, preserving
@@ -396,7 +382,7 @@ mod tests {
     /// Construct a DirectBackend with test configs (no real TOML loading).
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
         let app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
+            configs: Arc::new(aura_web_server::types::ConfigRegistry::new(configs)),
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,

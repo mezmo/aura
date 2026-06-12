@@ -225,7 +225,7 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
-    let configs_arc = Arc::new(configs);
+    let config_registry = Arc::new(types::ConfigRegistry::new(configs));
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
@@ -235,7 +235,7 @@ async fn run() -> std::io::Result<()> {
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
     let app_state = Arc::new(AppState {
-        configs: configs_arc,
+        configs: config_registry,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,
