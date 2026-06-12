@@ -6,38 +6,12 @@
 //! This separation keeps orchestration-specific types isolated from the base
 //! aura streaming infrastructure.
 
-use serde::{Deserialize, Serialize};
-
 /// How the coordinator routed a query that produced a plan.
 ///
-/// Provides a machine-readable signal in `plan_created` SSE events and
-/// `RunManifest` persistence so clients can distinguish single-worker
-/// classification from full orchestration without parsing text fields.
-///
-/// Direct answers and clarifications have their own event types
-/// (`aura.orchestrator.direct_answer`, `aura.orchestrator.clarification_needed`)
-/// and never produce a `PlanCreated` event, so they are not represented here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingMode {
-    /// Coordinator answered directly without task execution.
-    DirectAnswer,
-    /// Coordinator classified query to a single worker.
-    Routed,
-    /// Full orchestration — multi-task DAG execution.
-    Orchestrated,
-}
-
-impl RoutingMode {
-    /// Derive routing mode from the number of tasks in a plan.
-    pub fn for_plan(task_count: usize) -> Self {
-        if task_count == 1 {
-            Self::Routed
-        } else {
-            Self::Orchestrated
-        }
-    }
-}
+/// The type lives in [`aura_events`] (it is part of the SSE wire vocabulary
+/// shared with consumers); re-exported here so internal events and
+/// `RunManifest` persistence keep their existing paths.
+pub use aura_events::orchestration::RoutingMode;
 
 /// Events emitted by the orchestrator during execution.
 ///
