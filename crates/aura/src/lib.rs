@@ -6,6 +6,7 @@
 //! programmatically.
 
 pub mod bedrock_embedding;
+pub mod bootstrap;
 pub mod builder;
 pub mod config;
 pub mod env_flags;

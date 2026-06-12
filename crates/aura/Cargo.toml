@@ -28,9 +28,10 @@ url = "2"
 # Shared event types (lightweight, no agent/MCP deps)
 aura-events = { path = "../aura-events", features = ["rmcp-types"] }
 
-# Serialization (for tool schemas)
+# Serialization (for tool schemas; toml for the bootstrap config tools)
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 # Async
 tokio = { workspace = true }

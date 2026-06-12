@@ -67,6 +67,20 @@ fn check_legacy_top_level_llm(toml_str: &str) -> Result<(), ConfigError> {
 /// - Each config can be serialized and deserialized correctly.
 /// - Each config is uniquely identifiable by alias or name.
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Vec<Config>, ConfigError> {
+    Ok(load_config_with_paths(path)?
+        .into_iter()
+        .map(|(_, config)| config)
+        .collect())
+}
+
+/// [`load_config`], but each config is paired with the file it came from.
+///
+/// Callers that need to know which file declared something (e.g. the
+/// `[bootstrap]` table's write target) use this; everyone else uses
+/// `load_config`.
+pub fn load_config_with_paths<P: AsRef<Path>>(
+    path: P,
+) -> Result<Vec<(std::path::PathBuf, Config)>, ConfigError> {
     let path = path.as_ref();
 
     let configs = if path.is_dir() {
@@ -78,7 +92,7 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Vec<Config>, ConfigError> 
 
         let mut configs = Vec::new();
         for entry in entries {
-            configs.push(load_single_config(entry.path())?);
+            configs.push((entry.path(), load_single_config(entry.path())?));
         }
         if configs.is_empty() {
             return Err(ConfigError::Validation(
@@ -87,10 +101,11 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Vec<Config>, ConfigError> 
         }
         configs
     } else {
-        vec![load_single_config(path)?]
+        vec![(path.to_path_buf(), load_single_config(path)?)]
     };
 
-    validate_unique_identifiers(&configs)?;
+    let bare: Vec<Config> = configs.iter().map(|(_, c)| c.clone()).collect();
+    validate_unique_identifiers(&bare)?;
     Ok(configs)
 }
 
