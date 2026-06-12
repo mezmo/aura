@@ -107,7 +107,8 @@ pub struct WorkerConfig {
 
     /// Per-worker skill sources. Parsed from `[orchestration.worker.<name>.skills]`.
     /// `None` inherits `[agent.skills]`; an explicit empty list disables skills
-    /// for this worker.
+    /// for this worker; a non-empty list replaces the agent's skills entirely
+    /// (no merging).
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
 }

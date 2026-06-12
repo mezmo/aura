@@ -87,7 +87,6 @@ impl RigBuilder {
     fn discovered_agent_config(&self) -> Result<AgentRuntimeConfig, BuilderError> {
         let mut agent_config = self.to_agent_config();
 
-        // Build effective skill sources: explicit config > AURA_SKILLS_DIR env fallback
         let mut skill_sources = self.config.agent.skills.local.clone();
         if skill_sources.is_empty()
             && let Ok(env_dir) = std::env::var("AURA_SKILLS_DIR")
