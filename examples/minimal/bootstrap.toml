@@ -1,0 +1,36 @@
+# Minimal config with the aura-bootstrap agent enabled.
+# This is the shape `aura-cli init` generates: a placeholder assistant plus
+# the token-gated bootstrap agent, which builds out the real configuration
+# conversationally and applies changes without a restart (hot reload).
+#
+# Usage:
+#   export OPENAI_API_KEY="sk-..."
+#   export AURA_BOOTSTRAP_TOKEN="choose-a-token"   # optional — generated and logged otherwise
+#   CONFIG_PATH=examples/minimal/bootstrap.toml cargo run --bin aura-web-server
+#   aura-cli --api-url http://localhost:8080 --model aura-bootstrap --api-key "$AURA_BOOTSTRAP_TOKEN"
+#
+# SECURITY: the token is configuration admin on this server — see the
+# "Bootstrap Agent" section of the top-level README before enabling.
+
+[agent]
+name = "assistant"
+system_prompt = """
+You are a helpful general-purpose assistant.
+
+(This is a placeholder configuration. Chat with the aura-bootstrap
+agent to replace it with a real one, or edit this file directly.)
+"""
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.1"
+
+[bootstrap]
+enabled = true
+
+# Run the bootstrap agent on a different LLM than the placeholder agent:
+# [bootstrap.llm]
+# provider = "openai"
+# api_key = "{{ env.OPENAI_API_KEY }}"
+# model = "gpt-5.1"

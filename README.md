@@ -325,12 +325,46 @@ model_owner = "mezmo"        # override owned_by in /v1/models (defaults to LLM 
 
 Aliases must be unique across all loaded configs. If two configs share the same `name` and neither has an alias, loading fails with a validation error.
 
+### Bootstrap Agent (conversational configuration)
+
+AURA can serve a built-in **`aura-bootstrap`** agent that builds and modifies the server's configuration conversationally — first-time setup and day-2 changes alike. It is **disabled by default** and enabled per config file:
+
+```toml
+[bootstrap]
+enabled = true
+
+# optional: run the bootstrap agent on a different LLM than [agent.llm]
+# [bootstrap.llm]
+# provider = "openai"
+# api_key = "{{ env.OPENAI_API_KEY }}"
+# model = "gpt-5.1"
+```
+
+The fastest way to get a working setup from nothing:
+
+```bash
+aura-cli init                                  # senses API keys, verifies the model live, writes config.toml
+AURA_BOOTSTRAP_TOKEN=<token> CONFIG_PATH=config.toml aura-web-server
+aura-cli --api-url http://localhost:8080 --model aura-bootstrap --api-key <token>
+```
+
+The bootstrap agent interviews you (suggest-first: it proposes a sane setup and asks what to adjust), connects to your MCP servers to verify them and classify their tools, writes the **complete** configuration file — what it writes is exactly what runs, nothing is expanded at load time — and the running server applies it immediately (**hot reload**; in-flight requests finish on the old config). Every write leaves a timestamped backup next to the file.
+
+**Security model — read before enabling:**
+
+- The bootstrap token is **configuration admin on the server**. Anyone holding it can change providers, prompts, and attached MCP servers. Set it via `AURA_BOOTSTRAP_TOKEN`, or let the server generate one and print it to the startup logs (whoever can read the logs is considered authorized). Requests to the bootstrap agent without the token get a 401; the token rides the standard `Authorization: Bearer` header (so `aura-cli --api-key` just works) or `x-aura-bootstrap-token`.
+- Workers the agent creates are **read-only by default** (`read_only = true` on `[orchestration.worker.<name>]`), and the write tool mechanically refuses to allowlist MCP tools annotated as mutating — or tool names it never discovered, or glob patterns — onto read-only workers. Mutating capability requires an explicit operator request.
+- Literal API keys are rejected anywhere in a written config; secrets travel only as `{{ env.VAR }}` references.
+- `stdio` MCP transports in agent-written configs (which spawn processes on the server) are refused unless the server runs with `AURA_BOOTSTRAP_ALLOW_STDIO=true`.
+- `aura-bootstrap` is a reserved name; exactly one config file may enable `[bootstrap]`, and changes to the `[bootstrap]` table itself take effect on restart, not hot reload.
+
 ### Configuration Sections
 
 Configuration sections:
 
 - `[agent]`: identity, system prompt, and runtime behavior.
 - `[agent.llm]`: provider and model configuration for the agent.
+- `[bootstrap]`: the token-gated configuration agent (disabled by default).
 - `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
