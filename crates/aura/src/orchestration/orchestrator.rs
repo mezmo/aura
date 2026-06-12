@@ -2710,7 +2710,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - LlamaIndex's Sub-Question Query Engine
     /// - Anthropic's context engineering principles
     fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
-        build_dependency_context(plan, task_id)
+        build_dependency_context(plan, task_id, self.config.dependency_context_budget())
     }
 
     /// Execute a single task using a worker agent.
@@ -4153,27 +4153,70 @@ fn context_overflow_suggestion(phase: &str) -> String {
 /// the task instructions that follow the context block in the worker prompt.
 /// Returns `None` when no completed ancestor exists.
 ///
+/// `budget` caps the total bytes of injected results. Direct dependencies
+/// always render their full stored result (already bounded by the artifact
+/// threshold). Transitive ancestors render in full, nearest first, until the
+/// budget is reached; all farther ancestors then degrade to a compact
+/// preview (`Task::compact_preview`) that keeps the task header and any
+/// artifact pointer so the worker can still cite lineage.
+///
 /// See mezmo/aura#221 for the missing-context failure mode this addresses.
-fn build_dependency_context(plan: &Plan, task_id: usize) -> Option<String> {
+fn build_dependency_context(plan: &Plan, task_id: usize, budget: usize) -> Option<String> {
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+
     use super::prompt_constants::{context, sections};
 
-    let mut ancestors = plan.transitive_ancestors(task_id);
+    /// Byte cap for each over-budget ancestor entry. Matches the existing
+    /// 500-byte tool-output tier in the artifact system.
+    const DEGRADED_PREVIEW_BYTES: usize = 500;
+
+    let direct: HashSet<usize> = plan
+        .get_task(task_id)
+        .map(|t| t.dependencies.iter().copied().collect())
+        .unwrap_or_default();
+
+    // Nearest-first BFS order decides who keeps full results once the budget
+    // runs out; render order below stays ascending-ID regardless.
+    let bfs_ancestors = plan.transitive_ancestors(task_id);
+    let mut spent = 0usize;
+    let mut over_budget = false;
+    let mut degraded: HashSet<usize> = HashSet::new();
+    for id in &bfs_ancestors {
+        let Some(result) = plan.get_task(*id).and_then(|t| t.state.completed_result()) else {
+            continue;
+        };
+        if direct.contains(id) {
+            spent += result.len();
+        } else if over_budget || spent + result.len() > budget {
+            over_budget = true;
+            degraded.insert(*id);
+            spent += DEGRADED_PREVIEW_BYTES;
+        } else {
+            spent += result.len();
+        }
+    }
+
+    let mut ancestors = bfs_ancestors;
     ancestors.sort_unstable();
 
     ancestors
         .into_iter()
         .filter_map(|ancestor_id| {
-            plan.get_task(ancestor_id)
-                .and_then(|ancestor| match &ancestor.state {
-                    TaskState::Complete { result } => Some(format!(
-                        "{} — Task {} ({}):\n{}",
-                        sections::PRIOR_WORK,
-                        ancestor.id,
-                        ancestor.description,
-                        result
-                    )),
-                    TaskState::Pending | TaskState::Running | TaskState::Failed { .. } => None,
-                })
+            let ancestor = plan.get_task(ancestor_id)?;
+            let result = ancestor.state.completed_result()?;
+            let body: Cow<'_, str> = if degraded.contains(&ancestor_id) {
+                Cow::Owned(ancestor.compact_preview(DEGRADED_PREVIEW_BYTES)?)
+            } else {
+                Cow::Borrowed(result)
+            };
+            Some(format!(
+                "{} — Task {} ({}):\n{}",
+                sections::PRIOR_WORK,
+                ancestor.id,
+                ancestor.description,
+                body
+            ))
         })
         .reduce(|acc, part| acc + context::DEPENDENCY_SEPARATOR + &part)
 }
@@ -4199,7 +4242,7 @@ mod tests {
         plan.get_task_mut(0).unwrap().complete("deploy X at 14:02");
         plan.get_task_mut(1).unwrap().complete("errors start 14:03");
 
-        let ctx = build_dependency_context(&plan, 2).expect("context for task 2");
+        let ctx = build_dependency_context(&plan, 2, 32_000).expect("context for task 2");
         assert!(
             ctx.contains("deploy X at 14:02"),
             "T2 context must include T0's (transitive) result: {ctx}"
@@ -4226,7 +4269,7 @@ mod tests {
         plan.get_task_mut(1).unwrap().complete("left result");
         plan.get_task_mut(2).unwrap().complete("right result");
 
-        let ctx = build_dependency_context(&plan, 3).expect("context for task 3");
+        let ctx = build_dependency_context(&plan, 3, 32_000).expect("context for task 3");
         assert_eq!(
             ctx.matches("root result").count(),
             1,
@@ -4243,7 +4286,7 @@ mod tests {
             .fail("boom", FailureCategory::AgentError);
         plan.get_task_mut(1).unwrap().complete("partial result");
 
-        let ctx = build_dependency_context(&plan, 2).expect("context for task 2");
+        let ctx = build_dependency_context(&plan, 2, 32_000).expect("context for task 2");
         assert!(ctx.contains("partial result"));
         assert!(!ctx.contains("boom"), "failed ancestor must be omitted");
         assert!(!ctx.contains("Task 0"));
@@ -4253,8 +4296,62 @@ mod tests {
     fn test_dependency_context_none_when_no_completed_ancestors() {
         // Pending ancestors only -> None; no dependencies at all -> None
         let plan = three_task_chain();
-        assert!(build_dependency_context(&plan, 2).is_none());
-        assert!(build_dependency_context(&plan, 0).is_none());
+        assert!(build_dependency_context(&plan, 2, 32_000).is_none());
+        assert!(build_dependency_context(&plan, 0, 32_000).is_none());
+    }
+
+    #[test]
+    fn test_dependency_context_respects_budget() {
+        // Chain 0 -> 1 -> 2 -> 3 with 1KB results and a budget that fits the
+        // direct dep (2) plus one transitive ancestor: 0 must degrade.
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Fetch", "r"));
+        plan.add_task(Task::new(1, "Correlate", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Analyze", "r").with_dependency(1));
+        plan.add_task(Task::new(3, "Summarize", "r").with_dependency(2));
+        plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
+        plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
+        plan.get_task_mut(2).unwrap().complete("C".repeat(1000));
+
+        let ctx = build_dependency_context(&plan, 3, 2000).expect("context for task 3");
+        assert!(
+            ctx.contains(&"C".repeat(1000)),
+            "direct dep keeps full result"
+        );
+        assert!(
+            ctx.contains(&"B".repeat(1000)),
+            "nearest transitive ancestor fits the budget"
+        );
+        assert!(
+            !ctx.contains(&"A".repeat(1000)),
+            "farthest ancestor degrades once budget is spent"
+        );
+        assert!(
+            ctx.contains("Task 0 (Fetch)"),
+            "degraded ancestor keeps its lineage header: {ctx}"
+        );
+        assert!(
+            ctx.contains(&"A".repeat(500)),
+            "degraded ancestor keeps a 500-byte preview"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_direct_deps_never_degrade() {
+        // Direct dep result alone exceeds the budget; it still renders fully.
+        let mut plan = three_task_chain();
+        plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
+        plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
+
+        let ctx = build_dependency_context(&plan, 2, 100).expect("context for task 2");
+        assert!(
+            ctx.contains(&"B".repeat(1000)),
+            "direct dependency is budget-exempt"
+        );
+        assert!(
+            !ctx.contains(&"A".repeat(1000)),
+            "transitive ancestor degrades under a tiny budget"
+        );
     }
 
     #[test]
