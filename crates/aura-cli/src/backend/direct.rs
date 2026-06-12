@@ -51,21 +51,124 @@ pub struct DirectBackend {
     extra_headers: HashMap<String, String>,
 }
 
+/// Hot-reload hook for standalone mode: re-load the config path from disk,
+/// swap the roster, and refresh the REPL's `/model` cache so the new agents
+/// are immediately listable.
+fn make_reload_hook(
+    registry: Arc<aura_web_server::types::ConfigRegistry>,
+    config_path: String,
+) -> aura::bootstrap::ReloadHook {
+    Arc::new(move || {
+        let configs = aura_config::load_config(&config_path).map_err(|e| e.to_string())?;
+        let mut names: Vec<String> = configs
+            .iter()
+            .map(|c| {
+                c.agent
+                    .alias
+                    .as_deref()
+                    .unwrap_or(&c.agent.name)
+                    .to_string()
+            })
+            .collect();
+        let count = names.len();
+        registry.replace(configs);
+        names.push(aura::bootstrap::BOOTSTRAP_AGENT_NAME.to_string());
+        let summary = format!(
+            "Hot reload applied; {count} agent(s) now live: {}",
+            names[..count].join(", ")
+        );
+        crate::ui::prompt::seed_model_cache(names);
+        Ok(summary)
+    })
+}
+
 impl DirectBackend {
     /// Load configs and construct AppState, mirroring the web server's startup.
+    ///
+    /// When exactly one loaded config sets `[bootstrap] enabled = true`, the
+    /// aura-bootstrap agent is served alongside the roster — same shared
+    /// `prepare_request` routing as the web server. The token gate is an
+    /// HTTP-layer boundary, so standalone generates a private token and
+    /// presents it to itself on every request: the local operator already
+    /// owns the config file.
     pub async fn from_toml(
         config_path: &str,
         extra_headers: Vec<(String, String)>,
     ) -> Result<Self> {
-        let configs =
-            aura_config::load_config(config_path).context("Failed to load agent config")?;
-        if configs.is_empty() {
+        let config_pairs = aura_config::load_config_with_paths(config_path)
+            .context("Failed to load agent config")?;
+        if config_pairs.is_empty() {
             anyhow::bail!("No agent config found in {}", config_path);
         }
 
+        if let Some((_, config)) = config_pairs.iter().find(|(_, c)| {
+            [Some(c.agent.name.as_str()), c.agent.alias.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|id| id.eq_ignore_ascii_case(aura::bootstrap::BOOTSTRAP_AGENT_NAME))
+        }) {
+            anyhow::bail!(
+                "agent '{}' uses the reserved name '{}'",
+                config.agent.name,
+                aura::bootstrap::BOOTSTRAP_AGENT_NAME
+            );
+        }
+
+        let enablers: Vec<&(std::path::PathBuf, aura_config::Config)> = config_pairs
+            .iter()
+            .filter(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
+            .collect();
+        if enablers.len() > 1 {
+            anyhow::bail!(
+                "[bootstrap] is enabled in more than one config file — enable it in \
+                 exactly one so the bootstrap agent's LLM and write target are unambiguous"
+            );
+        }
+        let bootstrap_declaration = enablers
+            .first()
+            .map(|(path, config)| (path.clone(), config.clone()));
+
+        let configs: Vec<aura_config::Config> =
+            config_pairs.into_iter().map(|(_, config)| config).collect();
+        let roster_names: Vec<String> = configs
+            .iter()
+            .map(|c| {
+                c.agent
+                    .alias
+                    .as_deref()
+                    .unwrap_or(&c.agent.name)
+                    .to_string()
+            })
+            .collect();
+        let registry = Arc::new(aura_web_server::types::ConfigRegistry::new(configs));
+
+        let bootstrap = bootstrap_declaration.map(|(declaring_path, declaring)| {
+            let target = aura::bootstrap::ConfigTarget {
+                config_path: std::path::PathBuf::from(config_path),
+                target: declaring_path,
+            };
+            let reload = make_reload_hook(registry.clone(), config_path.to_string());
+            aura_web_server::types::BootstrapState {
+                agent_config: aura::bootstrap::bootstrap_agent_config(
+                    &declaring,
+                    &target,
+                    &roster_names,
+                ),
+                token: uuid::Uuid::new_v4().to_string(),
+                tools: aura::bootstrap::bootstrap_tools_factory(target, reload),
+            }
+        });
+
+        // Self-present the private token on every request so the shared
+        // routing in `prepare_request` admits bootstrap traffic.
+        let mut headers_map: HashMap<String, String> = extra_headers.into_iter().collect();
+        if let Some(bs) = &bootstrap {
+            headers_map.insert("x-aura-bootstrap-token".to_string(), bs.token.clone());
+        }
+
         let app_state = Arc::new(AppState {
-            configs: Arc::new(aura_web_server::types::ConfigRegistry::new(configs)),
-            bootstrap: None,
+            configs: registry,
+            bootstrap,
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
@@ -79,8 +182,6 @@ impl DirectBackend {
             default_agent: None,
             additional_tools: additional_tools_factory(),
         });
-
-        let headers_map = extra_headers.into_iter().collect();
 
         Ok(Self {
             app_state,
@@ -103,9 +204,11 @@ impl DirectBackend {
             .any(|c| !c.orchestration_enabled() && c.agent.enable_client_tools)
     }
 
-    /// Return the effective model ID for each loaded config.
+    /// Return the effective model ID for each loaded config, plus the
+    /// bootstrap agent when it is enabled.
     pub(crate) fn model_ids(&self) -> Vec<String> {
-        self.app_state
+        let mut ids: Vec<String> = self
+            .app_state
             .configs
             .snapshot()
             .iter()
@@ -116,7 +219,11 @@ impl DirectBackend {
                     .unwrap_or(&c.agent.name)
                     .to_string()
             })
-            .collect()
+            .collect();
+        if self.app_state.bootstrap.is_some() {
+            ids.push(aura::bootstrap::BOOTSTRAP_AGENT_NAME.to_string());
+        }
+        ids
     }
 
     /// Whether more than one agent config is loaded.
@@ -129,6 +236,9 @@ impl DirectBackend {
     /// Returns the canonical effective ID (alias or name) on match.
     pub fn find_matching_model(&self, model_name: &str) -> Option<String> {
         let lower = model_name.to_lowercase();
+        if self.app_state.bootstrap.is_some() && lower == aura::bootstrap::BOOTSTRAP_AGENT_NAME {
+            return Some(aura::bootstrap::BOOTSTRAP_AGENT_NAME.to_string());
+        }
         for config in self.app_state.configs.snapshot().iter() {
             let effective_id = config
                 .agent
@@ -411,6 +521,109 @@ mod tests {
         config.agent.alias = alias.map(|a| a.to_string());
         config.agent.system_prompt = system_prompt.to_string();
         config
+    }
+
+    // -----------------------------------------------------------------------
+    // standalone bootstrap host
+    // -----------------------------------------------------------------------
+
+    /// Complete config (ollama, no env deps) with the bootstrap agent enabled.
+    const BOOTSTRAP_ENABLED: &str = r#"
+[agent]
+name = "assistant"
+system_prompt = "You are helpful."
+
+[agent.llm]
+provider = "ollama"
+model = "qwen3:8b"
+
+[bootstrap]
+enabled = true
+"#;
+
+    #[tokio::test]
+    async fn from_toml_serves_bootstrap_agent_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, BOOTSTRAP_ENABLED).unwrap();
+
+        let backend = DirectBackend::from_toml(path.to_str().unwrap(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.model_ids(),
+            vec!["assistant".to_string(), "aura-bootstrap".to_string()]
+        );
+        assert_eq!(
+            backend.find_matching_model("aura-bootstrap"),
+            Some("aura-bootstrap".to_string())
+        );
+        // The private token is self-presented so shared routing admits it.
+        assert!(backend.extra_headers.contains_key("x-aura-bootstrap-token"));
+    }
+
+    #[tokio::test]
+    async fn from_toml_without_bootstrap_serves_roster_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            BOOTSTRAP_ENABLED.replace("enabled = true", "enabled = false"),
+        )
+        .unwrap();
+
+        let backend = DirectBackend::from_toml(path.to_str().unwrap(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(backend.model_ids(), vec!["assistant".to_string()]);
+        assert_eq!(backend.find_matching_model("aura-bootstrap"), None);
+        assert!(!backend.extra_headers.contains_key("x-aura-bootstrap-token"));
+    }
+
+    #[tokio::test]
+    async fn from_toml_rejects_reserved_agent_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            BOOTSTRAP_ENABLED.replace("name = \"assistant\"", "name = \"aura-bootstrap\""),
+        )
+        .unwrap();
+
+        let err = DirectBackend::from_toml(path.to_str().unwrap(), vec![])
+            .await
+            .err()
+            .expect("expected reserved-name error");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn reload_hook_swaps_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, BOOTSTRAP_ENABLED).unwrap();
+
+        let registry = Arc::new(aura_web_server::types::ConfigRegistry::new(vec![
+            make_config("assistant", None, "old"),
+        ]));
+        let hook = make_reload_hook(registry.clone(), path.to_str().unwrap().to_string());
+
+        std::fs::write(
+            &path,
+            BOOTSTRAP_ENABLED.replace("name = \"assistant\"", "name = \"renamed\""),
+        )
+        .unwrap();
+
+        let summary = hook().expect("reload should succeed");
+        assert!(summary.contains("renamed"), "got: {summary}");
+        assert_eq!(registry.snapshot()[0].agent.name, "renamed");
+
+        // A broken on-disk config reports an error and leaves the roster.
+        std::fs::write(&path, "not [valid").unwrap();
+        assert!(hook().is_err());
+        assert_eq!(registry.snapshot()[0].agent.name, "renamed");
     }
 
     // -----------------------------------------------------------------------
