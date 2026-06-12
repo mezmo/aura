@@ -16,9 +16,13 @@
 //! and, on failure, restore from the backup it just created.
 //!
 //! Safety boundaries enforced here rather than by prompt alone:
-//! - workers marked `read_only = true` may not be assigned MCP tools the
-//!   server annotated as mutating, undiscovered tool names (when discovery
-//!   ran), or glob patterns — most-restrictive-signal-wins;
+//! - workers marked `read_only = true` may only be assigned MCP tools that
+//!   `inspect_mcp_servers` discovered in this conversation and that no
+//!   server annotated as mutating (fail-closed: undiscovered names are
+//!   rejected, and same-named tools on different servers merge
+//!   most-restrictive). Glob and empty filters are rejected earlier by
+//!   config validation, and worker construction re-checks annotations at
+//!   runtime for configs that arrive by other paths;
 //! - literal API keys are rejected; secrets travel only as `{{ env.* }}`
 //!   references and the on-disk file is written from the raw input so they
 //!   stay references;
@@ -155,11 +159,37 @@ pub struct ToolSignal {
 }
 
 impl ToolSignal {
+    /// Extract the annotation signals from a discovered MCP tool.
+    pub fn of_tool(tool: &rmcp::model::Tool) -> Self {
+        Self {
+            read_only: tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            destructive: tool.annotations.as_ref().and_then(|a| a.destructive_hint),
+        }
+    }
+
     /// Whether the server itself declared this tool unsafe for read-only
     /// workers. Annotations are restrictive-only signals: they can bar a
     /// tool from read-only workers, never admit one.
-    fn declared_mutating(&self) -> bool {
+    pub fn declared_mutating(&self) -> bool {
         self.destructive == Some(true) || self.read_only == Some(false)
+    }
+
+    /// Most-restrictive merge for same-named tools discovered on different
+    /// servers: a mutating signal from either side survives, and agreement
+    /// is required for a positive read-only/non-destructive claim.
+    fn merge_most_restrictive(self, other: Self) -> Self {
+        Self {
+            read_only: match (self.read_only, other.read_only) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            },
+            destructive: match (self.destructive, other.destructive) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+        }
     }
 }
 
@@ -405,10 +435,7 @@ impl crate::RigTool for InspectMcpTool {
                         .or_else(|| manager.sse_tools.get(server))
                         .or_else(|| manager.stdio_tools.get(server));
                     for tool in tools.into_iter().flatten() {
-                        let signal = ToolSignal {
-                            read_only: tool.annotations.as_ref().and_then(|a| a.read_only_hint),
-                            destructive: tool.annotations.as_ref().and_then(|a| a.destructive_hint),
-                        };
+                        let signal = ToolSignal::of_tool(tool);
                         let label = if signal.declared_mutating() {
                             "MUTATING (annotated)"
                         } else if signal.read_only == Some(true) {
@@ -424,7 +451,15 @@ impl crate::RigTool for InspectMcpTool {
                             .take(140)
                             .collect();
                         report.push_str(&format!("- {} — {label} — {description}\n", tool.name));
-                        signals.insert(tool.name.to_string(), signal);
+                        // Same-named tools on different servers merge
+                        // most-restrictive: one server's read-only annotation
+                        // must not mask another server's mutating one.
+                        signals
+                            .entry(tool.name.to_string())
+                            .and_modify(|existing| {
+                                *existing = existing.merge_most_restrictive(signal);
+                            })
+                            .or_insert(signal);
                     }
                 }
                 crate::mcp::ConnectionStatus::Failed(err) => {
@@ -517,9 +552,12 @@ impl WriteConfigTool {
 
     /// Mechanical backstop for the LLM's classification: workers declared
     /// `read_only = true` may only list discovered tools that the server did
-    /// not declare mutating. Most-restrictive-signal-wins — the model cannot
-    /// admit a tool the annotations bar, and (when discovery ran) cannot
-    /// invent tool names or smuggle globs into read-only filters.
+    /// not declare mutating. Fails closed — every tool name in a read-only
+    /// worker's filter must have been returned by `inspect_mcp_servers` in
+    /// this conversation, so an empty discovery cache (model skipped
+    /// inspection, or the server restarted since) rejects the write instead
+    /// of waving the filter through. Glob/empty-filter rejection lives in
+    /// config validation (`OrchestrationConfig::validate_read_only_workers`).
     fn enforce_read_only_workers(&self, config: &Config) -> Result<(), String> {
         let signals = self.signals.lock().expect("signal cache poisoned");
         let Some(orch) = config.orchestration.as_ref() else {
@@ -527,13 +565,6 @@ impl WriteConfigTool {
         };
         for (worker_name, worker) in orch.workers.iter().filter(|(_, w)| w.read_only) {
             for entry in &worker.mcp_filter {
-                if entry.contains(['*', '?', '[']) {
-                    return Err(format!(
-                        "worker '{worker_name}' is read_only; its mcp_filter must list \
-                         exact tool names from inspect_mcp_servers, not glob patterns \
-                         (got '{entry}')"
-                    ));
-                }
                 match signals.get(entry) {
                     Some(signal) if signal.declared_mutating() => {
                         return Err(format!(
@@ -542,14 +573,16 @@ impl WriteConfigTool {
                              '{worker_name}'"
                         ));
                     }
-                    None if !signals.is_empty() => {
+                    Some(_) => {}
+                    None => {
                         return Err(format!(
                             "tool '{entry}' (assigned to read_only worker \
-                             '{worker_name}') was not found by inspect_mcp_servers — \
-                             use exact discovered tool names"
+                             '{worker_name}') has not been verified by \
+                             inspect_mcp_servers in this conversation — run \
+                             inspect_mcp_servers first and use exact discovered \
+                             tool names"
                         ));
                     }
-                    _ => {}
                 }
             }
         }
@@ -1211,7 +1244,7 @@ model = "gpt-5.1"
     }
 
     #[tokio::test]
-    async fn backstop_rejects_unknown_tool_when_discovery_ran() {
+    async fn backstop_rejects_undiscovered_tool() {
         let dir = tempfile::tempdir().unwrap();
         let target = target_with(dir.path(), COMPLETE);
         let cache = cache_with(&[("list_pods", READ_ONLY_LIST)]);
@@ -1223,9 +1256,44 @@ model = "gpt-5.1"
             .unwrap();
 
         assert!(
-            result.contains("not found by inspect_mcp_servers"),
+            result.contains("has not been verified by inspect_mcp_servers"),
             "got: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn backstop_fails_closed_when_discovery_never_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = target_with(dir.path(), COMPLETE);
+        // Empty signal cache: inspect_mcp_servers was never called.
+        let tool = write_tool(target);
+
+        let result = tool
+            .call(write_args(&worker_config("list_pods", true)))
+            .await
+            .unwrap();
+
+        assert!(
+            result.contains("has not been verified by inspect_mcp_servers"),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn signal_merge_keeps_mutating_across_servers() {
+        // Server A says mutating, server B says read-only: mutating wins
+        // regardless of discovery order.
+        assert!(MUTATING.merge_most_restrictive(READ_ONLY_LIST).declared_mutating());
+        assert!(READ_ONLY_LIST.merge_most_restrictive(MUTATING).declared_mutating());
+        // Agreement on read-only survives the merge.
+        assert!(
+            !READ_ONLY_LIST
+                .merge_most_restrictive(READ_ONLY_LIST)
+                .declared_mutating()
+        );
+        // Read-only + unannotated degrades to unannotated (no positive claim).
+        let merged = READ_ONLY_LIST.merge_most_restrictive(ToolSignal::default());
+        assert_eq!(merged.read_only, None);
     }
 
     #[tokio::test]

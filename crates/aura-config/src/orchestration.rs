@@ -108,11 +108,13 @@ pub struct WorkerConfig {
     /// Declares this worker read-only: it must never receive tools that
     /// mutate state. Default false.
     ///
-    /// Enforced mechanically where tool assignments are validated (e.g. the
-    /// bootstrap agent's `write_config` rejects MCP tools annotated as
-    /// mutating, undiscovered tool names, and glob patterns in a read-only
-    /// worker's `mcp_filter`). Designed to also feed future call-time
-    /// permission checks.
+    /// Enforced in layers: config validation requires a non-empty,
+    /// glob-free `mcp_filter` (an exact-name allowlist — an empty filter
+    /// would grant every MCP tool); worker construction rejects tools the
+    /// MCP server annotated as mutating; and the bootstrap agent's
+    /// `write_config` additionally rejects tool names that discovery did
+    /// not return. Designed to also feed future call-time permission
+    /// checks.
     #[serde(default)]
     pub read_only: bool,
 }
@@ -358,6 +360,37 @@ impl OrchestrationConfig {
                      case-insensitively to avoid filesystem collisions in \
                      artifact persistence)",
                     existing, name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate read-only worker tool filters.
+    ///
+    /// `read_only = true` promises the worker can never mutate state, so its
+    /// `mcp_filter` must be an explicit allowlist of exact tool names. An
+    /// empty filter is rejected because empty means "all MCP tools" (the
+    /// documented backwards-compatible default), and glob patterns are
+    /// rejected because they can admit tools that did not exist when the
+    /// config was validated.
+    pub fn validate_read_only_workers(&self) -> Result<(), crate::ConfigError> {
+        for (name, worker) in self.workers.iter().filter(|(_, w)| w.read_only) {
+            if worker.mcp_filter.is_empty() {
+                return Err(crate::ConfigError::Validation(format!(
+                    "worker '{name}' is read_only but has an empty mcp_filter, \
+                     which grants ALL MCP tools; list the exact tool names the \
+                     worker may use"
+                )));
+            }
+            if let Some(entry) = worker
+                .mcp_filter
+                .iter()
+                .find(|e| e.contains(['*', '?', '[']))
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "worker '{name}' is read_only; its mcp_filter must list \
+                     exact tool names, not glob patterns (got '{entry}')"
                 )));
             }
         }

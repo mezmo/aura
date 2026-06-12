@@ -611,6 +611,27 @@ impl Orchestrator {
                 )
             })?;
             tracing::info!("Creating worker '{}' for task {}", name, task_id);
+
+            // read_only is a hard promise, not bootstrap-agent courtesy:
+            // config validation already required an exact-name mcp_filter,
+            // and here we refuse any tool the MCP server annotated as
+            // mutating — so hand-edited configs get the same guarantee as
+            // bootstrap-written ones.
+            if worker.read_only
+                && let Some(manager) = self.mcp_manager.as_ref()
+                && let Some(tool) = manager.tool_definitions_iter().find(|t| {
+                    worker.mcp_filter.iter().any(|f| f.as_str() == t.name.as_ref())
+                        && crate::bootstrap::ToolSignal::of_tool(t).declared_mutating()
+                })
+            {
+                return Err(format!(
+                    "worker '{}' is read_only but its mcp_filter includes '{}', \
+                     which its MCP server annotates as mutating",
+                    name, tool.name
+                )
+                .into());
+            }
+
             let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
                 .replace("{{worker_system_prompt}}", &worker.preamble);
             worker_config.preamble_override = Some(full_preamble);

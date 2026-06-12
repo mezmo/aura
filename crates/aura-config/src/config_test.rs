@@ -1931,6 +1931,71 @@ max_extraction_tokens = 4000
     }
 
     // ========================================================================
+    // Read-only worker validation
+    // ========================================================================
+
+    fn read_only_worker_config(filter_lines: &str) -> String {
+        format!(
+            r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "m"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.watcher]
+description = "d"
+preamble = "p"
+read_only = true
+{filter_lines}
+"#
+        )
+    }
+
+    #[test]
+    fn test_read_only_worker_rejects_empty_mcp_filter() {
+        // Empty mcp_filter means "all MCP tools" at runtime, which a
+        // read-only worker must never get.
+        let err = load_config_from_str(&read_only_worker_config(""))
+            .expect_err("empty filter on read_only worker must be rejected")
+            .to_string();
+        assert!(err.contains("read_only"), "got: {err}");
+        assert!(err.contains("ALL MCP tools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_read_only_worker_rejects_glob_filter() {
+        let err = load_config_from_str(&read_only_worker_config(
+            "mcp_filter = [\"list_*\"]",
+        ))
+        .expect_err("glob filter on read_only worker must be rejected")
+        .to_string();
+        assert!(err.contains("not glob patterns"), "got: {err}");
+    }
+
+    #[test]
+    fn test_read_only_worker_accepts_exact_names() {
+        load_config_from_str(&read_only_worker_config(
+            "mcp_filter = [\"list_pods\", \"get_logs\"]",
+        ))
+        .expect("exact-name filter on read_only worker should pass");
+    }
+
+    #[test]
+    fn test_non_read_only_worker_keeps_glob_and_empty_filters() {
+        // The restriction applies only to read_only workers; ordinary
+        // workers keep the documented empty/glob semantics.
+        let config = read_only_worker_config("mcp_filter = [\"mezmo_*\"]")
+            .replace("read_only = true", "read_only = false");
+        load_config_from_str(&config).expect("non-read-only glob filter should pass");
+    }
+
+    // ========================================================================
     // [bootstrap] table
     // ========================================================================
 
@@ -2002,7 +2067,8 @@ model = "qwen3:8b"
         let toml = format!(
             "{MINIMAL_AGENT}\n[orchestration]\nenabled = true\n\n\
              [orchestration.worker.watcher]\n\
-             description = \"d\"\npreamble = \"p\"\nread_only = true\n\n\
+             description = \"d\"\npreamble = \"p\"\nread_only = true\n\
+             mcp_filter = [\"list_pods\"]\n\n\
              [orchestration.worker.doer]\n\
              description = \"d\"\npreamble = \"p\"\n"
         );

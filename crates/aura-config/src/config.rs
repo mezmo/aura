@@ -395,6 +395,7 @@ impl Config {
 
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
+            orch.validate_read_only_workers()?;
         }
 
         Ok(())
