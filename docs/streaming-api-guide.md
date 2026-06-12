@@ -162,7 +162,8 @@ data:
 Note:
 - Successful tool results include the `result` field (truncated per `TOOL_RESULT_MAX_LENGTH`, default 1000 chars)
 - Tool errors are automatically detected from Rig's error format prefixes (`ToolCallError:`, `JsonError:`, `Tool returned an error:`)
-- When detected, `success` is set to `false` and the `error` field contains the full error message
+- When detected, `success` is set to `false` and the `error` field contains the error message
+- Large tool errors (stack traces, provider error blobs) are truncated to ~8KB to prevent context window overflow. Truncated errors preserve the first ~75% (top-level error) and last ~25% (root cause), joined by a notice: `[tool error truncated: X of Y bytes omitted]`
 
 **Reasoning** (requires both flags):
 ```bash
