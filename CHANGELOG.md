@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.22.3](https://github.com/mezmo/aura/compare/v1.22.2...v1.22.3) (2026-06-12)
+
+
+### Documentation
+
+* **readme**: add slack, license, rust, and mcp badges [fbe3d57](https://github.com/mezmo/aura/commit/fbe3d5786c1071d657e297e00c3d0bbbcd0d3bd0) - Mike Shearer [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
+### Tests
+
+* **a2a**: fix flaky test_sequential_tasks_share_context [36a7f35](https://github.com/mezmo/aura/commit/36a7f354d1ae7c4e5efb09dbd8f60e7cafd6f2df) - Mike Shearer [#245](https://github.com/mezmo/aura/issues/245)
+
 ## [1.22.2](https://github.com/mezmo/aura/compare/v1.22.1...v1.22.2) (2026-06-11)
 
 
