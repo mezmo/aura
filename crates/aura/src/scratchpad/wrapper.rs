@@ -52,6 +52,10 @@ impl ToolWrapper for ScratchpadWrapper {
         // Tool errors should never be diverted to scratchpad — the LLM needs
         // to see the error inline so it can react. Only intercept successful
         // tool outputs that exceed the per-tool token threshold.
+        //
+        // Oversized errors are bounded upstream at the tool-result source
+        // (`mcp_response::bound_error_content`), so passing the
+        // error through here does not risk flooding a worker's context.
         if outcome.is_error() {
             return TransformOutputResult::new(output);
         }
