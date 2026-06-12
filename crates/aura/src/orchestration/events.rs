@@ -11,7 +11,7 @@
 /// The type lives in [`aura_events`] (it is part of the SSE wire vocabulary
 /// shared with consumers); re-exported here so internal events and
 /// `RunManifest` persistence keep their existing paths.
-pub use aura_events::orchestration::RoutingMode;
+pub use aura_events::orchestration::{RoutingMode, TaskDagNode};
 
 /// Events emitted by the orchestrator during execution.
 ///
@@ -23,8 +23,10 @@ pub enum OrchestratorEvent {
     PlanCreated {
         /// The goal being addressed
         goal: String,
-        /// Number of tasks in the plan
+        /// Task descriptions in task-ID order
         tasks: Vec<String>,
+        /// Dependency edges per task; `dag[i].id` pairs with `tasks[i]`
+        dag: Vec<TaskDagNode>,
         /// How the coordinator routed this query
         routing_mode: RoutingMode,
         /// Why the coordinator chose orchestration
@@ -54,6 +56,8 @@ pub enum OrchestratorEvent {
         task_id: usize,
         /// Human-readable task description
         description: String,
+        /// Direct dependency edges of this task (empty for root tasks)
+        dependencies: Vec<usize>,
         /// The ID of the orchestrator
         orchestrator_id: String,
         /// The ID of the Worker who is handling the task

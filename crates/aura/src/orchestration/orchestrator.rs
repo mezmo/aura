@@ -95,6 +95,17 @@ struct TaskExecutionParams<'a> {
     plan_goal: &'a str,
 }
 
+/// A task whose dependencies are all complete, selected for the current
+/// round of parallel execution, with everything the spawn path and
+/// TaskStarted emission need.
+struct ReadyTask {
+    id: usize,
+    description: String,
+    context: Option<String>,
+    worker: Option<String>,
+    dependencies: Vec<usize>,
+}
+
 /// Result from `execute_task` including structured output from `submit_result`.
 struct TaskExecutionResult {
     result: String,
@@ -2478,13 +2489,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
-            // Tuple: (task_id, description, context, worker_name)
-            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
+            let ready_tasks: Vec<ReadyTask> = plan
                 .ready_tasks()
                 .iter()
-                .map(|t| {
-                    let context = self.build_task_context(plan, t.id);
-                    (t.id, t.description.clone(), context, t.worker.clone())
+                .map(|t| ReadyTask {
+                    id: t.id,
+                    description: t.description.clone(),
+                    context: self.build_task_context(plan, t.id),
+                    worker: t.worker.clone(),
+                    dependencies: t.dependencies.clone(),
                 })
                 .collect();
 
@@ -2510,17 +2523,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
 
             // Mark all ready tasks as running and emit TaskStarted events
-            for (task_id, task_desc, _context, worker_name) in &ready_tasks {
-                if let Some(task) = plan.get_task_mut(*task_id) {
+            for rt in &ready_tasks {
+                if let Some(task) = plan.get_task_mut(rt.id) {
                     task.start();
                 }
                 let _ = event_tx
                     .send(Ok(StreamItem::OrchestratorEvent(
                         OrchestratorEvent::TaskStarted {
-                            task_id: *task_id,
-                            description: task_desc.clone(),
+                            task_id: rt.id,
+                            description: rt.description.clone(),
+                            dependencies: rt.dependencies.clone(),
                             orchestrator_id: self.orchestrator_id.clone(),
-                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                            worker_id: rt.worker.clone().unwrap_or(self.orchestrator_id.clone()),
                         },
                     )))
                     .await;
@@ -2531,19 +2545,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let goal = plan_goal.clone();
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
-                .map(|(task_id, task_desc, task_context, worker_name)| {
+                .map(|rt| {
                     let goal = goal.clone();
                     async move {
                         let start_time = Instant::now();
                         let params = TaskExecutionParams {
-                            task_description: &task_desc,
-                            task_context: &task_context,
-                            worker_name: worker_name.as_deref(),
+                            task_description: &rt.description,
+                            task_context: &rt.context,
+                            worker_name: rt.worker.as_deref(),
                             plan_goal: &goal,
                         };
-                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
+                        let result = self.execute_task(rt.id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
-                        (task_id, result, duration_ms, worker_name, task_desc)
+                        (rt.id, result, duration_ms, rt.worker, rt.description)
                     }
                 })
                 .collect();
@@ -3339,6 +3353,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     OrchestratorEvent::PlanCreated {
                         goal: plan.goal.clone(),
                         tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
+                        dag: plan_dag(&plan),
                         routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
                         routing_rationale: routing_rationale.clone(),
                         planning_response: planning_summary,
@@ -3736,6 +3751,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .iter()
                             .map(|t| t.description.clone())
                             .collect(),
+                        dag: plan_dag(&new_plan),
                         routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
                         routing_rationale,
                         planning_response: planning_summary,
@@ -4133,6 +4149,23 @@ fn context_overflow_suggestion(phase: &str) -> String {
         "worker" => context_overflow::WORKER.to_string(),
         _ => context_overflow::DEFAULT.to_string(),
     }
+}
+
+/// Map a plan's tasks to their DAG edge list for `plan_created` events.
+///
+/// `dag[i].id` pairs with the event's `tasks[i]` description (flatten
+/// assigns IDs sequentially). Carries every task — including ones that
+/// later end up blocked and never emit `task_started` — so SSE consumers
+/// can reconstruct the full intended DAG up front.
+fn plan_dag(plan: &Plan) -> Vec<super::events::TaskDagNode> {
+    plan.tasks
+        .iter()
+        .map(|t| super::events::TaskDagNode {
+            id: t.id,
+            dependencies: t.dependencies.clone(),
+            worker: t.worker.clone(),
+        })
+        .collect()
 }
 
 /// Build the dependency context injected into a worker's task prompt.
