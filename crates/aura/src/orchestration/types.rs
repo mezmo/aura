@@ -449,6 +449,31 @@ impl Task {
             category,
         };
     }
+
+    /// Compact preview of a completed task's result for budget-constrained
+    /// rendering: the structured-output summary when present, otherwise the
+    /// truncated result. An artifact footer in the result is re-appended if
+    /// truncation cut it off, so lineage to the on-disk artifact survives.
+    ///
+    /// Returns `None` unless the task is `Complete`.
+    pub(crate) fn compact_preview(&self, max_bytes: usize) -> Option<String> {
+        let result = self.state.completed_result()?;
+        let footer = extract_artifact_footer(result);
+        let body = self
+            .structured_output
+            .as_ref()
+            .map(|so| so.summary.as_str())
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or(result);
+        let (truncated, _) = crate::string_utils::safe_truncate(body, max_bytes);
+
+        Some(
+            footer
+                .filter(|f| !truncated.contains(f))
+                .map(|f| format!("{truncated}\n{f}"))
+                .unwrap_or_else(|| truncated.to_owned()),
+        )
+    }
 }
 
 /// Status of a task in the execution plan.
@@ -511,6 +536,16 @@ pub enum TaskState {
         error: String,
         category: FailureCategory,
     },
+}
+
+impl TaskState {
+    /// The result string when the task is `Complete`.
+    pub fn completed_result(&self) -> Option<&str> {
+        match self {
+            TaskState::Complete { result } => Some(result),
+            TaskState::Pending | TaskState::Running | TaskState::Failed { .. } => None,
+        }
+    }
 }
 
 impl From<&TaskState> for TaskStatus {
@@ -1246,6 +1281,70 @@ mod tests {
         plan.add_task(Task::new(1, "B", "r").with_dependencies([0, 99]));
 
         assert_eq!(plan.transitive_ancestors(1), vec![0]);
+    }
+
+    #[test]
+    fn test_compact_preview_prefers_structured_summary() {
+        use super::super::tools::submit_result::Confidence;
+
+        let mut task = Task::new(0, "Analyze", "r");
+        task.complete("X".repeat(2000));
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "Found 47 error groups".to_string(),
+            confidence: Confidence::High,
+        });
+
+        let preview = task.compact_preview(500).expect("complete task previews");
+        assert_eq!(preview, "Found 47 error groups");
+    }
+
+    #[test]
+    fn test_compact_preview_preserves_artifact_footer() {
+        let mut task = Task::new(0, "Analyze", "r");
+        let footer = "[Full result (12345 chars) saved to artifact: task-0-result.txt]";
+        task.complete(format!("{}\n\n{}", "X".repeat(2000), footer));
+
+        let preview = task.compact_preview(500).expect("complete task previews");
+        assert!(
+            preview.ends_with(footer),
+            "footer must survive truncation: {preview}"
+        );
+        assert!(preview.starts_with(&"X".repeat(500)));
+    }
+
+    #[test]
+    fn test_compact_preview_empty_summary_falls_back_to_result() {
+        use super::super::tools::submit_result::Confidence;
+
+        let mut task = Task::new(0, "Analyze", "r");
+        task.complete("X".repeat(2000));
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: String::new(),
+            confidence: Confidence::High,
+        });
+
+        let preview = task.compact_preview(500).expect("complete task previews");
+        assert_eq!(preview, "X".repeat(500), "empty summary must not win");
+    }
+
+    #[test]
+    fn test_compact_preview_truncates_plain_result() {
+        let mut task = Task::new(0, "Analyze", "r");
+        task.complete("X".repeat(2000));
+
+        let preview = task.compact_preview(500).expect("complete task previews");
+        assert_eq!(preview, "X".repeat(500));
+    }
+
+    #[test]
+    fn test_compact_preview_none_unless_complete() {
+        let mut task = Task::new(0, "Analyze", "r");
+        assert!(
+            task.compact_preview(500).is_none(),
+            "pending has no preview"
+        );
+        task.fail("boom", FailureCategory::AgentError);
+        assert!(task.compact_preview(500).is_none(), "failed has no preview");
     }
 
     #[test]
