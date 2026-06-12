@@ -44,6 +44,21 @@ pub struct CompletionOutcome {
     pub result: Option<String>,
 }
 
+/// One task's edges in the plan DAG, emitted on `plan_created`.
+///
+/// `id` indexes into the event's `tasks` list (flatten assigns IDs
+/// sequentially, so `tasks[i]` describes `id == i`). The flat edge list is
+/// the executor's ground truth: consumers reconstruct the DAG without
+/// re-deriving frontier semantics, and tasks that never start (blocked
+/// chains) are still visible here.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskDagNode {
+    pub id: usize,
+    pub dependencies: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+}
+
 /// How the coordinator routed a query that produced a plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -120,6 +135,9 @@ pub enum OrchestrationStreamEvent {
         /// Flat list of task descriptions, in task-ID order.
         #[serde(default)]
         tasks: Vec<String>,
+        /// Dependency edges per task; `dag[i].id` pairs with `tasks[i]`.
+        #[serde(default)]
+        dag: Vec<TaskDagNode>,
         routing_mode: RoutingMode,
         routing_rationale: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +164,11 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator starts a task.
     TaskStarted {
         description: String,
+        /// Direct dependency edges of this task (always present; empty for
+        /// root tasks). Lives on the variant rather than `TaskContext` so
+        /// `task_completed` does not grow the field.
+        #[serde(default)]
+        dependencies: Vec<usize>,
         #[serde(flatten)]
         task: TaskContext,
         #[serde(flatten)]
@@ -261,6 +284,7 @@ impl OrchestrationStreamEvent {
     pub fn plan_created(
         goal: impl Into<String>,
         tasks: Vec<String>,
+        dag: Vec<TaskDagNode>,
         routing_mode: RoutingMode,
         routing_rationale: impl Into<String>,
         planning_response: Option<String>,
@@ -269,6 +293,7 @@ impl OrchestrationStreamEvent {
         Self::PlanCreated {
             goal: goal.into(),
             tasks,
+            dag,
             routing_mode,
             routing_rationale: routing_rationale.into(),
             planning_response,
@@ -305,12 +330,14 @@ impl OrchestrationStreamEvent {
     pub fn task_started(
         task_id: usize,
         description: impl Into<String>,
+        dependencies: Vec<usize>,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
         context: EventContext,
     ) -> Self {
         Self::TaskStarted {
             description: description.into(),
+            dependencies,
             task: TaskContext {
                 task_id,
                 orchestrator_id: orchestrator_id.into(),

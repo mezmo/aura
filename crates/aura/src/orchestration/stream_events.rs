@@ -24,7 +24,7 @@ pub use aura_events::orchestration::{EventContext, OrchestrationStreamEvent, eve
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::events::RoutingMode;
+    use crate::orchestration::events::{RoutingMode, TaskDagNode};
     use crate::stream_events::{AgentContext, CorrelationContext};
 
     fn test_ctx() -> EventContext {
@@ -46,6 +46,7 @@ mod tests {
                     "Task 2 description".to_string(),
                     "Task 3 description".to_string(),
                 ]),
+                vec![],
                 RoutingMode::Orchestrated,
                 "test rationale",
                 None,
@@ -73,8 +74,15 @@ mod tests {
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::task_started(0, "desc", "orch-id", "worker-id", ctx.clone())
-                .event_name(),
+            OrchestrationStreamEvent::task_started(
+                0,
+                "desc",
+                vec![],
+                "orch-id",
+                "worker-id",
+                ctx.clone()
+            )
+            .event_name(),
             event_names::TASK_STARTED
         );
 
@@ -82,6 +90,42 @@ mod tests {
             OrchestrationStreamEvent::synthesizing(1, ctx).event_name(),
             event_names::SYNTHESIZING
         );
+    }
+
+    #[test]
+    fn test_format_sse_task_started_includes_dependencies() {
+        let event = OrchestrationStreamEvent::task_started(
+            2,
+            "Summarize root cause",
+            vec![0, 1],
+            "orch-1",
+            "writer",
+            test_ctx(),
+        );
+        let sse = event.format_sse();
+
+        assert!(sse.starts_with(&format!("event: {}\n", event_names::TASK_STARTED)));
+        assert!(sse.contains("\"dependencies\":[0,1]"));
+        assert!(sse.contains("\"task_id\":2"));
+    }
+
+    #[test]
+    fn test_old_task_started_without_dependencies_still_deserializes() {
+        // Pre-#221 task_started payloads have no dependencies field.
+        let old_payload = serde_json::json!({
+            "task_id": 1,
+            "description": "d",
+            "worker_id": "w",
+            "orchestrator_id": "o",
+            "agent_id": "coordinator",
+            "session_id": "s"
+        });
+        let event: OrchestrationStreamEvent =
+            serde_json::from_value(old_payload).expect("old payload deserializes");
+        assert!(matches!(
+            event,
+            OrchestrationStreamEvent::TaskStarted { ref dependencies, .. } if dependencies.is_empty()
+        ));
     }
 
     // These wire-format assertions are the equivalence proof for the
@@ -96,6 +140,18 @@ mod tests {
                 "Task 1 description".to_string(),
                 "Task 2 description".to_string(),
             ]),
+            vec![
+                TaskDagNode {
+                    id: 0,
+                    dependencies: vec![],
+                    worker: Some("sre".to_string()),
+                },
+                TaskDagNode {
+                    id: 1,
+                    dependencies: vec![0],
+                    worker: None,
+                },
+            ],
             RoutingMode::Orchestrated,
             "test rationale",
             Some("coordinator response text".to_string()),
@@ -106,6 +162,9 @@ mod tests {
         assert!(sse.starts_with(&format!("event: {}\n", event_names::PLAN_CREATED)));
         assert!(sse.contains("\"goal\":\"test goal\""));
         assert!(sse.contains("\"tasks\":[\"Task 1 description\",\"Task 2 description\"]"));
+        assert!(sse.contains(
+            "\"dag\":[{\"id\":0,\"dependencies\":[],\"worker\":\"sre\"},{\"id\":1,\"dependencies\":[0]}]"
+        ));
         assert!(sse.contains("\"routing_mode\":\"orchestrated\""));
         assert!(sse.contains("\"routing_rationale\":\"test rationale\""));
         assert!(sse.contains("\"planning_response\":\"coordinator response text\""));
@@ -116,6 +175,11 @@ mod tests {
         let event = OrchestrationStreamEvent::plan_created(
             "simple math",
             Vec::from(["Calculate the mean of [10, 20, 30]".to_string()]),
+            vec![TaskDagNode {
+                id: 0,
+                dependencies: vec![],
+                worker: None,
+            }],
             RoutingMode::Routed,
             "single worker",
             None,
@@ -132,6 +196,7 @@ mod tests {
         let event = OrchestrationStreamEvent::plan_created(
             "goal",
             Vec::from(["Task 1".to_string()]),
+            vec![],
             RoutingMode::Routed,
             "rationale",
             None,

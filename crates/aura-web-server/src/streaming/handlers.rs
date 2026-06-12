@@ -1043,6 +1043,7 @@ fn handle_orchestrator_event(
         OrchestratorEvent::PlanCreated {
             goal,
             tasks,
+            dag,
             routing_mode,
             routing_rationale,
             planning_response,
@@ -1057,6 +1058,7 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::plan_created(
                 goal,
                 tasks.clone(),
+                dag.clone(),
                 routing_mode.clone(),
                 routing_rationale,
                 if planning_response.is_empty() {
@@ -1097,6 +1099,7 @@ fn handle_orchestrator_event(
         OrchestratorEvent::TaskStarted {
             task_id,
             description,
+            dependencies,
             orchestrator_id,
             worker_id,
         } => {
@@ -1104,6 +1107,7 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::task_started(
                 *task_id,
                 description,
+                dependencies.clone(),
                 orchestrator_id,
                 worker_id,
                 event_context,
