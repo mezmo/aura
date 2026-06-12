@@ -244,8 +244,9 @@ impl Plan {
     ///
     /// Propagates transitively: when T0 fails in T0→T1→T2, both T1 and T2
     /// are blocked. Without this, T2 sat in pending limbo (its direct
-    /// dependency never failed) and was silently dropped when the wave loop
-    /// found no ready tasks. Used to identify tasks that need replanning.
+    /// dependency never failed) and was silently dropped when the execution
+    /// loop found no ready tasks. Used to identify tasks that need
+    /// replanning.
     pub fn blocked_tasks(&self) -> Vec<&Task> {
         self.tasks
             .iter()
