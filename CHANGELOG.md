@@ -1,5 +1,16 @@
 ## Changelog
 
+# [1.23.0](https://github.com/mezmo/aura/compare/v1.22.3...v1.23.0) (2026-06-12)
+
+
+### Bug Fixes
+
+* **mcp**: bound tool error content before it reaches an agent [bedfba5](https://github.com/mezmo/aura/commit/bedfba5e5ee874824891284bc9c29eb153c56c53) - Justin Gross [#18](https://github.com/mezmo/aura/issues/18)
+
+### Features
+
+* **mcp**: surface and report failed MCP server connections [8ba8573](https://github.com/mezmo/aura/commit/8ba85733d326578a27a4192599550bb42ad80884) - Justin Gross [#154](https://github.com/mezmo/aura/issues/154)
+
 ## [1.22.3](https://github.com/mezmo/aura/compare/v1.22.2...v1.22.3) (2026-06-12)
 
 
