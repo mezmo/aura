@@ -3,7 +3,7 @@
 //! This module defines the core types used by the orchestrator to decompose
 //! queries into tasks, track their execution, and manage dependencies.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -201,6 +201,11 @@ impl Plan {
         })
     }
 
+    /// Get a reference to a task by ID.
+    pub fn get_task(&self, task_id: usize) -> Option<&Task> {
+        self.tasks.iter().find(|t| t.id == task_id)
+    }
+
     /// Get a mutable reference to a task by ID.
     pub fn get_task_mut(&mut self, task_id: usize) -> Option<&mut Task> {
         self.tasks.iter_mut().find(|t| t.id == task_id)
@@ -252,6 +257,41 @@ impl Plan {
                     })
             })
             .collect()
+    }
+
+    /// Returns the transitive ancestor IDs of `task_id`: direct and indirect
+    /// dependencies, deduplicated.
+    ///
+    /// BFS order: nearest layer first, ascending ID within a layer. Dependency
+    /// IDs that don't resolve to a task are skipped, and cycles (malformed
+    /// plans) terminate via the visited set.
+    pub fn transitive_ancestors(&self, task_id: usize) -> Vec<usize> {
+        let mut visited: HashSet<usize> = HashSet::from([task_id]);
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        let mut ancestors = Vec::new();
+
+        let enqueue_deps = |queue: &mut VecDeque<usize>, task: &Task| {
+            let mut layer = task.dependencies.clone();
+            layer.sort_unstable();
+            queue.extend(layer);
+        };
+
+        if let Some(task) = self.get_task(task_id) {
+            enqueue_deps(&mut queue, task);
+        }
+
+        while let Some(id) = queue.pop_front() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(task) = self.get_task(id) else {
+                continue;
+            };
+            ancestors.push(id);
+            enqueue_deps(&mut queue, task);
+        }
+
+        ancestors
     }
 }
 
@@ -1160,6 +1200,52 @@ mod tests {
             plan.ready_tasks().is_empty(),
             "No tasks ready when chain is broken"
         );
+    }
+
+    #[test]
+    fn test_transitive_ancestors_chain() {
+        // 0 -> 1 -> 2: ancestors of 2 are [1, 0] (nearest layer first)
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Task A", "r"));
+        plan.add_task(Task::new(1, "Task B", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Task C", "r").with_dependency(1));
+
+        assert_eq!(plan.transitive_ancestors(2), vec![1, 0]);
+        assert_eq!(plan.transitive_ancestors(1), vec![0]);
+        assert_eq!(plan.transitive_ancestors(0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_transitive_ancestors_diamond() {
+        // 0 -> {1, 2} -> 3: shared root 0 appears exactly once
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Root", "r"));
+        plan.add_task(Task::new(1, "Left", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Right", "r").with_dependency(0));
+        plan.add_task(Task::new(3, "Join", "r").with_dependencies([1, 2]));
+
+        assert_eq!(plan.transitive_ancestors(3), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn test_transitive_ancestors_cycle_terminates() {
+        // Malformed plan with a 1 <-> 2 cycle must not hang
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(1, "A", "r").with_dependency(2));
+        plan.add_task(Task::new(2, "B", "r").with_dependency(1));
+
+        assert_eq!(plan.transitive_ancestors(1), vec![2]);
+        assert_eq!(plan.transitive_ancestors(2), vec![1]);
+    }
+
+    #[test]
+    fn test_transitive_ancestors_unknown_dep_skipped() {
+        // Dependency ID with no matching task is skipped, not panicked on
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "A", "r"));
+        plan.add_task(Task::new(1, "B", "r").with_dependencies([0, 99]));
+
+        assert_eq!(plan.transitive_ancestors(1), vec![0]);
     }
 
     #[test]
