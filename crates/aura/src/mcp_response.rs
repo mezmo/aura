@@ -84,16 +84,46 @@ impl CallOutcome {
     pub fn from_jsonrpc_error(code: i32, message: &str) -> Self {
         if SCHEMA_ERROR_CODES.contains(&code) {
             Self::SchemaError {
-                content: message.to_string(),
+                content: bound_error_content(message.to_string(), MAX_TOOL_ERROR_BYTES),
                 code,
             }
         } else {
             Self::GeneralToolError {
-                content: message.to_string(),
+                content: bound_error_content(message.to_string(), MAX_TOOL_ERROR_BYTES),
                 code: Some(code),
             }
         }
     }
+}
+
+/// Target budget (in bytes) for an MCP tool *error* surfaced to an agent.
+pub const MAX_TOOL_ERROR_BYTES: usize = 8 * 1024;
+
+/// Bound an MCP error message to roughly `max_bytes`, preserving head and tail.
+///
+/// This keeps ~75% from the head (top-level error and any
+/// failure-categorization keywords) and ~25% from the tail (deepest cause),
+/// joined by a notice stating how many bytes were omitted. Returns the input
+/// unchanged when it already fits.
+pub fn bound_error_content(content: String, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content;
+    }
+    let total = content.len();
+    let head_budget = max_bytes.saturating_mul(3) / 4;
+    let tail_budget = max_bytes - head_budget;
+
+    let head_end = content.floor_char_boundary(head_budget);
+    let tail_start = content.floor_char_boundary(total - tail_budget);
+    let omitted = tail_start.saturating_sub(head_end);
+
+    format!(
+        "{}\n\n[tool error truncated: {} of {} bytes omitted]\n\n{}",
+        &content[..head_end],
+        omitted,
+        total,
+        &content[tail_start..],
+    )
 }
 
 /// Maximum size (in bytes) for extracted resource content.
@@ -223,7 +253,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
 
         return if is_error {
             Ok(CallOutcome::GeneralToolError {
-                content: json_str,
+                content: bound_error_content(json_str, MAX_TOOL_ERROR_BYTES),
                 code: None,
             })
         } else {
@@ -269,7 +299,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
 
     if is_error {
         Ok(CallOutcome::GeneralToolError {
-            content,
+            content: bound_error_content(content, MAX_TOOL_ERROR_BYTES),
             code: None,
         })
     } else {
@@ -716,6 +746,147 @@ mod tests {
         let outcome = CallOutcome::classify_from_output("Tool returned an error: 503");
         assert!(outcome.is_error());
         assert_eq!(outcome.content(), "503");
+    }
+
+    #[test]
+    fn test_bound_error_content_passthrough_small() {
+        let small = "boom".to_string();
+        assert_eq!(bound_error_content(small.clone(), 1024), small);
+    }
+
+    #[test]
+    fn test_bound_error_content_passthrough_at_limit() {
+        let exact = "x".repeat(100);
+        assert_eq!(bound_error_content(exact.clone(), 100), exact);
+    }
+
+    #[test]
+    fn test_bound_error_content_truncates_large() {
+        // Distinct head and tail so we can prove both ends survive.
+        let head = "HEAD_ERROR_TYPE ".repeat(1000); // ~16 KB
+        let tail = " ROOT_CAUSE_DEEPEST_FRAME".repeat(1000); // ~25 KB
+        let big = format!("{head}{tail}");
+        let original_len = big.len();
+
+        let bounded = bound_error_content(big, MAX_TOOL_ERROR_BYTES);
+
+        assert!(
+            bounded.len() < original_len,
+            "bounded output must be smaller than the input"
+        );
+        // Target budget plus a small, fixed truncation-marker overhead.
+        assert!(
+            bounded.len() <= MAX_TOOL_ERROR_BYTES + 128,
+            "bounded output must stay near the budget; got {}",
+            bounded.len()
+        );
+        assert!(
+            bounded.contains("[tool error truncated:"),
+            "must include the truncation notice"
+        );
+        assert!(
+            bounded.contains("HEAD_ERROR_TYPE"),
+            "head of the error must be preserved"
+        );
+        assert!(
+            bounded.contains("ROOT_CAUSE_DEEPEST_FRAME"),
+            "tail (root cause) of the error must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_bound_error_content_multibyte_stays_valid_utf8() {
+        // CJK chars are 3 bytes; truncation must land on char boundaries so
+        // the result is never split mid-character.
+        let big = "日本語テスト".repeat(2000); // ~36 KB of 3-byte chars
+        let bounded = bound_error_content(big, MAX_TOOL_ERROR_BYTES);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+        assert!(bounded.len() <= MAX_TOOL_ERROR_BYTES + 128);
+        assert!(bounded.contains("[tool error truncated:"));
+    }
+
+    #[test]
+    fn test_extract_text_error_is_bounded() {
+        let huge = "stack frame line\n".repeat(5000); // ~85 KB
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::Text(RawTextContent {
+                    text: huge.clone(),
+                    meta: None,
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: Some(true),
+            meta: None,
+        };
+
+        let outcome = extract_tool_result(result, "exploding_tool").unwrap();
+        assert!(outcome.is_error());
+        assert!(
+            outcome.content().len() <= MAX_TOOL_ERROR_BYTES + 128,
+            "error content must be bounded; got {} bytes",
+            outcome.content().len()
+        );
+        assert!(outcome.content().contains("[tool error truncated:"));
+    }
+
+    #[test]
+    fn test_extract_structured_error_is_bounded() {
+        let huge_msg = "x".repeat(60_000);
+        let result = CallToolResult {
+            content: vec![],
+            structured_content: Some(json!({ "traceback": huge_msg })),
+            is_error: Some(true),
+            meta: None,
+        };
+
+        let outcome = extract_tool_result(result, "exploding_tool").unwrap();
+        assert!(outcome.is_error());
+        assert!(
+            outcome.content().len() <= MAX_TOOL_ERROR_BYTES + 128,
+            "structured error content must be bounded; got {} bytes",
+            outcome.content().len()
+        );
+    }
+
+    #[test]
+    fn test_extract_success_is_not_bounded() {
+        // Successful (non-error) outputs are handled by the scratchpad, not by
+        // error bounding — they must pass through untouched here.
+        let huge = "y".repeat(60_000);
+        let result = CallToolResult {
+            content: vec![Content {
+                raw: RawContent::Text(RawTextContent {
+                    text: huge.clone(),
+                    meta: None,
+                }),
+                annotations: None,
+            }],
+            structured_content: None,
+            is_error: Some(false),
+            meta: None,
+        };
+
+        let outcome = extract_tool_result(result, "big_success").unwrap();
+        assert!(!outcome.is_error());
+        assert_eq!(
+            outcome.content().len(),
+            huge.len(),
+            "successful output must not be truncated by error bounding"
+        );
+    }
+
+    #[test]
+    fn test_from_jsonrpc_error_is_bounded() {
+        let huge = "e".repeat(50_000);
+        let outcome = CallOutcome::from_jsonrpc_error(-32603, &huge);
+        assert!(outcome.is_error());
+        assert!(
+            outcome.content().len() <= MAX_TOOL_ERROR_BYTES + 128,
+            "jsonrpc error message must be bounded; got {} bytes",
+            outcome.content().len()
+        );
     }
 
     #[test]
