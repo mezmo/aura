@@ -245,7 +245,7 @@ pub(crate) fn format_telemetry_recent(
     n: usize,
 ) -> String {
     let Some(log) = telemetry.inspection_log() else {
-        return "inspection log is disabled (AURA_TELEMETRY_LOG_EVENTS=0).".to_string();
+        return format!("{}.", aura_telemetry::INSPECTION_LOG_DISABLED_MSG);
     };
     match log.recent(n) {
         Ok(events) if events.is_empty() => "no telemetry events recorded yet.".to_string(),

@@ -90,7 +90,10 @@ const CI_ENV_VARS: &[&str] = &[
 /// Without this, `DO_NOT_TRACK=false` or `CI=false` (a common
 /// shell-rc pattern for "I'm not in CI today") would silently
 /// suppress all telemetry — the opposite of the user's intent.
-fn is_false_value(s: &str) -> bool {
+/// The recognized false-y values for env-var booleans, case-insensitive.
+/// `pub(crate)` so the bootstrap config parsing applies exactly the same
+/// rule as the kill-switch parsing here — the two must never diverge.
+pub(crate) fn is_false_value(s: &str) -> bool {
     let lower = s.trim().to_ascii_lowercase();
     matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
 }

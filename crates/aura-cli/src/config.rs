@@ -272,6 +272,55 @@ pub fn save_style_to_global_cli_toml(public_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Byte index of the `#` that begins an inline comment, or `None` when
+/// the line has no comment. Quote-aware: a `#` inside a TOML basic
+/// (`"…"`) or literal (`'…'`) string is part of the value, not a comment
+/// — so rewriting `key = "a#b"` does not mistake `#b"` for a comment.
+/// Backslash escapes inside basic strings are honored.
+fn find_comment_start(line: &str) -> Option<usize> {
+    let mut in_basic = false;
+    let mut in_literal = false;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        if in_basic {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_basic = false;
+            }
+        } else if in_literal {
+            // TOML literal strings have no escape sequences.
+            if c == '\'' {
+                in_literal = false;
+            }
+        } else {
+            match c {
+                '"' => in_basic = true,
+                '\'' => in_literal = true,
+                '#' => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Strip a trailing `# comment` from a TOML line and trim surrounding
+/// whitespace, returning the bare content. Quote-aware via
+/// [`find_comment_start`]. Shared by both upsert helpers so their
+/// comment handling cannot drift — the section-header match in
+/// [`upsert_section_bool`] previously skipped this and appended a
+/// duplicate `[section]` table whenever the header carried a comment.
+fn strip_inline_comment(line: &str) -> &str {
+    let content = match find_comment_start(line) {
+        Some(i) => &line[..i],
+        None => line,
+    };
+    content.trim()
+}
+
 /// Update or insert a top-level `key = "value"` line in TOML source.
 ///
 /// - If `key` already exists at the top level, replaces the line, keeping
@@ -305,10 +354,7 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
         if in_section {
             continue;
         }
-        // Strip a trailing `#` comment (this is a heuristic — `#` inside
-        // a quoted string would be misclassified, but `cli.toml` keys are
-        // simple strings without embedded `#`).
-        let no_comment = trimmed.split('#').next().unwrap_or("").trim();
+        let no_comment = strip_inline_comment(trimmed);
         if let Some(rest) = no_comment.strip_prefix(key) {
             let rest = rest.trim_start();
             if rest.starts_with('=') {
@@ -320,9 +366,9 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
 
     if let Some(idx) = found_idx {
         let original = &lines[idx];
-        // Preserve a trailing comment if present.
-        let comment = original
-            .find('#')
+        // Preserve a trailing comment if present (quote-aware, so a `#`
+        // inside the value is not mistaken for one).
+        let comment = find_comment_start(original)
             .map(|p| original[p..].to_string())
             .unwrap_or_default();
         lines[idx] = if comment.is_empty() {
@@ -475,7 +521,9 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
 
     let mut lines: Vec<String> = content.lines().map(String::from).collect();
 
-    let section_index = lines.iter().position(|l| l.trim() == section_header);
+    let section_index = lines
+        .iter()
+        .position(|l| strip_inline_comment(l) == section_header);
 
     match section_index {
         Some(start) => {
@@ -493,8 +541,7 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
                     .iter()
                     .enumerate()
                     .find_map(|(offset, line)| {
-                        let trimmed = line.trim_start();
-                        let no_comment = trimmed.split('#').next().unwrap_or("").trim();
+                        let no_comment = strip_inline_comment(line);
                         let rest = no_comment.strip_prefix(key)?;
                         if rest.trim_start().starts_with('=') {
                             Some(start + 1 + offset)
@@ -505,8 +552,7 @@ fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> 
 
             if let Some(index) = found_index {
                 let original = &lines[index];
-                let comment = original
-                    .find('#')
+                let comment = find_comment_start(original)
                     .map(|p| original[p..].to_string())
                     .unwrap_or_default();
                 lines[index] = if comment.is_empty() {
@@ -1154,6 +1200,50 @@ endpoint = \"https://x/\"
         let parsed: Probe = toml::from_str(&out).expect("upsert output is valid TOML");
         assert_eq!(parsed.style.as_deref(), Some("normal"));
         assert_eq!(parsed.telemetry.and_then(|t| t.enabled), Some(false));
+    }
+
+    #[test]
+    fn upsert_preserves_hash_inside_quoted_value() {
+        // A `#` inside the existing quoted value must not be mistaken for
+        // an inline comment and re-appended as garbage when the line is
+        // rewritten. (Latent until a `#`-capable key like log_file flows
+        // through these helpers.)
+        let input = "log_file = \"/tmp/my#run.log\"\n";
+        let out = upsert_top_level_string(input, "log_file", "/tmp/new.log");
+        assert_eq!(
+            out, "log_file = \"/tmp/new.log\"\n",
+            "value's `#` leaked into a bogus comment:\n{out}"
+        );
+        let parsed: toml::Value = toml::from_str(&out).expect("valid TOML");
+        assert_eq!(parsed["log_file"].as_str(), Some("/tmp/new.log"));
+    }
+
+    #[test]
+    fn upsert_still_preserves_a_real_trailing_comment() {
+        let input = "style = \"normal\"  # keep me\n";
+        let out = upsert_top_level_string(input, "style", "compact");
+        assert!(out.contains("# keep me"), "real comment lost:\n{out}");
+        assert!(out.contains("style = \"compact\""), "value not updated:\n{out}");
+    }
+
+    #[test]
+    fn upsert_section_bool_matches_header_with_trailing_comment() {
+        // A header carrying a trailing comment must still be recognised;
+        // otherwise a second `[telemetry]` table is appended and the
+        // result is invalid TOML (duplicate table), which wipes the
+        // user's cli.toml on the next load.
+        let input = "style = \"compact\"\n[telemetry]  # my settings\nendpoint = \"x\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        assert_eq!(
+            out.matches("[telemetry]").count(),
+            1,
+            "must not append a duplicate [telemetry] table:\n{out}"
+        );
+        let parsed: toml::Value =
+            toml::from_str(&out).expect("a duplicate table would fail to parse");
+        assert_eq!(parsed["telemetry"]["enabled"].as_bool(), Some(false));
+        assert_eq!(parsed["telemetry"]["endpoint"].as_str(), Some("x"));
+        assert_eq!(parsed["style"].as_str(), Some("compact"));
     }
 
     // ---- save_telemetry_enabled_to_cli_toml_at ----

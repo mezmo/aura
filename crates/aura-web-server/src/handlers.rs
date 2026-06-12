@@ -923,7 +923,7 @@ pub fn build_telemetry_recent_response(
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             serde_json::json!({
-                "error": "inspection log disabled (AURA_TELEMETRY_LOG_EVENTS=0)"
+                "error": aura_telemetry::INSPECTION_LOG_DISABLED_MSG
             }),
         );
     };

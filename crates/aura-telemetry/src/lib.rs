@@ -39,12 +39,22 @@ pub use aura_telemetry_derive::Event;
 
 /// HTTP header an **Enabled** CLI attaches to its requests to propagate
 /// the user's telemetry consent to the non-interactive server it drives.
-/// A server in the `Unknown` state honors it (transitions to `Enabled`
-/// at runtime); a `Disabled` server ignores it. See `docs/telemetry.md`.
+/// Consent is **request-scoped**: server-side per-request events are
+/// captured via [`TelemetryHandle::capture_consented`], which sends only
+/// telemetry about that request and never changes the server's global
+/// state. A `Disabled` server ignores it (operator opt-out wins). See
+/// `docs/telemetry.md`.
 pub const CONSENT_HEADER: &str = "x-aura-telemetry-consent";
 
 /// The only value [`CONSENT_HEADER`] is ever sent with.
 pub const CONSENT_HEADER_VALUE: &str = "enabled";
+
+/// User-facing message for when the local inspection log is disabled via
+/// `AURA_TELEMETRY_LOG_EVENTS`. Shared so the CLI and web server (and any
+/// future surface) describe the condition identically — and stay in sync
+/// if the env var is ever renamed.
+pub const INSPECTION_LOG_DISABLED_MSG: &str =
+    "inspection log disabled (AURA_TELEMETRY_LOG_EVENTS=0)";
 
 /// The wire-ready property bag for a single event. The macro builds this
 /// from each `#[derive(Event)]` struct. `Clone` is supported so the

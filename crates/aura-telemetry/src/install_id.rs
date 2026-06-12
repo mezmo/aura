@@ -144,6 +144,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+// Non-Unix (Windows) has no `mode(0o600)` equivalent here, so the file
+// inherits the parent directory's ACLs rather than being restricted to
+// the owning user the way the Unix path is. This is an accepted
+// divergence: the install-id is a random, anonymous UUID — not a secret
+// or a credential — so the Unix `0o600` is defence-in-depth, not a
+// confidentiality requirement. Tightening Windows ACLs would mean
+// pulling in a platform crate for a non-secret on a currently untested
+// platform; revisit if Windows becomes a supported, tested target.
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;

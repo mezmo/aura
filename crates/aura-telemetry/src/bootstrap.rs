@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use crate::disable::{decide_state, EnvProvider, SystemEnv, TelemetryState};
+use crate::disable::{decide_state, is_false_value, EnvProvider, SystemEnv, TelemetryState};
 use crate::install_id;
 use crate::properties::{DeploymentMethod, OsFamily, Source};
 use crate::{FileTelemetryConfig, TelemetryConfig};
@@ -133,9 +133,15 @@ pub fn resolve_inspection_log_path(
     Some(default_inspection_log_path(source, memory_dir, env))
 }
 
-fn is_false_value(s: &str) -> bool {
-    let lower = s.trim().to_ascii_lowercase();
-    matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
+/// Resolve a setting by precedence: a non-empty env value wins over a
+/// non-empty file value, falling back to the built-in default.
+/// Single-sources the env-over-file-over-default rule (with empty-as-unset
+/// filtering) shared by `endpoint` and `api_key`.
+fn resolve_setting(env_value: Option<String>, file_value: Option<String>, default: &str) -> String {
+    env_value
+        .filter(|s| !s.is_empty())
+        .or_else(|| file_value.filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn default_inspection_log_path(
@@ -191,22 +197,16 @@ pub fn build_config_with_env(
     file: Option<&FileTelemetryConfig>,
     env: &dyn EnvProvider,
 ) -> TelemetryConfig {
-    let endpoint = env
-        .var("AURA_TELEMETRY_ENDPOINT")
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            file.and_then(|f| f.endpoint.clone())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    let api_key = env
-        .var("AURA_TELEMETRY_API_KEY")
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            file.and_then(|f| f.api_key.clone())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_API_KEY.to_string());
+    let endpoint = resolve_setting(
+        env.var("AURA_TELEMETRY_ENDPOINT"),
+        file.and_then(|f| f.endpoint.clone()),
+        DEFAULT_ENDPOINT,
+    );
+    let api_key = resolve_setting(
+        env.var("AURA_TELEMETRY_API_KEY"),
+        file.and_then(|f| f.api_key.clone()),
+        DEFAULT_API_KEY,
+    );
     let deployment_method = DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
 
     // Resolve the tri-state: hard kill switches + CI/test → Disabled

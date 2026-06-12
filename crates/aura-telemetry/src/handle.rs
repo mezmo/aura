@@ -457,6 +457,23 @@ impl TelemetryHandle {
     /// Drain in-flight events and stop the background task. Caller
     /// gives a max budget; we never block forever.
     pub async fn shutdown(self, budget: Duration) {
+        // The drain budget must exceed the per-POST timeout, otherwise an
+        // in-flight POST is cancelled mid-write and its inspection-log row
+        // is lost (the `post_timeout` invariant — see `TelemetryConfig`).
+        // `init` cannot enforce it (the budget is only known here), so
+        // surface a violation rather than letting it fail silently.
+        if let Some(params) = self.inner.sink_params.as_ref() {
+            if drain_budget_too_short(budget, params.post_timeout) {
+                tracing::warn!(
+                    budget_ms = budget.as_millis() as u64,
+                    post_timeout_ms = params.post_timeout.as_millis() as u64,
+                    "telemetry shutdown budget <= per-POST timeout; an \
+                     in-flight POST may be cancelled mid-write and its \
+                     inspection-log row dropped. Set post_timeout below \
+                     the shutdown budget."
+                );
+            }
+        }
         // Drop the sender so the background task observes channel
         // close after it has drained any pending events.
         {
@@ -668,6 +685,13 @@ async fn run_background(mut ctx: BackgroundCtx) {
     }
 }
 
+/// Whether a shutdown drain `budget` is too short to let an in-flight
+/// POST (up to `post_timeout`) finish and write its inspection-log row.
+/// The budget must be strictly greater than the per-POST timeout.
+fn drain_budget_too_short(budget: Duration, post_timeout: Duration) -> bool {
+    budget <= post_timeout
+}
+
 fn build_pending(envelope: &Envelope, payload: EventPayload) -> Pending {
     let ts = Utc::now();
     let wire = build_event_json(envelope, &payload, &ts.to_rfc3339());
@@ -761,5 +785,21 @@ mod file_config_merge_tests {
         let merged = cfg(Some(true), Some("https://base/")).merged_over(cfg(None, None));
         assert_eq!(merged.enabled, Some(true));
         assert_eq!(merged.endpoint.as_deref(), Some("https://base/"));
+    }
+}
+
+#[cfg(test)]
+mod drain_budget_tests {
+    use super::drain_budget_too_short;
+    use std::time::Duration;
+
+    #[test]
+    fn budget_must_exceed_post_timeout() {
+        let pt = Duration::from_millis(1500);
+        // Too short: equal or less than the per-POST timeout.
+        assert!(drain_budget_too_short(Duration::from_millis(1500), pt));
+        assert!(drain_budget_too_short(Duration::from_millis(1000), pt));
+        // Adequate: strictly greater (the documented 1.5s/2s pairing).
+        assert!(!drain_budget_too_short(Duration::from_millis(2000), pt));
     }
 }
