@@ -25,6 +25,68 @@ struct SkillFrontmatter {
     description: String,
 }
 
+/// A skill identifier, validated against the Agent Skills specification.
+///
+/// The only ways to obtain one are [`SkillName::new`] and deserialization,
+/// both of which run the spec validation, so holding a `SkillName` proves the
+/// rules held: 1-64 characters, lowercase alphanumerics and hyphens, no
+/// leading/trailing/consecutive hyphens.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String")]
+pub struct SkillName(String);
+
+impl SkillName {
+    pub fn new(name: impl Into<String>) -> Result<Self, String> {
+        let name = name.into();
+        validate_skill_name(&name)?;
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for SkillName {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for SkillName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for SkillName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for SkillName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SkillName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for SkillName {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
+
 /// Validate a skill name per the Agent Skills specification.
 ///
 /// Rules:
@@ -115,17 +177,17 @@ pub fn discover_skills(
     let mut skills = Vec::new();
 
     for source in sources {
-        let source_path = PathBuf::from(&source.source);
+        let source_path = &source.source;
         let resolved = if source_path.is_absolute() {
-            source_path
+            source_path.clone()
         } else if let Some(base) = config_dir {
-            base.join(&source_path)
+            base.join(source_path)
         } else {
             std::env::current_dir()
                 .map_err(|e| {
                     ConfigError::Validation(format!("Cannot resolve relative skill path: {e}"))
                 })?
-                .join(&source_path)
+                .join(source_path)
         };
 
         let resolved = resolved.canonicalize().map_err(|e| {
@@ -186,7 +248,7 @@ pub fn discover_skills(
             );
 
             skills.push(SkillConfig {
-                name: dir_name,
+                name: SkillName::new(dir_name).map_err(ConfigError::Validation)?,
                 description: frontmatter.description,
                 path: path.clone(),
             });
@@ -194,7 +256,7 @@ pub fn discover_skills(
     }
 
     // Deduplicate: keep the first occurrence, warn on duplicates
-    let mut seen: HashMap<String, PathBuf> = HashMap::new();
+    let mut seen: HashMap<SkillName, PathBuf> = HashMap::new();
     skills.retain(|skill| {
         if let Some(existing_path) = seen.get(&skill.name) {
             tracing::warn!(
@@ -389,7 +451,7 @@ allowed-tools: Bash(git:*) Read
         write_skill(dir.path(), "beta", "Beta skill");
 
         let sources = vec![LocalSkillSource {
-            source: dir.path().to_string_lossy().to_string(),
+            source: dir.path().to_path_buf(),
         }];
         let skills = discover_skills(&sources, None).unwrap();
 
@@ -409,7 +471,7 @@ allowed-tools: Bash(git:*) Read
         std::fs::write(dir.path().join("readme.md"), "# README").unwrap();
 
         let sources = vec![LocalSkillSource {
-            source: dir.path().to_string_lossy().to_string(),
+            source: dir.path().to_path_buf(),
         }];
         let skills = discover_skills(&sources, None).unwrap();
 
@@ -440,7 +502,7 @@ Content."#,
         .unwrap();
 
         let sources = vec![LocalSkillSource {
-            source: dir.path().to_string_lossy().to_string(),
+            source: dir.path().to_path_buf(),
         }];
         let skills = discover_skills(&sources, None).unwrap();
 
@@ -465,7 +527,7 @@ Content."#,
         .unwrap();
 
         let sources = vec![LocalSkillSource {
-            source: dir.path().to_string_lossy().to_string(),
+            source: dir.path().to_path_buf(),
         }];
         let err = discover_skills(&sources, None).unwrap_err();
         assert!(err.to_string().contains("does not match directory name"));
@@ -480,10 +542,10 @@ Content."#,
 
         let sources = vec![
             LocalSkillSource {
-                source: dir1.path().to_string_lossy().to_string(),
+                source: dir1.path().to_path_buf(),
             },
             LocalSkillSource {
-                source: dir2.path().to_string_lossy().to_string(),
+                source: dir2.path().to_path_buf(),
             },
         ];
         let skills = discover_skills(&sources, None).unwrap();
@@ -501,7 +563,7 @@ Content."#,
         write_skill(&skills_dir, "test-skill", "A test");
 
         let sources = vec![LocalSkillSource {
-            source: "my-skills".to_string(),
+            source: "my-skills".into(),
         }];
         let skills = discover_skills(&sources, Some(base.path())).unwrap();
 
@@ -512,7 +574,7 @@ Content."#,
     #[test]
     fn discover_skills_nonexistent_source_errors() {
         let sources = vec![LocalSkillSource {
-            source: "/nonexistent/path/to/skills".to_string(),
+            source: "/nonexistent/path/to/skills".into(),
         }];
         let err = discover_skills(&sources, None).unwrap_err();
         assert!(err.to_string().contains("not found"));

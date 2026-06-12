@@ -406,12 +406,12 @@ mod tests {
         );
         vec![
             SkillConfig {
-                name: "test-skill".to_string(),
+                name: crate::config::SkillName::new("test-skill").unwrap(),
                 description: "A test skill".to_string(),
                 path: path1,
             },
             SkillConfig {
-                name: "another-skill".to_string(),
+                name: crate::config::SkillName::new("another-skill").unwrap(),
                 description: "Another test skill".to_string(),
                 path: path2,
             },
@@ -434,7 +434,7 @@ mod tests {
         .unwrap();
 
         vec![SkillConfig {
-            name: "with-refs".to_string(),
+            name: crate::config::SkillName::new("with-refs").unwrap(),
             description: "Skill with references".to_string(),
             path: skill_dir,
         }]
@@ -474,7 +474,7 @@ mod tests {
         let skill_dir = dir.path().join("missing-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
         let configs = vec![SkillConfig {
-            name: "missing-skill".to_string(),
+            name: crate::config::SkillName::new("missing-skill").unwrap(),
             description: "Missing".to_string(),
             path: skill_dir,
         }];

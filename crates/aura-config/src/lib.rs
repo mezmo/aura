@@ -21,6 +21,7 @@ pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+pub use skills::SkillName;
 
 use std::collections::HashSet;
 use std::fs;
