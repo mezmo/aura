@@ -65,7 +65,8 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
 
 /// Parse YAML frontmatter delimited by `---` from a SKILL.md file.
 ///
-/// Returns the parsed frontmatter struct.
+/// Also enforces the spec constraints: a valid skill name and a non-empty
+/// description of at most 1024 characters.
 fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, ConfigError> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
