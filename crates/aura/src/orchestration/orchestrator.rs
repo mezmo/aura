@@ -4219,7 +4219,6 @@ fn build_dependency_context(plan: &Plan, task_id: usize, budget: usize) -> Optio
         } else if over_budget || spent + result.len() > budget {
             over_budget = true;
             degraded.insert(*id);
-            spent += DEGRADED_PREVIEW_BYTES;
         } else {
             spent += result.len();
         }
