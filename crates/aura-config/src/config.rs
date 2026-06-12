@@ -424,7 +424,7 @@ impl Config {
         }
 
         for source in &self.agent.skills.local {
-            if source.source.is_empty() {
+            if source.source.as_os_str().is_empty() {
                 return Err(crate::ConfigError::Validation(
                     "Skill source path cannot be empty".to_string(),
                 ));
@@ -630,7 +630,7 @@ pub struct SkillsConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LocalSkillSource {
     /// Path to directory containing skill subdirectories (absolute or relative to config file)
-    pub source: String,
+    pub source: std::path::PathBuf,
 }
 
 /// Configuration for TodoWrite/ReadTodos tool injection.
@@ -736,8 +736,7 @@ impl Default for AgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillConfig {
     /// Unique name for this skill (must match directory name).
-    /// Lowercase alphanumeric and hyphens only, 1-64 chars.
-    pub name: String,
+    pub name: crate::skills::SkillName,
     /// Human-readable description from SKILL.md frontmatter
     pub description: String,
     /// Absolute path to the skill directory
