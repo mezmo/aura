@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use std::fs;
@@ -266,126 +266,44 @@ pub fn save_style_to_global_cli_toml(public_name: &str) -> Result<()> {
     fs::create_dir_all(&dir)?;
     let path = dir.join(CLI_TOML_FILENAME);
     let existing = fs::read_to_string(&path).unwrap_or_default();
-    let updated = upsert_top_level_string(&existing, "style", public_name);
+    let updated = upsert_top_level_string(&existing, "style", public_name)
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
     let mut f = fs::File::create(&path)?;
     f.write_all(updated.as_bytes())?;
     Ok(())
 }
 
-/// Byte index of the `#` that begins an inline comment, or `None` when
-/// the line has no comment. Quote-aware: a `#` inside a TOML basic
-/// (`"…"`) or literal (`'…'`) string is part of the value, not a comment
-/// — so rewriting `key = "a#b"` does not mistake `#b"` for a comment.
-/// Backslash escapes inside basic strings are honored.
-fn find_comment_start(line: &str) -> Option<usize> {
-    let mut in_basic = false;
-    let mut in_literal = false;
-    let mut escaped = false;
-    for (i, c) in line.char_indices() {
-        if in_basic {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_basic = false;
-            }
-        } else if in_literal {
-            // TOML literal strings have no escape sequences.
-            if c == '\'' {
-                in_literal = false;
-            }
-        } else {
-            match c {
-                '"' => in_basic = true,
-                '\'' => in_literal = true,
-                '#' => return Some(i),
-                _ => {}
-            }
+/// Set `table[key] = new_item`, preserving the decor — notably a trailing
+/// `# comment` — of any value being replaced. toml_edit drops a replaced
+/// value's trailing comment by default, so copy the old value's decor
+/// onto the new one. A new key gets default decor.
+fn set_preserving_decor(table: &mut toml_edit::Table, key: &str, mut new_item: toml_edit::Item) {
+    if let Some(old) = table.get(key).and_then(|i| i.as_value()) {
+        let decor = old.decor().clone();
+        if let Some(v) = new_item.as_value_mut() {
+            *v.decor_mut() = decor;
         }
     }
-    None
+    table.insert(key, new_item);
 }
 
-/// Strip a trailing `# comment` from a TOML line and trim surrounding
-/// whitespace, returning the bare content. Quote-aware via
-/// [`find_comment_start`]. Shared by both upsert helpers so their
-/// comment handling cannot drift — the section-header match in
-/// [`upsert_section_bool`] previously skipped this and appended a
-/// duplicate `[section]` table whenever the header carried a comment.
-fn strip_inline_comment(line: &str) -> &str {
-    let content = match find_comment_start(line) {
-        Some(i) => &line[..i],
-        None => line,
-    };
-    content.trim()
-}
-
-/// Update or insert a top-level `key = "value"` line in TOML source.
+/// Update or insert a top-level `key = "value"` entry in TOML source via
+/// a format-preserving editor ([`toml_edit`]). Comments, blank lines,
+/// sibling fields, and section ordering are preserved; a new top-level
+/// key is rendered above any `[section]` tables (so it stays top-level),
+/// and a replaced value keeps its trailing comment. Value escaping is
+/// handled by toml_edit.
 ///
-/// - If `key` already exists at the top level, replaces the line, keeping
-///   any trailing `#` comment.
-/// - If absent, inserts a new line just before the first `[section]`
-///   header, or at end-of-file if there are no sections.
-/// - Top-level only — keys nested under a `[section]` are ignored. This
-///   matches `cli.toml`'s flat layout.
-///
-/// Loses nothing else: comments, blank lines, sibling fields, and
-/// section ordering are preserved byte-for-byte.
-fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
-    // Match toml's basic-string escaping for the value we're writing.
-    let escaped = value.replace('\\', r"\\").replace('"', r#"\""#);
-    let new_line = format!("{key} = \"{escaped}\"");
-
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-    let mut in_section = false;
-    let mut found_idx: Option<usize> = None;
-    let mut first_section_idx: Option<usize> = None;
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            if first_section_idx.is_none() {
-                first_section_idx = Some(i);
-            }
-            in_section = true;
-            continue;
-        }
-        if in_section {
-            continue;
-        }
-        let no_comment = strip_inline_comment(trimmed);
-        if let Some(rest) = no_comment.strip_prefix(key) {
-            let rest = rest.trim_start();
-            if rest.starts_with('=') {
-                found_idx = Some(i);
-                break;
-            }
-        }
-    }
-
-    if let Some(idx) = found_idx {
-        let original = &lines[idx];
-        // Preserve a trailing comment if present (quote-aware, so a `#`
-        // inside the value is not mistaken for one).
-        let comment = find_comment_start(original)
-            .map(|p| original[p..].to_string())
-            .unwrap_or_default();
-        lines[idx] = if comment.is_empty() {
-            new_line
-        } else {
-            format!("{new_line}  {comment}")
-        };
-    } else {
-        let insert_at = first_section_idx.unwrap_or(lines.len());
-        lines.insert(insert_at, new_line);
-    }
-
-    let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+/// Returns an error if `content` is not valid TOML — the caller must not
+/// overwrite a file it cannot parse.
+fn upsert_top_level_string(
+    content: &str,
+    key: &str,
+    value: &str,
+) -> Result<String, toml_edit::TomlError> {
+    let mut doc = content.parse::<toml_edit::DocumentMut>()?;
+    set_preserving_decor(doc.as_table_mut(), key, toml_edit::value(value));
+    Ok(doc.to_string())
 }
 
 /// Persist `[telemetry] enabled = <value>` to the global `cli.toml`.
@@ -431,7 +349,12 @@ fn save_telemetry_enabled_to_cli_toml_at(
             });
         }
     };
-    let updated = upsert_section_bool(&existing, "telemetry", "enabled", enabled);
+    let updated = upsert_section_bool(&existing, "telemetry", "enabled", enabled).map_err(
+        |source| TelemetryDisableError::Malformed {
+            path: path.to_path_buf(),
+            source,
+        },
+    )?;
 
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     let write_err = |source| TelemetryDisableError::Write {
@@ -464,6 +387,12 @@ pub enum TelemetryDisableError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// `cli.toml` was read but is not valid TOML. The file is left
+    /// untouched rather than overwritten from a misparse.
+    Malformed {
+        path: PathBuf,
+        source: toml_edit::TomlError,
+    },
     /// Creating `~/.aura/` or writing `cli.toml` failed — typically a
     /// read-only or sandboxed filesystem.
     Write {
@@ -488,6 +417,13 @@ impl std::fmt::Display for TelemetryDisableError {
                     path.display()
                 )
             }
+            Self::Malformed { path, source } => {
+                write!(
+                    f,
+                    "existing {} is not valid TOML (left untouched): {source}",
+                    path.display()
+                )
+            }
             Self::Write { path, source } => {
                 write!(f, "could not write {}: {source}", path.display())
             }
@@ -500,86 +436,37 @@ impl std::error::Error for TelemetryDisableError {
         match self {
             Self::NoHome => None,
             Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Malformed { source, .. } => Some(source),
         }
     }
 }
 
-/// Update or insert `key = <bool>` inside the `[section]` block in TOML
-/// source. Designed for `cli.toml`'s flat-section layout; nested
-/// sections / dotted keys are out of scope.
+/// Update or insert `key = <bool>` inside the `[section]` table in TOML
+/// source via a format-preserving editor ([`toml_edit`]). The `[section]`
+/// table is created (appended, with a blank-line separator) when absent;
+/// an existing key keeps its trailing comment. Other sections, sibling
+/// keys, blank lines, and comments are preserved.
 ///
-/// - If `[section]` exists and contains `key = …`, replace the line,
-///   preserving any trailing `# comment`.
-/// - If `[section]` exists but does not contain `key`, insert
-///   `key = <value>` immediately under the section header.
-/// - If `[section]` is missing, append `\n[section]\nkey = <value>` at
-///   end-of-file (a blank line separates it from any prior content).
-fn upsert_section_bool(content: &str, section: &str, key: &str, value: bool) -> String {
-    let val_str = if value { "true" } else { "false" };
-    let new_line = format!("{key} = {val_str}");
-    let section_header = format!("[{section}]");
-
-    let mut lines: Vec<String> = content.lines().map(String::from).collect();
-
-    let section_index = lines
-        .iter()
-        .position(|l| strip_inline_comment(l) == section_header);
-
-    match section_index {
-        Some(start) => {
-            // Bound the search to this section: stop at the next
-            // `[other]` header or end-of-file.
-            let end = lines
-                .iter()
-                .enumerate()
-                .skip(start + 1)
-                .find_map(|(i, l)| l.trim_start().starts_with('[').then_some(i))
-                .unwrap_or(lines.len());
-
-            let found_index =
-                lines[(start + 1)..end]
-                    .iter()
-                    .enumerate()
-                    .find_map(|(offset, line)| {
-                        let no_comment = strip_inline_comment(line);
-                        let rest = no_comment.strip_prefix(key)?;
-                        if rest.trim_start().starts_with('=') {
-                            Some(start + 1 + offset)
-                        } else {
-                            None
-                        }
-                    });
-
-            if let Some(index) = found_index {
-                let original = &lines[index];
-                let comment = find_comment_start(original)
-                    .map(|p| original[p..].to_string())
-                    .unwrap_or_default();
-                lines[index] = if comment.is_empty() {
-                    new_line
-                } else {
-                    format!("{new_line}  {comment}")
-                };
-            } else {
-                lines.insert(start + 1, new_line);
-            }
-        }
-        None => {
-            // Append a fresh section. Blank-line separator improves
-            // round-tripping (matches what `toml` would produce).
-            if lines.last().map(|l| !l.is_empty()).unwrap_or(false) {
-                lines.push(String::new());
-            }
-            lines.push(section_header);
-            lines.push(new_line);
-        }
+/// Returns an error if `content` is not valid TOML — the caller must not
+/// overwrite a file it cannot parse.
+fn upsert_section_bool(
+    content: &str,
+    section: &str,
+    key: &str,
+    value: bool,
+) -> Result<String, toml_edit::TomlError> {
+    let mut doc = content.parse::<toml_edit::DocumentMut>()?;
+    // Ensure `[section]` exists as an explicit table.
+    if !doc.get(section).map(|i| i.is_table()).unwrap_or(false) {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(false);
+        doc.insert(section, toml_edit::Item::Table(table));
     }
-
-    let mut out = lines.join("\n");
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    let table = doc[section]
+        .as_table_mut()
+        .expect("section was just ensured to be a table");
+    set_preserving_decor(table, key, toml_edit::value(value));
+    Ok(doc.to_string())
 }
 
 /// Load and merge the global and project-local `cli.toml` files.
@@ -1040,50 +927,53 @@ model = "global-model"
 
     // ---- upsert_section_bool ----
 
+    /// Parse helper: the upsert output must always be valid TOML.
+    fn parse(out: &str) -> toml::Value {
+        toml::from_str(out).unwrap_or_else(|e| panic!("upsert produced invalid TOML: {e}\n{out}"))
+    }
+
     #[test]
     fn upsert_section_bool_empty_input() {
-        let out = upsert_section_bool("", "telemetry", "enabled", false);
+        let out = upsert_section_bool("", "telemetry", "enabled", false).unwrap();
         assert_eq!(out, "[telemetry]\nenabled = false\n");
     }
 
     #[test]
     fn upsert_section_bool_appends_section_after_flat_content() {
         let input = "style = \"normal\"\nlog_file = \"/tmp/a.log\"\n";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
-        assert!(
-            out.contains("style = \"normal\""),
-            "preserves prior content: {out}"
-        );
-        assert!(out.contains("[telemetry]\nenabled = false\n"));
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        let v = parse(&out);
+        assert_eq!(v["style"].as_str(), Some("normal"), "prior content lost: {out}");
+        assert_eq!(v["log_file"].as_str(), Some("/tmp/a.log"));
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
         // Blank-line separator between the flat block and the new section.
-        assert!(out.contains("\n\n[telemetry]"), "got: {out}");
+        assert!(out.contains("\n\n[telemetry]"), "no blank-line separator: {out}");
     }
 
     #[test]
     fn upsert_section_bool_inserts_key_under_existing_header() {
         let input = "[telemetry]\nendpoint = \"https://x/\"\n";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
-        // The new key sits right under the header, ahead of siblings.
-        assert!(
-            out.contains("[telemetry]\nenabled = false\nendpoint = \"https://x/\"\n"),
-            "got: {out}"
-        );
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        let v = parse(&out);
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
+        assert_eq!(v["telemetry"]["endpoint"].as_str(), Some("https://x/"));
     }
 
     #[test]
     fn upsert_section_bool_replaces_existing_key() {
         let input = "[telemetry]\nenabled = true\nendpoint = \"https://x/\"\n";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
-        assert!(out.contains("enabled = false"));
-        assert!(!out.contains("enabled = true"));
-        assert!(out.contains("endpoint = \"https://x/\""));
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        let v = parse(&out);
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
+        assert_eq!(v["telemetry"]["endpoint"].as_str(), Some("https://x/"));
     }
 
     #[test]
     fn upsert_section_bool_preserves_trailing_comment() {
         let input = "[telemetry]\nenabled = true  # opt-in\n";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
-        assert!(out.contains("enabled = false  # opt-in"), "got: {out}");
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        assert!(out.contains("enabled = false"), "value not updated: {out}");
+        assert!(out.contains("# opt-in"), "trailing comment lost: {out}");
     }
 
     #[test]
@@ -1097,14 +987,30 @@ enabled = true
 [telemetry]
 endpoint = \"https://x/\"
 ";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
-        // [other].enabled is untouched.
-        assert!(out.contains("[other]\nenabled = true"), "got: {out}");
-        // [telemetry] gains the new key.
-        assert!(
-            out.contains("[telemetry]\nenabled = false\nendpoint = \"https://x/\""),
-            "got: {out}"
-        );
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        let v = parse(&out);
+        assert_eq!(v["other"]["enabled"].as_bool(), Some(true), "[other] touched: {out}");
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
+        assert_eq!(v["telemetry"]["endpoint"].as_str(), Some("https://x/"));
+    }
+
+    #[test]
+    fn upsert_top_level_string_new_key_stays_top_level() {
+        // Adding a top-level key to a file that already has a section
+        // must keep the key top-level (rendered above the section), not
+        // nest it under the trailing table.
+        let input = "[telemetry]\nenabled = false\n";
+        let out = upsert_top_level_string(input, "style", "compact").unwrap();
+        let v = parse(&out);
+        assert_eq!(v["style"].as_str(), Some("compact"), "style not top-level: {out}");
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn upsert_rejects_malformed_existing_toml() {
+        // Must error rather than overwrite a file it cannot parse.
+        assert!(upsert_section_bool("not valid = = toml", "telemetry", "enabled", false).is_err());
+        assert!(upsert_top_level_string("not valid = = toml", "style", "x").is_err());
     }
 
     // ---- telemetry-enabled cross-layer merge ----
@@ -1190,7 +1096,7 @@ endpoint = \"https://x/\"
     #[test]
     fn upsert_section_bool_round_trips_through_toml_parser() {
         let input = "style = \"normal\"\n";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
         // The result must parse and round-trip the values we expect.
         #[derive(serde::Deserialize)]
         struct Probe {
@@ -1209,7 +1115,7 @@ endpoint = \"https://x/\"
         // rewritten. (Latent until a `#`-capable key like log_file flows
         // through these helpers.)
         let input = "log_file = \"/tmp/my#run.log\"\n";
-        let out = upsert_top_level_string(input, "log_file", "/tmp/new.log");
+        let out = upsert_top_level_string(input, "log_file", "/tmp/new.log").unwrap();
         assert_eq!(
             out, "log_file = \"/tmp/new.log\"\n",
             "value's `#` leaked into a bogus comment:\n{out}"
@@ -1221,7 +1127,7 @@ endpoint = \"https://x/\"
     #[test]
     fn upsert_still_preserves_a_real_trailing_comment() {
         let input = "style = \"normal\"  # keep me\n";
-        let out = upsert_top_level_string(input, "style", "compact");
+        let out = upsert_top_level_string(input, "style", "compact").unwrap();
         assert!(out.contains("# keep me"), "real comment lost:\n{out}");
         assert!(out.contains("style = \"compact\""), "value not updated:\n{out}");
     }
@@ -1233,14 +1139,13 @@ endpoint = \"https://x/\"
         // result is invalid TOML (duplicate table), which wipes the
         // user's cli.toml on the next load.
         let input = "style = \"compact\"\n[telemetry]  # my settings\nendpoint = \"x\"\n";
-        let out = upsert_section_bool(input, "telemetry", "enabled", false);
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
         assert_eq!(
             out.matches("[telemetry]").count(),
             1,
             "must not append a duplicate [telemetry] table:\n{out}"
         );
-        let parsed: toml::Value =
-            toml::from_str(&out).expect("a duplicate table would fail to parse");
+        let parsed = parse(&out);
         assert_eq!(parsed["telemetry"]["enabled"].as_bool(), Some(false));
         assert_eq!(parsed["telemetry"]["endpoint"].as_str(), Some("x"));
         assert_eq!(parsed["style"].as_str(), Some("compact"));
@@ -1288,6 +1193,28 @@ endpoint = \"https://x/\"
             std::fs::read(&path).unwrap(),
             original,
             "unreadable cli.toml must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn telemetry_save_refuses_to_clobber_malformed_toml() {
+        // A cli.toml that is readable UTF-8 but not valid TOML must yield
+        // Malformed and stay byte-for-byte intact, rather than being
+        // overwritten from a misparse.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        let original = "this is = = not valid toml\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = save_telemetry_enabled_to_cli_toml_at(&path, true);
+        assert!(
+            matches!(result, Err(TelemetryDisableError::Malformed { .. })),
+            "expected Malformed error, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "malformed cli.toml must not be overwritten"
         );
     }
 
