@@ -16,6 +16,12 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // Subcommands run before any backend/REPL setup (and before the tokio
+    // runtime exists — init uses blocking HTTP for model discovery).
+    if let Some(aura_cli::cli::Command::Init(init_args)) = &args.command {
+        return aura_cli::init::run_init(init_args);
+    }
+
     // Validate --standalone + --config pairing when feature is enabled.
     #[cfg(feature = "standalone-cli")]
     aura_cli::cli::validate_standalone_args(&args);

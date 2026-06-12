@@ -1,9 +1,21 @@
 use clap::Parser;
 
+/// Subcommands that run before any backend/REPL setup.
+#[derive(clap::Subcommand, Debug)]
+pub enum Command {
+    /// Generate a starter configuration: senses API-key env vars, verifies
+    /// provider and model against the provider's live model list, and
+    /// enables the aura-bootstrap agent for conversational setup.
+    Init(crate::init::InitArgs),
+}
+
 /// Aura CLI — interactive chat completions REPL
 #[derive(Parser, Debug)]
 #[command(name = "aura-cli", version, about)]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Base API URL (e.g. https://api.example.com)
     #[arg(long, env = "AURA_API_URL")]
     pub api_url: Option<String>,
