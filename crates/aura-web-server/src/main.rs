@@ -187,9 +187,20 @@ async fn run() -> std::io::Result<()> {
     info!("Starting Aura Web Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Loading configuration from: {}", args.config);
 
-    let configs = match load_config(&args.config) {
-        Ok(cfgs) => cfgs,
+    let config_pairs = match aura_config::load_config_with_paths(&args.config) {
+        Ok(pairs) => pairs,
         Err(e) => {
+            if !std::path::Path::new(&args.config).exists() {
+                let msg = format!(
+                    "No configuration found at '{}'. Generate a starter config with \
+                     `aura-cli init` (it senses your API keys, verifies the model \
+                     against the provider, and enables the aura-bootstrap setup \
+                     agent), then start the server again.",
+                    args.config
+                );
+                error!("{msg}");
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+            }
             error!("Failed to load configuration: {}", e);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -198,11 +209,55 @@ async fn run() -> std::io::Result<()> {
         }
     };
 
-    for config in &configs {
+    for (_, config) in &config_pairs {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
         let (provider, model) = config.agent.llm.model_info();
         info!("Loaded agent '{}' ({}/{})", id, provider, model);
     }
+
+    // The bootstrap agent's name is reserved: a normal agent squatting on it
+    // would silently absorb token-gated traffic.
+    if let Some((_, config)) = config_pairs.iter().find(|(_, c)| {
+        [Some(c.agent.name.as_str()), c.agent.alias.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|id| id.eq_ignore_ascii_case(aura::bootstrap::BOOTSTRAP_AGENT_NAME))
+    }) {
+        let msg = format!(
+            "agent '{}' uses the reserved name '{}'",
+            config.agent.name,
+            aura::bootstrap::BOOTSTRAP_AGENT_NAME
+        );
+        error!("{msg}");
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+
+    // At most one config file may enable [bootstrap] — it supplies the
+    // bootstrap agent's LLM and is the default write target.
+    let enablers: Vec<&(std::path::PathBuf, aura_config::Config)> = config_pairs
+        .iter()
+        .filter(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
+        .collect();
+    if enablers.len() > 1 {
+        let files: Vec<String> = enablers
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+        let msg = format!(
+            "[bootstrap] is enabled in more than one config file ({}) — enable it \
+             in exactly one so the bootstrap agent's LLM and write target are \
+             unambiguous",
+            files.join(", ")
+        );
+        error!("{msg}");
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    let bootstrap_declaration = enablers
+        .first()
+        .map(|(path, config)| (path.clone(), config.clone()));
+
+    let configs: Vec<aura_config::Config> =
+        config_pairs.into_iter().map(|(_, config)| config).collect();
 
     // Validate DEFAULT_AGENT matches a loaded config
     if let Some(ref default_agent) = args.default_agent {
@@ -225,7 +280,90 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
+    let roster_names: Vec<String> = configs
+        .iter()
+        .map(|c| {
+            c.agent
+                .alias
+                .as_deref()
+                .unwrap_or(&c.agent.name)
+                .to_string()
+        })
+        .collect();
     let config_registry = Arc::new(types::ConfigRegistry::new(configs));
+
+    // Token-gated aura-bootstrap agent, when exactly one config enabled it.
+    let bootstrap_state = bootstrap_declaration.map(|(declaring_path, declaring)| {
+        let token = match std::env::var("AURA_BOOTSTRAP_TOKEN") {
+            Ok(t) if !t.trim().is_empty() => {
+                tracing::warn!("Bootstrap agent enabled; token taken from AURA_BOOTSTRAP_TOKEN");
+                t.trim().to_string()
+            }
+            _ => {
+                let token = uuid::Uuid::new_v4().to_string();
+                // Printed to logs by design: whoever can read this server's
+                // logs is authorized to administer its configuration.
+                tracing::warn!(
+                    "Bootstrap agent enabled; no AURA_BOOTSTRAP_TOKEN set — generated \
+                     token: {token}"
+                );
+                token
+            }
+        };
+        tracing::warn!(
+            "Chat with the bootstrap agent: aura-cli --api-url http://{}:{} \
+             --model {} --api-key <token>",
+            args.host,
+            args.port,
+            aura::bootstrap::BOOTSTRAP_AGENT_NAME,
+        );
+
+        let target = aura::bootstrap::ConfigTarget {
+            config_path: std::path::PathBuf::from(&args.config),
+            target: declaring_path,
+        };
+
+        // Hot reload: re-load from disk and swap the roster. Captures the
+        // registry (not the AppState) to avoid a reference cycle.
+        let registry = config_registry.clone();
+        let reload_path = args.config.clone();
+        let default_agent = args.default_agent.clone();
+        let reload: aura::bootstrap::ReloadHook = Arc::new(move || {
+            let configs = load_config(&reload_path).map_err(|e| e.to_string())?;
+            let names: Vec<String> = configs
+                .iter()
+                .map(|c| {
+                    c.agent
+                        .alias
+                        .as_deref()
+                        .unwrap_or(&c.agent.name)
+                        .to_string()
+                })
+                .collect();
+            if let Some(da) = &default_agent
+                && !names.iter().any(|n| n == da)
+            {
+                tracing::warn!("DEFAULT_AGENT '{da}' no longer matches any agent after hot reload");
+            }
+            let count = names.len();
+            registry.replace(configs);
+            tracing::warn!("Hot reload applied: {count} agent(s) now live");
+            Ok(format!(
+                "Hot reload applied; {count} agent(s) now live: {}",
+                names.join(", ")
+            ))
+        });
+
+        types::BootstrapState {
+            agent_config: aura::bootstrap::bootstrap_agent_config(
+                &declaring,
+                &target,
+                &roster_names,
+            ),
+            token,
+            tools: aura::bootstrap::bootstrap_tools_factory(target, reload),
+        }
+    });
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
@@ -236,6 +374,7 @@ async fn run() -> std::io::Result<()> {
 
     let app_state = Arc::new(AppState {
         configs: config_registry,
+        bootstrap: bootstrap_state,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,

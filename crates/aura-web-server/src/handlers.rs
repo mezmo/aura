@@ -60,6 +60,7 @@ impl Drop for RequestResourceGuard {
 pub enum PrepareError {
     BadRequest(String),
     NotFound(String),
+    Unauthorized(String),
     Internal(String),
 }
 
@@ -69,6 +70,7 @@ impl PrepareError {
         match self {
             PrepareError::BadRequest(msg) => msg,
             PrepareError::NotFound(msg) => msg,
+            PrepareError::Unauthorized(msg) => msg,
             PrepareError::Internal(msg) => msg,
         }
     }
@@ -84,6 +86,15 @@ impl PrepareError {
                 Json(ChatCompletionErrorResponse::ModelNotFound(model_name)),
             )
                 .into_response(),
+            PrepareError::Unauthorized(msg) => {
+                let mut response =
+                    error_response(StatusCode::UNAUTHORIZED, msg, "authentication_error");
+                response.headers_mut().insert(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static("Bearer"),
+                );
+                response
+            }
             PrepareError::Internal(msg) => {
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, msg, "internal_error")
             }
@@ -208,25 +219,40 @@ pub async fn prepare_request(
     // spawns) works against an immutable view, unaffected by hot reloads.
     let configs = data.configs.snapshot();
 
-    // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
-    // Single-config servers accept any model field value (clients like LibreChat always send one).
-    // Multi-config servers require the model field to match an alias or agent name.
-    let config = if configs.len() == 1 {
-        configs[0].clone()
-    } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
-        configs
-            .iter()
-            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
-            .cloned()
-            .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))?
+    // The reserved bootstrap model name is checked BEFORE roster resolution
+    // (the single-config passthrough would otherwise route it to the normal
+    // agent). Reaching the bootstrap agent always requires its explicit name
+    // plus the token — the passthrough and DEFAULT_AGENT can never select it.
+    let (config, additional_tools) = if req.model.as_deref()
+        == Some(aura::bootstrap::BOOTSTRAP_AGENT_NAME)
+    {
+        let Some(bootstrap) = data.bootstrap.as_ref() else {
+            return Err(PrepareError::NotFound(
+                aura::bootstrap::BOOTSTRAP_AGENT_NAME.to_string(),
+            ));
+        };
+        verify_bootstrap_token(&bootstrap.token, req_headers_map)?;
+        (bootstrap.agent_config.clone(), (bootstrap.tools)())
     } else {
-        return Err(PrepareError::BadRequest(
-            "you must provide a model parameter".to_string(),
-        ));
+        // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
+        // Single-config servers accept any model field value (clients like LibreChat always send one).
+        // Multi-config servers require the model field to match an alias or agent name.
+        let config = if configs.len() == 1 {
+            configs[0].clone()
+        } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
+            configs
+                .iter()
+                .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
+                .cloned()
+                .ok_or_else(|| PrepareError::NotFound(model_name.to_string()))?
+        } else {
+            return Err(PrepareError::BadRequest(
+                "you must provide a model parameter".to_string(),
+            ));
+        };
+        // Additional tools from the factory (e.g., CLI tools in standalone mode)
+        (config, (data.additional_tools)())
     };
-
-    // Get additional tools from the factory (e.g., CLI tools in standalone mode)
-    let additional_tools = (data.additional_tools)();
 
     // Convert request-supplied client tool definitions once; both paths use them.
     let client_tools_vec: Option<Vec<aura::builder::ClientTool>> = req
@@ -278,6 +304,48 @@ pub async fn prepare_request(
         chat_session_id: chat_session_id.to_string(),
         has_client_tools,
     })
+}
+
+/// Verify the bootstrap token on a request addressed to the bootstrap agent.
+///
+/// Accepts `Authorization: Bearer <token>` (the CLI's `--api-key` sends this
+/// unmodified) or `x-aura-bootstrap-token: <token>` for deployments where a
+/// gateway consumes the Authorization header. Header keys are lowercase
+/// (axum `HeaderName` invariant).
+fn verify_bootstrap_token(
+    expected: &str,
+    req_headers_map: &HashMap<String, String>,
+) -> Result<(), PrepareError> {
+    let presented = req_headers_map
+        .get("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| {
+            req_headers_map
+                .get("x-aura-bootstrap-token")
+                .map(String::as_str)
+        });
+    match presented {
+        Some(token) if constant_time_eq(token.trim(), expected) => Ok(()),
+        _ => Err(PrepareError::Unauthorized(
+            "the aura-bootstrap agent requires a valid token (Authorization: \
+             Bearer <token> or x-aura-bootstrap-token). The token is set via \
+             AURA_BOOTSTRAP_TOKEN or printed in this server's startup logs."
+                .to_string(),
+        )),
+    }
+}
+
+/// Constant-time string comparison (length folded into the accumulator) so
+/// token verification doesn't leak prefix-match timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
 }
 
 /// Handle chat completions endpoint
@@ -866,7 +934,7 @@ pub async fn health() -> Response {
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
-    let models: Vec<serde_json::Value> = state
+    let mut models: Vec<serde_json::Value> = state
         .configs
         .snapshot()
         .iter()
@@ -885,6 +953,17 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             })
         })
         .collect();
+
+    // The bootstrap agent is advertised for discoverability; chatting with
+    // it still requires the token.
+    if let Some(bootstrap) = &state.bootstrap {
+        models.push(serde_json::json!({
+            "id": aura::bootstrap::BOOTSTRAP_AGENT_NAME,
+            "object": "model",
+            "created": bootstrap.agent_config.agent.created_at / 1000,
+            "owned_by": "aura"
+        }));
+    }
 
     Json(serde_json::json!({
         "object": "list",
@@ -919,6 +998,121 @@ fn error_response(
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatMessageFunctionCall, ChatMessageToolCall, Role};
+
+    // ------------------------------------------------------------------
+    // bootstrap token gate
+    // ------------------------------------------------------------------
+
+    fn headers_with(key: &str, value: &str) -> HashMap<String, String> {
+        HashMap::from([(key.to_string(), value.to_string())])
+    }
+
+    #[test]
+    fn token_accepted_via_bearer_and_custom_header() {
+        let ok = headers_with("authorization", "Bearer secret-token");
+        assert!(verify_bootstrap_token("secret-token", &ok).is_ok());
+
+        let ok = headers_with("x-aura-bootstrap-token", "secret-token");
+        assert!(verify_bootstrap_token("secret-token", &ok).is_ok());
+    }
+
+    #[test]
+    fn token_rejected_when_wrong_or_missing() {
+        let wrong = headers_with("authorization", "Bearer nope");
+        assert!(matches!(
+            verify_bootstrap_token("secret-token", &wrong),
+            Err(PrepareError::Unauthorized(_))
+        ));
+
+        let missing = HashMap::new();
+        assert!(matches!(
+            verify_bootstrap_token("secret-token", &missing),
+            Err(PrepareError::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn constant_time_eq_handles_lengths_and_content() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    fn make_state(bootstrap: Option<crate::types::BootstrapState>) -> AppState {
+        AppState {
+            configs: Arc::new(crate::types::ConfigRegistry::new(vec![
+                aura_config::Config::default(),
+            ])),
+            bootstrap,
+            tool_result_mode: crate::streaming::ToolResultMode::None,
+            tool_result_max_length: 0,
+            streaming_buffer_size: 16,
+            aura_custom_events: false,
+            aura_emit_reasoning: false,
+            streaming_timeout_secs: 0,
+            first_chunk_timeout_secs: 0,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
+            active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
+            default_agent: None,
+            additional_tools: Arc::new(Vec::new),
+        }
+    }
+
+    fn bootstrap_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: Some(aura::bootstrap::BOOTSTRAP_AGENT_NAME.to_string()),
+            messages: vec![msg(Role::User, "hello")],
+            max_tokens: None,
+            stream: Some(true),
+            metadata: None,
+            tools: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_model_is_not_found_when_disabled() {
+        // Even on a single-config server (where the passthrough accepts any
+        // model name), the reserved name must not route to the normal agent.
+        let state = make_state(None);
+        let mut req = bootstrap_request();
+        let err = prepare_request(&state, &mut req, "session", &HashMap::new())
+            .await
+            .err()
+            .expect("expected error");
+        assert!(matches!(err, PrepareError::NotFound(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_model_requires_token_when_enabled() {
+        let bootstrap = crate::types::BootstrapState {
+            agent_config: aura_config::Config::default(),
+            token: "secret-token".to_string(),
+            tools: Arc::new(Vec::new),
+        };
+        let state = make_state(Some(bootstrap));
+
+        let mut req = bootstrap_request();
+        let err = prepare_request(&state, &mut req, "session", &HashMap::new())
+            .await
+            .err()
+            .expect("expected error");
+        assert!(matches!(err, PrepareError::Unauthorized(_)), "got: {err:?}");
+
+        let mut req = bootstrap_request();
+        let err = prepare_request(
+            &state,
+            &mut req,
+            "session",
+            &headers_with("authorization", "Bearer wrong"),
+        )
+        .await
+        .err()
+        .expect("expected error");
+        assert!(matches!(err, PrepareError::Unauthorized(_)), "got: {err:?}");
+    }
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {

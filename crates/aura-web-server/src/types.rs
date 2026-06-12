@@ -104,9 +104,28 @@ impl ConfigRegistry {
     }
 }
 
+/// Runtime state for the built-in `aura-bootstrap` agent.
+///
+/// Present only when exactly one loaded config set `[bootstrap] enabled =
+/// true`. The agent lives outside the [`ConfigRegistry`], so hot reloads
+/// never touch it and a bootstrap conversation survives the configs it
+/// applies. Fixed at startup — `[bootstrap]` changes take effect on restart.
+pub struct BootstrapState {
+    /// The served agent (assembled by `aura::bootstrap::bootstrap_agent_config`).
+    pub agent_config: aura_config::Config,
+    /// Required on every request addressed to the bootstrap agent
+    /// (`Authorization: Bearer <token>` or `x-aura-bootstrap-token`).
+    pub token: String,
+    /// Factory for the agent's configuration tools (read / inspect / write);
+    /// called once per request, shares the discovery cache across calls.
+    pub tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
+}
+
 /// Application state
 pub struct AppState {
     pub configs: Arc<ConfigRegistry>,
+    /// Token-gated bootstrap agent; `None` when disabled (the default).
+    pub bootstrap: Option<BootstrapState>,
     pub tool_result_mode: ToolResultMode,
     /// Maximum length for tool results (0 = no truncation)
     pub tool_result_max_length: usize,

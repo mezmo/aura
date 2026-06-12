@@ -65,6 +65,7 @@ impl DirectBackend {
 
         let app_state = Arc::new(AppState {
             configs: Arc::new(aura_web_server::types::ConfigRegistry::new(configs)),
+            bootstrap: None,
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
@@ -383,6 +384,7 @@ mod tests {
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
         let app_state = Arc::new(AppState {
             configs: Arc::new(aura_web_server::types::ConfigRegistry::new(configs)),
+            bootstrap: None,
             tool_result_mode: ToolResultMode::Aura,
             tool_result_max_length: 0,
             streaming_buffer_size: 400,
