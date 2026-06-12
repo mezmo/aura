@@ -462,19 +462,22 @@ impl Task {
     /// Compact preview of a completed task's result for budget-constrained
     /// rendering: the structured-output summary when present, otherwise the
     /// truncated result. An artifact footer in the result is re-appended if
-    /// truncation cut it off, so lineage to the on-disk artifact survives.
+    /// truncation cut it off, so lineage to the on-disk artifact survives;
+    /// the body truncation leaves room for it, keeping the whole preview
+    /// within `max_bytes`.
     ///
     /// Returns `None` unless the task is `Complete`.
     pub(crate) fn compact_preview(&self, max_bytes: usize) -> Option<String> {
         let result = self.state.completed_result()?;
         let footer = extract_artifact_footer(result);
+        let body_budget = max_bytes.saturating_sub(footer.map_or(0, |f| f.len() + 1));
         let body = self
             .structured_output
             .as_ref()
             .map(|so| so.summary.as_str())
             .filter(|summary| !summary.is_empty())
             .unwrap_or(result);
-        let (truncated, _) = crate::string_utils::safe_truncate(body, max_bytes);
+        let (truncated, _) = crate::string_utils::safe_truncate(body, body_budget);
 
         Some(
             footer
@@ -1367,7 +1370,12 @@ mod tests {
             preview.ends_with(footer),
             "footer must survive truncation: {preview}"
         );
-        assert!(preview.starts_with(&"X".repeat(500)));
+        assert!(preview.starts_with('X'), "body precedes footer: {preview}");
+        assert!(
+            preview.len() <= 500,
+            "preview must stay within max_bytes, got {} bytes",
+            preview.len()
+        );
     }
 
     #[test]
