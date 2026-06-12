@@ -144,6 +144,27 @@ Registering a store under `[[vector_stores]]` only defines it — no agent can q
 
 See [`examples/reference.toml`](../examples/reference.toml) for both.
 
+### Add agent skills
+
+Skills provide on-demand workflow instructions that the agent loads only when needed, keeping the base system prompt small. Create a skills directory with subdirectories containing `SKILL.md` files:
+
+```
+skills/
+└── incident-response/
+    ├── SKILL.md
+    └── references/
+        └── runbook.md
+```
+
+Then add the source to your config:
+
+```toml
+[[agent.skills.local]]
+source = "./skills"
+```
+
+The agent sees a catalog of available skills and calls `load_skill("incident-response")` when a user asks about incident handling. See the [Skills guide](skills.md) for the full `SKILL.md` format and orchestration options.
+
 ### Serve multiple agents
 
 Create a directory with one TOML file per agent:
