@@ -114,6 +114,9 @@ pub mod config {
         /// results are suppressed and the final chunk uses
         /// `finish_reason: "tool_calls"` instead of `"stop"`.
         pub has_client_tools: bool,
+        /// Surface raw upstream provider errors to the client (see
+        /// `AURA_DEBUG_PROVIDER_ERRORS`).
+        pub debug_provider_errors: bool,
     }
 
     impl StreamConfig {
@@ -130,6 +133,7 @@ pub mod config {
                 tool_result_max_length,
                 fallback_tool_parsing: false,
                 has_client_tools: false,
+                debug_provider_errors: false,
             }
         }
 
@@ -142,6 +146,12 @@ pub mod config {
         /// Mark the request as carrying client-side tool definitions.
         pub fn with_client_tools(mut self, enabled: bool) -> Self {
             self.has_client_tools = enabled;
+            self
+        }
+
+        /// Enable surfacing of raw upstream provider error detail (dev only).
+        pub fn with_debug_provider_errors(mut self, enabled: bool) -> Self {
+            self.debug_provider_errors = enabled;
             self
         }
     }

@@ -563,11 +563,10 @@ fn process_stream_next(
                     return NextItemResult::End(vec![bytes]);
                 }
             } else {
-                let user_message = format!(
-                    "The upstream model provider ({}) returned an error and the request \
-                     could not be completed. Please try again or contact support if the \
-                     issue persists.",
-                    ctx.model_str
+                let user_message = build_provider_error_message(
+                    &ctx.model_str,
+                    &error_str,
+                    config.debug_provider_errors,
                 );
                 state.accumulated_content.push_str(&user_message);
                 let chunk = build_text_chunk(ctx, &user_message, state.is_first_chunk);
@@ -1262,6 +1261,35 @@ fn is_context_overflow_error(error_str: &str) -> bool {
         || (lower.contains("context") && lower.contains("exceeded"))
 }
 
+/// `error_str`'s format is owned by the provider/rig, so it is surfaced as-is
+/// rather than parsed. `debug` gates whether it reaches the client verbatim or
+/// is replaced by a generic message (see `AURA_DEBUG_PROVIDER_ERRORS`).
+fn build_provider_error_message(model: &str, error_str: &str, debug: bool) -> String {
+    if debug {
+        format!(
+            "The upstream model provider ({model}) returned an error: {}",
+            truncate_error_detail(error_str.trim())
+        )
+    } else {
+        format!(
+            "The upstream model provider ({model}) returned an error and the request \
+             could not be completed. Please try again or contact support if the \
+             issue persists."
+        )
+    }
+}
+
+/// Bound the surfaced detail so a giant provider body (e.g. an HTML gateway
+/// error page) can't flood the response stream. Truncates on a char boundary.
+fn truncate_error_detail(detail: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 500;
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    let truncated: String = detail.chars().take(MAX_DETAIL_CHARS).collect();
+    format!("{truncated}…")
+}
+
 fn build_text_chunk(ctx: &TurnContext, content: &str, is_first: bool) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: ctx.completion_id.clone(),
@@ -1346,6 +1374,7 @@ mod tests {
             tool_result_max_length: 1000,
             fallback_tool_parsing: false,
             has_client_tools: false,
+            debug_provider_errors: false,
         };
 
         let ctx = TurnContext {
@@ -1607,32 +1636,103 @@ mod tests {
         );
 
         let items: Vec<Result<StreamItem, StreamError>> = vec![Err(
-            "400 Bad Request: temperature is not supported for gpt-5-mini".into(),
+            r#"ProviderError: Invalid status code 429 with message: {"error":{"message":"Rate limit reached for gpt-4o"}}"#
+                .into(),
         )];
         let stream = futures_util::stream::iter(items);
 
         let (outcome, termination) = collect_stream_to_completion(&config, &ctx, stream).await;
 
+        // Default config (debug off): generic message, no raw detail leaked.
         assert!(
             outcome.content.contains("upstream model provider"),
             "Expected error message in content, got: {}",
             outcome.content
         );
         assert!(
-            outcome.content.contains("test-model"),
-            "Expected model name in error message, got: {}",
-            outcome.content
-        );
-        assert!(
             outcome.content.contains("could not be completed"),
-            "Expected actionable guidance in error message, got: {}",
+            "Expected generic message by default, got: {}",
             outcome.content
         );
         assert!(
-            matches!(&termination, StreamTermination::StreamError(msg) if msg.contains("temperature")),
+            !outcome.content.contains("Rate limit reached for gpt-4o"),
+            "Raw provider detail must NOT leak when debug is off, got: {}",
+            outcome.content
+        );
+        // Full raw error is still captured for logs/OTel via the termination.
+        assert!(
+            matches!(&termination, StreamTermination::StreamError(msg) if msg.contains("Rate limit reached")),
             "Expected StreamError termination, got: {:?}",
             termination
         );
+    }
+
+    #[tokio::test]
+    async fn test_collect_stream_debug_flag_surfaces_provider_detail() {
+        let config = StreamConfig::new(false, false, ToolResultMode::None, 0)
+            .with_debug_provider_errors(true);
+        let ctx = TurnContext::new(
+            "test-id".to_string(),
+            "test-model".to_string(),
+            0,
+            None,
+            "test-session",
+        );
+
+        let raw = r#"ProviderError: Invalid status code 429 with message: {"error":{"message":"Rate limit reached for gpt-4o"}}"#;
+        let items: Vec<Result<StreamItem, StreamError>> = vec![Err(raw.into())];
+        let stream = futures_util::stream::iter(items);
+
+        let (outcome, _termination) = collect_stream_to_completion(&config, &ctx, stream).await;
+
+        assert!(
+            outcome.content.contains("test-model"),
+            "Expected model name, got: {}",
+            outcome.content
+        );
+        // Debug on: the raw provider error is surfaced verbatim.
+        assert!(
+            outcome.content.contains(raw),
+            "Expected raw provider detail with debug on, got: {}",
+            outcome.content
+        );
+    }
+
+    #[test]
+    fn provider_error_debug_surfaces_raw_detail_verbatim() {
+        let raw = r#"ProviderError: Invalid status code 429 with message: {"error":{"message":"Rate limit reached for gpt-4o","type":"requests"}}"#;
+        let msg = build_provider_error_message("openai/gpt-4o", raw, true);
+        assert!(msg.contains("openai/gpt-4o"), "model missing: {msg}");
+        // No parsing — the full upstream error is passed through unredacted.
+        assert!(msg.contains(raw), "raw detail missing: {msg}");
+    }
+
+    #[test]
+    fn provider_error_default_is_generic_and_hides_detail() {
+        let raw = r#"ProviderError: {"error":{"message":"sensitive internal detail","type":"x"}}"#;
+        let msg = build_provider_error_message("openai/gpt-4o", raw, false);
+        assert!(msg.contains("openai/gpt-4o"), "model missing: {msg}");
+        assert!(
+            msg.contains("could not be completed"),
+            "expected generic message: {msg}"
+        );
+        assert!(
+            !msg.contains("sensitive internal detail"),
+            "must not leak provider detail when debug is off: {msg}"
+        );
+    }
+
+    #[test]
+    fn provider_error_debug_caps_long_raw() {
+        let raw = format!("ProviderError: {}", "x".repeat(2000));
+        let msg = build_provider_error_message("test-model", &raw, true);
+        assert!(
+            msg.chars().count() < 700,
+            "expected capped length, got {} chars",
+            msg.chars().count()
+        );
+        assert!(msg.contains('…'), "expected ellipsis marker: {msg}");
+        assert!(msg.contains("test-model"), "model missing: {msg}");
     }
 
     #[tokio::test]

@@ -84,6 +84,9 @@ pub struct AppState {
     pub aura_custom_events: bool,
     /// Enable reasoning event emission (only when aura_custom_events is true)
     pub aura_emit_reasoning: bool,
+    /// Surface raw upstream provider errors to clients (see
+    /// `AURA_DEBUG_PROVIDER_ERRORS`).
+    pub debug_provider_errors: bool,
     /// SSE streaming request timeout in seconds (0 = no timeout)
     pub streaming_timeout_secs: u64,
     /// First chunk timeout in seconds (0 = disabled). Protects against hung provider connections.
