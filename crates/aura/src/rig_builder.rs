@@ -9,7 +9,7 @@
 //! web server can inject per-request credentials into MCP calls.
 
 use crate::builder::{Agent, ClientTool, build_streaming_agent};
-use crate::config::AgentRuntimeConfig;
+use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
 use crate::streaming::StreamingAgent;
 use aura_config::{AgentSettings, Config, LocalSkillSource, McpServerConfig};
@@ -92,7 +92,9 @@ impl RigBuilder {
             && let Ok(env_dir) = std::env::var("AURA_SKILLS_DIR")
         {
             tracing::info!("Using AURA_SKILLS_DIR fallback: {}", env_dir);
-            skill_sources.push(LocalSkillSource { source: env_dir });
+            skill_sources.push(LocalSkillSource {
+                source: env_dir.into(),
+            });
         }
 
         agent_config.agent.skills =
@@ -101,7 +103,7 @@ impl RigBuilder {
         // Per-worker skill overrides: discover explicit sources only (no
         // AURA_SKILLS_DIR fallback — that is agent-level only). A worker
         // without a skills key inherits `[agent.skills]` and stays out of
-        // the map; `skills.local = []` lands as an empty vec (disabled).
+        // the map.
         if let Some(orch) = &self.config.orchestration {
             for (name, worker) in &orch.workers {
                 if let Some(worker_skills) = &worker.skills {
@@ -109,7 +111,14 @@ impl RigBuilder {
                         &worker_skills.local,
                         self.config_dir.as_deref(),
                     )?;
-                    agent_config.worker_skills.insert(name.clone(), discovered);
+                    let override_skills = if discovered.is_empty() {
+                        WorkerSkills::Disable
+                    } else {
+                        WorkerSkills::Override(discovered)
+                    };
+                    agent_config
+                        .worker_skills
+                        .insert(name.clone(), override_skills);
                 }
             }
         }
@@ -572,25 +581,29 @@ skills.local = []
 
         let agent_config = agent_config.expect("discovery should succeed");
 
-        let skilled = agent_config
+        match agent_config
             .worker_skills
             .get("skilled")
-            .expect("explicit sources should discover skills into the map");
-        assert_eq!(skilled.len(), 1);
-        assert_eq!(skilled[0].name, "alpha");
+            .expect("explicit sources should discover skills into the map")
+        {
+            WorkerSkills::Override(skills) => {
+                assert_eq!(skills.len(), 1);
+                assert_eq!(skills[0].name, "alpha");
+            }
+            WorkerSkills::Disable => panic!("explicit sources should override, not disable"),
+        }
 
         assert!(
             !agent_config.worker_skills.contains_key("inheriting"),
             "worker without skills key should inherit (absent), even with AURA_SKILLS_DIR set"
         );
 
-        let disabled = agent_config
-            .worker_skills
-            .get("disabled")
-            .expect("skills.local = [] should be present, not inherit");
         assert!(
-            disabled.is_empty(),
-            "skills.local = [] should disable skills (empty entry)"
+            matches!(
+                agent_config.worker_skills.get("disabled"),
+                Some(WorkerSkills::Disable)
+            ),
+            "skills.local = [] should disable skills, not inherit"
         );
 
         // The AURA_SKILLS_DIR fallback applies to [agent.skills] only.

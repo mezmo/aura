@@ -146,18 +146,19 @@ struct CoordinatorTools {
 /// Apply the per-worker skill override onto the cloned agent config.
 ///
 /// Overrides live in `worker_skills`, keyed by worker name and discovered by
-/// `RigBuilder` at build time: a present key replaces `[agent.skills]` (an
-/// empty vec, from `skills.local = []`, explicitly disables skills); an
-/// absent key inherits.
+/// `RigBuilder` at build time: a present key replaces `[agent.skills]` for
+/// that worker; an absent key inherits.
 fn apply_worker_skills_override(
     worker_config: &mut crate::config::AgentRuntimeConfig,
     worker_name: Option<&str>,
 ) {
-    if let Some(override_skills) = worker_name
-        .and_then(|name| worker_config.worker_skills.get(name))
-        .cloned()
+    if let Some(override_skills) =
+        worker_name.and_then(|name| worker_config.worker_skills.get(name))
     {
-        worker_config.agent.skills = override_skills;
+        worker_config.agent.skills = match override_skills {
+            crate::config::WorkerSkills::Disable => Vec::new(),
+            crate::config::WorkerSkills::Override(skills) => skills.clone(),
+        };
     }
 }
 
@@ -5277,27 +5278,28 @@ mod tests {
     /// worker; an explicit empty entry disables skills.
     #[test]
     fn test_worker_skills_override_resolution() {
-        use crate::config::SkillConfig;
+        use crate::config::{SkillConfig, SkillName, WorkerSkills};
 
         let agent_skill = SkillConfig {
-            name: "agent-skill".to_string(),
+            name: SkillName::new("agent-skill").unwrap(),
             description: "Inherited from [agent.skills]".to_string(),
             path: std::path::PathBuf::from("/skills/agent-skill"),
         };
         let worker_skill = SkillConfig {
-            name: "worker-skill".to_string(),
+            name: SkillName::new("worker-skill").unwrap(),
             description: "Worker-specific".to_string(),
             path: std::path::PathBuf::from("/skills/worker-skill"),
         };
 
         let mut agent_config = crate::config::AgentRuntimeConfig::default();
         agent_config.agent.skills = vec![agent_skill];
+        agent_config.worker_skills.insert(
+            "overriding".to_string(),
+            WorkerSkills::Override(vec![worker_skill]),
+        );
         agent_config
             .worker_skills
-            .insert("overriding".to_string(), vec![worker_skill]);
-        agent_config
-            .worker_skills
-            .insert("disabling".to_string(), vec![]);
+            .insert("disabling".to_string(), WorkerSkills::Disable);
 
         let resolve = |worker_name: &str| {
             let mut worker_config = agent_config.clone();
