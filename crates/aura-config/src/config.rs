@@ -423,7 +423,6 @@ impl Config {
             }
         }
 
-        // Validate skill sources
         for source in &self.agent.skills.local {
             if source.source.is_empty() {
                 return Err(crate::ConfigError::Validation(
@@ -619,7 +618,7 @@ pub struct ToolsConfig {
     pub custom_tools: Vec<String>,
 }
 
-/// Skills configuration - supports directory-based skill discovery
+/// The `[agent.skills]` TOML table: where to discover skills from.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct SkillsConfig {
     /// Local skill sources (directories containing skill subdirectories)
@@ -627,7 +626,7 @@ pub struct SkillsConfig {
     pub local: Vec<LocalSkillSource>,
 }
 
-/// A local directory source for skill discovery
+/// One `[[agent.skills.local]]` entry.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LocalSkillSource {
     /// Path to directory containing skill subdirectories (absolute or relative to config file)
@@ -693,7 +692,8 @@ pub struct AgentConfig {
     /// provide `[orchestration.worker.<name>.scratchpad]`.
     #[serde(default)]
     pub scratchpad: Option<ScratchpadConfig>,
-    /// Skills configuration for directory-based skill discovery
+    /// Skill discovery sources. Workers inherit these unless they provide
+    /// `[orchestration.worker.<name>.skills]`.
     #[serde(default)]
     pub skills: SkillsConfig,
 }
