@@ -104,6 +104,17 @@ pub struct WorkerConfig {
     /// `[orchestration.worker.<name>.scratchpad]`.
     #[serde(default)]
     pub scratchpad: Option<ScratchpadConfig>,
+
+    /// Declares this worker read-only: it must never receive tools that
+    /// mutate state. Default false.
+    ///
+    /// Enforced mechanically where tool assignments are validated (e.g. the
+    /// bootstrap agent's `write_config` rejects MCP tools annotated as
+    /// mutating, undiscovered tool names, and glob patterns in a read-only
+    /// worker's `mcp_filter`). Designed to also feed future call-time
+    /// permission checks.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 // ============================================================================

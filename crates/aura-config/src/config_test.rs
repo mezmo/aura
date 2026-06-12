@@ -1884,6 +1884,7 @@ max_extraction_tokens = 4000
             turn_depth: None,
             llm: None,
             scratchpad: None,
+            read_only: false,
         };
         let mut orch = OrchestrationConfig::default();
         for name in names {
@@ -1927,5 +1928,87 @@ max_extraction_tokens = 4000
         // No workers configured at all is fine.
         let orch = crate::OrchestrationConfig::default();
         assert!(orch.validate_worker_names().is_ok());
+    }
+
+    // ========================================================================
+    // [bootstrap] table
+    // ========================================================================
+
+    const MINIMAL_AGENT: &str = r#"
+[agent]
+name = "assistant"
+system_prompt = "You are helpful."
+
+[agent.llm]
+provider = "ollama"
+model = "qwen3:8b"
+"#;
+
+    #[test]
+    fn bootstrap_absent_by_default() {
+        let config = load_config_from_str(MINIMAL_AGENT).unwrap();
+        assert!(config.bootstrap.is_none());
+    }
+
+    #[test]
+    fn bootstrap_table_parses_enabled() {
+        let toml = format!("{MINIMAL_AGENT}\n[bootstrap]\nenabled = true\n");
+        let config = load_config_from_str(&toml).unwrap();
+        let bootstrap = config.bootstrap.expect("bootstrap table present");
+        assert!(bootstrap.enabled);
+        assert!(bootstrap.llm.is_none());
+    }
+
+    #[test]
+    fn bootstrap_enabled_defaults_false() {
+        let toml = format!("{MINIMAL_AGENT}\n[bootstrap]\n");
+        let config = load_config_from_str(&toml).unwrap();
+        assert!(!config.bootstrap.unwrap().enabled);
+    }
+
+    #[test]
+    fn bootstrap_llm_override_parses() {
+        let toml = format!(
+            "{MINIMAL_AGENT}\n[bootstrap]\nenabled = true\n\n\
+             [bootstrap.llm]\nprovider = \"ollama\"\nmodel = \"qwen3:32b\"\n"
+        );
+        let config = load_config_from_str(&toml).unwrap();
+        let llm = config.bootstrap.unwrap().llm.expect("llm override");
+        assert_eq!(llm.model_info(), ("ollama", "qwen3:32b"));
+    }
+
+    #[test]
+    fn bootstrap_llm_override_requires_api_key() {
+        let toml = format!(
+            "{MINIMAL_AGENT}\n[bootstrap]\nenabled = true\n\n\
+             [bootstrap.llm]\nprovider = \"openai\"\napi_key = \"\"\nmodel = \"gpt-5.1\"\n"
+        );
+        let err = load_config_from_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("bootstrap.llm"), "got: {err}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_unknown_fields() {
+        let toml = format!("{MINIMAL_AGENT}\n[bootstrap]\nenabledd = true\n");
+        assert!(load_config_from_str(&toml).is_err());
+    }
+
+    // ========================================================================
+    // per-worker read_only flag
+    // ========================================================================
+
+    #[test]
+    fn worker_read_only_defaults_false_and_parses_true() {
+        let toml = format!(
+            "{MINIMAL_AGENT}\n[orchestration]\nenabled = true\n\n\
+             [orchestration.worker.watcher]\n\
+             description = \"d\"\npreamble = \"p\"\nread_only = true\n\n\
+             [orchestration.worker.doer]\n\
+             description = \"d\"\npreamble = \"p\"\n"
+        );
+        let config = load_config_from_str(&toml).unwrap();
+        let workers = &config.orchestration.unwrap().workers;
+        assert!(workers["watcher"].read_only);
+        assert!(!workers["doer"].read_only);
     }
 }

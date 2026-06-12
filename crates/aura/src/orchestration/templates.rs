@@ -391,6 +391,7 @@ Always verify your calculations before reporting results."
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
         workers.insert(
@@ -416,6 +417,7 @@ TOOL USAGE:
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
 

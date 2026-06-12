@@ -22,6 +22,30 @@ pub struct Config {
     /// Orchestration mode configuration (multi-agent workflows)
     #[serde(default)]
     pub orchestration: Option<OrchestrationConfig>,
+    /// Built-in `aura-bootstrap` agent configuration (TOML `[bootstrap]`
+    /// table). Absent or `enabled = false` (the default) means the
+    /// bootstrap agent is not served.
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapConfig>,
+}
+
+/// Configuration for the built-in `aura-bootstrap` agent (TOML `[bootstrap]`
+/// table).
+///
+/// The bootstrap agent is a token-gated administrative agent served alongside
+/// the configured agents; it can read, validate, and write this server's
+/// configuration. Disabled by default. Changes to this table take effect on
+/// restart, not hot reload.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapConfig {
+    /// Serve the bootstrap agent. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// LLM override for the bootstrap agent (TOML `[bootstrap.llm]`).
+    /// When omitted, the bootstrap agent runs on this file's `[agent.llm]`.
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -323,6 +347,10 @@ impl Config {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         validate_llm_api_key(&self.agent.llm, "agent.llm")?;
+
+        if let Some(bootstrap_llm) = self.bootstrap.as_ref().and_then(|b| b.llm.as_ref()) {
+            validate_llm_api_key(bootstrap_llm, "bootstrap.llm")?;
+        }
 
         if let Some(orch) = &self.orchestration {
             for (name, worker) in &orch.workers {

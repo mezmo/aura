@@ -4243,6 +4243,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
         workers.insert(
@@ -4255,6 +4256,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
 
@@ -4319,6 +4321,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
 
@@ -4333,6 +4336,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
 
@@ -4347,6 +4351,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
 
@@ -4480,6 +4485,7 @@ mod tests {
                 turn_depth: None,
                 llm: None,
                 scratchpad: None,
+                read_only: false,
             },
         );
 
