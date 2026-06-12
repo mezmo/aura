@@ -3081,14 +3081,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         format!("✗ failed: {}{}", truncated, suffix)
                     }
                     TaskState::Pending => {
-                        let blocked_by = t.dependencies.iter().any(|dep_id| {
-                            plan.tasks
-                                .iter()
-                                .find(|dt| dt.id == *dep_id)
-                                .map(|dt| matches!(dt.state, TaskState::Failed { .. }))
-                                .unwrap_or(false)
-                        });
-                        if blocked_by {
+                        if plan.has_failed_ancestor(t.id) {
                             "⏸ blocked by failed dependency".to_string()
                         } else {
                             "⏳ pending".to_string()

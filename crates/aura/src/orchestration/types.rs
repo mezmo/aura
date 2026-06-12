@@ -239,24 +239,32 @@ impl Plan {
             .collect()
     }
 
-    /// Returns tasks that are blocked due to failed dependencies.
+    /// Returns tasks that are blocked because a dependency failed anywhere
+    /// up their ancestor chain.
     ///
-    /// These tasks cannot execute because at least one dependency has failed.
-    /// Used to identify tasks that need replanning.
+    /// Propagates transitively: when T0 fails in T0→T1→T2, both T1 and T2
+    /// are blocked. Without this, T2 sat in pending limbo (its direct
+    /// dependency never failed) and was silently dropped when the wave loop
+    /// found no ready tasks. Used to identify tasks that need replanning.
     pub fn blocked_tasks(&self) -> Vec<&Task> {
         self.tasks
             .iter()
             .filter(|task| {
-                matches!(task.state, TaskState::Pending)
-                    && task.dependencies.iter().any(|dep_id| {
-                        self.tasks
-                            .iter()
-                            .find(|t| t.id == *dep_id)
-                            .map(|t| matches!(t.state, TaskState::Failed { .. }))
-                            .unwrap_or(false)
-                    })
+                matches!(task.state, TaskState::Pending) && self.has_failed_ancestor(task.id)
             })
             .collect()
+    }
+
+    /// True if any transitive ancestor of `task_id` has failed.
+    ///
+    /// Unlike a direct-dependency check, this sees failures anywhere up the
+    /// dependency chain (e.g. T0 failing in T0→T1→T2 makes this true for
+    /// both T1 and T2).
+    pub fn has_failed_ancestor(&self, task_id: usize) -> bool {
+        self.transitive_ancestors(task_id).into_iter().any(|id| {
+            self.get_task(id)
+                .is_some_and(|t| matches!(t.state, TaskState::Failed { .. }))
+        })
     }
 
     /// Returns the transitive ancestor IDs of `task_id`: direct and indirect
@@ -885,10 +893,12 @@ impl IterationContext {
                     }
                 }
                 TaskState::Pending | TaskState::Running => {
-                    blocked_lines.push(format!(
-                        "- Task {}: {} → blocked (dependency failed)",
-                        t.id, t.description
-                    ));
+                    let reason = if self.previous_plan.has_failed_ancestor(t.id) {
+                        "blocked (dependency failed)"
+                    } else {
+                        "not executed"
+                    };
+                    blocked_lines.push(format!("- Task {}: {} → {}", t.id, t.description, reason));
                 }
             }
         }
@@ -1212,8 +1222,9 @@ mod tests {
 
     #[test]
     fn test_blocked_tasks_transitive_dependency() {
-        // Test: A -> B -> C, where A fails
-        // Both B and C depend (transitively) on A
+        // A -> B -> C, where A fails: BOTH B and C are blocked. C used to
+        // sit in pending limbo (its direct dependency never failed) and was
+        // silently dropped — the Mode 2 failure of mezmo/aura#221.
         let mut plan = Plan::new("Test");
         plan.add_task(Task::new(0, "Task A", "Initial task"));
         plan.add_task(Task::new(1, "Task B", "Depends on A").with_dependency(0));
@@ -1224,16 +1235,62 @@ mod tests {
             .unwrap()
             .fail("Error", FailureCategory::AgentError);
 
-        // Only task 1 is immediately blocked (direct dependency)
-        // Task 2 is not blocked yet because its direct dependency (task 1) hasn't failed
-        let blocked = plan.blocked_tasks();
-        assert_eq!(blocked.len(), 1, "Only direct dependents are blocked");
-        assert_eq!(blocked[0].id, 1);
+        let blocked: Vec<usize> = plan.blocked_tasks().iter().map(|t| t.id).collect();
+        assert_eq!(
+            blocked,
+            vec![1, 2],
+            "failure propagates through the whole chain"
+        );
 
         // No tasks should be ready
         assert!(
             plan.ready_tasks().is_empty(),
             "No tasks ready when chain is broken"
+        );
+    }
+
+    #[test]
+    fn test_blocked_tasks_diamond_partial_failure() {
+        // 0 -> {1, 2} -> 3: after 0 completes, only 1 fails. 3 is blocked
+        // (transitively through 1) even though 2 completed fine.
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Root", "r"));
+        plan.add_task(Task::new(1, "Left", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Right", "r").with_dependency(0));
+        plan.add_task(Task::new(3, "Join", "r").with_dependencies([1, 2]));
+
+        plan.get_task_mut(0).unwrap().complete("root done");
+        plan.get_task_mut(2).unwrap().complete("right done");
+        plan.get_task_mut(1)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+
+        let blocked: Vec<usize> = plan.blocked_tasks().iter().map(|t| t.id).collect();
+        assert_eq!(blocked, vec![3], "join blocked through the failed branch");
+    }
+
+    #[test]
+    fn test_has_failed_ancestor_transitive() {
+        // 0 -> 1 -> 2 with 0 failed: true for 1 AND 2; false for unrelated 3
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "A", "r"));
+        plan.add_task(Task::new(1, "B", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "C", "r").with_dependency(1));
+        plan.add_task(Task::new(3, "Solo", "r"));
+
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("Error", FailureCategory::AgentError);
+
+        assert!(plan.has_failed_ancestor(1));
+        assert!(
+            plan.has_failed_ancestor(2),
+            "failure must propagate through the chain"
+        );
+        assert!(!plan.has_failed_ancestor(3));
+        assert!(
+            !plan.has_failed_ancestor(0),
+            "task itself is not an ancestor"
         );
     }
 
