@@ -15,11 +15,26 @@ use std::sync::Arc;
 // are the single source of truth — `aura` no longer defines its own copies.
 pub use aura_config::{
     AgentSettings, EmbeddingConfig, LlmConfig, McpConfig, McpServerConfig, OrchestrationConfig,
-    ReasoningEffort, TodoToolsConfig, ToolsConfig, VectorStoreConfig, VectorStoreType, glob_match,
+    ReasoningEffort, SkillConfig, SkillName, TodoToolsConfig, ToolsConfig, VectorStoreConfig,
+    VectorStoreType, glob_match,
 };
 
 /// Type alias for tool context factory function.
 pub type ToolContextFactory = Arc<dyn Fn(&str) -> ToolCallContext + Send + Sync>;
+
+/// Resolved per-worker skill override.
+///
+/// Absence from [`AgentRuntimeConfig::worker_skills`] means the worker
+/// inherits `[agent.skills]`. There is deliberately no `Inherit` variant and
+/// no `Default` impl, so map lookups cannot silently turn "inherit" into
+/// "disable" via `unwrap_or_default()`.
+#[derive(Debug, Clone)]
+pub enum WorkerSkills {
+    /// `skills.local = []`: the worker gets no skills.
+    Disable,
+    /// Discovered skills replacing `[agent.skills]` wholesale (no merging).
+    Override(Vec<SkillConfig>),
+}
 
 /// Runtime build context for constructing agents.
 ///
@@ -43,6 +58,12 @@ pub struct AgentRuntimeConfig {
     pub memory_dir: Option<String>,
     /// Orchestration mode configuration (multi-agent workflows)
     pub orchestration: Option<OrchestrationConfig>,
+
+    /// Discovered per-worker skill overrides keyed by worker name. Populated
+    /// by `RigBuilder` at build time because skill discovery does filesystem
+    /// IO and can fail, so it cannot live on the pure config types. A present
+    /// key overrides `[agent.skills]` for that worker; an absent key inherits.
+    pub worker_skills: std::collections::HashMap<String, WorkerSkills>,
 
     // === Extension fields ===
     // These allow callers to customize agent building without modifying the builder.
@@ -99,6 +120,7 @@ impl Clone for AgentRuntimeConfig {
             tools: self.tools.clone(),
             memory_dir: self.memory_dir.clone(),
             orchestration: self.orchestration.clone(),
+            worker_skills: self.worker_skills.clone(),
             // Arc fields clone the Arc (shared reference)
             tool_wrapper: self.tool_wrapper.clone(),
             tool_context_factory: self.tool_context_factory.clone(),

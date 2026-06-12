@@ -129,6 +129,7 @@ impl AgentExecutor for AuraAgentExecutor {
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let config = self.resolve_config();
+        let config_dir = self.app_state.config_dir.clone();
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
@@ -164,7 +165,7 @@ impl AgentExecutor for AuraAgentExecutor {
             let config = config.ok_or_else(|| A2AError::invalid_params("no agent configuration available"))?;
 
             let session_id = Some(context_id.clone());
-            let builder = RigBuilder::new(config);
+            let builder = RigBuilder::new(config).with_config_dir(config_dir);
             let agent = match builder
                 .build_streaming_agent_with_headers(Some(&req_headers), session_id, None)
                 .await

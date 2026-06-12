@@ -5,7 +5,7 @@
 //! building, vector-store context strings) live in the `aura` crate's
 //! `orchestration::config` module.
 
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, SkillsConfig};
 use crate::scratchpad::ScratchpadConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -104,6 +104,13 @@ pub struct WorkerConfig {
     /// `[orchestration.worker.<name>.scratchpad]`.
     #[serde(default)]
     pub scratchpad: Option<ScratchpadConfig>,
+
+    /// Per-worker skill sources. Parsed from `[orchestration.worker.<name>.skills]`.
+    /// `None` inherits `[agent.skills]`; an explicit empty list disables skills
+    /// for this worker; a non-empty list replaces the agent's skills entirely
+    /// (no merging).
+    #[serde(default)]
+    pub skills: Option<SkillsConfig>,
 }
 
 // ============================================================================

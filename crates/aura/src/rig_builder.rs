@@ -9,23 +9,39 @@
 //! web server can inject per-request credentials into MCP calls.
 
 use crate::builder::{Agent, ClientTool, build_streaming_agent};
-use crate::config::AgentRuntimeConfig;
+use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
 use crate::streaming::StreamingAgent;
-use aura_config::{AgentSettings, Config, McpServerConfig};
+use aura_config::{AgentSettings, Config, LocalSkillSource, McpServerConfig};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct RigBuilder {
     config: Config,
+    /// Base directory for resolving relative paths (derived from config file path)
+    config_dir: Option<PathBuf>,
 }
 
 impl RigBuilder {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            config_dir: None,
+        }
+    }
+
+    /// Set the base directory for resolving relative paths in config.
+    ///
+    /// This is typically derived from the config file's parent directory.
+    /// Used for resolving relative skill source paths.
+    pub fn with_config_dir(mut self, config_dir: PathBuf) -> Self {
+        self.config_dir = Some(config_dir);
+        self
     }
 
     /// Get the runtime [`AgentRuntimeConfig`] (mainly for tests/debugging).
+    /// Skips skill discovery; build methods use [`Self::discovered_agent_config`].
     pub fn get_agent_config(&self) -> AgentRuntimeConfig {
         self.to_agent_config()
     }
@@ -35,7 +51,9 @@ impl RigBuilder {
     /// The `[agent]` TOML table is split into `AgentSettings` (the runtime
     /// subset) plus the top-level `llm`; all other sections are shared types
     /// and copy across directly. Runtime extension fields start empty and are
-    /// populated by callers (e.g. the orchestrator) as needed.
+    /// populated by callers (e.g. the orchestrator) as needed. Skills start
+    /// empty here because discovery does filesystem IO and can fail; the
+    /// fallible build paths run it via [`Self::discovered_agent_config`].
     fn to_agent_config(&self) -> AgentRuntimeConfig {
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
@@ -46,6 +64,7 @@ impl RigBuilder {
             scratchpad: self.config.agent.scratchpad.clone(),
             enable_client_tools: self.config.agent.enable_client_tools,
             client_tool_filter: self.config.agent.client_tool_filter.clone(),
+            skills: Vec::new(),
         };
 
         AgentRuntimeConfig {
@@ -60,6 +79,53 @@ impl RigBuilder {
         }
     }
 
+    /// Project the parsed `Config` and run skill discovery.
+    ///
+    /// Effective skill sources are the explicit `[agent.skills]` config, with
+    /// the `AURA_SKILLS_DIR` env var as a fallback when none are configured.
+    /// Relative sources resolve against the config file's directory.
+    fn discovered_agent_config(&self) -> Result<AgentRuntimeConfig, BuilderError> {
+        let mut agent_config = self.to_agent_config();
+
+        let mut skill_sources = self.config.agent.skills.local.clone();
+        if skill_sources.is_empty()
+            && let Ok(env_dir) = std::env::var("AURA_SKILLS_DIR")
+        {
+            tracing::info!("Using AURA_SKILLS_DIR fallback: {}", env_dir);
+            skill_sources.push(LocalSkillSource {
+                source: env_dir.into(),
+            });
+        }
+
+        agent_config.agent.skills =
+            aura_config::skills::discover_skills(&skill_sources, self.config_dir.as_deref())?;
+
+        // Per-worker skill overrides: discover explicit sources only (no
+        // AURA_SKILLS_DIR fallback — that is agent-level only). A worker
+        // without a skills key inherits `[agent.skills]` and stays out of
+        // the map.
+        if let Some(orch) = &self.config.orchestration {
+            for (name, worker) in &orch.workers {
+                if let Some(worker_skills) = &worker.skills {
+                    let discovered = aura_config::skills::discover_skills(
+                        &worker_skills.local,
+                        self.config_dir.as_deref(),
+                    )?;
+                    let override_skills = if discovered.is_empty() {
+                        WorkerSkills::Disable
+                    } else {
+                        WorkerSkills::Override(discovered)
+                    };
+                    agent_config
+                        .worker_skills
+                        .insert(name.clone(), override_skills);
+                }
+            }
+        }
+
+        Ok(agent_config)
+    }
+
     /// Build an agent with optional request headers, additional tools, and client-side tools.
     ///
     /// - `req_headers`: HTTP headers for MCP `headers_from_request` resolution. Pass `None` when not in an HTTP context.
@@ -71,7 +137,7 @@ impl RigBuilder {
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Agent, BuilderError> {
-        let mut agent_config = self.to_agent_config();
+        let mut agent_config = self.discovered_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         Agent::new(&agent_config, additional_tools, client_tools)
             .await
@@ -94,7 +160,7 @@ impl RigBuilder {
         session_id: Option<String>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
-        let mut agent_config = self.to_agent_config();
+        let mut agent_config = self.discovered_agent_config()?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
 
@@ -439,5 +505,139 @@ model = "gpt-4o"
         let loaded = load_config_from_str(config).expect("should parse");
         let built = RigBuilder::new(loaded).get_agent_config();
         assert_eq!(built.effective_memory_dir(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // per-worker skills discovery tests
+    // -----------------------------------------------------------------------
+
+    /// Serializes tests that touch the AURA_SKILLS_DIR env var.
+    static SKILLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n# {name}\nContent."),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn worker_skills_toml_round_trip() {
+        let _env_lock = SKILLS_ENV_LOCK.lock().unwrap();
+        // Worker-level discovery must ignore the agent-level AURA_SKILLS_DIR
+        // fallback: a worker without a skills key stays out of the map even
+        // with the env var set.
+        let fallback_dir = tempfile::TempDir::new().unwrap();
+        write_skill(fallback_dir.path(), "fallback-skill", "Agent fallback");
+        unsafe {
+            std::env::set_var("AURA_SKILLS_DIR", fallback_dir.path());
+        }
+
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        write_skill(skills_dir.path(), "alpha", "Alpha skill");
+
+        let config_str = format!(
+            r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.skilled]
+description = "Has its own skills"
+preamble = "You use skills."
+
+[[orchestration.worker.skilled.skills.local]]
+source = '{}'
+
+[orchestration.worker.inheriting]
+description = "No skills key"
+preamble = "You inherit."
+
+[orchestration.worker.disabled]
+description = "Explicitly disabled skills"
+preamble = "You have none."
+skills.local = []
+"#,
+            skills_dir.path().display()
+        );
+
+        let config = aura_config::Config::parse_toml(&config_str).expect("config should parse");
+        let agent_config = RigBuilder::new(config).discovered_agent_config();
+
+        unsafe {
+            std::env::remove_var("AURA_SKILLS_DIR");
+        }
+
+        let agent_config = agent_config.expect("discovery should succeed");
+
+        match agent_config
+            .worker_skills
+            .get("skilled")
+            .expect("explicit sources should discover skills into the map")
+        {
+            WorkerSkills::Override(skills) => {
+                assert_eq!(skills.len(), 1);
+                assert_eq!(skills[0].name, "alpha");
+            }
+            WorkerSkills::Disable => panic!("explicit sources should override, not disable"),
+        }
+
+        assert!(
+            !agent_config.worker_skills.contains_key("inheriting"),
+            "worker without skills key should inherit (absent), even with AURA_SKILLS_DIR set"
+        );
+
+        assert!(
+            matches!(
+                agent_config.worker_skills.get("disabled"),
+                Some(WorkerSkills::Disable)
+            ),
+            "skills.local = [] should disable skills, not inherit"
+        );
+
+        // The AURA_SKILLS_DIR fallback applies to [agent.skills] only.
+        assert_eq!(agent_config.agent.skills.len(), 1);
+        assert_eq!(agent_config.agent.skills[0].name, "fallback-skill");
+    }
+
+    #[test]
+    fn worker_skills_nonexistent_source_fails_conversion() {
+        let _env_lock = SKILLS_ENV_LOCK.lock().unwrap();
+        let config_str = r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.broken]
+description = "Bad skill source"
+preamble = "You fail."
+
+[[orchestration.worker.broken.skills.local]]
+source = '/nonexistent/path/to/worker/skills'
+"#;
+        let config = aura_config::Config::parse_toml(config_str).expect("config should parse");
+        let err = RigBuilder::new(config)
+            .discovered_agent_config()
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }
