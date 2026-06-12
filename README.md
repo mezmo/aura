@@ -31,6 +31,7 @@ Key capabilities:
   - [Configuration Sections](#configuration-sections)
   - [Orchestration](#orchestration)
   - [Scratchpad (Context Window Management)](#scratchpad-context-window-management)
+  - [Skills (On-Demand Instructions)](#skills-on-demand-instructions)
   - [Ollama](#ollama)
   - [Observability](#observability)
 - [Development and Testing](#development-and-testing)
@@ -493,6 +494,7 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
 | `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
 | `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
+| `skills` | table | inherits `[agent.skills]` | Optional per-worker skill sources; an explicit `local = []` disables skills for this worker |
 
 ### Scratchpad (Context Window Management)
 
@@ -536,6 +538,45 @@ When multiple patterns match the same tool, the **longest (most specific) patter
 **Per-call extraction limit (`max_extraction_tokens`, default 10_000):** every exploration tool checks the size of its result before returning. If a single call would exceed this cap (or the cumulative `ContextBudget`), the tool returns a structured JSON error like `{"error": "head_too_large", "estimated_tokens": ..., "suggestions": [...]}` instead of the content. The LLM sees this as a successful tool result and retries with smaller params — each retry consumes a turn, which is why `turn_depth_bonus` exists.
 
 Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
+
+### Skills (On-Demand Instructions)
+
+Skills package task-specific instructions that the agent pulls in only when a task calls for them. Each skill is a directory in the [Agent Skills format](https://agentskills.io/specification): a `SKILL.md` file with YAML frontmatter (`name`, `description`) followed by the instructions, plus optional `references/`, `scripts/`, and `assets/` subdirectories for supporting files.
+
+Rather than inlining every skill into the system prompt, AURA appends only a catalog of names and descriptions. The LLM calls the `load_skill` tool to fetch a skill's full instructions on demand, and `read_skill_file` to fetch individual resource files. `read_skill_file` resolves symlinks and rejects any path that escapes the skill directory.
+
+```toml
+[agent.skills]
+local = [
+  { source = "./skills" },               # relative paths resolve against this config file
+  { source = "/opt/aura/shared-skills" }
+]
+```
+
+Each `source` is a directory containing skill subdirectories:
+
+```text
+skills/
+└── code-review/
+    ├── SKILL.md       # required: frontmatter (name, description) + instructions
+    ├── references/    # optional resources, fetched via read_skill_file
+    ├── scripts/
+    └── assets/
+```
+
+Discovery runs at agent build time and validates each skill against the specification: the frontmatter `name` must match the directory name and be 1-64 characters of lowercase alphanumerics and hyphens, and `description` must be non-empty (1024 characters max). Directories without a `SKILL.md` are skipped. When two sources provide the same skill name, the first one loaded wins and a warning is logged. Relative sources resolve against the config file's directory in every mode (web server, standalone CLI, and A2A).
+
+In orchestration mode the coordinator inherits `[agent.skills]`. Workers inherit it too, unless `[orchestration.worker.<name>.skills]` provides their own sources; an explicit empty list disables skills for that worker:
+
+```toml
+[orchestration.worker.knowledge.skills]
+local = [{ source = "./knowledge-skills" }]   # worker-specific skills
+
+[orchestration.worker.operations.skills]
+local = []                                    # no skills for this worker
+```
+
+The `AURA_SKILLS_DIR` environment variable names a fallback source directory, used only when `[agent.skills]` configures no sources. It applies at the agent level only; per-worker overrides never fall back to it.
 
 ### Ollama
 
