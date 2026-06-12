@@ -2710,41 +2710,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - LlamaIndex's Sub-Question Query Engine
     /// - Anthropic's context engineering principles
     fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
-        use super::prompt_constants::{context, sections};
-
-        let task = plan.tasks.iter().find(|t| t.id == task_id)?;
-
-        // Build structured dependency context — compact format to prevent scope creep
-
-        if !task.dependencies.is_empty() {
-            let dep_parts: Vec<String> = task
-                .dependencies
-                .iter()
-                .filter_map(|dep_id| {
-                    plan.tasks
-                        .iter()
-                        .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| match &dep_task.state {
-                            TaskState::Complete { result } => Some(format!(
-                                "{} — Task {} ({}):\n{}",
-                                sections::PRIOR_WORK,
-                                dep_task.id,
-                                dep_task.description,
-                                result
-                            )),
-                            _ => None,
-                        })
-                })
-                .collect();
-
-            if dep_parts.is_empty() {
-                None
-            } else {
-                Some(dep_parts.join(context::DEPENDENCY_SEPARATOR))
-            }
-        } else {
-            None
-        }
+        build_dependency_context(plan, task_id)
     }
 
     /// Execute a single task using a worker agent.
@@ -4176,9 +4142,122 @@ fn context_overflow_suggestion(phase: &str) -> String {
     }
 }
 
+/// Build the dependency context injected into a worker's task prompt.
+///
+/// Walks the task's transitive ancestor closure (not just direct
+/// dependencies) so that in a chain T0→T1→T2, T2 sees T0's result as well
+/// as T1's. Only `Complete` ancestors contribute; failed or pending
+/// ancestors are omitted (failure handling is the replanner's job).
+///
+/// Rendered in ascending task-ID order. Flattening assigns IDs in execution
+/// order (a dependency always has a lower ID than its dependents), so this
+/// reads oldest work first with direct-dependency results last — closest to
+/// the task instructions that follow the context block in the worker prompt.
+/// Returns `None` when no completed ancestor exists.
+///
+/// See mezmo/aura#221 for the missing-context failure mode this addresses.
+fn build_dependency_context(plan: &Plan, task_id: usize) -> Option<String> {
+    use super::prompt_constants::{context, sections};
+
+    let mut ancestors = plan.transitive_ancestors(task_id);
+    ancestors.sort_unstable();
+
+    ancestors
+        .into_iter()
+        .filter_map(|ancestor_id| {
+            plan.get_task(ancestor_id)
+                .and_then(|ancestor| match &ancestor.state {
+                    TaskState::Complete { result } => Some(format!(
+                        "{} — Task {} ({}):\n{}",
+                        sections::PRIOR_WORK,
+                        ancestor.id,
+                        ancestor.description,
+                        result
+                    )),
+                    TaskState::Pending | TaskState::Running | TaskState::Failed { .. } => None,
+                })
+        })
+        .reduce(|acc, part| acc + context::DEPENDENCY_SEPARATOR + &part)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::orchestration::types::Task;
+
+    fn three_task_chain() -> Plan {
+        // 0 -> 1 -> 2
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Fetch events", "r"));
+        plan.add_task(Task::new(1, "Correlate logs", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Summarize", "r").with_dependency(1));
+        plan
+    }
+
+    #[test]
+    fn test_dependency_context_includes_transitive_results() {
+        let mut plan = three_task_chain();
+        plan.get_task_mut(0).unwrap().complete("deploy X at 14:02");
+        plan.get_task_mut(1).unwrap().complete("errors start 14:03");
+
+        let ctx = build_dependency_context(&plan, 2).expect("context for task 2");
+        assert!(
+            ctx.contains("deploy X at 14:02"),
+            "T2 context must include T0's (transitive) result: {ctx}"
+        );
+        assert!(ctx.contains("errors start 14:03"));
+
+        let t0_pos = ctx.find("Task 0").unwrap();
+        let t1_pos = ctx.find("Task 1").unwrap();
+        assert!(
+            t0_pos < t1_pos,
+            "execution order: T0's section renders before T1's"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_dedups_diamond() {
+        // 0 -> {1, 2} -> 3: root result appears exactly once
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Root", "r"));
+        plan.add_task(Task::new(1, "Left", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Right", "r").with_dependency(0));
+        plan.add_task(Task::new(3, "Join", "r").with_dependencies([1, 2]));
+        plan.get_task_mut(0).unwrap().complete("root result");
+        plan.get_task_mut(1).unwrap().complete("left result");
+        plan.get_task_mut(2).unwrap().complete("right result");
+
+        let ctx = build_dependency_context(&plan, 3).expect("context for task 3");
+        assert_eq!(
+            ctx.matches("root result").count(),
+            1,
+            "diamond root must not be duplicated: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_skips_incomplete_ancestors() {
+        let mut plan = three_task_chain();
+        // T0 failed, T1 complete: only T1 contributes to T2's context
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+        plan.get_task_mut(1).unwrap().complete("partial result");
+
+        let ctx = build_dependency_context(&plan, 2).expect("context for task 2");
+        assert!(ctx.contains("partial result"));
+        assert!(!ctx.contains("boom"), "failed ancestor must be omitted");
+        assert!(!ctx.contains("Task 0"));
+    }
+
+    #[test]
+    fn test_dependency_context_none_when_no_completed_ancestors() {
+        // Pending ancestors only -> None; no dependencies at all -> None
+        let plan = three_task_chain();
+        assert!(build_dependency_context(&plan, 2).is_none());
+        assert!(build_dependency_context(&plan, 0).is_none());
+    }
 
     #[test]
     fn test_truncate_query_short() {
