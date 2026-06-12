@@ -575,7 +575,7 @@ skills/
     └── assets/
 ```
 
-Discovery runs at agent build time and validates each skill against the specification: the frontmatter `name` must match the directory name and be 1-64 characters of lowercase alphanumerics and hyphens, and `description` must be non-empty (1024 characters max). Directories without a `SKILL.md` are skipped. When two sources provide the same skill name, the first one loaded wins and a warning is logged. Relative sources resolve against the config file's directory in every mode (web server, standalone CLI, and A2A).
+Discovery runs at agent build time and validates each skill against the specification; the frontmatter `name` must match the directory name. Directories without a `SKILL.md` are skipped. When two sources provide the same skill name, the first one loaded wins and a warning is logged. Relative sources resolve against the config file's directory in every mode (web server, standalone CLI, and A2A).
 
 In orchestration mode the coordinator inherits `[agent.skills]`. Workers inherit it too, unless `[orchestration.worker.<name>.skills]` provides their own sources; an explicit empty list disables skills for that worker:
 
