@@ -190,12 +190,13 @@ fn test_continuation_full_scenario() {
         FailureCategory::AgentError,
     );
 
-    // Task 2: blocked
+    // Task 2: blocked behind the failed deployment query
     let t2 = Task::new(
         2,
         "Correlate events",
         "Correlate deployment events with error rates",
-    );
+    )
+    .with_dependency(1);
 
     plan.add_task(t0);
     plan.add_task(t1);
@@ -1127,7 +1128,10 @@ fn test_worker_task_empty_context() {
 // ========================================================================
 
 #[test]
-fn test_continuation_running_task_renders_as_blocked() {
+fn test_continuation_running_task_renders_as_not_executed() {
+    // A pending/running task with no failed ancestor is NOT blocked — it
+    // just never ran. It must not be mislabeled "blocked (dependency
+    // failed)" (the pre-#221 behavior this test used to document).
     let mut plan = Plan::new("Test goal");
     let t0 = Task::new(0, "running task", "This task is still running");
     plan.add_task(t0);
@@ -1136,8 +1140,35 @@ fn test_continuation_running_task_renders_as_blocked() {
     let prompt = ctx.build_continuation_prompt(3, false, 2000);
 
     assert!(
-        prompt.contains("blocked (dependency failed)"),
-        "Running renders as blocked: {}",
+        prompt.contains("running task → not executed"),
+        "dependency-free incomplete task renders as not executed: {}",
+        prompt
+    );
+    assert!(
+        !prompt.contains("running task → blocked"),
+        "must not be mislabeled blocked: {}",
+        prompt
+    );
+}
+
+#[test]
+fn test_continuation_transitive_limbo_task_renders_as_blocked() {
+    // T0 failed in T0 -> T1 -> T2: T2 (transitive dependent) must render
+    // blocked, not pending limbo.
+    let mut plan = Plan::new("Test goal");
+    plan.add_task(Task::new(0, "fetch", "r"));
+    plan.add_task(Task::new(1, "correlate", "r").with_dependency(0));
+    plan.add_task(Task::new(2, "summarize", "r").with_dependency(1));
+    plan.get_task_mut(0)
+        .unwrap()
+        .fail("boom", FailureCategory::AgentError);
+
+    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
+    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+    assert!(
+        prompt.contains("summarize → blocked (dependency failed)"),
+        "transitive dependent renders blocked: {}",
         prompt
     );
 }
