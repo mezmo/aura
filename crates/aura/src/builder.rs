@@ -364,7 +364,6 @@ impl Agent {
         // Extract model name for logging
         let model_name = config.llm.model_name().to_string();
 
-        // Build effective system prompt, appending skill catalog if skills are configured
         let mut system_prompt = config.effective_preamble().to_string();
         if let Some(catalog) = render_skill_catalog(&config.agent.skills) {
             system_prompt.push_str(&catalog);
@@ -970,7 +969,6 @@ impl Agent {
             builder_state = builder_state.add_tools_dyn(additional_tools);
         }
 
-        // Add skill tools if skills are configured
         if let Some(toolset) = SkillToolset::new(&config.agent.skills) {
             tracing::info!(
                 "Adding skill tools (load_skill, read_skill_file) with {} skills",
