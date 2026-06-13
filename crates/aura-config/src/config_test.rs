@@ -1869,6 +1869,202 @@ max_extraction_tokens = 4000
         load_config_from_str(config).expect("valid orchestration config should parse");
     }
 
+    #[test]
+    fn scratchpad_effective_memory_dir_prefers_top_level() {
+        // When both top-level memory_dir AND [orchestration.artifacts].memory_dir
+        // are set, the top-level one wins.
+        let config = r#"
+memory_dir = "/tmp/top-level"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(
+            loaded.effective_memory_dir(),
+            Some("/tmp/top-level"),
+            "top-level memory_dir should win over legacy artifacts.memory_dir"
+        );
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_falls_back_to_legacy() {
+        // No top-level memory_dir — should fall back to the legacy one.
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), Some("/tmp/legacy"));
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_falls_back_in_single_agent_mode() {
+        // Orchestration section present but disabled. effective_memory_dir()
+        // should still honor the legacy artifacts fallback so single-agent
+        // scratchpad setup resolves memory_dir the same way orchestration
+        // persistence and config validation do.
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+context_window = 128000
+
+[agent.scratchpad]
+enabled = true
+
+[orchestration]
+enabled = false
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy-single-agent"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(
+            loaded.effective_memory_dir(),
+            Some("/tmp/legacy-single-agent"),
+            "single-agent mode must honor [orchestration.artifacts].memory_dir fallback",
+        );
+        assert!(
+            !loaded.orchestration_enabled(),
+            "orchestration should be disabled in this test",
+        );
+    }
+
+    #[test]
+    fn scratchpad_effective_memory_dir_none_when_unset() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), None);
+    }
+
+    // ---- Config::effective_memory_dir() ----
+    //
+    // The raw Config view of the same fallback. Consumers
+    // that need the persistence root before building agents — the
+    // telemetry init in aura-web-server is the current example — read
+    // this method, so older configs that only set
+    // `[orchestration.artifacts].memory_dir` still land their
+    // telemetry inspection log under the same root they already use.
+
+    #[test]
+    fn config_effective_memory_dir_prefers_top_level() {
+        let config = r#"
+memory_dir = "/tmp/top"
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), Some("/tmp/top"));
+    }
+
+    #[test]
+    fn config_effective_memory_dir_falls_back_to_legacy_artifacts() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+[orchestration]
+enabled = true
+
+[orchestration.artifacts]
+memory_dir = "/tmp/legacy"
+
+[orchestration.worker.alpha]
+description = "worker"
+preamble = "alpha"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), Some("/tmp/legacy"));
+    }
+
+    #[test]
+    fn config_effective_memory_dir_none_when_unset() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#;
+        let loaded = load_config_from_str(config).expect("should parse");
+        assert_eq!(loaded.effective_memory_dir(), None);
+    }
+
     // ========================================================================
     // Worker Name Validation Tests
     // ========================================================================

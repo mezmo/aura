@@ -1,6 +1,7 @@
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
 use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+use crate::telemetry::FileTelemetryConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -22,6 +23,12 @@ pub struct Config {
     /// Orchestration mode configuration (multi-agent workflows)
     #[serde(default)]
     pub orchestration: Option<OrchestrationConfig>,
+    /// `[telemetry]` block — opt-out anonymous product analytics. See
+    /// `docs/telemetry.md` for the full contract; the bootstrap layer
+    /// in `aura-telemetry` reads this and lets env-var kill switches
+    /// override it.
+    #[serde(default)]
+    pub telemetry: Option<FileTelemetryConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -394,12 +401,7 @@ impl Config {
             return Ok(());
         }
 
-        let effective_memory_dir = self.memory_dir.as_deref().or_else(|| {
-            self.orchestration
-                .as_ref()
-                .and_then(|o| o.artifacts.memory_dir.as_deref())
-        });
-        if effective_memory_dir.is_none() {
+        if self.effective_memory_dir().is_none() {
             return Err(crate::ConfigError::Validation(
                 "Scratchpad enabled but top-level `memory_dir` is not set".to_string(),
             ));
@@ -424,6 +426,23 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Resolve the effective persistence directory: top-level
+    /// `memory_dir` if set, otherwise the legacy
+    /// `[orchestration.artifacts].memory_dir`. Returns `None` when
+    /// neither is configured.
+    ///
+    /// Scratchpad, orchestration persistence, and the telemetry
+    /// inspection log all root themselves under this directory; every
+    /// consumer should call this rather than reading `self.memory_dir`
+    /// directly, so legacy configs land in the same place new ones do.
+    pub fn effective_memory_dir(&self) -> Option<&str> {
+        self.memory_dir.as_deref().or_else(|| {
+            self.orchestration
+                .as_ref()
+                .and_then(|o| o.artifacts.memory_dir.as_deref())
+        })
     }
 }
 
