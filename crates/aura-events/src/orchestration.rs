@@ -25,9 +25,6 @@ impl EventContext {
 }
 
 /// Shared identity fields for task events (TaskStarted, TaskCompleted).
-///
-/// Composition keeps contextual identity in one place: adding a field here
-/// updates every task event without touching each variant.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskContext {
     pub task_id: usize,
@@ -45,12 +42,6 @@ pub struct CompletionOutcome {
 }
 
 /// One task's edges in the plan DAG, emitted on `plan_created`.
-///
-/// `id` indexes into the event's `tasks` list (flatten assigns IDs
-/// sequentially, so `tasks[i]` describes `id == i`). The flat edge list is
-/// the executor's ground truth: consumers reconstruct the DAG without
-/// re-deriving frontier semantics, and tasks that never start (blocked
-/// chains) are still visible here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskDagNode {
     pub id: usize,
@@ -164,9 +155,7 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator starts a task.
     TaskStarted {
         description: String,
-        /// Direct dependency edges of this task (always present; empty for
-        /// root tasks). Lives on the variant rather than `TaskContext` so
-        /// `task_completed` does not grow the field.
+        /// Direct dependency edges of this task.
         #[serde(default)]
         dependencies: Vec<usize>,
         #[serde(flatten)]
