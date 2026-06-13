@@ -99,6 +99,11 @@ pub struct AppState {
     /// Factory for additional tools to register on every agent (e.g., CLI tools in standalone mode).
     /// Called once per request to produce fresh tool instances. Returns empty vec for the web server.
     pub additional_tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
+    /// Telemetry handle — captures lifecycle events and serves the
+    /// `GET /telemetry/recent` inspection endpoint documented in
+    /// `docs/telemetry.md`. Always populated; outbound network may be
+    /// disabled at init time via the kill-switch decision tree.
+    pub telemetry: aura_telemetry::TelemetryHandle,
 }
 
 /// OpenAI-compatible message role

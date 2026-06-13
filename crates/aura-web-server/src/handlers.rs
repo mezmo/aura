@@ -292,6 +292,11 @@ pub async fn chat_completions(
         );
     }
 
+    // HTTP consent propagation: an Enabled CLI carries the user's
+    // telemetry consent in a header; adopt it if this server is Unknown.
+    // (No-op when the server is Disabled — operator opt-out wins.)
+    apply_consent_header(&state.telemetry, &headers);
+
     // Extract or generate chat_session_id
     // Priority: metadata > X-Chat-Session-Id header > x-openwebui-chat-id header > generate new
     let chat_session_id = req
@@ -857,6 +862,260 @@ pub async fn health() -> Response {
         },
     }))
     .into_response()
+}
+
+/// Telemetry self-inspection endpoint.
+///
+/// Returns the last `limit` events from the local inspection log
+/// (default 20). The endpoint is the HTTP counterpart of the CLI's
+/// `/telemetry recent` slash command. **Localhost-only by design** —
+/// the handler rejects non-loopback peers with 403 because the log
+/// reveals the kill-switch reason and the event timeline, neither of
+/// which should be reachable from outside the box. Operators who bind
+/// the server to a public interface lose nothing else; only this
+/// endpoint is restricted.
+pub async fn telemetry_recent(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    axum::extract::Query(params): axum::extract::Query<TelemetryRecentParams>,
+) -> Response {
+    let (status, body) = build_telemetry_recent_response(
+        addr.ip().is_loopback(),
+        state.telemetry.inspection_log(),
+        params.limit,
+    );
+    (status, Json(body)).into_response()
+}
+
+/// Pure formatting half of [`telemetry_recent`], factored out so the
+/// loopback gate and the log-read paths can be unit-tested without
+/// constructing a full Axum router and AppState.
+pub fn build_telemetry_recent_response(
+    is_loopback: bool,
+    log: Option<&aura_telemetry::inspection_log::InspectionLog>,
+    limit: Option<usize>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    if !is_loopback {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            serde_json::json!({
+                "error": "telemetry inspection endpoint is localhost-only"
+            }),
+        );
+    }
+    let Some(log) = log else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "error": "inspection log disabled (AURA_TELEMETRY_LOG_EVENTS=0)"
+            }),
+        );
+    };
+    let n = limit.unwrap_or(20);
+    match log.recent(n) {
+        Ok(events) => (
+            axum::http::StatusCode::OK,
+            serde_json::json!({ "events": events }),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": format!("could not read log: {e}") }),
+        ),
+    }
+}
+
+/// Query params for [`telemetry_recent`].
+#[derive(serde::Deserialize)]
+pub struct TelemetryRecentParams {
+    pub limit: Option<usize>,
+}
+
+/// Whether an inbound `X-Aura-Telemetry-Consent` header value grants
+/// consent (i.e. equals the one sanctioned value). Pure so the
+/// propagation decision is unit-testable without a request.
+pub fn header_grants_consent(value: Option<&str>) -> bool {
+    value == Some(aura_telemetry::CONSENT_HEADER_VALUE)
+}
+
+/// Apply an inbound consent header to the server's telemetry handle.
+///
+/// An `Enabled` CLI carries the user's telemetry consent in
+/// [`aura_telemetry::CONSENT_HEADER`]. When this server is `Unknown` (no
+/// explicit operator decision), adopt that consent and start sending for
+/// this process. `enable()` is idempotent and a no-op when the server is
+/// `Disabled`, so an operator opt-out always wins. Factored out of
+/// [`chat_completions`] so the header → consent wiring is unit-testable
+/// without standing up an agent.
+pub fn apply_consent_header(telemetry: &aura_telemetry::TelemetryHandle, headers: &HeaderMap) {
+    let consent = headers
+        .get(aura_telemetry::CONSENT_HEADER)
+        .and_then(|h| h.to_str().ok());
+    if header_grants_consent(consent) {
+        telemetry.enable();
+    }
+}
+
+#[cfg(test)]
+mod telemetry_endpoint_tests {
+    use super::*;
+    use aura_telemetry::inspection_log::{InspectedEvent, InspectionLog};
+    use chrono::Utc;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryHandle, TelemetryState, init};
+    use axum::http::HeaderValue;
+    use std::time::Duration;
+
+    fn fresh_log(dir: &std::path::Path) -> InspectionLog {
+        InspectionLog::open(dir.join("events.jsonl"), 1000).unwrap()
+    }
+
+    /// A telemetry handle in a given state, with no sink network traffic
+    /// (endpoint is unroutable and we never `capture`).
+    fn handle_in(state: TelemetryState) -> TelemetryHandle {
+        init(TelemetryConfig {
+            endpoint: "http://127.0.0.1:1".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::nil(),
+            install_id_path: None,
+            session_id: Uuid::nil(),
+            source: Source::WebServer,
+            os_family: OsFamily::Linux,
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: None,
+            state,
+            channel_capacity: 16,
+            batch_size: 1,
+            flush_interval: Duration::from_millis(50),
+            post_timeout: Duration::from_millis(100),
+            http_client: None,
+        })
+    }
+
+    fn consent_headers(value: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            aura_telemetry::CONSENT_HEADER,
+            HeaderValue::from_static(value),
+        );
+        h
+    }
+
+    #[test]
+    fn consent_header_only_the_sanctioned_value_grants() {
+        assert!(header_grants_consent(Some("enabled")));
+        assert!(!header_grants_consent(Some("true")));
+        assert!(!header_grants_consent(Some("")));
+        assert!(!header_grants_consent(None));
+    }
+
+    #[tokio::test]
+    async fn consent_header_adopts_consent_on_unknown_server() {
+        let telemetry = handle_in(TelemetryState::Unknown);
+        apply_consent_header(
+            &telemetry,
+            &consent_headers(aura_telemetry::CONSENT_HEADER_VALUE),
+        );
+        assert!(
+            matches!(telemetry.state(), TelemetryState::Enabled),
+            "an Unknown server must adopt a granting consent header"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_header_value_leaves_unknown_untouched() {
+        let telemetry = handle_in(TelemetryState::Unknown);
+        // Wrong value, then no header at all — neither grants consent.
+        apply_consent_header(&telemetry, &consent_headers("true"));
+        apply_consent_header(&telemetry, &HeaderMap::new());
+        assert!(
+            matches!(telemetry.state(), TelemetryState::Unknown),
+            "only the sanctioned value flips Unknown -> Enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_header_cannot_revive_disabled_server() {
+        // Operator opt-out (e.g. DO_NOT_TRACK) must win over a CLI's
+        // inbound consent: enable() is a no-op for a Disabled handle.
+        let telemetry = handle_in(TelemetryState::Disabled(DisableReason::DoNotTrack));
+        apply_consent_header(
+            &telemetry,
+            &consent_headers(aura_telemetry::CONSENT_HEADER_VALUE),
+        );
+        assert!(
+            matches!(telemetry.state(), TelemetryState::Disabled(_)),
+            "a Disabled server must ignore an inbound consent header"
+        );
+    }
+
+    #[test]
+    fn forbidden_for_non_loopback_peer() {
+        let dir = tempdir().unwrap();
+        let log = fresh_log(dir.path());
+        let (status, body) = build_telemetry_recent_response(false, Some(&log), None);
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("localhost-only"));
+    }
+
+    #[test]
+    fn service_unavailable_when_log_disabled() {
+        let (status, body) = build_telemetry_recent_response(true, None, None);
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("AURA_TELEMETRY_LOG_EVENTS=0")
+        );
+    }
+
+    #[test]
+    fn loopback_returns_recent_events_as_json_array() {
+        let dir = tempdir().unwrap();
+        let log = fresh_log(dir.path());
+        let evt = InspectedEvent {
+            ts: Utc::now(),
+            event: "server_started".into(),
+            properties: json!({"aura_source": "web-server"}),
+            sent: true,
+            not_sent_reason: None,
+        };
+        log.append(&evt).unwrap();
+
+        let (status, body) = build_telemetry_recent_response(true, Some(&log), Some(5));
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let events = body["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "server_started");
+    }
+
+    #[test]
+    fn default_limit_is_twenty() {
+        let dir = tempdir().unwrap();
+        let log = fresh_log(dir.path());
+        for i in 0..30 {
+            log.append(&InspectedEvent {
+                ts: Utc::now(),
+                event: format!("evt_{i}"),
+                properties: json!({}),
+                sent: true,
+                not_sent_reason: None,
+            })
+            .unwrap();
+        }
+        let (status, body) = build_telemetry_recent_response(true, Some(&log), None);
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 20);
+        // Oldest-first per InspectionLog::recent contract — the first
+        // returned event is evt_10, the last is evt_29.
+        assert_eq!(events[0]["event"], "evt_10");
+        assert_eq!(events[19]["event"], "evt_29");
+    }
 }
 
 /// OpenAI-compatible model listing endpoint.
