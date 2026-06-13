@@ -30,6 +30,7 @@ regex = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 aura-events = { path = "../aura-events" }
+aura-telemetry = { path = "../aura-telemetry" }
 eventsource-stream = "0.2"
 futures-util = "0.3"
 unicode-segmentation = "1"
@@ -53,3 +54,4 @@ thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+chrono = "0.4"

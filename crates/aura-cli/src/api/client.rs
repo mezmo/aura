@@ -24,14 +24,34 @@ pub fn is_model_error(err: &anyhow::Error) -> bool {
 pub struct ChatClient {
     http: Client,
     config: AppConfig,
+    /// When the CLI's telemetry is `Enabled`, requests carry the
+    /// consent header so an `Unknown` server can adopt the user's
+    /// consent. `None` in contexts that don't have a handle (tests).
+    telemetry: Option<aura_telemetry::TelemetryHandle>,
 }
 
 impl ChatClient {
     pub fn new(config: AppConfig) -> Self {
+        Self::with_telemetry(config, None)
+    }
+
+    pub fn with_telemetry(
+        config: AppConfig,
+        telemetry: Option<aura_telemetry::TelemetryHandle>,
+    ) -> Self {
         Self {
             http: Client::new(),
             config,
+            telemetry,
         }
+    }
+
+    /// Whether this client holds a telemetry handle (and would therefore
+    /// propagate consent when Enabled). One-shot `--query` deliberately
+    /// holds `None`; exposed for the wiring regression test.
+    #[cfg(test)]
+    pub(crate) fn has_telemetry(&self) -> bool {
+        self.telemetry.is_some()
     }
 
     /// Build a request with common headers (Content-Type, auth, extra headers).
@@ -68,6 +88,21 @@ impl ChatClient {
 
         if let Some(sid) = session_id {
             req = req.header(CHAT_SESSION_HEADER, sid);
+        }
+
+        // Propagate telemetry consent to the server only when this CLI
+        // is Enabled — never when Unknown/Disabled. A live `state()`
+        // check (not a startup snapshot) so the first request after the
+        // first-input consent gate carries the header.
+        if self
+            .telemetry
+            .as_ref()
+            .is_some_and(|t| matches!(t.state(), aura_telemetry::TelemetryState::Enabled))
+        {
+            req = req.header(
+                aura_telemetry::CONSENT_HEADER,
+                aura_telemetry::CONSENT_HEADER_VALUE,
+            );
         }
 
         req
@@ -238,5 +273,113 @@ mod tests {
     fn empty_error_returns_false() {
         let err = anyhow::anyhow!("");
         assert!(!is_model_error(&err));
+    }
+}
+
+/// On-the-wire propagation of the telemetry consent header. Asserts the
+/// actual built request, not just that a handle is present — only an
+/// `Enabled` CLI may emit `X-Aura-Telemetry-Consent`.
+#[cfg(test)]
+mod consent_header_tests {
+    use super::*;
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryHandle, TelemetryState, init};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            api_url: "http://localhost:8080".to_string(),
+            api_key: None,
+            model: None,
+            system_prompt: None,
+            query: None,
+            resume: None,
+            extra_headers: vec![],
+            force: false,
+            enable_client_tools: false,
+            enable_final_response_summary: false,
+            style: None,
+            pretty: false,
+            log_file: None,
+            telemetry: None,
+        }
+    }
+
+    fn handle_in(state: TelemetryState) -> TelemetryHandle {
+        init(TelemetryConfig {
+            endpoint: "http://127.0.0.1:1".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::nil(),
+            install_id_path: None,
+            session_id: Uuid::nil(),
+            source: Source::Cli,
+            os_family: OsFamily::Linux,
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: None,
+            state,
+            channel_capacity: 16,
+            batch_size: 1,
+            flush_interval: Duration::from_millis(50),
+            post_timeout: Duration::from_millis(100),
+            http_client: None,
+        })
+    }
+
+    /// The consent header value (if any) on a freshly built request.
+    fn consent_on_wire(client: &ChatClient) -> Option<String> {
+        let req = client
+            .build_request(
+                reqwest::Method::POST,
+                "http://localhost/v1/chat/completions",
+                Some("sess-1"),
+            )
+            .build()
+            .expect("request builds");
+        req.headers()
+            .get(aura_telemetry::CONSENT_HEADER)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn enabled_cli_sends_consent_header() {
+        let telemetry = handle_in(TelemetryState::Unknown);
+        assert_eq!(telemetry.enable(), aura_telemetry::EnableOutcome::Enabled);
+        let client = ChatClient::with_telemetry(test_config(), Some(telemetry));
+        assert_eq!(
+            consent_on_wire(&client).as_deref(),
+            Some(aura_telemetry::CONSENT_HEADER_VALUE),
+            "an Enabled CLI must propagate consent on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cli_sends_no_consent_header() {
+        let telemetry = handle_in(TelemetryState::Unknown);
+        let client = ChatClient::with_telemetry(test_config(), Some(telemetry));
+        assert_eq!(
+            consent_on_wire(&client),
+            None,
+            "Unknown must not propagate consent"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_cli_sends_no_consent_header() {
+        let telemetry = handle_in(TelemetryState::Disabled(DisableReason::DoNotTrack));
+        let client = ChatClient::with_telemetry(test_config(), Some(telemetry));
+        assert_eq!(
+            consent_on_wire(&client),
+            None,
+            "Disabled must not propagate consent"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_handle_sends_no_consent_header() {
+        // One-shot `--query` holds no handle; it must never emit the header.
+        let client = ChatClient::with_telemetry(test_config(), None);
+        assert_eq!(consent_on_wire(&client), None);
     }
 }

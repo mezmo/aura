@@ -405,12 +405,15 @@ fn orch_event_prints_scrollback(event_name: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_repl(
     rt: &Runtime,
     config: AppConfig,
     mut permissions: crate::permissions::PermissionChecker,
     backend: &Backend,
     post_launch_warning: Option<String>,
+    telemetry: &aura_telemetry::TelemetryHandle,
+    is_standalone: bool,
 ) -> Result<()> {
     let mut conversation = ConversationHistory::new(config.system_prompt.as_deref());
 
@@ -499,6 +502,16 @@ pub fn run_repl(
         set_mid_stream_history(Vec::new());
     }
 
+    // First-run telemetry notice: the REPL is the interactive surface
+    // where consent is obtained. If no preference is recorded yet
+    // (state == Unknown), present the one-time notice before any other
+    // output. Telemetry stays held until the user's first non-opt-out
+    // input enables it (see the first-input gate in the loop below).
+    let needs_consent = matches!(telemetry.state(), aura_telemetry::TelemetryState::Unknown);
+    if needs_consent {
+        crate::repl::telemetry_notice::present_notice();
+    }
+
     // Pick the welcome content + colors once; reused on /expand and /resume replays.
     set_welcome_state(WelcomeState::pick());
     // Visual flourish gate: only run the fade-in animation under `--pretty`.
@@ -509,6 +522,16 @@ pub fn run_repl(
         crate::ui::prompt::print_welcome_state();
     }
     setup_terminal();
+
+    // If telemetry is already Enabled at launch (recorded preference or
+    // explicit opt-in), capture the session-start event now. When
+    // `needs_consent`, this is deferred to the first-input gate so no
+    // event is emitted during the held `Unknown` state.
+    if matches!(telemetry.state(), aura_telemetry::TelemetryState::Enabled) {
+        capture_cli_session_started(telemetry, &config, is_standalone);
+    }
+    // Tracks whether the first-input consent gate still needs to run.
+    let mut consent_pending = needs_consent;
 
     // If resuming, replay the event log so the user sees the conversation
     let has_events = with_event_log(|log| !log.is_empty());
@@ -625,6 +648,22 @@ pub fn run_repl(
                     reset_input_geometry();
                 }
 
+                // First-input consent gate (runs once, on the first
+                // non-empty input after the notice was shown). Implied
+                // consent: any input that is NOT an explicit opt-out and
+                // NOT an immediate quit enables telemetry from here on.
+                // `/telemetry disable` falls through to its normal
+                // dispatch (which records Disabled); quitting leaves the
+                // state Unknown so the notice is shown again next launch.
+                if consent_pending {
+                    consent_pending = false;
+                    if crate::repl::telemetry_notice::first_input_enables_telemetry(&input) {
+                        telemetry.enable();
+                        let _ = crate::config::save_telemetry_enabled_to_global_cli_toml(true);
+                        capture_cli_session_started(telemetry, &config, is_standalone);
+                    }
+                }
+
                 if input == "/quit" || input == "/exit" {
                     // Save before exiting, or delete if conversation was never started
                     if let Some(ref store) = conv_store {
@@ -674,6 +713,9 @@ pub fn run_repl(
                     continue;
                 } else if let Some(arg) = input.strip_prefix("/style") {
                     commands::handle_style(arg.trim());
+                    continue;
+                } else if let Some(arg) = input.strip_prefix("/telemetry") {
+                    commands::handle_telemetry(arg.trim(), telemetry);
                     continue;
                 } else if input.starts_with('/') {
                     // Unknown command — don't send to API
@@ -1858,6 +1900,22 @@ pub fn run_repl(
 
     println!();
     Ok(())
+}
+
+/// Capture `cli_session_started` once the REPL session is Enabled. The
+/// `interactive` flag is always true here (this is the REPL, not the
+/// one-shot path). Never called while `Unknown`/`Disabled`, so no event
+/// is emitted before consent.
+fn capture_cli_session_started(
+    telemetry: &aura_telemetry::TelemetryHandle,
+    config: &AppConfig,
+    is_standalone: bool,
+) {
+    telemetry.capture(aura_telemetry::events::CliSessionStarted {
+        interactive: true,
+        standalone_mode: is_standalone,
+        client_tools_enabled: config.enable_client_tools,
+    });
 }
 
 /// Streaming event handler for the interactive REPL: drives the live

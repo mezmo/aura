@@ -230,6 +230,10 @@ pub(crate) const COMMANDS: &[(&str, &str)] = &[
     ("/rename", "rename the current conversation"),
     ("/model", "select a model"),
     ("/style", "switch the visual style"),
+    (
+        "/telemetry",
+        "telemetry: status | recent [N] | enable | disable",
+    ),
 ];
 
 // Cached matches from the last /resume autocomplete lookup.

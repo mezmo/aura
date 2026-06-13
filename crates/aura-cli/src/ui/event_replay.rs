@@ -891,6 +891,7 @@ pub fn print_help() {
     println!("  /resume <filter> — Resume a saved conversation (by ID or name)");
     println!("  /rename <name>   — Rename the current conversation");
     println!("  /model <filter>  — Select a model for LLM requests");
+    println!("  /telemetry [sub] — status | recent [N] | enable | disable. See docs/telemetry.md");
     println!("  /quit            — Exit the REPL");
     println!("  /exit            — Exit the REPL");
 }

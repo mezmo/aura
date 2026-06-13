@@ -40,6 +40,29 @@ fn main() -> Result<()> {
         aura_cli::logging::init(config.log_file.as_deref(), is_standalone)?;
     }
 
+    // Telemetry init runs inside the runtime so the background batch
+    // task can spawn cleanly. See `docs/telemetry.md` for the
+    // user-facing contract; the bootstrap helper centralises env-var
+    // resolution so this site and the web-server's stay in sync.
+    let telemetry = {
+        let _enter = rt.enter();
+        let tcfg = aura_telemetry::bootstrap::build_config_from_env_and_file(
+            aura_telemetry::properties::Source::Cli,
+            None,
+            config.telemetry.as_ref(),
+        );
+        tracing::info!(
+            "{}",
+            aura_telemetry::bootstrap::startup_log_line(&tcfg.state)
+        );
+        aura_telemetry::init(tcfg)
+        // `cli_session_started` is captured by `run_repl` once the
+        // session is Enabled (either already-recorded preference, or
+        // after the first-run notice + first non-opt-out input). It is
+        // never captured here: that would emit during `Unknown` (held,
+        // no-backfill) and would fire for one-shot `--query` too.
+    };
+
     // Make sure `~/.aura/cli.toml` exists and has a `style` line. First-run
     // users get a discoverable file with `style = "normal"` they can edit.
     // Failure is silent — read-only filesystems and weird home setups
@@ -64,7 +87,7 @@ fn main() -> Result<()> {
     // `render_queued_wave` in `ui::animation`.
     aura_cli::ui::prompt::set_pretty(config.pretty);
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
-    let mut backend = Backend::from_config(&rt, &config, &args)?;
+    let mut backend = Backend::from_config(&rt, &config, &args, &telemetry)?;
 
     let is_query = config.query.is_some();
 
@@ -128,8 +151,21 @@ fn main() -> Result<()> {
         }
         run_oneshot(&rt, config, permissions, &backend)
     } else {
-        run_repl(&rt, config, permissions, &backend, post_launch_warning)
+        run_repl(
+            &rt,
+            config,
+            permissions,
+            &backend,
+            post_launch_warning,
+            &telemetry,
+            is_standalone,
+        )
     };
+
+    // Drain telemetry before the runtime drops. Two-second budget
+    // matches the web-server site; if the network sink is hanging we
+    // exit anyway — telemetry must never block user-facing shutdown.
+    rt.block_on(telemetry.shutdown(std::time::Duration::from_secs(2)));
 
     // Flush any buffered OTel spans before `rt` drops — the
     // `BatchSpanProcessor` exports on a timer (~5s) and we'd lose the

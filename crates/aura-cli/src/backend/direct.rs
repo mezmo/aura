@@ -49,6 +49,11 @@ fn additional_tools_factory() -> Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + S
 pub struct DirectBackend {
     app_state: Arc<AppState>,
     extra_headers: HashMap<String, String>,
+    /// Cached telemetry handle so rebuilds (e.g. `/system_prompt`) can
+    /// reattach the same handle to the new AppState. Kept here rather
+    /// than re-deriving inside the rebuild path so the install-id and
+    /// inspection-log targets stay stable across reconfigurations.
+    telemetry: aura_telemetry::TelemetryHandle,
 }
 
 impl DirectBackend {
@@ -56,6 +61,7 @@ impl DirectBackend {
     pub async fn from_toml(
         config_path: &str,
         extra_headers: Vec<(String, String)>,
+        telemetry: aura_telemetry::TelemetryHandle,
     ) -> Result<Self> {
         let configs =
             aura_config::load_config(config_path).context("Failed to load agent config")?;
@@ -77,6 +83,7 @@ impl DirectBackend {
             active_requests: Arc::new(ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: additional_tools_factory(),
+            telemetry: telemetry.clone(),
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -84,6 +91,7 @@ impl DirectBackend {
         Ok(Self {
             app_state,
             extra_headers: headers_map,
+            telemetry,
         })
     }
 
@@ -205,6 +213,7 @@ impl DirectBackend {
             active_requests: old.active_requests.clone(),
             default_agent: old.default_agent.clone(),
             additional_tools: additional_tools_factory(),
+            telemetry: self.telemetry.clone(),
         });
     }
 
@@ -395,6 +404,32 @@ mod tests {
 
     /// Construct a DirectBackend with test configs (no real TOML loading).
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
+        // Synthesize a telemetry handle pre-disabled via ConfigDisabled
+        // so the test never spawns the background batch task and never
+        // touches the network. The inspection-log path is left unset
+        // so no JSONL appears on disk either.
+        let telemetry_cfg = aura_telemetry::TelemetryConfig {
+            endpoint: "http://127.0.0.1:1/test".into(),
+            api_key: String::new(),
+            install_id: uuid::Uuid::nil(),
+            install_id_path: None,
+            session_id: uuid::Uuid::nil(),
+            source: aura_telemetry::properties::Source::Cli,
+            os_family: aura_telemetry::properties::OsFamily::current(),
+            deployment_method: aura_telemetry::properties::DeploymentMethod::Local,
+            aura_version: "test",
+            inspection_log_path: None,
+            state: aura_telemetry::TelemetryState::Disabled(
+                aura_telemetry::DisableReason::ConfigDisabled,
+            ),
+            channel_capacity: 4,
+            batch_size: 1,
+            flush_interval: std::time::Duration::from_secs(60),
+            post_timeout: std::time::Duration::from_millis(500),
+            http_client: None,
+        };
+        let telemetry = aura_telemetry::init(telemetry_cfg);
+
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: ToolResultMode::Aura,
@@ -409,10 +444,12 @@ mod tests {
             active_requests: Arc::new(ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: additional_tools_factory(),
+            telemetry: telemetry.clone(),
         });
         DirectBackend {
             app_state,
             extra_headers: HashMap::new(),
+            telemetry,
         }
     }
 
