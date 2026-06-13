@@ -9,6 +9,14 @@
 #
 # For all available options, see: examples/reference.toml
 
+# ── Persistence ─────────────────────────────────────────────────────
+# Root directory for on-disk state (scratchpad, and the anonymous
+# telemetry install-id + local inspection log). The docker-compose file
+# mounts a named volume here so this survives container restarts and
+# image pulls — which keeps the anonymous install count stable. See
+# docs/telemetry.md.
+memory_dir = "/app/state"
+
 # ── Coordinator ─────────────────────────────────────────────────────
 # In orchestration mode, [agent].system_prompt is the COORDINATOR prompt.
 # It provides domain context and routing guidance, not worker behavior.
