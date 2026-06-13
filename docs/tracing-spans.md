@@ -57,7 +57,7 @@ agent.stream (AGENT, ROOT)
 |------|-----------|
 | `orchestration` | `orchestration.goal`, `orchestration.max_iterations`, `orchestration.routing` (direct/clarification/orchestrated) |
 | `orchestration.planning` | `orchestration.phase` |
-| `orchestration.iteration` | `orchestration.iteration`, `orchestration.task_count`, `orchestration.quality_score`, `orchestration.will_replan` |
+| `orchestration.iteration` | `orchestration.iteration`, `orchestration.task_count`, `orchestration.will_replan` |
 | `orchestration.worker` | `orchestration.task_id`, `orchestration.worker`, `orchestration.task` |
 
 Token usage (`llm.token_count.*`) is recorded on all orchestration phase
