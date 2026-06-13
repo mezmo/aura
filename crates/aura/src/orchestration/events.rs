@@ -6,11 +6,6 @@
 //! This separation keeps orchestration-specific types isolated from the base
 //! aura streaming infrastructure.
 
-/// How the coordinator routed a query that produced a plan.
-///
-/// The type lives in [`aura_events`] (it is part of the SSE wire vocabulary
-/// shared with consumers); re-exported here so internal events and
-/// `RunManifest` persistence keep their existing paths.
 pub use aura_events::orchestration::{RoutingMode, TaskDagNode};
 
 /// Events emitted by the orchestrator during execution.
