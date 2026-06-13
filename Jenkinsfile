@@ -1,9 +1,12 @@
+import groovy.transform.Field
 library 'magic-butler-catalogue'
+
 def PROJECT_NAME = 'aura'
 def DEFAULT_BRANCH = 'main'
 def CURRENT_BRANCH = [env.CHANGE_BRANCH, env.BRANCH_NAME]?.find{branch -> branch != null}
 def DOCKER_REPO = "docker.io/mezmo"
 def BUILD_SLUG = slugify(env.BUILD_TAG)
+
 
 def RELEASE_CREDENTIALS = [
    usernamePassword(
@@ -46,6 +49,7 @@ pipeline {
     RUSTUP_HOME = "${env.WORKSPACE}/.rustup"
     CARGO_HOME = "${env.WORKSPACE}/.cargo"
     FEATURE_TAG = slugify("${CURRENT_BRANCH}-${BUILD_NUMBER}")
+    HELP_URL = 'https://github.com/mezmo/aura/blob/main/CONTRIBUTING.md'
     GIT_AUTHOR_NAME = 'Mezmo Bot'
     GIT_AUTHOR_EMAIL = 'bot@mezmo.com'
     GIT_COMMITTER_NAME = 'Mezmo Bot'
@@ -381,7 +385,12 @@ class ManualCheckException extends Exception {
  */
 def withReport(checkName, command, callback = null) {
   def logFile = "output-${checkName.replaceAll(/[^a-zA-Z0-9]/, "_")}.log"
-  publishChecks(name: checkName, status: 'IN_PROGRESS', title: 'Running...')
+  publishChecks(
+    name: checkName,
+    status: 'IN_PROGRESS',
+    title: 'Running...',
+    detailsURL: "${env.HELP_URL}"
+  )
 
   try {
     if (command) {
@@ -390,7 +399,12 @@ def withReport(checkName, command, callback = null) {
     if(callback) {
       callback()
     } else {
-      publishChecks(name: checkName, conclusion: 'SUCCESS', summary: 'Check passed!')
+      publishChecks(
+        name: checkName,
+        conclusion: 'SUCCESS',
+        summary: 'Check passed!',
+        detailsURL: "${env.HELP_URL}"
+      )
     }
   } catch (ManualCheckException e) {
     // Check was already published by callback, just re-throw to fail the step
@@ -401,7 +415,8 @@ def withReport(checkName, command, callback = null) {
       name: checkName,
       conclusion: 'FAILURE',
       summary: "Command failed: ${e.message}",
-      text: "### Console Output\n```\n${consoleOutput}\n```"
+      text: "### Console Output\n```\n${consoleOutput}\n```",
+      detailsURL: "${env.HELP_URL}"
     )
 
     // throwing will trigger the FAILURE check state
