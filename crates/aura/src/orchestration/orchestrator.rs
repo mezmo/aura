@@ -95,6 +95,17 @@ struct TaskExecutionParams<'a> {
     plan_goal: &'a str,
 }
 
+/// A task whose dependencies are all complete, selected for the current
+/// round of parallel execution, with everything the spawn path and
+/// TaskStarted emission need.
+struct ReadyTask {
+    id: usize,
+    description: String,
+    context: Option<String>,
+    worker: Option<String>,
+    dependencies: Vec<usize>,
+}
+
 /// Result from `execute_task` including structured output from `submit_result`.
 struct TaskExecutionResult {
     result: String,
@@ -2478,13 +2489,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
-            // Tuple: (task_id, description, context, worker_name)
-            let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
+            let ready_tasks: Vec<ReadyTask> = plan
                 .ready_tasks()
                 .iter()
-                .map(|t| {
-                    let context = self.build_task_context(plan, t.id);
-                    (t.id, t.description.clone(), context, t.worker.clone())
+                .map(|t| ReadyTask {
+                    id: t.id,
+                    description: t.description.clone(),
+                    context: self.build_task_context(plan, t.id),
+                    worker: t.worker.clone(),
+                    dependencies: t.dependencies.clone(),
                 })
                 .collect();
 
@@ -2510,17 +2523,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             );
 
             // Mark all ready tasks as running and emit TaskStarted events
-            for (task_id, task_desc, _context, worker_name) in &ready_tasks {
-                if let Some(task) = plan.get_task_mut(*task_id) {
+            for rt in &ready_tasks {
+                if let Some(task) = plan.get_task_mut(rt.id) {
                     task.start();
                 }
                 let _ = event_tx
                     .send(Ok(StreamItem::OrchestratorEvent(
                         OrchestratorEvent::TaskStarted {
-                            task_id: *task_id,
-                            description: task_desc.clone(),
+                            task_id: rt.id,
+                            description: rt.description.clone(),
+                            dependencies: rt.dependencies.clone(),
                             orchestrator_id: self.orchestrator_id.clone(),
-                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                            worker_id: rt.worker.clone().unwrap_or(self.orchestrator_id.clone()),
                         },
                     )))
                     .await;
@@ -2531,19 +2545,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
             let goal = plan_goal.clone();
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
-                .map(|(task_id, task_desc, task_context, worker_name)| {
+                .map(|rt| {
                     let goal = goal.clone();
                     async move {
                         let start_time = Instant::now();
                         let params = TaskExecutionParams {
-                            task_description: &task_desc,
-                            task_context: &task_context,
-                            worker_name: worker_name.as_deref(),
+                            task_description: &rt.description,
+                            task_context: &rt.context,
+                            worker_name: rt.worker.as_deref(),
                             plan_goal: &goal,
                         };
-                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
+                        let result = self.execute_task(rt.id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
-                        (task_id, result, duration_ms, worker_name, task_desc)
+                        (rt.id, result, duration_ms, rt.worker, rt.description)
                     }
                 })
                 .collect();
@@ -2710,41 +2724,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// - LlamaIndex's Sub-Question Query Engine
     /// - Anthropic's context engineering principles
     fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
-        use super::prompt_constants::{context, sections};
-
-        let task = plan.tasks.iter().find(|t| t.id == task_id)?;
-
-        // Build structured dependency context — compact format to prevent scope creep
-
-        if !task.dependencies.is_empty() {
-            let dep_parts: Vec<String> = task
-                .dependencies
-                .iter()
-                .filter_map(|dep_id| {
-                    plan.tasks
-                        .iter()
-                        .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| match &dep_task.state {
-                            TaskState::Complete { result } => Some(format!(
-                                "{} — Task {} ({}):\n{}",
-                                sections::PRIOR_WORK,
-                                dep_task.id,
-                                dep_task.description,
-                                result
-                            )),
-                            _ => None,
-                        })
-                })
-                .collect();
-
-            if dep_parts.is_empty() {
-                None
-            } else {
-                Some(dep_parts.join(context::DEPENDENCY_SEPARATOR))
-            }
-        } else {
-            None
-        }
+        build_dependency_context(plan, task_id, self.config.dependency_context_budget())
     }
 
     /// Execute a single task using a worker agent.
@@ -3115,14 +3095,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         format!("✗ failed: {}{}", truncated, suffix)
                     }
                     TaskState::Pending => {
-                        let blocked_by = t.dependencies.iter().any(|dep_id| {
-                            plan.tasks
-                                .iter()
-                                .find(|dt| dt.id == *dep_id)
-                                .map(|dt| matches!(dt.state, TaskState::Failed { .. }))
-                                .unwrap_or(false)
-                        });
-                        if blocked_by {
+                        if plan.has_failed_ancestor(t.id) {
                             "⏸ blocked by failed dependency".to_string()
                         } else {
                             "⏳ pending".to_string()
@@ -3380,6 +3353,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     OrchestratorEvent::PlanCreated {
                         goal: plan.goal.clone(),
                         tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
+                        dag: plan_dag(&plan),
                         routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
                         routing_rationale: routing_rationale.clone(),
                         planning_response: planning_summary,
@@ -3777,6 +3751,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .iter()
                             .map(|t| t.description.clone())
                             .collect(),
+                        dag: plan_dag(&new_plan),
                         routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
                         routing_rationale,
                         planning_response: planning_summary,
@@ -4176,9 +4151,235 @@ fn context_overflow_suggestion(phase: &str) -> String {
     }
 }
 
+/// Map a plan's tasks to their DAG edge list for `plan_created` events.
+///
+/// `dag[i].id` pairs with the event's `tasks[i]` description (flatten
+/// assigns IDs sequentially). Carries every task — including ones that
+/// later end up blocked and never emit `task_started` — so SSE consumers
+/// can reconstruct the full intended DAG up front.
+fn plan_dag(plan: &Plan) -> Vec<super::events::TaskDagNode> {
+    plan.tasks
+        .iter()
+        .map(|t| super::events::TaskDagNode {
+            id: t.id,
+            dependencies: t.dependencies.clone(),
+            worker: t.worker.clone(),
+        })
+        .collect()
+}
+
+/// Build the dependency context injected into a worker's task prompt.
+///
+/// Walks the task's transitive ancestor closure (not just direct
+/// dependencies) so that in a chain T0→T1→T2, T2 sees T0's result as well
+/// as T1's. Only `Complete` ancestors contribute; failed or pending
+/// ancestors are omitted (failure handling is the replanner's job).
+///
+/// Rendered in ascending task-ID order. Flattening assigns IDs in execution
+/// order (a dependency always has a lower ID than its dependents), so this
+/// reads oldest work first with direct-dependency results last — closest to
+/// the task instructions that follow the context block in the worker prompt.
+/// Returns `None` when no completed ancestor exists.
+///
+/// `budget` caps the total bytes of injected results. Direct dependencies
+/// always render their full stored result (already bounded by the artifact
+/// threshold). Transitive ancestors render in full, nearest first, until the
+/// budget is reached; all farther ancestors then degrade to a compact
+/// preview (`Task::compact_preview`) that keeps the task header and any
+/// artifact pointer so the worker can still cite lineage.
+///
+/// See mezmo/aura#221 for the missing-context failure mode this addresses.
+fn build_dependency_context(plan: &Plan, task_id: usize, budget: usize) -> Option<String> {
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+
+    use super::prompt_constants::{context, sections};
+
+    /// Byte cap for each over-budget ancestor entry. Matches the existing
+    /// 500-byte tool-output tier in the artifact system.
+    const DEGRADED_PREVIEW_BYTES: usize = 500;
+
+    let direct: HashSet<usize> = plan
+        .get_task(task_id)
+        .map(|t| t.dependencies.iter().copied().collect())
+        .unwrap_or_default();
+
+    // Nearest-first BFS order decides who keeps full results once the budget
+    // runs out; render order below stays ascending-ID regardless.
+    let bfs_ancestors = plan.transitive_ancestors(task_id);
+    let mut spent = 0usize;
+    let mut over_budget = false;
+    let mut degraded: HashSet<usize> = HashSet::new();
+    for id in &bfs_ancestors {
+        let Some(result) = plan.get_task(*id).and_then(|t| t.state.completed_result()) else {
+            continue;
+        };
+        if direct.contains(id) {
+            spent += result.len();
+        } else if over_budget || spent + result.len() > budget {
+            over_budget = true;
+            degraded.insert(*id);
+        } else {
+            spent += result.len();
+        }
+    }
+
+    let mut ancestors = bfs_ancestors;
+    ancestors.sort_unstable();
+
+    ancestors
+        .into_iter()
+        .filter_map(|ancestor_id| {
+            let ancestor = plan.get_task(ancestor_id)?;
+            let result = ancestor.state.completed_result()?;
+            let body: Cow<'_, str> = if degraded.contains(&ancestor_id) {
+                Cow::Owned(ancestor.compact_preview(DEGRADED_PREVIEW_BYTES)?)
+            } else {
+                Cow::Borrowed(result)
+            };
+            Some(format!(
+                "{} — Task {} ({}):\n{}",
+                sections::PRIOR_WORK,
+                ancestor.id,
+                ancestor.description,
+                body
+            ))
+        })
+        .reduce(|acc, part| acc + context::DEPENDENCY_SEPARATOR + &part)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::orchestration::types::Task;
+
+    fn three_task_chain() -> Plan {
+        // 0 -> 1 -> 2
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Fetch events", "r"));
+        plan.add_task(Task::new(1, "Correlate logs", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Summarize", "r").with_dependency(1));
+        plan
+    }
+
+    #[test]
+    fn test_dependency_context_includes_transitive_results() {
+        let mut plan = three_task_chain();
+        plan.get_task_mut(0).unwrap().complete("deploy X at 14:02");
+        plan.get_task_mut(1).unwrap().complete("errors start 14:03");
+
+        let ctx = build_dependency_context(&plan, 2, 32_000).expect("context for task 2");
+        assert!(
+            ctx.contains("deploy X at 14:02"),
+            "T2 context must include T0's (transitive) result: {ctx}"
+        );
+        assert!(ctx.contains("errors start 14:03"));
+
+        let t0_pos = ctx.find("Task 0").unwrap();
+        let t1_pos = ctx.find("Task 1").unwrap();
+        assert!(
+            t0_pos < t1_pos,
+            "execution order: T0's section renders before T1's"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_dedups_diamond() {
+        // 0 -> {1, 2} -> 3: root result appears exactly once
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Root", "r"));
+        plan.add_task(Task::new(1, "Left", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Right", "r").with_dependency(0));
+        plan.add_task(Task::new(3, "Join", "r").with_dependencies([1, 2]));
+        plan.get_task_mut(0).unwrap().complete("root result");
+        plan.get_task_mut(1).unwrap().complete("left result");
+        plan.get_task_mut(2).unwrap().complete("right result");
+
+        let ctx = build_dependency_context(&plan, 3, 32_000).expect("context for task 3");
+        assert_eq!(
+            ctx.matches("root result").count(),
+            1,
+            "diamond root must not be duplicated: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_skips_incomplete_ancestors() {
+        let mut plan = three_task_chain();
+        // T0 failed, T1 complete: only T1 contributes to T2's context
+        plan.get_task_mut(0)
+            .unwrap()
+            .fail("boom", FailureCategory::AgentError);
+        plan.get_task_mut(1).unwrap().complete("partial result");
+
+        let ctx = build_dependency_context(&plan, 2, 32_000).expect("context for task 2");
+        assert!(ctx.contains("partial result"));
+        assert!(!ctx.contains("boom"), "failed ancestor must be omitted");
+        assert!(!ctx.contains("Task 0"));
+    }
+
+    #[test]
+    fn test_dependency_context_none_when_no_completed_ancestors() {
+        // Pending ancestors only -> None; no dependencies at all -> None
+        let plan = three_task_chain();
+        assert!(build_dependency_context(&plan, 2, 32_000).is_none());
+        assert!(build_dependency_context(&plan, 0, 32_000).is_none());
+    }
+
+    #[test]
+    fn test_dependency_context_respects_budget() {
+        // Chain 0 -> 1 -> 2 -> 3 with 1KB results and a budget that fits the
+        // direct dep (2) plus one transitive ancestor: 0 must degrade.
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Fetch", "r"));
+        plan.add_task(Task::new(1, "Correlate", "r").with_dependency(0));
+        plan.add_task(Task::new(2, "Analyze", "r").with_dependency(1));
+        plan.add_task(Task::new(3, "Summarize", "r").with_dependency(2));
+        plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
+        plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
+        plan.get_task_mut(2).unwrap().complete("C".repeat(1000));
+
+        let ctx = build_dependency_context(&plan, 3, 2000).expect("context for task 3");
+        assert!(
+            ctx.contains(&"C".repeat(1000)),
+            "direct dep keeps full result"
+        );
+        assert!(
+            ctx.contains(&"B".repeat(1000)),
+            "nearest transitive ancestor fits the budget"
+        );
+        assert!(
+            !ctx.contains(&"A".repeat(1000)),
+            "farthest ancestor degrades once budget is spent"
+        );
+        assert!(
+            ctx.contains("Task 0 (Fetch)"),
+            "degraded ancestor keeps its lineage header: {ctx}"
+        );
+        assert!(
+            ctx.contains(&"A".repeat(500)),
+            "degraded ancestor keeps a 500-byte preview"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_direct_deps_never_degrade() {
+        // Direct dep result alone exceeds the budget; it still renders fully.
+        let mut plan = three_task_chain();
+        plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
+        plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
+
+        let ctx = build_dependency_context(&plan, 2, 100).expect("context for task 2");
+        assert!(
+            ctx.contains(&"B".repeat(1000)),
+            "direct dependency is budget-exempt"
+        );
+        assert!(
+            !ctx.contains(&"A".repeat(1000)),
+            "transitive ancestor degrades under a tiny budget"
+        );
+    }
 
     #[test]
     fn test_truncate_query_short() {

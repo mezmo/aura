@@ -24,13 +24,44 @@ impl EventContext {
     }
 }
 
+/// Shared identity fields for task events (TaskStarted, TaskCompleted).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskContext {
+    pub task_id: usize,
+    pub orchestrator_id: String,
+    pub worker_id: String,
+}
+
+/// Outcome fields shared by completion events (TaskCompleted, ToolCallCompleted).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionOutcome {
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
+/// One task's edges in the plan DAG, emitted on `plan_created`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskDagNode {
+    pub id: usize,
+    pub dependencies: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+}
+
 /// How the coordinator routed a query that produced a plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
+    /// Coordinator answered directly without task execution.
+    ///
+    /// Never appears on `plan_created` events (direct answers emit
+    /// `direct_answer` instead); used by run-manifest persistence.
+    DirectAnswer,
     /// Coordinator classified query to a single worker.
     Routed,
-    /// Full orchestration — multi-task DAG with synthesis + evaluation.
+    /// Full orchestration — multi-task DAG execution.
     Orchestrated,
 }
 
@@ -92,7 +123,12 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator creates a plan from user query.
     PlanCreated {
         goal: String,
-        task_count: usize,
+        /// Flat list of task descriptions, in task-ID order.
+        #[serde(default)]
+        tasks: Vec<String>,
+        /// Dependency edges per task; `dag[i].id` pairs with `tasks[i]`.
+        #[serde(default)]
+        dag: Vec<TaskDagNode>,
         routing_mode: RoutingMode,
         routing_rationale: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,32 +154,28 @@ pub enum OrchestrationStreamEvent {
     },
     /// Emitted when orchestrator starts a task.
     TaskStarted {
-        task_id: usize,
         description: String,
-        worker_id: String,
-        orchestrator_id: String,
+        /// Direct dependency edges of this task.
+        #[serde(default)]
+        dependencies: Vec<usize>,
+        #[serde(flatten)]
+        task: TaskContext,
         #[serde(flatten)]
         context: EventContext,
     },
     /// Emitted when orchestrator completes a task.
     TaskCompleted {
-        task_id: usize,
-        success: bool,
-        duration_ms: u64,
-        orchestrator_id: String,
-        worker_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
+        #[serde(flatten)]
+        task: TaskContext,
+        #[serde(flatten)]
+        outcome: CompletionOutcome,
         #[serde(flatten)]
         context: EventContext,
     },
     /// Emitted when orchestrator completes an iteration.
     IterationComplete {
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -189,10 +221,8 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task_id: Option<usize>,
         tool_call_id: String,
-        success: bool,
-        duration_ms: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        result: Option<String>,
+        #[serde(flatten)]
+        outcome: CompletionOutcome,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -242,7 +272,8 @@ impl OrchestrationStreamEvent {
 
     pub fn plan_created(
         goal: impl Into<String>,
-        task_count: usize,
+        tasks: Vec<String>,
+        dag: Vec<TaskDagNode>,
         routing_mode: RoutingMode,
         routing_rationale: impl Into<String>,
         planning_response: Option<String>,
@@ -250,7 +281,8 @@ impl OrchestrationStreamEvent {
     ) -> Self {
         Self::PlanCreated {
             goal: goal.into(),
-            task_count,
+            tasks,
+            dag,
             routing_mode,
             routing_rationale: routing_rationale.into(),
             planning_response,
@@ -287,15 +319,19 @@ impl OrchestrationStreamEvent {
     pub fn task_started(
         task_id: usize,
         description: impl Into<String>,
+        dependencies: Vec<usize>,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
         context: EventContext,
     ) -> Self {
         Self::TaskStarted {
-            task_id,
             description: description.into(),
-            orchestrator_id: orchestrator_id.into(),
-            worker_id: worker_id.into(),
+            dependencies,
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
+            },
             context,
         }
     }
@@ -310,33 +346,30 @@ impl OrchestrationStreamEvent {
         context: EventContext,
     ) -> Self {
         Self::TaskCompleted {
-            task_id,
-            success,
-            duration_ms,
-            orchestrator_id: orchestrator_id.into(),
-            worker_id: worker_id.into(),
-            result,
+            task: TaskContext {
+                task_id,
+                orchestrator_id: orchestrator_id.into(),
+                worker_id: worker_id.into(),
+            },
+            outcome: CompletionOutcome {
+                success,
+                duration_ms,
+                result,
+            },
             context,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn iteration_complete(
         iteration: usize,
-        quality_score: f32,
-        quality_threshold: f32,
         will_replan: bool,
-        evaluation_skipped: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
         context: EventContext,
     ) -> Self {
         Self::IterationComplete {
             iteration,
-            quality_score,
-            quality_threshold,
             will_replan,
-            evaluation_skipped,
             reasoning,
             gaps,
             context,
@@ -402,9 +435,11 @@ impl OrchestrationStreamEvent {
         Self::ToolCallCompleted {
             task_id,
             tool_call_id: tool_call_id.into(),
-            success,
-            duration_ms,
-            result,
+            outcome: CompletionOutcome {
+                success,
+                duration_ms,
+                result,
+            },
             context,
         }
     }

@@ -173,6 +173,14 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_result_summary_length")]
     pub result_summary_length: usize,
 
+    /// Total byte budget for dependency context injected into a worker prompt.
+    /// Direct dependencies always render in full; transitive ancestors render
+    /// in full until this budget is reached, then degrade to compact previews.
+    /// Default: 32000 (8x result_artifact_threshold, sized to the same
+    /// continuation-prompt envelope that fits all 200K-window models).
+    #[serde(default = "default_dependency_context_budget")]
+    pub dependency_context_budget: usize,
+
     /// Maximum number of prior run manifests auto-injected into the coordinator
     /// preamble as session context. Set to 0 to disable session history injection.
     /// Default: 3.
@@ -216,6 +224,7 @@ impl Default for ArtifactsConfig {
             memory_dir: None,
             result_artifact_threshold: default_result_artifact_threshold(),
             result_summary_length: default_result_summary_length(),
+            dependency_context_budget: default_dependency_context_budget(),
             session_history_turns: default_session_history_turns(),
             persistence_drain_timeout_ms: default_persistence_drain_timeout_ms(),
             tool_output_artifact_threshold: default_tool_output_artifact_threshold(),
@@ -371,6 +380,11 @@ impl OrchestrationConfig {
     /// Maximum summary length for artifact extraction.
     pub fn result_summary_length(&self) -> usize {
         self.artifacts.result_summary_length
+    }
+
+    /// Total byte budget for dependency context in worker prompts.
+    pub fn dependency_context_budget(&self) -> usize {
+        self.artifacts.dependency_context_budget
     }
 
     /// Maximum prior run manifests to inject as session context.
@@ -594,6 +608,10 @@ fn default_result_summary_length() -> usize {
     2000
 }
 
+fn default_dependency_context_budget() -> usize {
+    32_000
+}
+
 fn default_max_session_runs() -> usize {
     20
 }
@@ -633,6 +651,7 @@ mod tests {
         assert_eq!(config.per_call_timeout_secs(), 0);
         assert_eq!(config.result_artifact_threshold(), 4000);
         assert_eq!(config.result_summary_length(), 2000);
+        assert_eq!(config.dependency_context_budget(), 32_000);
         assert!(config.memory_dir().is_none());
         assert_eq!(config.session_history_turns(), 3);
         assert_eq!(config.persistence_drain_timeout_ms(), 2000);

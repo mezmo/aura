@@ -375,7 +375,7 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 flowchart TD
     A([User query received]) --> R{Coordinator routing}
 
-    R -->|orchestrated / routed| B["plan_created<br/>(goal, tasks, routing_mode, routing_rationale)"]
+    R -->|orchestrated / routed| B["plan_created<br/>(goal, tasks, dag, routing_mode, routing_rationale)"]
     R -->|simple query| DA["direct_answer<br/>(response, routing_rationale)"]
     R -->|ambiguous| CL["clarification_needed<br/>(question, options, routing_rationale)"]
 
@@ -415,12 +415,22 @@ data:
 {
   "goal": "Calculate (3+7)*2 and list files",
   "tasks": ["Calculate (3+7)*2", "List files in /tmp"],
+  "dag": [
+    { "id": 0, "dependencies": [], "worker": "arithmetic" },
+    { "id": 1, "dependencies": [0], "worker": "files" }
+  ],
   "routing_mode": "orchestrated",
   "routing_rationale": "Multi-step: arithmetic + file listing",
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
+
+The `dag` field carries each task's dependency edges: `dag[i].id` pairs with
+`tasks[i]` (IDs are assigned sequentially in task order). `worker` is omitted
+when no specialized worker is assigned. Because the full plan is emitted up
+front, consumers can reconstruct the execution DAG even for tasks that later
+end up blocked and never emit `task_started`.
 
 The `routing_mode` field indicates how the coordinator routed the query:
 - `"routed"` — classified to a single worker
@@ -468,12 +478,16 @@ data:
 {
   "task_id": 0,
   "description": "Calculate (3+7)*2",
+  "dependencies": [],
   "worker_id": "arithmetic",
   "orchestrator_id": "orch-1",
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
+
+`dependencies` lists the task's direct dependency edges (empty for root
+tasks), matching the `dag` entry from `plan_created`.
 
 **Worker reasoning** (worker thinking with attribution):
 ```

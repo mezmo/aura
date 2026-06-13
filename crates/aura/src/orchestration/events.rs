@@ -6,38 +6,7 @@
 //! This separation keeps orchestration-specific types isolated from the base
 //! aura streaming infrastructure.
 
-use serde::{Deserialize, Serialize};
-
-/// How the coordinator routed a query that produced a plan.
-///
-/// Provides a machine-readable signal in `plan_created` SSE events and
-/// `RunManifest` persistence so clients can distinguish single-worker
-/// classification from full orchestration without parsing text fields.
-///
-/// Direct answers and clarifications have their own event types
-/// (`aura.orchestrator.direct_answer`, `aura.orchestrator.clarification_needed`)
-/// and never produce a `PlanCreated` event, so they are not represented here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingMode {
-    /// Coordinator answered directly without task execution.
-    DirectAnswer,
-    /// Coordinator classified query to a single worker.
-    Routed,
-    /// Full orchestration — multi-task DAG execution.
-    Orchestrated,
-}
-
-impl RoutingMode {
-    /// Derive routing mode from the number of tasks in a plan.
-    pub fn for_plan(task_count: usize) -> Self {
-        if task_count == 1 {
-            Self::Routed
-        } else {
-            Self::Orchestrated
-        }
-    }
-}
+pub use aura_events::orchestration::{RoutingMode, TaskDagNode};
 
 /// Events emitted by the orchestrator during execution.
 ///
@@ -49,8 +18,10 @@ pub enum OrchestratorEvent {
     PlanCreated {
         /// The goal being addressed
         goal: String,
-        /// Number of tasks in the plan
+        /// Task descriptions in task-ID order
         tasks: Vec<String>,
+        /// Dependency edges per task; `dag[i].id` pairs with `tasks[i]`
+        dag: Vec<TaskDagNode>,
         /// How the coordinator routed this query
         routing_mode: RoutingMode,
         /// Why the coordinator chose orchestration
@@ -80,6 +51,8 @@ pub enum OrchestratorEvent {
         task_id: usize,
         /// Human-readable task description
         description: String,
+        /// Direct dependency edges of this task (empty for root tasks)
+        dependencies: Vec<usize>,
         /// The ID of the orchestrator
         orchestrator_id: String,
         /// The ID of the Worker who is handling the task
