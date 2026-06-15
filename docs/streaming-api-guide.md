@@ -375,7 +375,7 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 flowchart TD
     A([User query received]) --> R{Coordinator routing}
 
-    R -->|orchestrated / routed| B["plan_created<br/>(goal, tasks, dag, routing_mode, routing_rationale)"]
+    R -->|orchestrated| B["plan_created<br/>(goal, tasks, dag, routing_mode, routing_rationale)"]
     R -->|simple query| DA["direct_answer<br/>(response, routing_rationale)"]
     R -->|ambiguous| CL["clarification_needed<br/>(question, options, routing_rationale)"]
 
@@ -432,9 +432,10 @@ when no specialized worker is assigned. Because the full plan is emitted up
 front, consumers can reconstruct the execution DAG even for tasks that later
 end up blocked and never emit `task_started`.
 
-The `routing_mode` field indicates how the coordinator routed the query:
-- `"routed"` — classified to a single worker
-- `"orchestrated"` — multi-task DAG with continuation
+The `routing_mode` field is `"orchestrated"` for any plan execution (both
+single-task and multi-task plans). The legacy `"routed"` value for single-task
+plans has been removed; the coordinator no longer has a separate single-worker
+routing path.
 
 The optional `planning_response` field contains the coordinator's raw planning text and is omitted when empty.
 
@@ -478,7 +479,6 @@ data:
 {
   "task_id": 0,
   "description": "Calculate (3+7)*2",
-  "dependencies": [],
   "worker_id": "arithmetic",
   "orchestrator_id": "orch-1",
   "agent_id": "coordinator",
@@ -486,8 +486,8 @@ data:
 }
 ```
 
-`dependencies` lists the task's direct dependency edges (empty for root
-tasks), matching the `dag` entry from `plan_created`.
+Dependency edges live on the `dag` field of `plan_created`; `task_started`
+carries only the runtime identity and description.
 
 **Worker reasoning** (worker thinking with attribution):
 ```

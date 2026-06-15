@@ -942,19 +942,19 @@ fn test_continuation_soft_failure_without_structured_output() {
 }
 
 // ========================================================================
-// Session history — RoutingMode::Routed variant
+// Session history — single-task orchestrated run
 // ========================================================================
 
 #[test]
-fn test_session_history_routed_single_worker() {
+fn test_session_history_single_task_orchestrated() {
     let manifest = RunManifest {
-        run_id: "run_routed".into(),
+        run_id: "run_single_task".into(),
         session_id: Some("s".into()),
         timestamp: "2026-04-30T16:00:00Z".into(),
         goal: "Check k8s pod status".into(),
         status: RunStatus::Success,
         iterations: 1,
-        routing_mode: Some(RoutingMode::Routed),
+        routing_mode: Some(RoutingMode::Orchestrated),
         outcome: Some("1/1 tasks completed".into()),
         response_summary: None,
         task_summaries: vec![complete_task_summary(

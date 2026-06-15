@@ -74,15 +74,8 @@ mod tests {
         );
 
         assert_eq!(
-            OrchestrationStreamEvent::task_started(
-                0,
-                "desc",
-                vec![],
-                "orch-id",
-                "worker-id",
-                ctx.clone()
-            )
-            .event_name(),
+            OrchestrationStreamEvent::task_started(0, "desc", "orch-id", "worker-id", ctx.clone())
+                .event_name(),
             event_names::TASK_STARTED
         );
 
@@ -93,11 +86,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_sse_task_started_includes_dependencies() {
+    fn test_format_sse_task_started_omits_dependencies() {
+        // DAG structure lives on plan_created; task_started only carries
+        // runtime identity and description.
         let event = OrchestrationStreamEvent::task_started(
             2,
             "Summarize root cause",
-            vec![0, 1],
             "orch-1",
             "writer",
             test_ctx(),
@@ -105,16 +99,20 @@ mod tests {
         let sse = event.format_sse();
 
         assert!(sse.starts_with(&format!("event: {}\n", event_names::TASK_STARTED)));
-        assert!(sse.contains("\"dependencies\":[0,1]"));
+        assert!(!sse.contains("dependencies"));
         assert!(sse.contains("\"task_id\":2"));
     }
 
     #[test]
     fn test_old_task_started_without_dependencies_still_deserializes() {
-        // Pre-#221 task_started payloads have no dependencies field.
+        // Pre-#221 task_started payloads had a dependencies field; modern
+        // payloads omit it because plan_created carries the authoritative DAG.
+        // Serde ignores unknown fields by default, so both old and new payloads
+        // deserialize successfully.
         let old_payload = serde_json::json!({
             "task_id": 1,
             "description": "d",
+            "dependencies": [0],
             "worker_id": "w",
             "orchestrator_id": "o",
             "agent_id": "coordinator",
@@ -124,7 +122,7 @@ mod tests {
             serde_json::from_value(old_payload).expect("old payload deserializes");
         assert!(matches!(
             event,
-            OrchestrationStreamEvent::TaskStarted { ref dependencies, .. } if dependencies.is_empty()
+            OrchestrationStreamEvent::TaskStarted { ref task, .. } if task.task_id == 1
         ));
     }
 
@@ -171,7 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_sse_plan_created_routed() {
+    fn test_format_sse_plan_created_single_task_is_orchestrated() {
+        // Single-task plans execute through the orchestrator and report the
+        // same routing_mode as multi-task plans.
         let event = OrchestrationStreamEvent::plan_created(
             "simple math",
             Vec::from(["Calculate the mean of [10, 20, 30]".to_string()]),
@@ -180,14 +180,14 @@ mod tests {
                 dependencies: vec![],
                 worker: None,
             }],
-            RoutingMode::Routed,
-            "single worker",
+            RoutingMode::Orchestrated,
+            "single task still goes through orchestrator",
             None,
             test_ctx(),
         );
         let sse = event.format_sse();
 
-        assert!(sse.contains("\"routing_mode\":\"routed\""));
+        assert!(sse.contains("\"routing_mode\":\"orchestrated\""));
         assert!(!sse.contains("planning_response"));
     }
 
@@ -197,7 +197,7 @@ mod tests {
             "goal",
             Vec::from(["Task 1".to_string()]),
             vec![],
-            RoutingMode::Routed,
+            RoutingMode::Orchestrated,
             "rationale",
             None,
             test_ctx(),

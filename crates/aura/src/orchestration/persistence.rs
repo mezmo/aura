@@ -1473,7 +1473,7 @@ mod tests {
             goal: "Test goal".to_string(),
             status: RunStatus::PartialSuccess,
             iterations: 1,
-            routing_mode: Some(RoutingMode::Routed),
+            routing_mode: Some(RoutingMode::Orchestrated),
             outcome: None,
             response_summary: None,
             task_summaries: vec![],
@@ -1535,7 +1535,7 @@ mod tests {
             goal: goal.to_string(),
             status: RunStatus::Success,
             iterations: 1,
-            routing_mode: Some(RoutingMode::Routed),
+            routing_mode: Some(RoutingMode::Orchestrated),
             outcome: None,
             response_summary: None,
             task_summaries: vec![TaskSummary {

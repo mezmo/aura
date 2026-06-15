@@ -51,8 +51,6 @@ pub enum OrchestratorEvent {
         task_id: usize,
         /// Human-readable task description
         description: String,
-        /// Direct dependency edges of this task (empty for root tasks)
-        dependencies: Vec<usize>,
         /// The ID of the orchestrator
         orchestrator_id: String,
         /// The ID of the Worker who is handling the task

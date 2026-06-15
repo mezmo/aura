@@ -102,7 +102,6 @@ struct ReadyTask {
     description: String,
     context: Option<String>,
     worker: Option<String>,
-    dependencies: Vec<usize>,
 }
 
 /// Result from `execute_task` including structured output from `submit_result`.
@@ -2501,7 +2500,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     description: t.description.clone(),
                     context: self.build_task_context(plan, t.id),
                     worker: t.worker.clone(),
-                    dependencies: t.dependencies.clone(),
                 })
                 .collect();
 
@@ -2536,7 +2534,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         OrchestratorEvent::TaskStarted {
                             task_id: rt.id,
                             description: rt.description.clone(),
-                            dependencies: rt.dependencies.clone(),
                             orchestrator_id: self.orchestrator_id.clone(),
                             worker_id: rt.worker.clone().unwrap_or(self.orchestrator_id.clone()),
                         },
@@ -2707,20 +2704,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Build context for a task from its completed dependencies and the plan goal.
+    /// Delegates to [`build_dependency_context`] using the configured byte budget.
     ///
-    /// Includes:
-    /// - For each dependency: description, rationale, and result
-    /// - The current task's rationale (how this task advances the goal)
-    ///
-    /// This ensures workers understand not just WHAT to do, but WHY.
-    ///
-    /// # Research Inspirations
-    ///
-    /// Based on patterns from:
-    /// - LangChain's Write-Select-Compress-Isolate framework
-    /// - LlamaIndex's Sub-Question Query Engine
-    /// - Anthropic's context engineering principles
+    /// See that function for rendering semantics (transitive ancestor closure,
+    /// nearest-first budget degradation, and artifact footer preservation).
     fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
         build_dependency_context(plan, task_id, self.config.dependency_context_budget())
     }
@@ -3350,7 +3337,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         goal: plan.goal.clone(),
                         tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
                         dag: plan_dag(&plan),
-                        routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
+                        routing_mode: super::events::RoutingMode::Orchestrated,
                         routing_rationale: routing_rationale.clone(),
                         planning_response: planning_summary,
                     },
@@ -3748,7 +3735,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             .map(|t| t.description.clone())
                             .collect(),
                         dag: plan_dag(&new_plan),
-                        routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
+                        routing_mode: super::events::RoutingMode::Orchestrated,
                         routing_rationale,
                         planning_response: planning_summary,
                     },
@@ -4014,7 +4001,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             goal: plan.goal.clone(),
             status,
             iterations,
-            routing_mode: Some(super::events::RoutingMode::for_plan(plan.tasks.len())),
+            routing_mode: Some(super::events::RoutingMode::Orchestrated),
             outcome,
             response_summary,
             task_summaries,

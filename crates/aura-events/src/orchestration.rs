@@ -50,30 +50,17 @@ pub struct TaskDagNode {
     pub worker: Option<String>,
 }
 
-/// How the coordinator routed a query that produced a plan.
+/// How the coordinator routed a query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingMode {
     /// Coordinator answered directly without task execution.
-    ///
-    /// Never appears on `plan_created` events (direct answers emit
-    /// `direct_answer` instead); used by run-manifest persistence.
     DirectAnswer,
-    /// Coordinator classified query to a single worker.
-    Routed,
-    /// Full orchestration — multi-task DAG execution.
+    /// Coordinator created a plan and executed it via the orchestrator.
+    ///
+    /// Both single-task and multi-task plans use this variant. There is no
+    /// separate single-worker routing path in the coordinator's tool set.
     Orchestrated,
-}
-
-impl RoutingMode {
-    /// Derive routing mode from the number of tasks in a plan.
-    pub fn for_plan(task_count: usize) -> Self {
-        if task_count == 1 {
-            Self::Routed
-        } else {
-            Self::Orchestrated
-        }
-    }
 }
 
 /// The continuation decision after a phase completes.
@@ -155,9 +142,6 @@ pub enum OrchestrationStreamEvent {
     /// Emitted when orchestrator starts a task.
     TaskStarted {
         description: String,
-        /// Direct dependency edges of this task.
-        #[serde(default)]
-        dependencies: Vec<usize>,
         #[serde(flatten)]
         task: TaskContext,
         #[serde(flatten)]
@@ -319,14 +303,12 @@ impl OrchestrationStreamEvent {
     pub fn task_started(
         task_id: usize,
         description: impl Into<String>,
-        dependencies: Vec<usize>,
         orchestrator_id: impl Into<String>,
         worker_id: impl Into<String>,
         context: EventContext,
     ) -> Self {
         Self::TaskStarted {
             description: description.into(),
-            dependencies,
             task: TaskContext {
                 task_id,
                 orchestrator_id: orchestrator_id.into(),
