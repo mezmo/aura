@@ -192,9 +192,7 @@ impl Plan {
         self.tasks.iter().find(|task| {
             matches!(task.state, TaskState::Pending)
                 && task.dependencies.iter().all(|dep_id| {
-                    self.tasks
-                        .iter()
-                        .find(|t| t.id == *dep_id)
+                    self.get_task(*dep_id)
                         .map(|t| matches!(t.state, TaskState::Complete { .. }))
                         .unwrap_or(true)
                 })
@@ -222,19 +220,11 @@ impl Plan {
         self.tasks
             .iter()
             .filter(|task| {
-                if !matches!(task.state, TaskState::Pending) {
-                    return false;
-                }
-
-                for dep_id in &task.dependencies {
-                    let dep = self.tasks.iter().find(|t| t.id == *dep_id);
-                    match dep.map(|t| &t.state) {
-                        Some(TaskState::Complete { .. }) => continue,
-                        Some(TaskState::Failed { .. }) => return false,
-                        _ => return false,
-                    }
-                }
-                true
+                matches!(task.state, TaskState::Pending)
+                    && task.dependencies.iter().all(|dep_id| {
+                        self.get_task(*dep_id)
+                            .is_some_and(|t| matches!(t.state, TaskState::Complete { .. }))
+                    })
             })
             .collect()
     }
@@ -747,7 +737,6 @@ pub struct FailedTaskRecord {
     pub category: FailureCategory,
 }
 
-/// Context from a previous iteration, used for the post-execute
 /// Context from a previous iteration, used for the post-execute
 /// coordinator decision (continuation prompt).
 ///

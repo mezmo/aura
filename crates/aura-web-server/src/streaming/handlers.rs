@@ -1099,7 +1099,6 @@ fn handle_orchestrator_event(
         OrchestratorEvent::TaskStarted {
             task_id,
             description,
-            dependencies,
             orchestrator_id,
             worker_id,
         } => {
@@ -1107,7 +1106,6 @@ fn handle_orchestrator_event(
             OrchestrationStreamEvent::task_started(
                 *task_id,
                 description,
-                dependencies.clone(),
                 orchestrator_id,
                 worker_id,
                 event_context,
