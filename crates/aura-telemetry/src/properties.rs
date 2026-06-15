@@ -116,8 +116,6 @@ pub enum PropertyValue {
     Static(&'static str),
     /// `env!("CARGO_PKG_VERSION")` value; resolved at compile time.
     AuraVersion,
-    /// Session UUID — random per-process; not linked to install identity.
-    SessionUuid(uuid::Uuid),
 }
 
 impl PropertyValue {
@@ -131,7 +129,6 @@ impl PropertyValue {
             Self::DeploymentMethod(v) => Value::String(v.as_str().into()),
             Self::Static(s) => Value::String((*s).into()),
             Self::AuraVersion => Value::String(env!("CARGO_PKG_VERSION").into()),
-            Self::SessionUuid(u) => Value::String(u.to_string()),
         }
     }
 }
@@ -188,18 +185,6 @@ impl IntoTelemetryProperty for &'static str {
 // types keeps the allow-list a structural property of the codebase
 // instead of a convention. The compile_fail test
 // `property_value_field.rs` locks this in.
-
-/// Marker newtype for a session UUID. Use this on event fields to avoid
-/// ambiguity with install UUID (different envelope position, different
-/// audit semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionUuid(pub uuid::Uuid);
-
-impl IntoTelemetryProperty for SessionUuid {
-    fn into_telemetry_property(self) -> PropertyValue {
-        PropertyValue::SessionUuid(self.0)
-    }
-}
 
 /// A bag of allow-listed properties for one event. `Clone` is
 /// provided so the background-task channel can move owned copies of

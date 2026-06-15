@@ -6,8 +6,8 @@
 //! identifier), allowing `PropertyValue`-typed event fields would let
 //! that variant be smuggled into the per-event property map by a future
 //! contributor. Forcing fields to use one of the typed source types
-//! (`bool`, `OsFamily`, `Source`, `DeploymentMethod`, `&'static str`,
-//! `SessionUuid`) keeps the gate structural rather than conventional.
+//! (`bool`, `OsFamily`, `Source`, `DeploymentMethod`, `&'static str`)
+//! keeps the gate structural rather than conventional.
 //!
 //! This file MUST fail to compile.
 

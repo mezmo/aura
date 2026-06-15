@@ -28,7 +28,6 @@ fn payload_carries_event_name_and_properties() {
     let payload = event.into_payload();
 
     assert_eq!(payload.name, "server_started");
-    assert_eq!(<ServerStarted as Event>::NAME, "server_started");
 
     let map: std::collections::HashMap<_, _> = payload
         .properties

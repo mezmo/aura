@@ -951,7 +951,9 @@ pub fn apply_consent_header(telemetry: &aura_telemetry::TelemetryHandle, headers
         .get(aura_telemetry::CONSENT_HEADER)
         .and_then(|h| h.to_str().ok());
     if header_grants_consent(consent) {
-        telemetry.enable();
+        // A Disabled server yields HeldUntilRestart here, so the operator
+        // opt-out wins and there is nothing to act on.
+        let _ = telemetry.enable();
     }
 }
 

@@ -165,9 +165,7 @@ pub(crate) fn format_telemetry_enable_result(
         // reason so the user knows what to clear.
         EnableOutcome::HeldUntilRestart => {
             let reason = match telemetry.state() {
-                aura_telemetry::TelemetryState::Disabled(r) => {
-                    aura_telemetry::inspection_log::disable_reason_label(&r)
-                }
+                aura_telemetry::TelemetryState::Disabled(r) => r.to_string(),
                 _ => "disabled".to_string(),
             };
             match persisted {
@@ -208,11 +206,10 @@ pub(crate) fn format_telemetry_disable_result(
 
 pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandle) -> String {
     use aura_telemetry::TelemetryState;
-    use aura_telemetry::inspection_log::disable_reason_label;
     let state = match telemetry.state() {
         TelemetryState::Unknown => "unknown (held — awaiting notice or enable)".to_string(),
         TelemetryState::Enabled => "active".to_string(),
-        TelemetryState::Disabled(r) => format!("disabled ({})", disable_reason_label(&r)),
+        TelemetryState::Disabled(r) => format!("disabled ({r})"),
     };
     let mut out = String::new();
     out.push_str(&format!("telemetry: {state}\n"));

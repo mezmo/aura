@@ -37,6 +37,20 @@ pub enum DisableReason {
     ConfigDisabled,
 }
 
+impl std::fmt::Display for DisableReason {
+    /// Stable labels for the inspection log; users and downstream
+    /// filtering rely on them. Keep them in sync with `docs/telemetry.md`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DoNotTrack => f.write_str("DoNotTrack"),
+            Self::AuraDisabled => f.write_str("AuraDisabled"),
+            Self::Ci(name) => write!(f, "Ci({name})"),
+            Self::CargoTest => f.write_str("CargoTest"),
+            Self::ConfigDisabled => f.write_str("ConfigDisabled"),
+        }
+    }
+}
+
 /// Pluggable env provider so tests don't touch the process env (which
 /// leaks between parallel `cargo test`s).
 pub trait EnvProvider {
@@ -73,7 +87,9 @@ const CI_ENV_VARS: &[&str] = &[
 /// Without this, `DO_NOT_TRACK=false` or `CI=false` (a common
 /// shell-rc pattern for "I'm not in CI today") would silently
 /// suppress all telemetry — the opposite of the user's intent.
-fn is_false_value(s: &str) -> bool {
+/// Shared with `bootstrap` so the `AURA_TELEMETRY_ENABLED` parse and the
+/// kill-switch parse agree on what counts as "off".
+pub(crate) fn is_false_value(s: &str) -> bool {
     let lower = s.trim().to_ascii_lowercase();
     matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
 }
@@ -97,7 +113,7 @@ fn flag_set(v: &Option<String>) -> bool {
 /// `AURA_TELEMETRY_DISABLED` → CI envs → cargo-test markers.
 ///
 /// Returns `Some(reason)` if a hard disable is active, else `None`.
-pub fn decide_hard_disable(env: &dyn EnvProvider) -> Option<DisableReason> {
+pub(crate) fn decide_hard_disable(env: &dyn EnvProvider) -> Option<DisableReason> {
     if flag_set(&env.var("DO_NOT_TRACK")) {
         return Some(DisableReason::DoNotTrack);
     }
@@ -126,7 +142,7 @@ pub fn decide_hard_disable(env: &dyn EnvProvider) -> Option<DisableReason> {
 /// 3. File preference: `Some(false)` → `Disabled`, `Some(true)` →
 ///    `Enabled`.
 /// 4. Otherwise → `Unknown` (held; awaiting a notice or explicit enable).
-pub fn decide_state(env: &dyn EnvProvider, file_enabled: Option<bool>) -> TelemetryState {
+pub(crate) fn decide_state(env: &dyn EnvProvider, file_enabled: Option<bool>) -> TelemetryState {
     if let Some(reason) = decide_hard_disable(env) {
         return TelemetryState::Disabled(reason);
     }
@@ -150,26 +166,18 @@ pub fn decide_state(env: &dyn EnvProvider, file_enabled: Option<bool>) -> Teleme
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::test_support::MockEnv;
 
-    /// Test double — gives every test its own isolated env map.
-    #[derive(Default)]
-    struct MockEnv(HashMap<String, String>);
-
-    impl MockEnv {
-        fn new() -> Self {
-            Self(HashMap::new())
-        }
-        fn set(mut self, key: &str, value: &str) -> Self {
-            self.0.insert(key.to_string(), value.to_string());
-            self
-        }
-    }
-
-    impl EnvProvider for MockEnv {
-        fn var(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
-        }
+    #[test]
+    fn disable_reason_display_stable_strings() {
+        assert_eq!(DisableReason::DoNotTrack.to_string(), "DoNotTrack");
+        assert_eq!(DisableReason::AuraDisabled.to_string(), "AuraDisabled");
+        assert_eq!(
+            DisableReason::Ci("GITHUB_ACTIONS").to_string(),
+            "Ci(GITHUB_ACTIONS)"
+        );
+        assert_eq!(DisableReason::CargoTest.to_string(), "CargoTest");
+        assert_eq!(DisableReason::ConfigDisabled.to_string(), "ConfigDisabled");
     }
 
     // ---- decide_hard_disable (tier-1 kill switches) ----

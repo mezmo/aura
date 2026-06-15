@@ -22,8 +22,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::disable::DisableReason;
-
 /// Default rotation cadence (mirrors OpenSRE).
 pub const DEFAULT_ROTATION_LINES: usize = 1000;
 
@@ -47,18 +45,6 @@ pub struct InspectedEvent {
     /// failures land here too.
     #[serde(default, alias = "disable_reason")]
     pub not_sent_reason: Option<String>,
-}
-
-/// Render a [`DisableReason`] for the inspection log. Stable strings so
-/// users (and downstream filtering) can rely on them.
-pub fn disable_reason_label(reason: &DisableReason) -> String {
-    match reason {
-        DisableReason::DoNotTrack => "DoNotTrack".into(),
-        DisableReason::AuraDisabled => "AuraDisabled".into(),
-        DisableReason::Ci(name) => format!("Ci({name})"),
-        DisableReason::CargoTest => "CargoTest".into(),
-        DisableReason::ConfigDisabled => "ConfigDisabled".into(),
-    }
 }
 
 /// The on-disk inspection log. Cheap to `Clone` — the inner state lives
@@ -429,26 +415,5 @@ mod tests {
         let all = log.recent(10).unwrap();
         let names: Vec<_> = all.iter().map(|e| e.event.clone()).collect();
         assert_eq!(names, vec!["first", "third"]);
-    }
-
-    #[test]
-    fn disable_reason_label_stable_strings() {
-        assert_eq!(
-            disable_reason_label(&DisableReason::DoNotTrack),
-            "DoNotTrack"
-        );
-        assert_eq!(
-            disable_reason_label(&DisableReason::AuraDisabled),
-            "AuraDisabled"
-        );
-        assert_eq!(
-            disable_reason_label(&DisableReason::Ci("GITHUB_ACTIONS")),
-            "Ci(GITHUB_ACTIONS)"
-        );
-        assert_eq!(disable_reason_label(&DisableReason::CargoTest), "CargoTest");
-        assert_eq!(
-            disable_reason_label(&DisableReason::ConfigDisabled),
-            "ConfigDisabled"
-        );
     }
 }

@@ -2,9 +2,10 @@
 //!
 //! These exist so the two integration sites do not drift in how they
 //! resolve env vars, default paths, or the kill-switch decision. The
-//! [`build_config_from_env`] function returns a fully populated
-//! [`TelemetryConfig`] given a `Source` and an optional `memory_dir`;
-//! callers pass it straight into [`crate::init`].
+//! [`build_config_from_env_and_file`] function returns a fully populated
+//! [`TelemetryConfig`] given a `Source`, an optional `memory_dir`, and an
+//! optional `[telemetry]` file block; callers pass it straight into
+//! [`crate::init`].
 //!
 //! Anything env-driven goes through this module so a future audit of
 //! "which env vars affect telemetry" only needs to grep here.
@@ -13,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use crate::disable::{decide_state, EnvProvider, SystemEnv, TelemetryState};
+use crate::disable::{decide_state, is_false_value, EnvProvider, SystemEnv, TelemetryState};
 use crate::install_id;
-use crate::properties::{DeploymentMethod, OsFamily, Source};
+use crate::properties::{DeploymentMethod, Source};
 use crate::{FileTelemetryConfig, TelemetryConfig};
 
 /// PostHog Cloud US ingest endpoint. Self-hosters override with
@@ -134,11 +135,6 @@ pub fn resolve_inspection_log_path(
     Some(default_inspection_log_path(source, memory_dir, env))
 }
 
-fn is_false_value(s: &str) -> bool {
-    let lower = s.trim().to_ascii_lowercase();
-    matches!(lower.as_str(), "" | "0" | "false" | "no" | "off")
-}
-
 fn default_inspection_log_path(
     source: Source,
     memory_dir: Option<&Path>,
@@ -167,13 +163,6 @@ fn default_inspection_log_path(
         .join("events.jsonl")
 }
 
-/// Resolve a [`TelemetryConfig`] from the environment + (optional)
-/// `memory_dir` + the disable decision tree. Equivalent to
-/// `build_config_from_env_and_file(source, memory_dir, None)`.
-pub fn build_config_from_env(source: Source, memory_dir: Option<&Path>) -> TelemetryConfig {
-    build_config_from_env_and_file(source, memory_dir, None)
-}
-
 /// Resolve a [`TelemetryConfig`] from env vars, an optional
 /// `memory_dir`, and an optional `[telemetry]` block parsed from the
 /// caller's config file. Precedence per `docs/telemetry.md`: env wins
@@ -197,22 +186,31 @@ pub fn build_config_with_env(
     file: Option<&FileTelemetryConfig>,
     env: &dyn EnvProvider,
 ) -> TelemetryConfig {
-    let endpoint = env
-        .var("AURA_TELEMETRY_ENDPOINT")
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            file.and_then(|f| f.endpoint.clone())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    let api_key = env
-        .var("AURA_TELEMETRY_API_KEY")
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            file.and_then(|f| f.api_key.clone())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| DEFAULT_API_KEY.to_string());
+    // env var (non-empty) wins over the file value (non-empty) wins over
+    // the built-in default, for each of endpoint and api_key.
+    fn resolve(
+        env: &dyn EnvProvider,
+        var: &str,
+        file_value: Option<String>,
+        default: &str,
+    ) -> String {
+        env.var(var)
+            .filter(|s| !s.is_empty())
+            .or_else(|| file_value.filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| default.to_string())
+    }
+    let endpoint = resolve(
+        env,
+        "AURA_TELEMETRY_ENDPOINT",
+        file.and_then(|f| f.endpoint.clone()),
+        DEFAULT_ENDPOINT,
+    );
+    let api_key = resolve(
+        env,
+        "AURA_TELEMETRY_API_KEY",
+        file.and_then(|f| f.api_key.clone()),
+        DEFAULT_API_KEY,
+    );
     let deployment_method = DeploymentMethod::parse(env.var("AURA_DEPLOYMENT_METHOD").as_deref());
 
     // Resolve the tri-state: hard kill switches + CI/test → Disabled
@@ -235,9 +233,9 @@ pub fn build_config_with_env(
         Uuid::new_v4()
     } else {
         match install_id::read_or_create(&install_id_path) {
-            Ok(uuid) => {
+            Ok(install) => {
                 persisted = durable_location;
-                uuid
+                install.id()
             }
             Err(e) => {
                 tracing::debug!(error = %e, path = %install_id_path.display(),
@@ -267,22 +265,18 @@ pub fn build_config_with_env(
         TelemetryConfig::default_for(source, install_id, endpoint, api_key, inspection_log_path);
     cfg.install_id_path = Some(install_id_path);
     cfg.deployment_method = deployment_method;
-    cfg.os_family = OsFamily::current();
     cfg.state = state;
     cfg
 }
 
 /// Best-effort one-line startup summary of the telemetry state.
 pub fn startup_log_line(state: &TelemetryState) -> String {
-    use crate::inspection_log::disable_reason_label;
     match state {
         TelemetryState::Unknown => {
             "telemetry: unknown (held — awaiting notice or explicit enable)".to_string()
         }
         TelemetryState::Enabled => "telemetry: active".to_string(),
-        TelemetryState::Disabled(r) => {
-            format!("telemetry: disabled ({})", disable_reason_label(r))
-        }
+        TelemetryState::Disabled(r) => format!("telemetry: disabled ({r})"),
     }
 }
 
@@ -290,21 +284,7 @@ pub fn startup_log_line(state: &TelemetryState) -> String {
 mod tests {
     use super::*;
     use crate::disable::DisableReason;
-    use std::collections::HashMap;
-
-    #[derive(Default)]
-    struct MockEnv(HashMap<String, String>);
-    impl MockEnv {
-        fn set(mut self, k: &str, v: &str) -> Self {
-            self.0.insert(k.into(), v.into());
-            self
-        }
-    }
-    impl EnvProvider for MockEnv {
-        fn var(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
-        }
-    }
+    use crate::test_support::MockEnv;
 
     #[test]
     fn resolve_inspection_log_zero_disables() {

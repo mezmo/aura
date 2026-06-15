@@ -658,7 +658,10 @@ pub fn run_repl(
                 if consent_pending {
                     consent_pending = false;
                     if crate::repl::telemetry_notice::first_input_enables_telemetry(&input) {
-                        telemetry.enable();
+                        // The first-input gate enables; a HeldUntilRestart (a kill
+                        // switch is in force) correctly leaves telemetry off and
+                        // needs no action here.
+                        let _ = telemetry.enable();
                         let _ = crate::config::save_telemetry_enabled_to_global_cli_toml(true);
                         capture_cli_session_started(telemetry, &config, is_standalone);
                     }

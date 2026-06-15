@@ -115,29 +115,53 @@ fn batch_url(endpoint: &str) -> String {
     format!("{base}/batch/")
 }
 
-/// Classify a `reqwest::Error` into one of a small set of stable
-/// labels for the local inspection log. Users debugging "why didn't
-/// PostHog see this event" should see at a glance whether the failure
-/// was the network, a timeout, or a status response — without needing
-/// the full error string (which can leak the endpoint URL into the
-/// audit log, which we want to keep tidy).
-pub fn classify_post_error(err: &reqwest::Error) -> &'static str {
+/// Stable category of a failed PostHog POST. Surfaced in the local
+/// inspection log so a user debugging "why didn't PostHog see this
+/// event" sees at a glance whether the failure was the network, a
+/// timeout, or a status response — without the full error string, which
+/// can leak the endpoint URL into the audit log. Its `Display` strings
+/// are the user-facing contract; keep them stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostErrorKind {
+    Timeout,
+    Http4xx,
+    Http5xx,
+    HttpOther,
+    Network,
+    Other,
+}
+
+impl std::fmt::Display for PostErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Http4xx => "http_4xx",
+            Self::Http5xx => "http_5xx",
+            Self::HttpOther => "http_other",
+            Self::Network => "network",
+            Self::Other => "other",
+        })
+    }
+}
+
+/// Classify a `reqwest::Error` into a [`PostErrorKind`].
+pub fn classify_post_error(err: &reqwest::Error) -> PostErrorKind {
     if err.is_timeout() {
-        return "timeout";
+        return PostErrorKind::Timeout;
     }
     if let Some(status) = err.status() {
         return if status.is_client_error() {
-            "http_4xx"
+            PostErrorKind::Http4xx
         } else if status.is_server_error() {
-            "http_5xx"
+            PostErrorKind::Http5xx
         } else {
-            "http_other"
+            PostErrorKind::HttpOther
         };
     }
     if err.is_connect() || err.is_request() {
-        return "network";
+        return PostErrorKind::Network;
     }
-    "other"
+    PostErrorKind::Other
 }
 
 #[cfg(test)]
@@ -262,14 +286,14 @@ mod tests {
         async fn client_error_status_is_http_4xx() {
             let server = server_returning(404).await;
             let err = post_error(&server.uri(), Duration::from_secs(2)).await;
-            assert_eq!(classify_post_error(&err), "http_4xx");
+            assert_eq!(classify_post_error(&err), PostErrorKind::Http4xx);
         }
 
         #[tokio::test]
         async fn server_error_status_is_http_5xx() {
             let server = server_returning(503).await;
             let err = post_error(&server.uri(), Duration::from_secs(2)).await;
-            assert_eq!(classify_post_error(&err), "http_5xx");
+            assert_eq!(classify_post_error(&err), PostErrorKind::Http5xx);
         }
 
         #[tokio::test]
@@ -283,7 +307,7 @@ mod tests {
                 .await;
             let err = post_error(&server.uri(), Duration::from_millis(100)).await;
             assert!(err.is_timeout(), "precondition: timed out, got {err:?}");
-            assert_eq!(classify_post_error(&err), "timeout");
+            assert_eq!(classify_post_error(&err), PostErrorKind::Timeout);
         }
 
         #[tokio::test]
@@ -294,7 +318,7 @@ mod tests {
                 !err.is_timeout() && err.status().is_none(),
                 "precondition: a transport error, not a timeout/status: {err:?}"
             );
-            assert_eq!(classify_post_error(&err), "network");
+            assert_eq!(classify_post_error(&err), PostErrorKind::Network);
         }
     }
 }

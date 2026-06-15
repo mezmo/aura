@@ -52,6 +52,29 @@ pub enum InstallIdError {
     BadFileName(PathBuf),
 }
 
+/// Outcome of [`read_or_create`]. The two cases carry the same `Uuid`
+/// shape but mean different things: a `Persisted` id was read from, or
+/// freshly published to, the on-disk file and survives restarts; a
+/// `PerRun` id exists only because the file was unparseable, so it lives
+/// for this process only. Surfacing the distinction (rather than
+/// flattening to a bare `Uuid`) keeps the corrupt-file path honest to the
+/// caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallId {
+    Persisted(Uuid),
+    PerRun(Uuid),
+}
+
+impl InstallId {
+    /// The id itself, for the wire envelope where the persistence
+    /// distinction does not matter.
+    pub fn id(self) -> Uuid {
+        match self {
+            Self::Persisted(id) | Self::PerRun(id) => id,
+        }
+    }
+}
+
 /// Read the install UUID at `path`, creating it if missing. Returns a
 /// fresh per-run UUID **without** modifying the file when the file
 /// exists but cannot be parsed.
@@ -60,7 +83,7 @@ pub enum InstallIdError {
 /// `read_or_create` against the same path converge on the same UUID
 /// via [`std::fs::hard_link`]. See the module-level docs for why the
 /// corrupt-file case is deliberately non-converging.
-pub fn read_or_create(path: &Path) -> Result<Uuid, InstallIdError> {
+pub fn read_or_create(path: &Path) -> Result<InstallId, InstallIdError> {
     let parent = path
         .parent()
         .ok_or_else(|| InstallIdError::BadParent(path.to_path_buf()))?;
@@ -100,7 +123,7 @@ pub fn read_or_create(path: &Path) -> Result<Uuid, InstallIdError> {
     let _ = fs::remove_file(&tmp);
 
     match link_result {
-        Ok(()) => Ok(candidate),
+        Ok(()) => Ok(InstallId::Persisted(candidate)),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             // Lost the publication race. Read whatever the winner
             // wrote; if even that is unparseable (the winner could
@@ -115,9 +138,9 @@ pub fn read_or_create(path: &Path) -> Result<Uuid, InstallIdError> {
     }
 }
 
-fn parse_or_per_run(contents: &str, path: &Path) -> Uuid {
+fn parse_or_per_run(contents: &str, path: &Path) -> InstallId {
     match Uuid::parse_str(contents.trim()) {
-        Ok(uuid) => uuid,
+        Ok(uuid) => InstallId::Persisted(uuid),
         Err(_) => {
             tracing::debug!(
                 path = %path.display(),
@@ -125,32 +148,23 @@ fn parse_or_per_run(contents: &str, path: &Path) -> Uuid {
                  Reset with `rm {}` per docs/telemetry.md.",
                 path.display()
             );
-            Uuid::new_v4()
+            InstallId::PerRun(Uuid::new_v4())
         }
     }
 }
 
-#[cfg(unix)]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    // Lock the install-id to the owning user where the platform supports
+    // it; on non-unix the create_new above is the best we can do.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
@@ -166,10 +180,10 @@ mod tests {
     fn creates_new_install_id_when_missing() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("install-id");
-        let uuid = read_or_create(&path).expect("create new");
+        let install = read_or_create(&path).expect("create new");
         let on_disk = fs::read_to_string(&path).unwrap();
         let on_disk_uuid = Uuid::parse_str(on_disk.trim()).unwrap();
-        assert_eq!(uuid, on_disk_uuid);
+        assert_eq!(install, InstallId::Persisted(on_disk_uuid));
     }
 
     #[test]
@@ -188,7 +202,7 @@ mod tests {
         let expected = Uuid::new_v4();
         fs::write(&path, format!("{expected}\n\n")).unwrap();
         let got = read_or_create(&path).unwrap();
-        assert_eq!(got, expected);
+        assert_eq!(got, InstallId::Persisted(expected));
     }
 
     #[test]
@@ -216,8 +230,8 @@ mod tests {
     fn new_uuid_is_version_4() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("install-id");
-        let uuid = read_or_create(&path).unwrap();
-        assert_eq!(uuid.get_version_num(), 4, "expected UUID v4, got {uuid}");
+        let id = read_or_create(&path).unwrap().id();
+        assert_eq!(id.get_version_num(), 4, "expected UUID v4, got {id}");
     }
 
     /// Many threads racing to create the install-id at a single path
@@ -234,7 +248,7 @@ mod tests {
         for _ in 0..32 {
             let p = path.clone();
             handles.push(std::thread::spawn(move || {
-                read_or_create(&p).expect("read_or_create")
+                read_or_create(&p).expect("read_or_create").id()
             }));
         }
         let results: Vec<Uuid> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -261,16 +275,19 @@ mod tests {
         let path = dir.path().join("install-id");
         fs::write(&path, "definitely-not-a-uuid").unwrap();
 
-        let uuid_a = read_or_create(&path).expect("call a");
-        let uuid_b = read_or_create(&path).expect("call b");
+        let a = read_or_create(&path).expect("call a");
+        let b = read_or_create(&path).expect("call b");
 
         // On-disk content is untouched.
         let on_disk = fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, "definitely-not-a-uuid");
-        // Each call returned a fresh per-run UUID.
-        assert_ne!(uuid_a, uuid_b);
-        assert_eq!(uuid_a.get_version_num(), 4);
-        assert_eq!(uuid_b.get_version_num(), 4);
+        // Each call returned a fresh per-run id, surfaced as the PerRun
+        // variant rather than inferred from inequality.
+        assert!(matches!(a, InstallId::PerRun(_)));
+        assert!(matches!(b, InstallId::PerRun(_)));
+        assert_ne!(a.id(), b.id());
+        assert_eq!(a.id().get_version_num(), 4);
+        assert_eq!(b.id().get_version_num(), 4);
     }
 
     /// Concurrent calls against a corrupt file must not modify the file
@@ -287,7 +304,7 @@ mod tests {
         for _ in 0..16 {
             let p = path.clone();
             handles.push(std::thread::spawn(move || {
-                read_or_create(&p).expect("read_or_create")
+                read_or_create(&p).expect("read_or_create").id()
             }));
         }
         let results: Vec<Uuid> = handles.into_iter().map(|h| h.join().unwrap()).collect();

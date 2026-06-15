@@ -31,8 +31,11 @@ pub mod install_id;
 pub mod properties;
 pub mod sink;
 
+#[cfg(test)]
+mod test_support;
+
 pub use aura_config::FileTelemetryConfig;
-pub use disable::{decide_state, DisableReason, EnvProvider, TelemetryState};
+pub use disable::{DisableReason, EnvProvider, TelemetryState};
 pub use handle::{init, EnableOutcome, TelemetryConfig, TelemetryHandle};
 pub use properties::{IntoTelemetryProperty, Properties, PropertyValue};
 
@@ -60,6 +63,5 @@ pub struct EventPayload {
 /// `#[derive(Event)]`; the trait is also implementable by hand for
 /// special cases (none today).
 pub trait Event: Sized {
-    const NAME: &'static str;
     fn into_payload(self) -> EventPayload;
 }

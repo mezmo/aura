@@ -115,7 +115,7 @@ async fn enable_does_not_backfill_unknown_events() {
         default_agent_set: false,
     });
 
-    f.handle.enable();
+    assert_eq!(f.handle.enable(), aura_telemetry::EnableOutcome::Enabled);
     assert!(matches!(f.handle.state(), TelemetryState::Enabled));
 
     // Captured after enabling — must be sent.

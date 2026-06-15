@@ -23,7 +23,7 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit, LitStr, Meta};
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Lit, LitStr};
 
 #[proc_macro_derive(Event, attributes(aura_event))]
 pub fn derive_event(input: TokenStream) -> TokenStream {
@@ -75,8 +75,6 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl aura_telemetry::Event for #struct_ident {
-            const NAME: &'static str = #event_name;
-
             fn into_payload(self) -> aura_telemetry::EventPayload {
                 let mut properties = aura_telemetry::Properties::new();
                 #(#inserts)*
@@ -116,9 +114,6 @@ fn extract_event_name(input: &DeriveInput) -> syn::Result<LitStr> {
             }
         })?;
         if let Some(name) = found {
-            // Force the helper-attribute reference so an unused
-            // import-style warning never fires on `attr`.
-            let _ = &Meta::List(attr.meta.require_list()?.clone());
             return Ok(name);
         }
     }
