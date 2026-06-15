@@ -223,8 +223,10 @@ pub async fn prepare_request(
     // (the single-config passthrough would otherwise route it to the normal
     // agent). Reaching the bootstrap agent always requires its explicit name
     // plus the token — the passthrough and DEFAULT_AGENT can never select it.
-    let (config, additional_tools) = if req.model.as_deref()
-        == Some(aura::bootstrap::BOOTSTRAP_AGENT_NAME)
+    let (config, additional_tools) = if req
+        .model
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case(aura::bootstrap::BOOTSTRAP_AGENT_NAME))
     {
         let Some(bootstrap) = data.bootstrap.as_ref() else {
             return Err(PrepareError::NotFound(
@@ -309,29 +311,38 @@ pub async fn prepare_request(
 /// Verify the bootstrap token on a request addressed to the bootstrap agent.
 ///
 /// Accepts `Authorization: Bearer <token>` (the CLI's `--api-key` sends this
-/// unmodified) or `x-aura-bootstrap-token: <token>` for deployments where a
-/// gateway consumes the Authorization header. Header keys are lowercase
-/// (axum `HeaderName` invariant).
+/// unmodified) **or** `x-aura-bootstrap-token: <token>` for deployments
+/// where a gateway injects its own Authorization header (oauth2-proxy, ALB
+/// OIDC, Istio, etc.). Either header matching the expected token is
+/// sufficient — the Bearer scheme comparison is case-insensitive per
+/// RFC 7235. Header keys are lowercase (axum `HeaderName` invariant).
 fn verify_bootstrap_token(
     expected: &str,
     req_headers_map: &HashMap<String, String>,
 ) -> Result<(), PrepareError> {
-    let presented = req_headers_map
-        .get("authorization")
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .or_else(|| {
-            req_headers_map
-                .get("x-aura-bootstrap-token")
-                .map(String::as_str)
-        });
-    match presented {
-        Some(token) if constant_time_eq(token.trim(), expected) => Ok(()),
-        _ => Err(PrepareError::Unauthorized(
+    let from_bearer = req_headers_map.get("authorization").and_then(|v| {
+        v.strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+            .or_else(|| v.strip_prefix("BEARER "))
+    });
+    let from_custom = req_headers_map
+        .get("x-aura-bootstrap-token")
+        .map(String::as_str);
+
+    let matched = [from_bearer, from_custom]
+        .into_iter()
+        .flatten()
+        .any(|token| constant_time_eq(token.trim(), expected));
+
+    if matched {
+        Ok(())
+    } else {
+        Err(PrepareError::Unauthorized(
             "the aura-bootstrap agent requires a valid token (Authorization: \
              Bearer <token> or x-aura-bootstrap-token). The token is set via \
              AURA_BOOTSTRAP_TOKEN or printed in this server's startup logs."
                 .to_string(),
-        )),
+        ))
     }
 }
 
