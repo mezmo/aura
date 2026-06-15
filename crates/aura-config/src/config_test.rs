@@ -1930,6 +1930,37 @@ max_extraction_tokens = 4000
         assert!(orch.validate_worker_names().is_ok());
     }
 
+    #[test]
+    fn test_orchestration_rejects_exact_duplicate_worker_header() {
+        // Defense-in-depth: the toml parser is expected to reject this at
+        // parse time, but we pin the behavior here so a future parser change
+        // doesn't silently regress into last-write-wins merging.
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "m"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.investigator]
+description = "first"
+preamble = "p"
+
+[orchestration.worker.investigator]
+description = "second"
+preamble = "p"
+"#;
+        assert!(
+            load_config_from_str(config_str).is_err(),
+            "duplicate [orchestration.worker.X] headers must be rejected"
+        );
+    }
+
     // ========================================================================
     // Read-only worker validation
     // ========================================================================
