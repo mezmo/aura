@@ -23,9 +23,10 @@
 //!   most-restrictive). Glob and empty filters are rejected earlier by
 //!   config validation, and worker construction re-checks annotations at
 //!   runtime for configs that arrive by other paths;
-//! - literal API keys are rejected; secrets travel only as `{{ env.* }}`
-//!   references and the on-disk file is written from the raw input so they
-//!   stay references;
+//! - literal credentials are rejected wherever they appear (api keys, MCP
+//!   header values, stdio env maps — any credential-looking key); secrets
+//!   travel only as `{{ env.* }}` references and the on-disk file is
+//!   written from the raw input so they stay references;
 //! - `stdio` MCP transports (arbitrary command execution at attach time)
 //!   are rejected unless the operator set `AURA_BOOTSTRAP_ALLOW_STDIO=true`;
 //! - no agent may take the reserved `aura-bootstrap` name.
@@ -740,26 +741,44 @@ impl WriteConfigTool {
     }
 }
 
-/// Reject literal API keys anywhere in the raw TOML tree: every string
-/// value under a key named `api_key` must be an `{{ env.VAR }}` reference.
+/// Reject literal secrets anywhere in the raw TOML tree: every string value
+/// under a credential-looking key (`api_key`, `*token*`, `*secret*`,
+/// `*password*`, `*authorization*`, …) must carry its secret as an
+/// `{{ env.VAR }}` reference. This covers `[mcp.servers.*.headers]` values
+/// and stdio `env` maps, not just `api_key` fields. Values may mix text and
+/// references (`Authorization = "Bearer {{ env.TOKEN }}"`) — what matters is
+/// that the secret itself travels as a reference.
+///
+/// `headers_from_request` tables are exempt: their values are *names* of
+/// incoming request headers, never secrets.
 fn check_secret_literals(value: &toml::Value) -> Result<(), String> {
-    fn is_env_reference(s: &str) -> bool {
-        let t = s.trim();
-        t.starts_with("{{") && t.ends_with("}}") && t[2..t.len() - 2].trim().starts_with("env.")
+    fn contains_env_reference(s: &str) -> bool {
+        s.find("{{")
+            .is_some_and(|start| s[start + 2..].trim_start().starts_with("env."))
+            && s.contains("}}")
+    }
+    fn credential_key(key: &str) -> bool {
+        let k = key.to_ascii_lowercase().replace('-', "_");
+        ["api_key", "apikey", "token", "secret", "password", "authorization", "credential"]
+            .iter()
+            .any(|marker| k.contains(marker))
     }
     fn walk(value: &toml::Value, path: &str, violations: &mut Vec<String>) {
         match value {
             toml::Value::Table(table) => {
                 for (key, v) in table {
+                    if key == "headers_from_request" {
+                        continue;
+                    }
                     let child = if path.is_empty() {
                         key.clone()
                     } else {
                         format!("{path}.{key}")
                     };
-                    if key == "api_key"
+                    if credential_key(key)
                         && let toml::Value::String(s) = v
                         && !s.is_empty()
-                        && !is_env_reference(s)
+                        && !contains_env_reference(s)
                     {
                         violations.push(child.clone());
                     }
@@ -780,7 +799,7 @@ fn check_secret_literals(value: &toml::Value) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "literal API key(s) at {} — secrets must be written as \
+            "literal API key(s)/secret(s) at {} — secrets must be written as \
              {{{{ env.VAR_NAME }}}} references to variables set on this server, \
              never inline",
             violations.join(", ")
@@ -1129,6 +1148,60 @@ model = "gpt-5.1"
             fs::read_to_string(dir.path().join("config.toml")).unwrap(),
             COMPLETE
         );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_literal_secret_in_mcp_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = target_with(dir.path(), COMPLETE);
+        let content = format!(
+            "{COMPLETE}\n[mcp.servers.k8s]\ntransport = \"http_streamable\"\n\
+             url = \"http://x/mcp\"\n\n[mcp.servers.k8s.headers]\n\
+             Authorization = \"Bearer sk-live-abc123\"\n"
+        );
+
+        let result = write_tool(target).call(write_args(&content)).await.unwrap();
+
+        assert!(result.contains("literal API key(s)/secret(s)"), "got: {result}");
+        assert!(
+            result.contains("mcp.servers.k8s.headers.Authorization"),
+            "got: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+            COMPLETE
+        );
+    }
+
+    #[test]
+    fn secret_scan_covers_credential_keys_and_allows_references() {
+        let check = |toml_str: &str| {
+            check_secret_literals(&toml::from_str::<toml::Value>(toml_str).unwrap())
+        };
+
+        // Credential-looking keys with literals are rejected wherever they sit.
+        for bad in [
+            "[mcp.servers.x.headers]\n\"x-api-key\" = \"abc\"",
+            "[mcp.servers.x.env]\nOPENAI_API_KEY = \"sk-123\"",
+            "[mcp.servers.x.headers]\nProxy-Authorization = \"Basic xyz\"",
+            "[a]\nmy_token = \"t\"",
+            "[a]\nclient_secret = \"s\"",
+            "[a]\ndb_password = \"p\"",
+        ] {
+            assert!(check(bad).is_err(), "expected rejection for: {bad}");
+        }
+
+        // References (whole-value or embedded) pass; so do non-credential
+        // values and headers_from_request name mappings.
+        for ok in [
+            "[a]\napi_key = \"{{ env.OPENAI_API_KEY }}\"",
+            "[mcp.servers.x.headers]\nAuthorization = \"Bearer {{ env.TOKEN }}\"",
+            "[mcp.servers.x.headers]\nContent-Type = \"application/json\"",
+            "[mcp.servers.x.env]\nAWS_REGION = \"us-east-1\"",
+            "[mcp.servers.x.headers_from_request]\nAuthorization = \"x-user-token\"",
+        ] {
+            assert!(check(ok).is_ok(), "expected pass for: {ok}");
+        }
     }
 
     #[tokio::test]
