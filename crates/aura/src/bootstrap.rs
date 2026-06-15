@@ -63,12 +63,7 @@ const KNOWN_KEY_VARS: &[&str] = &[
 
 /// Whether the operator allowed stdio MCP transports for this process.
 pub fn stdio_allowed_from_env() -> bool {
-    std::env::var(ALLOW_STDIO_ENV).is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    crate::env_flags::bool_env(ALLOW_STDIO_ENV, false)
 }
 
 /// Invoked after every successful `write_config`; returns a human-readable
