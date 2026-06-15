@@ -8,9 +8,10 @@
 //! 3. **Verify** the key by querying the provider's live model-list
 //!    endpoint (blocking HTTP, short timeout; bedrock has no cheap HTTP
 //!    listing and is skipped with a note).
-//! 4. **Model**: display the fetched list and suggest a default via a
-//!    small per-provider preference table ranked against the live list —
-//!    a suggestion the operator accepts or overrides, never a silent pick.
+//! 4. **Model**: rank the fetched list into a short, best-first shortlist via
+//!    a per-provider table of stable family roots (newest version per family,
+//!    snapshots hidden). The operator picks by number, accepts the suggested
+//!    default, or types any id — never a silent pick.
 //! 5. Write a minimal **complete** config: a placeholder assistant on an
 //!    `[agent.llm]` whose provider/model/key are referenced from a sibling
 //!    `.env` via `{{ env.LLM_* }}` (so no secret lands in the toml), plus
@@ -54,20 +55,22 @@ fn default_key_env(provider: &str) -> Option<&'static str> {
     }
 }
 
-/// Ordered model-preference patterns per provider: the suggested default is
-/// the first live model matching the earliest pattern (exact match preferred,
-/// then the shortest prefix match — the base model rather than a variant).
-/// These are suggestions ranked against what the key can actually use; the
-/// operator always confirms or overrides.
-fn preference_patterns(provider: &str) -> &'static [&'static str] {
+/// Ordered model *family roots* per provider, best-first and **specific →
+/// general** so each model is claimed by its first matching root. Roots are
+/// deliberately version-free (`gpt-5`, not `gpt-5.1`): a new `gpt-5.6` matches
+/// the `gpt-5` root automatically — no release needed. A release is only
+/// warranted to bless a genuinely new family (a future `gpt-6`/`o5`). The
+/// concrete id shown per family is chosen by `rank_shortlist`.
+fn family_roots(provider: &str) -> &'static [&'static str] {
     match provider {
-        "openai" => &["gpt-5.1", "gpt-5", "gpt-4.1", "gpt-4o"],
+        "openai" => &["gpt-5", "gpt-4.1", "gpt-4o", "o4", "o3", "o1", "gpt-4"],
         "anthropic" => &["claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
         "gemini" => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
         "openrouter" => &[
-            "openai/gpt-5.1",
-            "anthropic/claude-sonnet-4",
             "openai/gpt-5",
+            "anthropic/claude-sonnet-4",
+            "google/gemini-2.5-pro",
+            "openai/gpt-4o",
         ],
         "ollama" => &["qwen3", "llama3", "mistral"],
         _ => &[],
@@ -75,7 +78,7 @@ fn preference_patterns(provider: &str) -> &'static [&'static str] {
 }
 
 /// Substrings that mark an entry in a provider's model list as not a chat
-/// model (embeddings, audio, images, …) for display purposes.
+/// model (embeddings, audio, images, instruct/search variants, …).
 const NON_CHAT_MARKERS: &[&str] = &[
     "embedding",
     "whisper",
@@ -88,6 +91,8 @@ const NON_CHAT_MARKERS: &[&str] = &[
     "image",
     "davinci",
     "babbage",
+    "instruct",
+    "search",
 ];
 
 #[derive(Debug, clap::Args)]
@@ -300,23 +305,92 @@ fn filter_chat_models(models: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The suggested default: first pattern with a live match; exact match
-/// preferred, then the shortest id with the pattern as prefix (the base
-/// model rather than a dated/variant id).
-fn suggest_model(provider: &str, models: &[String]) -> Option<String> {
-    for pattern in preference_patterns(provider) {
-        if let Some(exact) = models.iter().find(|m| m == pattern) {
-            return Some(exact.clone());
-        }
-        if let Some(shortest) = models
-            .iter()
-            .filter(|m| m.starts_with(pattern))
-            .min_by_key(|m| m.len())
-        {
-            return Some(shortest.clone());
+/// Version key for natural ("human") ordering of model ids: the sequence of
+/// digit runs parsed as integers (`gpt-5.6` → `[5, 6]`, `o3` → `[3]`). Compared
+/// lexicographically, a higher key means a newer model within a family.
+fn natural_key(id: &str) -> Vec<u64> {
+    let mut keys = Vec::new();
+    let mut run = String::new();
+    for ch in id.chars() {
+        if ch.is_ascii_digit() {
+            run.push(ch);
+        } else if !run.is_empty() {
+            keys.push(run.parse().unwrap_or(0));
+            run.clear();
         }
     }
-    None
+    if !run.is_empty() {
+        keys.push(run.parse().unwrap_or(0));
+    }
+    keys
+}
+
+/// True when an id carries a dated/snapshot segment: any `-`-delimited segment
+/// that is all digits and at least 4 long (`2024`, `20250514`, `1106`, `0125`).
+/// Plain version ids (`gpt-4o`, `gpt-5.1`, `o3`) are not flagged.
+fn is_dated(id: &str) -> bool {
+    id.split('-')
+        .any(|seg| seg.len() >= 4 && seg.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Build the curated, best-first shortlist shown after verification. For each
+/// family root (in table order) pick one representative from the live list:
+/// prefer non-dated ids, then the highest `natural_key` (newest version), tie
+/// broken by the shortest id (the base). Models matching no root are omitted
+/// from the shortlist but remain typeable. Falls back to the chat-filtered list
+/// (newest-first) when no root matches at all.
+fn rank_shortlist(provider: &str, models: &[String]) -> Vec<String> {
+    let chat = filter_chat_models(models);
+    let mut claimed = vec![false; chat.len()];
+    let mut shortlist = Vec::new();
+
+    for root in family_roots(provider) {
+        let family: Vec<usize> = chat
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| !claimed[*i] && m.starts_with(root))
+            .map(|(i, _)| i)
+            .collect();
+        if family.is_empty() {
+            continue;
+        }
+        // Claim every family member so a later, more general root can't reuse
+        // them (e.g. gpt-4o-mini must not resurface under the gpt-4 root).
+        for &i in &family {
+            claimed[i] = true;
+        }
+        // Prefer a clean (non-dated) id; if the family is dated-only, rank those.
+        let non_dated: Vec<usize> = family
+            .iter()
+            .copied()
+            .filter(|&i| !is_dated(&chat[i]))
+            .collect();
+        let pool = if non_dated.is_empty() {
+            family
+        } else {
+            non_dated
+        };
+        if let Some(&best) = pool.iter().max_by(|&&a, &&b| {
+            natural_key(&chat[a])
+                .cmp(&natural_key(&chat[b]))
+                .then_with(|| chat[b].len().cmp(&chat[a].len())) // shorter wins ties
+        }) {
+            shortlist.push(chat[best].clone());
+        }
+    }
+
+    if shortlist.is_empty() {
+        // Exotic key with no recognized family: show the chat list newest-first.
+        let mut fallback = chat;
+        fallback.sort_by(|a, b| {
+            natural_key(b)
+                .cmp(&natural_key(a))
+                .then_with(|| a.len().cmp(&b.len()))
+        });
+        fallback.truncate(8);
+        return fallback;
+    }
+    shortlist
 }
 
 // ============================================================================
@@ -424,6 +498,52 @@ impl<R: BufRead> Prompter<R> {
             Ok(detected_value.map(String::from))
         } else {
             Ok(Some(answer.to_string()))
+        }
+    }
+
+    /// Pick a model: a number selects from the displayed `shortlist`, an empty
+    /// line / EOF accepts the suggested entry, and anything else is taken as a
+    /// typed model id verbatim. Out-of-range numbers re-prompt. Returns the
+    /// suggested entry in non-interactive mode (`None` if the shortlist is
+    /// empty, which the caller turns into the `--model` requirement).
+    fn ask_model(
+        &mut self,
+        shortlist: &[String],
+        suggested_index: usize,
+    ) -> Result<Option<String>> {
+        let suggested = shortlist.get(suggested_index).cloned();
+        if !self.interactive {
+            return Ok(suggested);
+        }
+        loop {
+            match &suggested {
+                Some(d) => print!("Model [{d}]: "),
+                None => print!("Model: "),
+            }
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            if self.stdin.read_line(&mut line)? == 0 {
+                return Ok(suggested); // EOF — don't spin forever
+            }
+            let answer = line.trim();
+            if answer.is_empty() {
+                return Ok(suggested);
+            }
+            // A bare number picks from the shortlist; anything else is a typed
+            // id (no real model id parses as a small in-range integer).
+            if !shortlist.is_empty()
+                && let Ok(n) = answer.parse::<usize>()
+            {
+                if (1..=shortlist.len()).contains(&n) {
+                    return Ok(Some(shortlist[n - 1].clone()));
+                }
+                eprintln!(
+                    "Please enter a number between 1 and {}, or a model id.",
+                    shortlist.len()
+                );
+                continue;
+            }
+            return Ok(Some(answer.to_string()));
         }
     }
 }
@@ -697,44 +817,35 @@ fn resolve_spec<R: BufRead>(
             m.clone()
         }
         None => {
-            let (display, suggested) = match &live_models {
-                Some(models) => {
-                    let chat = filter_chat_models(models);
-                    let display = if chat.is_empty() {
-                        models.clone()
-                    } else {
-                        chat
-                    };
-                    let suggested =
-                        suggest_model(&provider, &display).or_else(|| display.first().cloned());
-                    (display, suggested)
-                }
-                None => (Vec::new(), None),
+            // Curated, best-first shortlist; the operator picks by number or
+            // types any id. Empty when offline (no live list) — then a typed id
+            // is required.
+            let shortlist = match &live_models {
+                Some(models) => rank_shortlist(&provider, models),
+                None => Vec::new(),
             };
-            if prompter.interactive && !display.is_empty() {
-                println!("Models available to this key:");
-                const MAX_SHOWN: usize = 20;
-                for m in display.iter().take(MAX_SHOWN) {
-                    let marker = if Some(m) == suggested.as_ref() {
-                        "  (suggested)"
-                    } else {
-                        ""
-                    };
-                    println!("  - {m}{marker}");
+            if prompter.interactive && !shortlist.is_empty() {
+                println!("Models (enter a number, or type any model id):");
+                for (i, m) in shortlist.iter().enumerate() {
+                    let marker = if i == 0 { "  (suggested)" } else { "" };
+                    println!("  {}. {m}{marker}", i + 1);
                 }
-                if display.len() > MAX_SHOWN {
+                if let Some(models) = &live_models
+                    && models.len() > shortlist.len()
+                {
                     println!(
-                        "  … and {} more (type any of them)",
-                        display.len() - MAX_SHOWN
+                        "  … and {} more — type any id",
+                        models.len() - shortlist.len()
                     );
                 }
             }
-            let answer = prompter.ask("Model", suggested.as_deref())?;
-            let model = match answer {
+            let model = match prompter.ask_model(&shortlist, 0)? {
                 Some(m) => m,
                 None => bail!("--model is required in non-interactive mode"),
             };
-            if !display.is_empty() && !display.iter().any(|x| x == &model) {
+            if let Some(models) = &live_models
+                && !models.iter().any(|x| x == &model)
+            {
                 eprintln!(
                     "warning: '{model}' is not in {provider}'s model list — \
                      continuing anyway"
@@ -996,36 +1107,6 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn suggest_prefers_exact_then_shortest_prefix() {
-        let models = vec![
-            "gpt-4o".to_string(),
-            "gpt-5.1-mini".to_string(),
-            "gpt-5.1".to_string(),
-        ];
-        assert_eq!(
-            suggest_model("openai", &models),
-            Some("gpt-5.1".to_string())
-        );
-
-        // No exact gpt-5.1: shortest prefix match wins over a longer variant.
-        let models = vec![
-            "gpt-5.1-mini-2026-01".to_string(),
-            "gpt-5.1-mini".to_string(),
-        ];
-        assert_eq!(
-            suggest_model("openai", &models),
-            Some("gpt-5.1-mini".to_string())
-        );
-    }
-
-    #[test]
-    fn suggest_falls_through_patterns_and_can_miss() {
-        let models = vec!["gpt-4o".to_string()];
-        assert_eq!(suggest_model("openai", &models), Some("gpt-4o".to_string()));
-        assert_eq!(suggest_model("openai", &["weird".to_string()]), None);
-    }
-
-    #[test]
     fn chat_filter_drops_non_chat_entries() {
         let models = vec![
             "gpt-5.1".to_string(),
@@ -1034,6 +1115,217 @@ mod tests {
             "gpt-4o-audio-preview".to_string(),
         ];
         assert_eq!(filter_chat_models(&models), vec!["gpt-5.1".to_string()]);
+    }
+
+    #[test]
+    fn natural_key_orders_versions() {
+        assert!(natural_key("gpt-5.6") > natural_key("gpt-5.1"));
+        assert!(natural_key("gpt-5.1") > natural_key("gpt-5"));
+        assert!(natural_key("o4-mini") > natural_key("o3"));
+        assert_eq!(natural_key("gpt-4o"), vec![4]);
+        assert_eq!(natural_key("gpt-4o-2024-08-06"), vec![4, 2024, 8, 6]);
+    }
+
+    #[test]
+    fn is_dated_flags_snapshots_only() {
+        assert!(is_dated("gpt-4o-2024-05-13"));
+        assert!(is_dated("gpt-3.5-turbo-1106"));
+        assert!(is_dated("gpt-3.5-turbo-0125"));
+        assert!(is_dated("claude-sonnet-4-20250514"));
+        assert!(!is_dated("gpt-4o"));
+        assert!(!is_dated("gpt-5.1"));
+        assert!(!is_dated("o3"));
+    }
+
+    #[test]
+    fn rank_shortlist_curates_openai_from_screenshot_list() {
+        // The real list from the bug screenshot, plus the gpt-5.x the key has.
+        let models: Vec<String> = [
+            "gpt-3.5-turbo",
+            "gpt-3.5-turbo-16k",
+            "gpt-3.5-turbo-instruct",
+            "gpt-3.5-turbo-1106",
+            "gpt-3.5-turbo-0125",
+            "gpt-4o",
+            "gpt-4o-2024-05-13",
+            "gpt-4o-mini",
+            "gpt-4o-mini-2024-07-18",
+            "gpt-4o-2024-08-06",
+            "o1-2024-12-17",
+            "o1",
+            "o3-mini",
+            "o3-mini-2025-01-31",
+            "o3",
+            "o4-mini",
+            "o4-mini-2025-04-16",
+            "gpt-4o-mini-search-preview",
+            "gpt-4o-search-preview",
+            "o3-2025-04-16",
+            "gpt-4.1",
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5.6",
+            "text-embedding-3-small",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let shortlist = rank_shortlist("openai", &models);
+
+        // One clean representative per family, modern-first; gpt-5.6 wins the
+        // gpt-5 family (the no-release case) and is the suggested default.
+        assert_eq!(
+            shortlist,
+            vec![
+                "gpt-5.6".to_string(),
+                "gpt-4.1".to_string(),
+                "gpt-4o".to_string(),
+                "o4-mini".to_string(),
+                "o3".to_string(),
+                "o1".to_string(),
+            ]
+        );
+        // No legacy, instruct, search-preview, snapshots, or embeddings.
+        for m in &shortlist {
+            assert!(!m.contains("3.5"), "{m}");
+            assert!(!m.contains("instruct"), "{m}");
+            assert!(!m.contains("search"), "{m}");
+            assert!(!is_dated(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn rank_shortlist_picks_newest_dated_when_family_has_only_snapshots() {
+        // Anthropic ids are always dated; natural-sort surfaces the newest.
+        let models: Vec<String> = [
+            "claude-sonnet-4-20241022",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250101",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let shortlist = rank_shortlist("anthropic", &models);
+        assert_eq!(
+            shortlist,
+            vec![
+                "claude-sonnet-4-20250514".to_string(),
+                "claude-opus-4-20250101".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rank_shortlist_falls_back_when_no_family_matches() {
+        let models = vec!["weird-model".to_string(), "another-thing".to_string()];
+        let shortlist = rank_shortlist("openai", &models);
+        assert!(shortlist.contains(&"weird-model".to_string()));
+        assert!(shortlist.contains(&"another-thing".to_string()));
+    }
+
+    fn sample_shortlist() -> Vec<String> {
+        vec![
+            "gpt-5.6".to_string(),
+            "gpt-4.1".to_string(),
+            "gpt-4o".to_string(),
+        ]
+    }
+
+    #[test]
+    fn ask_model_empty_uses_suggested() {
+        let mut p = scripted("\n");
+        assert_eq!(
+            p.ask_model(&sample_shortlist(), 0).unwrap(),
+            Some("gpt-5.6".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_model_eof_uses_suggested() {
+        let mut p = scripted("");
+        assert_eq!(
+            p.ask_model(&sample_shortlist(), 0).unwrap(),
+            Some("gpt-5.6".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_model_number_selects_from_shortlist() {
+        let mut p = scripted("2\n");
+        assert_eq!(
+            p.ask_model(&sample_shortlist(), 0).unwrap(),
+            Some("gpt-4.1".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_model_typed_id_is_used_verbatim() {
+        let mut p = scripted("my-finetune\n");
+        assert_eq!(
+            p.ask_model(&sample_shortlist(), 0).unwrap(),
+            Some("my-finetune".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_model_out_of_range_number_reprompts_then_typed() {
+        let mut p = scripted("9\nmy-ft\n");
+        assert_eq!(
+            p.ask_model(&sample_shortlist(), 0).unwrap(),
+            Some("my-ft".to_string())
+        );
+    }
+
+    #[test]
+    fn ask_model_non_interactive_returns_suggested() {
+        assert_eq!(
+            non_interactive().ask_model(&sample_shortlist(), 0).unwrap(),
+            Some("gpt-5.6".to_string())
+        );
+        assert_eq!(non_interactive().ask_model(&[], 0).unwrap(), None);
+    }
+
+    #[test]
+    fn interactive_model_numbered_pick_through_resolve() {
+        // Prompts: provider, api key, model. "2" picks the second shortlist
+        // entry. Shortlist ranks gpt-5.1, gpt-4.1, gpt-4o -> #2 = gpt-4.1.
+        let mut a = args();
+        a.provider = None;
+        a.model = None;
+        a.offline = false;
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk".to_string());
+        let lister = FixedLister(vec!["gpt-4o", "gpt-5.1", "gpt-4.1"]);
+        let spec = resolve_spec(
+            &a,
+            &mut scripted("\n\n2\n"),
+            &lister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(spec.model, "gpt-4.1");
+    }
+
+    #[test]
+    fn interactive_model_typed_off_list_is_kept() {
+        let mut a = args();
+        a.provider = None;
+        a.model = None;
+        a.offline = false;
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk".to_string());
+        let lister = FixedLister(vec!["gpt-4o", "gpt-5.1"]);
+        let spec = resolve_spec(
+            &a,
+            &mut scripted("\n\nmy-finetune\n"),
+            &lister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(spec.model, "my-finetune");
     }
 
     // ------------------------------------------------------------------
