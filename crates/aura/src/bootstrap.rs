@@ -721,11 +721,16 @@ impl WriteConfigTool {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
-        let tmp = target_file.with_extension("toml.tmp");
+        let tmp = target_file.with_extension(format!(
+            "toml.tmp.{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         fs::write(&tmp, &args.content)
             .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
-        fs::rename(&tmp, &target_file)
-            .map_err(|e| format!("failed to move config into place: {e}"))?;
+        if let Err(e) = fs::rename(&tmp, &target_file) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!("failed to move config into place: {e}"));
+        }
         warn!(
             "Bootstrap: configuration written to {}",
             target_file.display()
