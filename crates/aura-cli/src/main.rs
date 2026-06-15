@@ -22,6 +22,11 @@ fn main() -> Result<()> {
         return aura_cli::init::run_init(init_args);
     }
 
+    // Load .env from the working directory so a standalone config's
+    // {{ env.* }} references resolve without manual exporting. Only fills vars
+    // not already set (shell exports win); an absent .env is not an error.
+    dotenv::dotenv().ok();
+
     // Validate --standalone + --config pairing when feature is enabled.
     #[cfg(feature = "standalone-cli")]
     aura_cli::cli::validate_standalone_args(&args);
