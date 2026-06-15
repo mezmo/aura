@@ -1,5 +1,4 @@
 use a2a_server::StaticAgentCard;
-use aura_config::load_config;
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -215,45 +214,14 @@ async fn run() -> std::io::Result<()> {
         info!("Loaded agent '{}' ({}/{})", id, provider, model);
     }
 
-    // The bootstrap agent's name is reserved: a normal agent squatting on it
-    // would silently absorb token-gated traffic.
-    if let Some((_, config)) = config_pairs.iter().find(|(_, c)| {
-        [Some(c.agent.name.as_str()), c.agent.alias.as_deref()]
-            .into_iter()
-            .flatten()
-            .any(|id| id.eq_ignore_ascii_case(aura::bootstrap::BOOTSTRAP_AGENT_NAME))
-    }) {
-        let msg = format!(
-            "agent '{}' uses the reserved name '{}'",
-            config.agent.name,
-            aura::bootstrap::BOOTSTRAP_AGENT_NAME
-        );
+    // Bootstrap-specific roster invariants (reserved name + single enabler).
+    if let Err(msg) = aura::bootstrap::validate_roster(&config_pairs) {
         error!("{msg}");
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
     }
-
-    // At most one config file may enable [bootstrap] — it supplies the
-    // bootstrap agent's LLM and is the default write target.
-    let enablers: Vec<&(std::path::PathBuf, aura_config::Config)> = config_pairs
+    let bootstrap_declaration = config_pairs
         .iter()
-        .filter(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
-        .collect();
-    if enablers.len() > 1 {
-        let files: Vec<String> = enablers
-            .iter()
-            .map(|(p, _)| p.display().to_string())
-            .collect();
-        let msg = format!(
-            "[bootstrap] is enabled in more than one config file ({}) — enable it \
-             in exactly one so the bootstrap agent's LLM and write target are \
-             unambiguous",
-            files.join(", ")
-        );
-        error!("{msg}");
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
-    }
-    let bootstrap_declaration = enablers
-        .first()
+        .find(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
         .map(|(path, config)| (path.clone(), config.clone()));
 
     let configs: Vec<aura_config::Config> =
@@ -329,7 +297,11 @@ async fn run() -> std::io::Result<()> {
         let reload_path = args.config.clone();
         let default_agent = args.default_agent.clone();
         let reload: aura::bootstrap::ReloadHook = Arc::new(move || {
-            let configs = load_config(&reload_path).map_err(|e| e.to_string())?;
+            let config_pairs =
+                aura_config::load_config_with_paths(&reload_path).map_err(|e| e.to_string())?;
+            aura::bootstrap::validate_roster(&config_pairs)?;
+            let configs: Vec<aura_config::Config> =
+                config_pairs.into_iter().map(|(_, c)| c).collect();
             let names: Vec<String> = configs
                 .iter()
                 .map(|c| {

@@ -59,7 +59,11 @@ fn make_reload_hook(
     config_path: String,
 ) -> aura::bootstrap::ReloadHook {
     Arc::new(move || {
-        let configs = aura_config::load_config(&config_path).map_err(|e| e.to_string())?;
+        let config_pairs =
+            aura_config::load_config_with_paths(&config_path).map_err(|e| e.to_string())?;
+        aura::bootstrap::validate_roster(&config_pairs)?;
+        let configs: Vec<aura_config::Config> =
+            config_pairs.into_iter().map(|(_, c)| c).collect();
         let mut names: Vec<String> = configs
             .iter()
             .map(|c| {
@@ -101,31 +105,11 @@ impl DirectBackend {
             anyhow::bail!("No agent config found in {}", config_path);
         }
 
-        if let Some((_, config)) = config_pairs.iter().find(|(_, c)| {
-            [Some(c.agent.name.as_str()), c.agent.alias.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|id| id.eq_ignore_ascii_case(aura::bootstrap::BOOTSTRAP_AGENT_NAME))
-        }) {
-            anyhow::bail!(
-                "agent '{}' uses the reserved name '{}'",
-                config.agent.name,
-                aura::bootstrap::BOOTSTRAP_AGENT_NAME
-            );
-        }
-
-        let enablers: Vec<&(std::path::PathBuf, aura_config::Config)> = config_pairs
+        aura::bootstrap::validate_roster(&config_pairs)
+            .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+        let bootstrap_declaration = config_pairs
             .iter()
-            .filter(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
-            .collect();
-        if enablers.len() > 1 {
-            anyhow::bail!(
-                "[bootstrap] is enabled in more than one config file — enable it in \
-                 exactly one so the bootstrap agent's LLM and write target are unambiguous"
-            );
-        }
-        let bootstrap_declaration = enablers
-            .first()
+            .find(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
             .map(|(path, config)| (path.clone(), config.clone()));
 
         let configs: Vec<aura_config::Config> =

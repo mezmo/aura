@@ -636,17 +636,22 @@ impl WriteConfigTool {
         self.enforce_read_only_workers(&config)?;
 
         // Directory deployments: the candidate must stay uniquely
-        // identifiable next to its sibling files.
-        let mut roster = vec![config.clone()];
+        // identifiable next to its sibling files, and the full roster must
+        // pass bootstrap-specific invariants (reserved name already checked
+        // above for the candidate; this catches siblings and multi-enabler).
+        let mut roster_pairs: Vec<(PathBuf, Config)> =
+            vec![(target_file.to_path_buf(), config.clone())];
         for path in self.target.config_files() {
             if path == target_file {
                 continue;
             }
-            let sibling = aura_config::load_config(&path)
+            let siblings = aura_config::load_config_with_paths(&path)
                 .map_err(|e| format!("sibling config {} failed to load: {e}", path.display()))?;
-            roster.extend(sibling);
+            roster_pairs.extend(siblings);
         }
+        let roster: Vec<Config> = roster_pairs.iter().map(|(_, c)| c.clone()).collect();
         aura_config::validate_unique_identifiers(&roster).map_err(|e| e.to_string())?;
+        validate_roster(&roster_pairs)?;
 
         let mut warnings = Vec::new();
         let previously_enabled = fs::read_to_string(target_file)
@@ -956,6 +961,43 @@ fn instance_context(target: &ConfigTarget, roster: &[String]) -> String {
         out.push_str(&format!("  - {var}: {mark}\n"));
     }
     out
+}
+
+/// Validate a loaded roster against bootstrap-specific invariants:
+///
+/// 1. No roster agent may use the reserved `BOOTSTRAP_AGENT_NAME`.
+/// 2. At most one config may enable `[bootstrap]`.
+///
+/// Called by both startup paths and both reload hooks so the invariants
+/// are enforced uniformly regardless of how the roster was loaded.
+pub fn validate_roster(configs: &[(impl AsRef<std::path::Path>, Config)]) -> Result<(), String> {
+    // Reserved name
+    if let Some((_, config)) = configs.iter().find(|(_, c)| {
+        [Some(c.agent.name.as_str()), c.agent.alias.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|id| id.eq_ignore_ascii_case(BOOTSTRAP_AGENT_NAME))
+    }) {
+        return Err(format!(
+            "agent '{}' uses the reserved name '{BOOTSTRAP_AGENT_NAME}'",
+            config.agent.name,
+        ));
+    }
+    // Single enabler
+    let enablers: Vec<String> = configs
+        .iter()
+        .filter(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
+        .map(|(p, _)| p.as_ref().display().to_string())
+        .collect();
+    if enablers.len() > 1 {
+        return Err(format!(
+            "[bootstrap] is enabled in more than one config file ({}) — enable it \
+             in exactly one so the bootstrap agent's LLM and write target are \
+             unambiguous",
+            enablers.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Factory for the bootstrap agent's tools, in the shape
