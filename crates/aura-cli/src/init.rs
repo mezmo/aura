@@ -234,9 +234,11 @@ impl ModelLister for HttpModelLister {
                 "id",
             ),
             "gemini" => Self::extract(
-                &Self::get_json(Self::client()?.get(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-                )))?,
+                &Self::get_json(
+                    Self::client()?
+                        .get("https://generativelanguage.googleapis.com/v1beta/models")
+                        .header("x-goog-api-key", key),
+                )?,
                 "models",
                 "name",
             )
