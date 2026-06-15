@@ -45,10 +45,15 @@ fn additional_tools_factory() -> Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + S
     Arc::new(Vec::new)
 }
 
+/// A `(model, prompt)` pair stashed by `override_system_prompt` so the
+/// reload hook can re-apply it after swapping the roster from disk.
+type PromptOverride = Arc<std::sync::Mutex<Option<(Option<String>, String)>>>;
+
 /// Direct backend — holds AppState with loaded configs and CLI tool factory.
 pub struct DirectBackend {
     app_state: Arc<AppState>,
     extra_headers: HashMap<String, String>,
+    prompt_override: PromptOverride,
 }
 
 /// Hot-reload hook for standalone mode: re-load the config path from disk,
@@ -57,13 +62,36 @@ pub struct DirectBackend {
 fn make_reload_hook(
     registry: Arc<aura_web_server::types::ConfigRegistry>,
     config_path: String,
+    prompt_override: PromptOverride,
 ) -> aura::bootstrap::ReloadHook {
     Arc::new(move || {
         let config_pairs =
             aura_config::load_config_with_paths(&config_path).map_err(|e| e.to_string())?;
         aura::bootstrap::validate_roster(&config_pairs)?;
-        let configs: Vec<aura_config::Config> =
+        let mut configs: Vec<aura_config::Config> =
             config_pairs.into_iter().map(|(_, c)| c).collect();
+
+        // Re-apply the CLI --system-prompt override so a reload doesn't
+        // silently revert the session's prompt.
+        if let Some((ref model, ref prompt)) = *prompt_override.lock().expect("prompt lock") {
+            let target = if let Some(model_name) = model {
+                let lower = model_name.to_lowercase();
+                configs.iter_mut().find(|c| {
+                    c.agent
+                        .alias
+                        .as_deref()
+                        .unwrap_or(&c.agent.name)
+                        .to_lowercase()
+                        == lower
+                })
+            } else {
+                configs.first_mut()
+            };
+            if let Some(config) = target {
+                config.agent.system_prompt = prompt.clone();
+            }
+        }
+
         let mut names: Vec<String> = configs
             .iter()
             .map(|c| {
@@ -125,13 +153,18 @@ impl DirectBackend {
             })
             .collect();
         let registry = Arc::new(aura_web_server::types::ConfigRegistry::new(configs));
+        let prompt_override: PromptOverride = Arc::default();
 
         let bootstrap = bootstrap_declaration.map(|(declaring_path, declaring)| {
             let target = aura::bootstrap::ConfigTarget {
                 config_path: std::path::PathBuf::from(config_path),
                 target: declaring_path,
             };
-            let reload = make_reload_hook(registry.clone(), config_path.to_string());
+            let reload = make_reload_hook(
+                registry.clone(),
+                config_path.to_string(),
+                prompt_override.clone(),
+            );
             aura_web_server::types::BootstrapState {
                 agent_config: aura::bootstrap::bootstrap_agent_config(
                     &declaring,
@@ -170,6 +203,7 @@ impl DirectBackend {
         Ok(Self {
             app_state,
             extra_headers: headers_map,
+            prompt_override,
         })
     }
 
@@ -267,7 +301,14 @@ impl DirectBackend {
     }
 
     /// Replace the system prompt in the config matching `model` (or first config if None).
+    ///
+    /// The override is stashed so the reload hook can re-apply it after
+    /// swapping the roster from disk — without this, a bootstrap-triggered
+    /// hot reload would silently revert the session's prompt.
     pub fn override_system_prompt(&mut self, model: Option<&str>, new_prompt: String) {
+        *self.prompt_override.lock().expect("prompt lock") =
+            Some((model.map(str::to_owned), new_prompt.clone()));
+
         let mut configs: Vec<_> = (*self.app_state.configs.snapshot()).clone();
         let target = if let Some(model_name) = model {
             let lower = model_name.to_lowercase();
