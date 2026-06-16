@@ -187,6 +187,29 @@ model = "gpt-5.2"
 # actual context window.
 # context_window = 200000
 
+# ── Orchestration (multi-agent coordinator/worker mode) ───────────────
+[orchestration]
+enabled = false
+max_planning_cycles = 3
+allow_direct_answers = true
+allow_clarification = true
+tools_in_planning = "summary"
+max_tools_per_worker = 10
+
+[orchestration.artifacts]
+# Base directory for execution persistence, plan storage, and result artifacts.
+memory_dir = "/tmp/aura-orchestration"
+result_artifact_threshold = 4000
+result_summary_length = 2000
+# Byte budget for transitive dependency context injected into worker prompts.
+dependency_context_budget = 32000
+
+# [orchestration.worker.example]
+# description = "Example specialist worker"
+# preamble = "You are an example specialist."
+# mcp_filter = ["example_*"]
+# vector_stores = []
+
 # Anthropic alternative:
 # provider = "anthropic"
 # api_key = "{{ env.ANTHROPIC_API_KEY }}"
