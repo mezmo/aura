@@ -19,7 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # Environment variables
-dotenv = { workspace = true }
+dotenvy = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]

@@ -28,7 +28,8 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-dotenv = { workspace = true }
+dotenvy = { workspace = true }
+rpassword = "7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 aura-events = { path = "../aura-events" }
 eventsource-stream = "0.2"

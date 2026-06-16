@@ -185,7 +185,7 @@ async fn run() -> std::io::Result<()> {
     // {{ env.* }} references work without manual exporting (parity with the
     // Docker quickstart's `env_file: .env`). Shell exports take precedence; an
     // absent .env is not an error.
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     // Initialize logging using shared module
     aura::logging::init_logging(args.debug, args.verbose, "aura_web_server");

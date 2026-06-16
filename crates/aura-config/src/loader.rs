@@ -97,7 +97,7 @@ impl ConfigLoader {
 
         // Load .env file if requested
         if self.use_dotenv {
-            match dotenv::dotenv() {
+            match dotenvy::dotenv() {
                 Ok(path) => {
                     tracing::info!("Loaded .env file from: {}", path.display());
                 }
