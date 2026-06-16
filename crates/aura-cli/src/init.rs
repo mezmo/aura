@@ -1,23 +1,25 @@
 //! `aura-cli init` — generate a starter configuration.
 //!
-//! The flow the product spec describes:
+//! The flow:
 //!
 //! 1. **Sense** conventional API-key env vars (OPENAI_API_KEY, …).
 //! 2. **Provider**: exactly one key found → suggested as the default;
 //!    several → list prioritized by the ones found; none → default order.
-//! 3. **Verify** the key by querying the provider's live model-list
+//! 3. **API key**: if the provider's conventional env var is set, tell the
+//!    user and ask whether to use it. If not set, prompt for the key value
+//!    (masked input). The generated config references the provider's native
+//!    env var directly (`{{ env.OPENAI_API_KEY }}`), not an intermediate
+//!    `LLM_*` name. A `.env` is only written when the user provides a new
+//!    key that isn't already in the environment.
+//! 4. **Verify** the key by querying the provider's live model-list
 //!    endpoint (blocking HTTP, short timeout; bedrock has no cheap HTTP
 //!    listing and is skipped with a note).
-//! 4. **Model**: rank the fetched list into a short, best-first shortlist via
+//! 5. **Model**: rank the fetched list into a short, best-first shortlist via
 //!    a per-provider table of stable family roots (newest version per family,
-//!    snapshots hidden). The operator picks by number, accepts the suggested
+//!    snapshots hidden). The user picks by number, accepts the suggested
 //!    default, or types any id — never a silent pick.
-//! 5. Write a minimal **complete** config: a placeholder assistant on an
-//!    `[agent.llm]` whose provider/model/key are referenced from a sibling
-//!    `.env` via `{{ env.LLM_* }}` (so no secret lands in the toml), plus
-//!    `[bootstrap] enabled = true` so the aura-bootstrap agent can build out
-//!    the real configuration conversationally. The actual values are written
-//!    to `.env` (merged non-destructively if one already exists).
+//! 6. Write a minimal **complete** config referencing the provider's native
+//!    env vars.
 //!
 //! Verification is best-effort: network or key failures warn and continue
 //! (`--offline` skips the attempt entirely); init never hard-blocks on the
@@ -109,9 +111,9 @@ pub struct InitArgs {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Environment variable whose value seeds the API key (its value is
-    /// written to `.env` as `LLM_API_KEY`). Defaults to the provider's
-    /// conventional var (e.g. OPENAI_API_KEY); not used for bedrock/ollama.
+    /// Environment variable whose value is used as the API key. Defaults to
+    /// the provider's conventional var (e.g. OPENAI_API_KEY); not used for
+    /// bedrock/ollama.
     #[arg(long)]
     pub api_key_env: Option<String>,
 
@@ -354,12 +356,9 @@ fn rank_shortlist(provider: &str, models: &[String]) -> Vec<String> {
         if family.is_empty() {
             continue;
         }
-        // Claim every family member so a later, more general root can't reuse
-        // them (e.g. gpt-4o-mini must not resurface under the gpt-4 root).
         for &i in &family {
             claimed[i] = true;
         }
-        // Prefer a clean (non-dated) id; if the family is dated-only, rank those.
         let non_dated: Vec<usize> = family
             .iter()
             .copied()
@@ -373,14 +372,13 @@ fn rank_shortlist(provider: &str, models: &[String]) -> Vec<String> {
         if let Some(&best) = pool.iter().max_by(|&&a, &&b| {
             natural_key(&chat[a])
                 .cmp(&natural_key(&chat[b]))
-                .then_with(|| chat[b].len().cmp(&chat[a].len())) // shorter wins ties
+                .then_with(|| chat[b].len().cmp(&chat[a].len()))
         }) {
             shortlist.push(chat[best].clone());
         }
     }
 
     if shortlist.is_empty() {
-        // Exotic key with no recognized family: show the chat list newest-first.
         let mut fallback = chat;
         fallback.sort_by(|a, b| {
             natural_key(b)
@@ -462,7 +460,7 @@ impl<R: BufRead> Prompter<R> {
             std::io::stdout().flush()?;
             let mut line = String::new();
             if self.stdin.read_line(&mut line)? == 0 {
-                return Ok(default); // EOF — don't spin forever
+                return Ok(default);
             }
             let answer = line.trim();
             if answer.is_empty() {
@@ -478,28 +476,35 @@ impl<R: BufRead> Prompter<R> {
         }
     }
 
-    /// Prompt for the API key *value* to persist. When `detected_value` is
-    /// present (the conventional env var is set in this shell) it is shown as
-    /// `[detected_var]` and used on an empty line; typed text is taken
-    /// literally. On a real terminal the input is read with echo suppressed so
-    /// the secret never appears on screen. Returns `detected_value` in
-    /// non-interactive mode.
-    fn ask_secret(
-        &mut self,
-        detected_var: Option<&str>,
-        detected_value: Option<&str>,
-    ) -> Result<Option<String>> {
+    /// Ask a yes/no question. Returns the default in non-interactive mode.
+    fn ask_yes_no(&mut self, question: &str, default: bool) -> Result<bool> {
         if !self.interactive {
-            return Ok(detected_value.map(String::from));
+            return Ok(default);
         }
-        match detected_var {
-            Some(v) if detected_value.is_some() => print!("API key [{v}]: "),
-            _ => print!("API key: "),
+        let hint = if default { "Y/n" } else { "y/N" };
+        print!("{question} [{hint}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        self.stdin.read_line(&mut line)?;
+        let answer = line.trim().to_lowercase();
+        if answer.is_empty() {
+            Ok(default)
+        } else {
+            Ok(answer.starts_with('y'))
         }
+    }
+
+    /// Prompt for an API key with masked input. On a real terminal the input
+    /// is read with echo suppressed via `rpassword`. In test contexts
+    /// (`is_tty = false`), falls back to `read_line` on the injected stdin.
+    /// Returns `None` on empty input or EOF.
+    fn ask_secret_masked(&mut self, prompt: &str) -> Result<Option<String>> {
+        if !self.interactive {
+            return Ok(None);
+        }
+        print!("{prompt}: ");
         std::io::stdout().flush()?;
         let raw = if self.is_tty {
-            // Real terminal: read without echoing the secret. The suppressed
-            // Enter leaves the cursor on the prompt line, so emit a newline.
             let secret = rpassword::read_password()?;
             println!();
             secret
@@ -508,11 +513,11 @@ impl<R: BufRead> Prompter<R> {
             self.stdin.read_line(&mut line)?;
             line
         };
-        let answer = raw.trim();
-        if answer.is_empty() {
-            Ok(detected_value.map(String::from))
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            Ok(None)
         } else {
-            Ok(Some(answer.to_string()))
+            Ok(Some(trimmed.to_string()))
         }
     }
 
@@ -532,20 +537,18 @@ impl<R: BufRead> Prompter<R> {
         }
         loop {
             match &suggested {
-                Some(d) => print!("Model [{d}]: "),
-                None => print!("Model: "),
+                Some(d) => print!("Which model would you like to use? [{d}]: "),
+                None => print!("Which model would you like to use?: "),
             }
             std::io::stdout().flush()?;
             let mut line = String::new();
             if self.stdin.read_line(&mut line)? == 0 {
-                return Ok(suggested); // EOF — don't spin forever
+                return Ok(suggested);
             }
             let answer = line.trim();
             if answer.is_empty() {
                 return Ok(suggested);
             }
-            // A bare number picks from the shortlist; anything else is a typed
-            // id (no real model id parses as a small in-range integer).
             if !shortlist.is_empty()
                 && let Ok(n) = answer.parse::<usize>()
             {
@@ -567,144 +570,107 @@ impl<R: BufRead> Prompter<R> {
 // Resolution + rendering
 // ============================================================================
 
+/// How the API key is sourced — determines what goes into the config and
+/// whether a `.env` needs to be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApiKeySource {
+    /// The key lives in an existing environment variable; the config
+    /// references it directly via `{{ env.<var_name> }}`. No `.env` write.
+    EnvVar(String),
+    /// The user typed a key at the prompt; it's written to `.env` under the
+    /// provider's conventional env var name, and the config references that.
+    Provided { env_var: String, value: String },
+}
+
 /// Fully resolved inputs (after flags, sensing, verification, prompts).
 #[derive(Debug)]
 struct ConfigSpec {
     provider: String,
     model: String,
-    /// Env var the key is read from (drives verification + warnings). The
-    /// generated toml references `LLM_API_KEY`, not this name.
-    api_key_env: Option<String>,
-    /// Actual API key value to write into `.env` as `LLM_API_KEY`.
-    api_key_value: Option<String>,
+    api_key: Option<ApiKeySource>,
     region: Option<String>,
     base_url: Option<String>,
     name: String,
+}
+
+impl ConfigSpec {
+    fn api_key_env_var(&self) -> Option<&str> {
+        match &self.api_key {
+            Some(ApiKeySource::EnvVar(var)) => Some(var),
+            Some(ApiKeySource::Provided { env_var, .. }) => Some(env_var),
+            None => None,
+        }
+    }
+
 }
 
 fn toml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// The `.env` keys init owns, in canonical write order. Shared by
-/// `render_env` (fresh file) and `merge_env` (existing file) so both agree on
-/// exactly which lines belong to init.
-const MANAGED_ENV_KEYS: &[&str] = &[
-    "LLM_PROVIDER",
-    "LLM_MODEL",
-    "LLM_API_KEY",
-    "LLM_REGION",
-    "LLM_BASE_URL",
-];
-
-/// The managed `.env` key/value pairs for this spec, in `MANAGED_ENV_KEYS`
-/// order. Keys not applicable to the provider are omitted (e.g. no
-/// `LLM_API_KEY` for bedrock/ollama, no `LLM_REGION` outside bedrock).
-fn managed_env_pairs(spec: &ConfigSpec) -> Vec<(&'static str, String)> {
-    let mut pairs = vec![
-        ("LLM_PROVIDER", spec.provider.clone()),
-        ("LLM_MODEL", spec.model.clone()),
-    ];
-    if spec.api_key_env.is_some() {
-        pairs.push((
-            "LLM_API_KEY",
-            spec.api_key_value.clone().unwrap_or_default(),
-        ));
+/// Render the `[agent.llm]` block. Values that come from the environment are
+/// referenced via `{{ env.<ACTUAL_VAR> }}` — no intermediate `LLM_*` rename.
+fn render_config(spec: &ConfigSpec) -> String {
+    let mut llm = format!("provider = \"{}\"\n", toml_escape(&spec.provider));
+    if let Some(var) = spec.api_key_env_var() {
+        llm.push_str(&format!("api_key = \"{{{{ env.{var} }}}}\"\n"));
     }
+    llm.push_str(&format!("model = \"{}\"\n", toml_escape(&spec.model)));
     if let Some(region) = &spec.region {
-        pairs.push(("LLM_REGION", region.clone()));
+        llm.push_str(&format!("region = \"{}\"\n", toml_escape(region)));
     }
     if let Some(base_url) = &spec.base_url {
-        pairs.push(("LLM_BASE_URL", base_url.clone()));
-    }
-    pairs
-}
-
-/// Render the `[agent.llm]` block — every value referenced from `.env` via
-/// `{{ env.LLM_* }}` so no provider settings (and no secret) live in the toml.
-fn render_config(spec: &ConfigSpec) -> String {
-    let mut llm = String::from("provider = \"{{ env.LLM_PROVIDER }}\"\n");
-    if spec.api_key_env.is_some() {
-        llm.push_str("api_key = \"{{ env.LLM_API_KEY }}\"\n");
-    }
-    llm.push_str("model = \"{{ env.LLM_MODEL }}\"\n");
-    if spec.region.is_some() {
-        llm.push_str("region = \"{{ env.LLM_REGION }}\"\n");
-    }
-    if spec.base_url.is_some() {
-        llm.push_str("base_url = \"{{ env.LLM_BASE_URL }}\"\n");
+        llm.push_str(&format!("base_url = \"{}\"\n", toml_escape(base_url)));
     }
 
     format!(
         "# Generated by `aura-cli init`.\n\
-         # This is a minimal starting point: a placeholder assistant plus the\n\
-         # aura-bootstrap agent, which builds out the real configuration\n\
-         # conversationally and applies changes without a restart.\n\
-         #\n\
-         # Provider, model, and API key are read from the generated .env file.\n\
          \n\
          [agent]\n\
          name = \"{name}\"\n\
-         system_prompt = \"\"\"\n\
-         You are a helpful general-purpose assistant.\n\
-         \n\
-         (This is a placeholder configuration. Chat with the aura-bootstrap\n\
-         agent to replace it with a real one, or edit this file directly.)\n\
-         \"\"\"\n\
+         system_prompt = \"You are a helpful general-purpose assistant.\"\n\
          \n\
          [agent.llm]\n\
-         {llm}\
-         \n\
-         [bootstrap]\n\
-         enabled = true\n",
+         {llm}",
         name = toml_escape(&spec.name),
     )
 }
 
-/// Render a fresh `.env` holding the actual provider/model/key values that
-/// `config.toml` references. Used when no `.env` exists yet; see `merge_env`
-/// for the update-in-place path.
-fn render_env(spec: &ConfigSpec) -> String {
-    let mut out = String::from(
-        "# Generated by `aura-cli init`. Values referenced by config.toml via\n\
-         # {{ env.LLM_* }}. Gitignored — do not commit.\n",
-    );
-    for (key, value) in managed_env_pairs(spec) {
-        out.push_str(&format!("{key}={value}\n"));
-    }
-    out
+/// Render a `.env` file for a user-provided API key. Only called when the
+/// user typed a key that isn't already in their environment.
+fn render_env(env_var: &str, value: &str) -> String {
+    format!(
+        "# Generated by `aura-cli init`. Gitignored — do not commit.\n\
+         {env_var}={value}\n"
+    )
 }
 
-/// Returns true if `line` assigns one of the managed `LLM_*` keys
-/// (`KEY=` / `KEY =`), so `merge_env` can replace just those lines.
-fn is_managed_env_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    MANAGED_ENV_KEYS.iter().any(|k| {
-        trimmed
-            .strip_prefix(k)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-    })
-}
-
-/// Upsert the managed `LLM_*` keys into an existing `.env`: drop every managed
-/// line (wherever it sits), keep all other lines/comments/blanks in order, then
-/// append the current spec's managed pairs in canonical order. Idempotent.
-fn merge_env(existing: &str, spec: &ConfigSpec) -> String {
+/// Merge a new key into an existing `.env`: replace the line if the key
+/// already exists, otherwise append it.
+fn merge_env(existing: &str, env_var: &str, value: &str) -> String {
+    let mut found = false;
     let mut out = String::new();
     for line in existing.lines() {
-        if !is_managed_env_line(line) {
+        let trimmed = line.trim_start();
+        if trimmed
+            .strip_prefix(env_var)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            out.push_str(&format!("{env_var}={value}\n"));
+            found = true;
+        } else {
             out.push_str(line);
             out.push('\n');
         }
     }
-    for (key, value) in managed_env_pairs(spec) {
-        out.push_str(&format!("{key}={value}\n"));
+    if !found {
+        out.push_str(&format!("{env_var}={value}\n"));
     }
     out
 }
 
 /// Resolve all inputs. Network access only through `lister`; environment
-/// reads only through `key_is_set`.
+/// reads only through `key_is_set` / `key_value`.
 fn resolve_spec<R: BufRead>(
     args: &InitArgs,
     prompter: &mut Prompter<R>,
@@ -712,21 +678,19 @@ fn resolve_spec<R: BufRead>(
     key_is_set: &dyn Fn(&str) -> bool,
     key_value: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConfigSpec> {
-    // ---- provider (sense keys → suggest) ----
+    // ---- provider ----
     let sensed = sensed_providers(key_is_set);
     let provider = match &args.provider {
         Some(p) => p.trim().to_lowercase(),
         None => {
             let order = provider_display_order(&sensed);
-            // Default to the sole sensed provider (if exactly one), located by
-            // its position in the displayed order.
             let default_index = if sensed.len() == 1 {
                 order.iter().position(|p| *p == sensed[0])
             } else {
                 None
             };
             if prompter.interactive {
-                println!("Providers:");
+                println!("\nWhich LLM provider would you like to use?\n");
                 for (i, p) in order.iter().enumerate() {
                     let marker = if sensed.contains(p) {
                         "  (key detected)"
@@ -735,8 +699,9 @@ fn resolve_spec<R: BufRead>(
                     };
                     println!("  {}. {p}{marker}", i + 1);
                 }
+                println!();
             }
-            match prompter.ask_choice("Provider (number)", order.len(), default_index)? {
+            match prompter.ask_choice("Provider", order.len(), default_index)? {
                 Some(i) => order[i].to_string(),
                 None => bail!("--provider is required in non-interactive mode"),
             }
@@ -750,14 +715,11 @@ fn resolve_spec<R: BufRead>(
     }
 
     // ---- provider-specific connection details ----
-    // The env var the key is read from: `--api-key-env` override, else the
-    // provider's conventional var. Not prompted for — the *value* is collected
-    // after model selection (and written to `.env` as `LLM_API_KEY`).
-    let api_key_env = default_key_env(&provider).map(|default_var| {
-        args.api_key_env
-            .clone()
-            .unwrap_or_else(|| default_var.to_string())
-    });
+    let api_key_env_var = args
+        .api_key_env
+        .clone()
+        .or_else(|| default_key_env(&provider).map(String::from));
+
     let region = if provider == "bedrock" {
         Some(match &args.region {
             Some(r) => r.clone(),
@@ -777,23 +739,64 @@ fn resolve_spec<R: BufRead>(
         None
     };
 
-    // ---- api key value (asked BEFORE verification, so the key the operator
-    // provides — not just the detected env var — is the one used to verify and
-    // list models; written to `.env` as LLM_API_KEY). The detected env var's
-    // value is the default: an empty answer accepts it, a typed answer
-    // overrides it. Skipped for keyless providers (bedrock, ollama).
-    let api_key_value = if api_key_env.is_some() {
-        let detected = api_key_env.as_deref().and_then(key_value);
-        prompter.ask_secret(api_key_env.as_deref(), detected.as_deref())?
+    // ---- API key ----
+    let api_key: Option<ApiKeySource> = if let Some(env_var) = &api_key_env_var {
+        let detected_value = (key_value)(env_var);
+        if let Some(_value) = &detected_value {
+            if prompter.ask_yes_no(
+                &format!("Found {env_var} in your environment. Use this environment variable?"),
+                true,
+            )? {
+                Some(ApiKeySource::EnvVar(env_var.clone()))
+            } else {
+                match prompter.ask_secret_masked("Enter your API key")? {
+                    Some(v) => Some(ApiKeySource::Provided {
+                        env_var: env_var.clone(),
+                        value: v,
+                    }),
+                    None => bail!("an API key is required for {provider}"),
+                }
+            }
+        } else {
+            if prompter.interactive {
+                println!(
+                    "\nNo {env_var} found in your environment."
+                );
+            }
+            match prompter.ask_secret_masked("Enter your API key")? {
+                Some(v) => Some(ApiKeySource::Provided {
+                    env_var: env_var.clone(),
+                    value: v,
+                }),
+                None => {
+                    if prompter.interactive {
+                        eprintln!(
+                            "warning: no API key provided — set {env_var} before starting"
+                        );
+                    }
+                    Some(ApiKeySource::EnvVar(env_var.clone()))
+                }
+            }
+        }
     } else {
         None
     };
 
     // ---- verify key + fetch models ----
+    let detected_for_verify: Option<String> = match &api_key {
+        Some(ApiKeySource::EnvVar(var)) => (key_value)(var),
+        _ => None,
+    };
+    let verify_key: Option<&str> = match &api_key {
+        Some(ApiKeySource::Provided { value, .. }) => Some(value.as_str()),
+        Some(ApiKeySource::EnvVar(_)) => detected_for_verify.as_deref(),
+        None => None,
+    };
+
     let live_models: Option<Vec<String>> = if args.offline {
         None
     } else {
-        match lister.list(&provider, api_key_value.as_deref(), base_url.as_deref()) {
+        match lister.list(&provider, verify_key, base_url.as_deref()) {
             Ok(ModelList::Verified(models)) => {
                 println!(
                     "Verified: {provider} answered with {} model(s).",
@@ -818,7 +821,7 @@ fn resolve_spec<R: BufRead>(
         }
     };
 
-    // ---- model (display list, suggest a default) ----
+    // ---- model ----
     let model = match &args.model {
         Some(m) => {
             if let Some(models) = &live_models
@@ -832,15 +835,12 @@ fn resolve_spec<R: BufRead>(
             m.clone()
         }
         None => {
-            // Curated, best-first shortlist; the operator picks by number or
-            // types any id. Empty when offline (no live list) — then a typed id
-            // is required.
             let shortlist = match &live_models {
                 Some(models) => rank_shortlist(&provider, models),
                 None => Vec::new(),
             };
             if prompter.interactive && !shortlist.is_empty() {
-                println!("Models (enter a number, or type any model id):");
+                println!("\nAvailable models (enter a number, or type any model id):\n");
                 for (i, m) in shortlist.iter().enumerate() {
                     let marker = if i == 0 { "  (suggested)" } else { "" };
                     println!("  {}. {m}{marker}", i + 1);
@@ -853,6 +853,7 @@ fn resolve_spec<R: BufRead>(
                         models.len() - shortlist.len()
                     );
                 }
+                println!();
             }
             let model = match prompter.ask_model(&shortlist, 0)? {
                 Some(m) => m,
@@ -873,38 +874,34 @@ fn resolve_spec<R: BufRead>(
     Ok(ConfigSpec {
         provider,
         model,
-        api_key_env,
-        api_key_value,
+        api_key,
         region,
         base_url,
         name: args.name.clone(),
     })
 }
 
-/// Validate the generated config through the real parser. The toml references
-/// `{{ env.LLM_* }}`, which aren't in this process's environment during init,
-/// so substitute the spec's literal values first — this avoids mutating the
-/// process env and avoids `resolve_env_vars`' missing-variable error — then
-/// parse, validate, and confirm bootstrap is enabled.
+/// Validate the generated config through the real parser.
 #[cfg(feature = "standalone-cli")]
 fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()> {
     let mut literal = rendered.to_string();
-    for (key, value) in managed_env_pairs(spec) {
-        literal = literal.replace(&format!("{{{{ env.{key} }}}}"), &value);
+    // Substitute env var references with literal values for validation
+    literal = literal.replace(
+        &format!("{{{{ env.{} }}}}", ""),
+        "",
+    );
+    // Replace specific known references
+    if let Some(var) = spec.api_key_env_var() {
+        literal = literal.replace(&format!("{{{{ env.{var} }}}}"), "test-key");
     }
+    // Provider and model are written literally, not as env refs
     let config = aura_config::load_config_from_str(&literal)
         .map_err(|e| anyhow::anyhow!("generated config failed validation (bug): {e}"))?;
-    anyhow::ensure!(
-        config.bootstrap.is_some_and(|b| b.enabled),
-        "generated config does not enable [bootstrap] (bug)"
-    );
     Ok(())
 }
 
-/// Human-readable next-steps shown after writing the files. The run command
-/// `cd`s into the config's directory when it has one, so the sibling `.env` is
-/// on dotenvy's (cwd-based) search path.
-fn next_steps(config_path: &Path, env_path: &Path) -> String {
+/// Human-readable next-steps shown after writing the files.
+fn next_steps(config_path: &Path, wrote_env: bool) -> String {
     let dir = config_path.parent().filter(|p| !p.as_os_str().is_empty());
     let (run_prefix, config_for_run) = match dir {
         Some(d) => {
@@ -916,22 +913,23 @@ fn next_steps(config_path: &Path, env_path: &Path) -> String {
         }
         None => (String::new(), config_path.display().to_string()),
     };
+    let env_note = if wrote_env {
+        "\nThe API key was written to .env (gitignored — do not commit it).\n\
+         The server reads it automatically; a shell export of the same \
+         variable takes precedence."
+    } else {
+        ""
+    };
     format!(
         "\nNext steps:\n  \
-           1. (optional) export AURA_BOOTSTRAP_TOKEN=<token> — otherwise a token \
-         is generated and printed in the server's startup logs\n  \
-           2. {run_prefix}CONFIG_PATH={config_for_run} aura-web-server\n  \
-           3. aura-cli --api-url http://localhost:8080 --model aura-bootstrap \
-         --api-key <token>\n\n\
-         Provider, model, and API key were written to {env} (gitignored — do not \
-         commit it). The server reads it automatically; a shell export of the same \
-         variable takes precedence. The aura-bootstrap agent then builds out the \
-         configuration conversationally and applies changes without a restart.",
-        env = env_path.display(),
+           1. {run_prefix}CONFIG_PATH={config_for_run} aura-web-server\n  \
+           2. aura-cli --api-url http://localhost:8080\n\
+         {env_note}",
     )
 }
 
 pub fn run_init(args: &InitArgs) -> Result<()> {
+    dotenvy::dotenv().ok();
     let is_tty = std::io::stdin().is_terminal();
     let interactive = !args.non_interactive && is_tty;
     let mut prompter = Prompter {
@@ -950,8 +948,6 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
     )?;
     let rendered = render_config(&spec);
 
-    // The generated config must at minimum be valid TOML; with the standalone
-    // feature, also run it through the real config parser.
     toml::from_str::<toml::Value>(&rendered).context("generated config is not valid TOML (bug)")?;
     #[cfg(feature = "standalone-cli")]
     validate_rendered(&spec, &rendered)?;
@@ -963,34 +959,32 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
         );
     }
 
-    // Write the .env first (non-destructive merge): if config.toml then fails,
-    // the secret-bearing file is left consistent and the toml is regenerable.
-    let env_path = args
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from(".env"), |dir| dir.join(".env"));
-    let env_contents = if env_path.exists() {
-        let existing = std::fs::read_to_string(&env_path)
-            .with_context(|| format!("failed to read {}", env_path.display()))?;
-        merge_env(&existing, &spec)
-    } else {
-        render_env(&spec)
-    };
-    std::fs::write(&env_path, &env_contents)
-        .with_context(|| format!("failed to write {}", env_path.display()))?;
+    // Only write .env when the user provided a new key
+    let mut wrote_env = false;
+    if let Some(ApiKeySource::Provided { env_var, value }) = &spec.api_key {
+        let env_path = args
+            .output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from(".env"), |dir| dir.join(".env"));
+        let env_contents = if env_path.exists() {
+            let existing = std::fs::read_to_string(&env_path)
+                .with_context(|| format!("failed to read {}", env_path.display()))?;
+            merge_env(&existing, env_var, value)
+        } else {
+            render_env(env_var, value)
+        };
+        std::fs::write(&env_path, &env_contents)
+            .with_context(|| format!("failed to write {}", env_path.display()))?;
+        wrote_env = true;
+        println!("Wrote {}", env_path.display());
+    }
 
     std::fs::write(&args.output, &rendered)
         .with_context(|| format!("failed to write {}", args.output.display()))?;
+    println!("Wrote {}", args.output.display());
 
-    println!("Wrote {} and {}", args.output.display(), env_path.display());
-    if spec.api_key_env.is_some() && spec.api_key_value.as_deref().unwrap_or_default().is_empty() {
-        println!(
-            "note: no API key was captured — set LLM_API_KEY in {} before starting.",
-            env_path.display()
-        );
-    }
-    println!("{}", next_steps(&args.output, &env_path));
+    println!("{}", next_steps(&args.output, wrote_env));
     Ok(())
 }
 
@@ -1030,7 +1024,6 @@ mod tests {
         }
     }
 
-    /// Lister that always fails (network down / bad key).
     struct FailingLister;
     impl ModelLister for FailingLister {
         fn list(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ModelList, String> {
@@ -1038,7 +1031,6 @@ mod tests {
         }
     }
 
-    /// Lister returning a fixed list.
     struct FixedLister(Vec<&'static str>);
     impl ModelLister for FixedLister {
         fn list(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ModelList, String> {
@@ -1048,8 +1040,6 @@ mod tests {
         }
     }
 
-    /// Lister that records the API key it was asked to verify with, so tests
-    /// can assert which key actually drove verification.
     struct RecordingLister {
         seen_key: std::cell::RefCell<Option<String>>,
         models: Vec<&'static str>,
@@ -1072,7 +1062,6 @@ mod tests {
         false
     }
 
-    /// Key-value reader that reports nothing set (companion to `no_keys`).
     fn no_values(_: &str) -> Option<String> {
         None
     }
@@ -1159,7 +1148,6 @@ mod tests {
 
     #[test]
     fn rank_shortlist_curates_openai_from_screenshot_list() {
-        // The real list from the bug screenshot, plus the gpt-5.x the key has.
         let models: Vec<String> = [
             "gpt-3.5-turbo",
             "gpt-3.5-turbo-16k",
@@ -1193,8 +1181,6 @@ mod tests {
 
         let shortlist = rank_shortlist("openai", &models);
 
-        // One clean representative per family, modern-first; gpt-5.6 wins the
-        // gpt-5 family (the no-release case) and is the suggested default.
         assert_eq!(
             shortlist,
             vec![
@@ -1206,7 +1192,6 @@ mod tests {
                 "o1".to_string(),
             ]
         );
-        // No legacy, instruct, search-preview, snapshots, or embeddings.
         for m in &shortlist {
             assert!(!m.contains("3.5"), "{m}");
             assert!(!m.contains("instruct"), "{m}");
@@ -1217,7 +1202,6 @@ mod tests {
 
     #[test]
     fn rank_shortlist_picks_newest_dated_when_family_has_only_snapshots() {
-        // Anthropic ids are always dated; natural-sort surfaces the newest.
         let models: Vec<String> = [
             "claude-sonnet-4-20241022",
             "claude-sonnet-4-20250514",
@@ -1306,10 +1290,246 @@ mod tests {
         assert_eq!(non_interactive().ask_model(&[], 0).unwrap(), None);
     }
 
+    // ------------------------------------------------------------------
+    // resolution + rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn deterministic_output() {
+        let spec1 = resolve(&args()).unwrap();
+        let spec2 = resolve(&args()).unwrap();
+        assert_eq!(render_config(&spec1), render_config(&spec2));
+    }
+
+    #[test]
+    fn openai_config_references_native_env_var() {
+        let spec = resolve(&args()).unwrap();
+        let rendered = render_config(&spec);
+        assert!(rendered.contains("provider = \"openai\""));
+        assert!(rendered.contains("api_key = \"{{ env.OPENAI_API_KEY }}\""));
+        assert!(rendered.contains("model = \"gpt-5.1\""));
+        assert!(rendered.contains("name = \"assistant\""));
+        toml::from_str::<toml::Value>(&rendered).unwrap();
+    }
+
+    #[test]
+    fn bedrock_gets_region_and_no_key() {
+        let mut a = args();
+        a.provider = Some("bedrock".to_string());
+        a.region = Some("us-east-1".to_string());
+        let spec = resolve(&a).unwrap();
+        let rendered = render_config(&spec);
+        assert!(rendered.contains("region = \"us-east-1\""));
+        assert!(!rendered.contains("api_key"));
+    }
+
+    #[test]
+    fn ollama_gets_base_url_and_no_key() {
+        let mut a = args();
+        a.provider = Some("ollama".to_string());
+        let spec = resolve(&a).unwrap();
+        let rendered = render_config(&spec);
+        assert!(rendered.contains(&format!("base_url = \"{DEFAULT_OLLAMA_URL}\"")));
+        assert!(!rendered.contains("api_key"));
+    }
+
+    #[test]
+    fn env_var_detected_skips_prompt_non_interactive() {
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
+        let spec = resolve_spec(
+            &args(),
+            &mut non_interactive(),
+            &FailingLister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+    }
+
+    #[test]
+    fn env_var_detected_user_accepts() {
+        // "y\n" accepts the detected key
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
+        let spec = resolve_spec(
+            &args(),
+            &mut scripted("y\n"),
+            &FailingLister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+        let rendered = render_config(&spec);
+        assert!(rendered.contains("api_key = \"{{ env.OPENAI_API_KEY }}\""));
+    }
+
+    #[test]
+    fn env_var_detected_user_declines_and_provides_key() {
+        // "n\n" declines, then provides a key
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
+        let spec = resolve_spec(
+            &args(),
+            &mut scripted("n\nsk-new\n"),
+            &FailingLister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::Provided {
+                env_var: "OPENAI_API_KEY".to_string(),
+                value: "sk-new".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn no_env_var_user_provides_key() {
+        let spec = resolve_spec(
+            &args(),
+            &mut scripted("sk-manual\n"),
+            &FailingLister,
+            &no_keys,
+            &no_values,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::Provided {
+                env_var: "OPENAI_API_KEY".to_string(),
+                value: "sk-manual".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn provided_key_is_used_for_verification() {
+        let mut a = args();
+        a.offline = false;
+        let lister = RecordingLister {
+            seen_key: std::cell::RefCell::new(None),
+            models: vec!["gpt-5.1"],
+        };
+        // "n\n" declines detected key, "sk-override\n" provides new one
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
+        let spec = resolve_spec(
+            &a,
+            &mut scripted("n\nsk-override\n"),
+            &lister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::Provided {
+                env_var: "OPENAI_API_KEY".to_string(),
+                value: "sk-override".to_string(),
+            })
+        );
+        assert_eq!(lister.seen_key.borrow().as_deref(), Some("sk-override"));
+    }
+
+    #[test]
+    fn detected_key_is_used_for_verification() {
+        let mut a = args();
+        a.offline = false;
+        let lister = RecordingLister {
+            seen_key: std::cell::RefCell::new(None),
+            models: vec!["gpt-5.1"],
+        };
+        let only_openai = |v: &str| v == "OPENAI_API_KEY";
+        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
+        // "y\n" accepts detected key
+        let spec = resolve_spec(
+            &a,
+            &mut scripted("y\n"),
+            &lister,
+            &only_openai,
+            &detected,
+        )
+        .unwrap();
+        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+        assert_eq!(lister.seen_key.borrow().as_deref(), Some("sk-detected"));
+    }
+
+    #[test]
+    fn ollama_has_no_api_key() {
+        let mut a = args();
+        a.provider = Some("ollama".to_string());
+        let spec = resolve_spec(
+            &a,
+            &mut non_interactive(),
+            &FailingLister,
+            &no_keys,
+            &no_values,
+        )
+        .unwrap();
+        assert_eq!(spec.api_key, None);
+    }
+
+    #[test]
+    fn bedrock_has_no_api_key() {
+        let mut a = args();
+        a.provider = Some("bedrock".to_string());
+        a.region = Some("us-east-1".to_string());
+        let spec = resolve_spec(
+            &a,
+            &mut non_interactive(),
+            &FailingLister,
+            &no_keys,
+            &no_values,
+        )
+        .unwrap();
+        assert_eq!(spec.api_key, None);
+    }
+
+    // ------------------------------------------------------------------
+    // .env rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn render_env_single_key() {
+        let env = render_env("OPENAI_API_KEY", "sk-xyz");
+        assert!(env.contains("OPENAI_API_KEY=sk-xyz"));
+        assert!(!env.contains("LLM_"));
+    }
+
+    #[test]
+    fn merge_env_preserves_unrelated() {
+        let existing = "GITHUB_TOKEN=ghp_abc\nOPENAI_API_KEY=old\n";
+        let env = merge_env(existing, "OPENAI_API_KEY", "sk-new");
+        assert!(env.contains("GITHUB_TOKEN=ghp_abc"));
+        assert!(env.contains("OPENAI_API_KEY=sk-new"));
+        assert!(!env.contains("OPENAI_API_KEY=old"));
+    }
+
+    #[test]
+    fn merge_env_appends_when_absent() {
+        let existing = "GITHUB_TOKEN=ghp_abc\n";
+        let env = merge_env(existing, "OPENAI_API_KEY", "sk-new");
+        assert!(env.contains("GITHUB_TOKEN=ghp_abc"));
+        assert!(env.contains("OPENAI_API_KEY=sk-new"));
+    }
+
+    #[test]
+    fn merge_env_idempotent() {
+        let once = merge_env("", "OPENAI_API_KEY", "sk-test");
+        assert_eq!(merge_env(&once, "OPENAI_API_KEY", "sk-test"), once);
+    }
+
+    // ------------------------------------------------------------------
+    // interactive flow
+    // ------------------------------------------------------------------
+
     #[test]
     fn interactive_model_numbered_pick_through_resolve() {
-        // Prompts: provider, api key, model. "2" picks the second shortlist
-        // entry. Shortlist ranks gpt-5.1, gpt-4.1, gpt-4o -> #2 = gpt-4.1.
         let mut a = args();
         a.provider = None;
         a.model = None;
@@ -1317,9 +1537,10 @@ mod tests {
         let only_openai = |v: &str| v == "OPENAI_API_KEY";
         let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk".to_string());
         let lister = FixedLister(vec!["gpt-4o", "gpt-5.1", "gpt-4.1"]);
+        // provider(enter) -> accept key(y) -> model(2)
         let spec = resolve_spec(
             &a,
-            &mut scripted("\n\n2\n"),
+            &mut scripted("\ny\n2\n"),
             &lister,
             &only_openai,
             &detected,
@@ -1337,9 +1558,10 @@ mod tests {
         let only_openai = |v: &str| v == "OPENAI_API_KEY";
         let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk".to_string());
         let lister = FixedLister(vec!["gpt-4o", "gpt-5.1"]);
+        // provider(enter) -> accept key(y) -> model(my-finetune)
         let spec = resolve_spec(
             &a,
-            &mut scripted("\n\nmy-finetune\n"),
+            &mut scripted("\ny\nmy-finetune\n"),
             &lister,
             &only_openai,
             &detected,
@@ -1348,197 +1570,8 @@ mod tests {
         assert_eq!(spec.model, "my-finetune");
     }
 
-    // ------------------------------------------------------------------
-    // resolution + rendering
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn deterministic_output() {
-        let spec1 = resolve(&args()).unwrap();
-        let spec2 = resolve(&args()).unwrap();
-        assert_eq!(render_config(&spec1), render_config(&spec2));
-    }
-
-    #[test]
-    fn openai_config_shape() {
-        // Provider/model/key are referenced from .env, not written literally.
-        let rendered = render_config(&resolve(&args()).unwrap());
-        assert!(rendered.contains("provider = \"{{ env.LLM_PROVIDER }}\""));
-        assert!(rendered.contains("api_key = \"{{ env.LLM_API_KEY }}\""));
-        assert!(rendered.contains("model = \"{{ env.LLM_MODEL }}\""));
-        assert!(rendered.contains("[bootstrap]\nenabled = true"));
-        assert!(rendered.contains("name = \"assistant\""));
-        // Parses as plain TOML.
-        toml::from_str::<toml::Value>(&rendered).unwrap();
-    }
-
-    #[test]
-    fn bedrock_gets_region_and_no_key() {
-        let mut a = args();
-        a.provider = Some("bedrock".to_string());
-        a.region = Some("us-east-1".to_string());
-        let spec = resolve(&a).unwrap();
-        let rendered = render_config(&spec);
-        assert!(rendered.contains("region = \"{{ env.LLM_REGION }}\""));
-        assert!(!rendered.contains("api_key"));
-        // The literal region lands in .env.
-        assert!(render_env(&spec).contains("LLM_REGION=us-east-1"));
-    }
-
-    #[test]
-    fn ollama_gets_base_url_and_no_key() {
-        let mut a = args();
-        a.provider = Some("ollama".to_string());
-        let spec = resolve(&a).unwrap();
-        let rendered = render_config(&spec);
-        assert!(rendered.contains("base_url = \"{{ env.LLM_BASE_URL }}\""));
-        assert!(!rendered.contains("api_key"));
-        assert!(render_env(&spec).contains(&format!("LLM_BASE_URL={DEFAULT_OLLAMA_URL}")));
-    }
-
-    #[test]
-    fn render_env_openai() {
-        let mut spec = resolve(&args()).unwrap();
-        spec.api_key_value = Some("sk-xyz".to_string());
-        let env = render_env(&spec);
-        assert!(env.contains("LLM_PROVIDER=openai"));
-        assert!(env.contains("LLM_MODEL=gpt-5.1"));
-        assert!(env.contains("LLM_API_KEY=sk-xyz"));
-        assert!(!env.contains("LLM_REGION"));
-        assert!(!env.contains("LLM_BASE_URL"));
-    }
-
-    #[test]
-    fn render_env_deterministic() {
-        let spec1 = resolve(&args()).unwrap();
-        let spec2 = resolve(&args()).unwrap();
-        assert_eq!(render_env(&spec1), render_env(&spec2));
-    }
-
-    fn openai_spec() -> ConfigSpec {
-        let mut s = resolve(&args()).unwrap();
-        s.api_key_value = Some("sk-new".to_string());
-        s
-    }
-
-    #[test]
-    fn merge_env_into_empty() {
-        let env = merge_env("", &openai_spec());
-        assert!(env.contains("LLM_PROVIDER=openai"));
-        assert!(env.contains("LLM_MODEL=gpt-5.1"));
-        assert!(env.contains("LLM_API_KEY=sk-new"));
-    }
-
-    #[test]
-    fn merge_env_preserves_unrelated() {
-        let existing = "GITHUB_PERSONAL_ACCESS_TOKEN=ghp_abc\nLLM_API_KEY=old\n";
-        let env = merge_env(existing, &openai_spec());
-        assert!(env.contains("GITHUB_PERSONAL_ACCESS_TOKEN=ghp_abc"));
-        assert!(env.contains("LLM_API_KEY=sk-new"));
-        assert!(!env.contains("LLM_API_KEY=old"));
-    }
-
-    #[test]
-    fn merge_env_switches_provider() {
-        // openai -> ollama: LLM_API_KEY drops, LLM_BASE_URL appears, the
-        // unrelated token survives.
-        let existing =
-            "LLM_PROVIDER=openai\nLLM_MODEL=gpt-5.1\nLLM_API_KEY=sk-old\nGITHUB_TOKEN=abc\n";
-        let mut a = args();
-        a.provider = Some("ollama".to_string());
-        let spec = resolve(&a).unwrap();
-        let env = merge_env(existing, &spec);
-        assert!(env.contains("GITHUB_TOKEN=abc"));
-        assert!(env.contains("LLM_PROVIDER=ollama"));
-        assert!(env.contains("LLM_BASE_URL="));
-        assert!(!env.contains("LLM_API_KEY"));
-    }
-
-    #[test]
-    fn merge_env_idempotent() {
-        let spec = openai_spec();
-        let once = merge_env("", &spec);
-        assert_eq!(merge_env(&once, &spec), once);
-    }
-
-    #[test]
-    fn next_steps_mentions_env() {
-        let s = next_steps(Path::new("config.toml"), Path::new(".env"));
-        assert!(s.contains(".env"), "got: {s}");
-        assert!(s.contains("config.toml"), "got: {s}");
-        assert!(s.contains("aura-bootstrap"), "got: {s}");
-    }
-
-    #[test]
-    fn next_steps_cds_into_config_dir() {
-        // When the config lives in a subdir, the run command cd's there so the
-        // sibling .env is on dotenv's search path.
-        let s = next_steps(Path::new("proj/config.toml"), Path::new("proj/.env"));
-        assert!(s.contains("cd proj"), "got: {s}");
-        assert!(s.contains("CONFIG_PATH=config.toml"), "got: {s}");
-    }
-
-    #[cfg(feature = "standalone-cli")]
-    #[test]
-    fn validate_rendered_accepts_generated() {
-        let spec = openai_spec();
-        let rendered = render_config(&spec);
-        validate_rendered(&spec, &rendered).unwrap();
-    }
-
-    #[cfg(feature = "standalone-cli")]
-    #[test]
-    fn validate_rendered_requires_bootstrap() {
-        let spec = openai_spec();
-        let rendered = render_config(&spec).replace("[bootstrap]\nenabled = true\n", "");
-        let err = validate_rendered(&spec, &rendered).unwrap_err().to_string();
-        assert!(err.contains("bootstrap"), "got: {err}");
-    }
-
-    #[test]
-    fn non_interactive_missing_model_errors() {
-        let mut a = args();
-        a.model = None;
-        let err = resolve(&a).unwrap_err().to_string();
-        assert!(err.contains("--model"), "got: {err}");
-    }
-
-    #[test]
-    fn non_interactive_missing_provider_errors() {
-        let mut a = args();
-        a.provider = None;
-        let err = resolve(&a).unwrap_err().to_string();
-        assert!(err.contains("--provider"), "got: {err}");
-    }
-
-    #[test]
-    fn unknown_provider_rejected() {
-        let mut a = args();
-        a.provider = Some("closedai".to_string());
-        let err = resolve(&a).unwrap_err().to_string();
-        assert!(err.contains("unknown provider"), "got: {err}");
-    }
-
-    #[test]
-    fn lister_failure_warns_and_continues() {
-        // offline = false with a failing lister must still resolve.
-        let mut a = args();
-        a.offline = false;
-        let spec = resolve_spec(
-            &a,
-            &mut non_interactive(),
-            &FailingLister,
-            &no_keys,
-            &no_values,
-        )
-        .unwrap();
-        assert_eq!(spec.model, "gpt-5.1");
-    }
-
     #[test]
     fn interactive_model_defaults_to_suggestion() {
-        // Empty answers accept the defaults: provider list default (single
-        // sensed key) and the suggested model from the live list.
         let mut a = args();
         a.provider = None;
         a.model = None;
@@ -1546,7 +1579,7 @@ mod tests {
         let only_openai = |var: &str| var == "OPENAI_API_KEY";
         let detected = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
         let lister = FixedLister(vec!["gpt-4o", "gpt-5.1", "text-embedding-3-small"]);
-        // Prompts in order: provider, model, API key — three empty lines.
+        // provider(enter) -> accept key(enter=yes) -> model(enter=suggested)
         let spec = resolve_spec(
             &a,
             &mut scripted("\n\n\n"),
@@ -1557,13 +1590,11 @@ mod tests {
         .unwrap();
         assert_eq!(spec.provider, "openai");
         assert_eq!(spec.model, "gpt-5.1");
-        assert_eq!(spec.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-detected"));
+        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
     }
 
     #[test]
     fn interactive_provider_by_number_uses_display_order() {
-        // With a gemini key sensed, "1" selects gemini (found-first order).
         let mut a = args();
         a.provider = None;
         a.api_key_env = Some("GEMINI_API_KEY".to_string());
@@ -1585,7 +1616,6 @@ mod tests {
 
     #[test]
     fn ask_choice_rejects_until_valid_number() {
-        // out-of-range high, zero, non-numeric, then a valid choice.
         let mut p = scripted("9\n0\nfoo\n2\n");
         assert_eq!(p.ask_choice("Provider", 6, None).unwrap(), Some(1));
     }
@@ -1612,8 +1642,6 @@ mod tests {
 
     #[test]
     fn provider_reprompt_then_selects() {
-        // Free-text and out-of-range entries are rejected; only a number in
-        // range is accepted. "2" -> anthropic (default PROVIDERS order).
         let mut a = args();
         a.provider = None;
         a.offline = true;
@@ -1647,8 +1675,6 @@ mod tests {
 
     #[test]
     fn provider_empty_no_default_reprompts() {
-        // No sensed key -> no default; an empty line is rejected, not silently
-        // accepted, and the prompt repeats until a valid number arrives.
         let mut a = args();
         a.provider = None;
         a.offline = true;
@@ -1663,97 +1689,34 @@ mod tests {
         assert_eq!(spec.provider, "anthropic");
     }
 
-    // ------------------------------------------------------------------
-    // api key value (asked before verification, written to .env)
-    // ------------------------------------------------------------------
-
     #[test]
-    fn typed_api_key_is_used_for_verification() {
-        // A key typed at the prompt must drive verification — not the detected
-        // env var — so the model list reflects the operator's chosen key.
+    fn non_interactive_missing_model_errors() {
         let mut a = args();
-        a.model = Some("gpt-5.1".to_string()); // skip the model prompt
-        a.offline = false; // actually verify
-        let lister = RecordingLister {
-            seen_key: std::cell::RefCell::new(None),
-            models: vec!["gpt-5.1"],
-        };
-        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
-        let spec = resolve_spec(
-            &a,
-            &mut scripted("sk-override\n"),
-            &lister,
-            &no_keys,
-            &detected,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-override"));
-        assert_eq!(lister.seen_key.borrow().as_deref(), Some("sk-override"));
+        a.model = None;
+        let err = resolve(&a).unwrap_err().to_string();
+        assert!(err.contains("--model"), "got: {err}");
     }
 
     #[test]
-    fn empty_api_key_verifies_with_detected_value() {
+    fn non_interactive_missing_provider_errors() {
         let mut a = args();
-        a.model = Some("gpt-5.1".to_string());
+        a.provider = None;
+        let err = resolve(&a).unwrap_err().to_string();
+        assert!(err.contains("--provider"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_provider_rejected() {
+        let mut a = args();
+        a.provider = Some("closedai".to_string());
+        let err = resolve(&a).unwrap_err().to_string();
+        assert!(err.contains("unknown provider"), "got: {err}");
+    }
+
+    #[test]
+    fn lister_failure_warns_and_continues() {
+        let mut a = args();
         a.offline = false;
-        let lister = RecordingLister {
-            seen_key: std::cell::RefCell::new(None),
-            models: vec!["gpt-5.1"],
-        };
-        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
-        let spec = resolve_spec(&a, &mut scripted("\n"), &lister, &no_keys, &detected).unwrap();
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-detected"));
-        assert_eq!(lister.seen_key.borrow().as_deref(), Some("sk-detected"));
-    }
-
-    #[test]
-    fn api_key_empty_uses_detected_value() {
-        // openai + offline + model from flags -> the only prompt is the key.
-        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
-        let spec = resolve_spec(
-            &args(),
-            &mut scripted("\n"),
-            &FailingLister,
-            &no_keys,
-            &detected,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-detected"));
-        assert_eq!(spec.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
-    }
-
-    #[test]
-    fn api_key_typed_is_literal() {
-        let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
-        let spec = resolve_spec(
-            &args(),
-            &mut scripted("sk-typed\n"),
-            &FailingLister,
-            &no_keys,
-            &detected,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-typed"));
-    }
-
-    #[test]
-    fn api_key_no_detected_var_typed() {
-        // No value in the shell -> plain "API key:" prompt; typed value used.
-        let spec = resolve_spec(
-            &args(),
-            &mut scripted("sk-manual\n"),
-            &FailingLister,
-            &no_keys,
-            &no_values,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-manual"));
-    }
-
-    #[test]
-    fn ollama_has_no_api_key_value() {
-        let mut a = args();
-        a.provider = Some("ollama".to_string());
         let spec = resolve_spec(
             &a,
             &mut non_interactive(),
@@ -1762,42 +1725,7 @@ mod tests {
             &no_values,
         )
         .unwrap();
-        assert_eq!(spec.api_key_value, None);
-        assert_eq!(spec.api_key_env, None);
-    }
-
-    #[test]
-    fn bedrock_has_no_api_key_value() {
-        let mut a = args();
-        a.provider = Some("bedrock".to_string());
-        a.region = Some("us-east-1".to_string());
-        let spec = resolve_spec(
-            &a,
-            &mut non_interactive(),
-            &FailingLister,
-            &no_keys,
-            &no_values,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key_value, None);
-    }
-
-    #[test]
-    fn non_interactive_api_key_from_flag() {
-        // --api-key-env names the var whose *value* seeds the key.
-        let mut a = args();
-        a.api_key_env = Some("MY_KEY".to_string());
-        let from_flag = |v: &str| (v == "MY_KEY").then(|| "sk-flag".to_string());
-        let spec = resolve_spec(
-            &a,
-            &mut non_interactive(),
-            &FailingLister,
-            &no_keys,
-            &from_flag,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key_value.as_deref(), Some("sk-flag"));
-        assert_eq!(spec.api_key_env.as_deref(), Some("MY_KEY"));
+        assert_eq!(spec.model, "gpt-5.1");
     }
 
     #[test]
@@ -1808,5 +1736,65 @@ mod tests {
         let lister = FixedLister(vec!["gpt-5.1"]);
         let spec = resolve_spec(&a, &mut non_interactive(), &lister, &no_keys, &no_values).unwrap();
         assert_eq!(spec.model, "my-finetune");
+    }
+
+    #[test]
+    fn next_steps_mentions_config() {
+        let s = next_steps(Path::new("config.toml"), false);
+        assert!(s.contains("config.toml"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_mentions_env_when_written() {
+        let s = next_steps(Path::new("config.toml"), true);
+        assert!(s.contains(".env"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_cds_into_config_dir() {
+        let s = next_steps(Path::new("proj/config.toml"), false);
+        assert!(s.contains("cd proj"), "got: {s}");
+        assert!(s.contains("CONFIG_PATH=config.toml"), "got: {s}");
+    }
+
+    #[cfg(feature = "standalone-cli")]
+    #[test]
+    fn validate_rendered_accepts_generated() {
+        let spec = resolve(&args()).unwrap();
+        let rendered = render_config(&spec);
+        validate_rendered(&spec, &rendered).unwrap();
+    }
+
+    #[test]
+    fn non_interactive_api_key_from_flag() {
+        let mut a = args();
+        a.api_key_env = Some("MY_KEY".to_string());
+        let from_flag = |v: &str| (v == "MY_KEY").then(|| "sk-flag".to_string());
+        let key_set = |v: &str| v == "MY_KEY";
+        let spec = resolve_spec(
+            &a,
+            &mut non_interactive(),
+            &FailingLister,
+            &key_set,
+            &from_flag,
+        )
+        .unwrap();
+        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("MY_KEY".to_string())));
+    }
+
+    #[test]
+    fn ask_yes_no_defaults() {
+        let mut p = scripted("\n");
+        assert!(p.ask_yes_no("test?", true).unwrap());
+        let mut p = scripted("\n");
+        assert!(!p.ask_yes_no("test?", false).unwrap());
+    }
+
+    #[test]
+    fn ask_yes_no_explicit() {
+        let mut p = scripted("y\n");
+        assert!(p.ask_yes_no("test?", false).unwrap());
+        let mut p = scripted("n\n");
+        assert!(!p.ask_yes_no("test?", true).unwrap());
     }
 }

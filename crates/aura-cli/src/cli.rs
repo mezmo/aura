@@ -4,8 +4,8 @@ use clap::Parser;
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
     /// Generate a starter configuration: senses API-key env vars, verifies
-    /// provider and model against the provider's live model list, and
-    /// enables the aura-bootstrap agent for conversational setup.
+    /// provider and model against the provider's live model list, and writes
+    /// a minimal config.toml.
     Init(crate::init::InitArgs),
 }
 
