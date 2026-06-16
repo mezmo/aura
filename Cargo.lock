@@ -246,12 +246,13 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
- "dotenv",
+ "dotenvy",
  "eventsource-stream",
  "futures-util",
  "libc",
  "regex",
  "reqwest",
+ "rpassword",
  "rustyline",
  "serde",
  "serde_json",
@@ -274,7 +275,7 @@ name = "aura-config"
 version = "1.23.0"
 dependencies = [
  "clap",
- "dotenv",
+ "dotenvy",
  "regex",
  "serde",
  "serde_json",
@@ -319,7 +320,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
- "dotenv",
+ "dotenvy",
  "env_logger",
  "eventsource-stream",
  "futures",
@@ -1559,10 +1560,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotenv"
-version = "0.15.0"
+name = "dotenvy"
+version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dunce"
@@ -3662,6 +3663,27 @@ dependencies = [
  "quote",
  "serde_json",
  "syn",
+]
+
+[[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -2,9 +2,9 @@
 //! loaded into the process environment supplies the `{{ env.LLM_* }}`
 //! references that `aura-cli init` writes into `config.toml`.
 //!
-//! `aura-web-server` and the standalone CLI call `dotenv::dotenv()` at startup
+//! `aura-web-server` and the standalone CLI call `dotenvy::dotenv()` at startup
 //! before `load_config_with_paths`; this test exercises that load → resolve
-//! path end to end with `dotenv::from_path` (an explicit path keeps it
+//! path end to end with `dotenvy::from_path` (an explicit path keeps it
 //! independent of the test's working directory).
 
 use aura_config::LlmConfig;
@@ -46,7 +46,7 @@ enabled = true
         std::env::remove_var("LLM_API_KEY");
     }
 
-    dotenv::from_path(&env_path).expect("load .env");
+    dotenvy::from_path(&env_path).expect("load .env");
 
     let configs = aura_config::load_config(cfg_path.to_str().unwrap()).expect("load config");
     let config = &configs[0];

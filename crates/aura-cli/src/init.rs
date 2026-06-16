@@ -401,6 +401,10 @@ fn rank_shortlist(provider: &str, models: &[String]) -> Vec<String> {
 /// logic stays testable without a terminal.
 struct Prompter<R: BufRead> {
     interactive: bool,
+    /// True when reading from a real terminal. Secret prompts then read with
+    /// echo suppressed; in tests (scripted stdin) this is false so `ask_secret`
+    /// reads the injected `stdin` instead.
+    is_tty: bool,
     stdin: R,
 }
 
@@ -477,7 +481,9 @@ impl<R: BufRead> Prompter<R> {
     /// Prompt for the API key *value* to persist. When `detected_value` is
     /// present (the conventional env var is set in this shell) it is shown as
     /// `[detected_var]` and used on an empty line; typed text is taken
-    /// literally. Returns `detected_value` in non-interactive mode.
+    /// literally. On a real terminal the input is read with echo suppressed so
+    /// the secret never appears on screen. Returns `detected_value` in
+    /// non-interactive mode.
     fn ask_secret(
         &mut self,
         detected_var: Option<&str>,
@@ -491,9 +497,18 @@ impl<R: BufRead> Prompter<R> {
             _ => print!("API key: "),
         }
         std::io::stdout().flush()?;
-        let mut line = String::new();
-        self.stdin.read_line(&mut line)?;
-        let answer = line.trim();
+        let raw = if self.is_tty {
+            // Real terminal: read without echoing the secret. The suppressed
+            // Enter leaves the cursor on the prompt line, so emit a newline.
+            let secret = rpassword::read_password()?;
+            println!();
+            secret
+        } else {
+            let mut line = String::new();
+            self.stdin.read_line(&mut line)?;
+            line
+        };
+        let answer = raw.trim();
         if answer.is_empty() {
             Ok(detected_value.map(String::from))
         } else {
@@ -888,7 +903,7 @@ fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()> {
 
 /// Human-readable next-steps shown after writing the files. The run command
 /// `cd`s into the config's directory when it has one, so the sibling `.env` is
-/// on dotenv's (cwd-based) search path.
+/// on dotenvy's (cwd-based) search path.
 fn next_steps(config_path: &Path, env_path: &Path) -> String {
     let dir = config_path.parent().filter(|p| !p.as_os_str().is_empty());
     let (run_prefix, config_for_run) = match dir {
@@ -917,9 +932,11 @@ fn next_steps(config_path: &Path, env_path: &Path) -> String {
 }
 
 pub fn run_init(args: &InitArgs) -> Result<()> {
-    let interactive = !args.non_interactive && std::io::stdin().is_terminal();
+    let is_tty = std::io::stdin().is_terminal();
+    let interactive = !args.non_interactive && is_tty;
     let mut prompter = Prompter {
         interactive,
+        is_tty,
         stdin: std::io::stdin().lock(),
     };
     let key_is_set = |var: &str| std::env::var(var).is_ok_and(|v| !v.trim().is_empty());
@@ -999,13 +1016,16 @@ mod tests {
     fn non_interactive() -> Prompter<std::io::Empty> {
         Prompter {
             interactive: false,
+            is_tty: false,
             stdin: std::io::empty(),
         }
     }
 
     fn scripted(input: &'static str) -> Prompter<&'static [u8]> {
+        // is_tty = false so ask_secret reads the scripted stdin (no real tty).
         Prompter {
             interactive: true,
+            is_tty: false,
             stdin: input.as_bytes(),
         }
     }

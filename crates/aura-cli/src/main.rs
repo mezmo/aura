@@ -25,7 +25,7 @@ fn main() -> Result<()> {
     // Load .env from the working directory so a standalone config's
     // {{ env.* }} references resolve without manual exporting. Only fills vars
     // not already set (shell exports win); an absent .env is not an error.
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
 
     // Validate --standalone + --config pairing when feature is enabled.
     #[cfg(feature = "standalone-cli")]
