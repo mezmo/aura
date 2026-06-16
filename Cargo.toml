@@ -60,7 +60,7 @@ twelf = { version = "0.15", features = ["toml", "json", "yaml", "env", "clap"] }
 config = { version = "0.14", features = ["toml"] }  # Alternative for custom handling
 
 # Environment variables
-dotenv = "0.15"
+dotenvy = "0.15"
 regex = "1.11"
 
 # Vector stores - pinned to exact version compatible with our rig-core 0.28.x fork
