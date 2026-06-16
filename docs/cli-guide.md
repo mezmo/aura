@@ -163,9 +163,11 @@ OTel init is independent of `--log-file`. You can run with traces only, logs onl
 | `/expand` | Toggle expanded/compact tool call view |
 | `/stream` | Toggle SSE event stream panel |
 | `/style [name]` | Switch visual style: `normal`, `high-contrast`, `no-colors` |
-| `/quit` | Exit the REPL |
+| `/quit` or `/exit` | Exit the REPL |
 
-All commands can be executed while the model is streaming.
+All commands can be executed while the model is streaming. Run `/help` at any time to print this list.
+
+If you type an unrecognized or partial command, the CLI reports `Unknown command` and points you to `/help` instead of sending the text to the model. As you type, the prompt suggests matching commands. Press `Tab` to complete an abbreviation to its full command name before you submit.
 
 ## Keyboard Shortcuts
 
