@@ -406,6 +406,47 @@ fn orch_event_prints_scrollback(event_name: &str) -> bool {
     )
 }
 
+/// Bare-word aliases for slash commands that are not themselves command names —
+/// abbreviations and editor-isms (vim's `:q`, a lone `?`) typed without a
+/// leading slash. Each maps to the canonical command name to suggest, resolved
+/// through [`registry`] at lookup time.
+///
+/// Inputs that match a command name directly (`clear`, `model`, …) resolve
+/// against the registry in [`command_hint`] and have no entry here.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("q", "/quit"),
+    (":q", "/quit"),
+    (":wq", "/quit"),
+    (":x", "/quit"),
+    ("bye", "/exit"),
+    ("logout", "/exit"),
+    ("?", "/help"),
+];
+
+/// Returns the slash command to suggest for a bare, slash-less word, or `None`
+/// when the input is neither a command name nor a known alias.
+///
+/// Matches case-insensitively against the trimmed input — first against
+/// registered command names (bare `clear` resolves to `/clear`), then against
+/// [`COMMAND_ALIASES`]. Multi-word input never matches. The result is advisory:
+/// a suggestion to surface, not a command to run.
+fn command_hint(input: &str) -> Option<&'static str> {
+    let trimmed = input.trim();
+    // A command word is a single token; multi-word input is ordinary chat.
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(cmd) = registry::lookup(&format!("/{lower}")) {
+        return Some(cmd.name);
+    }
+    COMMAND_ALIASES
+        .iter()
+        .find(|(bare, _)| *bare == lower)
+        .and_then(|(_, name)| registry::lookup(name))
+        .map(|cmd| cmd.name)
+}
+
 pub fn run_repl(
     rt: &Runtime,
     config: AppConfig,
@@ -647,6 +688,14 @@ pub fn run_repl(
                             continue;
                         }
                     }
+                } else if let Some(suggestion) = command_hint(&input) {
+                    println!(
+                        "{}",
+                        format!("This REPL uses slash commands. Did you mean {suggestion} ?")
+                            .themed(AuraStyle::Muted),
+                    );
+                    redraw_input_frame();
+                    continue;
                 }
 
                 // Append compaction hint to user message if pending
@@ -2733,5 +2782,66 @@ impl StreamHandler for ReplStreamHandler {
             *guard = Some((wave_anim, wave_stop));
         }
         prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMAND_ALIASES, command_hint};
+    use crate::repl::registry;
+
+    #[test]
+    fn intercepts_every_registered_command() {
+        // A command added to the registry must not slip through unhinted
+        for cmd in registry::COMMANDS {
+            let bare = cmd.name.strip_prefix('/').unwrap();
+            assert_eq!(
+                command_hint(bare),
+                Some(cmd.name),
+                "{} is not captured as a bare word",
+                cmd.name,
+            );
+        }
+    }
+
+    #[test]
+    fn intercepts_aliases() {
+        assert_eq!(command_hint("q"), Some("/quit"));
+        assert_eq!(command_hint(":q"), Some("/quit"));
+        assert_eq!(command_hint(":wq"), Some("/quit"));
+        assert_eq!(command_hint(":x"), Some("/quit"));
+        assert_eq!(command_hint("bye"), Some("/exit"));
+        assert_eq!(command_hint("logout"), Some("/exit"));
+        assert_eq!(command_hint("?"), Some("/help"));
+    }
+
+    #[test]
+    fn is_case_insensitive_and_trims() {
+        assert_eq!(command_hint("EXIT"), Some("/exit"));
+        assert_eq!(command_hint("  Quit  "), Some("/quit"));
+        assert_eq!(command_hint(":Q"), Some("/quit"));
+        assert_eq!(command_hint("  Model "), Some("/model"));
+    }
+
+    #[test]
+    fn passes_through_real_chat_input() {
+        // Slash commands are handled before this lookup, and ordinary chat
+        // must never be intercepted.
+        assert_eq!(command_hint("/exit"), None);
+        assert_eq!(command_hint("exit the building"), None);
+        assert_eq!(command_hint("how do I quit vim"), None);
+        assert_eq!(command_hint("question?"), None);
+        assert_eq!(command_hint(""), None);
+    }
+
+    #[test]
+    fn every_alias_resolves_to_a_real_command() {
+        // Guards against the alias table drifting from the registry.
+        for (bare, target) in COMMAND_ALIASES {
+            assert!(
+                registry::lookup(target).is_some(),
+                "alias {bare:?} targets unknown command {target:?}",
+            );
+        }
     }
 }
