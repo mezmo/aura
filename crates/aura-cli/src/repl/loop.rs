@@ -21,11 +21,12 @@ use crate::repl::commands;
 use crate::repl::conversations::ConversationStore;
 use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{self, HISTORY_COUNT, HISTORY_DEPTH, LAST_READLINE_INPUT};
+use crate::repl::registry::{self, CommandContext, CommandOutcome};
 use crate::tools;
 use crate::ui::markdown::render_markdown;
 use crate::ui::prompt::{
-    PendingCommand, WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint,
-    drain_stdin, erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
+    WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
+    erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
     get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output,
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
@@ -625,62 +626,27 @@ pub fn run_repl(
                     reset_input_geometry();
                 }
 
-                if input == "/quit" || input == "/exit" {
-                    // Save before exiting, or delete if conversation was never started
-                    if let Some(ref store) = conv_store {
-                        if conversation.messages().len() > 1 {
-                            with_event_log(|log| {
-                                store.save_all(conversation.messages(), log, is_expanded_output())
-                            });
-                        } else {
-                            store.delete();
+                if input.starts_with('/') {
+                    let mut ctx = CommandContext {
+                        conversation: &mut conversation,
+                        conv_store: &mut conv_store,
+                        input_reader: &mut input_reader,
+                    };
+                    match registry::dispatch(&input, &mut ctx) {
+                        Some(CommandOutcome::Exit) => break,
+                        Some(CommandOutcome::Reinject(new_input)) => {
+                            initial_input = new_input;
+                            continue;
+                        }
+                        Some(CommandOutcome::Handled) => continue,
+                        None => {
+                            // Unknown command — don't send to API
+                            println!("Unknown command: {}", input);
+                            println!("Type /help for available commands.");
+                            redraw_input_frame();
+                            continue;
                         }
                     }
-                    break;
-                } else if input == "/clear" {
-                    commands::handle_clear(&mut conversation, &mut conv_store, &mut input_reader);
-                    continue;
-                } else if input == "/help" {
-                    commands::handle_help();
-                    continue;
-                } else if input == "/expand" {
-                    commands::handle_expand(&conversation, &conv_store);
-                    continue;
-                } else if input == "/stream" {
-                    commands::handle_stream();
-                    continue;
-                } else if input == "/conversations" {
-                    commands::handle_conversations();
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/rename") {
-                    commands::handle_rename(arg.trim(), &conv_store);
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/resume") {
-                    // In-REPL resume ignores CLI --model and --system-prompt;
-                    // uses whatever the resumed conversation had saved.
-                    if let Some(new_input) = commands::handle_resume(
-                        arg.trim(),
-                        &mut conversation,
-                        &mut conv_store,
-                        &mut input_reader,
-                        None,
-                    ) {
-                        initial_input = new_input;
-                    }
-                    continue;
-                } else if let Some(filter) = input.strip_prefix("/model") {
-                    let filter = filter.trim();
-                    commands::handle_model(filter, &conv_store);
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/style") {
-                    commands::handle_style(arg.trim());
-                    continue;
-                } else if input.starts_with('/') {
-                    // Unknown command — don't send to API
-                    println!("Unknown command: {}", input);
-                    println!("Type /help for available commands.");
-                    redraw_input_frame();
-                    continue;
                 }
 
                 // Append compaction hint to user message if pending
@@ -1725,54 +1691,21 @@ pub fn run_repl(
                 // Done processing — restore status bar to token counts / default
                 set_processing(false);
 
-                // Check for pending commands set by mid-stream slash commands
-                if let Some(cmd) = take_pending_command() {
-                    match cmd {
-                        PendingCommand::Quit => {
-                            // Save before exiting, or delete if conversation was never started
-                            if let Some(ref store) = conv_store {
-                                if conversation.messages().len() > 1 {
-                                    with_event_log(|log| {
-                                        store.save_all(
-                                            conversation.messages(),
-                                            log,
-                                            is_expanded_output(),
-                                        )
-                                    });
-                                } else {
-                                    store.delete();
-                                }
-                            }
-                            break;
-                        }
-                        PendingCommand::Clear => {
-                            commands::handle_clear(
-                                &mut conversation,
-                                &mut conv_store,
-                                &mut input_reader,
-                            );
+                // Run any command deferred from mid-stream input through the
+                // same registry dispatch the prompt uses.
+                if let Some(pending) = take_pending_command() {
+                    let mut ctx = CommandContext {
+                        conversation: &mut conversation,
+                        conv_store: &mut conv_store,
+                        input_reader: &mut input_reader,
+                    };
+                    match (pending.command.handler)(&mut ctx, &pending.args) {
+                        CommandOutcome::Exit => break,
+                        CommandOutcome::Reinject(new_input) => {
+                            initial_input = new_input;
                             continue;
                         }
-                        PendingCommand::Resume(filter) => {
-                            let arg = filter.trim();
-                            if arg.is_empty() {
-                                // No argument — just continue normally
-                                redraw_input_frame();
-                                continue;
-                            }
-                            // In-REPL resume ignores CLI --model and --system-prompt
-                            if let Some(new_input) = commands::handle_resume(
-                                arg,
-                                &mut conversation,
-                                &mut conv_store,
-                                &mut input_reader,
-                                None,
-                            ) {
-                                initial_input = new_input;
-                            }
-                            redraw_input_frame();
-                            continue;
-                        }
+                        CommandOutcome::Handled => continue,
                     }
                 }
 

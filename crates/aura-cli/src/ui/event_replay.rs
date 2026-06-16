@@ -883,16 +883,20 @@ pub fn print_tool_call_expanded(
 }
 
 pub fn print_help() {
+    use crate::repl::registry::COMMANDS;
     println!("Available commands:");
-    println!("  /help            — Show this help message");
-    println!("  /clear           — Start a new conversation");
-    println!("  /expand          — Toggle expanded/compact tool call view");
-    println!("  /conversations   — List saved conversations");
-    println!("  /resume <filter> — Resume a saved conversation (by ID or name)");
-    println!("  /rename <name>   — Rename the current conversation");
-    println!("  /model <filter>  — Select a model for LLM requests");
-    println!("  /quit            — Exit the REPL");
-    println!("  /exit            — Exit the REPL");
+    let width = COMMANDS
+        .iter()
+        .map(|c| c.name.len() + c.usage_hint.map_or(0, |h| h.len() + 1))
+        .max()
+        .unwrap_or(0);
+    for cmd in COMMANDS {
+        let cell = match cmd.usage_hint {
+            Some(hint) => format!("{} {}", cmd.name, hint),
+            None => cmd.name.to_string(),
+        };
+        println!("  {cell:<width$} — {}", cmd.description);
+    }
 }
 
 pub fn list_conversations() {
