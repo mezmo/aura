@@ -67,6 +67,23 @@ The card then advertises absolute endpoints under that origin:
 
 A trailing slash on `AURA_SERVER_URL` is trimmed before the paths are appended.
 
+## Model selection (`x-aura-model`)
+
+When the server is started with multiple agent configs (e.g. `--config agent-a.toml --config agent-b.toml`), A2A clients can target a specific agent by sending the `x-aura-model` request header. This mirrors the `model` field in the OpenAI-compatible `/v1/chat/completions` endpoint.
+
+| Scenario | Behavior |
+|----------|----------|
+| Single config loaded | Header is ignored — the only config is always used |
+| Multi-config, header present | Matches against `agent.alias` (if set), otherwise `agent.name` |
+| Multi-config, header absent | Falls back to the server's default agent (`--default-agent` / `AURA_DEFAULT_AGENT`) |
+| No matching config found | Returns an `invalid_params` A2A error |
+
+The error message when no config matches:
+- Header provided: `"no agent configuration found for model '<name>'"` (A2A `invalid_params`)
+- No header and no default: `"no agent configuration available"` (A2A `invalid_params`)
+
+`x-aura-model` is **not** part of the A2A spec — it is an Aura extension. Like all request headers, it is also forwarded to the agent's MCP connections via the `headers_from_request` mechanism.
+
 ## Testing with curl
 
 Assumes the server is running on `localhost:8080`.
@@ -88,9 +105,23 @@ curl http://localhost:8080/health
 ### REST — send a message
 
 ```bash
+# Single-config server — no x-aura-model needed
 curl -s -X POST http://localhost:8080/a2a/v1/message:send \
   -H "Content-Type: application/json" \
   -H "A2A-Version: 1.0" \
+  -d '{
+    "message": {
+      "messageId": "msg-001",
+      "role": "ROLE_USER",
+      "parts": [{ "text": "What is 2 + 2?" }]
+    }
+  }' | jq .
+
+# Multi-config server — target a specific agent by alias or name
+curl -s -X POST http://localhost:8080/a2a/v1/message:send \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -H "x-aura-model: my-agent-alias" \
   -d '{
     "message": {
       "messageId": "msg-001",
@@ -128,6 +159,7 @@ curl -s -X POST http://localhost:8080/a2a/v1/tasks/<task-id>:cancel | jq .
 curl -s -X POST http://localhost:8080/a2a/v1/rpc \
   -H "Content-Type: application/json" \
   -H "A2A-Version: 1.0" \
+  -H "x-aura-model: my-agent-alias" \
   -d '{
     "jsonrpc": "2.0",
     "method": "SendMessage",
@@ -178,11 +210,8 @@ curl -s -X POST http://localhost:8080/a2a/v1/rpc \
 - **`messageId` and `role` are required** on the `Message` object — malformed bodies return `-32602 Invalid params`.
 - **Text-only parts** — the executor only accepts `text` parts; `file` and `data` parts return an error.
 - Tasks are stored in the `a2a-rs-server` in-memory `TaskStore` for the lifetime of the process. Use `GET /a2a/v1/tasks/{id}` or `GetTask` to poll after `message:send` returns.
-- Request headers passed to `/a2a/v1/message:send` are forwarded to the agent's MCP connections (same `headers_from_request` mechanism as the OpenAI-compatible endpoint).
-- As of now, the AURA implementation of A2A only supports a single agent, just as the following questions in the spec
-  - https://github.com/a2aproject/A2A/issues/221
-  - https://github.com/a2aproject/A2A/issues/178
-  - https://github.com/a2aproject/A2A/discussions/166
+- Request headers passed to `/a2a/v1/message:send` are forwarded to the agent's MCP connections (same `headers_from_request` mechanism as the OpenAI-compatible endpoint). This includes `x-aura-model`.
+- **`x-aura-model` is an Aura extension**, not part of the A2A spec. It selects the agent configuration when multiple configs are loaded — see [Model selection](#model-selection-x-aura-model).
 
 ## Module layout
 

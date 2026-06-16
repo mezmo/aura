@@ -46,18 +46,19 @@ impl AuraAgentExecutor {
         }
     }
 
-    fn resolve_config(&self) -> Option<aura_config::Config> {
-        if let Some(ref name) = self.app_state.default_agent
-            && let Some(agent_config) = self
-                .app_state
-                .configs
-                .iter()
-                .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name)
-                .cloned()
-        {
-            return Some(agent_config);
+    fn resolve_config(&self, requested_model: Option<&str>) -> Option<aura_config::Config> {
+        let configs = &self.app_state.configs;
+        // Single-config: always use it, ignore any requested_model (mirrors chat completions passthrough).
+        if configs.len() == 1 {
+            return configs.first().cloned();
         }
-        self.app_state.configs.first().cloned()
+        // multi-config. If a specific model requested, try to find it
+        // otherwise go with the config default.
+        let name = requested_model.or(self.app_state.default_agent.as_deref())?;
+        configs
+            .iter()
+            .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == name)
+            .cloned()
     }
 
     /// Build the A2A agent card.
@@ -68,7 +69,7 @@ impl AuraAgentExecutor {
     /// relative paths.
     pub fn build_agent_card(&self, base_url: &str) -> AgentCard {
         let base = base_url.trim_end_matches('/');
-        let config = self.resolve_config();
+        let config = self.resolve_config(None);
         let name = config
             .as_ref()
             .map(|c| c.agent.name.as_str())
@@ -128,7 +129,23 @@ impl AgentExecutor for AuraAgentExecutor {
         &self,
         ctx: ExecutorContext,
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-        let config = self.resolve_config();
+        let model_requested_model = ctx
+            .service_params
+            .get("x-aura-model")
+            .and_then(|v| v.first())
+            .cloned();
+        let config = match self.resolve_config(model_requested_model.as_deref()) {
+            Some(c) => c,
+            None => {
+                let msg = match model_requested_model.as_deref() {
+                    Some(name) => format!("no agent configuration found for model '{name}'"),
+                    None => "no agent configuration available".to_string(),
+                };
+                return Box::pin(futures_util::stream::once(async move {
+                    Err::<StreamResponse, A2AError>(A2AError::invalid_params(msg))
+                }));
+            }
+        };
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
@@ -160,8 +177,6 @@ impl AgentExecutor for AuraAgentExecutor {
                 },
                 metadata: None,
             }));
-
-            let config = config.ok_or_else(|| A2AError::invalid_params("no agent configuration available"))?;
 
             let session_id = Some(context_id.clone());
             let builder = RigBuilder::new(config);
@@ -607,5 +622,130 @@ fn convert_a2a_msg_to_aura(msg: &a2a::Message) -> Option<aura::Message> {
             a2a::Role::Agent => Some(aura::Message::assistant(&text)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::a2a::SharedTaskStore;
+    use crate::streaming::ToolResultMode;
+    use crate::types::{ActiveRequestTracker, AppState};
+
+    fn make_executor(
+        configs: Vec<aura_config::Config>,
+        default_agent: Option<&str>,
+    ) -> AuraAgentExecutor {
+        let app_state = Arc::new(AppState {
+            configs: Arc::new(configs),
+            default_agent: default_agent.map(str::to_owned),
+            tool_result_mode: ToolResultMode::default(),
+            tool_result_max_length: 0,
+            streaming_buffer_size: 0,
+            aura_custom_events: false,
+            aura_emit_reasoning: false,
+            streaming_timeout_secs: 0,
+            first_chunk_timeout_secs: 0,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
+            active_requests: Arc::new(ActiveRequestTracker::default()),
+            additional_tools: Arc::new(Vec::new),
+        });
+        AuraAgentExecutor::new(app_state, SharedTaskStore::default())
+    }
+
+    fn make_config(name: &str, alias: Option<&str>) -> aura_config::Config {
+        aura_config::Config {
+            memory_dir: None,
+            mcp: None,
+            vector_stores: vec![],
+            tools: None,
+            orchestration: None,
+            agent: aura_config::AgentConfig {
+                name: name.to_owned(),
+                alias: alias.map(str::to_owned),
+                ..aura_config::AgentConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn empty_configs_returns_none() {
+        let ex = make_executor(vec![], None);
+        assert!(ex.resolve_config(None).is_none());
+    }
+
+    #[test]
+    fn single_config_no_requested_model_returns_it() {
+        let ex = make_executor(vec![make_config("A", None)], None);
+        let result = ex.resolve_config(None);
+        assert_eq!(result.map(|c| c.agent.name), Some("A".to_owned()));
+    }
+
+    #[test]
+    fn single_config_requested_model_ignored() {
+        // Branch A: single-config always wins, the requested_model is irrelevant
+        let ex = make_executor(vec![make_config("A", None)], None);
+        let result = ex.resolve_config(Some("B"));
+        assert_eq!(result.map(|c| c.agent.name), Some("A".to_owned()));
+    }
+
+    #[test]
+    fn multi_config_no_requested_model_no_default_returns_none() {
+        let ex = make_executor(vec![make_config("A", None), make_config("B", None)], None);
+        assert!(ex.resolve_config(None).is_none());
+    }
+
+    #[test]
+    fn multi_config_default_agent_matches_by_name() {
+        let ex = make_executor(
+            vec![make_config("A", None), make_config("B", None)],
+            Some("B"),
+        );
+        let result = ex.resolve_config(None);
+        assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
+    }
+
+    #[test]
+    fn multi_config_default_agent_matches_by_alias() {
+        let ex = make_executor(
+            vec![make_config("A", None), make_config("B", Some("b-alias"))],
+            Some("b-alias"),
+        );
+        let result = ex.resolve_config(None);
+        assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
+    }
+
+    #[test]
+    fn multi_config_model_requested_model_matches_by_name() {
+        let ex = make_executor(vec![make_config("A", None), make_config("B", None)], None);
+        let result = ex.resolve_config(Some("B"));
+        assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
+    }
+
+    #[test]
+    fn multi_config_model_requested_model_matches_by_alias() {
+        let ex = make_executor(
+            vec![make_config("A", None), make_config("B", Some("b-alias"))],
+            None,
+        );
+        let result = ex.resolve_config(Some("b-alias"));
+        assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
+    }
+
+    #[test]
+    fn multi_config_no_match_returns_none() {
+        let ex = make_executor(vec![make_config("A", None), make_config("B", None)], None);
+        assert!(ex.resolve_config(Some("C")).is_none());
+    }
+
+    #[test]
+    fn multi_config_requested_model_overrides_default_agent() {
+        let ex = make_executor(
+            vec![make_config("A", None), make_config("B", None)],
+            Some("A"),
+        );
+        let result = ex.resolve_config(Some("B"));
+        assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
     }
 }
