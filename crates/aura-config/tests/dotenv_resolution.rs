@@ -15,11 +15,7 @@ fn dotenv_supplies_env_vars_for_config_resolution() {
     let env_path = dir.path().join(".env");
     let cfg_path = dir.path().join("config.toml");
 
-    std::fs::write(
-        &env_path,
-        "OPENAI_API_KEY=sk-test\n",
-    )
-    .unwrap();
+    std::fs::write(&env_path, "OPENAI_API_KEY=sk-test\n").unwrap();
     std::fs::write(
         &cfg_path,
         r#"

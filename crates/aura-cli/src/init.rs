@@ -601,7 +601,6 @@ impl ConfigSpec {
             None => None,
         }
     }
-
 }
 
 fn toml_escape(s: &str) -> String {
@@ -759,9 +758,7 @@ fn resolve_spec<R: BufRead>(
             }
         } else {
             if prompter.interactive {
-                println!(
-                    "\nNo {env_var} found in your environment."
-                );
+                println!("\nNo {env_var} found in your environment.");
             }
             match prompter.ask_secret_masked("Enter your API key")? {
                 Some(v) => Some(ApiKeySource::Provided {
@@ -770,9 +767,7 @@ fn resolve_spec<R: BufRead>(
                 }),
                 None => {
                     if prompter.interactive {
-                        eprintln!(
-                            "warning: no API key provided — set {env_var} before starting"
-                        );
+                        eprintln!("warning: no API key provided — set {env_var} before starting");
                     }
                     Some(ApiKeySource::EnvVar(env_var.clone()))
                 }
@@ -886,16 +881,13 @@ fn resolve_spec<R: BufRead>(
 fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()> {
     let mut literal = rendered.to_string();
     // Substitute env var references with literal values for validation
-    literal = literal.replace(
-        &format!("{{{{ env.{} }}}}", ""),
-        "",
-    );
+    literal = literal.replace(&format!("{{{{ env.{} }}}}", ""), "");
     // Replace specific known references
     if let Some(var) = spec.api_key_env_var() {
         literal = literal.replace(&format!("{{{{ env.{var} }}}}"), "test-key");
     }
     // Provider and model are written literally, not as env refs
-    let config = aura_config::load_config_from_str(&literal)
+    aura_config::load_config_from_str(&literal)
         .map_err(|e| anyhow::anyhow!("generated config failed validation (bug): {e}"))?;
     Ok(())
 }
@@ -1345,7 +1337,10 @@ mod tests {
             &detected,
         )
         .unwrap();
-        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string()))
+        );
     }
 
     #[test]
@@ -1361,7 +1356,10 @@ mod tests {
             &detected,
         )
         .unwrap();
-        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string()))
+        );
         let rendered = render_config(&spec);
         assert!(rendered.contains("api_key = \"{{ env.OPENAI_API_KEY }}\""));
     }
@@ -1447,15 +1445,12 @@ mod tests {
         let only_openai = |v: &str| v == "OPENAI_API_KEY";
         let detected = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
         // "y\n" accepts detected key
-        let spec = resolve_spec(
-            &a,
-            &mut scripted("y\n"),
-            &lister,
-            &only_openai,
-            &detected,
-        )
-        .unwrap();
-        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+        let spec =
+            resolve_spec(&a, &mut scripted("y\n"), &lister, &only_openai, &detected).unwrap();
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string()))
+        );
         assert_eq!(lister.seen_key.borrow().as_deref(), Some("sk-detected"));
     }
 
@@ -1590,7 +1585,10 @@ mod tests {
         .unwrap();
         assert_eq!(spec.provider, "openai");
         assert_eq!(spec.model, "gpt-5.1");
-        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string())));
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string()))
+        );
     }
 
     #[test]
@@ -1779,7 +1777,10 @@ mod tests {
             &from_flag,
         )
         .unwrap();
-        assert_eq!(spec.api_key, Some(ApiKeySource::EnvVar("MY_KEY".to_string())));
+        assert_eq!(
+            spec.api_key,
+            Some(ApiKeySource::EnvVar("MY_KEY".to_string()))
+        );
     }
 
     #[test]
