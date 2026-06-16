@@ -537,8 +537,8 @@ impl<R: BufRead> Prompter<R> {
         }
         loop {
             match &suggested {
-                Some(d) => print!("Which model would you like to use? [{d}]: "),
-                None => print!("Which model would you like to use?: "),
+                Some(d) => print!("Which model should AURA use? [{d}]: "),
+                None => print!("Which model should AURA use?: "),
             }
             std::io::stdout().flush()?;
             let mut line = String::new();
@@ -689,7 +689,7 @@ fn resolve_spec<R: BufRead>(
                 None
             };
             if prompter.interactive {
-                println!("\nWhich LLM provider would you like to use?\n");
+                println!("\nWhich LLM provider should AURA use?\n");
                 for (i, p) in order.iter().enumerate() {
                     let marker = if sensed.contains(p) {
                         "  (key detected)"
@@ -929,6 +929,34 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
         is_tty,
         stdin: std::io::stdin().lock(),
     };
+    if prompter.interactive {
+        println!(
+            "Welcome to AURA. This init process will generate a starter config \
+             you can run right away. I'll ask a couple of questions, then write \
+             your config."
+        );
+    }
+
+    // Resolve an existing config before asking anything: prompt to overwrite
+    // (interactive) or fail fast with --force guidance (non-interactive).
+    if args.output.exists() && !args.force {
+        if prompter.interactive {
+            let overwrite = prompter.ask_yes_no(
+                &format!("\n{} already exists. Overwrite?", args.output.display()),
+                false,
+            )?;
+            if !overwrite {
+                println!("Exiting — {} left unchanged.", args.output.display());
+                return Ok(());
+            }
+        } else {
+            bail!(
+                "{} already exists — pass --force to overwrite",
+                args.output.display()
+            );
+        }
+    }
+
     let key_is_set = |var: &str| std::env::var(var).is_ok_and(|v| !v.trim().is_empty());
     let key_value = |var: &str| std::env::var(var).ok().filter(|v| !v.trim().is_empty());
     let spec = resolve_spec(
@@ -943,13 +971,6 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
     toml::from_str::<toml::Value>(&rendered).context("generated config is not valid TOML (bug)")?;
     #[cfg(feature = "standalone-cli")]
     validate_rendered(&spec, &rendered)?;
-
-    if args.output.exists() && !args.force {
-        bail!(
-            "{} already exists — pass --force to overwrite",
-            args.output.display()
-        );
-    }
 
     // Only write .env when the user provided a new key
     let mut wrote_env = false;
