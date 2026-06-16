@@ -7,19 +7,18 @@
 // ---------------------------------------------------------------------------
 
 // Re-export from state.rs
-pub(crate) use super::state::lock_term;
 pub use super::state::{
-    ACTIVE_ORCH_TOOLS, ORCH_SCROLLBACK_COUNTER, PendingCommand, cache_anim_lines,
-    capture_style_preview_original, check_resize, clear_display_events, clear_queued_input,
-    clear_style_preview_original, extend_display_events, frame_lines, get_model_matches,
-    get_selected_model, install_sigint_handler, is_expanded_output, is_pretty,
-    last_mid_stream_history_entry, print_welcome_state, print_welcome_state_animated,
-    push_display_event, push_mid_stream_history, random_bullet_color, reset_input_geometry,
-    reset_task_colors, restore_style_preview_original, set_expanded_output, set_mid_stream_history,
-    set_pending_command, set_pretty, set_processing, set_queued_input, set_selected_model,
-    set_welcome_state, take_pending_command, take_queued_input, task_color_for, term_size,
+    ACTIVE_ORCH_TOOLS, ORCH_SCROLLBACK_COUNTER, cache_anim_lines, capture_style_preview_original,
+    check_resize, clear_display_events, clear_queued_input, clear_style_preview_original,
+    extend_display_events, frame_lines, get_model_matches, get_selected_model,
+    install_sigint_handler, is_expanded_output, is_pretty, last_mid_stream_history_entry,
+    print_welcome_state, print_welcome_state_animated, push_display_event, push_mid_stream_history,
+    random_bullet_color, reset_input_geometry, reset_task_colors, restore_style_preview_original,
+    set_expanded_output, set_mid_stream_history, set_pretty, set_processing, set_queued_input,
+    set_selected_model, set_welcome_state, take_queued_input, task_color_for, term_size,
     text_lines, with_event_log, with_event_log_mut,
 };
+pub(crate) use super::state::{lock_term, take_pending_command};
 
 // Re-export from status_bar.rs
 pub(crate) use super::status_bar::update_status_bar_unlocked;
