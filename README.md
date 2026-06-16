@@ -428,6 +428,11 @@ tools_in_planning = "summary"
 allow_direct_answers = true
 allow_clarification = true
 
+[orchestration.artifacts]
+result_artifact_threshold = 4000
+result_summary_length = 2000
+dependency_context_budget = 32000
+
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
 preamble = "You are an operations specialist."
@@ -463,7 +468,7 @@ Workers run with isolated task context windows and filtered MCP/vector-store acc
 
 For a fuller multi-worker example, see [configs/example-math-orchestration.toml](configs/example-math-orchestration.toml).
 
-#### Orchestration fields
+#### Orchestration fields (`[orchestration]`)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -478,9 +483,24 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
+| `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
+
+#### Artifact and persistence fields (`[orchestration.artifacts]`)
+
+These fields control how worker results and dependency context are stored and summarized.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `memory_dir` | string | — | Base directory for execution persistence and plan storage |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
-| `timeouts.per_call_timeout_secs` | int | `0` | Per-tool-call timeout in seconds (0 = disabled) |
+| `dependency_context_budget` | int | `32000` | Byte budget for transitive dependency context injected into worker prompts. Direct dependencies always render in full; farther transitive ancestors degrade to 500-byte compact previews |
+| `session_history_turns` | int | `3` | Prior run manifests injected into the coordinator preamble as session context |
+| `tool_output_artifact_threshold` | int | `500` | Character threshold for promoting tool outputs to artifact files |
+| `tool_output_duration_threshold_ms` | int | `5000` | Duration threshold (ms) for promoting tool outputs to artifacts |
+| `max_session_runs` | int | `20` | Maximum run directories retained per session |
+
+> **Note:** `memory_dir`, `result_artifact_threshold`, and `result_summary_length` may also be placed directly under `[orchestration]` for backward compatibility, but `[orchestration.artifacts]` is the canonical location. `dependency_context_budget` is **only** honored inside `[orchestration.artifacts]`.
 
 #### Worker fields (`[orchestration.worker.<name>]`)
 
