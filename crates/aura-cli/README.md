@@ -55,6 +55,48 @@ In standalone mode, the CLI builds agents in-process using the same code paths a
 
 ---
 
+## Generating a starter config (`aura-cli init`)
+
+New to AURA? `aura-cli init` walks you through creating a ready-to-run `config.toml` — no hand-editing TOML required.
+
+```bash
+aura-cli init                 # interactive; writes ./config.toml
+aura-cli init -o my.toml      # choose the output path
+```
+
+It will:
+
+- **Sense** your environment for a provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) and suggest that provider.
+- **Pick a provider** from a validated list (openai, anthropic, bedrock, gemini, ollama, openrouter).
+- **Handle the API key**: if the provider's conventional env var is already set it asks whether to use it; otherwise it prompts for the key (input is masked). The generated config references the key by its native env var (`api_key = "{{ env.OPENAI_API_KEY }}"`) — secrets are never written into `config.toml`.
+- **Verify & list models**: it queries the provider's live model list and shows a short, curated shortlist (newest per family — pick by number, accept the default, or type any id). For Ollama it lists whatever you have installed.
+- **Write** `config.toml`, plus a `.env` **only when you enter a new key** that isn't already in your environment. The `.env` holds a secret — add it to your `.gitignore`.
+
+`aura-web-server` and the standalone CLI load `.env` automatically at startup, so a config generated here runs as-is.
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <PATH>` | Output config path (default `config.toml`). |
+| `--provider <P>` | Provider: openai, anthropic, bedrock, gemini, ollama, openrouter. |
+| `--model <ID>` | Model id (skips the model picker). |
+| `--api-key-env <VAR>` | Env var to read the key from (default per provider). |
+| `--region <R>` | AWS region (bedrock only). |
+| `--base-url <URL>` | Base URL (ollama only; default `http://localhost:11434`). |
+| `--name <NAME>` | Agent name written to the config (default `assistant`). |
+| `--offline` | Skip live model-list verification. |
+| `--non-interactive` | Fail on missing values instead of prompting (automatic when stdin isn't a TTY). |
+| `--force` | Overwrite an existing config without asking. |
+
+For scripted/CI use, supply the required values as flags:
+
+```bash
+aura-cli init --provider openai --model gpt-4o --non-interactive
+```
+
+---
+
 ## Backends
 
 AURA CLI supports two backends, selected explicitly via the `--standalone` flag:
