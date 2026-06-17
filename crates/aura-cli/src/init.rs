@@ -848,9 +848,15 @@ fn resolve_spec<R: BufRead>(
                         "Verified: {provider} answered with {} model(s).",
                         models.len()
                     );
+                } else if default_key_env(provider).is_some() {
+                    // Provider uses a key, but its list endpoint doesn't check
+                    // it — be explicit that nothing was validated.
+                    println!(
+                        "{provider} lists {} model(s) (this did not validate \
+                         your key — that happens on first use).",
+                        models.len()
+                    );
                 } else {
-                    // The endpoint didn't authenticate, so this lists models
-                    // without confirming the key works.
                     println!("{provider} lists {} model(s).", models.len());
                 }
                 Some(models)
