@@ -440,7 +440,7 @@ allow_clarification = true
 [orchestration.artifacts]
 result_artifact_threshold = 4000
 result_summary_length = 2000
-dependency_context_budget = 32000
+dependency_context_budget = 8000
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
@@ -503,7 +503,7 @@ These fields control how worker results and dependency context are stored and su
 | `memory_dir` | string | — | Base directory for execution persistence and plan storage |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
-| `dependency_context_budget` | int | `32000` | Byte budget for transitive dependency context injected into worker prompts. Direct dependencies always render in full; farther transitive ancestors degrade to 500-byte compact previews |
+| `dependency_context_budget` | int | `8000` | Token budget for dependency context injected into worker prompts. Results without an artifact footer are inlined while they fit the budget; results with an artifact footer (or that would exceed the budget) render as their structured-output summary plus an artifact pointer |
 | `session_history_turns` | int | `3` | Prior run manifests injected into the coordinator preamble as session context |
 | `tool_output_artifact_threshold` | int | `500` | Character threshold for promoting tool outputs to artifact files |
 | `tool_output_duration_threshold_ms` | int | `5000` | Duration threshold (ms) for promoting tool outputs to artifacts |

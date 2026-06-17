@@ -1123,8 +1123,7 @@ fn test_worker_task_empty_context() {
 #[test]
 fn test_continuation_running_task_renders_as_not_executed() {
     // A pending/running task with no failed ancestor is NOT blocked — it
-    // just never ran. It must not be mislabeled "blocked (dependency
-    // failed)" (the pre-#221 behavior this test used to document).
+    // just never ran. It must not be mislabeled "blocked (dependency failed)".
     let mut plan = Plan::new("Test goal");
     let t0 = Task::new(0, "running task", "This task is still running");
     plan.add_task(t0);

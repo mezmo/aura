@@ -449,32 +449,86 @@ impl Task {
         };
     }
 
-    /// Compact preview of a completed task's result for budget-constrained
-    /// rendering: the structured-output summary when present, otherwise the
-    /// truncated result. An artifact footer in the result is re-appended if
-    /// truncation cut it off, so lineage to the on-disk artifact survives;
-    /// the body truncation leaves room for it, keeping the whole preview
-    /// within `max_bytes`.
+    /// Returns true if the completed result contains an artifact footer.
+    pub(crate) fn has_artifact_footer(&self) -> bool {
+        self.state
+            .completed_result()
+            .map(|r| extract_artifact_footer(r).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Render the full result as a dependency-context entry.
     ///
     /// Returns `None` unless the task is `Complete`.
-    pub(crate) fn compact_preview(&self, max_bytes: usize) -> Option<String> {
+    pub(crate) fn render_full_entry(&self) -> Option<String> {
+        use super::prompt_constants::sections;
+
+        let result = self.state.completed_result()?;
+        Some(format!(
+            "{} — Task {} ({}):\n{}",
+            sections::PRIOR_WORK,
+            self.id,
+            self.description,
+            result
+        ))
+    }
+
+    /// Render a compact, budget-safe dependency-context entry.
+    ///
+    /// Prefers the task's structured-output summary. If an artifact footer is
+    /// present, it is always included so the worker can load the full result
+    /// on demand. Falls back to a token-truncated raw preview only when no
+    /// summary and no artifact footer exist.
+    ///
+    /// Returns `None` unless the task is `Complete`.
+    pub(crate) fn render_pointer_entry(
+        &self,
+        max_preview_tokens: usize,
+        counter: &dyn crate::scratchpad::TokenCounter,
+    ) -> Option<String> {
+        use super::prompt_constants::sections;
+
         let result = self.state.completed_result()?;
         let footer = extract_artifact_footer(result);
-        let body_budget = max_bytes.saturating_sub(footer.map_or(0, |f| f.len() + 1));
-        let body = self
-            .structured_output
-            .as_ref()
-            .map(|so| so.summary.as_str())
-            .filter(|summary| !summary.is_empty())
-            .unwrap_or(result);
-        let (truncated, _) = crate::string_utils::safe_truncate(body, body_budget);
 
-        Some(
-            footer
-                .filter(|f| !truncated.contains(f))
-                .map(|f| format!("{truncated}\n{f}"))
-                .unwrap_or_else(|| truncated.to_owned()),
-        )
+        let body = if let Some(ref so) = self.structured_output {
+            if !so.summary.is_empty() {
+                if let Some(footer) = footer {
+                    format!("{}\n{}", so.summary, footer)
+                } else {
+                    so.summary.clone()
+                }
+            } else if let Some(footer) = footer {
+                // Empty summary but artifact exists: point at the artifact.
+                footer.to_string()
+            } else {
+                counter.truncate_to_tokens(result, max_preview_tokens)
+            }
+        } else if let Some(footer) = footer {
+            // No structured output but artifact exists: small preview + pointer.
+            // Strip the footer from the result body so we don't duplicate it.
+            let footer_start = result.rfind(footer).unwrap_or(result.len());
+            let body_without_footer = result[..footer_start].trim_end();
+            let footer_tokens = counter.count_tokens(footer).saturating_add(1);
+            let preview_budget = max_preview_tokens.saturating_sub(footer_tokens);
+            let preview = counter.truncate_to_tokens(body_without_footer, preview_budget);
+            if preview.is_empty() {
+                footer.to_string()
+            } else {
+                format!("{}\n{}", preview, footer)
+            }
+        } else {
+            // No structured output, no artifact: fallback truncate.
+            counter.truncate_to_tokens(result, max_preview_tokens)
+        };
+
+        Some(format!(
+            "{} — Task {} ({}):\n{}",
+            sections::PRIOR_WORK,
+            self.id,
+            self.description,
+            body
+        ))
     }
 }
 
@@ -1334,9 +1388,45 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_preview_prefers_structured_summary() {
-        use super::super::tools::submit_result::Confidence;
+    fn test_render_full_entry() {
+        let mut task = Task::new(0, "Analyze", "r");
+        task.complete("deploy X at 14:02");
+        let entry = task.render_full_entry().expect("complete task renders");
+        assert!(entry.contains("COMPLETED — Task 0 (Analyze):"));
+        assert!(entry.contains("deploy X at 14:02"));
+    }
 
+    #[test]
+    fn test_render_pointer_entry_with_summary_and_footer() {
+        use super::super::tools::submit_result::Confidence;
+        use crate::scratchpad::context_budget::TiktokenCounter;
+
+        let counter = TiktokenCounter::default_counter();
+        let mut task = Task::new(0, "Analyze", "r");
+        let footer = "[Full result (12345 chars) saved to artifact: task-0-result.txt]";
+        task.complete(format!("{}\n\n{}", "X".repeat(2000), footer));
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "Found 47 error groups".to_string(),
+            confidence: Confidence::High,
+        });
+
+        let entry = task
+            .render_pointer_entry(100, &counter)
+            .expect("complete task renders");
+        assert!(entry.contains("Found 47 error groups"));
+        assert!(entry.contains(footer));
+        assert!(
+            !entry.contains(&"X".repeat(100)),
+            "raw body should not appear"
+        );
+    }
+
+    #[test]
+    fn test_render_pointer_entry_with_summary_only() {
+        use super::super::tools::submit_result::Confidence;
+        use crate::scratchpad::context_budget::TiktokenCounter;
+
+        let counter = TiktokenCounter::default_counter();
         let mut task = Task::new(0, "Analyze", "r");
         task.complete("X".repeat(2000));
         task.structured_output = Some(StructuredTaskOutput {
@@ -1344,62 +1434,117 @@ mod tests {
             confidence: Confidence::High,
         });
 
-        let preview = task.compact_preview(500).expect("complete task previews");
-        assert_eq!(preview, "Found 47 error groups");
-    }
-
-    #[test]
-    fn test_compact_preview_preserves_artifact_footer() {
-        let mut task = Task::new(0, "Analyze", "r");
-        let footer = "[Full result (12345 chars) saved to artifact: task-0-result.txt]";
-        task.complete(format!("{}\n\n{}", "X".repeat(2000), footer));
-
-        let preview = task.compact_preview(500).expect("complete task previews");
-        assert!(
-            preview.ends_with(footer),
-            "footer must survive truncation: {preview}"
-        );
-        assert!(preview.starts_with('X'), "body precedes footer: {preview}");
-        assert!(
-            preview.len() <= 500,
-            "preview must stay within max_bytes, got {} bytes",
-            preview.len()
+        let entry = task
+            .render_pointer_entry(100, &counter)
+            .expect("complete task renders");
+        assert_eq!(
+            entry,
+            "COMPLETED — Task 0 (Analyze):\nFound 47 error groups"
         );
     }
 
     #[test]
-    fn test_compact_preview_empty_summary_falls_back_to_result() {
+    fn test_render_pointer_entry_empty_summary_falls_back_to_result() {
         use super::super::tools::submit_result::Confidence;
+        use crate::scratchpad::context_budget::TiktokenCounter;
 
+        let counter = TiktokenCounter::default_counter();
+        // Distinct words so the tokenizer cannot compress the runaway text.
+        let body = (0..300)
+            .map(|i| format!("token{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut task = Task::new(0, "Analyze", "r");
-        task.complete("X".repeat(2000));
+        task.complete(body.clone());
         task.structured_output = Some(StructuredTaskOutput {
             summary: String::new(),
             confidence: Confidence::High,
         });
 
-        let preview = task.compact_preview(500).expect("complete task previews");
-        assert_eq!(preview, "X".repeat(500), "empty summary must not win");
-    }
-
-    #[test]
-    fn test_compact_preview_truncates_plain_result() {
-        let mut task = Task::new(0, "Analyze", "r");
-        task.complete("X".repeat(2000));
-
-        let preview = task.compact_preview(500).expect("complete task previews");
-        assert_eq!(preview, "X".repeat(500));
-    }
-
-    #[test]
-    fn test_compact_preview_none_unless_complete() {
-        let mut task = Task::new(0, "Analyze", "r");
+        let entry = task
+            .render_pointer_entry(10, &counter)
+            .expect("complete task renders");
+        assert!(entry.starts_with("COMPLETED — Task 0 (Analyze):"));
         assert!(
-            task.compact_preview(500).is_none(),
-            "pending has no preview"
+            entry.len() < body.len(),
+            "empty summary must fall back to truncated result"
         );
+    }
+
+    #[test]
+    fn test_render_pointer_entry_with_footer_only() {
+        use crate::scratchpad::context_budget::TiktokenCounter;
+
+        let counter = TiktokenCounter::default_counter();
+        let mut task = Task::new(0, "Analyze", "r");
+        let footer = "[Full result (12345 chars) saved to artifact: task-0-result.txt]";
+        // Use distinct words so tiktoken cannot compress the runaway text.
+        let body = (0..300)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        task.complete(format!("{}\n\n{}", body, footer));
+
+        let entry = task
+            .render_pointer_entry(20, &counter)
+            .expect("complete task renders");
+        assert!(entry.contains(footer));
+        // Full body is far larger than the truncated entry.
+        assert!(entry.len() < body.len(), "entry should be truncated");
+    }
+
+    #[test]
+    fn test_render_pointer_entry_small_body_footer_not_duplicated() {
+        use crate::scratchpad::context_budget::TiktokenCounter;
+
+        let counter = TiktokenCounter::default_counter();
+        let mut task = Task::new(0, "Analyze", "r");
+        let footer = "[Full result (12345 chars) saved to artifact: task-0-result.txt]";
+        // Small body that fits entirely inside the preview budget.
+        let body = "Small result body.";
+        task.complete(format!("{}\n\n{}", body, footer));
+
+        let entry = task
+            .render_pointer_entry(50, &counter)
+            .expect("complete task renders");
+        assert!(entry.contains(footer));
+        assert!(entry.contains(body));
+        assert_eq!(
+            entry.matches(footer).count(),
+            1,
+            "footer must appear exactly once: {entry}"
+        );
+    }
+
+    #[test]
+    fn test_render_pointer_entry_fallback_truncate() {
+        use crate::scratchpad::context_budget::TiktokenCounter;
+
+        let counter = TiktokenCounter::default_counter();
+        let mut task = Task::new(0, "Analyze", "r");
+        // Distinct words to avoid tokenizer compression.
+        let body = (0..300)
+            .map(|i| format!("token{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        task.complete(body.clone());
+
+        let entry = task
+            .render_pointer_entry(10, &counter)
+            .expect("complete task renders");
+        assert!(entry.starts_with("COMPLETED — Task 0 (Analyze):"));
+        assert!(entry.len() < body.len(), "entry should be truncated");
+    }
+
+    #[test]
+    fn test_render_pointer_entry_none_unless_complete() {
+        use crate::scratchpad::context_budget::TiktokenCounter;
+
+        let counter = TiktokenCounter::default_counter();
+        let mut task = Task::new(0, "Analyze", "r");
+        assert!(task.render_pointer_entry(50, &counter).is_none());
         task.fail("boom", FailureCategory::AgentError);
-        assert!(task.compact_preview(500).is_none(), "failed has no preview");
+        assert!(task.render_pointer_entry(50, &counter).is_none());
     }
 
     #[test]
