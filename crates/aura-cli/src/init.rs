@@ -31,15 +31,49 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-/// Default provider order (also the no-keys-found display order).
-const PROVIDERS: &[&str] = &[
-    "openai",
-    "anthropic",
-    "bedrock",
-    "gemini",
-    "ollama",
-    "openrouter",
-];
+/// The LLM providers `init` supports. Variant order is the canonical display
+/// order (also the no-keys-found order). `clap::ValueEnum` parses and validates
+/// `--provider` and lists the choices in `--help`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum Provider {
+    OpenAI,
+    Anthropic,
+    Bedrock,
+    Gemini,
+    Ollama,
+    OpenRouter,
+}
+
+impl Provider {
+    /// All providers in canonical (display) order.
+    const ALL: &'static [Provider] = &[
+        Provider::OpenAI,
+        Provider::Anthropic,
+        Provider::Bedrock,
+        Provider::Gemini,
+        Provider::Ollama,
+        Provider::OpenRouter,
+    ];
+
+    /// Canonical lowercase id — matches the config's `provider` tag.
+    fn as_str(self) -> &'static str {
+        match self {
+            Provider::OpenAI => "openai",
+            Provider::Anthropic => "anthropic",
+            Provider::Bedrock => "bedrock",
+            Provider::Gemini => "gemini",
+            Provider::Ollama => "ollama",
+            Provider::OpenRouter => "openrouter",
+        }
+    }
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
@@ -49,18 +83,21 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Whether the provider's model-list endpoint authenticates with the API key,
 /// so a successful response actually verifies it. OpenRouter's `/models` is
 /// public and Ollama's `/api/tags` is local — neither checks a key.
-fn list_verifies_key(provider: &str) -> bool {
-    matches!(provider, "openai" | "anthropic" | "gemini")
+fn list_verifies_key(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::OpenAI | Provider::Anthropic | Provider::Gemini
+    )
 }
 
 /// Default API-key env var per provider (None = provider needs no key).
-fn default_key_env(provider: &str) -> Option<&'static str> {
+fn default_key_env(provider: Provider) -> Option<&'static str> {
     match provider {
-        "openai" => Some("OPENAI_API_KEY"),
-        "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "gemini" => Some("GEMINI_API_KEY"),
-        "openrouter" => Some("OPENROUTER_API_KEY"),
-        _ => None,
+        Provider::OpenAI => Some("OPENAI_API_KEY"),
+        Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
+        Provider::Gemini => Some("GEMINI_API_KEY"),
+        Provider::OpenRouter => Some("OPENROUTER_API_KEY"),
+        Provider::Bedrock | Provider::Ollama => None,
     }
 }
 
@@ -70,19 +107,19 @@ fn default_key_env(provider: &str) -> Option<&'static str> {
 /// the `gpt-5` root automatically — no release needed. A release is only
 /// warranted to bless a genuinely new family (a future `gpt-6`/`o5`). The
 /// concrete id shown per family is chosen by `rank_shortlist`.
-fn family_roots(provider: &str) -> &'static [&'static str] {
+fn family_roots(provider: Provider) -> &'static [&'static str] {
     match provider {
-        "openai" => &["gpt-5", "gpt-4.1", "gpt-4o", "o4", "o3", "o1", "gpt-4"],
-        "anthropic" => &["claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
-        "gemini" => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
-        "openrouter" => &[
+        Provider::OpenAI => &["gpt-5", "gpt-4.1", "gpt-4o", "o4", "o3", "o1", "gpt-4"],
+        Provider::Anthropic => &["claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
+        Provider::Gemini => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+        Provider::OpenRouter => &[
             "openai/gpt-5",
             "anthropic/claude-sonnet-4",
             "google/gemini-2.5-pro",
             "openai/gpt-4o",
         ],
-        "ollama" => &["qwen3", "llama3", "mistral"],
-        _ => &[],
+        // Ollama is shown uncurated (see rank_shortlist); bedrock has no list.
+        Provider::Ollama | Provider::Bedrock => &[],
     }
 }
 
@@ -111,8 +148,8 @@ pub struct InitArgs {
     pub output: PathBuf,
 
     /// LLM provider (openai, anthropic, bedrock, gemini, ollama, openrouter)
-    #[arg(long)]
-    pub provider: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
 
     /// Model name (verified against the provider's model list when possible)
     #[arg(long)]
@@ -168,7 +205,7 @@ pub trait ModelLister {
     /// reason (bad key, no network, …) — callers warn and continue.
     fn list(
         &self,
-        provider: &str,
+        provider: Provider,
         api_key: Option<&str>,
         base_url: Option<&str>,
     ) -> Result<ModelList, String>;
@@ -219,13 +256,13 @@ impl HttpModelLister {
 impl ModelLister for HttpModelLister {
     fn list(
         &self,
-        provider: &str,
+        provider: Provider,
         api_key: Option<&str>,
         base_url: Option<&str>,
     ) -> Result<ModelList, String> {
         let key = api_key.unwrap_or_default();
         let models = match provider {
-            "openai" => Self::extract(
+            Provider::OpenAI => Self::extract(
                 &Self::get_json(
                     Self::client()?
                         .get("https://api.openai.com/v1/models")
@@ -234,7 +271,7 @@ impl ModelLister for HttpModelLister {
                 "data",
                 "id",
             ),
-            "anthropic" => Self::extract(
+            Provider::Anthropic => Self::extract(
                 &Self::get_json(
                     Self::client()?
                         .get("https://api.anthropic.com/v1/models")
@@ -244,12 +281,12 @@ impl ModelLister for HttpModelLister {
                 "data",
                 "id",
             ),
-            "openrouter" => Self::extract(
+            Provider::OpenRouter => Self::extract(
                 &Self::get_json(Self::client()?.get("https://openrouter.ai/api/v1/models"))?,
                 "data",
                 "id",
             ),
-            "gemini" => Self::extract(
+            Provider::Gemini => Self::extract(
                 &Self::get_json(
                     Self::client()?
                         .get("https://generativelanguage.googleapis.com/v1beta/models")
@@ -261,7 +298,7 @@ impl ModelLister for HttpModelLister {
             .into_iter()
             .map(|name| name.trim_start_matches("models/").to_string())
             .collect(),
-            "ollama" => Self::extract(
+            Provider::Ollama => Self::extract(
                 &Self::get_json(Self::client()?.get(format!(
                     "{}/api/tags",
                     base_url.unwrap_or(DEFAULT_OLLAMA_URL).trim_end_matches('/')
@@ -270,8 +307,7 @@ impl ModelLister for HttpModelLister {
                 "name",
             ),
             // Bedrock needs the AWS SDK (ListFoundationModels); skipped in v1.
-            "bedrock" => return Ok(ModelList::Unsupported),
-            other => return Err(format!("unknown provider '{other}'")),
+            Provider::Bedrock => return Ok(ModelList::Unsupported),
         };
         if models.is_empty() {
             return Err("the provider returned an empty model list".to_string());
@@ -284,20 +320,25 @@ impl ModelLister for HttpModelLister {
 // Pure selection logic (unit-tested)
 // ============================================================================
 
-/// Providers whose conventional key env var is set, in PROVIDERS order.
+/// Providers whose conventional key env var is set, in canonical order.
 /// `is_set` is injected so tests don't touch the process environment.
-fn sensed_providers(is_set: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
-    PROVIDERS
+fn sensed_providers(is_set: &dyn Fn(&str) -> bool) -> Vec<Provider> {
+    Provider::ALL
         .iter()
         .copied()
-        .filter(|p| default_key_env(p).is_some_and(is_set))
+        .filter(|&p| default_key_env(p).is_some_and(is_set))
         .collect()
 }
 
 /// Provider display order: sensed providers first, then the rest.
-fn provider_display_order(sensed: &[&'static str]) -> Vec<&'static str> {
-    let mut order: Vec<&'static str> = sensed.to_vec();
-    order.extend(PROVIDERS.iter().copied().filter(|p| !sensed.contains(p)));
+fn provider_display_order(sensed: &[Provider]) -> Vec<Provider> {
+    let mut order: Vec<Provider> = sensed.to_vec();
+    order.extend(
+        Provider::ALL
+            .iter()
+            .copied()
+            .filter(|p| !sensed.contains(p)),
+    );
     order
 }
 
@@ -348,12 +389,12 @@ fn is_dated(id: &str) -> bool {
 /// broken by the shortest id (the base). Models matching no root are omitted
 /// from the shortlist but remain typeable. Falls back to the chat-filtered list
 /// (newest-first) when no root matches at all.
-fn rank_shortlist(provider: &str, models: &[String]) -> Vec<String> {
+fn rank_shortlist(provider: Provider, models: &[String]) -> Vec<String> {
     // Ollama's `/api/tags` returns whatever the user installed — non-canonical
     // names with quant suffixes and aliases — so family-root matching and the
     // chat-marker filter are both unreliable (many good local models are tagged
     // `*-instruct`). Show the installed list as-is and let the user choose.
-    if provider == "ollama" {
+    if provider == Provider::Ollama {
         return models.to_vec();
     }
     let chat = filter_chat_models(models);
@@ -599,7 +640,7 @@ enum ApiKeySource {
 /// Fully resolved inputs (after flags, sensing, verification, prompts).
 #[derive(Debug)]
 struct ConfigSpec {
-    provider: String,
+    provider: Provider,
     model: String,
     api_key: Option<ApiKeySource>,
     region: Option<String>,
@@ -624,7 +665,7 @@ fn toml_escape(s: &str) -> String {
 /// Render the `[agent.llm]` block. Values that come from the environment are
 /// referenced via `{{ env.<ACTUAL_VAR> }}` — no intermediate `LLM_*` rename.
 fn render_config(spec: &ConfigSpec) -> String {
-    let mut llm = format!("provider = \"{}\"\n", toml_escape(&spec.provider));
+    let mut llm = format!("provider = \"{}\"\n", spec.provider.as_str());
     if let Some(var) = spec.api_key_env_var() {
         llm.push_str(&format!("api_key = \"{{{{ env.{var} }}}}\"\n"));
     }
@@ -692,14 +733,14 @@ fn resolve_spec<R: BufRead>(
     key_is_set: &dyn Fn(&str) -> bool,
     key_value: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConfigSpec> {
-    // ---- provider ----
+    // ---- provider ---- (clap already validated --provider into a Provider)
     let sensed = sensed_providers(key_is_set);
-    let provider = match &args.provider {
-        Some(p) => p.trim().to_lowercase(),
+    let provider = match args.provider {
+        Some(p) => p,
         None => {
             let order = provider_display_order(&sensed);
             let default_index = if sensed.len() == 1 {
-                order.iter().position(|p| *p == sensed[0])
+                order.iter().position(|&p| p == sensed[0])
             } else {
                 None
             };
@@ -716,25 +757,19 @@ fn resolve_spec<R: BufRead>(
                 println!();
             }
             match prompter.ask_choice("Provider", order.len(), default_index)? {
-                Some(i) => order[i].to_string(),
+                Some(i) => order[i],
                 None => bail!("--provider is required in non-interactive mode"),
             }
         }
     };
-    if !PROVIDERS.contains(&provider.as_str()) {
-        bail!(
-            "unknown provider '{provider}' (expected one of: {})",
-            PROVIDERS.join(", ")
-        );
-    }
 
     // ---- provider-specific connection details ----
     let api_key_env_var = args
         .api_key_env
         .clone()
-        .or_else(|| default_key_env(&provider).map(String::from));
+        .or_else(|| default_key_env(provider).map(String::from));
 
-    let region = if provider == "bedrock" {
+    let region = if provider == Provider::Bedrock {
         Some(match &args.region {
             Some(r) => r.clone(),
             None => prompter.require("AWS region (e.g. us-east-1)", "--region")?,
@@ -742,7 +777,7 @@ fn resolve_spec<R: BufRead>(
     } else {
         None
     };
-    let base_url = if provider == "ollama" {
+    let base_url = if provider == Provider::Ollama {
         Some(match &args.base_url {
             Some(u) => u.clone(),
             None => prompter
@@ -806,9 +841,9 @@ fn resolve_spec<R: BufRead>(
     let live_models: Option<Vec<String>> = if args.offline {
         None
     } else {
-        match lister.list(&provider, verify_key, base_url.as_deref()) {
+        match lister.list(provider, verify_key, base_url.as_deref()) {
             Ok(ModelList::Verified(models)) => {
-                if list_verifies_key(&provider) {
+                if list_verifies_key(provider) {
                     println!(
                         "Verified: {provider} answered with {} model(s).",
                         models.len()
@@ -852,13 +887,13 @@ fn resolve_spec<R: BufRead>(
         }
         None => {
             let shortlist = match &live_models {
-                Some(models) => rank_shortlist(&provider, models),
+                Some(models) => rank_shortlist(provider, models),
                 None => Vec::new(),
             };
             if prompter.interactive && !shortlist.is_empty() {
                 // Ollama's list is the user's installed models, not a curated
                 // recommendation, so don't mark a "suggested" pick for it.
-                let is_ollama = provider == "ollama";
+                let is_ollama = provider == Provider::Ollama;
                 println!("\nAvailable models (enter a number, or type any model id):\n");
                 for (i, m) in shortlist.iter().enumerate() {
                     let marker = if i == 0 && !is_ollama {
@@ -1043,7 +1078,7 @@ mod tests {
     fn args() -> InitArgs {
         InitArgs {
             output: PathBuf::from("config.toml"),
-            provider: Some("openai".to_string()),
+            provider: Some(Provider::OpenAI),
             model: Some("gpt-5.1".to_string()),
             api_key_env: None,
             region: None,
@@ -1074,14 +1109,14 @@ mod tests {
 
     struct FailingLister;
     impl ModelLister for FailingLister {
-        fn list(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ModelList, String> {
+        fn list(&self, _: Provider, _: Option<&str>, _: Option<&str>) -> Result<ModelList, String> {
             Err("connection refused".to_string())
         }
     }
 
     struct FixedLister(Vec<&'static str>);
     impl ModelLister for FixedLister {
-        fn list(&self, _: &str, _: Option<&str>, _: Option<&str>) -> Result<ModelList, String> {
+        fn list(&self, _: Provider, _: Option<&str>, _: Option<&str>) -> Result<ModelList, String> {
             Ok(ModelList::Verified(
                 self.0.iter().map(|s| s.to_string()).collect(),
             ))
@@ -1095,7 +1130,7 @@ mod tests {
     impl ModelLister for RecordingLister {
         fn list(
             &self,
-            _: &str,
+            _: Provider,
             api_key: Option<&str>,
             _: Option<&str>,
         ) -> Result<ModelList, String> {
@@ -1132,16 +1167,16 @@ mod tests {
     fn sensing_orders_found_providers_first() {
         let only_gemini = |var: &str| var == "GEMINI_API_KEY";
         let sensed = sensed_providers(&only_gemini);
-        assert_eq!(sensed, vec!["gemini"]);
+        assert_eq!(sensed, vec![Provider::Gemini]);
         assert_eq!(
             provider_display_order(&sensed),
             vec![
-                "gemini",
-                "openai",
-                "anthropic",
-                "bedrock",
-                "ollama",
-                "openrouter"
+                Provider::Gemini,
+                Provider::OpenAI,
+                Provider::Anthropic,
+                Provider::Bedrock,
+                Provider::Ollama,
+                Provider::OpenRouter,
             ]
         );
     }
@@ -1150,13 +1185,16 @@ mod tests {
     fn sensing_none_keeps_default_order() {
         let sensed = sensed_providers(&no_keys);
         assert!(sensed.is_empty());
-        assert_eq!(provider_display_order(&sensed), PROVIDERS);
+        assert_eq!(provider_display_order(&sensed), Provider::ALL.to_vec());
     }
 
     #[test]
     fn sensing_multiple_keys_preserves_provider_order() {
         let two = |var: &str| var == "OPENROUTER_API_KEY" || var == "ANTHROPIC_API_KEY";
-        assert_eq!(sensed_providers(&two), vec!["anthropic", "openrouter"]);
+        assert_eq!(
+            sensed_providers(&two),
+            vec![Provider::Anthropic, Provider::OpenRouter]
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1227,7 +1265,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
 
-        let shortlist = rank_shortlist("openai", &models);
+        let shortlist = rank_shortlist(Provider::OpenAI, &models);
 
         assert_eq!(
             shortlist,
@@ -1257,7 +1295,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(rank_shortlist("ollama", &models), models);
+        assert_eq!(rank_shortlist(Provider::Ollama, &models), models);
     }
 
     #[test]
@@ -1270,7 +1308,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let shortlist = rank_shortlist("anthropic", &models);
+        let shortlist = rank_shortlist(Provider::Anthropic, &models);
         assert_eq!(
             shortlist,
             vec![
@@ -1283,7 +1321,7 @@ mod tests {
     #[test]
     fn rank_shortlist_falls_back_when_no_family_matches() {
         let models = vec!["weird-model".to_string(), "another-thing".to_string()];
-        let shortlist = rank_shortlist("openai", &models);
+        let shortlist = rank_shortlist(Provider::OpenAI, &models);
         assert!(shortlist.contains(&"weird-model".to_string()));
         assert!(shortlist.contains(&"another-thing".to_string()));
     }
@@ -1375,7 +1413,7 @@ mod tests {
     #[test]
     fn bedrock_gets_region_and_no_key() {
         let mut a = args();
-        a.provider = Some("bedrock".to_string());
+        a.provider = Some(Provider::Bedrock);
         a.region = Some("us-east-1".to_string());
         let spec = resolve(&a).unwrap();
         let rendered = render_config(&spec);
@@ -1386,7 +1424,7 @@ mod tests {
     #[test]
     fn ollama_gets_base_url_and_no_key() {
         let mut a = args();
-        a.provider = Some("ollama".to_string());
+        a.provider = Some(Provider::Ollama);
         let spec = resolve(&a).unwrap();
         let rendered = render_config(&spec);
         assert!(rendered.contains(&format!("base_url = \"{DEFAULT_OLLAMA_URL}\"")));
@@ -1525,7 +1563,7 @@ mod tests {
     #[test]
     fn ollama_has_no_api_key() {
         let mut a = args();
-        a.provider = Some("ollama".to_string());
+        a.provider = Some(Provider::Ollama);
         let spec = resolve_spec(
             &a,
             &mut non_interactive(),
@@ -1540,7 +1578,7 @@ mod tests {
     #[test]
     fn bedrock_has_no_api_key() {
         let mut a = args();
-        a.provider = Some("bedrock".to_string());
+        a.provider = Some(Provider::Bedrock);
         a.region = Some("us-east-1".to_string());
         let spec = resolve_spec(
             &a,
@@ -1651,7 +1689,7 @@ mod tests {
             &detected,
         )
         .unwrap();
-        assert_eq!(spec.provider, "openai");
+        assert_eq!(spec.provider, Provider::OpenAI);
         assert_eq!(spec.model, "gpt-5.1");
         assert_eq!(
             spec.api_key,
@@ -1673,7 +1711,7 @@ mod tests {
             &no_values,
         )
         .unwrap();
-        assert_eq!(spec.provider, "gemini");
+        assert_eq!(spec.provider, Provider::Gemini);
     }
 
     // ------------------------------------------------------------------
@@ -1719,7 +1757,7 @@ mod tests {
             &no_values,
         )
         .unwrap();
-        assert_eq!(spec.provider, "anthropic");
+        assert_eq!(spec.provider, Provider::Anthropic);
     }
 
     #[test]
@@ -1736,7 +1774,7 @@ mod tests {
             &no_values,
         )
         .unwrap();
-        assert_eq!(spec.provider, "openai");
+        assert_eq!(spec.provider, Provider::OpenAI);
     }
 
     #[test]
@@ -1752,7 +1790,7 @@ mod tests {
             &no_values,
         )
         .unwrap();
-        assert_eq!(spec.provider, "anthropic");
+        assert_eq!(spec.provider, Provider::Anthropic);
     }
 
     #[test]
@@ -1771,13 +1809,8 @@ mod tests {
         assert!(err.contains("--provider"), "got: {err}");
     }
 
-    #[test]
-    fn unknown_provider_rejected() {
-        let mut a = args();
-        a.provider = Some("closedai".to_string());
-        let err = resolve(&a).unwrap_err().to_string();
-        assert!(err.contains("unknown provider"), "got: {err}");
-    }
+    // (Invalid `--provider` values are now rejected by clap's ValueEnum at
+    // parse time, so there's nothing for resolve_spec to validate.)
 
     #[test]
     fn lister_failure_warns_and_continues() {
