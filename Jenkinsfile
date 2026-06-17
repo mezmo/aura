@@ -239,13 +239,18 @@ pipeline {
 
               steps {
                 script {
+                  def releaseCmd = 'npm run release:dry'
+                  if (env.CHANGE_FORK) {
+                    sh "git checkout -B ${CURRENT_BRANCH}"
+                    releaseCmd = "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/release-notes-generator"
+                  }
                   docker.withRegistry(
                       'https://index.docker.io/v1/',
                       'dockerhub-token-mezmo'
                   ) {
                     withCredentials(RELEASE_CREDENTIALS) {
                       buildx {
-                        withReport('Release Test', 'npm run release:dry')
+                        withReport('Release Test', releaseCmd)
                       }
                     }
                   }
