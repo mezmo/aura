@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.24.0](https://github.com/mezmo/aura/compare/v1.23.0...v1.24.0) (2026-06-17)
+
+
+### Features
+
+* **a2a**: add header to request model [a036c19](https://github.com/mezmo/aura/commit/a036c19536187eea64f4c0840f9ba0d2207e912c) - Dominic McAllister [#253](https://github.com/mezmo/aura/issues/253)
+
 # [1.23.0](https://github.com/mezmo/aura/compare/v1.22.3...v1.23.0) (2026-06-12)
 
 
