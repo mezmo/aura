@@ -169,6 +169,8 @@ All commands can be executed while the model is streaming. Run `/help` at any ti
 
 If you type an unrecognized or partial command, the CLI reports `Unknown command` and points you to `/help` instead of sending the text to the model. As you type, the prompt suggests matching commands. Press `Tab` to complete an abbreviation to its full command name before you submit.
 
+You don't need the leading slash for the REPL to recognize a command word. Type a bare command name such as `exit`, `quit`, `clear`, `help`, or `model`, and the CLI prints a one-line hint pointing to the matching slash command rather than sending the word to the model as a billable chat message. A few abbreviations and editor shortcuts work the same way. `q`, `:q`, `:wq`, and `:x` suggest `/quit`; `bye` and `logout` suggest `/exit`; and `?` suggests `/help`. Recognition is case-insensitive and applies only to single-word input, so ordinary chat such as "how do I quit vim" is never intercepted.
+
 ## Keyboard Shortcuts
 
 | Key | Action |
