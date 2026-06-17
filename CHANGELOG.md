@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.24.1](https://github.com/mezmo/aura/compare/v1.24.0...v1.24.1) (2026-06-17)
+
+
+### Bug Fixes
+
+* **ci**: create local branch ref for fork PR release dry-run [aab616c](https://github.com/mezmo/aura/commit/aab616cffe61f0045398395874ac44991013f431) - Tony Rogers
+
 # [1.24.0](https://github.com/mezmo/aura/compare/v1.23.0...v1.24.0) (2026-06-17)
 
 
