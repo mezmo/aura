@@ -45,7 +45,7 @@ pub mod vector_dynamic;
 pub mod vector_store;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
-pub use config::{AgentRuntimeConfig, ToolContextFactory};
+pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
@@ -59,8 +59,8 @@ pub use orchestration::tools::{
 };
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorEvent, OrchestratorFactory, Plan, PlanningResponse, RoutingMode, Task, TaskJson,
-    TaskState, TaskStatus, TimeoutsConfig,
+    OrchestratorEvent, OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task,
+    TaskIdentity, TaskJson, TaskState, TaskStatus, TimeoutsConfig,
 };
 pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{
