@@ -1,5 +1,16 @@
 ## Changelog
 
+## [1.24.2](https://github.com/mezmo/aura/compare/v1.24.1...v1.24.2) (2026-06-17)
+
+
+### Code Refactoring
+
+* consolidate slash-command handling into one registry [3178e8d](https://github.com/mezmo/aura/commit/3178e8d5937a5c2ef7a40fe5ec1e87f36c6c9cec) - Jacob Hull [#177](https://github.com/mezmo/aura/issues/177)
+
+### Documentation
+
+* **adr**: record hitl approval architecture decision [ec21337](https://github.com/mezmo/aura/commit/ec21337c85fec7117be0f79bb99f2dbc34c35382) - Mike Shearer [#191](https://github.com/mezmo/aura/issues/191)* **design**: add hitl implementation note [4c86ef4](https://github.com/mezmo/aura/commit/4c86ef4a9d1501116c53ed781f75516640b0581f) - Mike Shearer [#191](https://github.com/mezmo/aura/issues/191)
+
 ## [1.24.1](https://github.com/mezmo/aura/compare/v1.24.0...v1.24.1) (2026-06-17)
 
 
