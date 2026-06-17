@@ -19,6 +19,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Provider-aware token counter.
 pub trait TokenCounter: Send + Sync {
     fn count_tokens(&self, text: &str) -> usize;
+
+    /// Truncate `text` to at most `max_tokens` tokens.
+    ///
+    /// Default implementation is conservative: it assumes ~4 bytes per token
+    /// and byte-truncates with `safe_truncate`. Implementations that have
+    /// access to a real tokenizer should override this for accurate boundaries.
+    fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> String {
+        if max_tokens == 0 {
+            return String::new();
+        }
+        if self.count_tokens(text) <= max_tokens {
+            return text.to_string();
+        }
+        let approx_bytes = max_tokens.saturating_mul(4).min(text.len());
+        crate::string_utils::safe_truncate(text, approx_bytes)
+            .0
+            .to_string()
+    }
 }
 
 impl std::fmt::Debug for dyn TokenCounter {
@@ -85,6 +103,35 @@ fn bpe_singleton_for_model(model: &str) -> &'static tiktoken_rs::CoreBPE {
 impl TokenCounter for TiktokenCounter {
     fn count_tokens(&self, text: &str) -> usize {
         self.bpe.encode_with_special_tokens(text).len()
+    }
+
+    fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> String {
+        if max_tokens == 0 {
+            return String::new();
+        }
+        let tokens = self.bpe.encode_with_special_tokens(text);
+        if tokens.len() <= max_tokens {
+            return text.to_string();
+        }
+        // Decoding a token prefix can produce a string whose re-encoded token
+        // count is larger than the prefix when the cut falls inside a multi-
+        // token character. Walk backward until the decoded string fits the
+        // budget, falling back to byte-safe truncation if decode fails.
+        let mut n = max_tokens;
+        while n > 0 {
+            let truncated = &tokens[..n];
+            let decoded = self.bpe.decode(truncated.to_vec()).unwrap_or_else(|_| {
+                let approx_bytes = n.saturating_mul(4).min(text.len());
+                crate::string_utils::safe_truncate(text, approx_bytes)
+                    .0
+                    .to_string()
+            });
+            if self.count_tokens(&decoded) <= n {
+                return decoded;
+            }
+            n -= 1;
+        }
+        String::new()
     }
 }
 
@@ -323,12 +370,19 @@ impl std::fmt::Display for ExtractionLimitExceeded {
 mod tests {
     use super::*;
 
-    /// Simple test counter that returns chars / 4 (for predictable test behavior).
+    /// Simple test counter that returns bytes / 4 (for predictable test behavior).
     struct TestCounter;
 
     impl TokenCounter for TestCounter {
         fn count_tokens(&self, text: &str) -> usize {
             text.len() / 4
+        }
+
+        fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> String {
+            let approx_bytes = max_tokens.saturating_mul(4).min(text.len());
+            crate::string_utils::safe_truncate(text, approx_bytes)
+                .0
+                .to_string()
         }
     }
 
@@ -414,6 +468,83 @@ mod tests {
         assert_eq!(budget.count_tokens("abcd"), 1);
         assert_eq!(budget.count_tokens("abcdefgh"), 2);
         assert_eq!(budget.count_tokens(""), 0);
+    }
+
+    #[test]
+    fn test_truncate_to_tokens_test_counter() {
+        let counter = TestCounter;
+        // 12 chars = 3 tokens; truncate to 2 tokens -> 8 chars
+        assert_eq!(counter.truncate_to_tokens("abcdefghjklm", 2), "abcdefgh");
+        // Truncate to more tokens than present returns full text
+        assert_eq!(counter.truncate_to_tokens("abcd", 10), "abcd");
+        // Zero tokens returns empty
+        assert_eq!(counter.truncate_to_tokens("abcd", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_to_tokens_tiktoken() {
+        let counter = TiktokenCounter::default_counter();
+        let text = "Hello, world! This is a longer sentence for truncation.";
+        let full_tokens = counter.count_tokens(text);
+        assert!(full_tokens > 5);
+
+        let truncated = counter.truncate_to_tokens(text, 3);
+        assert!(counter.count_tokens(&truncated) <= 3);
+        assert!(text.starts_with(&truncated));
+
+        // Truncate to more tokens than present returns full text
+        assert_eq!(counter.truncate_to_tokens(text, full_tokens + 10), text);
+    }
+
+    #[test]
+    fn test_truncate_to_tokens_tiktoken_emoji() {
+        let counter = TiktokenCounter::default_counter();
+        // Mix of ASCII and 4-byte emoji. BPE decoding a token prefix must never
+        // produce invalid UTF-8 or split a glyph, and the returned string must
+        // re-encode to at most the requested token budget.
+        let text = "Hello 🎉 world 🚀 test 🌟";
+        let full_tokens = counter.count_tokens(text);
+        assert!(full_tokens > 3);
+
+        for n in [1, 2, full_tokens - 1] {
+            let truncated = counter.truncate_to_tokens(text, n);
+            assert!(
+                truncated.is_char_boundary(truncated.len()),
+                "truncation must end at a char boundary for n={n}: {truncated:?}"
+            );
+            assert!(
+                text.starts_with(&truncated),
+                "truncation must be a prefix for n={n}"
+            );
+            assert!(
+                counter.count_tokens(&truncated) <= n,
+                "truncated token count must not exceed budget for n={n}"
+            );
+        }
+
+        assert_eq!(counter.truncate_to_tokens(text, full_tokens + 10), text);
+    }
+
+    #[test]
+    fn test_truncate_to_tokens_default_impl_emoji() {
+        // A counter without its own truncate_to_tokens uses the trait default,
+        // which falls back to safe_truncate with an approximate byte budget.
+        struct ByteCounter;
+        impl TokenCounter for ByteCounter {
+            fn count_tokens(&self, text: &str) -> usize {
+                text.len() / 4
+            }
+        }
+
+        let counter = ByteCounter;
+        // Four 4-byte emoji = 16 bytes = 4 tokens for ByteCounter.
+        let text = "🎉🚀🌟🎊";
+        assert_eq!(counter.count_tokens(text), 4);
+
+        // Truncating to 2 tokens should keep exactly two emoji.
+        let truncated = counter.truncate_to_tokens(text, 2);
+        assert_eq!(truncated, "🎉🚀");
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 
     #[test]

@@ -201,8 +201,8 @@ max_tools_per_worker = 10
 memory_dir = "/tmp/aura-orchestration"
 result_artifact_threshold = 4000
 result_summary_length = 2000
-# Byte budget for transitive dependency context injected into worker prompts.
-dependency_context_budget = 32000
+# Token budget for transitive dependency context injected into worker prompts.
+dependency_context_budget = 8000
 
 # [orchestration.worker.example]
 # description = "Example specialist worker"

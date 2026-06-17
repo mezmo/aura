@@ -2495,7 +2495,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .map(|t| ReadyTask {
                     id: t.id,
                     description: t.description.clone(),
-                    context: self.build_task_context(plan, t.id),
+                    context: self.build_task_context(plan, t.id, t.worker.as_deref()),
                     worker: t.worker.clone(),
                 })
                 .collect();
@@ -2707,12 +2707,38 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Delegates to [`build_dependency_context`] using the configured byte budget.
+    /// Build a token counter for the task's effective LLM.
+    ///
+    /// Respects per-worker LLM overrides, falling back to `[agent.llm]`.
+    fn token_counter_for_task(
+        &self,
+        worker_name: Option<&str>,
+    ) -> Arc<dyn scratchpad::TokenCounter> {
+        let effective_llm = worker_name
+            .and_then(|name| self.config.workers.get(name))
+            .and_then(|w| w.llm.as_ref())
+            .unwrap_or(&self.agent_config.llm);
+        let (provider, model) = effective_llm.model_info();
+        scratchpad::token_counter_for_provider(provider, model)
+    }
+
+    /// Delegates to [`build_dependency_context`] using the configured token budget.
     ///
     /// See that function for rendering semantics (transitive ancestor closure,
-    /// nearest-first budget degradation, and artifact footer preservation).
-    fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
-        build_dependency_context(plan, task_id, self.config.dependency_context_budget())
+    /// budget-aware full-vs-pointer selection, and artifact footer preservation).
+    fn build_task_context(
+        &self,
+        plan: &Plan,
+        task_id: usize,
+        worker_name: Option<&str>,
+    ) -> Option<String> {
+        let counter = self.token_counter_for_task(worker_name);
+        build_dependency_context(
+            plan,
+            task_id,
+            self.config.dependency_context_budget(),
+            &*counter,
+        )
     }
 
     /// Execute a single task using a worker agent.
@@ -4169,70 +4195,73 @@ fn plan_dag(plan: &Plan) -> Vec<super::events::TaskDagNode> {
 /// the task instructions that follow the context block in the worker prompt.
 /// Returns `None` when no completed ancestor exists.
 ///
-/// `budget` caps the total bytes of injected results. Direct dependencies
-/// always render their full stored result (already bounded by the artifact
-/// threshold). Transitive ancestors render in full, nearest first, until the
-/// budget is reached; all farther ancestors then degrade to a compact
-/// preview (`Task::compact_preview`) that keeps the task header and any
-/// artifact pointer so the worker can still cite lineage.
+/// `budget_tokens` caps the total tokens of inlined full results. Results
+/// with an artifact footer are always rendered as a compact pointer
+/// (`Task::render_pointer_entry`): structured-output summary + artifact
+/// path, so the worker can load the full result on demand. Results without
+/// an artifact footer are inlined in full while they fit the budget; once
+/// the budget is exhausted, remaining ancestors (direct or transitive)
+/// render as compact pointers.
+///
+/// This mirrors the continuation-prompt policy proven in the SRE E2E suite:
+/// never raw-truncate a result that has an artifact pointer; always give
+/// the downstream agent a path to load the full data.
 ///
 /// See mezmo/aura#221 for the missing-context failure mode this addresses.
-fn build_dependency_context(plan: &Plan, task_id: usize, budget: usize) -> Option<String> {
-    use std::borrow::Cow;
-    use std::collections::HashSet;
+fn build_dependency_context(
+    plan: &Plan,
+    task_id: usize,
+    budget_tokens: usize,
+    counter: &dyn scratchpad::TokenCounter,
+) -> Option<String> {
+    use super::prompt_constants::context;
 
-    use super::prompt_constants::{context, sections};
+    /// Token cap for fallback raw-text previews. Results with structured
+    /// output or an artifact footer rarely hit this path.
+    const DEGRADED_PREVIEW_TOKENS: usize = 125;
 
-    /// Byte cap for each over-budget ancestor entry. Matches the existing
-    /// 500-byte tool-output tier in the artifact system.
-    const DEGRADED_PREVIEW_BYTES: usize = 500;
-
-    let direct: HashSet<usize> = plan
-        .get_task(task_id)
-        .map(|t| t.dependencies.iter().copied().collect())
-        .unwrap_or_default();
-
-    // Nearest-first BFS order decides who keeps full results once the budget
-    // runs out; render order below stays ascending-ID regardless.
+    // BFS order: direct dependencies first, then nearest transitive ancestors.
+    // We decide full-vs-pointer in this order, but render in ascending ID
+    // order so the worker reads oldest work first.
     let bfs_ancestors = plan.transitive_ancestors(task_id);
     let mut spent = 0usize;
-    let mut over_budget = false;
-    let mut degraded: HashSet<usize> = HashSet::new();
+    let mut rendered = Vec::new();
+
     for id in &bfs_ancestors {
-        let Some(result) = plan.get_task(*id).and_then(|t| t.state.completed_result()) else {
+        let Some(ancestor) = plan.get_task(*id) else {
             continue;
         };
-        if direct.contains(id) {
-            spent += result.len();
-        } else if over_budget || spent + result.len() > budget {
-            over_budget = true;
-            degraded.insert(*id);
+        let Some(result) = ancestor.state.completed_result() else {
+            continue;
+        };
+
+        // Artifact results are always pointers: summary + artifact path.
+        // Non-artifact results are inlined full while they fit the budget;
+        // otherwise they fall back to a compact pointer entry.
+        let has_artifact = ancestor.has_artifact_footer();
+        let full_tokens = counter.count_tokens(result);
+        let use_full = !has_artifact && spent + full_tokens <= budget_tokens;
+
+        let entry = if use_full {
+            spent += full_tokens;
+            ancestor.render_full_entry()
         } else {
-            spent += result.len();
+            ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter)
+        };
+
+        if let Some(entry) = entry {
+            rendered.push((ancestor.id, entry));
         }
     }
 
-    let mut ancestors = bfs_ancestors;
-    ancestors.sort_unstable();
+    if rendered.is_empty() {
+        return None;
+    }
 
-    ancestors
+    rendered.sort_unstable_by_key(|(id, _)| *id);
+    rendered
         .into_iter()
-        .filter_map(|ancestor_id| {
-            let ancestor = plan.get_task(ancestor_id)?;
-            let result = ancestor.state.completed_result()?;
-            let body: Cow<'_, str> = if degraded.contains(&ancestor_id) {
-                Cow::Owned(ancestor.compact_preview(DEGRADED_PREVIEW_BYTES)?)
-            } else {
-                Cow::Borrowed(result)
-            };
-            Some(format!(
-                "{} — Task {} ({}):\n{}",
-                sections::PRIOR_WORK,
-                ancestor.id,
-                ancestor.description,
-                body
-            ))
-        })
+        .map(|(_, entry)| entry)
         .reduce(|acc, part| acc + context::DEPENDENCY_SEPARATOR + &part)
 }
 
@@ -4241,6 +4270,26 @@ mod tests {
     use super::*;
 
     use crate::orchestration::types::Task;
+    use crate::scratchpad::TokenCounter;
+
+    /// Test counter that counts one token per character and truncates by char
+    /// count. Makes budget assertions deterministic without depending on
+    /// tiktoken's compression of repeated characters.
+    struct OneTokenPerChar;
+
+    impl TokenCounter for OneTokenPerChar {
+        fn count_tokens(&self, text: &str) -> usize {
+            text.chars().count()
+        }
+
+        fn truncate_to_tokens(&self, text: &str, max_tokens: usize) -> String {
+            text.chars().take(max_tokens).collect()
+        }
+    }
+
+    fn test_counter() -> OneTokenPerChar {
+        OneTokenPerChar
+    }
 
     fn three_task_chain() -> Plan {
         // 0 -> 1 -> 2
@@ -4257,7 +4306,8 @@ mod tests {
         plan.get_task_mut(0).unwrap().complete("deploy X at 14:02");
         plan.get_task_mut(1).unwrap().complete("errors start 14:03");
 
-        let ctx = build_dependency_context(&plan, 2, 32_000).expect("context for task 2");
+        let ctx =
+            build_dependency_context(&plan, 2, 8_000, &test_counter()).expect("context for task 2");
         assert!(
             ctx.contains("deploy X at 14:02"),
             "T2 context must include T0's (transitive) result: {ctx}"
@@ -4284,7 +4334,8 @@ mod tests {
         plan.get_task_mut(1).unwrap().complete("left result");
         plan.get_task_mut(2).unwrap().complete("right result");
 
-        let ctx = build_dependency_context(&plan, 3, 32_000).expect("context for task 3");
+        let ctx =
+            build_dependency_context(&plan, 3, 8_000, &test_counter()).expect("context for task 3");
         assert_eq!(
             ctx.matches("root result").count(),
             1,
@@ -4301,7 +4352,8 @@ mod tests {
             .fail("boom", FailureCategory::AgentError);
         plan.get_task_mut(1).unwrap().complete("partial result");
 
-        let ctx = build_dependency_context(&plan, 2, 32_000).expect("context for task 2");
+        let ctx =
+            build_dependency_context(&plan, 2, 8_000, &test_counter()).expect("context for task 2");
         assert!(ctx.contains("partial result"));
         assert!(!ctx.contains("boom"), "failed ancestor must be omitted");
         assert!(!ctx.contains("Task 0"));
@@ -4311,14 +4363,15 @@ mod tests {
     fn test_dependency_context_none_when_no_completed_ancestors() {
         // Pending ancestors only -> None; no dependencies at all -> None
         let plan = three_task_chain();
-        assert!(build_dependency_context(&plan, 2, 32_000).is_none());
-        assert!(build_dependency_context(&plan, 0, 32_000).is_none());
+        assert!(build_dependency_context(&plan, 2, 8_000, &test_counter()).is_none());
+        assert!(build_dependency_context(&plan, 0, 8_000, &test_counter()).is_none());
     }
 
     #[test]
     fn test_dependency_context_respects_budget() {
-        // Chain 0 -> 1 -> 2 -> 3 with 1KB results and a budget that fits the
-        // direct dep (2) plus one transitive ancestor: 0 must degrade.
+        // Chain 0 -> 1 -> 2 -> 3 with 1000-token results and a budget that
+        // fits the direct dep (2) plus one transitive ancestor: 0 renders as
+        // a compact pointer.
         let mut plan = Plan::new("Test");
         plan.add_task(Task::new(0, "Fetch", "r"));
         plan.add_task(Task::new(1, "Correlate", "r").with_dependency(0));
@@ -4328,7 +4381,8 @@ mod tests {
         plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
         plan.get_task_mut(2).unwrap().complete("C".repeat(1000));
 
-        let ctx = build_dependency_context(&plan, 3, 2000).expect("context for task 3");
+        let ctx =
+            build_dependency_context(&plan, 3, 2_500, &test_counter()).expect("context for task 3");
         assert!(
             ctx.contains(&"C".repeat(1000)),
             "direct dep keeps full result"
@@ -4339,33 +4393,66 @@ mod tests {
         );
         assert!(
             !ctx.contains(&"A".repeat(1000)),
-            "farthest ancestor degrades once budget is spent"
+            "farthest ancestor switches to pointer once budget is spent"
         );
         assert!(
             ctx.contains("Task 0 (Fetch)"),
-            "degraded ancestor keeps its lineage header: {ctx}"
+            "pointer ancestor keeps its lineage header: {ctx}"
         );
         assert!(
-            ctx.contains(&"A".repeat(500)),
-            "degraded ancestor keeps a 500-byte preview"
+            ctx.contains(&"A".repeat(125)),
+            "pointer ancestor keeps a 125-token preview"
         );
     }
 
     #[test]
-    fn test_dependency_context_direct_deps_never_degrade() {
-        // Direct dep result alone exceeds the budget; it still renders fully.
+    fn test_dependency_context_artifact_results_use_pointer() {
+        // A result with an artifact footer is always rendered as a pointer,
+        // even when the budget would allow the full text.
+        let mut plan = three_task_chain();
+        let footer = "[Full result (12345 chars) saved to artifact: task-0-result.txt]";
+        plan.get_task_mut(0)
+            .unwrap()
+            .complete(format!("{}\n\n{}", "A".repeat(1000), footer));
+        plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
+
+        let ctx =
+            build_dependency_context(&plan, 2, 8_000, &test_counter()).expect("context for task 2");
+        assert!(
+            ctx.contains(&"B".repeat(1000)),
+            "direct non-artifact dep keeps full result"
+        );
+        assert!(
+            ctx.contains(footer),
+            "artifact result renders its footer pointer"
+        );
+        assert!(
+            !ctx.contains(&"A".repeat(1000)),
+            "artifact result body is not inlined"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_over_budget_renders_pointer() {
+        // Once the budget is exhausted, both direct and transitive deps render
+        // as compact pointers — no raw truncation, and lineage is preserved.
         let mut plan = three_task_chain();
         plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
         plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
 
-        let ctx = build_dependency_context(&plan, 2, 100).expect("context for task 2");
+        let ctx =
+            build_dependency_context(&plan, 2, 100, &test_counter()).expect("context for task 2");
         assert!(
-            ctx.contains(&"B".repeat(1000)),
-            "direct dependency is budget-exempt"
+            !ctx.contains(&"B".repeat(1000)),
+            "direct dependency over budget must switch to pointer"
+        );
+        assert!(
+            ctx.contains("Task 1 (Correlate logs)"),
+            "pointer keeps the task header: {ctx}"
         );
         assert!(
             !ctx.contains(&"A".repeat(1000)),
-            "transitive ancestor degrades under a tiny budget"
+            "transitive ancestor switches to pointer under a tiny budget"
         );
     }
 

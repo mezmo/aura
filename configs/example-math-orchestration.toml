@@ -73,7 +73,7 @@ tools_in_planning = "summary"
 [orchestration.artifacts]
 result_artifact_threshold = 4000
 result_summary_length = 2000
-dependency_context_budget = 32000
+dependency_context_budget = 8000
 
 # Worker: arithmetic
 # Uses mock_tool as a stand-in for computation. The LLM formats the

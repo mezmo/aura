@@ -173,11 +173,13 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_result_summary_length")]
     pub result_summary_length: usize,
 
-    /// Total byte budget for dependency context injected into a worker prompt.
-    /// Direct dependencies always render in full; transitive ancestors render
-    /// in full until this budget is reached, then degrade to compact previews.
-    /// Default: 32000 (8x result_artifact_threshold, sized to the same
-    /// continuation-prompt envelope that fits all 200K-window models).
+    /// Total token budget for dependency context injected into a worker prompt.
+    /// Results without an artifact footer are inlined in full while they fit
+    /// the remaining budget; results with an artifact footer (or that would
+    /// exceed the budget) render as their structured-output summary plus the
+    /// artifact pointer so the worker can load the full result on demand.
+    /// Default: 8000 tokens (approximately the same envelope as the previous
+    /// 32000-byte budget under tiktoken, sized for 200K-window models).
     #[serde(default = "default_dependency_context_budget")]
     pub dependency_context_budget: usize,
 
@@ -382,7 +384,7 @@ impl OrchestrationConfig {
         self.artifacts.result_summary_length
     }
 
-    /// Total byte budget for dependency context in worker prompts.
+    /// Total token budget for dependency context in worker prompts.
     pub fn dependency_context_budget(&self) -> usize {
         self.artifacts.dependency_context_budget
     }
@@ -609,7 +611,7 @@ fn default_result_summary_length() -> usize {
 }
 
 fn default_dependency_context_budget() -> usize {
-    32_000
+    8_000
 }
 
 fn default_max_session_runs() -> usize {
@@ -651,7 +653,7 @@ mod tests {
         assert_eq!(config.per_call_timeout_secs(), 0);
         assert_eq!(config.result_artifact_threshold(), 4000);
         assert_eq!(config.result_summary_length(), 2000);
-        assert_eq!(config.dependency_context_budget(), 32_000);
+        assert_eq!(config.dependency_context_budget(), 8_000);
         assert!(config.memory_dir().is_none());
         assert_eq!(config.session_history_turns(), 3);
         assert_eq!(config.persistence_drain_timeout_ms(), 2000);
