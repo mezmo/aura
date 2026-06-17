@@ -790,8 +790,7 @@ fn resolve_spec<R: BufRead>(
 
     // ---- API key ----
     let api_key: Option<ApiKeySource> = if let Some(env_var) = &api_key_env_var {
-        let detected_value = (key_value)(env_var);
-        if let Some(_value) = &detected_value {
+        if (key_value)(env_var).is_some() {
             if prompter.ask_yes_no(
                 &format!("Found {env_var} in your environment. Use this environment variable?"),
                 true,
@@ -880,17 +879,7 @@ fn resolve_spec<R: BufRead>(
 
     // ---- model ----
     let model = match &args.model {
-        Some(m) => {
-            if let Some(models) = &live_models
-                && !models.iter().any(|x| x == m)
-            {
-                eprintln!(
-                    "warning: '{m}' is not in {provider}'s model list — \
-                     continuing anyway"
-                );
-            }
-            m.clone()
-        }
+        Some(m) => m.clone(),
         None => {
             let shortlist = match &live_models {
                 Some(models) => rank_shortlist(provider, models),
@@ -926,21 +915,23 @@ fn resolve_spec<R: BufRead>(
                 }
                 println!();
             }
-            let model = match prompter.ask_model(&shortlist, 0)? {
+            match prompter.ask_model(&shortlist, 0)? {
                 Some(m) => m,
                 None => bail!("--model is required in non-interactive mode"),
-            };
-            if let Some(models) = &live_models
-                && !models.iter().any(|x| x == &model)
-            {
-                eprintln!(
-                    "warning: '{model}' is not in {provider}'s model list — \
-                     continuing anyway"
-                );
             }
-            model
         }
     };
+
+    // Warn once if the chosen model isn't in the provider's live list — typed
+    // ids and offline runs may legitimately miss it.
+    if let Some(models) = &live_models
+        && !models.iter().any(|x| x == &model)
+    {
+        eprintln!(
+            "warning: '{model}' is not in {provider}'s model list — \
+             continuing anyway"
+        );
+    }
 
     Ok(ConfigSpec {
         provider,
@@ -956,13 +947,12 @@ fn resolve_spec<R: BufRead>(
 #[cfg(feature = "standalone-cli")]
 fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()> {
     let mut literal = rendered.to_string();
-    // Substitute env var references with literal values for validation
-    literal = literal.replace(&format!("{{{{ env.{} }}}}", ""), "");
-    // Replace specific known references
+    // The only env reference in a generated config is the api_key; substitute a
+    // literal so the real parser can validate the rest (provider/model are
+    // already literals).
     if let Some(var) = spec.api_key_env_var() {
         literal = literal.replace(&format!("{{{{ env.{var} }}}}"), "test-key");
     }
-    // Provider and model are written literally, not as env refs
     aura_config::load_config_from_str(&literal)
         .map_err(|e| anyhow::anyhow!("generated config failed validation (bug): {e}"))?;
     Ok(())
