@@ -663,10 +663,15 @@ impl McpManager {
 
         debug!("  Spawning process: {:?}", process);
 
-        // Create the transport
-        let transport = TokioChildProcess::new(process).map_err(|e| {
-            BuilderError::McpInitError(format!("Failed to spawn MCP server process: {e}"))
-        })?;
+        // TokioChildProcess::new defaults stderr to Stdio::inherit(), which
+        // leaks MCP server debug output (often raw JSON-RPC frames) to the
+        // host terminal. Pipe stderr to null instead.
+        let (transport, _stderr) = TokioChildProcess::builder(process)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                BuilderError::McpInitError(format!("Failed to spawn MCP server process: {e}"))
+            })?;
 
         let client = McpClient::from_transport(transport, format!("stdio://{server_name}"))
             .await
