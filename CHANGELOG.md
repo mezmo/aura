@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.25.0](https://github.com/mezmo/aura/compare/v1.24.3...v1.25.0) (2026-06-18)
+
+
+### Features
+
+* **cli**: suggest slash command for bare command-word input [da8d7a0](https://github.com/mezmo/aura/commit/da8d7a01a8441c64f40897ee9f432d96f2fe1c81) - Jacob Hull [#178](https://github.com/mezmo/aura/issues/178)
+
 ## [1.24.3](https://github.com/mezmo/aura/compare/v1.24.2...v1.24.3) (2026-06-18)
 
 
