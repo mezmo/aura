@@ -507,6 +507,21 @@ pub fn run_repl(
     } else {
         crate::ui::prompt::print_welcome_state();
     }
+
+    if config
+        .model
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("aura-bootstrap"))
+    {
+        use crate::theme::Themed;
+        println!(
+            "\n  {} You're connected to the bootstrap configuration agent.\n  \
+             Describe what you want this AURA instance to do and it will\n  \
+             build a configuration for you.\n",
+            "aura-bootstrap".themed_with(crate::theme::theme().heading),
+        );
+    }
+
     setup_terminal();
 
     // If resuming, replay the event log so the user sees the conversation
