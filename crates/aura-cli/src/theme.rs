@@ -308,9 +308,9 @@ pub static NORMAL: Theme = Theme {
     error: Style::fg(Color::Red),
     emphasis: Style::fg(BABY_BLUE).italic(),
     code: Style::fg(Color::Rgb {
-        r: 192,
-        g: 192,
-        b: 192,
+        r: 230,
+        g: 230,
+        b: 230,
     })
     .bold(),
     identifier: Style::fg(Color::Cyan),
@@ -326,8 +326,16 @@ pub static NORMAL: Theme = Theme {
     markdown_bg: Color::Reset,
     diff_bg: Color::Reset,
     user_echo_bg: Color::DarkGrey,
-    inline_code_bg: BABY_BLUE,
-    code_block_bg: BABY_BLUE,
+    inline_code_bg: Color::Rgb {
+        r: 40,
+        g: 42,
+        b: 54,
+    },
+    code_block_bg: Color::Rgb {
+        r: 40,
+        g: 42,
+        b: 54,
+    },
     shimmer_base: Color::Reset,
     task_palette: TASK_PALETTE_NORMAL,
 };
