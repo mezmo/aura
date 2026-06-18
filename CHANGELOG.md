@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.24.3](https://github.com/mezmo/aura/compare/v1.24.2...v1.24.3) (2026-06-18)
+
+
+### Bug Fixes
+
+* **mcp**: suppress stdio MCP server stderr output [5f3d7ea](https://github.com/mezmo/aura/commit/5f3d7eadc6f94decf852dbfeb192511e31561cc4) - Tony Rogers
+
 ## [1.24.2](https://github.com/mezmo/aura/compare/v1.24.1...v1.24.2) (2026-06-17)
 
 
