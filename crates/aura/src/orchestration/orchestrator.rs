@@ -4231,22 +4231,32 @@ fn build_dependency_context(
         let Some(ancestor) = plan.get_task(*id) else {
             continue;
         };
-        let Some(result) = ancestor.state.completed_result() else {
+        if ancestor.state.completed_result().is_none() {
             continue;
-        };
+        }
 
         // Artifact results are always pointers: summary + artifact path.
-        // Non-artifact results are inlined full while they fit the budget;
-        // otherwise they fall back to a compact pointer entry.
-        let has_artifact = ancestor.has_artifact_footer();
-        let full_tokens = counter.count_tokens(result);
-        let use_full = !has_artifact && spent + full_tokens <= budget_tokens;
-
-        let entry = if use_full {
-            spent += full_tokens;
-            ancestor.render_full_entry()
+        // Non-artifact results are inlined full while the *rendered* entry
+        // (lineage header + body) fits the budget; otherwise they fall back
+        // to a compact pointer entry. Counting the rendered entry — not the
+        // raw result — keeps the header overhead inside the budget.
+        let full_entry = if ancestor.has_artifact_footer() {
+            None
         } else {
-            ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter)
+            ancestor.render_full_entry()
+        };
+
+        let entry = match full_entry {
+            Some(full) => {
+                let full_tokens = counter.count_tokens(&full);
+                if spent + full_tokens <= budget_tokens {
+                    spent += full_tokens;
+                    Some(full)
+                } else {
+                    ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter)
+                }
+            }
+            None => ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter),
         };
 
         if let Some(entry) = entry {
@@ -4259,10 +4269,12 @@ fn build_dependency_context(
     }
 
     rendered.sort_unstable_by_key(|(id, _)| *id);
-    rendered
+    let joined = rendered
         .into_iter()
         .map(|(_, entry)| entry)
-        .reduce(|acc, part| acc + context::DEPENDENCY_SEPARATOR + &part)
+        .collect::<Vec<_>>()
+        .join(context::DEPENDENCY_SEPARATOR);
+    Some(joined)
 }
 
 #[cfg(test)]
