@@ -568,16 +568,17 @@ impl Orchestrator {
                     &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
                 ) + mcp_tool_tokens;
 
-                // Hold the persistence lock only long enough to copy iteration_path
-                // (sync method). Drop the guard before any .await on storage.
-                let iter_dir = {
+                let (iter_dir, read_root) = {
                     let persistence = self.persistence.lock().await;
-                    persistence.iteration_path()
+                    let run_dir = persistence.run_path().to_path_buf();
+                    let read_root = run_dir.parent().map(|p| p.to_path_buf()).unwrap_or(run_dir);
+                    (persistence.iteration_path(), read_root)
                 };
 
                 let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
                     sp_cfg,
                     storage_dir: &iter_dir,
+                    read_root: Some(&read_root),
                     scratchpad_tool_map,
                     context_window,
                     initial_used,

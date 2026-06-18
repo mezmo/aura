@@ -237,6 +237,7 @@ impl Agent {
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
             sp_cfg: &sp_cfg,
             storage_dir: std::path::Path::new(&memory_dir),
+            read_root: None,
             scratchpad_tool_map,
             context_window,
             initial_used,
@@ -925,9 +926,28 @@ impl Agent {
                 .add_tool(ReadTool::new(s.clone(), b.clone()));
         }
 
-        // Add read_artifact tool when orchestration persistence is available
+        // Add read_artifact tool when orchestration persistence is available.
+        // When the scratchpad is active, hand it the budget + storage so a
+        // large artifact is returned as an in-place pointer (explored with the
+        // scratchpad read tools).
         if let Some(ref persistence) = config.orchestration_persistence {
-            let read_artifact = crate::orchestration::ReadArtifactTool::new(persistence.clone());
+            let mut read_artifact =
+                crate::orchestration::ReadArtifactTool::new(persistence.clone());
+            if let Some(ref scratchpad) = config.scratchpad_tools_config {
+                let read_root = scratchpad.storage.read_root().to_path_buf();
+                let run_path = persistence.lock().await.run_path().to_path_buf();
+                if !run_path.starts_with(&read_root) {
+                    tracing::warn!(
+                        "read_artifact scratchpad read_root {} does not cover the artifacts \
+                         directory under {}; large artifacts will be refused instead of \
+                         explorable in place",
+                        read_root.display(),
+                        run_path.display(),
+                    );
+                }
+                read_artifact = read_artifact
+                    .with_scratchpad(scratchpad.budget.clone(), scratchpad.storage.clone());
+            }
             builder_state = builder_state.add_tool(read_artifact);
         }
 
