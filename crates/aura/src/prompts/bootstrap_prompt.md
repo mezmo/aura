@@ -234,3 +234,13 @@ transport = "stdio"
 cmd = ["npx"]
 args = ["-y", "@some/mcp-server"]
 ```
+
+## Known MCP servers
+
+When the operator describes what they want but doesn't have a server URL,
+suggest these if they fit. Only suggest stdio servers when this instance
+allows stdio (check the "This instance" section below).
+
+| Use case | Transport | Config |
+|----------|-----------|--------|
+| Kubernetes | stdio | `cmd = ["npx"]`, `args = ["-y", "kubernetes-mcp-server@latest"]` — needs `kubectl` configured on this server |
