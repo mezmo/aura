@@ -14,10 +14,10 @@
 //! 4. **Verify** the key by querying the provider's live model-list
 //!    endpoint (blocking HTTP, short timeout; bedrock has no cheap HTTP
 //!    listing and is skipped with a note).
-//! 5. **Model**: rank the fetched list into a short, best-first shortlist via
-//!    a per-provider table of stable family roots (newest version per family,
-//!    snapshots hidden). The user picks by number, accepts the suggested
-//!    default, or types any id — never a silent pick.
+//! 5. **Model**: rank the fetched list into a short, best-first shortlist of
+//!    per-provider recommended ids (clean id preferred over dated snapshots).
+//!    OpenRouter and Ollama are uncurated — the user types an id / picks from
+//!    what's installed. Pick by number, accept the default, or type any id.
 //! 6. Write a minimal **complete** config referencing the provider's native
 //!    env vars.
 //!
@@ -101,25 +101,20 @@ fn default_key_env(provider: Provider) -> Option<&'static str> {
     }
 }
 
-/// Ordered model *family roots* per provider, best-first and **specific →
-/// general** so each model is claimed by its first matching root. Roots are
-/// deliberately version-free (`gpt-5`, not `gpt-5.1`): a new `gpt-5.6` matches
-/// the `gpt-5` root automatically — no release needed. A release is only
-/// warranted to bless a genuinely new family (a future `gpt-6`/`o5`). The
-/// concrete id shown per family is chosen by `rank_shortlist`.
+/// Recommended model ids per provider, best-first — the first is the suggested
+/// default. Each entry is matched as a prefix against the live list, and within
+/// a match `rank_shortlist` prefers the clean (non-dated) id, else the newest.
+/// OpenRouter and Ollama are intentionally uncurated (see `rank_shortlist`):
+/// OpenRouter users have their own opinions over a huge catalog, and Ollama
+/// lists whatever is installed locally. Updating these lists is a deliberate
+/// editorial choice — keep them current as providers ship new flagships.
 fn family_roots(provider: Provider) -> &'static [&'static str] {
     match provider {
-        Provider::OpenAI => &["gpt-5", "gpt-4.1", "gpt-4o", "o4", "o3", "o1", "gpt-4"],
-        Provider::Anthropic => &["claude-sonnet-4", "claude-opus-4", "claude-haiku-4"],
-        Provider::Gemini => &["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
-        Provider::OpenRouter => &[
-            "openai/gpt-5",
-            "anthropic/claude-sonnet-4",
-            "google/gemini-2.5-pro",
-            "openai/gpt-4o",
-        ],
-        // Ollama is shown uncurated (see rank_shortlist); bedrock has no list.
-        Provider::Ollama | Provider::Bedrock => &[],
+        Provider::OpenAI => &["gpt-5.5", "gpt-5.4"],
+        Provider::Anthropic => &["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"],
+        Provider::Gemini => &["gemini-3.5-flash", "gemini-3.1-pro"],
+        // Uncurated providers (and bedrock, which has no list endpoint).
+        Provider::OpenRouter | Provider::Ollama | Provider::Bedrock => &[],
     }
 }
 
@@ -390,12 +385,16 @@ fn is_dated(id: &str) -> bool {
 /// from the shortlist but remain typeable. Falls back to the chat-filtered list
 /// (newest-first) when no root matches at all.
 fn rank_shortlist(provider: Provider, models: &[String]) -> Vec<String> {
-    // Ollama's `/api/tags` returns whatever the user installed — non-canonical
-    // names with quant suffixes and aliases — so family-root matching and the
-    // chat-marker filter are both unreliable (many good local models are tagged
-    // `*-instruct`). Show the installed list as-is and let the user choose.
-    if provider == Provider::Ollama {
-        return models.to_vec();
+    match provider {
+        // Ollama's `/api/tags` returns whatever the user installed —
+        // non-canonical names with quant suffixes and aliases — so family-root
+        // matching and the chat-marker filter are both unreliable (many good
+        // local models are tagged `*-instruct`). Show the list as-is.
+        Provider::Ollama => return models.to_vec(),
+        // OpenRouter has thousands of models and opinionated users; we make no
+        // recommendation. An empty shortlist makes the operator type an id.
+        Provider::OpenRouter => return Vec::new(),
+        _ => {}
     }
     let chat = filter_chat_models(models);
     let mut claimed = vec![false; chat.len()];
@@ -885,6 +884,16 @@ fn resolve_spec<R: BufRead>(
                 Some(models) => rank_shortlist(provider, models),
                 None => Vec::new(),
             };
+            if prompter.interactive && shortlist.is_empty() {
+                // No curated shortlist (e.g. OpenRouter's huge catalog) — the
+                // operator types the id they want.
+                if let Some(models) = &live_models {
+                    println!(
+                        "\n{provider} lists {} model(s); enter the model id you want.\n",
+                        models.len()
+                    );
+                }
+            }
             if prompter.interactive && !shortlist.is_empty() {
                 // Ollama's list is the user's installed models, not a curated
                 // recommendation, so don't mark a "suggested" pick for it.
@@ -1229,57 +1238,28 @@ mod tests {
     }
 
     #[test]
-    fn rank_shortlist_curates_openai_from_screenshot_list() {
+    fn rank_shortlist_curates_openai_to_recommended_ids() {
         let models: Vec<String> = [
             "gpt-3.5-turbo",
-            "gpt-3.5-turbo-16k",
-            "gpt-3.5-turbo-instruct",
-            "gpt-3.5-turbo-1106",
-            "gpt-3.5-turbo-0125",
             "gpt-4o",
-            "gpt-4o-2024-05-13",
-            "gpt-4o-mini",
-            "gpt-4o-mini-2024-07-18",
-            "gpt-4o-2024-08-06",
-            "o1-2024-12-17",
-            "o1",
-            "o3-mini",
-            "o3-mini-2025-01-31",
             "o3",
             "o4-mini",
-            "o4-mini-2025-04-16",
-            "gpt-4o-mini-search-preview",
-            "gpt-4o-search-preview",
-            "o3-2025-04-16",
             "gpt-4.1",
-            "gpt-5",
-            "gpt-5.1",
-            "gpt-5.6",
+            "gpt-5.4",
+            "gpt-5.5",
+            "gpt-5.5-2025-11-01", // dated snapshot of a recommended id
             "text-embedding-3-small",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-        let shortlist = rank_shortlist(Provider::OpenAI, &models);
-
+        // Only the recommended gpt-5.x are shown (5.5 first/suggested), and the
+        // clean id wins over its dated snapshot. o-series / 4o / 3.5 are dropped.
         assert_eq!(
-            shortlist,
-            vec![
-                "gpt-5.6".to_string(),
-                "gpt-4.1".to_string(),
-                "gpt-4o".to_string(),
-                "o4-mini".to_string(),
-                "o3".to_string(),
-                "o1".to_string(),
-            ]
+            rank_shortlist(Provider::OpenAI, &models),
+            vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()]
         );
-        for m in &shortlist {
-            assert!(!m.contains("3.5"), "{m}");
-            assert!(!m.contains("instruct"), "{m}");
-            assert!(!m.contains("search"), "{m}");
-            assert!(!is_dated(m), "{m}");
-        }
     }
 
     #[test]
@@ -1295,23 +1275,32 @@ mod tests {
     }
 
     #[test]
-    fn rank_shortlist_picks_newest_dated_when_family_has_only_snapshots() {
+    fn rank_shortlist_anthropic_picks_newest_dated_per_family() {
         let models: Vec<String> = [
-            "claude-sonnet-4-20241022",
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250101",
+            "claude-sonnet-4-6-20251001",
+            "claude-sonnet-4-6-20251115", // newer sonnet snapshot
+            "claude-opus-4-8-20251101",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let shortlist = rank_shortlist(Provider::Anthropic, &models);
+        // Sonnet is the default (first); the newest dated id wins per family.
         assert_eq!(
-            shortlist,
+            rank_shortlist(Provider::Anthropic, &models),
             vec![
-                "claude-sonnet-4-20250514".to_string(),
-                "claude-opus-4-20250101".to_string(),
+                "claude-sonnet-4-6-20251115".to_string(),
+                "claude-opus-4-8-20251101".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn rank_shortlist_openrouter_makes_no_recommendation() {
+        let models = vec![
+            "openai/gpt-5".to_string(),
+            "anthropic/claude-sonnet-4".to_string(),
+        ];
+        assert!(rank_shortlist(Provider::OpenRouter, &models).is_empty());
     }
 
     #[test]
@@ -1675,7 +1664,7 @@ mod tests {
         a.offline = false;
         let only_openai = |var: &str| var == "OPENAI_API_KEY";
         let detected = |var: &str| (var == "OPENAI_API_KEY").then(|| "sk-detected".to_string());
-        let lister = FixedLister(vec!["gpt-4o", "gpt-5.1", "text-embedding-3-small"]);
+        let lister = FixedLister(vec!["gpt-5.4", "gpt-5.5", "text-embedding-3-small"]);
         // provider(enter) -> accept key(enter=yes) -> model(enter=suggested)
         let spec = resolve_spec(
             &a,
@@ -1686,7 +1675,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.provider, Provider::OpenAI);
-        assert_eq!(spec.model, "gpt-5.1");
+        assert_eq!(spec.model, "gpt-5.5");
         assert_eq!(
             spec.api_key,
             Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string()))
