@@ -300,4 +300,53 @@ mod tests {
             OrchestrationStreamEvent::PlanCreated { ref tasks, .. } if tasks.is_empty()
         ));
     }
+
+    #[test]
+    fn test_old_task_completed_flat_fields_still_deserialize() {
+        // Pre-flatten TaskCompleted carried task_id/success/duration_ms/result
+        // and the orchestrator/worker ids at the top level. The TaskContext +
+        // CompletionOutcome flatten keeps the wire shape identical, so old
+        // payloads must still deserialize into the flattened variant.
+        let old_payload = serde_json::json!({
+            "task_id": 2,
+            "success": true,
+            "duration_ms": 1234,
+            "orchestrator_id": "o",
+            "worker_id": "w",
+            "result": "done",
+            "agent_id": "coordinator",
+            "session_id": "s"
+        });
+        let event: OrchestrationStreamEvent =
+            serde_json::from_value(old_payload).expect("old TaskCompleted deserializes");
+        assert!(matches!(
+            event,
+            OrchestrationStreamEvent::TaskCompleted { ref task, ref outcome, .. }
+                if task.task_id == 2 && outcome.success && outcome.duration_ms == 1234
+        ));
+    }
+
+    #[test]
+    fn test_old_tool_call_completed_flat_fields_still_deserialize() {
+        // Pre-flatten ToolCallCompleted carried success/duration_ms/result at
+        // the top level alongside tool_call_id. The CompletionOutcome flatten
+        // keeps the wire shape, so old payloads still deserialize into the
+        // flattened variant.
+        let old_payload = serde_json::json!({
+            "task_id": 0,
+            "tool_call_id": "call_1",
+            "success": true,
+            "duration_ms": 42,
+            "result": "30.0",
+            "agent_id": "coordinator",
+            "session_id": "s"
+        });
+        let event: OrchestrationStreamEvent =
+            serde_json::from_value(old_payload).expect("old ToolCallCompleted deserializes");
+        assert!(matches!(
+            event,
+            OrchestrationStreamEvent::ToolCallCompleted { ref outcome, ref tool_call_id, .. }
+                if outcome.duration_ms == 42 && tool_call_id == "call_1"
+        ));
+    }
 }
