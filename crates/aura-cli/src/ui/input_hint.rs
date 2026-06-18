@@ -115,11 +115,12 @@ fn persist_model_cache(models: &[String]) {
     let _ = fs::write(dir.join("models_cache"), models.join("\n"));
 }
 
-/// Seed the in-memory model cache.
+/// Seed (or replace) the in-memory model cache.
+///
+/// Called at startup and after every hot reload so `/model` reflects
+/// the current roster.
 pub fn seed_model_cache(models: Vec<String>) {
-    if let Ok(mut g) = MODEL_CACHE.lock()
-        && g.is_empty()
-    {
+    if let Ok(mut g) = MODEL_CACHE.lock() {
         *g = models;
     }
 }

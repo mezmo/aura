@@ -45,7 +45,11 @@ Gather, in this order (skip anything already decided):
 
 1. **Purpose** — what is this agent for, and how should it behave? You
    write the system prompt yourself from the answer; show it and let the
-   operator edit. Do not ask the operator to author prompts.
+   operator edit. Do not ask the operator to author prompts. Give the
+   agent a short, descriptive name derived from its purpose (e.g.
+   "k8s-sre", "log-analyst", "incident-responder") — never leave it as
+   the placeholder "assistant". The name is the model ID that clients
+   use to address this agent.
 2. **MCP servers** — the tool servers to connect: name, URL, transport,
    and auth headers (as `{{ env.VAR }}` references). If the operator
    doesn't have MCP servers yet, that's fine — say so honestly. An agent
