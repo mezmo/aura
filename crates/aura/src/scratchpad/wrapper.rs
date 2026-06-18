@@ -11,6 +11,32 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+/// Build the primary "this lives in a file, explore it with these tools"
+/// pointer. Shared by [`ScratchpadWrapper`] (for intercepted MCP output) and
+/// the orchestration `read_artifact` tool (for large artifacts read in place),
+/// so both surfaces give the LLM identical exploration guidance.
+///
+/// `headline` is the caller-specific first line (e.g. "[scratchpad: output
+/// saved to 'foo.json' (...)]" vs "[artifact 'result.txt' is large (...)]").
+/// `file_ref` is the exact `file=` token the read tools accept — a bare
+/// scratchpad filename, or a relative path under the read root for an in-place
+/// artifact.
+pub(crate) fn build_file_pointer(headline: &str, file_ref: &str) -> String {
+    format!(
+        "{headline}\n\n\
+         The full output is too large for the context window. \
+         Use these tools to explore it:\n\
+         - schema file=\"{f}\" — view structure and line ranges\n\
+         - item_schema file=\"{f}\" path=\"key\" — see all keys across array items\n\
+         - head file=\"{f}\" lines=50 — preview first 50 lines\n\
+         - grep file=\"{f}\" pattern=\"keyword\" — search for specific content\n\
+         - get_in file=\"{f}\" path=\"key.subkey\" — extract nested values (supports offset/limit for large strings)\n\
+         - iterate_over file=\"{f}\" path=\"key\" fields=\"a,b\" — extract fields from array items\n\
+         - slice file=\"{f}\" start=N end=M — extract line range",
+        f = file_ref,
+    )
+}
+
 /// ToolWrapper that intercepts large outputs from flagged tools and writes
 /// them to scratchpad files, replacing the output with a compact pointer.
 pub struct ScratchpadWrapper {
@@ -123,20 +149,12 @@ impl ToolWrapper for ScratchpadWrapper {
                 let format = result.format;
                 let token_count = output_tokens;
 
-                let mut pointer = format!(
+                let headline = format!(
                     "[scratchpad: output saved to '{filename}' (~{token_count} tokens, \
-                     {line_count} lines, format={fmt})]\n\n\
-                     The full output is too large for the context window. \
-                     Use these tools to explore it:\n\
-                     - schema file=\"{filename}\" — view structure and line ranges\n\
-                     - item_schema file=\"{filename}\" path=\"key\" — see all keys across array items\n\
-                     - head file=\"{filename}\" lines=50 — preview first 50 lines\n\
-                     - grep file=\"{filename}\" pattern=\"keyword\" — search for specific content\n\
-                     - get_in file=\"{filename}\" path=\"key.subkey\" — extract nested values (supports offset/limit for large strings)\n\
-                     - iterate_over file=\"{filename}\" path=\"key\" fields=\"a,b\" — extract fields from array items\n\
-                     - slice file=\"{filename}\" start=N end=M — extract line range",
+                     {line_count} lines, format={fmt})]",
                     fmt = format.as_str(),
                 );
+                let mut pointer = build_file_pointer(&headline, &filename);
 
                 for companion in &result.companions {
                     // Header is the same for both formats: the content moved

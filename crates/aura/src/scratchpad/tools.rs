@@ -144,14 +144,17 @@ fn format_budget_error(
 }
 
 /// Result of a budget check — either Ok or one of two exceeded variants.
-enum BudgetCheckError {
+pub(crate) enum BudgetCheckError {
     ExtractionLimit(super::context_budget::ExtractionLimitExceeded),
     BudgetExceeded(super::context_budget::BudgetExceeded),
 }
 
 /// Check budget and record usage. Returns `Ok(())` if within budget,
 /// or `Err` with details for the caller to format.
-fn check_and_record_budget(budget: &ContextBudget, content: &str) -> Result<(), BudgetCheckError> {
+pub(crate) fn check_and_record_budget(
+    budget: &ContextBudget,
+    content: &str,
+) -> Result<(), BudgetCheckError> {
     // Per-call extraction limit check first
     if let Some(limit) = budget.max_extraction_tokens() {
         let tokens = budget.count_tokens(content);

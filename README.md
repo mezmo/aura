@@ -537,6 +537,8 @@ When multiple patterns match the same tool, the **longest (most specific) patter
 
 Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
 
+**Result artifacts and `read_artifact`:** in orchestration, large task results are saved to artifact files under `{memory_dir}/{run_id}/artifacts/`. When a worker reads one back with `read_artifact`, the same budget rules apply: an artifact that fits is returned inline, while one that exceeds the limit comes back as a scratchpad pointer the worker explores in place with the read tools (`head`, `grep`, `slice`, …) — the artifact is read directly from the artifacts directory, never copied into the scratchpad. (The coordinator has no scratchpad, so its `read_artifact` always returns inline content.)
+
 ### Ollama
 
 AURA supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).

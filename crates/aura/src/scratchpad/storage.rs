@@ -119,8 +119,11 @@ const COMPANION_MIN_LINES: usize = 10;
 /// Manages scratchpad file storage for a single request.
 #[derive(Debug, Clone)]
 pub struct ScratchpadStorage {
-    /// Directory for this request's scratchpad files.
+    /// Directory for this request's scratchpad files; all writes land here.
     dir: PathBuf,
+    /// Boundary for reads (an ancestor of `dir`, or `dir` itself). `validate_path`
+    /// permits reads anywhere under this root; writes stay confined to `dir`.
+    read_root: PathBuf,
 }
 
 impl ScratchpadStorage {
@@ -131,19 +134,90 @@ impl ScratchpadStorage {
         let dir = parent.join("scratchpad");
         fs::create_dir_all(&dir).await?;
         info!("Scratchpad directory created: {}", dir.display());
-        Ok(Self { dir })
+        Ok(Self {
+            read_root: dir.clone(),
+            dir,
+        })
     }
 
     /// Create storage with a specific base directory (for testing).
     pub async fn with_base_dir(base: &Path, request_id: &str) -> std::io::Result<Self> {
         let dir = base.join(request_id);
         fs::create_dir_all(&dir).await?;
-        Ok(Self { dir })
+        Ok(Self {
+            read_root: dir.clone(),
+            dir,
+        })
+    }
+
+    /// Widen the read boundary to `read_root` (must be an ancestor of `dir`).
+    ///
+    /// Reads via [`validate_path`](Self::validate_path) are then permitted
+    /// anywhere under `read_root`, while writes stay confined to `dir`. If
+    /// `read_root` is not an ancestor of `dir`, the call is a no-op (the read
+    /// boundary stays at `dir`) — this keeps the invariant that the scratchpad
+    /// write dir is always readable.
+    pub fn with_read_root(mut self, read_root: PathBuf) -> Self {
+        let normalized = normalize_path(&read_root);
+        if self.dir.starts_with(&normalized) {
+            self.read_root = normalized;
+        } else {
+            warn!(
+                "Ignoring scratchpad read_root {} — not an ancestor of write dir {}",
+                normalized.display(),
+                self.dir.display()
+            );
+        }
+        self
     }
 
     /// Get the scratchpad directory path.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Get the read boundary (writes are confined to [`dir`](Self::dir), but
+    /// reads are permitted anywhere under this root).
+    pub fn read_root(&self) -> &Path {
+        &self.read_root
+    }
+
+    /// Build a tool-usable `file=` token for an absolute path under the read
+    /// root, expressed relative to the scratchpad write dir so it can be passed
+    /// straight back to the read tools (`head`, `slice`, `grep`, `read`, …).
+    ///
+    /// For an artifact at `{run}/artifacts/x.txt` with the scratchpad dir at
+    /// `{run}/iteration-1/scratchpad`, this returns `../../artifacts/x.txt`.
+    /// The result is validated through [`validate_path`](Self::validate_path),
+    /// so a path outside the read root is rejected.
+    pub fn relative_ref(&self, abs: &Path) -> Result<String, ScratchpadPathError> {
+        let abs_norm = normalize_path(abs);
+        let dir_norm = normalize_path(&self.dir);
+
+        // Both the target and the scratchpad dir must live under the read root.
+        let target_rel = abs_norm.strip_prefix(&self.read_root).map_err(|_| {
+            ScratchpadPathError::OutsideDirectory {
+                path: abs.display().to_string(),
+                dir: self.read_root.display().to_string(),
+            }
+        })?;
+        let dir_rel = dir_norm.strip_prefix(&self.read_root).map_err(|_| {
+            ScratchpadPathError::OutsideDirectory {
+                path: self.dir.display().to_string(),
+                dir: self.read_root.display().to_string(),
+            }
+        })?;
+
+        let mut rel = PathBuf::new();
+        for _ in dir_rel.components() {
+            rel.push("..");
+        }
+        rel.push(target_rel);
+
+        let token = rel.to_string_lossy().to_string();
+        // Defense-in-depth: confirm the token resolves back inside the read root.
+        self.validate_path(&token)?;
+        Ok(token)
     }
 
     /// Prepare content for writing: detect format, pretty-print JSON, resolve path.
@@ -402,35 +476,35 @@ impl ScratchpadStorage {
         // Stage 1: lexical normalization (handles ../).
         let normalized = normalize_path(&requested);
 
-        if !normalized.starts_with(&self.dir) {
+        if !normalized.starts_with(&self.read_root) {
             return Err(ScratchpadPathError::OutsideDirectory {
                 path: file_path.to_string(),
-                dir: self.dir.display().to_string(),
+                dir: self.read_root.display().to_string(),
             });
         }
 
         // Stage 2: symlink resolution if the file exists. We compare the
-        // canonicalized request against the canonicalized scratchpad dir
+        // canonicalized request against the canonicalized read root
         // (canonicalize is consistent on macOS where /tmp is a symlink for
         // /private/tmp — comparing one canonical to one non-canonical
         // would always reject).
         if normalized.exists() {
-            let canonical_dir = std::fs::canonicalize(&self.dir).map_err(|_| {
+            let canonical_root = std::fs::canonicalize(&self.read_root).map_err(|_| {
                 ScratchpadPathError::OutsideDirectory {
                     path: file_path.to_string(),
-                    dir: self.dir.display().to_string(),
+                    dir: self.read_root.display().to_string(),
                 }
             })?;
             let canonical_path = std::fs::canonicalize(&normalized).map_err(|_| {
                 ScratchpadPathError::OutsideDirectory {
                     path: file_path.to_string(),
-                    dir: self.dir.display().to_string(),
+                    dir: self.read_root.display().to_string(),
                 }
             })?;
-            if !canonical_path.starts_with(&canonical_dir) {
+            if !canonical_path.starts_with(&canonical_root) {
                 return Err(ScratchpadPathError::OutsideDirectory {
                     path: file_path.to_string(),
-                    dir: self.dir.display().to_string(),
+                    dir: self.read_root.display().to_string(),
                 });
             }
         }
@@ -774,6 +848,84 @@ mod tests {
 
         let result = storage.validate_path("call-1.json");
         assert!(result.is_ok());
+    }
+
+    /// With a widened `read_root`, a file that lives outside the scratchpad
+    /// write dir but under the read root (e.g. a result artifact) is readable
+    /// via a relative `../` path — without copying it into the scratchpad.
+    #[tokio::test]
+    async fn test_read_root_allows_sibling_artifact() {
+        let tmp = TempDir::new().unwrap();
+        // Layout: {run}/iteration-1/scratchpad  (write dir)
+        //         {run}/artifacts/result.txt    (sibling, under read_root={run})
+        let run_dir = tmp.path().join("run-1");
+        let scratch_parent = run_dir.join("iteration-1");
+        let storage = ScratchpadStorage::in_dir(&scratch_parent)
+            .await
+            .unwrap()
+            .with_read_root(run_dir.clone());
+
+        let artifacts = run_dir.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let artifact = artifacts.join("result.txt");
+        std::fs::write(&artifact, "artifact content").unwrap();
+
+        // relative_ref builds the token the read tools accept.
+        let token = storage.relative_ref(&artifact).unwrap();
+        assert!(token.contains("artifacts/result.txt"), "got token: {token}");
+
+        // The token validates and resolves to the artifact on disk.
+        let resolved = storage.validate_path(&token).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(&artifact).unwrap()
+        );
+    }
+
+    /// A path that escapes the widened `read_root` is still rejected.
+    #[tokio::test]
+    async fn test_read_root_escape_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        let scratch_parent = run_dir.join("iteration-1");
+        let storage = ScratchpadStorage::in_dir(&scratch_parent)
+            .await
+            .unwrap()
+            .with_read_root(run_dir.clone());
+
+        // ../../.. climbs above the run dir (read_root) → rejected.
+        let result = storage.validate_path("../../../etc/passwd");
+        assert!(result.is_err(), "path escaping read_root must be rejected");
+    }
+
+    /// `relative_ref` rejects an absolute path that is not under the read root.
+    #[tokio::test]
+    async fn test_relative_ref_outside_read_root_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let run_dir = tmp.path().join("run-1");
+        let scratch_parent = run_dir.join("iteration-1");
+        let storage = ScratchpadStorage::in_dir(&scratch_parent)
+            .await
+            .unwrap()
+            .with_read_root(run_dir.clone());
+
+        let outside = tmp.path().join("other").join("secret.txt");
+        assert!(storage.relative_ref(&outside).is_err());
+    }
+
+    /// `with_read_root` ignores a root that is not an ancestor of the write
+    /// dir, preserving the invariant that the scratchpad dir stays readable.
+    #[tokio::test]
+    async fn test_with_read_root_ignores_non_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-rr")
+            .await
+            .unwrap();
+        let dir = storage.dir().to_path_buf();
+        let unrelated = tmp.path().join("unrelated");
+        let storage = storage.with_read_root(unrelated);
+        // read_root falls back to the write dir.
+        assert_eq!(storage.read_root(), dir.as_path());
     }
 
     #[tokio::test]
