@@ -110,7 +110,7 @@ fn default_key_env(provider: Provider) -> Option<&'static str> {
 /// editorial choice — keep them current as providers ship new flagships.
 fn family_roots(provider: Provider) -> &'static [&'static str] {
     match provider {
-        Provider::OpenAI => &["gpt-5.5", "gpt-5.4"],
+        Provider::OpenAI => &["gpt-5.5"],
         Provider::Anthropic => &["claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5"],
         Provider::Gemini => &["gemini-3.5-flash", "gemini-3.1-pro"],
         // Uncurated providers (and bedrock, which has no list endpoint).
@@ -1254,11 +1254,11 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
 
-        // Only the recommended gpt-5.x are shown (5.5 first/suggested), and the
-        // clean id wins over its dated snapshot. o-series / 4o / 3.5 are dropped.
+        // Only the recommended gpt-5.5 is shown, and the clean id wins over its
+        // dated snapshot. gpt-5.4 / o-series / 4o / 3.5 are dropped.
         assert_eq!(
             rank_shortlist(Provider::OpenAI, &models),
-            vec!["gpt-5.5".to_string(), "gpt-5.4".to_string()]
+            vec!["gpt-5.5".to_string()]
         );
     }
 
