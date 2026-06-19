@@ -27,7 +27,9 @@ pub enum ScratchpadToolError {
     Path(String),
     #[error("Invalid argument: {0}")]
     InvalidArg(String),
-    #[error("Not JSON: file is not valid JSON")]
+    #[error(
+        "File is not valid JSON. Use `read`, `head`, `grep`, or `slice` to explore it as text."
+    )]
     NotJson,
     #[error("Key path not found: {0}")]
     KeyNotFound(String),
@@ -485,8 +487,16 @@ impl Tool for GrepTool {
             )));
         }
         let content = read_scratchpad_file(&self.storage, &args.file).await?;
-        let regex = regex::Regex::new(&args.pattern)
-            .map_err(|e| ScratchpadToolError::InvalidArg(format!("Invalid regex: {e}")))?;
+        // The LLM frequently passes a literal snippet (e.g. a JSON fragment
+        // like `"metric": {`) as the pattern; the unescaped `{` then fails to
+        // compile ("unclosed counted repetition"). Fall back to a literal
+        // (escaped) search so grep behaves like the substring match the model
+        // expected instead of erroring.
+        let regex = match regex::Regex::new(&args.pattern) {
+            Ok(re) => re,
+            Err(_) => regex::Regex::new(&regex::escape(&args.pattern))
+                .map_err(|e| ScratchpadToolError::InvalidArg(format!("Invalid regex: {e}")))?,
+        };
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -1941,6 +1951,35 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("No matches"));
+    }
+
+    /// The LLM frequently passes a literal JSON fragment as the grep pattern.
+    /// An unescaped `{` is an invalid regex quantifier ("unclosed counted
+    /// repetition"); grep must fall back to a literal search instead of
+    /// erroring. Regression test for the noisy `Invalid regex` tool-call error.
+    #[tokio::test]
+    async fn test_grep_falls_back_to_literal_on_invalid_regex() {
+        let (_tmp, storage, budget) = setup().await;
+        // Pretty-printed on write, so the file contains the line `  "metric": {`.
+        storage
+            .write_output("metrics", "{\"metric\":{\"id\":1},\"value\":2}")
+            .await
+            .unwrap();
+
+        let tool = GrepTool::new(storage, budget);
+        let result = tool
+            .call(GrepArgs {
+                file: "metrics.json".to_string(),
+                pattern: "\"metric\": {".to_string(),
+                context: 0,
+            })
+            .await
+            .expect("invalid regex should fall back to literal search, not error");
+        assert!(
+            result.contains("\"metric\": {"),
+            "literal fallback should match the JSON fragment, got: {}",
+            &result[..result.len().min(200)]
+        );
     }
 
     #[tokio::test]
