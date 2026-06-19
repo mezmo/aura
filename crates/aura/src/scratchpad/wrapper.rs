@@ -11,6 +11,24 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+/// Inline footer the persistence wrapper appends to promoted tool outputs
+/// (see `orchestration::persistence_wrapper`). Kept in sync with that marker.
+const ARTIFACT_FOOTER_MARKER: &str = "\n\n[Tool output saved to artifact: ";
+
+/// Strip a trailing persistence artifact footer from `output`, if present.
+///
+/// `ComposedWrapper` runs `transform_output` in reverse order, so the
+/// persistence wrapper appends its footer before this wrapper sees the output.
+/// Mirrors the strip in `persistence_wrapper` so the scratchpad never writes
+/// the footer into a file, where it would corrupt otherwise-valid JSON and
+/// break `get_in`/`schema`/`iterate_over`.
+fn strip_artifact_footer(output: &str) -> &str {
+    match output.rfind(ARTIFACT_FOOTER_MARKER) {
+        Some(pos) => &output[..pos],
+        None => output,
+    }
+}
+
 /// Build the primary "this lives in a file, explore it with these tools"
 /// pointer. Shared by [`ScratchpadWrapper`] (for intercepted MCP output) and
 /// the orchestration `read_artifact` tool (for large artifacts read in place),
@@ -91,7 +109,18 @@ impl ToolWrapper for ScratchpadWrapper {
             None => return TransformOutputResult::new(output),
         };
 
-        let output_tokens = self.budget.count_tokens(&output);
+        // Persistence runs before this wrapper (ComposedWrapper applies
+        // transform_output in reverse order) and may have appended an artifact
+        // footer. Diverting to the scratchpad replaces the output with our own
+        // pointer, so that footer is redundant here — and writing it into the
+        // scratchpad file would append a non-JSON line that breaks get_in,
+        // schema, and iterate_over on otherwise-valid JSON. Strip it before
+        // counting, hashing, and writing. The passthrough returns below keep
+        // the original output so the footer still serves as the persistence
+        // read_artifact pointer when the scratchpad does not intercept.
+        let content = strip_artifact_footer(&output);
+
+        let output_tokens = self.budget.count_tokens(content);
         if output_tokens < min_tokens {
             tracing::debug!(
                 "Scratchpad: {} output (~{} tokens) below threshold ({}), passing through",
@@ -107,7 +136,7 @@ impl ToolWrapper for ScratchpadWrapper {
         // runs after this wrapper and compares pointer strings; a fresh UUID
         // every call would defeat duplicate detection on intercepted tools.
         let mut hasher = DefaultHasher::new();
-        output.hash(&mut hasher);
+        content.hash(&mut hasher);
         let content_hash = format!("{:016x}", hasher.finish());
 
         let file_id = format!(
@@ -137,7 +166,7 @@ impl ToolWrapper for ScratchpadWrapper {
         // the LLM round-trip that follows — so briefly blocking the actix
         // worker is acceptable (for now). Revisit if scratchpad payloads grow into the
         // multi-MB range or if profiling shows the sync write on the hot path.
-        let write = self.storage.write_output_sync(&file_id, &output);
+        let write = self.storage.write_output_sync(&file_id, content);
         match write {
             Ok(result) => {
                 let filename = result
@@ -360,6 +389,74 @@ mod tests {
         // Verify file was written
         let files = storage.list_files().await.unwrap();
         assert!(!files.is_empty());
+    }
+
+    #[test]
+    fn test_strip_artifact_footer() {
+        let body = "{\"a\":1}";
+        let with_footer =
+            format!("{body}\n\n[Tool output saved to artifact: task-0-w-iter-1-t-0-output.txt]");
+        assert_eq!(strip_artifact_footer(&with_footer), body);
+        // No footer → returned unchanged.
+        assert_eq!(strip_artifact_footer(body), body);
+    }
+
+    /// A large JSON output that arrives carrying the persistence wrapper's
+    /// artifact footer (persistence runs first under `ComposedWrapper`) must be
+    /// written to the scratchpad file WITHOUT the footer, so the exploration
+    /// tools can still parse it as JSON. Regression test for the footer leaking
+    /// into the file and breaking get_in/schema/iterate_over with "not valid
+    /// JSON".
+    #[tokio::test]
+    async fn test_wrapper_strips_persistence_footer_before_write() {
+        let tmp = TempDir::new().unwrap();
+        let storage = Arc::new(
+            ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-footer")
+                .await
+                .unwrap(),
+        );
+
+        let tools = HashMap::from([("execute_range_query".to_string(), 10)]);
+        let counter = TiktokenCounter::default_counter();
+        let budget = ContextBudget::new(128_000, 0.20, 0, std::sync::Arc::new(counter));
+        let wrapper = ScratchpadWrapper::new(tools, storage.clone(), budget);
+
+        // Valid JSON payload, large enough to be intercepted...
+        let items: String = (0..200)
+            .map(|i| format!("{{\"metric\":{{\"id\":{i}}},\"value\":{i}}},"))
+            .collect();
+        let json = format!("{{\"result\":[{}]}}", items.trim_end_matches(','));
+        // ...with the persistence footer appended, exactly as persistence does.
+        let with_footer = format!(
+            "{json}\n\n[Tool output saved to artifact: \
+             task-0-metrics-iter-1-execute_range_query-0-output.txt]"
+        );
+
+        let mut ctx = ToolCallContext::new("execute_range_query");
+        ctx.task_id = Some(0);
+        ctx.tool_initiator_id = "metrics".to_string();
+        ctx.attempt = Some(0);
+
+        let result = wrapper.transform_output(with_footer, &ok(), &ctx, None);
+        assert!(result.output.contains("[scratchpad:"), "must intercept");
+
+        let files = storage.list_files().await.unwrap();
+        let name = files.first().expect("a scratchpad file must be written");
+        let written = tokio::fs::read_to_string(storage.dir().join(name))
+            .await
+            .unwrap();
+
+        assert!(
+            !written.contains("[Tool output saved to artifact:"),
+            "persistence footer must be stripped from the scratchpad file; tail: {}",
+            &written[written.len().saturating_sub(120)..]
+        );
+        // The file (pretty-printed on write) must parse as JSON and match the
+        // original payload semantically — the whole point of the strip.
+        let written_value: serde_json::Value = serde_json::from_str(&written)
+            .expect("written scratchpad file must be valid JSON after footer strip");
+        let expected: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(written_value, expected);
     }
 
     #[tokio::test]
