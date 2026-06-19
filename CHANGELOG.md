@@ -1,5 +1,28 @@
 ## Changelog
 
+# [1.26.0](https://github.com/mezmo/aura/compare/v1.25.0...v1.26.0) (2026-06-19)
+
+
+### Bug Fixes
+
+* **cli**: clarify unverified key and document init in the README [52f5490](https://github.com/mezmo/aura/commit/52f54905750476ade7e27dcf62b3b8925e1bc256) - Mike Shearer* **cli**: correct init env-file note, verify wording, ollama listing [6f74adb](https://github.com/mezmo/aura/commit/6f74adb8e4e5e09fdaed6ef11d7bde56ec5ad87d) - Mike Shearer* **cli**: mask api-key prompt and migrate dotenv to dotenvy [3ef546c](https://github.com/mezmo/aura/commit/3ef546cc823715eaf41d7a5aca41d19e439d43a8) - Mike Shearer* **cli**: recommend only gpt-5.5 for openai [5b546a8](https://github.com/mezmo/aura/commit/5b546a820cb859ec0a6cf9939fcae3655b9b9215) - Mike Shearer* **cli**: rework init api key flow and drop bootstrap references [b6d8f5d](https://github.com/mezmo/aura/commit/b6d8f5dafe9ae8f2fdc7e2f37e3828026824fb21) - Mike Shearer* **cli**: send Gemini API key via header, not query string [78368aa](https://github.com/mezmo/aura/commit/78368aa588253a8c50c8628d23412ecf6aa1728d) - Mike Shearer
+
+### Chores
+
+* **config**: drop the unused [bootstrap] config table [7ed4e27](https://github.com/mezmo/aura/commit/7ed4e2791f167785f0324ca2afe617f1326e7c74) - Mike Shearer
+
+### Code Refactoring
+
+* **cli**: make the init provider a clap ValueEnum [9bc4593](https://github.com/mezmo/aura/commit/9bc4593be185321ffa95d14b14e34f6e08a97b90) - Mike Shearer* **cli**: tidy init after a quality pass [19e48d5](https://github.com/mezmo/aura/commit/19e48d5c3933bb7317edb2ce7fb570fd3079b7ae) - Mike Shearer
+
+### Features
+
+* **cli**: add init subcommand with live model discovery [985c41b](https://github.com/mezmo/aura/commit/985c41b300f9dedcc6438532bb24495403b7e453) - Mike Shearer* **cli**: curate init model selection per provider [c9916da](https://github.com/mezmo/aura/commit/c9916dadc320e17de131c83457cdf584eaa73d1d) - Mike Shearer* **cli**: polish the init wizard intro and overwrite flow [c63fa38](https://github.com/mezmo/aura/commit/c63fa38713097cc644bcf167abac196701c57eb5) - Mike Shearer* **cli**: source init config from .env and prompt for the api key [e23ba43](https://github.com/mezmo/aura/commit/e23ba43913d0a2cc9ca8fc3c0f44bd03073ebfff) - Mike Shearer* **cli**: update init model recommendations per review [72caf95](https://github.com/mezmo/aura/commit/72caf95b25cd3ce6f2f01cf93b8dcdb6a29e1495) - Mike Shearer* **config**: add [bootstrap] config table [ab859ea](https://github.com/mezmo/aura/commit/ab859ea03bbbc2a276d50b22ff63960ee727bdb7) - Mike Shearer
+
+### Style
+
+* **cli**: rustfmt the reworked init and drop an unused binding [cec0ab4](https://github.com/mezmo/aura/commit/cec0ab46ac5536b02c2b7b644b922997e3ba17a6) - Mike Shearer
+
 # [1.25.0](https://github.com/mezmo/aura/compare/v1.24.3...v1.25.0) (2026-06-18)
 
 
