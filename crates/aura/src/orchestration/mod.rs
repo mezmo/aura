@@ -52,11 +52,11 @@ mod persistence;
 mod persistence_wrapper;
 mod prompt_constants;
 mod prompt_journal;
-mod stream_events;
 mod templates;
 pub mod tools;
 mod types;
 
+pub use aura_events::orchestration::{EventContext, OrchestrationStreamEvent, event_names};
 pub use config::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
     build_coordinator_preamble, build_vector_store_context, build_worker_preamble,
@@ -70,9 +70,6 @@ pub use persistence::{
     build_session_context, load_session_manifests,
 };
 pub use persistence_wrapper::PersistenceWrapper;
-pub use stream_events::EventContext;
-pub use stream_events::OrchestrationStreamEvent;
-pub use stream_events::event_names;
 pub use tools::ListPriorRunsTool;
 pub use tools::ReadArtifactTool;
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
