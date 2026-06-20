@@ -4198,8 +4198,8 @@ fn plan_dag(plan: &Plan) -> Vec<super::events::TaskDagNode> {
 /// `budget_tokens` caps the entire rendered context: full entries, pointer
 /// entries, and the separators between them all count against it. Direct
 /// dependencies are always included (the floor) so a worker never loses its
-/// immediate inputs; transitive ancestors fill whatever budget remains,
-/// nearest-first, and the farthest are dropped once it is spent. Results
+/// immediate inputs; transitive ancestors fill whatever budget, if any,
+/// remains nearest-first, and the farthest are dropped once it is spent. Results
 /// with an artifact footer always render as a compact pointer
 /// (`Task::render_pointer_entry`): structured-output summary + artifact
 /// path, so the worker can load the full result on demand. Other results
@@ -4223,8 +4223,9 @@ fn build_dependency_context(
     const DEGRADED_PREVIEW_TOKENS: usize = 125;
 
     // Direct dependencies are the floor: a worker always sees its immediate
-    // inputs, even under a tight budget. Transitive ancestors fill whatever
-    // budget remains, nearest-first; the farthest are dropped once it runs out.
+    // inputs, even under a tight budget. An over-budget direct dep can leave
+    // nothing for transitive ancestors; whatever budget remains is filled
+    // nearest-first, and the farthest are dropped once it runs out.
     let direct_deps: &[usize] = plan
         .get_task(task_id)
         .map(|task| task.dependencies.as_slice())
@@ -4546,7 +4547,7 @@ mod tests {
         );
         let total = test_counter().count_tokens(&ctx);
         assert!(
-            total <= budget + 500,
+            total <= budget + 200,
             "deep chain must stay bounded near budget, got {total} for budget {budget}"
         );
     }
