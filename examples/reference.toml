@@ -18,6 +18,12 @@
 #   examples/complete/kubernetes-sre.toml             - K8s MCP + Prometheus
 #   examples/complete/devops-assistant.toml           - GitHub MCP
 
+# ── Persistence ─────────────────────────────────────────────────────
+# Top-level base directory. Independent systems each persist under it: the
+# scratchpad (context-window offload), the result artifact system, and
+# orchestration run/plan storage.
+memory_dir = "/tmp/aura-orchestration"
+
 # ── MCP Tool Servers ────────────────────────────────────────────────
 [mcp]
 # Sanitize tool schemas for OpenAI function-calling compatibility.
@@ -197,8 +203,6 @@ tools_in_planning = "summary"
 max_tools_per_worker = 10
 
 [orchestration.artifacts]
-# Base directory for execution persistence, plan storage, and result artifacts.
-memory_dir = "/tmp/aura-orchestration"
 result_artifact_threshold = 4000
 result_summary_length = 2000
 # Token budget for transitive dependency context injected into worker prompts.
