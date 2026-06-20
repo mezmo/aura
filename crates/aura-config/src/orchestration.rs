@@ -173,12 +173,13 @@ pub struct ArtifactsConfig {
     #[serde(default = "default_result_summary_length")]
     pub result_summary_length: usize,
 
-    /// Total token budget for dependency context injected into a worker prompt.
-    /// Results without an artifact footer are inlined in full while they fit
-    /// the remaining budget; results with an artifact footer (or that would
-    /// exceed the budget) render as their structured-output summary plus the
-    /// artifact pointer so the worker can load the full result on demand.
-    /// Default: 8000 tokens (approximately the same envelope as the previous
+    /// Total token budget for the dependency context injected into a worker
+    /// prompt. Full entries, pointer entries, and separators all count toward
+    /// it. Direct dependencies are always included; transitive ancestors fill
+    /// the remaining budget nearest-first and the farthest are dropped once it
+    /// is spent. Results with an artifact footer render as a structured-output
+    /// summary plus the artifact pointer so the worker can load the full result
+    /// on demand. Default: 8000 tokens (about the same envelope as the previous
     /// 32000-byte budget under tiktoken, sized for 200K-window models).
     #[serde(default = "default_dependency_context_budget")]
     pub dependency_context_budget: usize,

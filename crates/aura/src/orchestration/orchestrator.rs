@@ -4190,13 +4190,15 @@ fn plan_dag(plan: &Plan) -> Vec<super::events::TaskDagNode> {
 /// the task instructions that follow the context block in the worker prompt.
 /// Returns `None` when no completed ancestor exists.
 ///
-/// `budget_tokens` caps the total tokens of inlined full results. Results
-/// with an artifact footer are always rendered as a compact pointer
+/// `budget_tokens` caps the entire rendered context: full entries, pointer
+/// entries, and the separators between them all count against it. Direct
+/// dependencies are always included (the floor) so a worker never loses its
+/// immediate inputs; transitive ancestors fill whatever budget remains,
+/// nearest-first, and the farthest are dropped once it is spent. Results
+/// with an artifact footer always render as a compact pointer
 /// (`Task::render_pointer_entry`): structured-output summary + artifact
-/// path, so the worker can load the full result on demand. Results without
-/// an artifact footer are inlined in full while they fit the budget; once
-/// the budget is exhausted, remaining ancestors (direct or transitive)
-/// render as compact pointers.
+/// path, so the worker can load the full result on demand. Other results
+/// inline in full while they fit, otherwise as a compact pointer.
 ///
 /// This mirrors the continuation-prompt policy proven in the SRE E2E suite:
 /// never raw-truncate a result that has an artifact pointer; always give
@@ -4215,10 +4217,19 @@ fn build_dependency_context(
     /// output or an artifact footer rarely hit this path.
     const DEGRADED_PREVIEW_TOKENS: usize = 125;
 
+    // Direct dependencies are the floor: a worker always sees its immediate
+    // inputs, even under a tight budget. Transitive ancestors fill whatever
+    // budget remains, nearest-first; the farthest are dropped once it runs out.
+    let direct_deps: &[usize] = plan
+        .get_task(task_id)
+        .map(|task| task.dependencies.as_slice())
+        .unwrap_or_default();
+
     // BFS order: direct dependencies first, then nearest transitive ancestors.
-    // We decide full-vs-pointer in this order, but render in ascending ID
-    // order so the worker reads oldest work first.
+    // Full-vs-pointer selection and the budget apply in this order; entries are
+    // rendered in ascending ID order so the worker reads oldest work first.
     let bfs_ancestors = plan.transitive_ancestors(task_id);
+    let separator_tokens = counter.count_tokens(context::DEPENDENCY_SEPARATOR);
     let mut spent = 0usize;
     let mut rendered = Vec::new();
 
@@ -4230,31 +4241,46 @@ fn build_dependency_context(
             continue;
         }
 
-        // Artifact results are always pointers: summary + artifact path.
-        // Non-artifact results are inlined full while the *rendered* entry
-        // (lineage header + body) fits the budget; otherwise they fall back
-        // to a compact pointer entry. Counting the rendered entry — not the
-        // raw result — keeps the header overhead inside the budget.
-        let full_entry = if ancestor.has_artifact_footer() {
+        // Every entry after the first adds a separator when the parts are
+        // joined, so charge it to the budget too.
+        let separator = if rendered.is_empty() {
+            0
+        } else {
+            separator_tokens
+        };
+        let remaining = budget_tokens.saturating_sub(spent);
+
+        // Artifact results are always pointers (summary + artifact path).
+        // Non-artifact results inline in full when the rendered entry (lineage
+        // header + body) plus its separator fits the remaining budget;
+        // otherwise they fall back to a compact pointer. Counting the rendered
+        // entry — full or pointer, plus separators — keeps the whole context
+        // block inside the budget.
+        let full = if ancestor.has_artifact_footer() {
             None
         } else {
             ancestor.render_full_entry()
         };
-
-        let entry = match full_entry {
-            Some(full) => {
-                let full_tokens = counter.count_tokens(&full);
-                if spent + full_tokens <= budget_tokens {
-                    spent += full_tokens;
-                    Some(full)
-                } else {
-                    ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter)
-                }
+        let full_cost = full.as_ref().map(|f| counter.count_tokens(f) + separator);
+        let (entry, cost) = match (full, full_cost) {
+            (Some(full), Some(full_cost)) if full_cost <= remaining => (Some(full), full_cost),
+            _ => {
+                let pointer = ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter);
+                let cost = pointer
+                    .as_ref()
+                    .map_or(0, |p| counter.count_tokens(p) + separator);
+                (pointer, cost)
             }
-            None => ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter),
         };
 
-        if let Some(entry) = entry {
+        let Some(entry) = entry else {
+            continue;
+        };
+
+        // Direct dependencies are always kept; transitive ancestors only while
+        // they fit the total budget.
+        if direct_deps.contains(id) || spent + cost <= budget_tokens {
+            spent += cost;
             rendered.push((ancestor.id, entry));
         }
     }
@@ -4441,8 +4467,9 @@ mod tests {
 
     #[test]
     fn test_dependency_context_over_budget_renders_pointer() {
-        // Once the budget is exhausted, both direct and transitive deps render
-        // as compact pointers — no raw truncation, and lineage is preserved.
+        // Under a tiny budget the direct dependency is still rendered (as a
+        // compact pointer — the floor), but farther transitive ancestors are
+        // dropped rather than ballooning the prompt past the budget.
         let mut plan = three_task_chain();
         plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
         plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
@@ -4455,11 +4482,67 @@ mod tests {
         );
         assert!(
             ctx.contains("Task 1 (Correlate logs)"),
-            "pointer keeps the task header: {ctx}"
+            "direct dependency is kept as a pointer (the floor): {ctx}"
         );
         assert!(
-            !ctx.contains(&"A".repeat(1000)),
-            "transitive ancestor switches to pointer under a tiny budget"
+            !ctx.contains("Task 0"),
+            "far transitive ancestor is dropped under a tiny budget: {ctx}"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_direct_dep_floor() {
+        // A direct dependency is always included even when it alone exceeds the
+        // budget — the worker must never lose its immediate input.
+        let mut plan = three_task_chain();
+        plan.get_task_mut(0).unwrap().complete("A".repeat(1000));
+        plan.get_task_mut(1).unwrap().complete("B".repeat(1000));
+
+        let ctx = build_dependency_context(&plan, 2, 1, &test_counter())
+            .expect("direct dep is the floor");
+        assert!(
+            ctx.contains("Task 1 (Correlate logs)"),
+            "direct dependency must appear even under a 1-token budget: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Task 0"),
+            "transitive ancestor is dropped below the floor"
+        );
+    }
+
+    #[test]
+    fn test_dependency_context_deep_chain_stays_bounded() {
+        // A long ancestor chain must not blow past the budget: the direct
+        // dependency is kept, the farthest ancestors are dropped, and the total
+        // rendered context (entries + separators) stays within a small overhead
+        // of the budget. This is the wide/deep fan-out concern from review.
+        let mut plan = Plan::new("Test");
+        plan.add_task(Task::new(0, "Task 0", "r"));
+        for i in 1..=15 {
+            plan.add_task(Task::new(i, "Task", "r").with_dependency(i - 1));
+        }
+        for i in 0..=14 {
+            plan.get_task_mut(i)
+                .unwrap()
+                .complete(format!("R{i}-{}", "x".repeat(300)));
+        }
+
+        let budget = 1500;
+        let ctx = build_dependency_context(&plan, 15, budget, &test_counter())
+            .expect("context for the deepest task");
+
+        assert!(
+            ctx.contains("Task 14 ("),
+            "direct dependency must be kept: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Task 0 ("),
+            "farthest ancestor must be dropped under a tight budget"
+        );
+        let total = test_counter().count_tokens(&ctx);
+        assert!(
+            total <= budget + 500,
+            "deep chain must stay bounded near budget, got {total} for budget {budget}"
         );
     }
 
