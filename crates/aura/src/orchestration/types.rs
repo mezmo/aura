@@ -4,13 +4,66 @@
 //! queries into tasks, track their execution, and manage dependencies.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
 /// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
 const MAX_STEP_NESTING: usize = 2;
+
+// --- Identity types ---------------------------------------------------------
+//
+// Domain identifiers for orchestration runs and tasks, modeled as simple types
+// (opaque newtypes reached through canonical conversion traits).
+
+/// Identifier for a single orchestration run.
+///
+/// A run is an orchestration concept; single-agent requests have none. Run ids
+/// are v4 UUIDs; parse one from its string form via `FromStr`. Serializes as
+/// the bare UUID string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(Uuid);
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for RunId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(s).map(Self)
+    }
+}
+
+/// Identity of a worker task within a run.
+///
+/// `task_id` is the task's number within an iteration's plan — the same `usize`
+/// the DAG uses for `Task::id` and its `dependencies`. `worker` is the assigned
+/// worker's config name (reusable across tasks), or `None` for the generic
+/// worker.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TaskIdentity {
+    /// Task number within the iteration's plan; matches the DAG `Task::id`.
+    pub task_id: usize,
+    /// Assigned worker's config name, or `None` for the generic worker.
+    pub worker: Option<String>,
+}
+
+impl TaskIdentity {
+    /// Construct a task identity from its plan number and optional worker name.
+    #[must_use]
+    pub fn new(task_id: usize, worker: Option<String>) -> Self {
+        Self { task_id, worker }
+    }
+}
 
 /// A step in a sequential plan. Tagged enum so models declare intent
 /// explicitly via `"type"` before filling fields.

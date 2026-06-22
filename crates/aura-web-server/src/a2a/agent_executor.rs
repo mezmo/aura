@@ -181,7 +181,7 @@ impl AgentExecutor for AuraAgentExecutor {
             let session_id = Some(context_id.clone());
             let builder = RigBuilder::new(config);
             let agent = match builder
-                .build_streaming_agent_with_headers(Some(&req_headers), session_id, None)
+                .build_streaming_agent_with_headers(Some(&req_headers), session_id, None, None)
                 .await
             {
                 Ok(a) => a,
@@ -661,6 +661,7 @@ mod tests {
             vector_stores: vec![],
             tools: None,
             orchestration: None,
+            hitl: None,
             agent: aura_config::AgentConfig {
                 name: name.to_owned(),
                 alias: alias.map(str::to_owned),
