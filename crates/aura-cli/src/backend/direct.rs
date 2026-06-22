@@ -101,6 +101,7 @@ impl DirectBackend {
             active_requests: Arc::new(ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: additional_tools_factory(),
+            pending_approvals: aura::hitl::PendingApprovals::new(),
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -230,6 +231,7 @@ impl DirectBackend {
             active_requests: old.active_requests.clone(),
             default_agent: old.default_agent.clone(),
             additional_tools: additional_tools_factory(),
+            pending_approvals: old.pending_approvals.clone(),
         });
     }
 
@@ -434,6 +436,7 @@ mod tests {
             active_requests: Arc::new(ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: additional_tools_factory(),
+            pending_approvals: aura::hitl::PendingApprovals::new(),
         });
         DirectBackend {
             app_state,
