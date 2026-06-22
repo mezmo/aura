@@ -1,7 +1,7 @@
 <!-- markdownlint-disable MD033 -->
 # Human-in-the-loop approval gating for agent tool calls
 
-- Status: **proposed**
+- Status: **accepted**
 - Deciders: Mike Shearer
 - Date: 2026-06-16
 

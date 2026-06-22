@@ -30,6 +30,7 @@ Key capabilities:
   - [Multiple Agents](#multiple-agents)
   - [Configuration Sections](#configuration-sections)
   - [Orchestration](#orchestration)
+  - [Human-in-the-loop approval gates](#human-in-the-loop-approval-gates)
   - [Scratchpad (Context Window Management)](#scratchpad-context-window-management)
   - [Skills (On-Demand Instructions)](#skills-on-demand-instructions)
   - [Ollama](#ollama)
@@ -343,6 +344,7 @@ Configuration sections:
 - `[agent.llm]`: provider and model configuration for the agent.
 - `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
+- `[hitl]` and `[hitl.route]`: optional approval gates for orchestration worker tool calls.
 
 Supported providers: OpenAI, Anthropic, Bedrock, Gemini, Ollama, and OpenRouter.
 
@@ -504,6 +506,31 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
 | `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
 | `skills` | table | inherits `[agent.skills]` | Optional per-worker skill sources; an explicit `local = []` disables skills for this worker |
+
+### Human-in-the-loop approval gates
+
+Human-in-the-loop (HITL) approval gates let orchestration workers ask a webhook
+for permission before running selected MCP tools. Configure `[hitl]` with
+tool-name globs and a `[hitl.route]` webhook. Approved calls run normally;
+denied calls return a blocked-action result to the worker without running the
+MCP tool.
+
+```toml
+[hitl]
+require_approval = ["k8s_apply_*", "restart_*", "delete_*"]
+
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/aura"
+timeout_secs = 300
+```
+
+Current scope: webhook approval works for orchestration workers.
+`aura.approval_requested` and `aura.approval_completed` SSE events are emitted
+on the webhook route regardless of `AURA_CUSTOM_EVENTS`. Conversational
+approval (`aura.approval_pending`, decision ingress) and single-agent config
+gates are not wired in this phase. See [docs/hitl.md](docs/hitl.md) for the
+webhook contract and response behavior.
 
 ### Scratchpad (Context Window Management)
 
