@@ -254,6 +254,7 @@ async fn run() -> std::io::Result<()> {
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
+        pending_approvals: aura::hitl::PendingApprovals::new(),
     });
 
     info!(

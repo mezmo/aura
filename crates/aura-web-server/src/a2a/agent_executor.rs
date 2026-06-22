@@ -150,6 +150,7 @@ impl AgentExecutor for AuraAgentExecutor {
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
         let task_store = self.task_store.clone();
+        let pending_approvals = self.app_state.pending_approvals.clone();
         let mut append_tracker: HashMap<(String, String, String), bool> = HashMap::new();
 
         Box::pin(async_stream::stream! {
@@ -179,7 +180,7 @@ impl AgentExecutor for AuraAgentExecutor {
             }));
 
             let session_id = Some(context_id.clone());
-            let builder = RigBuilder::new(config);
+            let builder = RigBuilder::new(config, pending_approvals);
             let agent = match builder
                 .build_streaming_agent_with_headers(Some(&req_headers), session_id, None, None)
                 .await
@@ -650,6 +651,7 @@ mod tests {
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(ActiveRequestTracker::default()),
             additional_tools: Arc::new(Vec::new),
+            pending_approvals: aura::hitl::PendingApprovals::new(),
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }

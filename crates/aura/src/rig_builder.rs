@@ -11,6 +11,7 @@
 use crate::builder::{Agent, ClientTool, build_streaming_agent};
 use crate::config::AgentRuntimeConfig;
 use crate::error::BuilderError;
+use crate::hitl::PendingApprovals;
 use crate::streaming::StreamingAgent;
 use aura_config::{AgentSettings, Config, McpServerConfig};
 use std::collections::HashMap;
@@ -18,11 +19,15 @@ use std::sync::Arc;
 
 pub struct RigBuilder {
     config: Config,
+    pending_approvals: PendingApprovals,
 }
 
 impl RigBuilder {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config, pending_approvals: PendingApprovals) -> Self {
+        Self {
+            config,
+            pending_approvals,
+        }
     }
 
     /// Get the runtime [`AgentRuntimeConfig`] (mainly for tests/debugging).
@@ -60,7 +65,7 @@ impl RigBuilder {
                 .config
                 .hitl
                 .as_ref()
-                .map(crate::hitl::HitlRuntime::from_config),
+                .map(|cfg| crate::hitl::HitlRuntime::from_config(cfg, &self.pending_approvals)),
             ..Default::default()
         }
     }
@@ -359,7 +364,7 @@ description = "worker"
 preamble = "alpha"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
         assert_eq!(
             built.effective_memory_dir(),
             Some("/tmp/top-level"),
@@ -392,7 +397,7 @@ description = "worker"
 preamble = "alpha"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
         assert_eq!(built.effective_memory_dir(), Some("/tmp/legacy"));
     }
 
@@ -423,7 +428,7 @@ enabled = false
 memory_dir = "/tmp/legacy-single-agent"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
         assert_eq!(
             built.effective_memory_dir(),
             Some("/tmp/legacy-single-agent"),
@@ -448,7 +453,7 @@ api_key = "test"
 model = "gpt-4o"
 "#;
         let loaded = load_config_from_str(config).expect("should parse");
-        let built = RigBuilder::new(loaded).get_agent_config();
+        let built = RigBuilder::new(loaded, PendingApprovals::new()).get_agent_config();
         assert_eq!(built.effective_memory_dir(), None);
     }
 }
