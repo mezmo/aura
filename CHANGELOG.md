@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.26.2](https://github.com/mezmo/aura/compare/v1.26.1...v1.26.2) (2026-06-22)
+
+
+### Code Refactoring
+
+* **cli**: modularize init.rs into focused submodules [e94ca84](https://github.com/mezmo/aura/commit/e94ca84a7a93bd13c8213105ee347d4d707e29d3) - Mike Shearer [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
 ## [1.26.1](https://github.com/mezmo/aura/compare/v1.26.0...v1.26.1) (2026-06-22)
 
 
