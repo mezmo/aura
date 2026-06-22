@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 use super::decision::{ApprovalDecision, AwaitingDecision, DecisionId, Timestamp};
 use super::protocol::ApprovalRequest;
@@ -69,31 +70,200 @@ impl PendingApprovals {
     /// `oneshot::Sender` in the entry.
     #[must_use]
     pub fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision {
-        let _ = (&self.0, request, timeout);
-        todo!(
-            "build oneshot + ParkedApproval, insert keyed by decision id, return AwaitingDecision"
-        )
+        let id = request.decision_id;
+        let now = chrono::Utc::now();
+        let (tx, rx) = oneshot::channel();
+        let entry = PendingEntry {
+            parked: ParkedApproval {
+                request,
+                registered_at: now,
+                expires_at: now
+                    + chrono::Duration::from_std(timeout).expect("approval timeout fits in chrono"),
+            },
+            wake: tx,
+        };
+        self.0
+            .entries
+            .lock()
+            .expect("registry lock poisoned")
+            .insert(id, entry);
+        AwaitingDecision::new(id, rx, Instant::now() + timeout)
     }
 
     /// Resolve a parked approval, waking its await. Removes the entry, so a
     /// `DecisionId` resolves at most once in-process.
     pub fn resolve(&self, id: &DecisionId, decision: ApprovalDecision) -> Result<(), ResolveError> {
-        let _ = (&self.0, id, decision);
-        todo!("remove entry; send decision on its oneshot; NotFound if absent")
+        let entry = self
+            .0
+            .entries
+            .lock()
+            .expect("registry lock poisoned")
+            .remove(id);
+        match entry {
+            Some(entry) => {
+                let _ = entry.wake.send(decision);
+                Ok(())
+            }
+            None => Err(ResolveError::NotFound),
+        }
     }
 
     /// Cancel every approval parked under a request id (stream drop / shutdown);
     /// their awaits resolve to `Cancelled`.
     pub fn cancel_request(&self, request_id: &str) {
-        let _ = (&self.0, request_id);
-        todo!(
-            "drop entries whose request.request_id matches; dropping the sender cancels the await"
-        )
+        self.0
+            .entries
+            .lock()
+            .expect("registry lock poisoned")
+            .retain(|_, entry| entry.parked.request.request_id != request_id);
     }
 }
 
 impl Default for PendingApprovals {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::hitl::decision::{
+        AgentScope, ApprovalOrigin, ApprovalOutcome, CancelReason, DecisionId,
+    };
+    use crate::hitl::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
+
+    fn test_request(request_id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: request_id.to_string(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "test_*".to_string(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "test_tool".to_string(),
+                arguments: json!({}),
+            }],
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn register_and_resolve_approved() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-1");
+        let id = req.decision_id;
+        let handle = registry.register(req, Duration::from_secs(60));
+        let cancel = CancellationToken::new();
+
+        registry
+            .resolve(&id, ApprovalDecision::Approved)
+            .expect("resolve succeeds");
+
+        assert_eq!(
+            handle.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn register_and_resolve_denied() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-2");
+        let id = req.decision_id;
+        let handle = registry.register(req, Duration::from_secs(60));
+        let cancel = CancellationToken::new();
+
+        registry
+            .resolve(
+                &id,
+                ApprovalDecision::Denied {
+                    reason: Some("not safe".into()),
+                },
+            )
+            .expect("resolve succeeds");
+
+        assert_eq!(
+            handle.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Denied {
+                reason: Some("not safe".into())
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_unknown_id_returns_not_found() {
+        let registry = PendingApprovals::new();
+        let unknown = DecisionId::generate();
+        assert_eq!(
+            registry.resolve(&unknown, ApprovalDecision::Approved),
+            Err(ResolveError::NotFound)
+        );
+    }
+
+    #[test]
+    fn resolve_twice_returns_not_found_on_second() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-3");
+        let id = req.decision_id;
+        let _handle = registry.register(req, Duration::from_secs(60));
+
+        registry
+            .resolve(&id, ApprovalDecision::Approved)
+            .expect("first resolve succeeds");
+        assert_eq!(
+            registry.resolve(&id, ApprovalDecision::Approved),
+            Err(ResolveError::NotFound)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_request_drops_matching_entries() {
+        let registry = PendingApprovals::new();
+        let req_a = test_request("req-cancel");
+        let req_b = test_request("req-keep");
+        let id_b = req_b.decision_id;
+        let handle_a = registry.register(req_a, Duration::from_secs(60));
+        let handle_b = registry.register(req_b, Duration::from_secs(60));
+        let cancel = CancellationToken::new();
+
+        registry.cancel_request("req-cancel");
+
+        assert_eq!(
+            handle_a.outcome(&cancel).await,
+            ApprovalOutcome::Cancelled(CancelReason::SenderDropped)
+        );
+
+        registry
+            .resolve(&id_b, ApprovalDecision::Approved)
+            .expect("unrelated entry survives");
+        assert_eq!(
+            handle_b.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    #[test]
+    fn register_sets_expires_at_from_timeout() {
+        let registry = PendingApprovals::new();
+        let req = test_request("req-ts");
+        let id = req.decision_id;
+        let timeout = Duration::from_secs(300);
+        let before = chrono::Utc::now();
+        let _handle = registry.register(req, timeout);
+        let after = chrono::Utc::now();
+
+        let entries = registry.0.entries.lock().unwrap();
+        let entry = entries.get(&id).expect("entry exists");
+        let delta = entry.parked.expires_at - entry.parked.registered_at;
+        assert_eq!(delta, chrono::Duration::from_std(timeout).unwrap());
+        assert!(entry.parked.registered_at >= before);
+        assert!(entry.parked.registered_at <= after);
     }
 }
