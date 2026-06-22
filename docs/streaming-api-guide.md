@@ -45,7 +45,7 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `STREAMING_TIMEOUT_SECS` | `900` | Request timeout in seconds (0 = no timeout) |
 | `FIRST_CHUNK_TIMEOUT_SECS` | `30` | Max seconds to wait for first provider chunk before aborting |
 | `STREAMING_BUFFER_SIZE` | `400` | Chunks to buffer before backpressure |
-| `AURA_CUSTOM_EVENTS` | `false` | Enable custom `aura.*` events |
+| `AURA_CUSTOM_EVENTS` | `false` | Enable optional custom `aura.*` events. HITL approval lifecycle events are emitted regardless because clients may need to act on them. |
 | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` events |
 | `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period (seconds) for in-flight streams on shutdown |
 
@@ -72,6 +72,9 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.tool_usage` | Usage snapshot after tool execution (associates tool IDs with token counts) | ✅ Implemented |
 | `aura.usage` | Final token usage emitted at stream end (prompt/completion/total) | ✅ Implemented |
 | `aura.scratchpad_usage` | Per-agent scratchpad usage summary (single-agent or worker), emitted when an agent finishes with scratchpad activity | ✅ Implemented |
+| `aura.approval_requested` | HITL approval request raised for a gated tool or `request_approval` call | ✅ Implemented for webhook route |
+| `aura.approval_pending` | HITL approval is waiting for an attended decision | Planned for conversational route |
+| `aura.approval_completed` | HITL approval reached a terminal outcome | ✅ Implemented for webhook route |
 | `aura.orchestrator.*` | Orchestration lifecycle events (see [Orchestration Events](#orchestration-events) below) | ✅ Implemented |
 
 ### Event Flow
@@ -302,7 +305,55 @@ event: aura.scratchpad_usage
 data: {"agent_id":"main","tokens_intercepted":15840,"tokens_extracted":1200,"session_id":"sess_xyz"}
 ```
 
-Emitted once per agent that used scratchpad — fires for both single-agent and orchestration worker contexts (in the latter, `agent_id` is the worker name). `tokens_intercepted` is the total tool output diverted to disk; `tokens_extracted` is what the agent pulled back into context via the scratchpad exploration tools.
+Emitted once per agent that used scratchpad. It fires for both single-agent and orchestration worker contexts (in the latter, `agent_id` is the worker name). `tokens_intercepted` is the total tool output diverted to disk; `tokens_extracted` is what the agent pulled back into context via the scratchpad exploration tools.
+
+**Approval requested** (HITL approval request raised):
+```
+event: aura.approval_requested
+data:
+```
+```json
+{
+  "decision_id": "019edead-beef-7000-8000-000000000001",
+  "tool_name": "restart_deployment",
+  "origin": {
+    "kind": "config_gate",
+    "matched_pattern": "restart_*"
+  },
+  "scope": {
+    "kind": "worker",
+    "run_id": "019edead-beef-7000-8000-000000000002",
+    "task_id": 3,
+    "worker": "operations",
+    "session_id": "sess_xyz"
+  }
+}
+```
+
+**Approval completed** (HITL approval reached a terminal outcome):
+```
+event: aura.approval_completed
+data:
+```
+```json
+{
+  "decision_id": "019edead-beef-7000-8000-000000000001",
+  "outcome": {
+    "kind": "denied",
+    "reason": "maintenance window not open"
+  },
+  "duration_ms": 1820,
+  "scope": {
+    "kind": "worker",
+    "run_id": "019edead-beef-7000-8000-000000000002",
+    "task_id": 3,
+    "worker": "operations",
+    "session_id": "sess_xyz"
+  }
+}
+```
+
+Webhook-route approval events are emitted even when `AURA_CUSTOM_EVENTS=false` because they are protocol lifecycle events, not optional telemetry. The webhook route emits `aura.approval_requested` before dispatch and `aura.approval_completed` for all terminal webhook outcomes. `outcome.kind` is one of `approved`, `denied`, `timed_out`, `cancelled`, or `errored`; `errored` represents webhook channel faults such as transport errors, non-2xx responses, or invalid JSON. `aura.approval_pending` is reserved for the conversational route and is not emitted by the webhook route.
 
 ### Client Handling
 
@@ -323,13 +374,15 @@ for (const line of chunk.split('\n')) {
 
 ### Correlation Fields
 
-All custom events include correlation fields for tracing:
+Most custom events include correlation fields for tracing:
 
 | Field | Description |
 |-------|-------------|
 | `session_id` | Chat session ID (from request metadata) |
 | `trace_id` | OTEL trace ID (when available) |
 | `agent_id` | Agent identifier (`main` for single-agent) |
+
+Approval lifecycle events carry `decision_id` and HITL `scope` instead of the shared `AgentContext` / `CorrelationContext` fields. Use `decision_id` to correlate `aura.approval_requested` with `aura.approval_completed`, and inspect `scope` for the requesting surface (`single`, `worker`, or future `coordinator`).
 
 #### Tool Event Correlation
 

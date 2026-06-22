@@ -23,5 +23,8 @@ tracing = { workspace = true }
 dotenvy = { workspace = true }
 regex = { workspace = true }
 
+# Glob matching for HITL tool-name patterns
+globset = "0.4"
+
 [dev-dependencies]
 tempfile = "3"

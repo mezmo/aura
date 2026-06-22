@@ -1,8 +1,9 @@
 use a2a::VERSION;
 use aura::RigBuilder;
 use aura::{
-    RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
-    tool_event_subscribe, tool_usage_subscribe,
+    RequestCancellation, ResponseContent, StreamingAgent, UsageState, approval_event_subscribe,
+    approval_event_unsubscribe, request_progress_subscribe, tool_event_subscribe,
+    tool_usage_subscribe,
 };
 use axum::Json;
 use axum::body::Body;
@@ -44,6 +45,7 @@ impl Drop for RequestResourceGuard {
             let id = self.request_id.clone();
             handle.spawn(async move {
                 RequestCancellation::unregister(&id);
+                approval_event_unsubscribe(&id).await;
                 request_progress_unsubscribe(&id).await;
                 tool_event_unsubscribe(&id).await;
                 tool_usage_unsubscribe(&id).await;
@@ -151,12 +153,20 @@ async fn build_agent_for_request(
     req_headers: &HashMap<String, String>,
     additional_tools: Vec<Box<dyn aura::ToolDyn>>,
     client_tools: Option<&[ClientToolDefinition]>,
+    request_id: String,
+    session_id: String,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
     let builder = RigBuilder::new(config.clone());
     let agent = builder
-        .build_agent(Some(req_headers), additional_tools, client_tool_defs)
+        .build_agent(
+            Some(req_headers),
+            additional_tools,
+            client_tool_defs,
+            Some(request_id),
+            Some(session_id),
+        )
         .await
         .map_err(|e| {
             error!("Failed to build agent: {}", e);
@@ -181,6 +191,8 @@ pub struct RequestSetup {
     /// emit `finish_reason: "tool_calls"` instead of `"stop"` when the LLM
     /// invokes a passthrough tool.
     pub has_client_tools: bool,
+    /// Request id (`req_…`) shared by the agent build and the completion stream.
+    pub request_id: String,
 }
 
 /// Extract query, chat history, and build agent -- shared across both code paths.
@@ -198,6 +210,12 @@ pub async fn prepare_request(
     // the streaming layer to keep assistant tool_calls in chat history and emit
     // `finish_reason: "tool_calls"` when one fires.
     let has_client_tools = req.tools.is_some();
+
+    // Generate the request id up front so the agent build (single-agent or
+    // orchestration) shares one value with the completion stream. The HITL gate
+    // and approval events stamp this id; previously it was minted later in
+    // `build_completion_config`, after the agent was already built.
+    let request_id = format!("req_{}", Uuid::new_v4().simple());
 
     // Single pass: pull the user query out of `messages` and convert the rest
     // into Aura/Rig history, with optional client-tool support (preserves
@@ -240,6 +258,7 @@ pub async fn prepare_request(
                 Some(req_headers_map),
                 Some(chat_session_id.to_string()),
                 client_tools_vec.clone(),
+                Some(request_id.clone()),
             )
             .await
             .map_err(|e| {
@@ -254,8 +273,15 @@ pub async fn prepare_request(
         } else {
             None
         };
-        build_agent_for_request(&config, req_headers_map, additional_tools, client_tools).await?
-            as Arc<dyn StreamingAgent>
+        build_agent_for_request(
+            &config,
+            req_headers_map,
+            additional_tools,
+            client_tools,
+            request_id.clone(),
+            chat_session_id.to_string(),
+        )
+        .await? as Arc<dyn StreamingAgent>
     };
 
     let (provider, model) = streaming_agent.get_provider_info();
@@ -273,6 +299,7 @@ pub async fn prepare_request(
         created_timestamp,
         chat_session_id: chat_session_id.to_string(),
         has_client_tools,
+        request_id,
     })
 }
 
@@ -342,7 +369,7 @@ pub fn build_completion_config(
     } else {
         None
     };
-    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
     let stream_config = StreamConfig::new(
@@ -416,6 +443,7 @@ pub async fn execute_completion(
         created_timestamp: _,
         chat_session_id,
         has_client_tools: _,
+        request_id: _,
     } = setup;
 
     // Create stream with timeout — single path for both Agent and Orchestrator
@@ -467,6 +495,7 @@ pub async fn execute_completion(
             let progress_rx = request_progress_subscribe(&config.request_id).await;
             let tool_event_rx = tool_event_subscribe(&config.request_id).await;
             let tool_usage_rx = tool_usage_subscribe(&config.request_id).await;
+            let approval_event_rx = approval_event_subscribe(&config.request_id).await;
 
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
@@ -474,6 +503,7 @@ pub async fn execute_completion(
                 tool_event_rx,
                 progress_rx,
                 tool_usage_rx,
+                approval_event_rx,
                 usage_state: usage_state.clone(),
                 response_content,
                 model_name: model_str,

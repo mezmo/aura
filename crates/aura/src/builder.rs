@@ -963,6 +963,13 @@ impl Agent {
             builder_state = builder_state.add_tool(submit_tool);
         }
 
+        // Attach the agent-callable request_approval tool when HITL pre-built one
+        // for this build (orchestration workers set it in `create_worker`; the
+        // single-agent path leaves it unset until that surface is wired).
+        if let Some(ref approval_tool) = config.hitl_request_approval_tool {
+            builder_state = builder_state.add_tool(approval_tool.clone());
+        }
+
         // Add additional custom tools (e.g., CLI local tools in standalone mode)
         if !additional_tools.is_empty() {
             tracing::info!("Adding {} additional custom tools", additional_tools.len());
@@ -1548,6 +1555,13 @@ pub async fn build_streaming_agent(
         // Standard single-agent mode: gate client tools on the agent's TOML opt-in
         // and apply its client_tool_filter.
         tracing::info!("Building Agent (orchestration.enabled = false)");
+        if config.hitl.is_some() {
+            tracing::warn!(
+                "[hitl] is configured but orchestration is not enabled. \
+                 The HITL config gate is only composed for orchestration workers \
+                 in this phase; the [hitl] table will be ignored in single-agent mode."
+            );
+        }
         let attached = if config.agent.enable_client_tools {
             client_tools.map(|tools| {
                 tools

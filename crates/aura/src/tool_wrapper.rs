@@ -148,6 +148,15 @@ pub struct TransformOutputResult {
     pub warning: Option<String>,
 }
 
+/// Result of an async pre-call gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreCallOutcome {
+    /// Continue to the wrapped tool.
+    Proceed,
+    /// Skip the wrapped tool and return this output as a successful tool result.
+    ShortCircuit { output: String },
+}
+
 impl TransformOutputResult {
     /// Create successful result with output.
     pub fn new(output: String) -> Self {
@@ -279,6 +288,27 @@ pub trait ToolWrapper: Send + Sync {
         _ctx: &ToolCallContext,
     ) -> Result<(), ToolError> {
         Ok(())
+    }
+
+    /// Async hook called before tool execution.
+    ///
+    /// Use this for async gates that must run before the tool executes, such as
+    /// approval workflows that call external services or park for a human
+    /// decision.
+    ///
+    /// Returns [`PreCallOutcome::Proceed`] to continue, [`PreCallOutcome::ShortCircuit`]
+    /// to skip the inner tool with a model-visible result, or `Err(ToolError)`
+    /// to reject the call as a true tool error.
+    ///
+    /// `WrappedTool::call` invokes this after `validate_args` and before the
+    /// inner tool runs. Like `validate_args`, a rejection still runs
+    /// `on_complete` so wrappers can clean up.
+    async fn pre_call(
+        &self,
+        _args: &Value,
+        _ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, ToolError> {
+        Ok(PreCallOutcome::Proceed)
     }
 
     /// Async hook called after tool completion (success or failure).
@@ -430,6 +460,69 @@ where
                 return Err(validation_error);
             }
 
+            // Async pre-call gate (e.g. HITL approval): may call an external
+            // service or park for a human decision before the tool runs. Spawned
+            // (like the inner call below) so this future stays `Sync` — the
+            // async_trait `pre_call` future is `Send` but not `Sync`, and awaiting
+            // it inline would taint `call`'s returned future. Like validate_args,
+            // a rejection still runs on_complete so wrappers can clean up, and the
+            // error is returned to the LLM.
+            let pre_wrapper = wrapper.clone();
+            let pre_args = clean_args.clone();
+            let pre_ctx = ctx.clone();
+            let pre_span = tracing::Span::current();
+            let pre_handle = tokio::spawn(tracing::Instrument::instrument(
+                async move { pre_wrapper.pre_call(&pre_args, &pre_ctx).await },
+                pre_span,
+            ));
+            let pre_call_result = match pre_handle.await {
+                Ok(r) => r,
+                Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
+            };
+            match pre_call_result {
+                Ok(PreCallOutcome::Proceed) => {}
+                Ok(PreCallOutcome::ShortCircuit { output }) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+
+                    let wrapper_clone = wrapper.clone();
+                    let ctx_clone = ctx.clone();
+                    let extracted_clone = extracted.clone();
+                    let output_clone = output.clone();
+                    tokio::spawn(async move {
+                        wrapper_clone
+                            .on_complete(
+                                &ctx_clone,
+                                extracted_clone.as_ref(),
+                                Ok(&output_clone),
+                                duration_ms,
+                            )
+                            .await;
+                    });
+
+                    return Ok(output);
+                }
+                Err(pre_call_error) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let error_msg = pre_call_error.to_string();
+
+                    let wrapper_clone = wrapper.clone();
+                    let ctx_clone = ctx.clone();
+                    let extracted_clone = extracted.clone();
+                    tokio::spawn(async move {
+                        wrapper_clone
+                            .on_complete(
+                                &ctx_clone,
+                                extracted_clone.as_ref(),
+                                Err(&error_msg),
+                                duration_ms,
+                            )
+                            .await;
+                    });
+
+                    return Err(pre_call_error);
+                }
+            }
+
             // Call inner tool (spawn to handle non-Sync futures).
             // Propagate the current span so mcp.tool_call nests under execute_tool.
             let inner_clone = inner.clone();
@@ -570,6 +663,23 @@ impl ToolWrapper for ComposedWrapper {
             wrapper.validate_args(args, extracted, ctx)?;
         }
         Ok(())
+    }
+
+    async fn pre_call(
+        &self,
+        args: &Value,
+        ctx: &ToolCallContext,
+    ) -> Result<PreCallOutcome, ToolError> {
+        // Forward to each wrapper in order, short-circuiting on the first
+        // non-proceed outcome. Without this, a composed gate (e.g. HITL) would
+        // silently inherit the no-op default and never run.
+        for wrapper in &self.wrappers {
+            match wrapper.pre_call(args, ctx).await? {
+                PreCallOutcome::Proceed => {}
+                outcome @ PreCallOutcome::ShortCircuit { .. } => return Ok(outcome),
+            }
+        }
+        Ok(PreCallOutcome::Proceed)
     }
 
     fn transform_output(
@@ -779,5 +889,146 @@ mod tests {
 
         assert_eq!(modified["field_a"], true);
         assert_eq!(modified["field_b"], true);
+    }
+
+    #[derive(Clone)]
+    struct RecordingInner {
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RigTool for RecordingInner {
+        const NAME: &'static str = "recording_inner";
+        type Error = ToolError;
+        type Args = Value;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<String, ToolError> {
+            self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("ran".to_string())
+        }
+    }
+
+    struct RejectingPreCall;
+
+    #[async_trait]
+    impl ToolWrapper for RejectingPreCall {
+        async fn pre_call(
+            &self,
+            _args: &Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<PreCallOutcome, ToolError> {
+            Err(ToolError::ToolCallError(
+                "rejected by pre_call".to_string().into(),
+            ))
+        }
+    }
+
+    struct ShortCircuitPreCall;
+
+    #[async_trait]
+    impl ToolWrapper for ShortCircuitPreCall {
+        async fn pre_call(
+            &self,
+            _args: &Value,
+            _ctx: &ToolCallContext,
+        ) -> Result<PreCallOutcome, ToolError> {
+            Ok(PreCallOutcome::ShortCircuit {
+                output: "blocked with feedback".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_call_rejection_blocks_inner_tool() {
+        use std::sync::atomic::Ordering;
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner = RecordingInner { ran: ran.clone() };
+        let wrapped = WrappedTool::new(inner, Arc::new(RejectingPreCall) as Arc<dyn ToolWrapper>);
+
+        let result = wrapped.call(serde_json::json!({})).await;
+
+        assert!(
+            result.is_err(),
+            "pre_call rejection must reject the tool call"
+        );
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "inner tool must not run when pre_call rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_call_short_circuit_returns_feedback_without_inner_tool_error() {
+        use std::sync::atomic::Ordering;
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inner = RecordingInner { ran: ran.clone() };
+        let wrapped =
+            WrappedTool::new(inner, Arc::new(ShortCircuitPreCall) as Arc<dyn ToolWrapper>);
+
+        let result = wrapped.call(serde_json::json!({})).await;
+
+        assert_eq!(result.unwrap(), "blocked with feedback");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "inner tool must not run when pre_call short-circuits"
+        );
+    }
+
+    #[tokio::test]
+    async fn composed_pre_call_short_circuits_on_first_rejection() {
+        use std::sync::atomic::Ordering;
+
+        struct Reject;
+        #[async_trait]
+        impl ToolWrapper for Reject {
+            async fn pre_call(
+                &self,
+                _a: &Value,
+                _c: &ToolCallContext,
+            ) -> Result<PreCallOutcome, ToolError> {
+                Err(ToolError::ToolCallError("rejected".to_string().into()))
+            }
+        }
+
+        struct Record(Arc<std::sync::atomic::AtomicBool>);
+        #[async_trait]
+        impl ToolWrapper for Record {
+            async fn pre_call(
+                &self,
+                _a: &Value,
+                _c: &ToolCallContext,
+            ) -> Result<PreCallOutcome, ToolError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(PreCallOutcome::Proceed)
+            }
+        }
+
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let composed = ComposedWrapper::new(vec![
+            Arc::new(Reject) as Arc<dyn ToolWrapper>,
+            Arc::new(Record(second_ran.clone())) as Arc<dyn ToolWrapper>,
+        ]);
+
+        let ctx = ToolCallContext::new("t");
+        let result = composed.pre_call(&serde_json::json!({}), &ctx).await;
+
+        assert!(
+            result.is_err(),
+            "composed pre_call must surface the rejection"
+        );
+        assert!(
+            !second_ran.load(Ordering::SeqCst),
+            "wrappers after the first rejection must not run"
+        );
     }
 }

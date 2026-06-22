@@ -23,6 +23,10 @@ pub struct Config {
     /// Orchestration mode configuration (multi-agent workflows)
     #[serde(default)]
     pub orchestration: Option<OrchestrationConfig>,
+    /// Human-in-the-loop approval gating. `None` (no `[hitl]` table) disables
+    /// it; presence of the table is the enable bit.
+    #[serde(default)]
+    pub hitl: Option<HitlConfig>,
 }
 
 /// Reasoning effort level for GPT-5 models
@@ -375,6 +379,15 @@ impl Config {
         // Scratchpad validation
         self.validate_scratchpad()?;
 
+        if let (Some(hitl), Some(orch)) = (
+            &self.hitl,
+            self.orchestration.as_ref().filter(|o| o.enabled),
+        ) && let Some(msg) =
+            hitl_timeout_conflict_warning(hitl, orch.timeouts.per_call_timeout_secs)
+        {
+            tracing::warn!("{msg}");
+        }
+
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
         }
@@ -442,6 +455,30 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+/// Warn when a HITL route timeout >= orchestration per-call timeout.
+///
+/// A parked tool call that outlives its task budget gets killed by the
+/// per-call timeout instead of the approval's own timeout, with a misleading
+/// "LLM provider did not respond" error. Returns `None` when there is no
+/// conflict: no HITL config, per-call timeout disabled (0), or route timeout
+/// strictly less than per-call timeout.
+fn hitl_timeout_conflict_warning(hitl: &HitlConfig, per_call_timeout_secs: u64) -> Option<String> {
+    if per_call_timeout_secs == 0 {
+        return None;
+    }
+    let route_timeout = match &hitl.route {
+        DecisionRouteConfig::Webhook { timeout_secs, .. } => *timeout_secs,
+        DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
+    };
+    if route_timeout >= per_call_timeout_secs {
+        Some(format!(
+            "hitl route timeout ({route_timeout}s) is greater than or equal to the orchestration per-call timeout ({per_call_timeout_secs}s); parked approvals may be killed by the per-call timeout before they fire, producing a misleading 'LLM provider did not respond' error"
+        ))
+    } else {
+        None
     }
 }
 
@@ -895,5 +932,202 @@ mod tests {
     fn test_glob_match_star_only() {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn test_hitl_timeout_conflict_disabled_per_call_timeout() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            route: DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("http://localhost:9999").unwrap(),
+                timeout_secs: 300,
+            },
+        };
+        assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
+    }
+
+    #[test]
+    fn test_hitl_timeout_conflict_route_timeout_less_than_per_call() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            route: DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("http://localhost:9999").unwrap(),
+                timeout_secs: 30,
+            },
+        };
+        assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
+    }
+
+    #[test]
+    fn test_hitl_timeout_conflict_route_timeout_equals_per_call() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            route: DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("http://localhost:9999").unwrap(),
+                timeout_secs: 60,
+            },
+        };
+        let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
+        assert!(msg.contains("60s"));
+        assert!(msg.contains("LLM provider did not respond"));
+    }
+
+    #[test]
+    fn test_hitl_timeout_conflict_route_timeout_greater_than_per_call() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            route: DecisionRouteConfig::Webhook {
+                url: WebhookUrl::new("http://localhost:9999").unwrap(),
+                timeout_secs: 120,
+            },
+        };
+        let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
+        assert!(msg.contains("120s"));
+        assert!(msg.contains("60s"));
+        assert!(msg.contains("LLM provider did not respond"));
+    }
+
+    #[test]
+    fn test_hitl_timeout_conflict_conversational_variant() {
+        let hitl = HitlConfig {
+            require_approval: vec![],
+            route: DecisionRouteConfig::Conversational { timeout_secs: 120 },
+        };
+        let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
+        assert!(msg.contains("120s"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HITL approval configuration
+// ---------------------------------------------------------------------------
+//
+// Parse-time `[hitl]` config types. They live in aura-config (the lower layer
+// after the PR #201 dependency inversion); the runtime domain lives in
+// `aura::hitl`. These are declarative DTOs — fully implemented, no holes.
+
+/// `[hitl]` config table. `Option<HitlConfig>` on [`Config`] is the enable bit;
+/// there is no `enabled` bool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HitlConfig {
+    /// Glob patterns whose match gates a tool call. Compiled at TOML load.
+    #[serde(default)]
+    pub require_approval: Vec<GlobPattern>,
+    /// The decision route; required when `[hitl]` is present.
+    pub route: DecisionRouteConfig,
+}
+
+/// `[hitl.route]` table. The `Webhook` variant cannot parse without a valid
+/// URL, so the "url required, never empty" invariant holds structurally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DecisionRouteConfig {
+    /// Attended: the approver is already at the client (default timeout 60s).
+    Conversational {
+        #[serde(default = "default_conversational_timeout_secs")]
+        timeout_secs: u64,
+    },
+    /// Unattended: the webhook may page a human or route through chat ops
+    /// (default timeout 300s).
+    Webhook {
+        url: WebhookUrl,
+        #[serde(default = "default_webhook_timeout_secs")]
+        timeout_secs: u64,
+    },
+}
+
+fn default_conversational_timeout_secs() -> u64 {
+    60
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    300
+}
+
+/// A validated webhook URL.
+///
+/// NOTE (skeleton): validation is a minimal scheme check; aura-config has no
+/// URL-parsing crate today, so a full parse is a hole-fill decision.
+#[derive(Debug, Clone)]
+pub struct WebhookUrl(String);
+
+impl WebhookUrl {
+    /// Validate and wrap a webhook URL. Rejects anything without an http(s) scheme.
+    pub fn new(raw: impl Into<String>) -> Result<Self, WebhookUrlError> {
+        let raw = raw.into();
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            Ok(Self(raw))
+        } else {
+            Err(WebhookUrlError::MissingHttpScheme)
+        }
+    }
+
+    /// The URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a [`WebhookUrl`] could not be constructed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WebhookUrlError {
+    #[error("webhook url must start with http:// or https://")]
+    MissingHttpScheme,
+}
+
+impl Serialize for WebhookUrl {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WebhookUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A tool-name glob pattern, compiled to a matcher at TOML load. Keeps its
+/// source text alongside the compiled matcher; the wire `matched_pattern` is the
+/// source string.
+#[derive(Debug, Clone)]
+pub struct GlobPattern {
+    source: String,
+    matcher: globset::GlobMatcher,
+}
+
+impl GlobPattern {
+    /// Compile a glob pattern from its source text.
+    pub fn new(source: impl Into<String>) -> Result<Self, globset::Error> {
+        let source = source.into();
+        let matcher = globset::Glob::new(&source)?.compile_matcher();
+        Ok(Self { source, matcher })
+    }
+
+    /// The original pattern text (the wire `matched_pattern`).
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.source
+    }
+
+    /// Whether `tool_name` matches this pattern.
+    #[must_use]
+    pub fn matches(&self, tool_name: &str) -> bool {
+        self.matcher.is_match(tool_name)
+    }
+}
+
+impl Serialize for GlobPattern {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.source)
+    }
+}
+
+impl<'de> Deserialize<'de> for GlobPattern {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let source = String::deserialize(deserializer)?;
+        Self::new(source).map_err(serde::de::Error::custom)
     }
 }

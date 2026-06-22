@@ -682,6 +682,46 @@ impl Orchestrator {
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
+
+        // HITL config gate. When `[hitl]` is configured, gate matching worker
+        // tool calls behind the decision route, and pre-build the agent-callable
+        // `request_approval` tool with the same scope/route (attached by
+        // `add_all_tools` via `hitl_request_approval_tool`). The gate is composed
+        // FIRST so its `pre_call` runs before every other wrapper and a denial
+        // short-circuits the call — `ComposedWrapper::pre_call` iterates the vec
+        // front-to-back. The gate only implements `pre_call`, so prepending it
+        // leaves the documented `transform_output` ordering above untouched.
+        if let Some(hitl) = worker_config.hitl.clone() {
+            let (run_id_str, session_id_owned) = {
+                let p = self.persistence.lock().await;
+                (p.run_id().to_string(), p.session_id().map(String::from))
+            };
+            let run_id = run_id_str.parse::<super::RunId>().map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("HITL: orchestration run id '{run_id_str}' is not a valid UUID: {e}")
+                        .into()
+                },
+            )?;
+            let scope = crate::hitl::AgentScope::Worker {
+                run_id,
+                task: super::TaskIdentity::new(task_id, worker_name.map(String::from)),
+                session_id: session_id_owned.map(crate::config::SessionId::new),
+            };
+            let request_id = worker_config.request_id.clone().unwrap_or_default();
+            let gate = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                hitl.patterns.clone(),
+                hitl.route.clone(),
+                scope.clone(),
+                request_id.clone(),
+            ));
+            wrappers.insert(0, gate);
+            worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
+                hitl.route.clone(),
+                scope,
+                request_id,
+            ));
+        }
+
         let wrapper: Arc<dyn ToolWrapper> = Arc::new(ComposedWrapper::new(wrappers));
 
         // Configure worker based on assignment

@@ -320,6 +320,12 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted when a HITL approval request is raised.
+    ApprovalRequested(ApprovalRequested),
+    /// Emitted when a HITL approval is awaiting an attended decision.
+    ApprovalPending(ApprovalPending),
+    /// Emitted when a HITL approval reaches a terminal outcome.
+    ApprovalCompleted(ApprovalCompleted),
     /// Emitted at stream start with the connection status of every configured
     /// MCP server. Lets clients distinguish between "server connected", "server has no tools"
     /// "server is configured but unavailable", (auth failure, connection refused), etc...
@@ -347,6 +353,9 @@ impl AuraStreamEvent {
             Self::ToolUsage { .. } => event_names::TOOL_USAGE,
             Self::Usage { .. } => event_names::USAGE,
             Self::ScratchpadUsage { .. } => event_names::SCRATCHPAD_USAGE,
+            Self::ApprovalRequested(_) => event_names::APPROVAL_REQUESTED,
+            Self::ApprovalPending(_) => event_names::APPROVAL_PENDING,
+            Self::ApprovalCompleted(_) => event_names::APPROVAL_COMPLETED,
             Self::McpStatus { .. } => event_names::MCP_STATUS,
         }
     }
@@ -640,4 +649,140 @@ mod tests {
             other => panic!("expected ToolRequested, got {:?}", other),
         }
     }
+
+    #[test]
+    fn approval_completed_error_roundtrip_and_event_name() {
+        let event = AuraStreamEvent::ApprovalCompleted(ApprovalCompleted {
+            decision_id: "019edead-beef-7000-8000-000000000001".to_string(),
+            outcome: ApprovalOutcomeWire::Errored {
+                message: "approval webhook returned status 500".to_string(),
+            },
+            duration_ms: 42,
+            scope: AgentScopeWire::Worker {
+                run_id: "019edead-beef-7000-8000-000000000002".to_string(),
+                task_id: 3,
+                worker: Some("ops".to_string()),
+                session_id: None,
+            },
+        });
+
+        assert_eq!(event.event_name(), "aura.approval_completed");
+        let sse = event.format_sse();
+        assert!(sse.starts_with("event: aura.approval_completed\n"));
+        assert!(sse.contains("\"kind\":\"errored\""));
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: AuraStreamEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AuraStreamEvent::ApprovalCompleted(completed) => {
+                assert_eq!(
+                    completed.decision_id,
+                    "019edead-beef-7000-8000-000000000001"
+                );
+                assert_eq!(completed.duration_ms, 42);
+                assert!(matches!(
+                    completed.outcome,
+                    ApprovalOutcomeWire::Errored { .. }
+                ));
+            }
+            other => panic!("expected ApprovalCompleted, got {:?}", other),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HITL approval SSE DTOs
+// ---------------------------------------------------------------------------
+//
+// Serde-only wire mirrors for the HITL approval lifecycle. No behavior; the
+// `aura` crate's `hitl::events` module is the single boundary that converts the
+// domain types into these.
+
+/// Why this approval was raised.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalOriginWire {
+    ConfigGate { matched_pattern: String },
+    AgentRequested { reason: String },
+}
+
+/// Which agent surface is asking for approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentScopeWire {
+    Single {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    Worker {
+        run_id: String,
+        task_id: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    Coordinator {
+        run_id: String,
+    },
+}
+
+/// The terminal outcome of an approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalOutcomeWire {
+    Approved,
+    Denied {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    TimedOut {
+        waited_ms: u64,
+    },
+    Cancelled {
+        reason: CancelReasonWire,
+    },
+    Errored {
+        message: String,
+    },
+}
+
+/// Why a pending approval was cancelled rather than decided or timed out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelReasonWire {
+    ClientDisconnected,
+    Shutdown,
+    SenderDropped,
+}
+
+/// `approval_requested`: an approval was raised (emitted on both routes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequested {
+    pub decision_id: String,
+    pub tool_name: String,
+    pub origin: ApprovalOriginWire,
+    pub scope: AgentScopeWire,
+}
+
+/// `approval_pending`: the attended prompt; conversational route only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalPending {
+    pub decision_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub origin: ApprovalOriginWire,
+    pub scope: AgentScopeWire,
+    /// RFC3339 instant after which the pending approval expires.
+    pub expires_at: String,
+}
+
+/// `approval_completed`: terminal outcome (both routes; the outcome enum
+/// includes timeout / cancelled, not just approve/deny).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalCompleted {
+    pub decision_id: String,
+    pub outcome: ApprovalOutcomeWire,
+    pub duration_ms: u64,
+    pub scope: AgentScopeWire,
 }
