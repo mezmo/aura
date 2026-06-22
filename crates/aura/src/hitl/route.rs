@@ -89,7 +89,11 @@ pub enum DecisionRoute {
 impl DecisionRoute {
     /// Obtain a decision for `request`, applying the shared semantics (deadline,
     /// fail-closed mapping, event emission) in one place.
-    pub async fn decide(&self, request: ApprovalRequest) -> Result<ApprovalOutcome, ApprovalError> {
+    pub async fn decide(
+        &self,
+        request: ApprovalRequest,
+        _cancel: &crate::request_cancellation::RequestCancelToken,
+    ) -> Result<ApprovalOutcome, ApprovalError> {
         let started = Instant::now();
         let request_id = request.request_id.clone();
         let decision_id = request.decision_id;
@@ -324,7 +328,8 @@ mod tests {
             origin: ApprovalOrigin::AgentRequested { reason: "x".into() },
             items: vec![],
         };
-        let _ = route.decide(request).await;
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let _ = route.decide(request, &cancel).await;
     }
 
     #[tokio::test]
@@ -352,7 +357,8 @@ mod tests {
             }],
         };
 
-        let result = route.decide(request).await;
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let result = route.decide(request, &cancel).await;
         assert!(result.is_err(), "discard-port webhook should fail closed");
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())

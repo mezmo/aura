@@ -100,7 +100,9 @@ impl Tool for RequestApprovalTool {
                 arguments: serde_json::to_value(&args).unwrap_or_default(),
             }],
         };
-        match self.route.decide(request).await {
+        let cancel = crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
+            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        match self.route.decide(request, &cancel).await {
             Ok(ApprovalOutcome::Decided(ApprovalDecision::Approved)) => Ok(format!(
                 "Approved. You may proceed with: {}",
                 args.action_description
