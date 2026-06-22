@@ -28,10 +28,10 @@ use super::types::{
 };
 use aura::stream_events::AuraStreamEvent;
 use aura::{
-    EventContext, OrchestrationStreamEvent, OrchestratorEvent, PASSTHROUGH_MARKER,
-    ProgressNotification, RequestCancellation, ResponseContent, StreamError, StreamItem,
-    StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall, ToolLifecycleEvent,
-    ToolResult, ToolUsageEvent, UsageState,
+    ApprovalLifecycleEvent, EventContext, OrchestrationStreamEvent, OrchestratorEvent,
+    PASSTHROUGH_MARKER, ProgressNotification, RequestCancellation, ResponseContent, StreamError,
+    StreamItem, StreamedAssistantContent, StreamedUserContent, StreamingAgent, ToolCall,
+    ToolLifecycleEvent, ToolResult, ToolUsageEvent, UsageState,
 };
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -51,6 +51,8 @@ pub struct StreamingCallbacks {
     pub progress_rx: mpsc::Receiver<ProgressNotification>,
     /// Tool usage event receiver (for aura.tool_usage events from hook)
     pub tool_usage_rx: mpsc::Receiver<ToolUsageEvent>,
+    /// HITL approval lifecycle event receiver (always emitted, not gated by AURA_CUSTOM_EVENTS)
+    pub approval_event_rx: mpsc::Receiver<ApprovalLifecycleEvent>,
     /// Shared usage state for reading final usage at stream end
     pub usage_state: UsageState,
     /// Shared response content for OTel span recording at stream end
@@ -272,6 +274,27 @@ where
                     };
                     if tx.send(Ok(Bytes::from(sse_event.format_sse()))).await.is_err() {
                         tracing::info!("Client disconnected during tool event");
+                        break StreamTermination::Disconnected;
+                    }
+                }
+            }
+
+            // HITL approval lifecycle events are protocol, not optional telemetry.
+            approval_event = callbacks.approval_event_rx.recv() => {
+                if let Some(approval_event) = approval_event {
+                    let event = match approval_event {
+                        ApprovalLifecycleEvent::Requested(requested) => {
+                            AuraStreamEvent::ApprovalRequested(requested)
+                        }
+                        ApprovalLifecycleEvent::Pending(pending) => {
+                            AuraStreamEvent::ApprovalPending(pending)
+                        }
+                        ApprovalLifecycleEvent::Completed(completed) => {
+                            AuraStreamEvent::ApprovalCompleted(completed)
+                        }
+                    };
+                    if tx.send(Ok(Bytes::from(event.format_sse()))).await.is_err() {
+                        tracing::info!("Client disconnected during approval event");
                         break StreamTermination::Disconnected;
                     }
                 }

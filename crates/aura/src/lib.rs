@@ -5,6 +5,7 @@
 //! in web services or other applications that need to build agents
 //! programmatically.
 
+pub mod approval_event_broker;
 pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod env_flags;
 pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
+pub mod hitl;
 pub mod logging;
 pub mod mcp;
 pub mod mcp_dynamic;
@@ -45,7 +47,7 @@ pub mod vector_dynamic;
 pub mod vector_store;
 
 pub use builder::{Agent, AgentBuilder, FilesystemTools, build_streaming_agent};
-pub use config::{AgentRuntimeConfig, ToolContextFactory};
+pub use config::{AgentRuntimeConfig, SessionId, ToolContextFactory};
 // Pure config types are owned by `aura-config` and re-exported here for
 // ergonomic consumption (`aura::LlmConfig`, etc.).
 pub use aura_config::{
@@ -59,8 +61,8 @@ pub use orchestration::tools::{
 };
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
-    OrchestratorEvent, OrchestratorFactory, Plan, PlanningResponse, RoutingMode, Task, TaskJson,
-    TaskState, TaskStatus, TimeoutsConfig,
+    OrchestratorEvent, OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task,
+    TaskIdentity, TaskJson, TaskState, TaskStatus, TimeoutsConfig,
 };
 pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{
@@ -85,6 +87,10 @@ pub type AuraToolCall = provider_agent::ToolCall;
 #[deprecated(since = "1.2.0", note = "use ToolResult instead")]
 pub type AuraToolResult = provider_agent::ToolResult;
 
+pub use approval_event_broker::{
+    ApprovalEventBroker, ApprovalLifecycleEvent, subscribe as approval_event_subscribe,
+    unsubscribe as approval_event_unsubscribe,
+};
 pub use mcp::McpManager;
 pub use mcp_progress::ProgressEnabledHandler;
 pub use mcp_streamable_http::InFlightRequests;

@@ -15,3 +15,6 @@ pub const WORKER_PHASE: &str = "aura.worker_phase";
 pub const TOOL_USAGE: &str = "aura.tool_usage";
 pub const USAGE: &str = "aura.usage";
 pub const SCRATCHPAD_USAGE: &str = "aura.scratchpad_usage";
+pub const APPROVAL_REQUESTED: &str = "aura.approval_requested";
+pub const APPROVAL_PENDING: &str = "aura.approval_pending";
+pub const APPROVAL_COMPLETED: &str = "aura.approval_completed";

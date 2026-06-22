@@ -6,8 +6,10 @@
 //! persistence handles, shared chat history, scratchpad runtime state, and the
 //! session id.
 
+use crate::hitl::HitlRuntime;
 use crate::scratchpad::ScratchpadToolsConfig;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // Re-export the pure config types from `aura-config` so existing
@@ -20,6 +22,29 @@ pub use aura_config::{
 
 /// Type alias for tool context factory function.
 pub type ToolContextFactory = Arc<dyn Fn(&str) -> ToolCallContext + Send + Sync>;
+
+/// Identifier for a chat session — the conversational context an agent runs in.
+///
+/// Threaded from the web server's `chat_session_id`, but meaningful for any
+/// agent run, including library use without the web layer; not every run has
+/// one. An opaque, branded string. Serializes as the bare string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Wrap a session-id string. Accepts a `&str` or an owned `String`.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrow the underlying id as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Runtime build context for constructing agents.
 ///
@@ -86,6 +111,24 @@ pub struct AgentRuntimeConfig {
     /// Shared decision state for worker `submit_result` tool.
     /// When set, workers get the `submit_result` tool for structured output.
     pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
+
+    /// Resolved HITL approval runtime (compiled globs + decision route), built
+    /// from `[hitl]` once per request and shared with orchestration workers.
+    /// `None` disables approval gating.
+    pub hitl: Option<HitlRuntime>,
+
+    /// Request id (`req_…`) for this build, used to stamp HITL approval requests
+    /// and route their SSE events. Threaded from the web server so the
+    /// single-agent and orchestration paths share one value.
+    pub request_id: Option<String>,
+
+    /// Per-worker `request_approval` tool, pre-built in `create_worker` with the
+    /// worker's [`AgentScope`] so the agent-callable approval surface is attached
+    /// to orchestration workers. `None` leaves it unattached — the single-agent
+    /// path does not set it yet.
+    ///
+    /// [`AgentScope`]: crate::hitl::AgentScope
+    pub hitl_request_approval_tool: Option<crate::hitl::RequestApprovalTool>,
 }
 
 // Manual Clone implementation because Arc<dyn Trait> fields require special handling
@@ -109,6 +152,9 @@ impl Clone for AgentRuntimeConfig {
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
+            hitl: self.hitl.clone(),
+            request_id: self.request_id.clone(),
+            hitl_request_approval_tool: self.hitl_request_approval_tool.clone(),
         }
     }
 }
@@ -154,6 +200,15 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .orchestration_submit_result
                     .as_ref()
                     .map(|_| "<submit_result>"),
+            )
+            .field("hitl", &self.hitl.as_ref().map(|_| "<hitl>"))
+            .field("request_id", &self.request_id)
+            .field(
+                "hitl_request_approval_tool",
+                &self
+                    .hitl_request_approval_tool
+                    .as_ref()
+                    .map(|_| "<request_approval>"),
             )
             .finish()
     }
