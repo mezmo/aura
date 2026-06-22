@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.26.1](https://github.com/mezmo/aura/compare/v1.26.0...v1.26.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* **context-flood**: route read_artifact through the scratchpad [0596c43](https://github.com/mezmo/aura/commit/0596c43c4e1a41464181771c55b0649e0d8cc9b7) - Justin Gross [#125](https://github.com/mezmo/aura/issues/125)
+
 # [1.26.0](https://github.com/mezmo/aura/compare/v1.25.0...v1.26.0) (2026-06-19)
 
 
