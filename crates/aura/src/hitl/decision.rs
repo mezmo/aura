@@ -11,9 +11,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
+
+use crate::request_cancellation::RequestCancelToken;
 
 use crate::config::SessionId;
 use crate::orchestration::{RunId, TaskIdentity};
@@ -146,7 +147,7 @@ impl AwaitingDecision {
 
     /// Await the terminal outcome: a posted decision, the deadline, or
     /// cancellation (client disconnect / shutdown), whichever fires first.
-    pub async fn outcome(self, cancel: &CancellationToken) -> ApprovalOutcome {
+    pub async fn outcome(self, cancel: &RequestCancelToken) -> ApprovalOutcome {
         let start = Instant::now();
         tokio::select! {
             // Fail closed: once the request is cancelled, do not let an already
@@ -180,7 +181,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_secs(60);
         let awaiting = AwaitingDecision::new(DecisionId::generate(), rx, deadline);
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         tx.send(ApprovalDecision::Approved).unwrap();
 
@@ -195,7 +196,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_secs(60);
         let awaiting = AwaitingDecision::new(DecisionId::generate(), rx, deadline);
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         tx.send(ApprovalDecision::Denied {
             reason: Some("no".to_owned()),
@@ -215,7 +216,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_secs(60);
         let awaiting = AwaitingDecision::new(DecisionId::generate(), rx, deadline);
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         drop(tx);
 
@@ -230,7 +231,7 @@ mod tests {
         let (_tx, rx) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_secs(5);
         let awaiting = AwaitingDecision::new(DecisionId::generate(), rx, deadline);
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         let outcome = awaiting.outcome(&cancel);
         let advance = time::advance(Duration::from_secs(6));
@@ -249,7 +250,7 @@ mod tests {
         let (_tx, rx) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_secs(60);
         let awaiting = AwaitingDecision::new(DecisionId::generate(), rx, deadline);
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         cancel.cancel();
 

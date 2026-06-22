@@ -8,12 +8,38 @@ use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tracing::{debug, info};
 
 use crate::mcp_streamable_http::McpClient;
 
 pub type RequestId = String;
+
+/// Request-scoped cancellation signal. Fired by the handler on client
+/// disconnect, timeout, or server shutdown. Observed by MCP notifications,
+/// HITL approval gates, and resource cleanup.
+#[derive(Clone)]
+pub struct RequestCancelToken(CancellationToken);
+
+impl RequestCancelToken {
+    pub fn cancelled(&self) -> WaitForCancellationFuture<'_> {
+        self.0.cancelled()
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// A token that is never cancelled. Used when no request-level
+    /// cancellation is registered (e.g. CLI standalone mode).
+    pub fn unbound() -> Self {
+        Self(CancellationToken::new())
+    }
+}
 
 struct Registry {
     requests: RwLock<HashMap<RequestId, CancellationToken>>,
@@ -36,7 +62,7 @@ fn registry() -> &'static Registry {
 /// Per-request cancellation context
 #[derive(Clone)]
 pub struct RequestCancellation {
-    pub token: CancellationToken,
+    pub token: RequestCancelToken,
     pub request_id: RequestId,
 }
 
@@ -44,7 +70,7 @@ impl RequestCancellation {
     /// Register a new request in the global cancellation registry.
     pub fn register(request_id: impl Into<RequestId>) -> Self {
         let request_id = request_id.into();
-        let token = CancellationToken::new();
+        let raw = CancellationToken::new();
 
         registry()
             .requests
@@ -53,11 +79,28 @@ impl RequestCancellation {
                 tracing::error!("Cancellation registry write lock poisoned, recovering");
                 poisoned.into_inner()
             })
-            .insert(request_id.clone(), token.clone());
+            .insert(request_id.clone(), raw.clone());
 
         debug!("Registered cancellation for request '{}'", request_id);
 
-        Self { token, request_id }
+        Self {
+            token: RequestCancelToken(raw),
+            request_id,
+        }
+    }
+
+    /// Look up the cancel token for a request id. Returns `None` if the
+    /// request was never registered (e.g. CLI standalone mode).
+    pub fn token_for_id(request_id: &str) -> Option<RequestCancelToken> {
+        registry()
+            .requests
+            .read()
+            .unwrap_or_else(|poisoned| {
+                tracing::error!("Cancellation registry read lock poisoned, recovering");
+                poisoned.into_inner()
+            })
+            .get(request_id)
+            .map(|raw| RequestCancelToken(raw.clone()))
     }
 
     /// Cancel a request by ID. Called on timeout or client disconnect.
