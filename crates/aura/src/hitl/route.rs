@@ -39,14 +39,14 @@ impl HitlRuntime {
     /// compiled globs and build the decision route once (the webhook client and
     /// its connection pool are created here).
     #[must_use]
-    pub fn from_config(config: &HitlConfig) -> Self {
+    pub fn from_config(config: &HitlConfig, pending_approvals: &PendingApprovals) -> Self {
         let route = match &config.route {
             DecisionRouteConfig::Webhook { url, timeout_secs } => DecisionRoute::Webhook {
                 client: WebhookClient::new(build_webhook_client(), url.clone()),
                 timeout: Duration::from_secs(*timeout_secs),
             },
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
-                registry: PendingApprovals::new(),
+                registry: pending_approvals.clone(),
                 timeout: Duration::from_secs(*timeout_secs),
             },
         };
