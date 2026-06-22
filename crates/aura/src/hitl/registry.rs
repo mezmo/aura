@@ -130,7 +130,7 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use tokio_util::sync::CancellationToken;
+    use crate::request_cancellation::RequestCancelToken;
 
     use super::*;
     use crate::hitl::decision::{
@@ -160,7 +160,7 @@ mod tests {
         let req = test_request("req-1");
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60));
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         registry
             .resolve(&id, ApprovalDecision::Approved)
@@ -178,7 +178,7 @@ mod tests {
         let req = test_request("req-2");
         let id = req.decision_id;
         let handle = registry.register(req, Duration::from_secs(60));
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         registry
             .resolve(
@@ -231,7 +231,7 @@ mod tests {
         let id_b = req_b.decision_id;
         let handle_a = registry.register(req_a, Duration::from_secs(60));
         let handle_b = registry.register(req_b, Duration::from_secs(60));
-        let cancel = CancellationToken::new();
+        let cancel = RequestCancelToken::unbound();
 
         registry.cancel_request("req-cancel");
 
