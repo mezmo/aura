@@ -54,6 +54,24 @@ fn main() -> Result<()> {
         aura_cli::logging::init(config.log_file.as_deref(), is_standalone)?;
     }
 
+    // Telemetry init runs inside the runtime so the background batch task
+    // can spawn cleanly. See `docs/telemetry.md` for the user-facing
+    // contract; the bootstrap helper centralises env-var resolution.
+    // `cli_session_started` is captured by `run_repl` once the session is
+    // Enabled (a recorded preference, or the first-message consent gate),
+    // never here — emitting during `Unknown` would be held/no-backfill,
+    // and it must not fire for one-shot `--query` at all.
+    let telemetry = {
+        let _enter = rt.enter();
+        let tcfg =
+            aura_telemetry::bootstrap::build_config_from_env_and_file(config.telemetry.as_ref());
+        tracing::info!(
+            "{}",
+            aura_telemetry::bootstrap::startup_log_line(&tcfg.state)
+        );
+        aura_telemetry::init(tcfg)
+    };
+
     // Make sure `~/.aura/cli.toml` exists and has a `style` line. First-run
     // users get a discoverable file with `style = "normal"` they can edit.
     // Failure is silent — read-only filesystems and weird home setups
@@ -142,8 +160,22 @@ fn main() -> Result<()> {
         }
         run_oneshot(&rt, config, permissions, &backend)
     } else {
-        run_repl(&rt, config, permissions, &backend, post_launch_warning)
+        run_repl(
+            &rt,
+            config,
+            permissions,
+            &backend,
+            post_launch_warning,
+            &telemetry,
+            is_standalone,
+        )
     };
+
+    // Drain telemetry before the runtime drops. Two-second budget; if the
+    // network sink is hanging we exit anyway — telemetry must never block
+    // user-facing shutdown. (One-shot never enabled it, so this is a
+    // cheap no-op there.)
+    rt.block_on(telemetry.shutdown(std::time::Duration::from_secs(2)));
 
     // Flush any buffered OTel spans before `rt` drops — the
     // `BatchSpanProcessor` exports on a timer (~5s) and we'd lose the

@@ -197,6 +197,80 @@ fn aura_log_file_env_is_picked_up() {
     );
 }
 
+#[test]
+fn init_leaves_telemetry_unknown_and_silent() {
+    // `aura init` runs before the telemetry bootstrap and must never
+    // prompt for, enable, or send telemetry: it writes only the agent
+    // config (and optionally .env), never `~/.aura/cli.toml`, so the
+    // telemetry state stays Unknown. This pins all four properties:
+    // no notice, no [telemetry] preference written, no inspection-log
+    // file created, and a clean exit.
+    let work = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let out = work.path().join("config.toml");
+
+    let output = aura_cli()
+        // Sandbox the home dir so we never touch the developer's
+        // ~/.aura, and so we can assert nothing was created there.
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        // Make sure no kill switch is what's keeping it quiet — the
+        // point is that init never reaches telemetry at all.
+        .env_remove("DO_NOT_TRACK")
+        .env_remove("AURA_TELEMETRY_DISABLED")
+        .env_remove("CI")
+        .current_dir(work.path())
+        .arg("init")
+        .arg("--non-interactive")
+        .arg("--offline")
+        .arg("--provider")
+        .arg("openai")
+        .arg("--model")
+        .arg("gpt-5.5")
+        .arg("--output")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "aura init should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The first-run notice must never appear during init.
+    assert!(
+        !combined.contains("anonymous usage telemetry"),
+        "init must not print the telemetry notice; output:\n{combined}"
+    );
+
+    // No telemetry preference written into cli.toml.
+    let cli_toml = home.path().join(".aura").join("cli.toml");
+    if cli_toml.is_file() {
+        let contents = std::fs::read_to_string(&cli_toml).unwrap();
+        assert!(
+            !contents.contains("[telemetry]"),
+            "init must not write a [telemetry] section; cli.toml:\n{contents}"
+        );
+    }
+
+    // No inspection log created — init never initialised telemetry.
+    let events = home
+        .path()
+        .join(".aura")
+        .join("telemetry")
+        .join("events.jsonl");
+    assert!(
+        !events.exists(),
+        "init must not create the telemetry inspection log"
+    );
+}
+
 #[cfg(feature = "standalone-cli")]
 #[test]
 fn standalone_otel_init_does_not_panic_without_collector() {

@@ -4,3 +4,4 @@ pub mod history;
 pub mod input_reader;
 pub mod r#loop;
 pub mod registry;
+pub mod telemetry_notice;
