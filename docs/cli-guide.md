@@ -7,18 +7,26 @@ Interactive terminal client for Aura with conversation persistence, streaming re
 ### Build the CLI
 
 ```bash
-# HTTP-only mode (connects to an aura-web-server)
+# Default build — includes standalone support (builds agents in-process from TOML config)
 cargo build -p aura-cli --release
 
-# Standalone mode (builds agents in-process from TOML config)
-cargo build -p aura-cli --release --features standalone-cli
+# HTTP-only build (connects to an aura-web-server; no in-process agents)
+cargo build -p aura-cli --release --no-default-features
 ```
 
-The binary is at `target/release/aura-cli`.
+The binary is at `target/release/aura-cli`. The `standalone-cli` feature is on by default, so the standard build runs both backends. Use `--no-default-features` only when you want an HTTP-only client.
 
 ### Run it
 
-**HTTP mode** (connect to an aura-web-server):
+**Standalone mode** (no server needed) is the default when you don't set `--api-url`:
+
+```bash
+aura-cli --config path/to/agent.toml
+```
+
+If you omit `--config`, the CLI loads `config.toml` from the current directory, so a bare `aura-cli` runs the local config.
+
+**HTTP mode** (connect to an aura-web-server) is selected when you set `--api-url` (or `AURA_API_URL`):
 
 ```bash
 export AURA_API_URL="https://api.example.com"
@@ -26,20 +34,14 @@ export AURA_API_KEY="your-api-key"
 aura-cli
 ```
 
-**Standalone mode** (no server needed):
-
-```bash
-aura-cli --standalone --config path/to/agent.toml
-```
-
-Standalone mode requires the `standalone-cli` feature at build time and the `--standalone` flag at runtime.
+The default build includes standalone support. Pass `--standalone` explicitly only when you want standalone mode and `--api-url` is also set, such as for debugging. In that case, `--config` is required.
 
 ## Backends
 
-| Backend | Flag | Use case | Dependencies |
-|---------|------|----------|--------------|
-| **HTTP** (default) | None | Connect to a running aura-web-server | Lightweight HTTP client only |
-| **Standalone** | `--standalone --config path` | Run agents locally without a server | Full aura stack (requires `--features standalone-cli`) |
+| Backend | Selected by | Use case | Build |
+|---------|-------------|----------|-------|
+| **Standalone** (default) | No `--api-url` set (loads `--config`, or `config.toml`) | Run agents in-process without a server | Included in the default build |
+| **HTTP** | `--api-url` / `AURA_API_URL` is set | Connect to a running aura-web-server | Any build (an HTTP-only build requires `--api-url`) |
 
 Both backends share the same SSE event parser. All CLI features work identically regardless of backend.
 
@@ -49,7 +51,7 @@ Both backends share the same SSE event parser. All CLI features work identically
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AURA_API_URL` | Base API URL for HTTP mode | `http://localhost:8080` |
+| `AURA_API_URL` | Base API URL. Setting it (or `--api-url`) selects HTTP mode; when unset, the CLI runs standalone | `http://localhost:8080` (in HTTP mode) |
 | `AURA_API_KEY` | Bearer token for authentication | None |
 | `AURA_MODEL` | Model name (HTTP: starting model; standalone: agent name/alias) | None |
 | `AURA_EXTRA_HEADERS` | Additional headers as `key:value` pairs | None |
@@ -61,7 +63,7 @@ Both backends share the same SSE event parser. All CLI features work identically
 
 | Flag | Description |
 |------|-------------|
-| `--api-url <URL>` | Base API URL |
+| `--api-url <URL>` | Base API URL; setting it selects HTTP mode |
 | `--api-key <KEY>` | Bearer token for authentication |
 | `--model <MODEL>` | Model name (HTTP: starting model; standalone: selects agent) |
 | `--system-prompt <PROMPT>` | System prompt (standalone: append/replace; HTTP: prompts for confirmation) |
@@ -69,8 +71,8 @@ Both backends share the same SSE event parser. All CLI features work identically
 | `--resume <ID>` | Resume a conversation by ID or prefix |
 | `--force` | Bypass warnings (useful in one-shot mode) |
 | `--enable-client-tools` | Enable local tool execution |
-| `--standalone` | Run in standalone mode |
-| `--config <PATH>` | Path to TOML config file or directory (requires `--standalone`) |
+| `--standalone` | Force standalone mode; only needed when `--api-url` is also set (standalone is otherwise the default) |
+| `--config <PATH>` | Path to TOML config file or directory for standalone mode (defaults to `config.toml` in the current directory) |
 | `--log-file <PATH>` | Append diagnostic logs to file (see [Logging](#logging)) |
 
 **Precedence:** CLI flags > environment variables > project `cli.toml` > global `cli.toml` > defaults.
@@ -136,7 +138,7 @@ The file is opened in **append mode** and created if missing. The default filter
 
 ### Standalone-Mode OpenTelemetry
 
-When built with `--features standalone-cli` and run with `--standalone`, the CLI runs the agent in-process. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the CLI installs an OpenTelemetry layer with the same trace structure as `aura-web-server` — `agent.stream` → `agent.turn` → `mcp.tool_call`, with `orchestration.*` spans between them in orchestration mode.
+When the CLI runs in standalone mode (the default build, with no `--api-url` set), the agent runs in-process. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the CLI installs an OpenTelemetry layer with the same trace structure as `aura-web-server` — `agent.stream` → `agent.turn` → `mcp.tool_call`, with `orchestration.*` spans between them in orchestration mode.
 
 The CLI omits `chat_completions` / `streaming_completion` spans because standalone mode has no HTTP layer — those live on a separate trace in the server. HTTP-mode CLIs skip OTel entirely; traces come from the server process.
 
