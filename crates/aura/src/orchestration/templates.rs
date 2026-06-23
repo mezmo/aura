@@ -498,8 +498,12 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             "Analyze this user query and decide on the best approach.\n\n\
              USER QUERY: {query}{worker_section}{error_section}\n\n\
              You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
-             1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
-                NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
+             1. **respond_directly** — For simple factual questions answerable from general knowledge, \
+                OR when the relevant workers have no tools configured (tools show \"none configured\") \
+                and the query requires external data. In that case, explain the limitation and suggest \
+                configuring MCP servers.\n\
+                Do not use for queries about system data, logs, metrics, or anything requiring tools \
+                when workers DO have tools available.\n\n\
              2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
                 When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.\n\n\
              3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
