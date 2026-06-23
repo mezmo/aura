@@ -129,8 +129,8 @@ impl Default for PendingApprovals {
 mod tests {
     use std::time::Duration;
 
-    use serde_json::json;
     use crate::request_cancellation::RequestCancelToken;
+    use serde_json::json;
 
     use super::*;
     use crate::hitl::decision::{

@@ -22,12 +22,9 @@
 //! `decision.rs`, the wire protocol in `protocol.rs`, and the SSE event
 //! conversion in `events.rs` are all working.
 //!
-//! The conversational route (Phase 2) is not yet wired: the
-//! [`DecisionRoute::Conversational`] arm panics with `unimplemented!`, and
-//! `registry.rs` (`PendingApprovals::register`, `resolve`, `cancel_request`)
-//! contains `todo!()` bodies. The `#![allow(dead_code)]` below covers those
-//! registry items until Phase 2 lands.
-#![allow(dead_code)]
+//! The conversational route (Phase 2) is wired: the
+//! [`DecisionRoute::Conversational`] arm parks on the registry and awaits a
+//! decision via `POST /v1/approvals/{decision_id}`.
 
 mod decision;
 mod events;

@@ -84,8 +84,9 @@ impl ToolWrapper for HitlApprovalWrapper {
                 arguments: args.clone(),
             }],
         };
-        let cancel = crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
-            .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
+        let cancel =
+            crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
+                .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
         approval_result_to_pre_call(self.route.decide(request, &cancel).await)
     }
 }
