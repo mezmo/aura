@@ -267,7 +267,7 @@ async fn run() -> std::io::Result<()> {
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route(
-            "/v1/approvals/:decision_id",
+            "/v1/approvals/{decision_id}",
             post(handlers::resolve_approval),
         )
         .layer(TraceLayer::new_for_http())
