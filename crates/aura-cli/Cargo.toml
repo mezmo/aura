@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [features]
 default = ["standalone-cli"]
-standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util", "dep:thiserror"]
+standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -51,7 +51,7 @@ aura-web-server = { path = "../aura-web-server", default-features = false, optio
 bytes = { version = "1", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tokio-util = { version = "0.7", optional = true }
-thiserror = { workspace = true, optional = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

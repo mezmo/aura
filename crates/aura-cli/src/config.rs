@@ -215,6 +215,17 @@ impl AppConfig {
         format!("{}/v1/models", self.api_url.trim_end_matches('/'))
     }
 
+    /// Build the approval ingress endpoint URL for a specific decision.
+    ///
+    /// `POST /v1/approvals/{decision_id}` — the attended decision return
+    /// path for the conversational HITL route.
+    pub fn approvals_url(&self, decision_id: &str) -> String {
+        format!(
+            "{}/v1/approvals/{decision_id}",
+            self.api_url.trim_end_matches('/')
+        )
+    }
+
     /// Build the health endpoint URL from the base URL.
     pub fn health_url(&self) -> String {
         format!("{}/health", self.api_url.trim_end_matches('/'))

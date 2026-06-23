@@ -464,7 +464,7 @@ fn warn_legacy_permissions_once(path: &Path) {
 /// for the read, then restores the normal non-blocking non-canonical mode
 /// used during processing.
 #[cfg(unix)]
-fn read_single_key(valid: &[char]) -> char {
+pub(crate) fn read_single_key(valid: &[char]) -> char {
     unsafe {
         // Save current termios, then switch to blocking single-char reads.
         let mut saved: libc::termios = std::mem::zeroed();
@@ -498,6 +498,38 @@ fn read_single_key(valid: &[char]) -> char {
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
         result
     }
+}
+
+/// Read a line of text from stdin with canonical mode and echo enabled.
+///
+/// The REPL runs in non-canonical no-echo mode (for rustyline). After
+/// [`read_single_key`] restores that mode, `io::stdin().read_line` won't
+/// work — the user can't see what they type and Enter doesn't submit.
+/// This function temporarily switches to canonical+echo, reads a line,
+/// then restores the prior terminal state.
+#[cfg(unix)]
+pub(crate) fn read_line_with_echo() -> String {
+    unsafe {
+        let mut saved: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(libc::STDIN_FILENO, &mut saved);
+
+        let mut canonical = saved;
+        canonical.c_lflag |= libc::ICANON | libc::ECHO;
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &canonical);
+
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input);
+
+        libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
+        input
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn read_line_with_echo() -> String {
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+    input
 }
 
 #[cfg(not(unix))]
