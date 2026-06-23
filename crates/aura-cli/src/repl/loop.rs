@@ -6,7 +6,7 @@ use crossterm::style::Stylize;
 use crate::theme::{AuraStyle, Themed};
 use rustyline::error::ReadlineError;
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
@@ -871,6 +871,17 @@ pub fn run_repl(
                 // when the LLM is inside an Update group.
                 let in_update_group = Arc::new(AtomicBool::new(false));
 
+                // Approval poster: HTTP mode can POST decisions to the
+                // server's /v1/approvals/{id} ingress; standalone mode
+                // has no HTTP server to POST to.
+                let approval_poster = match backend {
+                    Backend::Http(_) => Some(crate::api::approval::ApprovalPoster::new(Arc::new(
+                        config.clone(),
+                    ))),
+                    #[cfg(feature = "standalone-cli")]
+                    Backend::Direct(_) => None,
+                };
+
                 // Tool execution loop: send request → process stream → if tool calls,
                 // execute locally and send results back → repeat until text response.
                 'tool_loop: loop {
@@ -895,6 +906,7 @@ pub fn run_repl(
                             orch_state: orch_state.clone(),
                             needs_blank: needs_blank.clone(),
                             in_update_group: in_update_group.clone(),
+                            approval_poster: approval_poster.clone(),
                         };
                         backend
                             .stream_chat(
@@ -1860,6 +1872,9 @@ struct ReplStreamHandler {
     orch_state: Arc<Mutex<OrchDisplayState>>,
     needs_blank: Arc<AtomicBool>,
     in_update_group: Arc<AtomicBool>,
+    /// HTTP client for POSTing approval decisions. `None` in standalone
+    /// mode (no HTTP ingress endpoint to POST to).
+    approval_poster: Option<crate::api::approval::ApprovalPoster>,
 }
 
 impl StreamHandler for ReplStreamHandler {
@@ -2773,6 +2788,217 @@ impl StreamHandler for ReplStreamHandler {
             let _term = lock_term();
             WaveAnimation::start(
                 anim_label,
+                vec![],
+                self.input_buf.clone(),
+                Some(self.cancel.clone()),
+            )
+        };
+        if let Ok(mut guard) = self.post_tool_wave.lock() {
+            *guard = Some((wave_anim, wave_stop));
+        }
+        prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+
+    fn on_approval_pending(&mut self, pending: &aura_events::ApprovalPending) {
+        flush_live_reasoning(&self.live_reasoning);
+
+        // Stop animation — same dance as on_tool_complete / on_orchestrator_event.
+        let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+            guard.take().map(|(a, _)| a.finish()).is_some()
+        } else {
+            false
+        };
+        if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+            stop_and_clear_animation(&self.stop_flag);
+            self.anim_cleared.store(true, Ordering::Relaxed);
+        }
+
+        let poster = match &self.approval_poster {
+            Some(p) => p.clone(),
+            None => {
+                let _term = lock_term();
+                erase_input_frame();
+                eprintln!(
+                    "error: approval received but standalone mode has no HTTP ingress to \
+                     POST a decision. The tool call will time out and fail closed."
+                );
+                return;
+            }
+        };
+
+        // Render the prompt and read the human's decision.
+        let decision_id = pending.decision_id.clone();
+        let response = {
+            let _term = lock_term();
+            erase_input_frame();
+
+            // Prompt header
+            println!(
+                "{}  {}",
+                "⏺ Approval required".themed(AuraStyle::Warning),
+                format!("(expires {})", pending.expires_at).themed(AuraStyle::Muted),
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+
+            // Tool name + arguments
+            println!(
+                "  {} {}",
+                "Tool:".themed(AuraStyle::Muted),
+                pending.tool_name.clone().themed(AuraStyle::Primary),
+            );
+            crate::ui::prompt::increment_orch_scrollback();
+
+            let args_str = serde_json::to_string_pretty(&pending.arguments)
+                .unwrap_or_else(|_| pending.arguments.to_string());
+            println!("  {}", "Arguments:".themed(AuraStyle::Muted));
+            crate::ui::prompt::increment_orch_scrollback();
+            for line in args_str.lines() {
+                println!("    {line}");
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+
+            // Read y/n
+            eprint!("  {} ", "Approve? [y]es / [n]o".themed(AuraStyle::Warning),);
+            let _ = io::stderr().flush();
+            let choice = crate::permissions::read_single_key(&['y', 'n']);
+
+            let _ = crossterm::execute!(
+                io::stderr(),
+                crossterm::cursor::MoveToColumn(0),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+            );
+
+            match choice {
+                'y' => {
+                    eprintln!("  {}", "✓ Approved".themed(AuraStyle::Success),);
+                    crate::api::approval::ApprovalResponse::Approved
+                }
+                'n' => {
+                    // Optional reason — need canonical+echo mode for
+                    // line-buffered input (the REPL runs non-canonical
+                    // no-echo for rustyline).
+                    eprint!(
+                        "  {} ",
+                        "Reason (optional, Enter to skip):".themed(AuraStyle::Muted),
+                    );
+                    let _ = io::stderr().flush();
+                    let reason = crate::permissions::read_line_with_echo();
+                    let reason = reason.trim();
+                    let reason = if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason.to_string())
+                    };
+
+                    let _ = crossterm::execute!(
+                        io::stderr(),
+                        crossterm::cursor::MoveToColumn(0),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                    );
+                    eprintln!(
+                        "  {} {}",
+                        "✗ Denied".themed(AuraStyle::Error),
+                        reason
+                            .as_ref()
+                            .map(|r| format!("— {r}"))
+                            .unwrap_or_default()
+                            .themed(AuraStyle::Muted),
+                    );
+                    crate::api::approval::ApprovalResponse::Denied { reason }
+                }
+                _ => unreachable!("read_single_key only returns valid chars"),
+            }
+        };
+
+        // Fire-and-forget POST — the stream stays open; the server resolves
+        // the parked call and sends `approval_completed` when done.
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            match poster.post_decision(&decision_id, response).await {
+                Ok(crate::api::approval::PostOutcome::Accepted) => {}
+                Ok(crate::api::approval::PostOutcome::NotFound) => {
+                    eprintln!(
+                        "warning: approval decision was not found on the server \
+                         (it may have already expired or been cancelled)."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: failed to post approval decision: {e}");
+                    // Cancel the stream so the user isn't left waiting.
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        // Restart "Thinking" animation while we wait for approval_completed.
+        let (wave_anim, wave_stop) = {
+            let _term = lock_term();
+            WaveAnimation::start(
+                "Thinking",
+                vec![],
+                self.input_buf.clone(),
+                Some(self.cancel.clone()),
+            )
+        };
+        if let Ok(mut guard) = self.post_tool_wave.lock() {
+            *guard = Some((wave_anim, wave_stop));
+        }
+        prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+
+    fn on_approval_completed(&mut self, completed: &aura_events::ApprovalCompleted) {
+        flush_live_reasoning(&self.live_reasoning);
+
+        // Stop animation.
+        let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+            guard.take().map(|(a, _)| a.finish()).is_some()
+        } else {
+            false
+        };
+        if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+            stop_and_clear_animation(&self.stop_flag);
+            self.anim_cleared.store(true, Ordering::Relaxed);
+        }
+
+        {
+            let _term = lock_term();
+            erase_input_frame();
+
+            use aura_events::ApprovalOutcomeWire;
+
+            let (style, label, detail) = match &completed.outcome {
+                ApprovalOutcomeWire::Approved => (AuraStyle::Success, "✓ Approved", String::new()),
+                ApprovalOutcomeWire::Denied { reason } => (
+                    AuraStyle::Warning,
+                    "✗ Denied",
+                    reason
+                        .as_ref()
+                        .map(|r| format!(" — {r}"))
+                        .unwrap_or_default(),
+                ),
+                ApprovalOutcomeWire::TimedOut { waited_ms } => {
+                    (AuraStyle::Muted, "⏱ Timed out", format!(" ({waited_ms}ms)"))
+                }
+                ApprovalOutcomeWire::Cancelled { reason } => {
+                    (AuraStyle::Error, "✗ Cancelled", format!(" — {reason:?}"))
+                }
+                ApprovalOutcomeWire::Errored { message } => {
+                    (AuraStyle::Error, "✗ Error", format!(" — {message}"))
+                }
+            };
+
+            let line = format!("⏺ Approval {label}{detail}");
+            println!("{}", line.themed(style));
+            crate::ui::prompt::increment_orch_scrollback();
+            println!();
+            crate::ui::prompt::increment_orch_scrollback();
+        }
+
+        // Restart "Thinking" animation.
+        let (wave_anim, wave_stop) = {
+            let _term = lock_term();
+            WaveAnimation::start(
+                "Thinking",
                 vec![],
                 self.input_buf.clone(),
                 Some(self.cancel.clone()),
