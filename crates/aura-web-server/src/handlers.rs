@@ -1374,4 +1374,142 @@ mod tests {
         assert_eq!(json["usage"]["total_tokens"], 0);
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
     }
+
+    mod approval_ingress {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        use crate::streaming::ToolResultMode;
+        use crate::types::{ActiveRequestTracker, AppState};
+
+        fn test_app_state() -> Arc<AppState> {
+            Arc::new(AppState {
+                configs: Arc::new(vec![]),
+                tool_result_mode: ToolResultMode::default(),
+                tool_result_max_length: 0,
+                streaming_buffer_size: 0,
+                aura_custom_events: false,
+                aura_emit_reasoning: false,
+                streaming_timeout_secs: 0,
+                first_chunk_timeout_secs: 0,
+                shutdown_token: tokio_util::sync::CancellationToken::new(),
+                stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
+                active_requests: Arc::new(ActiveRequestTracker::default()),
+                default_agent: None,
+                additional_tools: Arc::new(Vec::new),
+                pending_approvals: aura::hitl::PendingApprovals::new(),
+            })
+        }
+
+        fn approval_router(state: Arc<AppState>) -> Router {
+            Router::new()
+                .route(
+                    "/v1/approvals/{decision_id}",
+                    post(super::super::resolve_approval),
+                )
+                .with_state(state)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn resolve_approval_returns_204_and_wakes_parked() {
+            let state = test_app_state();
+            let app = approval_router(state.clone());
+
+            let req = aura::hitl::ApprovalRequest {
+                version: aura::hitl::PROTOCOL_VERSION,
+                decision_id: aura::hitl::DecisionId::generate(),
+                request_id: "req-smoke".into(),
+                scope: aura::hitl::AgentScope::Single { session_id: None },
+                origin: aura::hitl::ApprovalOrigin::ConfigGate {
+                    matched_pattern: "test_*".into(),
+                },
+                items: vec![],
+            };
+            let decision_id = req.decision_id;
+            let handle = state
+                .pending_approvals
+                .register(req, Duration::from_secs(60));
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/approvals/{decision_id}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::to_string(&serde_json::json!({
+                                "approved": true
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+
+            let cancel = aura::request_cancellation::RequestCancelToken::unbound();
+            let outcome = handle.outcome(&cancel).await;
+            assert_eq!(
+                outcome,
+                aura::hitl::ApprovalOutcome::Decided(aura::hitl::ApprovalDecision::Approved)
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_unknown_id_returns_404() {
+            let state = test_app_state();
+            let app = approval_router(state);
+            let fake_id = aura::hitl::DecisionId::generate();
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/approvals/{fake_id}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn resolve_bad_uuid_returns_400() {
+            let state = test_app_state();
+            let app = approval_router(state);
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/approvals/not-a-uuid")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid decision id")
+            );
+        }
+    }
 }
