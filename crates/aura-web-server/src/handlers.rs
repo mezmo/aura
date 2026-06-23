@@ -923,6 +923,42 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// Resolve a parked conversational approval by decision id.
+///
+/// `POST /v1/approvals/{decision_id}` — the ingress endpoint for attended
+/// approval decisions. Accepts the same JSON body as the webhook response:
+/// `{ "approved": bool, "reason": "..." }`.
+pub async fn resolve_approval(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(decision_id_str): axum::extract::Path<String>,
+    Json(body): Json<aura::hitl::ApprovalDecisionWire>,
+) -> Response {
+    let decision_id = match aura::hitl::DecisionId::parse(&decision_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid decision id: {decision_id_str}"),
+                "invalid_request_error",
+            );
+        }
+    };
+    let decision = aura::hitl::ApprovalDecision::from(body);
+    match state.pending_approvals.resolve(&decision_id, decision) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(aura::hitl::ResolveError::NotFound) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("no pending approval for decision id {decision_id}"),
+            "not_found",
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected resolve error",
+            "internal_error",
+        ),
+    }
+}
+
 /// Generate a chat session ID (simple GUID)
 fn generate_chat_session_id() -> String {
     format!("cs_{}", Uuid::new_v4().simple())

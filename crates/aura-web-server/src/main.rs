@@ -266,6 +266,10 @@ async fn run() -> std::io::Result<()> {
         .route("/health", get(handlers::health))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
+        .route(
+            "/v1/approvals/:decision_id",
+            post(handlers::resolve_approval),
+        )
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
