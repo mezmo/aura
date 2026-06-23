@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.27.0](https://github.com/mezmo/aura/compare/v1.26.2...v1.27.0) (2026-06-23)
+
+
+### Features
+
+* **init**: generate sre orchestrator config as default [b699e1a](https://github.com/mezmo/aura/commit/b699e1a1abe2453e0d9afc334f554713911ac353) - Chip Johnson [#analyst](https://github.com/mezmo/aura/issues/analyst) [#266](https://github.com/mezmo/aura/issues/266)
+
 ## [1.26.2](https://github.com/mezmo/aura/compare/v1.26.1...v1.26.2) (2026-06-22)
 
 
