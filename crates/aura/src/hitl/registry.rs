@@ -108,6 +108,16 @@ impl PendingApprovals {
         }
     }
 
+    /// Expire a parked approval after timeout/cancellation so later ingress
+    /// returns [`ResolveError::NotFound`].
+    pub fn remove(&self, id: &DecisionId) {
+        self.0
+            .entries
+            .lock()
+            .expect("registry lock poisoned")
+            .remove(id);
+    }
+
     /// Cancel every approval parked under a request id (stream drop / shutdown);
     /// their awaits resolve to `Cancelled`.
     pub fn cancel_request(&self, request_id: &str) {
