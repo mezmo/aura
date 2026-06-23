@@ -19,7 +19,7 @@
 //! scoped to the REPL there and intentionally absent here.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tokio::runtime::Runtime;
@@ -37,7 +37,18 @@ use crate::ui::prompt::set_selected_model;
 /// `aura.mcp_status`, which it renders to **stderr** so degraded MCP servers
 /// are visible without polluting stdout (reserved for the assistant response
 /// per the output contract).
-struct OneshotStreamHandler;
+///
+/// Approval events (`aura.approval_pending`) set the `approval_required` flag
+/// and cancel the stream — one-shot mode cannot handle interactive approvals
+/// (no terminal prompt loop). The post-stream check in [`run_oneshot`]
+/// reads this flag and exits non-zero.
+struct OneshotStreamHandler {
+    /// Set when `approval_pending` arrives. Read after the stream ends
+    /// to decide the exit code.
+    approval_required: Arc<AtomicBool>,
+    /// Set when the user cancels (Ctrl-C) or the stream errors.
+    cancel: Arc<AtomicBool>,
+}
 
 impl StreamHandler for OneshotStreamHandler {
     fn on_orchestrator_event(&mut self, event_name: &str, value: &serde_json::Value) {
@@ -51,6 +62,16 @@ impl StreamHandler for OneshotStreamHandler {
             };
             eprintln!("{prefix} {message}");
         }
+    }
+
+    fn on_approval_pending(&mut self, pending: &aura_events::ApprovalPending) {
+        self.approval_required.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
+        eprintln!(
+            "error: approval required for `{}` but one-shot mode cannot handle \
+             interactive approvals. Use the REPL for approval-gated workflows.",
+            pending.tool_name
+        );
     }
 }
 
@@ -100,18 +121,30 @@ pub fn run_oneshot(
         crate::api::session::SessionKind::Chat,
     );
 
+    // Shared flags: the stream cancel flag is also visible to the handler,
+    // so `on_approval_pending` can break the stream loop by setting it.
+    let approval_required = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+
     // Tool execution loop. One-shot ignores nearly every stream event —
     // stdout is reserved for the final assistant text — but degraded MCP
     // servers are surfaced on stderr via `OneshotStreamHandler`.
     let result: Result<()> = loop {
+        // Reset cancel for each iteration (a previous tool-call turn
+        // may have set it via approval_pending).
+        cancel.store(false, Ordering::Relaxed);
+
         let stream_result = rt.block_on(async {
             backend
                 .stream_chat(
                     conversation.messages(),
                     tool_defs_arg,
                     &chat_session_id,
-                    Arc::new(AtomicBool::new(false)),
-                    &mut OneshotStreamHandler,
+                    cancel.clone(),
+                    &mut OneshotStreamHandler {
+                        approval_required: approval_required.clone(),
+                        cancel: cancel.clone(),
+                    },
                 )
                 .await
         });
@@ -126,6 +159,9 @@ pub fn run_oneshot(
                 tool_calls,
                 server_results,
             }) => {
+                if approval_required.load(Ordering::Relaxed) {
+                    break Ok(());
+                }
                 let tool_call_infos: Vec<ToolCallInfo> = tool_calls
                     .iter()
                     .map(|tc| ToolCallInfo {
@@ -206,6 +242,13 @@ pub fn run_oneshot(
 
     match result {
         Ok(()) => {
+            if approval_required.load(Ordering::Relaxed) {
+                eprintln!(
+                    "error: one-shot mode received an approval request but cannot handle \
+                     interactive approvals. Use the REPL for approval-gated workflows."
+                );
+                std::process::exit(1);
+            }
             // Raw assistant text to stdout, exactly as the server emitted
             // it. A trailing newline is appended only when the response
             // doesn't already end with one — same convention as `curl`,
