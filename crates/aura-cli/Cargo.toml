@@ -16,7 +16,7 @@ name = "aura-cli"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["standalone-cli"]
 standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util", "dep:thiserror"]
 
 [dependencies]

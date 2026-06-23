@@ -85,12 +85,19 @@ pub struct Args {
           num_args = 0..=1, default_missing_value = "true")]
     pub enable_final_response_summary: Option<bool>,
 
-    /// Run in standalone mode (requires --config). Builds agents in-process from TOML config.
+    /// Run in standalone mode — builds agents in-process from TOML config
+    /// instead of connecting to an aura-web-server over HTTP. This is the
+    /// default when --api-url is not provided; pass --standalone explicitly
+    /// when you want standalone mode *and* --api-url is set (e.g. for
+    /// debugging).
     #[cfg(feature = "standalone-cli")]
     #[arg(long)]
     pub standalone: bool,
 
-    /// Path to TOML agent config file or directory (requires --standalone)
+    /// Path to TOML agent config file or directory for standalone mode.
+    /// When --api-url is not set, standalone mode is the default and this
+    /// flag selects which config to load. When omitted, defaults to
+    /// `config.toml` in the current directory.
     #[cfg(feature = "standalone-cli")]
     #[arg(long = "config")]
     pub agent_config: Option<String>,
@@ -110,8 +117,11 @@ pub struct Args {
     pub log_file: Option<String>,
 }
 
-/// Pre-parse check for `--config` and `--standalone` when the standalone-cli feature is not enabled.
-/// Gives a helpful error instead of clap's generic "unexpected argument" message.
+/// Pre-parse check when the standalone-cli feature is not enabled.
+///
+/// Catches `--config`/`--standalone` before clap parses (clap would give a
+/// cryptic "unexpected argument" message). Also errors when no `--api-url` is
+/// set, since standalone mode (the default) is unavailable without the feature.
 #[cfg(not(feature = "standalone-cli"))]
 pub fn check_standalone_flag() {
     let has_standalone = std::env::args().any(|a| a == "--standalone");
@@ -125,38 +135,65 @@ pub fn check_standalone_flag() {
         };
         eprintln!(
             "error: {flag} requires the standalone-cli feature\n\n\
-             This build of aura-cli is an HTTP client only and cannot load \
-             agent configs directly.\n\n\
-             To run standalone (without an aura-web-server), you'll need a \
-             \"standalone-cli\" build of aura-cli.\n\n\
-             Without --standalone, aura-cli connects to a server via HTTP.\n\
-             Use --api-url to specify the server address."
+             This build of aura-cli is HTTP-only and cannot load agent configs \
+             directly. Standalone mode (the default) is not available.\n\n\
+             Pass --api-url to connect to an aura-web-server over HTTP, or \
+             rebuild with the standalone-cli feature (enabled by default)."
+        );
+        std::process::exit(2);
+    }
+
+    let has_api_url = std::env::args().any(|a| a == "--api-url" || a.starts_with("--api-url="))
+        || std::env::var("AURA_API_URL").ok().filter(|v| !v.is_empty()).is_some();
+
+    if !has_api_url {
+        eprintln!(
+            "error: --api-url is required (standalone mode unavailable)\n\n\
+             This build of aura-cli was compiled without the standalone-cli \
+             feature, so it cannot run agents in-process. Provide --api-url \
+             to connect to an aura-web-server, or rebuild with the default \
+             features to enable standalone mode."
         );
         std::process::exit(2);
     }
 }
 
-/// Post-parse validation for standalone mode flag pairing.
-/// Ensures --standalone and --config are used together.
+/// Resolve whether the CLI should run in standalone mode and which config
+/// to use. Standalone is the default when `--api-url` is absent.
+///
+/// Returns `true` if standalone mode should be used.
 #[cfg(feature = "standalone-cli")]
-pub fn validate_standalone_args(args: &Args) {
-    if args.agent_config.is_some() && !args.standalone {
+pub fn resolve_standalone(args: &Args) -> bool {
+    let api_url_set = args.api_url.is_some()
+        || std::env::var("AURA_API_URL").ok().filter(|v| !v.is_empty()).is_some();
+
+    if args.standalone && api_url_set && args.agent_config.is_none() {
         eprintln!(
-            "error: --config requires --standalone\n\n\
-             The --config flag is only valid in standalone mode. Add --standalone \
-             to run agents in-process from TOML config:\n\n\
-             aura-cli --standalone --config <path>"
+            "error: --standalone with --api-url requires --config\n\n\
+             When both --standalone and --api-url are set, standalone mode is \
+             explicit and needs a TOML config. Provide --config <path>, or drop \
+             --standalone to use HTTP mode."
         );
         std::process::exit(2);
     }
 
-    if args.standalone && args.agent_config.is_none() {
-        eprintln!(
-            "error: --standalone requires --config\n\n\
-             Standalone mode needs a TOML agent config to load. Provide the path \
-             to a config file or directory:\n\n\
-             aura-cli --standalone --config <path>"
-        );
-        std::process::exit(2);
+    if args.standalone {
+        return true;
     }
+
+    // No --api-url and no explicit --standalone → standalone by default
+    if !api_url_set {
+        return true;
+    }
+
+    // --api-url is set and --standalone is not → HTTP mode.
+    // --config is ignored in HTTP mode; warn if it was passed.
+    if args.agent_config.is_some() {
+        eprintln!(
+            "warning: --config is ignored in HTTP mode (--api-url is set)\n\
+             To run standalone with a config, omit --api-url or add --standalone."
+        );
+    }
+
+    false
 }
