@@ -28,17 +28,23 @@ use crate::types::*;
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
     request_id: String,
+    pending_approvals: aura::hitl::PendingApprovals,
 }
 
 impl RequestResourceGuard {
-    fn new(request_id: String) -> Self {
-        Self { request_id }
+    fn new(request_id: String, pending_approvals: aura::hitl::PendingApprovals) -> Self {
+        Self {
+            request_id,
+            pending_approvals,
+        }
     }
 }
 
 impl Drop for RequestResourceGuard {
     fn drop(&mut self) {
         use aura::{request_progress_unsubscribe, tool_event_unsubscribe, tool_usage_unsubscribe};
+
+        self.pending_approvals.cancel_request(&self.request_id);
 
         // Use try_current to avoid panic during runtime shutdown
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -116,6 +122,7 @@ pub struct CompletionConfig {
     pub query_for_otel: String,
     pub message_count: usize,
     pub response_content: ResponseContent,
+    pub pending_approvals: aura::hitl::PendingApprovals,
 }
 
 /// Determines how stream output reaches the client.
@@ -416,6 +423,7 @@ pub fn build_completion_config(
         query_for_otel: setup.query.clone(),
         message_count,
         response_content,
+        pending_approvals: data.pending_approvals.clone(),
     }
 }
 
@@ -432,7 +440,8 @@ pub async fn execute_completion(
     let _active_guard = ActiveRequestGuard::new(config.active_requests.clone());
     let _cancellation = RequestCancellation::register(config.request_id.clone());
 
-    let _resource_guard = RequestResourceGuard::new(config.request_id.clone());
+    let _resource_guard =
+        RequestResourceGuard::new(config.request_id.clone(), config.pending_approvals.clone());
 
     // Destructure to move chat_history instead of cloning
     let RequestSetup {
