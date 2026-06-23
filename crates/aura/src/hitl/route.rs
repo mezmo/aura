@@ -120,6 +120,12 @@ impl DecisionRoute {
                 .await;
 
                 let outcome = handle.outcome(cancel).await;
+                if matches!(
+                    outcome,
+                    ApprovalOutcome::TimedOut { .. } | ApprovalOutcome::Cancelled(_)
+                ) {
+                    registry.remove(&decision_id);
+                }
 
                 let completed_event =
                     events::completed(decision_id, &outcome, &scope, started.elapsed());
@@ -434,17 +440,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_times_out() {
-        use super::super::registry::PendingApprovals;
+        use super::super::registry::{PendingApprovals, ResolveError};
         use std::time::Duration;
 
         let registry = PendingApprovals::new();
         let route = DecisionRoute::Conversational {
-            registry,
+            registry: registry.clone(),
             timeout: Duration::from_secs(5),
         };
+        let decision_id = DecisionId::generate();
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
-            decision_id: DecisionId::generate(),
+            decision_id,
             request_id: "conv-req-3".into(),
             scope: AgentScope::Single { session_id: None },
             origin: ApprovalOrigin::AgentRequested {
@@ -463,6 +470,11 @@ mod tests {
             ApprovalOutcome::TimedOut { .. } => {}
             other => panic!("expected TimedOut, got {:?}", other),
         }
+        assert_eq!(
+            registry.resolve(&decision_id, ApprovalDecision::Approved),
+            Err(ResolveError::NotFound),
+            "late decisions for timed-out approvals must be rejected as expired",
+        );
     }
 
     #[tokio::test(start_paused = true)]
