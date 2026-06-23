@@ -1,14 +1,16 @@
 //! The agent-callable surface: `request_approval`, a Rig tool the agent invokes
 //! when it judges that an action needs a human.
 //!
-//! The tool always returns a string message — even on rejection or error — so
-//! the LLM can reason about the outcome; it never returns a `ToolError`.
+//! Denials and timeouts return `Ok(String)` — the model sees these as feedback
+//! it can reason about ("do not proceed"). Channel errors (transport, bad status,
+//! parse) return `Err(ToolError)` — the model sees an infrastructure failure it
+//! can retry or surface to the user, consistent with the config-gate path in
+//! `gate.rs`.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use rig::completion::ToolDefinition;
-use rig::tool::Tool;
+use rig::tool::{Tool, ToolError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -54,7 +56,7 @@ pub struct RequestApprovalArgs {
 impl Tool for RequestApprovalTool {
     const NAME: &'static str = "request_approval";
 
-    type Error = Infallible;
+    type Error = ToolError;
     type Args = RequestApprovalArgs;
     type Output = String;
 
@@ -118,8 +120,9 @@ impl Tool for RequestApprovalTool {
             Ok(ApprovalOutcome::Cancelled(_)) => Ok(
                 "Approval was cancelled. Treat this as not approved; do not proceed.".to_string(),
             ),
-            Err(e) => Ok(format!(
-                "Approval request failed: {e}. Do not proceed — treat this as a rejection."
+            Err(e) => Err(ToolError::ToolCallError(
+                format!("Approval request failed: {e}. You may try again or notify the user.")
+                    .into(),
             )),
         }
     }
