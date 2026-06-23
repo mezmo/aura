@@ -70,6 +70,28 @@ impl From<&ParkedApproval> for ApprovalPending {
     }
 }
 
+/// Build an `ApprovalPending` event from the request before it is consumed by
+/// `register`. Only emitted on the conversational route.
+#[must_use]
+pub fn pending(
+    request: &ApprovalRequest,
+    expires_at: &super::decision::Timestamp,
+) -> ApprovalPending {
+    let first_item = request.items.first();
+    ApprovalPending {
+        decision_id: request.decision_id.to_string(),
+        tool_name: first_item
+            .map(|item| item.tool_name.clone())
+            .unwrap_or_default(),
+        arguments: first_item
+            .map(|item| item.arguments.clone())
+            .unwrap_or(serde_json::Value::Null),
+        origin: origin_to_wire(&request.origin),
+        scope: scope_to_wire(&request.scope),
+        expires_at: expires_at.to_rfc3339(),
+    }
+}
+
 /// `approval_completed`: emitted on both routes. Aggregate source (the design
 /// note's `From` does not fit a multi-value origin), so this is a named
 /// constructor rather than a `From` impl.
