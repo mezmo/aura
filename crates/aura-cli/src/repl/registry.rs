@@ -21,6 +21,10 @@ pub(crate) struct CommandContext<'a> {
     pub conversation: &'a mut ConversationHistory,
     pub conv_store: &'a mut Option<ConversationStore>,
     pub input_reader: &'a mut Editor<AuraHelper, DefaultHistory>,
+    /// Telemetry handle, so `/telemetry status|recent|disable` can read
+    /// state and persist an opt-out. Inspection/disable only — dispatch
+    /// happens before the consent gate, so a slash command never enables.
+    pub telemetry: &'a aura_telemetry::TelemetryHandle,
 }
 
 /// What the REPL loop should do after a command handler returns.
@@ -168,6 +172,14 @@ pub(crate) const COMMANDS: &[Command] = &[
         validate: Some(validate_style),
         mid_stream: MidStream::Live(crate::ui::mid_stream::live_style),
     },
+    Command {
+        name: "/telemetry",
+        description: "Inspect or disable anonymous usage telemetry",
+        usage_hint: Some("status|recent|disable"),
+        handler: cmd_telemetry,
+        validate: None,
+        mid_stream: MidStream::Defer,
+    },
 ];
 
 /// Look up a command by its exact, fully-resolved name.
@@ -256,6 +268,11 @@ fn cmd_model(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
 
 fn cmd_style(_ctx: &mut CommandContext, args: &str) -> CommandOutcome {
     commands::handle_style(args);
+    CommandOutcome::Handled
+}
+
+fn cmd_telemetry(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
+    commands::handle_telemetry(args, ctx.telemetry);
     CommandOutcome::Handled
 }
 

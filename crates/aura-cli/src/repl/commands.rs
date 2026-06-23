@@ -493,3 +493,242 @@ pub(crate) fn resume_conversation(
         }
     }
 }
+
+/// Default number of inspection-log rows `/telemetry recent` shows.
+const TELEMETRY_RECENT_DEFAULT: usize = 20;
+
+/// Parsed `/telemetry` subcommand. `enable` is intentionally absent —
+/// telemetry is opted into implicitly by sending the first message, not
+/// via a slash command (a slash command never grants consent).
+enum TelemetrySubcommand {
+    Status,
+    Recent(usize),
+    Disable,
+    Unknown(String),
+}
+
+impl TelemetrySubcommand {
+    fn parse(arg: &str) -> Self {
+        let mut parts = arg.split_whitespace();
+        match parts.next() {
+            None | Some("status") => Self::Status,
+            Some("recent") => {
+                let n = parts
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(TELEMETRY_RECENT_DEFAULT);
+                Self::Recent(n)
+            }
+            Some("disable") => Self::Disable,
+            Some(other) => Self::Unknown(other.to_string()),
+        }
+    }
+}
+
+/// Handle `/telemetry status | recent [N] | disable`. Inspection and
+/// disable only — opting in happens by sending a message, never here.
+pub(crate) fn handle_telemetry(arg: &str, telemetry: &aura_telemetry::TelemetryHandle) {
+    let body = match TelemetrySubcommand::parse(arg) {
+        TelemetrySubcommand::Status => format_telemetry_status(telemetry),
+        TelemetrySubcommand::Recent(n) => format_telemetry_recent(telemetry, n),
+        TelemetrySubcommand::Disable => {
+            telemetry.set_disabled(aura_telemetry::DisableReason::AuraDisabled);
+            format_telemetry_disable_result(
+                crate::config::save_telemetry_enabled_to_global_cli_toml(false),
+            )
+        }
+        TelemetrySubcommand::Unknown(other) => format!(
+            "Unknown /telemetry subcommand: {other}\n\
+             Available: status, recent [N], disable"
+        ),
+    };
+    println!("{body}");
+    redraw_input_frame();
+}
+
+pub(crate) fn format_telemetry_disable_result(
+    result: std::result::Result<(), crate::config::TelemetryDisableError>,
+) -> String {
+    match result {
+        // "No new events will be captured" is precise: `set_disabled` holds
+        // all future captures, but a small number of already-consented
+        // events still buffered from before the switch may flush once.
+        Ok(()) => "telemetry: disabled and persisted [telemetry] enabled = false in \
+                   ~/.aura/cli.toml. No new events will be captured; re-enable by \
+                   removing the line or setting `enabled = true`."
+            .to_string(),
+        // Writing cli.toml can fail in a read-only container or where
+        // ~/.aura is not writable. Point the user at the env-var kill
+        // switches, which need no filesystem access and take effect on
+        // the next launch.
+        Err(e) => format!(
+            "telemetry: disabled (no new events will be captured), but the preference \
+             could not be persisted: {e}\n\
+             In a read-only or sandboxed environment, set DO_NOT_TRACK=1 or \
+             AURA_TELEMETRY_DISABLED=1 instead; no file write required."
+        ),
+    }
+}
+
+pub(crate) fn format_telemetry_status(telemetry: &aura_telemetry::TelemetryHandle) -> String {
+    use aura_telemetry::TelemetryState;
+    use aura_telemetry::inspection_log::disable_reason_label;
+    let state = match telemetry.state() {
+        TelemetryState::Unknown => "unknown (held — awaiting notice or first message)".to_string(),
+        TelemetryState::Enabled => "active".to_string(),
+        TelemetryState::Disabled(r) => format!("disabled ({})", disable_reason_label(&r)),
+    };
+    let mut out = String::new();
+    out.push_str(&format!("telemetry: {state}\n"));
+    out.push_str(&format!("endpoint: {}\n", telemetry.endpoint()));
+    out.push_str(&format!(
+        "install-id path: {}\n",
+        telemetry
+            .install_id_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unset)".to_string())
+    ));
+    out.push_str(&format!(
+        "inspection log: {}\n",
+        telemetry
+            .inspection_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(disabled — AURA_TELEMETRY_LOG_EVENTS=0)".to_string())
+    ));
+    out.push_str(&format!(
+        "dropped (channel-full): {}\n",
+        telemetry.dropped_count()
+    ));
+    out.push_str("see docs/telemetry.md for kill switches and the full event table.");
+    out
+}
+
+pub(crate) fn format_telemetry_recent(
+    telemetry: &aura_telemetry::TelemetryHandle,
+    n: usize,
+) -> String {
+    let Some(log) = telemetry.inspection_log() else {
+        return format!("{}.", aura_telemetry::INSPECTION_LOG_DISABLED_MSG);
+    };
+    match log.recent(n) {
+        Ok(events) if events.is_empty() => "no telemetry events recorded yet.".to_string(),
+        Ok(events) => {
+            use std::fmt::Write as _;
+            let mut out = format!("last {} event(s):", events.len());
+            for evt in events {
+                let _ = write!(
+                    out,
+                    "\n  {}  {}  ",
+                    evt.ts.format("%Y-%m-%dT%H:%M:%SZ"),
+                    evt.event,
+                );
+                match (evt.sent, evt.not_sent_reason) {
+                    (true, _) => out.push_str("[sent]"),
+                    (false, Some(r)) => {
+                        let _ = write!(out, "[not sent: {r}]");
+                    }
+                    (false, None) => out.push_str("[not sent]"),
+                }
+            }
+            out
+        }
+        Err(e) => format!("could not read inspection log: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod telemetry_command_tests {
+    use super::*;
+    use aura_telemetry::events::ChatRequestStarted;
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryState};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    struct TestHandle {
+        handle: aura_telemetry::TelemetryHandle,
+        _dir: TempDir,
+    }
+
+    fn build(state: TelemetryState) -> TestHandle {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let install_path = dir.path().join("install-id");
+        let cfg = TelemetryConfig {
+            endpoint: "http://127.0.0.1:1/no-such-host".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::new_v4(),
+            install_id_path: Some(install_path),
+            session_id: Uuid::new_v4(),
+            source: Source::Cli,
+            os_family: OsFamily::Linux,
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: Some(log_path),
+            state,
+            channel_capacity: 16,
+            batch_size: 1,
+            flush_interval: Duration::from_millis(50),
+            post_timeout: Duration::from_millis(200),
+            http_client: None,
+        };
+        TestHandle {
+            handle: aura_telemetry::init(cfg),
+            _dir: dir,
+        }
+    }
+
+    #[test]
+    fn status_reports_state_and_paths() {
+        let t = build(TelemetryState::Unknown);
+        let out = format_telemetry_status(&t.handle);
+        assert!(out.contains("telemetry: unknown"), "{out}");
+        assert!(out.contains("endpoint:"));
+        assert!(out.contains("install-id path:"));
+        assert!(out.contains("inspection log:"));
+    }
+
+    #[test]
+    fn recent_lists_held_events() {
+        let t = build(TelemetryState::Unknown);
+        t.handle.capture(ChatRequestStarted {});
+        let out = format_telemetry_recent(&t.handle, 10);
+        assert!(out.contains("chat_request_started"), "{out}");
+        assert!(out.contains("[not sent"), "{out}");
+    }
+
+    #[test]
+    fn disable_subcommand_sets_disabled_state() {
+        let t = build(TelemetryState::Unknown);
+        // Drive the state transition directly (the persistence side
+        // effect targets the real ~/.aura and is covered in config tests).
+        t.handle.set_disabled(DisableReason::AuraDisabled);
+        assert!(matches!(
+            t.handle.state(),
+            TelemetryState::Disabled(DisableReason::AuraDisabled)
+        ));
+    }
+
+    #[test]
+    fn unknown_subcommand_message() {
+        let t = build(TelemetryState::Unknown);
+        // Parser maps an unknown word to the Unknown variant; the handler
+        // would print the help line. We assert the parse indirectly via
+        // the public behaviour: status/recent/disable are the only known
+        // verbs.
+        let _ = &t;
+        assert!(matches!(
+            TelemetrySubcommand::parse("frobnicate"),
+            TelemetrySubcommand::Unknown(_)
+        ));
+        assert!(matches!(
+            TelemetrySubcommand::parse(""),
+            TelemetrySubcommand::Status
+        ));
+        assert!(matches!(
+            TelemetrySubcommand::parse("recent 5"),
+            TelemetrySubcommand::Recent(5)
+        ));
+    }
+}

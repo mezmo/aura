@@ -690,6 +690,7 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 - [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
+- [docs/telemetry.md](docs/telemetry.md): anonymous, opt-out CLI telemetry — the three-state consent model, exactly what is and isn't collected, kill switches, and how to audit it.
 
 ## Architecture
 

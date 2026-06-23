@@ -454,6 +454,8 @@ pub fn run_repl(
     mut permissions: crate::permissions::PermissionChecker,
     backend: &Backend,
     post_launch_warning: Option<String>,
+    telemetry: &aura_telemetry::TelemetryHandle,
+    is_standalone: bool,
 ) -> Result<()> {
     let mut conversation = ConversationHistory::new(config.system_prompt.as_deref());
 
@@ -552,6 +554,16 @@ pub fn run_repl(
         server
     ));
 
+    // First-run telemetry notice: the REPL is the interactive surface
+    // where consent is obtained. If no preference is recorded yet
+    // (state == Unknown), present the one-time notice before any other
+    // output. Telemetry stays held until the user's first non-opt-out
+    // input enables it (see the first-input gate in the loop below).
+    let needs_consent = matches!(telemetry.state(), aura_telemetry::TelemetryState::Unknown);
+    if needs_consent {
+        crate::repl::telemetry_notice::present_notice();
+    }
+
     // Pick the welcome content + colors once; reused on /expand and /resume replays.
     set_welcome_state(WelcomeState::pick());
     // Visual flourish gate: only run the fade-in animation under `--pretty`.
@@ -562,6 +574,16 @@ pub fn run_repl(
         crate::ui::prompt::print_welcome_state();
     }
     setup_terminal();
+
+    // If telemetry is already Enabled at launch (a recorded preference),
+    // capture the session-start event now. When `needs_consent`, this is
+    // deferred to the first-input gate so no event is emitted during the
+    // held `Unknown` state.
+    if matches!(telemetry.state(), aura_telemetry::TelemetryState::Enabled) {
+        capture_cli_session_started(telemetry, &config, is_standalone);
+    }
+    // Tracks whether the first-input consent gate still needs to run.
+    let mut consent_pending = needs_consent;
 
     // If resuming, replay the event log so the user sees the conversation
     let has_events = with_event_log(|log| !log.is_empty());
@@ -683,6 +705,7 @@ pub fn run_repl(
                         conversation: &mut conversation,
                         conv_store: &mut conv_store,
                         input_reader: &mut input_reader,
+                        telemetry,
                     };
                     match registry::dispatch(&input, &mut ctx) {
                         Some(CommandOutcome::Exit) => break,
@@ -708,6 +731,40 @@ pub fn run_repl(
                     redraw_input_frame();
                     continue;
                 }
+
+                // First-message consent gate (runs once, on the first input
+                // that is actually submitted to the agent after the notice
+                // was shown). Implied consent is tied to the act of sending a
+                // message — slash commands (`/telemetry …`, typos, `/quit`)
+                // were dispatched above and never grant consent. The decision
+                // is derived from the telemetry state those commands left
+                // behind, so the gate can't drift from the command parser.
+                if consent_pending {
+                    consent_pending = false;
+                    use crate::repl::telemetry_notice::{
+                        FirstMessageConsent, consent_on_first_message,
+                    };
+                    match consent_on_first_message(&telemetry.state()) {
+                        FirstMessageConsent::EnableAndCapture => {
+                            telemetry.enable();
+                            if let Err(e) =
+                                crate::config::save_telemetry_enabled_to_global_cli_toml(true)
+                            {
+                                eprintln!("warning: could not persist telemetry preference: {e}");
+                            }
+                            capture_cli_session_started(telemetry, &config, is_standalone);
+                        }
+                        FirstMessageConsent::CaptureOnly => {
+                            capture_cli_session_started(telemetry, &config, is_standalone);
+                        }
+                        FirstMessageConsent::Skip => {}
+                    }
+                }
+
+                // One chat turn begins. Paired 1:1 with the completed event
+                // below, fired once per turn regardless of backend (held and
+                // unsent unless telemetry is Enabled).
+                telemetry.capture(aura_telemetry::events::ChatRequestStarted {});
 
                 // Append compaction hint to user message if pending
                 if compact_hint_pending {
@@ -1581,6 +1638,13 @@ pub fn run_repl(
 
                 let was_cancelled = cancel_flag.load(Ordering::Relaxed);
 
+                // Turn outcome telemetry, paired 1:1 with the started event.
+                // Success = the turn produced a response without erroring or
+                // being cancelled. No latency, model, or content is recorded.
+                telemetry.capture(aura_telemetry::events::ChatRequestCompleted {
+                    success: !was_cancelled && tool_loop_error.is_none(),
+                });
+
                 if was_cancelled {
                     // Display cancellation message in the Thinking style
                     println!(
@@ -1780,6 +1844,7 @@ pub fn run_repl(
                         conversation: &mut conversation,
                         conv_store: &mut conv_store,
                         input_reader: &mut input_reader,
+                        telemetry,
                     };
                     match (pending.command.handler)(&mut ctx, &pending.args) {
                         CommandOutcome::Exit => break,
@@ -1873,6 +1938,22 @@ pub fn run_repl(
 
     println!();
     Ok(())
+}
+
+/// Capture `cli_session_started` once the REPL session is Enabled. The
+/// `interactive` flag is always true here (this is the REPL, not the
+/// one-shot path). Never called while `Unknown`/`Disabled`, so no event
+/// is emitted before consent.
+fn capture_cli_session_started(
+    telemetry: &aura_telemetry::TelemetryHandle,
+    config: &AppConfig,
+    is_standalone: bool,
+) {
+    telemetry.capture(aura_telemetry::events::CliSessionStarted {
+        interactive: true,
+        standalone_mode: is_standalone,
+        client_tools_enabled: config.enable_client_tools,
+    });
 }
 
 /// Streaming event handler for the interactive REPL: drives the live

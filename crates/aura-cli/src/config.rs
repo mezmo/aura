@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Result;
@@ -39,6 +39,11 @@ struct FileConfig {
     /// **The user is responsible for log rotation / pruning** — the CLI
     /// opens this path in append mode and never truncates it.
     log_file: Option<String>,
+    /// `[telemetry]` block — opt-out anonymous product analytics. See
+    /// `docs/telemetry.md`. Project file wins over global for the shared
+    /// fields via `merge_telemetry`; env-var kill switches still override
+    /// either.
+    telemetry: Option<aura_telemetry::FileTelemetryConfig>,
 }
 
 impl FileConfig {
@@ -57,7 +62,27 @@ impl FileConfig {
                 .or(self.enable_final_response_summary),
             style: other.style.or(self.style),
             log_file: other.log_file.or(self.log_file),
+            telemetry: merge_telemetry(self.telemetry, other.telemetry),
         }
+    }
+}
+
+/// Merge the global and project `[telemetry]` blocks via the shared
+/// kill-switch merge in `aura-telemetry`: `enabled = Some(false)` from
+/// **either** layer wins — a user who ran `/telemetry disable` (which
+/// writes `enabled = false` into the global `cli.toml`) must not have
+/// that decision silently reversed by a project `.aura/cli.toml` that
+/// ships `enabled = true`. Only when no layer asserts `false` do the
+/// "project wins over global" semantics kick in.
+fn merge_telemetry(
+    base: Option<aura_telemetry::FileTelemetryConfig>,
+    over: Option<aura_telemetry::FileTelemetryConfig>,
+) -> Option<aura_telemetry::FileTelemetryConfig> {
+    match (base, over) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(o)) => Some(o),
+        (Some(b), Some(o)) => Some(b.merged_over(o)),
     }
 }
 
@@ -102,6 +127,12 @@ pub struct AppConfig {
     /// opened in append mode and never truncated by the CLI. See
     /// `crate::logging::init_tracing` for the subscriber setup.
     pub log_file: Option<String>,
+    /// Resolved `[telemetry]` block from layered `cli.toml`. Fed into
+    /// `aura_telemetry::bootstrap::build_config_from_env_and_file` so a
+    /// user can disable telemetry via `enabled = false` in their
+    /// `cli.toml` (the kill switch documented in `docs/telemetry.md`)
+    /// without setting an env var.
+    pub telemetry: Option<aura_telemetry::FileTelemetryConfig>,
 }
 
 impl AppConfig {
@@ -176,6 +207,7 @@ impl AppConfig {
             .unwrap_or_else(crate::api::session::is_final_response_summary_enabled);
 
         let style = file_config.style.clone();
+        let telemetry = file_config.telemetry.clone();
 
         // Precedence: CLI flag / `AURA_LOG_FILE` env > project cli.toml > global
         // cli.toml > None (no logging). An explicitly empty string is treated as
@@ -202,6 +234,7 @@ impl AppConfig {
             style,
             pretty: args.pretty,
             log_file,
+            telemetry,
         })
     }
 
@@ -322,6 +355,178 @@ fn upsert_top_level_string(content: &str, key: &str, value: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Persist `[telemetry] enabled = <value>` to the global `cli.toml`.
+///
+/// Backs `/telemetry disable` and the first-message implied-consent
+/// opt-in. The upsert is sectioned: it locates `[telemetry]` and either
+/// replaces an existing `enabled = …` line or inserts one immediately
+/// under the header. If the section is missing, it is appended at
+/// end-of-file. Other sections, sibling keys, and comments are preserved.
+pub fn save_telemetry_enabled_to_global_cli_toml(
+    enabled: bool,
+) -> std::result::Result<(), TelemetryDisableError> {
+    let dir = global_aura_dir().ok_or(TelemetryDisableError::NoHome)?;
+    fs::create_dir_all(&dir).map_err(|source| TelemetryDisableError::Write {
+        path: dir.clone(),
+        source,
+    })?;
+    save_telemetry_enabled_to_cli_toml_at(&dir.join(CLI_TOML_FILENAME), enabled)
+}
+
+/// Path-parameterized body of [`save_telemetry_enabled_to_global_cli_toml`].
+///
+/// Two safety properties beyond the naive read-modify-write:
+/// - A file that exists but cannot be read (permissions, non-UTF-8)
+///   yields [`TelemetryDisableError::Read`] and is left untouched —
+///   never silently replaced by a bare `[telemetry]` section, which
+///   would destroy every other setting in `cli.toml`. Only a missing
+///   file is treated as empty input.
+/// - The write is temp-file + rename in the same directory, so a crash
+///   mid-write cannot leave a truncated `cli.toml` behind.
+fn save_telemetry_enabled_to_cli_toml_at(
+    path: &Path,
+    enabled: bool,
+) -> std::result::Result<(), TelemetryDisableError> {
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(TelemetryDisableError::Read {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let updated =
+        upsert_section_bool(&existing, "telemetry", "enabled", enabled).map_err(|source| {
+            TelemetryDisableError::Malformed {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let write_err = |source| TelemetryDisableError::Write {
+        path: path.to_path_buf(),
+        source,
+    };
+    fs::write(&tmp, updated).map_err(write_err)?;
+    fs::rename(&tmp, path)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+        .map_err(write_err)?;
+    Ok(())
+}
+
+/// Update or insert `[section] key = <bool>` in TOML source, preserving
+/// every other section, sibling key, comment, and the decor around an
+/// existing value. Format-preserving via `toml_edit`. Errors (rather
+/// than clobbering) when `content` is not valid TOML.
+fn upsert_section_bool(
+    content: &str,
+    section: &str,
+    key: &str,
+    value: bool,
+) -> std::result::Result<String, toml_edit::TomlError> {
+    let mut doc = content.parse::<toml_edit::DocumentMut>()?;
+    // Ensure `[section]` exists as an explicit table.
+    if !doc.get(section).map(|i| i.is_table()).unwrap_or(false) {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(false);
+        doc.insert(section, toml_edit::Item::Table(table));
+    }
+    let table = doc[section]
+        .as_table_mut()
+        .expect("section was just ensured to be a table");
+    set_preserving_decor(table, key, toml_edit::value(value));
+    Ok(doc.to_string())
+}
+
+/// Insert `key = item` into `table`, preserving the surrounding
+/// whitespace/comment decor of any value it replaces.
+fn set_preserving_decor(table: &mut toml_edit::Table, key: &str, mut new_item: toml_edit::Item) {
+    if let Some(old) = table.get(key).and_then(|i| i.as_value()) {
+        let decor = old.decor().clone();
+        if let Some(v) = new_item.as_value_mut() {
+            *v.decor_mut() = decor;
+        }
+    }
+    table.insert(key, new_item);
+}
+
+/// Failure modes of [`save_telemetry_enabled_to_global_cli_toml`].
+///
+/// A typed error rather than `anyhow` so the `/telemetry disable`
+/// renderer can describe *what* failed; the caller appends the env-var
+/// fallback advice (which is the same regardless of variant).
+/// `Display`/`Error` are hand-rolled because `thiserror` is only a
+/// dependency of the `standalone-cli` feature, and this path compiles
+/// in the default build too.
+#[derive(Debug)]
+pub enum TelemetryDisableError {
+    /// No home directory available, so `~/.aura/` can't be located.
+    NoHome,
+    /// `cli.toml` exists but could not be read (permissions, non-UTF-8
+    /// content). The file is left untouched rather than overwritten.
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// `cli.toml` was read but is not valid TOML. The file is left
+    /// untouched rather than overwritten from a misparse.
+    Malformed {
+        path: PathBuf,
+        source: toml_edit::TomlError,
+    },
+    /// Creating `~/.aura/` or writing `cli.toml` failed — typically a
+    /// read-only or sandboxed filesystem.
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for TelemetryDisableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoHome => {
+                write!(
+                    f,
+                    "could not determine ~/.aura/ (no home directory available)"
+                )
+            }
+            Self::Read { path, source } => {
+                write!(
+                    f,
+                    "could not read existing {} (left untouched): {source}",
+                    path.display()
+                )
+            }
+            Self::Malformed { path, source } => {
+                write!(
+                    f,
+                    "existing {} is not valid TOML (left untouched): {source}",
+                    path.display()
+                )
+            }
+            Self::Write { path, source } => {
+                write!(f, "could not write {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for TelemetryDisableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoHome => None,
+            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Malformed { source, .. } => Some(source),
+        }
+    }
 }
 
 /// Load and merge the global and project-local `cli.toml` files.
@@ -708,6 +913,7 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -731,6 +937,7 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(
             config.chat_completions_url(),
@@ -754,6 +961,7 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
     }
@@ -774,7 +982,162 @@ model = "global-model"
             style: None,
             pretty: false,
             log_file: None,
+            telemetry: None,
         };
         assert_eq!(config.models_url(), "https://api.example.com/v1/models");
+    }
+
+    // ---- telemetry [telemetry] block ----
+
+    fn parse(s: &str) -> toml::Value {
+        toml::from_str(s).expect("valid TOML")
+    }
+
+    /// Cross-layer `enabled` semantics flow through the shared merge in
+    /// `aura-telemetry`: a global `enabled = false` (from `/telemetry
+    /// disable`) must survive a project `enabled = true`.
+    fn merge_enabled(global: Option<bool>, project: Option<bool>) -> Option<bool> {
+        let layer = |enabled| aura_telemetry::FileTelemetryConfig {
+            enabled,
+            ..Default::default()
+        };
+        merge_telemetry(Some(layer(global)), Some(layer(project))).and_then(|t| t.enabled)
+    }
+
+    #[test]
+    fn merge_enabled_either_layer_false_wins() {
+        assert_eq!(merge_enabled(Some(false), Some(true)), Some(false));
+        assert_eq!(merge_enabled(Some(true), Some(false)), Some(false));
+        assert_eq!(merge_enabled(Some(false), None), Some(false));
+        assert_eq!(merge_enabled(None, Some(false)), Some(false));
+    }
+
+    #[test]
+    fn merge_enabled_project_wins_when_no_false() {
+        assert_eq!(merge_enabled(None, Some(true)), Some(true));
+        assert_eq!(merge_enabled(Some(true), None), Some(true));
+        assert_eq!(merge_enabled(None, None), None);
+    }
+
+    #[test]
+    fn telemetry_block_loaded_from_cli_toml() {
+        let (cwd, home) = empty_env();
+        let global = empty_global(&home);
+        fs::write(global.join("cli.toml"), "[telemetry]\nenabled = false\n").unwrap();
+        let config = AppConfig::load_with_dirs(&default_args(), cwd.path(), Some(&global)).unwrap();
+        assert_eq!(config.telemetry.and_then(|t| t.enabled), Some(false));
+    }
+
+    #[test]
+    fn upsert_section_bool_creates_section_when_absent() {
+        let out = upsert_section_bool("", "telemetry", "enabled", false).unwrap();
+        assert_eq!(out, "[telemetry]\nenabled = false\n");
+    }
+
+    #[test]
+    fn upsert_section_bool_preserves_flat_content() {
+        let input = "style = \"normal\"\nlog_file = \"/tmp/a.log\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", true).unwrap();
+        let v = parse(&out);
+        assert_eq!(
+            v["style"].as_str(),
+            Some("normal"),
+            "prior content lost: {out}"
+        );
+        assert_eq!(v["log_file"].as_str(), Some("/tmp/a.log"));
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn upsert_section_bool_replaces_and_preserves_siblings() {
+        let input = "[telemetry]\nenabled = true\nendpoint = \"https://x/\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        let v = parse(&out);
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
+        assert_eq!(v["telemetry"]["endpoint"].as_str(), Some("https://x/"));
+    }
+
+    #[test]
+    fn upsert_section_bool_scoped_to_named_section() {
+        let input = "[other]\nenabled = true\n\n[telemetry]\nendpoint = \"https://x/\"\n";
+        let out = upsert_section_bool(input, "telemetry", "enabled", false).unwrap();
+        let v = parse(&out);
+        assert_eq!(
+            v["other"]["enabled"].as_bool(),
+            Some(true),
+            "[other] touched: {out}"
+        );
+        assert_eq!(v["telemetry"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn upsert_section_bool_rejects_malformed_toml() {
+        assert!(upsert_section_bool("not = = valid", "telemetry", "enabled", false).is_err());
+    }
+
+    #[test]
+    fn telemetry_save_creates_file_when_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        save_telemetry_enabled_to_cli_toml_at(&path, false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[telemetry]\nenabled = false\n"
+        );
+    }
+
+    #[test]
+    fn telemetry_save_preserves_existing_settings() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        std::fs::write(&path, "style = \"compact\"\nlog_file = \"/tmp/x.log\"\n").unwrap();
+        save_telemetry_enabled_to_cli_toml_at(&path, true).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("style = \"compact\""),
+            "style lost: {written}"
+        );
+        assert!(
+            written.contains("log_file = \"/tmp/x.log\""),
+            "log_file lost: {written}"
+        );
+        assert!(
+            written.contains("enabled = true"),
+            "telemetry missing: {written}"
+        );
+    }
+
+    #[test]
+    fn telemetry_save_refuses_to_clobber_malformed_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        let original = "this is = = not valid toml\n";
+        std::fs::write(&path, original).unwrap();
+        let result = save_telemetry_enabled_to_cli_toml_at(&path, true);
+        assert!(
+            matches!(result, Err(TelemetryDisableError::Malformed { .. })),
+            "expected Malformed error, got {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "malformed cli.toml must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn telemetry_save_leaves_no_temp_file_behind() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cli.toml");
+        save_telemetry_enabled_to_cli_toml_at(&path, false).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["cli.toml".to_string()],
+            "stray files: {entries:?}"
+        );
     }
 }
