@@ -144,7 +144,10 @@ pub fn check_standalone_flag() {
     }
 
     let has_api_url = std::env::args().any(|a| a == "--api-url" || a.starts_with("--api-url="))
-        || std::env::var("AURA_API_URL").ok().filter(|v| !v.is_empty()).is_some();
+        || std::env::var("AURA_API_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some();
 
     if !has_api_url {
         eprintln!(
@@ -165,7 +168,10 @@ pub fn check_standalone_flag() {
 #[cfg(feature = "standalone-cli")]
 pub fn resolve_standalone(args: &Args) -> bool {
     let api_url_set = args.api_url.is_some()
-        || std::env::var("AURA_API_URL").ok().filter(|v| !v.is_empty()).is_some();
+        || std::env::var("AURA_API_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some();
 
     if args.standalone && api_url_set && args.agent_config.is_none() {
         eprintln!(
