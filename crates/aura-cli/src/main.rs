@@ -22,10 +22,17 @@ fn main() -> Result<()> {
         return aura_cli::init::run_init(init_args);
     }
 
-    // Load .env from the working directory so a standalone config's
-    // {{ env.* }} references resolve without manual exporting. Only fills vars
-    // not already set (shell exports win); an absent .env is not an error.
+    // Load .env so a config's {{ env.* }} references resolve without manual
+    // exporting. CWD first, then the config file's directory (init writes
+    // .env next to the config). dotenvy never overwrites — shell exports and
+    // earlier .env entries win.
     dotenvy::dotenv().ok();
+    #[cfg(feature = "standalone-cli")]
+    if let Some(cfg) = &args.agent_config
+        && let Some(dir) = std::path::Path::new(cfg).parent()
+    {
+        dotenvy::from_path(dir.join(".env")).ok();
+    }
 
     // Validate --standalone + --config pairing when feature is enabled.
     #[cfg(feature = "standalone-cli")]
