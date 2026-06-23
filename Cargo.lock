@@ -344,6 +344,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "tokio-util",
+ "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
