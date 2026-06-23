@@ -214,6 +214,17 @@ impl AppConfig {
     pub fn models_url(&self) -> String {
         format!("{}/v1/models", self.api_url.trim_end_matches('/'))
     }
+
+    /// Build the approval ingress endpoint URL for a specific decision.
+    ///
+    /// `POST /v1/approvals/{decision_id}` — the attended decision return
+    /// path for the conversational HITL route.
+    pub fn approvals_url(&self, decision_id: &str) -> String {
+        format!(
+            "{}/v1/approvals/{decision_id}",
+            self.api_url.trim_end_matches('/')
+        )
+    }
 }
 
 /// Persist the user's selected style to `~/.aura/cli.toml`. Updates the

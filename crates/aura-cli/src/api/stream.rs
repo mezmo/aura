@@ -8,7 +8,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::Response;
 
-use aura_events::AuraStreamEvent;
+use aura_events::{ApprovalCompleted, ApprovalPending, ApprovalRequested, AuraStreamEvent};
 
 use crate::api::types::{AccumulatedToolCall, ChatCompletionChunk};
 use crate::event_names;
@@ -88,6 +88,19 @@ pub trait StreamHandler {
     /// Called for `aura.orchestrator.*`, `aura.session_info`, `aura.progress`,
     /// `aura.worker_phase`, and any future events, with (event_name, value).
     fn on_orchestrator_event(&mut self, _event_name: &str, _value: &serde_json::Value) {}
+
+    /// Called when a HITL approval is raised (emitted on both routes).
+    /// Informational — the actual prompt arrives via [`Self::on_approval_pending`].
+    fn on_approval_requested(&mut self, _requested: &ApprovalRequested) {}
+
+    /// Called when a conversational HITL approval is awaiting a human
+    /// decision. The SSE stream is held open; the decision returns via
+    /// `POST /v1/approvals/{decision_id}`. Only fires for the
+    /// conversational route (not webhook).
+    fn on_approval_pending(&mut self, _pending: &ApprovalPending) {}
+
+    /// Called when an approval reaches a terminal outcome (both routes).
+    fn on_approval_completed(&mut self, _completed: &ApprovalCompleted) {}
 }
 
 /// A [`StreamHandler`] that ignores every event. Used by one-shot mode and
@@ -262,6 +275,21 @@ where
                             .to_string();
                         let fields: BTreeMap<String, serde_json::Value> = map.into_iter().collect();
                         handler.on_reasoning(&content, &agent_id, &fields);
+                    }
+                }
+                event_names::APPROVAL_REQUESTED => {
+                    if let Ok(requested) = serde_json::from_str::<ApprovalRequested>(&event.data) {
+                        handler.on_approval_requested(&requested);
+                    }
+                }
+                event_names::APPROVAL_PENDING => {
+                    if let Ok(pending) = serde_json::from_str::<ApprovalPending>(&event.data) {
+                        handler.on_approval_pending(&pending);
+                    }
+                }
+                event_names::APPROVAL_COMPLETED => {
+                    if let Ok(completed) = serde_json::from_str::<ApprovalCompleted>(&event.data) {
+                        handler.on_approval_completed(&completed);
                     }
                 }
                 _ => {
