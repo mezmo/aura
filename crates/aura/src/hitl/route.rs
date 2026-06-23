@@ -92,7 +92,7 @@ impl DecisionRoute {
     pub async fn decide(
         &self,
         request: ApprovalRequest,
-        _cancel: &crate::request_cancellation::RequestCancelToken,
+        cancel: &crate::request_cancellation::RequestCancelToken,
     ) -> Result<ApprovalOutcome, ApprovalError> {
         let started = Instant::now();
         let request_id = request.request_id.clone();
@@ -101,11 +101,35 @@ impl DecisionRoute {
 
         match self {
             Self::Conversational { registry, timeout } => {
-                let _ = (registry, timeout);
-                unimplemented!(
-                    "HITL conversational route is not yet wired (Phase 2); \
-                     set [hitl.route] mode = \"webhook\""
+                approval_event_broker::publish(
+                    &request_id,
+                    ApprovalLifecycleEvent::Requested((&request).into()),
                 )
+                .await;
+
+                let expires_at = chrono::Utc::now()
+                    + chrono::Duration::from_std(*timeout)
+                        .expect("approval timeout fits in chrono");
+                let pending_event = events::pending(&request, &expires_at);
+                let handle = registry.register(request, *timeout);
+
+                approval_event_broker::publish(
+                    &request_id,
+                    ApprovalLifecycleEvent::Pending(pending_event),
+                )
+                .await;
+
+                let outcome = handle.outcome(cancel).await;
+
+                let completed_event =
+                    events::completed(decision_id, &outcome, &scope, started.elapsed());
+                approval_event_broker::publish(
+                    &request_id,
+                    ApprovalLifecycleEvent::Completed(completed_event),
+                )
+                .await;
+
+                Ok(outcome)
             }
             Self::Webhook { client, timeout } => {
                 approval_event_broker::publish(
@@ -204,10 +228,13 @@ impl WebhookClient {
 mod tests {
     use serde_json::json;
 
-    use super::super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId};
+    use super::super::decision::{
+        AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId,
+    };
     use super::super::protocol::{
         ApprovalDecisionWire, ApprovalItem, ApprovalRequest, ApprovalRequestWire, PROTOCOL_VERSION,
     };
+    use super::DecisionRoute;
 
     #[test]
     fn single_agent_request_wire_shape() {
@@ -306,30 +333,174 @@ mod tests {
         );
     }
 
-    /// The conversational route is wired into agent builds (4b) but its decision
-    /// logic lands in Phase 2. Until then a gated call routed to it must fail
-    /// loud, not silently allow. Webhook is the only route that decides today.
-    #[tokio::test]
-    #[should_panic(expected = "conversational route is not yet wired")]
-    async fn conversational_decide_is_not_yet_implemented() {
+    #[tokio::test(start_paused = true)]
+    async fn conversational_decide_approved() {
         use super::super::registry::PendingApprovals;
-        use super::DecisionRoute;
         use std::time::Duration;
 
+        let registry = PendingApprovals::new();
         let route = DecisionRoute::Conversational {
-            registry: PendingApprovals::new(),
+            registry: registry.clone(),
+            timeout: Duration::from_secs(60),
+        };
+        let decision_id = DecisionId::generate();
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id,
+            request_id: "conv-req-1".into(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::AgentRequested {
+                reason: "test".into(),
+            },
+            items: vec![],
+        };
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+        let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
+            tokio::spawn({
+                let cancel = cancel.clone();
+                async move { route.decide(request, &cancel).await }
+            });
+
+        loop {
+            tokio::task::yield_now().await;
+            if registry
+                .resolve(&decision_id, ApprovalDecision::Approved)
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let result = decide_handle.await.unwrap();
+        assert_eq!(
+            result.unwrap(),
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conversational_decide_denied() {
+        use super::super::registry::PendingApprovals;
+        use std::time::Duration;
+
+        let registry = PendingApprovals::new();
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(60),
+        };
+        let decision_id = DecisionId::generate();
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id,
+            request_id: "conv-req-2".into(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "rm_*".into(),
+            },
+            items: vec![],
+        };
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+        let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
+            tokio::spawn({
+                let cancel = cancel.clone();
+                async move { route.decide(request, &cancel).await }
+            });
+
+        loop {
+            tokio::task::yield_now().await;
+            if registry
+                .resolve(
+                    &decision_id,
+                    ApprovalDecision::Denied {
+                        reason: Some("too risky".into()),
+                    },
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let result = decide_handle.await.unwrap();
+        assert_eq!(
+            result.unwrap(),
+            ApprovalOutcome::Decided(ApprovalDecision::Denied {
+                reason: Some("too risky".into())
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conversational_decide_times_out() {
+        use super::super::registry::PendingApprovals;
+        use std::time::Duration;
+
+        let registry = PendingApprovals::new();
+        let route = DecisionRoute::Conversational {
+            registry,
+            timeout: Duration::from_secs(5),
+        };
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: "conv-req-3".into(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::AgentRequested {
+                reason: "test".into(),
+            },
+            items: vec![],
+        };
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+        let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
+            tokio::spawn(async move { route.decide(request, &cancel).await });
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let result = decide_handle.await.unwrap().unwrap();
+        match result {
+            ApprovalOutcome::TimedOut { .. } => {}
+            other => panic!("expected TimedOut, got {:?}", other),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conversational_decide_cancelled_on_disconnect() {
+        use super::super::registry::PendingApprovals;
+        use std::time::Duration;
+
+        let registry = PendingApprovals::new();
+        let route = DecisionRoute::Conversational {
+            registry,
             timeout: Duration::from_secs(60),
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             decision_id: DecisionId::generate(),
-            request_id: "r".into(),
+            request_id: "conv-req-4".into(),
             scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::AgentRequested { reason: "x".into() },
+            origin: ApprovalOrigin::AgentRequested {
+                reason: "test".into(),
+            },
             items: vec![],
         };
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
-        let _ = route.decide(request, &cancel).await;
+
+        let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
+            tokio::spawn({
+                let cancel = cancel.clone();
+                async move { route.decide(request, &cancel).await }
+            });
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let result = decide_handle.await.unwrap().unwrap();
+        assert_eq!(
+            result,
+            ApprovalOutcome::Cancelled(super::super::decision::CancelReason::ClientDisconnected)
+        );
     }
 
     #[tokio::test]
