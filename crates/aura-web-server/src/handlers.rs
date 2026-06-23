@@ -138,6 +138,22 @@ pub enum DeliveryMode {
     },
 }
 
+/// Delivery channels after pre-startup setup. SSE receivers must exist before
+/// orchestration can publish side-channel events.
+enum DeliveryChannels {
+    Collect {
+        result_tx: oneshot::Sender<CollectedResult>,
+    },
+    Sse {
+        chunk_tx: mpsc::Sender<Result<Bytes, String>>,
+        heartbeat_interval: std::time::Duration,
+        progress_rx: mpsc::Receiver<aura::ProgressNotification>,
+        tool_event_rx: mpsc::Receiver<aura::ToolLifecycleEvent>,
+        tool_usage_rx: mpsc::Receiver<aura::ToolUsageEvent>,
+        approval_event_rx: mpsc::Receiver<aura::ApprovalLifecycleEvent>,
+    },
+}
+
 /// Result sent back via oneshot for the non-streaming path.
 pub struct CollectedResult {
     pub outcome: StreamOutcome,
@@ -246,6 +262,7 @@ pub async fn prepare_request(
             "you must provide a model parameter".to_string(),
         ));
     };
+    validate_hitl_delivery_mode(&config, req)?;
 
     // Get additional tools from the factory (e.g., CLI tools in standalone mode)
     let additional_tools = (data.additional_tools)();
@@ -310,6 +327,23 @@ pub async fn prepare_request(
         has_client_tools,
         request_id,
     })
+}
+
+fn validate_hitl_delivery_mode(
+    config: &aura_config::Config,
+    req: &ChatCompletionRequest,
+) -> Result<(), PrepareError> {
+    let uses_conversational_hitl = matches!(
+        config.hitl.as_ref().map(|hitl| &hitl.route),
+        Some(aura_config::DecisionRouteConfig::Conversational { .. })
+    );
+    if uses_conversational_hitl && req.stream != Some(true) {
+        return Err(PrepareError::BadRequest(
+            "conversational HITL requires streaming responses; set `stream: true` so approval prompts can be delivered over SSE"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Handle chat completions endpoint
@@ -457,6 +491,23 @@ pub async fn execute_completion(
         request_id: _,
     } = setup;
 
+    // Orchestration spawns inside `stream_with_timeout`, so SSE side-channel
+    // receivers must be subscribed before stream startup.
+    let delivery_channels = match delivery {
+        DeliveryMode::Collect { result_tx } => DeliveryChannels::Collect { result_tx },
+        DeliveryMode::Sse {
+            chunk_tx,
+            heartbeat_interval,
+        } => DeliveryChannels::Sse {
+            chunk_tx,
+            heartbeat_interval,
+            progress_rx: request_progress_subscribe(&config.request_id).await,
+            tool_event_rx: tool_event_subscribe(&config.request_id).await,
+            tool_usage_rx: tool_usage_subscribe(&config.request_id).await,
+            approval_event_rx: approval_event_subscribe(&config.request_id).await,
+        },
+    };
+
     // Create stream with timeout — single path for both Agent and Orchestrator
     let (stream, cancel_tx, usage_state) = streaming_agent
         .stream_with_timeout(
@@ -482,8 +533,8 @@ pub async fn execute_completion(
     };
     otel_ctx.record_input();
 
-    let termination = match delivery {
-        DeliveryMode::Collect { result_tx } => {
+    let termination = match delivery_channels {
+        DeliveryChannels::Collect { result_tx } => {
             let (outcome, termination) =
                 collect_stream_to_completion(&config.stream_config, &config.turn_context, stream)
                     .await;
@@ -498,16 +549,14 @@ pub async fn execute_completion(
             });
             termination
         }
-        DeliveryMode::Sse {
+        DeliveryChannels::Sse {
             chunk_tx,
             heartbeat_interval,
+            progress_rx,
+            tool_event_rx,
+            tool_usage_rx,
+            approval_event_rx,
         } => {
-            // Request-scoped subscriptions (isolated per request to prevent cross-tenant leakage)
-            let progress_rx = request_progress_subscribe(&config.request_id).await;
-            let tool_event_rx = tool_event_subscribe(&config.request_id).await;
-            let tool_usage_rx = tool_usage_subscribe(&config.request_id).await;
-            let approval_event_rx = approval_event_subscribe(&config.request_id).await;
-
             let callbacks = StreamingCallbacks {
                 request_id: config.request_id.clone(),
                 agent: streaming_agent.clone(),
@@ -991,6 +1040,13 @@ fn error_response(
 mod tests {
     use super::*;
     use crate::types::{ChatMessage, ChatMessageFunctionCall, ChatMessageToolCall, Role};
+    use async_trait::async_trait;
+    use futures::stream::{self, BoxStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
@@ -1000,6 +1056,215 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    fn make_test_config() -> aura_config::Config {
+        aura_config::Config {
+            memory_dir: None,
+            mcp: None,
+            vector_stores: vec![],
+            tools: None,
+            orchestration: None,
+            hitl: None,
+            agent: aura_config::AgentConfig {
+                name: "test-agent".to_string(),
+                ..aura_config::AgentConfig::default()
+            },
+        }
+    }
+
+    fn make_hitl_config(route: aura_config::DecisionRouteConfig) -> aura_config::Config {
+        aura_config::Config {
+            hitl: Some(aura_config::HitlConfig {
+                require_approval: vec![],
+                route,
+            }),
+            ..make_test_config()
+        }
+    }
+
+    fn chat_request_with_stream(stream: Option<bool>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: Some("test-agent".to_string()),
+            messages: vec![msg(Role::User, "hello")],
+            max_tokens: None,
+            stream,
+            metadata: None,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn non_streaming_conversational_hitl_is_rejected() {
+        let config =
+            make_hitl_config(aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 });
+        let req = chat_request_with_stream(None);
+
+        let err = validate_hitl_delivery_mode(&config, &req).unwrap_err();
+
+        match err {
+            PrepareError::BadRequest(message) => {
+                assert!(message.contains("conversational HITL requires streaming responses"));
+                assert!(message.contains("stream: true"));
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_conversational_hitl_is_allowed() {
+        let config =
+            make_hitl_config(aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 });
+        let req = chat_request_with_stream(Some(true));
+
+        validate_hitl_delivery_mode(&config, &req).unwrap();
+    }
+
+    #[test]
+    fn non_streaming_webhook_hitl_is_allowed() {
+        let config = make_hitl_config(aura_config::DecisionRouteConfig::Webhook {
+            url: aura_config::WebhookUrl::new("http://127.0.0.1:8080/approve").unwrap(),
+            timeout_secs: 300,
+        });
+        let req = chat_request_with_stream(None);
+
+        validate_hitl_delivery_mode(&config, &req).unwrap();
+    }
+
+    struct StartupApprovalPublisher {
+        published: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl StreamingAgent for StartupApprovalPublisher {
+        fn get_provider_info(&self) -> (&str, &str) {
+            ("test", "fake")
+        }
+
+        async fn stream(
+            &self,
+            _query: &str,
+            _chat_history: Vec<aura::Message>,
+            _cancel_token: CancellationToken,
+            _request_id: &str,
+        ) -> Result<
+            BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
+            aura::StreamError,
+        > {
+            Ok(Box::pin(stream::pending()))
+        }
+
+        async fn stream_with_timeout(
+            &self,
+            _query: &str,
+            _chat_history: Vec<aura::Message>,
+            _timeout: Duration,
+            request_id: &str,
+        ) -> (
+            BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
+            watch::Sender<bool>,
+            aura::UsageState,
+        ) {
+            let event = aura::ApprovalLifecycleEvent::Requested(aura_events::ApprovalRequested {
+                decision_id: aura::hitl::DecisionId::generate().to_string(),
+                tool_name: "dangerous_apply".to_string(),
+                origin: aura_events::ApprovalOriginWire::ConfigGate {
+                    matched_pattern: "dangerous_*".to_string(),
+                },
+                scope: aura_events::AgentScopeWire::Single { session_id: None },
+            });
+            self.published.store(
+                aura::approval_event_broker::publish(request_id, event).await,
+                Ordering::SeqCst,
+            );
+
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            (
+                Box::pin(stream::pending()),
+                cancel_tx,
+                aura::UsageState::new(),
+            )
+        }
+
+        async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_approval_subscription_exists_before_stream_startup() {
+        let request_id = format!("req_test_{}", Uuid::new_v4().simple());
+        let published = Arc::new(AtomicBool::new(false));
+        let agent: Arc<dyn StreamingAgent> = Arc::new(StartupApprovalPublisher {
+            published: Arc::clone(&published),
+        });
+        let setup = RequestSetup {
+            query: "trigger approval".to_string(),
+            chat_history: vec![],
+            streaming_agent: agent,
+            config: make_test_config(),
+            completion_id: "chatcmpl-test".to_string(),
+            model_str: "test/fake".to_string(),
+            created_timestamp: 1_700_000_000,
+            chat_session_id: "cs-test".to_string(),
+            has_client_tools: false,
+            request_id: request_id.clone(),
+        };
+        let config = CompletionConfig {
+            request_id,
+            timeout_duration: Duration::from_secs(30),
+            first_chunk_timeout: None,
+            stream_config: StreamConfig::new(false, false, ToolResultMode::default(), 0),
+            turn_context: TurnContext::new(
+                "chatcmpl-test".to_string(),
+                "test/fake".to_string(),
+                1_700_000_000,
+                None,
+                "cs-test",
+            ),
+            stream_shutdown_token: CancellationToken::new(),
+            active_requests: Arc::new(ActiveRequestTracker::default()),
+            provider: "test".to_string(),
+            model: "fake".to_string(),
+            query_for_otel: "trigger approval".to_string(),
+            message_count: 1,
+            response_content: ResponseContent::new(),
+            pending_approvals: aura::hitl::PendingApprovals::new(),
+        };
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
+
+        let task = tokio::spawn(execute_completion(
+            setup,
+            config,
+            DeliveryMode::Sse {
+                chunk_tx,
+                heartbeat_interval: Duration::from_secs(60),
+            },
+        ));
+
+        let mut saw_approval_event = false;
+        for _ in 0..8 {
+            let chunk = tokio::time::timeout(Duration::from_secs(1), chunk_rx.recv())
+                .await
+                .expect("SSE chunk should arrive")
+                .expect("SSE channel should stay open")
+                .expect("SSE chunk should be successful");
+            let text = std::str::from_utf8(&chunk).expect("SSE chunk is UTF-8");
+            if text.contains("aura.approval_requested") {
+                saw_approval_event = true;
+                break;
+            }
+        }
+        task.abort();
+
+        assert!(
+            published.load(Ordering::SeqCst),
+            "approval publish during stream startup should find an active subscriber",
+        );
+        assert!(
+            saw_approval_event,
+            "startup approval event should be delivered over SSE",
+        );
     }
 
     #[test]
