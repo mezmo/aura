@@ -77,7 +77,7 @@ Span kind is inferred from the span name by the custom exporter in
 
 ## CLI Standalone Mode
 
-When `aura-cli` is built with `--features standalone-cli` and run with `--standalone`, it produces the same `agent.stream`-rooted trace structure as the web server. The CLI wraps `execute_completion` with `.instrument(info_span!(parent: None, "agent.stream"))` in `crates/aura-cli/src/backend/direct.rs`, so all LLM turns, tool calls, and orchestration spans nest under the same root.
+When `aura-cli` runs in standalone mode (the default whenever `--api-url` is not set), it produces the same `agent.stream`-rooted trace structure as the web server. The CLI wraps `execute_completion` with `.instrument(info_span!(parent: None, "agent.stream"))` in `crates/aura-cli/src/backend/direct.rs`, so all LLM turns, tool calls, and orchestration spans nest under the same root.
 
 The CLI omits the `chat_completions` / `streaming_completion` HTTP-infrastructure spans because standalone mode has no HTTP layer. HTTP-mode CLIs (connecting to `aura-web-server`) don't emit traces — the server owns OTel in that case.
 

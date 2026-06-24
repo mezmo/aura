@@ -34,7 +34,7 @@ export AURA_API_KEY="your-api-key"
 aura-cli
 ```
 
-The default build includes standalone support. Pass `--standalone` explicitly only when you want standalone mode and `--api-url` is also set, such as for debugging. In that case, `--config` is required.
+The default build includes standalone support. You only need the `--standalone` flag when `AURA_API_URL` is set in your environment but you want to run standalone anyway. Passing `--standalone` overrides the env var. The `--standalone` flag is mutually exclusive with the `--api-url` flag, so never pass both. When you omit `--config` in standalone mode, the CLI loads `config.toml` from the current directory.
 
 ## Backends
 
@@ -71,7 +71,7 @@ Both backends share the same SSE event parser. All CLI features work identically
 | `--resume <ID>` | Resume a conversation by ID or prefix |
 | `--force` | Bypass warnings (useful in one-shot mode) |
 | `--enable-client-tools` | Enable local tool execution |
-| `--standalone` | Force standalone mode; only needed when `--api-url` is also set (standalone is otherwise the default) |
+| `--standalone` | Force standalone mode; overrides the `AURA_API_URL` env var. Only needed when `AURA_API_URL` is set, and mutually exclusive with the `--api-url` flag (standalone is otherwise the default) |
 | `--config <PATH>` | Path to TOML config file or directory for standalone mode (defaults to `config.toml` in the current directory) |
 | `--log-file <PATH>` | Append diagnostic logs to file (see [Logging](#logging)) |
 
