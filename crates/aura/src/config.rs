@@ -139,10 +139,10 @@ pub struct AgentRuntimeConfig {
     /// single-agent and orchestration paths share one value.
     pub request_id: Option<String>,
 
-    /// Per-worker `request_approval` tool, pre-built in `create_worker` with the
-    /// worker's [`AgentScope`] so the agent-callable approval surface is attached
-    /// to orchestration workers. `None` leaves it unattached — the single-agent
-    /// path does not set it yet.
+    /// The `request_approval` tool, pre-built with the appropriate
+    /// [`AgentScope`]. Orchestration workers set this in `create_worker` with
+    /// `AgentScope::Worker`; single-agent mode sets it in `Agent::new` with
+    /// `AgentScope::Single`. `None` when `[hitl]` is not configured.
     ///
     /// [`AgentScope`]: crate::hitl::AgentScope
     pub hitl_request_approval_tool: Option<crate::hitl::RequestApprovalTool>,
