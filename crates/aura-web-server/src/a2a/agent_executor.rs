@@ -179,10 +179,16 @@ impl AgentExecutor for AuraAgentExecutor {
                 metadata: None,
             }));
 
+            let request_id = format!("a2a_{}", task_id);
             let session_id = Some(context_id.clone());
             let builder = RigBuilder::new(config, pending_approvals);
             let agent = match builder
-                .build_streaming_agent_with_headers(Some(&req_headers), session_id, None, None)
+                .build_streaming_agent_with_headers(
+                    Some(&req_headers),
+                    session_id,
+                    None,
+                    Some(request_id.clone()),
+                )
                 .await
             {
                 Ok(a) => a,
@@ -191,8 +197,6 @@ impl AgentExecutor for AuraAgentExecutor {
                     return;
                 }
             };
-
-            let request_id = format!("a2a_{}", task_id);
 
             // build any history for this context that can be used in further aura reasoning
             let history = get_history_for_context(task_store.clone(), &request_id, &context_id, &task_id).await?;

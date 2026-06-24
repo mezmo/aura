@@ -1,23 +1,28 @@
 # Human-in-the-loop approval gates
 
-Human-in-the-loop (HITL) approval gates let an orchestration worker ask a
-webhook for permission before running selected MCP tools. Use them for
-operations that need a human decision before execution, such as production
-changes or destructive actions.
+Human-in-the-loop (HITL) approval gates let an orchestration worker ask for
+permission before running selected MCP tools. Use them for operations that need
+a human decision before execution, such as production changes or destructive
+actions.
 
 Current behavior:
 
-- Webhook routing works for orchestration workers.
-- Matching worker tool calls are blocked until the webhook approves them.
+- Webhook routing works for unattended orchestration-worker approvals.
+- Conversational routing works for attended orchestration-worker approvals over
+  an open SSE stream. The AURA CLI in HTTP mode is the first attended client.
+- Matching worker tool calls are blocked until the configured route approves
+  them.
 - Human denials are returned to the model as normal tool feedback, so the worker
   can explain the denial without treating it as a transport failure.
 - Timeouts, cancellation, and webhook channel failures still fail closed as tool
   errors.
-- Conversational approval over SSE is not wired yet. Use `mode = "webhook"`.
-- Single-agent config gates are not composed in this phase. The webhook gate is
-  for orchestration workers.
-- Webhook approval lifecycle events emit as `aura.approval_requested` and
-  `aura.approval_completed` on streaming responses.
+- Conversational HITL requires `stream=true`; non-streaming requests are
+  rejected because approval prompts are delivered over SSE.
+- Single-agent config gates are not composed in this phase. HITL gates are for
+  orchestration workers.
+- Approval lifecycle events emit on streaming responses. Webhook emits
+  `aura.approval_requested` and `aura.approval_completed`; conversational also
+  emits `aura.approval_pending` while the tool call is parked.
 
 ## Configure a webhook gate
 
@@ -39,7 +44,7 @@ request to the webhook before the MCP tool runs.
 
 Patterns are matched in **config order, first-match wins**. The first glob that
 matches a tool name triggers the approval request; later patterns are not
-checked. This means a broad early pattern shadows a later, more specific one:
+checked. A broad early pattern shadows a later, more specific one:
 
 ```toml
 # k8s_* matches first for every k8s tool, including k8s_get_*.
@@ -56,9 +61,8 @@ specific glob wins). HITL uses first-match because approval gating is a
 security decision where explicit config ordering gives the operator direct
 control over which pattern applies.
 
-The `request_approval` tool is never matched by these globs — it is excluded
-from the gate so the agent can ask for approval without triggering the gate
-itself.
+The `request_approval` tool is never matched by these globs. It is excluded from
+the gate so the agent can ask for approval without triggering the gate itself.
 
 `timeout_secs` defaults to `300` for webhooks. If the webhook does not return a
 decision before the timeout, the tool does not run.
@@ -179,12 +183,15 @@ Response behavior:
 
 ## SSE lifecycle events
 
-The webhook route emits approval lifecycle events on streaming responses before
-and after the webhook call. These events are emitted even when
-`AURA_CUSTOM_EVENTS=false` because clients may need to react to approval state.
+Approval routes emit lifecycle events on streaming responses. These events are
+emitted even when `AURA_CUSTOM_EVENTS=false` because clients may need to react to
+approval state.
 
 ```text
 event: aura.approval_requested
+data: { ... }
+
+event: aura.approval_pending
 data: { ... }
 
 event: aura.approval_completed
@@ -192,12 +199,48 @@ data: { ... }
 ```
 
 `aura.approval_requested` includes `decision_id`, `tool_name`, `origin`, and
-`scope`. `aura.approval_completed` includes `decision_id`, terminal `outcome`,
-`duration_ms`, and `scope`. Outcome kinds are `approved`, `denied`, `timed_out`,
-`cancelled`, and `errored`; `errored` means the approval channel failed before a
-human decision was obtained.
+`scope`. `aura.approval_pending` is emitted only by the conversational route and
+contains the attended prompt payload that an Aura-aware client renders before
+posting a decision. `aura.approval_completed` includes `decision_id`, terminal
+`outcome`, `duration_ms`, and `scope`. Outcome kinds are `approved`, `denied`,
+`timed_out`, `cancelled`, and `errored`; `errored` means the approval channel
+failed before a human decision was obtained.
 
-## Manual smoke test
+## Conversational route
+
+Use conversational routing when the approver is present on the chat stream. The
+server parks the worker tool call, sends `aura.approval_pending` over SSE, and
+waits for a decision on the approval ingress endpoint:
+
+```toml
+[hitl]
+require_approval = ["multiply", "divide", "dangerous_*"]
+
+[hitl.route]
+mode = "conversational"
+timeout_secs = 120
+```
+
+The chat request must set `stream=true`. Aura rejects non-streaming requests for
+conversational HITL because there is no channel for the pending approval prompt.
+
+An attended client resolves a pending approval by POSTing the same decision shape
+as a webhook response:
+
+```http
+POST /v1/approvals/{decision_id}
+```
+
+```json
+{ "approved": false, "reason": "maintenance window not open" }
+```
+
+The AURA CLI supports this flow in HTTP mode. It renders
+`aura.approval_pending`, prompts for approve/deny, and POSTs the decision back to
+the server. One-shot CLI mode fails loud instead of prompting because it has no
+interactive approval surface.
+
+## Webhook manual smoke test
 
 Start a webhook service that accepts the request shape above and returns an
 approval response. Then run Aura with an orchestration config that uses:
@@ -220,15 +263,27 @@ Ask an orchestration worker to use the gated tool. An approval should let the
 tool run. A denial with a custom reason should produce a successful blocked tool
 result containing that reason.
 
+## Conversational manual smoke test
+
+Run Aura with an orchestration config that uses `mode = "conversational"`, a
+route timeout shorter than `[orchestration.timeouts].per_call_timeout_secs`, and
+at least one gated worker tool. Connect with the AURA CLI in HTTP mode and send a
+query that forces the worker to call the gated tool.
+
+Expected behavior:
+
+- The CLI renders an approval prompt from `aura.approval_pending`.
+- Approving the prompt POSTs to `/v1/approvals/{decision_id}` and lets the tool
+  run.
+- Denying the prompt POSTs the denial and returns blocked-action feedback to the
+  worker.
+
 ## Current limitations
 
 - The webhook route is synchronous. Aura waits for the webhook response during
   the tool call.
-- `mode = "conversational"` is reserved for a later phase and is guarded at
-  runtime.
-- `aura.approval_pending` is not emitted yet; it belongs to the conversational
-  route.
-- Decision ingress (`POST /v1/approvals/{decision_id}`) is not implemented yet.
+- Conversational approvals are in-process only. The parked approval must be
+  resolved by the same server process that emitted `aura.approval_pending`.
 - Durable approval parking and cross-pod resume are not implemented yet.
 - Webhook egress has no built-in authentication layer. Put auth, signing, or
   network controls in front of the webhook service.

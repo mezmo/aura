@@ -51,7 +51,9 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 
 ## Custom AURA Events (Optional)
 
-For enhanced client UX, you can enable custom AURA events that provide real-time tool status and timing:
+Most custom AURA events are optional and require `AURA_CUSTOM_EVENTS=true`.
+HITL approval lifecycle events are the exception: the server emits them whenever
+an approval route needs clients to observe or act on approval state.
 
 ```bash
 AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
@@ -72,9 +74,9 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.tool_usage` | Usage snapshot after tool execution (associates tool IDs with token counts) | ✅ Implemented |
 | `aura.usage` | Final token usage emitted at stream end (prompt/completion/total) | ✅ Implemented |
 | `aura.scratchpad_usage` | Per-agent scratchpad usage summary (single-agent or worker), emitted when an agent finishes with scratchpad activity | ✅ Implemented |
-| `aura.approval_requested` | HITL approval request raised for a gated tool or `request_approval` call | ✅ Implemented for webhook route |
-| `aura.approval_pending` | HITL approval is waiting for an attended decision | Planned for conversational route |
-| `aura.approval_completed` | HITL approval reached a terminal outcome | ✅ Implemented for webhook route |
+| `aura.approval_requested` | HITL approval request raised for a gated tool or `request_approval` call | ✅ Implemented for webhook and conversational routes |
+| `aura.approval_pending` | HITL approval is waiting for an attended decision | ✅ Implemented for conversational route |
+| `aura.approval_completed` | HITL approval reached a terminal outcome | ✅ Implemented for webhook and conversational routes |
 | `aura.orchestrator.*` | Orchestration lifecycle events (see [Orchestration Events](#orchestration-events) below) | ✅ Implemented |
 
 ### Event Flow
@@ -330,6 +332,31 @@ data:
 }
 ```
 
+**Approval pending** (conversational HITL is waiting for an attended decision):
+```
+event: aura.approval_pending
+data:
+```
+```json
+{
+  "decision_id": "019edead-beef-7000-8000-000000000001",
+  "tool_name": "restart_deployment",
+  "arguments": {"namespace": "prod", "deployment": "api"},
+  "origin": {
+    "kind": "config_gate",
+    "matched_pattern": "restart_*"
+  },
+  "scope": {
+    "kind": "worker",
+    "run_id": "019edead-beef-7000-8000-000000000002",
+    "task_id": 3,
+    "worker": "operations",
+    "session_id": "sess_xyz"
+  },
+  "expires_at": "2026-06-23T22:15:30Z"
+}
+```
+
 **Approval completed** (HITL approval reached a terminal outcome):
 ```
 event: aura.approval_completed
@@ -353,7 +380,16 @@ data:
 }
 ```
 
-Webhook-route approval events are emitted even when `AURA_CUSTOM_EVENTS=false` because they are protocol lifecycle events, not optional telemetry. The webhook route emits `aura.approval_requested` before dispatch and `aura.approval_completed` for all terminal webhook outcomes. `outcome.kind` is one of `approved`, `denied`, `timed_out`, `cancelled`, or `errored`; `errored` represents webhook channel faults such as transport errors, non-2xx responses, or invalid JSON. `aura.approval_pending` is reserved for the conversational route and is not emitted by the webhook route.
+Approval events are emitted even when `AURA_CUSTOM_EVENTS=false` because they are
+protocol lifecycle events, not optional telemetry. The webhook route emits
+`aura.approval_requested` before dispatch and `aura.approval_completed` for all
+terminal webhook outcomes. The conversational route emits
+`aura.approval_requested`, then `aura.approval_pending` while the tool call is
+parked, then `aura.approval_completed` after the decision, timeout, or
+cancellation. `outcome.kind` is one of `approved`, `denied`, `timed_out`,
+`cancelled`, or `errored`; `errored` represents channel faults such as transport
+errors, non-2xx responses, or invalid JSON. `aura.approval_pending` is reserved
+for the conversational route and is not emitted by the webhook route.
 
 ### Client Handling
 
