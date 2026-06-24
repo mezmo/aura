@@ -91,6 +91,15 @@ pub enum PostError {
     /// Network/transport failure (DNS, connection refused, timeout).
     #[error("approval POST failed: {0}")]
     Transport(#[from] reqwest::Error),
+    /// Failed to read the error response body after an unexpected status.
+    /// Distinct from [`PostError::Transport`](Self::Transport) (request-level)
+    /// so callers can distinguish a body-read failure from a request failure.
+    #[error("approval POST returned unexpected status and body-read failed: {source}")]
+    BodyRead {
+        status: u16,
+        #[source]
+        source: reqwest::Error,
+    },
     /// Unexpected HTTP status (not 204 or 404).
     #[error("approval POST returned unexpected status {status}: {body}")]
     UnexpectedStatus { status: u16, body: String },
@@ -143,19 +152,11 @@ impl ApprovalPoster {
         let url = self.config.approvals_url(decision_id);
         let body = ApprovalDecisionBody::from(response);
 
-        let mut req = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-
-        if let Some(ref key) = self.config.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        for (name, value) in &self.config.extra_headers {
-            req = req.header(name, value);
-        }
+        let req = crate::api::client::apply_common_headers(
+            &self.config,
+            self.http.post(&url).json(&body),
+            None,
+        );
 
         let resp = req.send().await?;
 
@@ -163,10 +164,10 @@ impl ApprovalPoster {
         match status {
             204 => Ok(PostOutcome::Accepted),
             404 => Ok(PostOutcome::NotFound),
-            _ => {
-                let text = resp.text().await.unwrap_or_default();
-                Err(PostError::UnexpectedStatus { status, body: text })
-            }
+            _ => match resp.text().await {
+                Ok(text) => Err(PostError::UnexpectedStatus { status, body: text }),
+                Err(source) => Err(PostError::BodyRead { status, source }),
+            },
         }
     }
 }
