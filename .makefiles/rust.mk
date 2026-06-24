@@ -54,6 +54,11 @@ nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
 
+.PHONY: check-cli-http-only
+check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features) aura-cli still builds
+	$(RUN) cargo clippy -p aura-cli --no-default-features --all-targets -- -D warnings
+	$(RUN) cargo test -p aura-cli --no-default-features
+
 .PHONY: update-lockfile
 update-lockfile: $(DOCKER_ENV) ## Regenerate Cargo.lock after version changes
 	$(RUN) cargo update --quiet --workspace

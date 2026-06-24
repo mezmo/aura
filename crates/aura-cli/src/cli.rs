@@ -123,6 +123,13 @@ pub struct Args {
 /// set, since standalone mode (the default) is unavailable without the feature.
 #[cfg(not(feature = "standalone-cli"))]
 pub fn check_standalone_flag() {
+    // Let clap handle --help / --version and subcommands before we error
+    let pass_through = std::env::args()
+        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V" | "init"));
+    if pass_through {
+        return;
+    }
+
     let has_standalone = std::env::args().any(|a| a == "--standalone");
     let has_config = std::env::args().any(|a| a == "--config" || a.starts_with("--config="));
 
