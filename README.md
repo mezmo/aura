@@ -498,11 +498,10 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 
 ### Human-in-the-loop approval gates
 
-Human-in-the-loop (HITL) approval gates let orchestration workers ask a webhook
-for permission before running selected MCP tools. Configure `[hitl]` with
-tool-name globs and a `[hitl.route]` webhook. Approved calls run normally;
-denied calls return a blocked-action result to the worker without running the
-MCP tool.
+Human-in-the-loop (HITL) approval gates let orchestration workers ask for
+permission before running selected MCP tools. Configure `[hitl]` with tool-name
+globs and a `[hitl.route]`. Approved calls run normally; denied calls return a
+blocked-action result to the worker without running the MCP tool.
 
 ```toml
 [hitl]
@@ -514,12 +513,12 @@ url = "https://approvals.example.com/aura"
 timeout_secs = 300
 ```
 
-Current scope: webhook approval works for orchestration workers.
-`aura.approval_requested` and `aura.approval_completed` SSE events are emitted
-on the webhook route regardless of `AURA_CUSTOM_EVENTS`. Conversational
-approval (`aura.approval_pending`, decision ingress) and single-agent config
-gates are not wired in this phase. See [docs/hitl.md](docs/hitl.md) for the
-webhook contract and response behavior.
+Current scope: webhook and conversational approval work for orchestration
+workers. Approval lifecycle SSE events are emitted regardless of
+`AURA_CUSTOM_EVENTS`; conversational mode also emits `aura.approval_pending` and
+requires `stream=true` plus an Aura-aware client such as the AURA CLI in HTTP
+mode. Single-agent config gates are not wired in this phase. See
+[docs/hitl.md](docs/hitl.md) for the route contracts and response behavior.
 
 ### Scratchpad (Context Window Management)
 
@@ -635,6 +634,7 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/quickstart.md](docs/quickstart.md): getting started guide — setup, customization, architecture, and troubleshooting.
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
+- [docs/hitl.md](docs/hitl.md): human approval gates for orchestration worker tool calls, including webhook and conversational routes.
 - [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
 - [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
