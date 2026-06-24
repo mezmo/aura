@@ -7,9 +7,16 @@ per-process registry with named boundaries). This note carries the type-level
 design, the module layout, the config and wire formats, and a keep / rework /
 discard map over the spike on `mshearer/hitl-v1-config-gate` (@ `52f37e6`).
 
-**Status:** living design note, current as of 2026-06-16. The ADR holds the
+**Status:** living design note, current as of 2026-06-23. The ADR holds the
 durable decision. This note follows the code, so parts of it go stale; the
 anchors below make the staleness checkable.
+
+Both routes (webhook and conversational) are fully operational in single-agent
+and orchestration mode. Single-agent wiring lives in `Agent::new`
+(`crates/aura/src/builder.rs`); orchestration wiring in `create_worker`
+(`crates/aura/src/orchestration/orchestrator.rs`). CLI standalone resolves
+conversational approvals in-process via `PendingApprovals::resolve()` instead
+of `POST /v1/approvals/{id}`.
 
 - Spike references (`mshearer/hitl-v1-config-gate`) are pinned to the immutable
   revision `52f37e6` and stay valid.
