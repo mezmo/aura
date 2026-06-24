@@ -410,7 +410,7 @@ To validate your own config file, start the web server or CLI — both validate 
 cargo run -p aura-web-server -- --config your-config.toml
 
 # Validate via standalone CLI (exits on parse error before REPL)
-cargo run -p aura-cli --features standalone-cli -- --standalone --config your-config.toml
+cargo run -p aura-cli -- --config your-config.toml
 ```
 
 ### Orchestration

@@ -34,8 +34,8 @@ CONFIG_PATH=configs/example-math-orchestration.toml AURA_CUSTOM_EVENTS=true carg
 # Build and run CLI (HTTP mode — connects to aura-web-server)
 cargo run -p aura-cli -- --api-url http://localhost:8080
 
-# Build and run CLI (standalone mode — no server needed)
-cargo run -p aura-cli --features standalone-cli -- --standalone --config configs/my-agent.toml
+# Build and run CLI (standalone mode — no server needed, default when --api-url absent)
+cargo run -p aura-cli -- --config configs/my-agent.toml
 
 # Run integration tests (local, requires Docker)
 make test-integration-local                        # base integration
@@ -115,8 +115,8 @@ aura/
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
 - **One-shot output contract** (`--query`): stdout is the **raw assistant response only** — no `●` markers, no markdown rendering, no tool-execution summaries, no response-summary header, no `backend.summarize` round-trip. Errors, permission prompts, and warnings go to stderr (with `error:` / `warning:` prefixes, no markers). Exit code 0 ⇒ stdout is the full response; non-zero ⇒ stderr explains and stdout is empty. The REPL retains rich formatting; the strict-output rules apply only to `--query` mode. See `crates/aura-cli/src/oneshot.rs`.
-- **Two backends:** HTTP mode (default) and standalone mode (`--standalone --config`, builds agents in-process)
-- Standalone mode requires `--features standalone-cli` at build time and explicit `--standalone` flag at runtime
+- **Two backends:** standalone mode (default when `--api-url` absent) and HTTP mode (`--api-url`)
+- Standalone mode is enabled by the `standalone-cli` default feature; `--standalone` flag overrides `AURA_API_URL` env var but is mutually exclusive with the `--api-url` flag. HTTP-only builds: `--no-default-features`
 - `--model` works in both modes: HTTP passes it as starting model; standalone matches against agent.name/agent.alias in configs
 - `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for AURA vs OpenAI-compatible service
 - `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
@@ -128,7 +128,7 @@ aura/
 - `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
 - Env vars: `AURA_API_URL`, `AURA_API_KEY`, `AURA_MODEL`, `AURA_EXTRA_HEADERS`, `AURA_LOG_FILE`
 - **Diagnostic logs**: opt-in via `--log-file <path>` / `AURA_LOG_FILE` / `cli.toml` `log_file` (precedence: CLI > env > project > global > none). Events are appended to the file (no rotation — user-managed) in **both REPL and one-shot mode**, so stdout stays a clean pipe. Default filter is `warn,aura=info,aura_cli=info,aura_config=info,rig::agent::prompt_request=info`; override with `RUST_LOG`.
-- **OpenTelemetry (standalone only)**: when built with `--features standalone-cli` and run with `--standalone`, the CLI installs an OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace shape mirrors the web server — `agent.stream` root span via `direct.rs`, with `agent.turn` / `mcp.tool_call` / `orchestration.*` nesting under it. CLI omits the HTTP-infrastructure spans (`chat_completions`, `streaming_completion`) since it has no HTTP layer.
+- **OpenTelemetry (standalone only)**: when running in standalone mode, the CLI installs an OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace shape mirrors the web server — `agent.stream` root span via `direct.rs`, with `agent.turn` / `mcp.tool_call` / `orchestration.*` nesting under it. CLI omits the HTTP-infrastructure spans (`chat_completions`, `streaming_completion`) since it has no HTTP layer.
 - **Single shared tokio runtime**: `main` owns one `tokio::runtime::Runtime` and threads it into `Backend::from_config`, `run_oneshot`, and `run_repl`. `logging::init` runs inside `rt.enter()` so the OTLP gRPC exporter can call `Handle::current()` during `with_tonic()` construction; the `BatchSpanProcessor` worker lives on the same runtime that handles every subsequent request. `main` calls `aura::logging::shutdown_tracer()` via `rt.block_on(...)` before returning to flush buffered spans.
 - SSE event parsing uses shared types from `aura-events` crate (not in `default-members`, build explicitly with `cargo build -p aura-cli`)
 - See `crates/aura-cli/README.md` for full documentation

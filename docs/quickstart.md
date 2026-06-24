@@ -57,11 +57,11 @@ cargo build -p aura-cli --release
 ./target/release/aura-cli
 ```
 
-The CLI also supports a **standalone mode** that runs agents in-process from a TOML config — no server needed:
+The CLI defaults to **standalone mode** — it runs agents in-process from a TOML config, no server needed:
 
 ```bash
-cargo build -p aura-cli --release --features standalone-cli
-./target/release/aura-cli --standalone --config quickstart.toml
+cargo build -p aura-cli --release
+./target/release/aura-cli --config quickstart.toml
 ```
 
 See the [CLI README](../crates/aura-cli/README.md) for the full feature set.

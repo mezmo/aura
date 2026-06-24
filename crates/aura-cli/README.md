@@ -9,11 +9,11 @@ A fast, interactive terminal client for chat completions with tool execution. Bu
 ### Build from the mono-repo
 
 ```bash
-# HTTP-only mode (lightweight, connects to an aura-web-server)
+# Default build (standalone + HTTP — builds agents in-process from TOML config)
 cargo build -p aura-cli --release
 
-# Standalone mode (builds agents in-process from TOML config, no server needed)
-cargo build -p aura-cli --release --features standalone-cli
+# HTTP-only mode (lightweight, no agent/MCP dependencies)
+cargo build -p aura-cli --release --no-default-features
 ```
 
 The binary will be at `target/release/aura-cli`.
@@ -35,20 +35,23 @@ aura-cli --api-url "https://api.example.com" \
 
 #### Standalone mode (no server needed)
 
-When built with `--features standalone-cli`, the CLI can load agent configs directly and run without an HTTP server. Use the `--standalone` flag along with `--config`:
+Standalone mode is enabled by default. The CLI loads agent configs directly and runs without an HTTP server. When `--api-url` is not set, standalone mode activates automatically:
 
 ```bash
+# Uses config.toml in the current directory by default
+aura-cli
+
 # Single TOML config file
-aura-cli --standalone --config path/to/agent.toml
+aura-cli --config path/to/agent.toml
 
 # Directory of TOML configs (enables /model switching between agents)
-aura-cli --standalone --config configs/
+aura-cli --config configs/
 
 # One-shot query in standalone mode
-aura-cli --standalone --config agent.toml --query "hello"
+aura-cli --config agent.toml --query "hello"
 
 # Select a specific agent from a config directory
-aura-cli --standalone --config configs/ --model "Math Agent"
+aura-cli --config configs/ --model "Math Agent"
 ```
 
 In standalone mode, the CLI builds agents in-process using the same code paths as `aura-web-server`. MCP tools from the TOML config are available. CLI local tools (Shell, Read, Update, ...) become available when **both** sides opt in — pass `--enable-client-tools` and set `[agent].enable_client_tools = true` in the loaded TOML config (single-agent configs only; orchestrated configs drop client tools). See [Client-Side Tools](#client-side-tools) for details. The `/model` command works identically — it lists all loaded configs and lets you switch between them.
@@ -99,25 +102,25 @@ aura-cli init --provider openai --model gpt-4o --non-interactive
 
 ## Backends
 
-AURA CLI supports two backends, selected explicitly via the `--standalone` flag:
+AURA CLI supports two backends, selected by the presence of `--api-url`:
 
 | Backend                 | When                         | Dependencies                             | Tools                                                                            |
 | ----------------------- | ---------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
-| **HTTP** (default)      | No `--standalone` flag       | Lightweight — just HTTP client           | Server-side MCP tools always; CLI local tools when both sides opt in (see below) |
-| **Direct** (standalone) | `--standalone --config path` | Full AURA stack (agents, MCP, providers) | MCP tools from TOML config; CLI local tools when `--enable-client-tools` is set  |
+| **Direct** (standalone, default) | No `--api-url` flag    | Full AURA stack (agents, MCP, providers) | MCP tools from TOML config; CLI local tools when `--enable-client-tools` is set  |
+| **HTTP**                         | `--api-url <URL>`      | Lightweight — just HTTP client           | Server-side MCP tools always; CLI local tools when both sides opt in (see below) |
 
 Both backends produce identical SSE event streams and share the same stream parser (`process_sse_events`), so all CLI features (stream panel, tool display, orchestration events, etc.) work identically regardless of backend.
 
 ### Feature flag: `standalone-cli`
 
-The `--standalone` and `--config` flags require the `standalone-cli` Cargo feature. Without it, the binary is a lightweight HTTP-only client with no agent or MCP dependencies.
+The `standalone-cli` Cargo feature is **enabled by default**. It includes the full agent framework, MCP integration, and provider support. To build a lightweight HTTP-only client with no agent or MCP dependencies, disable default features:
 
 ```bash
-# HTTP-only (default) — small binary, fast compile
+# Default build — standalone + HTTP
 cargo build -p aura-cli
 
-# Standalone — includes full agent framework
-cargo build -p aura-cli --features standalone-cli
+# HTTP-only — small binary, fast compile, no agent dependencies
+cargo build -p aura-cli --no-default-features
 ```
 
 ---
@@ -127,7 +130,7 @@ cargo build -p aura-cli --features standalone-cli
 - **Interactive REPL** with conversation history, streaming responses, and markdown rendering
 - **One-shot mode** for scripting and pipelines (`--query`) — stdout is the raw assistant response, no markers or markdown rendering
 - **Local tool execution** — the model can read files, search code, list directories, run shell commands, and edit files on your behalf
-- **Standalone mode** — run agents directly from TOML config without a web server (`--standalone --config`)
+- **Standalone mode** (default) — run agents directly from TOML config without a web server
 - **Conversation persistence** — pick up where you left off with `--resume` or `/resume`
 - **Tab completion** — cycle through matching models and conversations with `Tab` / `Shift+Tab`
 - **Model selection** — browse and select models from the server (or loaded configs in standalone mode)
@@ -170,8 +173,8 @@ aura-cli [OPTIONS]
 | `--force`                                  | —                                    | Bypass warnings and non-critical errors (useful in one-shot/query mode)                                  |
 | `--enable-client-tools[=<bool>]`           | `AURA_ENABLE_CLIENT_TOOLS`           | Advertise CLI local tools to the model (default: disabled — see [Client-Side Tools](#client-side-tools)) |
 | `--enable-final-response-summary[=<bool>]` | `AURA_ENABLE_FINAL_RESPONSE_SUMMARY` | Generate a one-line LLM title for each final response (adds an extra round-trip per turn; default: disabled) |
-| `--standalone`                             | —                                    | Run in standalone mode (requires `--config`, requires `standalone-cli` feature)                          |
-| `--config <PATH>`                          | —                                    | Path to TOML agent config file or directory (requires `--standalone`)                                    |
+| `--standalone`                             | —                                    | Force standalone mode (default when `--api-url` is absent; mutually exclusive with `--api-url` flag, but overrides `AURA_API_URL` env var) |
+| `--config <PATH>`                          | —                                    | Path to TOML agent config file or directory (standalone mode; defaults to `config.toml`)                 |
 | `--log-file <PATH>`                        | `AURA_LOG_FILE`                      | Append diagnostic tracing logs to this file. Omit for no logging (see [Logging](#logging))               |
 
 **Precedence:** CLI flags > environment variables > project `cli.toml` > global `cli.toml` > defaults.
@@ -449,7 +452,7 @@ levels.
 
 ### Standalone-mode OpenTelemetry
 
-When built with `--features standalone-cli` and run with `--standalone`, the
+When running in standalone mode (the default when `--api-url` is absent), the
 CLI runs the agent in-process. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the CLI
 will install an OpenTelemetry layer alongside (or instead of) the file fmt
 layer — the same trace structure (`agent.stream` → `agent.turn` →
@@ -520,21 +523,21 @@ When `--enable-client-tools` is off, the CLI only sees server-side tool executio
 ## Building & Testing
 
 ```bash
-# Build (HTTP-only)
+# Build (default — standalone + HTTP)
 cargo build -p aura-cli
 
-# Build (standalone)
-cargo build -p aura-cli --features standalone-cli
+# Build (HTTP-only — lightweight, no agent dependencies)
+cargo build -p aura-cli --no-default-features
 
 # Run tests
-cargo test -p aura-cli                           # HTTP-only mode
-cargo test -p aura-cli --features standalone-cli  # + standalone tests
+cargo test -p aura-cli                       # default (standalone + HTTP)
+cargo test -p aura-cli --no-default-features  # HTTP-only path
 
 # Clippy
 cargo clippy -p aura-cli --all-targets
-cargo clippy -p aura-cli --features standalone-cli --all-targets
+cargo clippy -p aura-cli --no-default-features --all-targets
 
 # Run directly
-cargo run -p aura-cli -- --api-url "http://localhost:8080"
-cargo run -p aura-cli --features standalone-cli -- --standalone --config agent.toml
+cargo run -p aura-cli -- --config agent.toml                    # standalone (default)
+cargo run -p aura-cli -- --api-url "http://localhost:8080"      # HTTP mode
 ```
