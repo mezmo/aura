@@ -893,6 +893,14 @@ pub fn run_repl(
                     Backend::Direct(_) => None,
                 };
 
+                // In-process approval registry: standalone mode resolves
+                // conversational approvals directly via the shared registry.
+                #[cfg(feature = "standalone-cli")]
+                let pending_approvals: Option<aura::hitl::PendingApprovals> = match backend {
+                    Backend::Http(_) => None,
+                    Backend::Direct(d) => Some(d.pending_approvals()),
+                };
+
                 // Tool execution loop: send request → process stream → if tool calls,
                 // execute locally and send results back → repeat until text response.
                 'tool_loop: loop {
@@ -918,6 +926,8 @@ pub fn run_repl(
                             needs_blank: needs_blank.clone(),
                             in_update_group: in_update_group.clone(),
                             approval_poster: approval_poster.clone(),
+                            #[cfg(feature = "standalone-cli")]
+                            pending_approvals: pending_approvals.clone(),
                         };
                         backend
                             .stream_chat(
@@ -1886,6 +1896,11 @@ struct ReplStreamHandler {
     /// HTTP client for POSTing approval decisions. `None` in standalone
     /// mode (no HTTP ingress endpoint to POST to).
     approval_poster: Option<crate::api::approval::ApprovalPoster>,
+    /// In-process approval registry for standalone (direct) mode. When set,
+    /// conversational approvals are resolved locally via
+    /// `PendingApprovals::resolve()` instead of an HTTP POST.
+    #[cfg(feature = "standalone-cli")]
+    pending_approvals: Option<aura::hitl::PendingApprovals>,
 }
 
 impl StreamHandler for ReplStreamHandler {
@@ -2824,18 +2839,23 @@ impl StreamHandler for ReplStreamHandler {
             self.anim_cleared.store(true, Ordering::Relaxed);
         }
 
-        let poster = match &self.approval_poster {
-            Some(p) => p.clone(),
-            None => {
-                let _term = lock_term();
-                erase_input_frame();
-                eprintln!(
-                    "error: approval received but standalone mode has no HTTP ingress to \
-                     POST a decision. The tool call will time out and fail closed."
-                );
-                return;
-            }
-        };
+        // Determine resolution path: HTTP poster (web-server mode) or
+        // in-process registry (standalone mode).
+        let has_poster = self.approval_poster.is_some();
+        #[cfg(feature = "standalone-cli")]
+        let has_registry = self.pending_approvals.is_some();
+        #[cfg(not(feature = "standalone-cli"))]
+        let has_registry = false;
+
+        if !has_poster && !has_registry {
+            let _term = lock_term();
+            erase_input_frame();
+            eprintln!(
+                "error: approval received but no resolver available. \
+                 The tool call will time out and fail closed."
+            );
+            return;
+        }
 
         // Render the prompt and read the human's decision.
         let decision_id = pending.decision_id.clone();
@@ -2921,25 +2941,62 @@ impl StreamHandler for ReplStreamHandler {
             }
         };
 
-        // Fire-and-forget POST — the stream stays open; the server resolves
-        // the parked call and sends `approval_completed` when done.
-        let cancel = self.cancel.clone();
-        tokio::spawn(async move {
-            match poster.post_decision(&decision_id, response).await {
-                Ok(crate::api::approval::PostOutcome::Accepted) => {}
-                Ok(crate::api::approval::PostOutcome::NotFound) => {
-                    eprintln!(
-                        "warning: approval decision was not found on the server \
-                         (it may have already expired or been cancelled)."
-                    );
+        // Resolve the approval: in-process registry (standalone) or HTTP POST
+        // (web-server mode). The registry path is synchronous (mutex + oneshot
+        // send); the HTTP path is fire-and-forget async.
+        #[cfg(feature = "standalone-cli")]
+        let resolved_locally = if let Some(ref registry) = self.pending_approvals {
+            let decision = match &response {
+                crate::api::approval::ApprovalResponse::Approved => {
+                    aura::hitl::ApprovalDecision::Approved
+                }
+                crate::api::approval::ApprovalResponse::Denied { reason } => {
+                    aura::hitl::ApprovalDecision::Denied {
+                        reason: reason.clone(),
+                    }
+                }
+            };
+            match aura::hitl::DecisionId::parse(&decision_id) {
+                Ok(id) => {
+                    if let Err(aura::hitl::ResolveError::NotFound) = registry.resolve(&id, decision)
+                    {
+                        eprintln!(
+                            "warning: approval decision was not found \
+                             (it may have already expired or been cancelled)."
+                        );
+                    }
                 }
                 Err(e) => {
-                    eprintln!("error: failed to post approval decision: {e}");
-                    // Cancel the stream so the user isn't left waiting.
-                    cancel.store(true, Ordering::Relaxed);
+                    eprintln!("error: invalid decision id '{decision_id}': {e}");
+                    self.cancel.store(true, Ordering::Relaxed);
                 }
             }
-        });
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "standalone-cli"))]
+        let resolved_locally = false;
+
+        if !resolved_locally && let Some(poster) = &self.approval_poster {
+            let poster = poster.clone();
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                match poster.post_decision(&decision_id, response).await {
+                    Ok(crate::api::approval::PostOutcome::Accepted) => {}
+                    Ok(crate::api::approval::PostOutcome::NotFound) => {
+                        eprintln!(
+                            "warning: approval decision was not found on the server \
+                             (it may have already expired or been cancelled)."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to post approval decision: {e}");
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
 
         // Restart "Thinking" animation while we wait for approval_completed.
         let (wave_anim, wave_stop) = {
