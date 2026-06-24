@@ -17,14 +17,16 @@
 //!
 //! ## Implementation status
 //!
-//! The webhook route (Phase 1) is implemented: [`HitlApprovalWrapper`],
-//! [`RequestApprovalTool`], [`DecisionRoute::Webhook`], the domain types in
-//! `decision.rs`, the wire protocol in `protocol.rs`, and the SSE event
-//! conversion in `events.rs` are all working.
+//! Both routes are fully operational in both single-agent and orchestration mode:
 //!
-//! The conversational route (Phase 2) is wired: the
-//! [`DecisionRoute::Conversational`] arm parks on the registry and awaits a
-//! decision via `POST /v1/approvals/{decision_id}`.
+//! - **Webhook** (Route A): [`HitlApprovalWrapper`], [`RequestApprovalTool`],
+//!   [`DecisionRoute::Webhook`], domain types, wire protocol, and SSE events.
+//! - **Conversational** (Route B): [`DecisionRoute::Conversational`] parks on
+//!   the registry; decisions arrive via `POST /v1/approvals/{decision_id}`
+//!   (web-server) or in-process `PendingApprovals::resolve()` (CLI standalone).
+//!
+//! Single-agent mode composes the gate and tool in [`Agent::new`](crate::builder::Agent::new);
+//! orchestration workers compose them per-task in `create_worker`.
 
 mod decision;
 mod events;

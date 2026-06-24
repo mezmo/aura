@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [features]
 default = ["standalone-cli"]
-standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util", "dep:thiserror"]
+standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util"]
 
 [dependencies]
 tokio = { workspace = true }

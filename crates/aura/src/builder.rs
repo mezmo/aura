@@ -300,11 +300,46 @@ impl Agent {
             None
         };
 
-        // Clone so setup_single_agent_scratchpad can mutate extension fields
-        // (tool_wrapper, preamble_override, scratchpad_tools_config).
+        // Clone so setup_single_agent_scratchpad and HITL can mutate extension
+        // fields (tool_wrapper, preamble_override, scratchpad_tools_config,
+        // hitl_request_approval_tool).
         let mut config_owned = config.clone();
         let agent_scratchpad_budget =
             Self::setup_single_agent_scratchpad(&mut config_owned, mcp_manager.as_ref()).await?;
+
+        // HITL gate for single-agent mode. Orchestration workers wire their
+        // own gate in create_worker with per-task AgentScope::Worker; this
+        // covers single-agent only (AgentScope::Single).
+        if !config_owned.orchestration_enabled()
+            && let Some(ref hitl) = config_owned.hitl
+        {
+            let scope = crate::hitl::AgentScope::Single {
+                session_id: config_owned
+                    .session_id
+                    .clone()
+                    .map(crate::config::SessionId::new),
+            };
+            let request_id = config_owned.request_id.clone().unwrap_or_default();
+            let gate: Arc<dyn crate::tool_wrapper::ToolWrapper> =
+                Arc::new(crate::hitl::HitlApprovalWrapper::new(
+                    hitl.patterns.clone(),
+                    hitl.route.clone(),
+                    scope.clone(),
+                    request_id.clone(),
+                ));
+            config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
+                Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                    gate, existing,
+                ])),
+                None => gate,
+            });
+            config_owned.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
+                hitl.route.clone(),
+                scope,
+                request_id,
+            ));
+        }
+
         let config = &config_owned;
 
         // Scratchpad bonus only applies when scratchpad was actually wired up
@@ -1547,10 +1582,9 @@ pub async fn build_streaming_agent(
         // and apply its client_tool_filter.
         tracing::info!("Building Agent (orchestration.enabled = false)");
         if config.hitl.is_some() {
-            tracing::warn!(
-                "[hitl] is configured but orchestration is not enabled. \
-                 The HITL config gate is only composed for orchestration workers \
-                 in this phase; the [hitl] table will be ignored in single-agent mode."
+            tracing::info!(
+                "Single-agent HITL gate active: tool calls matching configured \
+                 globs will require approval via the configured route"
             );
         }
         let attached = if config.agent.enable_client_tools {
