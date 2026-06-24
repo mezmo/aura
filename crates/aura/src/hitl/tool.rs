@@ -1,11 +1,10 @@
 //! The agent-callable surface: `request_approval`, a Rig tool the agent invokes
 //! when it judges that an action needs a human.
 //!
-//! Denials and timeouts return `Ok(String)` — the model sees these as feedback
-//! it can reason about ("do not proceed"). Channel errors (transport, bad status,
-//! parse) return `Err(ToolError)` — the model sees an infrastructure failure it
-//! can retry or surface to the user, consistent with the config-gate path in
-//! `gate.rs`.
+//! Denial returns `Ok(String)` - the model sees it as policy feedback it can
+//! reason about ("do not proceed"). Non-decisions (timeout, cancellation) and
+//! channel errors return `Err(ToolError)` - the model sees an infrastructure
+//! failure. This aligns with the config-gate path in `gate.rs`.
 
 use std::sync::Arc;
 
@@ -16,7 +15,7 @@ use serde_json::Value;
 
 use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-use super::route::DecisionRoute;
+use super::route::{ApprovalError, DecisionRoute};
 
 /// The `request_approval` tool. Constructs an
 /// [`ApprovalOrigin::AgentRequested`] and dispatches through the shared
@@ -51,6 +50,37 @@ pub struct RequestApprovalArgs {
     /// Optional structured metadata for the reviewer.
     #[serde(default)]
     pub context: Option<Value>,
+}
+
+/// Map [`DecisionRoute::decide`] outcome to [`Tool::Output`] / [`Tool::Error`].
+///
+/// Denial -> `Ok` (policy feedback). Timeout/cancel/channel -> `Err` (tool error).
+fn approval_outcome_to_tool_result(
+    result: Result<ApprovalOutcome, ApprovalError>,
+    action: &str,
+) -> Result<String, ToolError> {
+    match result {
+        Ok(ApprovalOutcome::Decided(ApprovalDecision::Approved)) => {
+            Ok(format!("Approved. You may proceed with: {action}"))
+        }
+        Ok(ApprovalOutcome::Decided(ApprovalDecision::Denied { reason })) => Ok(format!(
+            "Rejected: {}. Do not proceed with this action.",
+            reason.unwrap_or_else(|| "no reason provided".to_string())
+        )),
+        Ok(ApprovalOutcome::TimedOut { .. }) => Err(ToolError::ToolCallError(
+            "Approval timed out. Treat this as not approved; do not proceed."
+                .to_string()
+                .into(),
+        )),
+        Ok(ApprovalOutcome::Cancelled(_)) => Err(ToolError::ToolCallError(
+            "Approval was cancelled. Treat this as not approved; do not proceed."
+                .to_string()
+                .into(),
+        )),
+        Err(e) => Err(ToolError::ToolCallError(
+            format!("Approval request failed: {e}. You may try again or notify the user.").into(),
+        )),
+    }
 }
 
 impl Tool for RequestApprovalTool {
@@ -105,25 +135,86 @@ impl Tool for RequestApprovalTool {
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
                 .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
-        match self.route.decide(request, &cancel).await {
-            Ok(ApprovalOutcome::Decided(ApprovalDecision::Approved)) => Ok(format!(
-                "Approved. You may proceed with: {}",
-                args.action_description
-            )),
-            Ok(ApprovalOutcome::Decided(ApprovalDecision::Denied { reason })) => Ok(format!(
-                "Rejected: {}. Do not proceed with this action.",
-                reason.unwrap_or_else(|| "no reason provided".to_string())
-            )),
-            Ok(ApprovalOutcome::TimedOut { .. }) => {
-                Ok("Approval timed out. Treat this as not approved; do not proceed.".to_string())
-            }
-            Ok(ApprovalOutcome::Cancelled(_)) => Ok(
-                "Approval was cancelled. Treat this as not approved; do not proceed.".to_string(),
-            ),
-            Err(e) => Err(ToolError::ToolCallError(
-                format!("Approval request failed: {e}. You may try again or notify the user.")
-                    .into(),
-            )),
-        }
+        approval_outcome_to_tool_result(
+            self.route.decide(request, &cancel).await,
+            &args.action_description,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::decision::{ApprovalOutcome, CancelReason};
+    use super::*;
+
+    #[test]
+    fn mapping_approved_returns_ok_with_action() {
+        let result = approval_outcome_to_tool_result(
+            Ok(ApprovalOutcome::Decided(ApprovalDecision::Approved)),
+            "deploy service",
+        );
+        assert!(result.is_ok());
+        assert!(result.as_ref().unwrap().contains("Approved"));
+        assert!(result.as_ref().unwrap().contains("deploy service"));
+    }
+
+    #[test]
+    fn mapping_denied_returns_ok_with_reason() {
+        let result = approval_outcome_to_tool_result(
+            Ok(ApprovalOutcome::Decided(ApprovalDecision::Denied {
+                reason: Some("too risky".to_string()),
+            })),
+            "deploy service",
+        );
+        assert!(result.is_ok());
+        assert!(result.as_ref().unwrap().contains("Rejected"));
+        assert!(result.as_ref().unwrap().contains("too risky"));
+    }
+
+    #[test]
+    fn mapping_denied_with_no_reason_returns_ok() {
+        let result = approval_outcome_to_tool_result(
+            Ok(ApprovalOutcome::Decided(ApprovalDecision::Denied {
+                reason: None,
+            })),
+            "deploy service",
+        );
+        assert!(result.is_ok());
+        assert!(result.as_ref().unwrap().contains("no reason provided"));
+    }
+
+    #[test]
+    fn mapping_timeout_returns_err() {
+        let result = approval_outcome_to_tool_result(
+            Ok(ApprovalOutcome::TimedOut {
+                waited: std::time::Duration::from_secs(5),
+            }),
+            "deploy service",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("timed out"));
+    }
+
+    #[test]
+    fn mapping_cancelled_returns_err() {
+        let result = approval_outcome_to_tool_result(
+            Ok(ApprovalOutcome::Cancelled(CancelReason::ClientDisconnected)),
+            "deploy service",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("cancelled"));
+    }
+
+    #[test]
+    fn mapping_channel_error_returns_err() {
+        let result = approval_outcome_to_tool_result(
+            Err(ApprovalError::Transport("connection refused".to_string())),
+            "deploy service",
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Approval request failed"));
     }
 }
