@@ -1,5 +1,24 @@
 ## Changelog
 
+# [1.28.0](https://github.com/mezmo/aura/compare/v1.27.0...v1.28.0) (2026-06-24)
+
+
+### Bug Fixes
+
+* **cli**: make --standalone and --api-url mutually exclusive [249201e](https://github.com/mezmo/aura/commit/249201e34595ab43adea0fe66ecb0848706cdb88) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+### Documentation
+
+* **cli**: update docs for standalone-as-default and add CI guard [a5d8dc9](https://github.com/mezmo/aura/commit/a5d8dc9ad61e57f89c89acb6821642be9e11e2b9) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+### Features
+
+* **cli**: default to standalone mode when --api-url is absent [170d957](https://github.com/mezmo/aura/commit/170d9572c94e409eb6cabe5881c003bdc701919e) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+### Style
+
+* **cli**: fix rustfmt chain indentation in cli.rs [b930960](https://github.com/mezmo/aura/commit/b9309609cca5b7e7abc4ad02756356891e6d79a6) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
 # [1.27.0](https://github.com/mezmo/aura/compare/v1.26.2...v1.27.0) (2026-06-23)
 
 
