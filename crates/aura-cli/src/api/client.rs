@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 
 use crate::api::session::CHAT_SESSION_HEADER;
 use crate::api::types::{ChatCompletion, ChatRequest, Message, ModelList, ToolDefinition};
@@ -10,6 +10,42 @@ const SUMMARIZE_PROMPT: &str = "\
 You are a title generator. Given an assistant response, produce a single short \
 plain-text title (max 72 chars) that summarizes it. No markdown, no quotes, no \
 punctuation at the end. Just the title.";
+
+/// Apply common headers to a request: Content-Type, `Authorization: Bearer`
+/// (when [`AppConfig::api_key`] is set), and the user-supplied `extra_headers`.
+///
+/// If `session_id` is `Some`, attaches `x-chat-session-id` with that value and
+/// suppresses any same-named header from `extra_headers` (so the resolved
+/// value wins). Pass `None` for endpoints that don't participate in chat
+/// sessions (e.g. `/v1/models`, `/v1/approvals/{id}`).
+///
+/// Shared between [`ChatClient::build_request`] and
+/// [`crate::api::approval::ApprovalPoster::post_decision`] so auth policy
+/// changes land in one place.
+pub(crate) fn apply_common_headers(
+    config: &AppConfig,
+    builder: RequestBuilder,
+    session_id: Option<&str>,
+) -> RequestBuilder {
+    let mut req = builder.header("Content-Type", "application/json");
+
+    if let Some(ref key) = config.api_key {
+        req = req.bearer_auth(key);
+    }
+
+    for (name, value) in &config.extra_headers {
+        if session_id.is_some() && name.eq_ignore_ascii_case(CHAT_SESSION_HEADER) {
+            continue;
+        }
+        req = req.header(name, value);
+    }
+
+    if let Some(sid) = session_id {
+        req = req.header(CHAT_SESSION_HEADER, sid);
+    }
+
+    req
+}
 
 /// Check if an error is a model-related error from the API (not found, missing, invalid).
 pub fn is_model_error(err: &anyhow::Error) -> bool {
@@ -34,43 +70,17 @@ impl ChatClient {
         }
     }
 
-    /// Build a request with common headers (Content-Type, auth, extra headers).
+    /// Build a request with common headers.
     ///
-    /// If `session_id` is `Some`, attaches `x-chat-session-id` with that value
-    /// and suppresses any same-named header from `extra_headers` (so the caller's
-    /// resolved value wins). If `None`, falls through and lets `extra_headers`
-    /// pass through unchanged (used for endpoints like `/v1/models` that don't
-    /// participate in chat sessions).
+    /// Delegates to [`apply_common_headers`] so chat and approval requests
+    /// share the same auth/header policy.
     fn build_request(
         &self,
         method: reqwest::Method,
         url: &str,
         session_id: Option<&str>,
     ) -> reqwest::RequestBuilder {
-        let mut req = self
-            .http
-            .request(method, url)
-            .header("Content-Type", "application/json");
-
-        if let Some(ref key) = self.config.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        for (name, value) in &self.config.extra_headers {
-            // When a session_id is being injected, drop any user-supplied
-            // x-chat-session-id from extra_headers — the resolved value
-            // (which may itself originate from extra_headers) is authoritative.
-            if session_id.is_some() && name.eq_ignore_ascii_case(CHAT_SESSION_HEADER) {
-                continue;
-            }
-            req = req.header(name, value);
-        }
-
-        if let Some(sid) = session_id {
-            req = req.header(CHAT_SESSION_HEADER, sid);
-        }
-
-        req
+        apply_common_headers(&self.config, self.http.request(method, url), session_id)
     }
 
     pub async fn send_streaming(
