@@ -146,6 +146,7 @@ impl AgentExecutor for AuraAgentExecutor {
                 }));
             }
         };
+        let config_dir = self.app_state.config_dir.clone();
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
@@ -181,7 +182,7 @@ impl AgentExecutor for AuraAgentExecutor {
 
             let request_id = format!("a2a_{}", task_id);
             let session_id = Some(context_id.clone());
-            let builder = RigBuilder::new(config, pending_approvals);
+            let builder = RigBuilder::new(config, pending_approvals).with_config_dir(config_dir);
             let agent = match builder
                 .build_streaming_agent_with_headers(
                     Some(&req_headers),
@@ -656,6 +657,7 @@ mod tests {
             active_requests: Arc::new(ActiveRequestTracker::default()),
             additional_tools: Arc::new(Vec::new),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            config_dir: std::path::PathBuf::from("."),
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }

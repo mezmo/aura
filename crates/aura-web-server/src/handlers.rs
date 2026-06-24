@@ -171,6 +171,7 @@ struct ResponseContext {
 /// Build a fresh agent for a request, applying headers_from_request mappings
 /// and optionally registering additional tools (e.g., CLI tools in standalone mode)
 /// or client-side passthrough tools.
+#[allow(clippy::too_many_arguments)]
 async fn build_agent_for_request(
     config: &aura_config::Config,
     req_headers: &HashMap<String, String>,
@@ -179,10 +180,12 @@ async fn build_agent_for_request(
     request_id: String,
     session_id: String,
     pending_approvals: aura::hitl::PendingApprovals,
+    config_dir: &std::path::Path,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
-    let builder = RigBuilder::new(config.clone(), pending_approvals);
+    let builder = RigBuilder::new(config.clone(), pending_approvals)
+        .with_config_dir(config_dir.to_path_buf());
     let agent = builder
         .build_agent(
             Some(req_headers),
@@ -277,7 +280,8 @@ pub async fn prepare_request(
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
         // Orchestration path: build via streaming agent builder (returns Orchestrator).
         // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
-        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone());
+        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
+            .with_config_dir(data.config_dir.clone());
         builder
             .build_streaming_agent_with_headers(
                 Some(req_headers_map),
@@ -306,6 +310,7 @@ pub async fn prepare_request(
             request_id.clone(),
             chat_session_id.to_string(),
             data.pending_approvals.clone(),
+            &data.config_dir,
         )
         .await? as Arc<dyn StreamingAgent>
     };
@@ -1667,6 +1672,7 @@ mod tests {
                 default_agent: None,
                 additional_tools: Arc::new(Vec::new),
                 pending_approvals: aura::hitl::PendingApprovals::new(),
+                config_dir: std::path::PathBuf::from("."),
             })
         }
 

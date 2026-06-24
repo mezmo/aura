@@ -8,6 +8,7 @@ use crate::{
         StreamedAssistantContent,
     },
     scratchpad,
+    skill_tool::{SkillToolset, render_skill_catalog},
     tool_wrapper::WrappedTool,
     tools::{FilesystemTool, ListDirTool, ReadFileTool, WriteFileTool},
     vector_dynamic::DynamicVectorSearchTool,
@@ -398,6 +399,11 @@ impl Agent {
         // Extract model name for logging
         let model_name = config.llm.model_name().to_string();
 
+        let mut system_prompt = config.effective_preamble().to_string();
+        if let Some(catalog) = render_skill_catalog(&config.agent.skills) {
+            system_prompt.push_str(&catalog);
+        }
+
         // Build provider-specific agent with tools
         // Each branch creates its own completion model and agent builder,
         // adds tools using the shared BuilderState helper, then wraps in ProviderAgent
@@ -432,7 +438,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -498,7 +504,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -563,7 +569,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -612,7 +618,7 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -656,7 +662,7 @@ impl Agent {
 
                 // Create agent builder with system prompt and temperature
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -704,7 +710,7 @@ impl Agent {
                 let completion_model = client.completion_model(model);
 
                 let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
-                agent_builder = agent_builder.preamble(config.effective_preamble());
+                agent_builder = agent_builder.preamble(&system_prompt);
                 if let Some(temp) = temperature {
                     agent_builder = agent_builder.temperature(*temp);
                 }
@@ -1010,6 +1016,16 @@ impl Agent {
         if !additional_tools.is_empty() {
             tracing::info!("Adding {} additional custom tools", additional_tools.len());
             builder_state = builder_state.add_tools_dyn(additional_tools);
+        }
+
+        if let Some(toolset) = SkillToolset::new(&config.agent.skills) {
+            tracing::info!(
+                "Adding skill tools (load_skill, read_skill_file) with {} skills",
+                config.agent.skills.len(),
+            );
+            builder_state = builder_state
+                .add_tool(toolset.load)
+                .add_tool(toolset.read_file);
         }
 
         Ok(builder_state)

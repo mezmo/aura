@@ -5,6 +5,7 @@ pub mod lenient_int;
 pub mod loader;
 pub mod orchestration;
 pub mod scratchpad;
+pub mod skills;
 
 #[cfg(test)]
 mod config_test;
@@ -20,6 +21,7 @@ pub use orchestration::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
 };
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
+pub use skills::SkillName;
 
 use std::collections::HashSet;
 use std::fs;
