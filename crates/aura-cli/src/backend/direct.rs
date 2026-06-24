@@ -102,6 +102,13 @@ impl DirectBackend {
             .any(|c| !c.orchestration_enabled() && c.agent.enable_client_tools)
     }
 
+    /// In-process pending approvals registry for direct (standalone) approval
+    /// resolution. The CLI REPL uses this to resolve conversational approvals
+    /// without an HTTP round-trip to `/v1/approvals/{id}`.
+    pub fn pending_approvals(&self) -> aura::hitl::PendingApprovals {
+        self.app_state.pending_approvals.clone()
+    }
+
     /// Return the effective model ID for each loaded config.
     pub(crate) fn model_ids(&self) -> Vec<String> {
         self.app_state
