@@ -308,6 +308,28 @@ fn config_with_api_url_warns_ignored() {
     );
 }
 
+#[cfg(feature = "standalone-cli")]
+#[test]
+fn standalone_and_api_url_flags_are_mutually_exclusive() {
+    let output = aura_cli()
+        .arg("--standalone")
+        .arg("--api-url")
+        .arg("http://localhost:9999")
+        .arg("--config")
+        .arg("some/path.toml")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "--standalone and --api-url together should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "should explain that --standalone and --api-url are mutually exclusive"
+    );
+}
+
 #[cfg(not(feature = "standalone-cli"))]
 #[test]
 fn standalone_flag_without_feature_exits_with_error() {
