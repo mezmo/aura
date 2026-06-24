@@ -1,8 +1,9 @@
+use a2a::VERSION;
+use aura::RigBuilder;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
     tool_event_subscribe, tool_usage_subscribe,
 };
-use aura_config::RigBuilder;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -22,25 +23,6 @@ use crate::streaming::{
     TurnContext, collect_stream_to_completion, process_sse_stream_full,
 };
 use crate::types::*;
-
-/// RAII guard that increments the active request counter on creation and
-/// decrements it on drop, notifying the shutdown task when the count hits zero.
-struct ActiveRequestGuard {
-    tracker: Arc<ActiveRequestTracker>,
-}
-
-impl ActiveRequestGuard {
-    fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
-        tracker.increment();
-        Self { tracker }
-    }
-}
-
-impl Drop for ActiveRequestGuard {
-    fn drop(&mut self) {
-        self.tracker.decrement();
-    }
-}
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
 struct RequestResourceGuard {
@@ -868,7 +850,11 @@ fn convert_tool_message(msg: &ChatMessage, client_tools_enabled: bool) -> Option
 /// Health check endpoint
 pub async fn health() -> Response {
     Json(serde_json::json!({
-        "status": "healthy"
+        "status": "healthy",
+        "timestamp": Utc::now().to_rfc3339(),
+        "a2a_server": {
+            "version": VERSION,
+        },
     }))
     .into_response()
 }

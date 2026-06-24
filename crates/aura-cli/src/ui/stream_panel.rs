@@ -17,6 +17,7 @@ use super::state::{
     CURSOR_ROW, EXPANDED_OUTPUT, FRAME_LINES, STREAM_CONV_DIR, STREAM_PANEL, STREAM_PANEL_DIRTY,
     term_size,
 };
+use crate::event_names;
 use crate::theme::{AuraStyle, Style, Themed, theme};
 
 /// Resolve the per-event-type style for a stream panel row.
@@ -94,20 +95,18 @@ fn extract_display_id(event_name: &str, data: &str) -> Option<String> {
     };
 
     match event_name {
-        "aura.tool_requested" | "aura.tool_start" | "aura.tool_complete" => {
+        event_names::TOOL_REQUESTED | event_names::TOOL_START | event_names::TOOL_COMPLETE => {
             try_field(&val, "tool_id")
         }
-        "aura.usage" | "aura.session_info" => try_field(&val, "session_id"),
+        event_names::USAGE | event_names::SESSION_INFO => try_field(&val, "session_id"),
         "message" => try_field(&val, "id"),
-        "aura.orchestrator.tool_call_started" | "aura.orchestrator.tool_call_completed" => {
+        event_names::TOOL_CALL_STARTED | event_names::TOOL_CALL_COMPLETED => {
             try_field(&val, "tool_call_id")
         }
-        "aura.orchestrator.task_started" | "aura.orchestrator.task_completed" => {
-            try_field(&val, "task_id")
+        event_names::TASK_STARTED | event_names::TASK_COMPLETED => try_field(&val, "task_id"),
+        event_names::PLAN_CREATED | event_names::ITERATION_COMPLETE | event_names::SYNTHESIZING => {
+            try_field(&val, "session_id")
         }
-        "aura.orchestrator.plan_created"
-        | "aura.orchestrator.iteration_complete"
-        | "aura.orchestrator.synthesizing" => try_field(&val, "session_id"),
         _ => try_field(&val, "id")
             .or_else(|| try_field(&val, "session_id"))
             .or_else(|| try_field(&val, "tool_id")),

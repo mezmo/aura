@@ -10,6 +10,7 @@
 #   examples/minimal/ollama.toml     - local Ollama models, no API key needed
 #   examples/minimal/bedrock.toml    - AWS Bedrock
 #   examples/minimal/gemini.toml     - Google Gemini
+#   examples/minimal/openrouter.toml - OpenRouter (300+ models, or any compatible API)
 #
 # Complete agent configs (LLM + MCP tools + system prompts):
 #   examples/complete/incident-response-mezmo.toml    - PagerDuty + Mezmo
@@ -45,6 +46,29 @@ description = "Example SSE MCP server"
 #
 # [mcp.servers.example_sse.headers_from_request]
 # Authorization = "x-user-token"
+
+# ── STDIO transport (local child process) ────────────────────────────
+# Spawns a local child process for each agent instance. By design, STDIO
+# MCP servers are local sidecars for an AI assistant client — they are
+# not remote services. Each agent request creates its own process.
+#
+# cmd is a list where cmd[0] is the executable and cmd[1..] are arguments
+# that are part of the command itself (e.g., a script path). args are
+# additional arguments passed after the command elements.
+[mcp.servers.example_stdio]
+transport = "stdio"
+# Just a binary to spawn — args go in the separate args list
+cmd = ["npx"]
+args = ["-y", "@modelcontextprotocol/server-everything"]
+description = "Example STDIO MCP server"
+
+# Another example: a script that needs an interpreter
+# cmd = ["python3", "/opt/mcp-servers/weather.py"]
+# args = ["--verbose"]
+#
+# Or a direct binary with no extra args:
+# cmd = ["/usr/local/bin/mcp-server"]
+# args = ["--config", "/etc/mcp/config.json"]
 
 # Static headers sent with every request.
 [mcp.servers.example_http.headers]
@@ -182,4 +206,13 @@ model = "gpt-5.2"
 # provider = "gemini"
 # api_key = "{{ env.GOOGLE_API_KEY }}"
 # model = "gemini-2.0-flash"
+
+# OpenRouter alternative (300+ models via single key):
+# Uses OpenRouter's reasoning wire format (reasoning + reasoning_details).
+# For other OpenAI-compatible APIs (Fireworks, Together), use provider = "openai"
+# with base_url instead -- those send reasoning_content, not reasoning_details.
+# provider = "openrouter"
+# api_key = "{{ env.OPENROUTER_API_KEY }}"
+# model = "anthropic/claude-sonnet-4"
+# base_url = "https://custom-endpoint/v1"  # optional: OpenRouter-compatible proxies only
 

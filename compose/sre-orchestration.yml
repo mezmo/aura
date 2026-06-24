@@ -10,8 +10,8 @@
 
 services:
   # Stub out mock-mcp from base.yml — SRE orchestration tests don't use it.
-  # Override with a minimal container so the stack doesn't need the external
-  # aura-mock-mcp:local image (which requires `make mock-mcp-build`).
+  # Override with a minimal container so the stack doesn't pull the
+  # mezmo/aura-mock-mcp image it would otherwise require.
   mock-mcp:
     image: alpine:latest
     command: ["sleep", "infinity"]

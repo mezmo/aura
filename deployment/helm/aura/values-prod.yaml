@@ -11,6 +11,14 @@ replicaCount: 3
 imagePullSecrets:
   - name: gcr
 
+server:
+  # Externally-reachable origin clients use to reach this deployment (your
+  # Ingress/load-balancer host). Required for the A2A agent card to advertise
+  # absolute, reachable URLs — without it the card falls back to the pod's
+  # bind host/port (0.0.0.0:8080), which no external A2A client can reach.
+  # CHANGE THIS WHEN READY TO SERVE A2A TRAFFIC, AND SET IT TO YOUR DEPLOYMENT'S PUBLIC ORIGIN
+  publicUrl: ""
+
 # Use existing secrets from production
 secrets:
   existingSecret: "aura-secrets"

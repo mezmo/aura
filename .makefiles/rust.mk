@@ -54,6 +54,15 @@ nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
 
+.PHONY: check-cli-http-only
+check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features) aura-cli still builds
+	$(RUN) cargo clippy -p aura-cli --no-default-features --all-targets -- -D warnings
+	$(RUN) cargo test -p aura-cli --no-default-features
+
+.PHONY: update-lockfile
+update-lockfile: $(DOCKER_ENV) ## Regenerate Cargo.lock after version changes
+	$(RUN) cargo update --quiet --workspace
+
 .PHONY:clean-rust
 clean-rust: ## Clean up rust build artifacts
 	$(RUN_NO_ENV) cargo clean
@@ -81,6 +90,39 @@ fmt-rust:: $(REPORT_DIR)                 ## Format code with rustfmt
 		sed -i.bak "s|name=\"$$REPO_ROOT/|name=\"|g" $(REPORT_DIR)/rustfmt.xml; \
 		rm -f $(REPORT_DIR)/rustfmt.xml.bak; \
 	fi
+
+$(DIST_DIR):
+	@mkdir -p $(@)
+
+.PHONY: build-release-binary-amd64
+build-release-binary-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build release binaries for linux/amd64
+	$(RUN) cargo build --release --bin aura-web-server
+	$(RUN) cargo build --release -p aura-cli --bin aura-cli
+	cp target/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
+	cp target/release/aura-cli $(DIST_DIR)/aura-cli-linux-amd64
+
+.PHONY: build-release-binary-arm64
+build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release binaries for linux/arm64
+	$(RUN) bash -c "\
+		rustup target add aarch64-unknown-linux-gnu 2>/dev/null; \
+		export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
+		export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
+		export PKG_CONFIG_ALLOW_CROSS=1; \
+		cargo build --release --target aarch64-unknown-linux-gnu --bin aura-web-server && \
+		cargo build --release --target aarch64-unknown-linux-gnu -p aura-cli --bin aura-cli"
+	cp target/aarch64-unknown-linux-gnu/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
+	cp target/aarch64-unknown-linux-gnu/release/aura-cli $(DIST_DIR)/aura-cli-linux-arm64
+
+.PHONY: build-release-binaries
+build-release-binaries: ## Build release binaries for all platforms
+	$(MAKE) -j2 build-release-binary-amd64 build-release-binary-arm64
+	cd $(DIST_DIR) && sha256sum aura-* > checksums.txt
+
+clean:: clean-dist
+
+.PHONY: clean-dist
+clean-dist:
+	rm -rf $(DIST_DIR)
 
 $(NEXTEST_BIN): $(CARGO_BIN_DIR)
 	@if [ "$(AURA_AUTO_DOWNLOAD)" != "true" ]; then \

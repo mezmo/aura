@@ -3,14 +3,12 @@ pub mod http;
 #[cfg(feature = "standalone-cli")]
 pub mod direct;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::api::stream::StreamResult;
+use crate::api::stream::{StreamHandler, StreamResult};
 use crate::api::types::{Message, ToolDefinition};
 use crate::cli::Args;
 use crate::config::AppConfig;
@@ -29,17 +27,19 @@ pub enum Backend {
 impl Backend {
     /// Create the appropriate backend based on config.
     ///
-    /// If `--standalone` is set, uses `DirectBackend` with the config from `--config`.
+    /// When `is_standalone` is true, uses `DirectBackend` with the config from
+    /// `--config` (or `config.toml` in the current directory if omitted).
     /// Otherwise, uses `HttpBackend` (HTTP/SSE to aura-web-server).
     pub fn from_config(
         _rt: &tokio::runtime::Runtime,
         config: &AppConfig,
         _args: &Args,
+        _is_standalone: bool,
     ) -> Result<Self> {
         #[cfg(feature = "standalone-cli")]
-        if _args.standalone {
-            // validate_standalone_args guarantees --config is present when --standalone is set
-            let config_path = _args.agent_config.as_ref().unwrap();
+        if _is_standalone {
+            let default_config = String::from("config.toml");
+            let config_path = _args.agent_config.as_ref().unwrap_or(&default_config);
             let direct = _rt.block_on(direct::DirectBackend::from_toml(
                 config_path,
                 config.extra_headers.clone(),
@@ -50,59 +50,25 @@ impl Backend {
         Ok(Self::Http(http::HttpBackend::new(config.clone())))
     }
 
-    /// Send a streaming chat completion and process the response,
-    /// invoking callbacks for each event.
-    ///
-    /// The callback signatures match `process_stream` exactly so that
-    /// callers (REPL, oneshot) need minimal changes.
-    #[allow(clippy::too_many_arguments)]
+    /// Send a streaming chat completion and process the response, invoking
+    /// `handler`'s methods for each event.
     pub async fn stream_chat(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         session_id: &str,
         cancel: Arc<AtomicBool>,
-        on_token: impl FnMut(&str),
-        on_tool_requested: impl FnMut(&str, &str, &BTreeMap<String, serde_json::Value>),
-        on_tool_start: impl FnMut(&str, &str),
-        on_tool_complete: impl FnMut(&str, &str, Duration, Option<&str>),
-        on_usage: impl FnMut(u64, u64),
-        on_raw_event: impl FnMut(&str, &str),
-        on_orchestrator_event: impl FnMut(&str, &serde_json::Value),
+        handler: &mut impl StreamHandler,
     ) -> Result<StreamResult> {
         match self {
             Self::Http(http) => {
-                http.stream_chat(
-                    messages,
-                    tools,
-                    session_id,
-                    cancel,
-                    on_token,
-                    on_tool_requested,
-                    on_tool_start,
-                    on_tool_complete,
-                    on_usage,
-                    on_raw_event,
-                    on_orchestrator_event,
-                )
-                .await
+                http.stream_chat(messages, tools, session_id, cancel, handler)
+                    .await
             }
             #[cfg(feature = "standalone-cli")]
             Self::Direct(direct) => {
                 direct
-                    .stream_chat(
-                        messages,
-                        tools,
-                        session_id,
-                        cancel,
-                        on_token,
-                        on_tool_requested,
-                        on_tool_start,
-                        on_tool_complete,
-                        on_usage,
-                        on_raw_event,
-                        on_orchestrator_event,
-                    )
+                    .stream_chat(messages, tools, session_id, cancel, handler)
                     .await
             }
         }

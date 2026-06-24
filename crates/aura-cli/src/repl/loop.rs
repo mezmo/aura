@@ -11,19 +11,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
-use crate::api::stream::StreamResult;
+use crate::api::mcp_status::McpNotice;
+use crate::api::stream::{StreamHandler, StreamResult};
 use crate::api::types::{DisplayEvent, ShellCallDetail, ToolCallInfo, snake_to_pascal_case};
 use crate::backend::Backend;
 use crate::config::AppConfig;
+use crate::event_names;
 use crate::repl::commands;
 use crate::repl::conversations::ConversationStore;
 use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{self, HISTORY_COUNT, HISTORY_DEPTH, LAST_READLINE_INPUT};
+use crate::repl::registry::{self, CommandContext, CommandOutcome};
 use crate::tools;
 use crate::ui::markdown::render_markdown;
 use crate::ui::prompt::{
-    PendingCommand, WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint,
-    drain_stdin, erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
+    WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
+    erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
     get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output,
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
@@ -37,6 +40,412 @@ use crate::ui::prompt::{
     update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
+
+/// Orchestrator task tracking — promoted to module scope so reasoning
+/// helpers can look up which task a worker's reasoning belongs to.
+pub(crate) struct OrchTaskInfo {
+    pub header_line_num: u32,
+    pub worker_id: String,
+    pub tools: Vec<String>,
+}
+
+pub(crate) struct OrchDisplayState {
+    pub tasks: std::collections::HashMap<String, OrchTaskInfo>,
+}
+
+/// Live reasoning state.
+///
+/// Top-level reasoning (no `parent_agent_id`) renders as a top-level
+/// `● Reasoning` header followed by one or more `│ <body>` rows in scrollback.
+/// Each `\n` in incoming content pushes a new body row; sub-line content
+/// updates the current body row in place via cursor save/move/clear/print/restore.
+///
+/// Worker reasoning (has `parent_agent_id`) renders as a tree entry inside
+/// the worker's task: `└─ ● Reasoning` plus a single `   ⎿ <body>` line that
+/// updates in place as chunks arrive. Newlines in worker reasoning are
+/// flattened to spaces so the body stays on one line — matching the format
+/// of tool-call entries already in the tree.
+///
+/// Live updates use cursor SavePosition / MoveUp / Clear / Print /
+/// RestorePosition (the same pattern the WaveAnimation thread uses for tool
+/// duration in-place updates), so the cursor never lives mid-line and the
+/// next event lands cleanly.
+struct LiveReasoning {
+    agent_id: String,
+    /// Carried so we can persist it back into the DisplayEvent's fields map
+    /// on flush; `is_worker` drives the rendering branch.
+    #[allow(dead_code)]
+    parent_agent_id: Option<String>,
+    /// Task id for worker reasoning (filled in at first chunk via
+    /// `orch_state` lookup). `None` for top-level reasoning.
+    task_id: Option<String>,
+    combined: String,
+    fields: BTreeMap<String, serde_json::Value>,
+    /// `true` once the header line has been printed to scrollback.
+    #[allow(dead_code)]
+    started: bool,
+    /// Scrollback line number of the FIRST body row (top-level reasoning
+    /// may now span multiple rows, growing as newlines arrive). For worker
+    /// reasoning this is the single in-place updated row.
+    body_line_num: u32,
+    /// Text currently displayed on the body (worker: one row; top-level:
+    /// multi-line content rendered across `body_visual_rows` rows).
+    body_line_text: String,
+    /// Number of scrollback rows the body region currently occupies. Always
+    /// `1` for worker reasoning. For top-level reasoning this grows by one
+    /// for each newline encountered in incoming chunks — the growth is
+    /// committed to scrollback via a brief halt+extend+restart of the
+    /// WaveAnimation (same pattern `tool_call_started` uses to push the
+    /// frame down when a new tree entry is added).
+    body_visual_rows: u32,
+    is_worker: bool,
+}
+
+/// Worker reasoning body connector (`   ⎿ <text>`). Caller must hold
+/// `lock_term()`.
+fn write_worker_reasoning_body_line(text: &str) {
+    print!(
+        "{}{} {}",
+        crate::ui::orchestrator::TREE_END_DURATION.themed(AuraStyle::Connector),
+        "⎿".themed(AuraStyle::Connector),
+        text.themed(AuraStyle::Muted),
+    );
+}
+
+/// Flatten + truncate worker reasoning body to one terminal row.
+fn worker_reasoning_body_for_terminal(text: &str) -> String {
+    // Connector width: "   ⎿ " = 5 cols visible.
+    let prefix_cols: usize = 5;
+    let (term_w, _) = crate::ui::prompt::term_size();
+    let avail = (term_w as usize).saturating_sub(prefix_cols).max(8);
+    let flattened: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() <= avail {
+        flattened
+    } else {
+        let truncated: String = flattened.chars().take(avail.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
+}
+
+/// In-place rewrite of the worker reasoning body row.
+/// Caller must already hold `lock_term()`. The WaveAnimation is restarted
+/// after the worker block opens, so the cursor lives at the input line and
+/// we use the same `+3` offset that the animation thread uses for tool
+/// durations (line 372 of `ui/animation.rs`).
+fn rewrite_worker_reasoning_body_inplace(state: &LiveReasoning, body_text: &str) {
+    use std::io::Write;
+    let total_sb = crate::ui::prompt::current_orch_scrollback();
+    let body_up = (total_sb + 3).saturating_sub(state.body_line_num);
+    let (_, th) = crate::ui::prompt::term_size();
+    if body_up == 0 || body_up >= th as u32 {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, crossterm::cursor::SavePosition);
+    let _ = execute!(
+        stdout,
+        crossterm::cursor::MoveUp(body_up as u16),
+        crossterm::cursor::MoveToColumn(0)
+    );
+    let _ = execute!(
+        stdout,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+    );
+    write_worker_reasoning_body_line(body_text);
+    let _ = execute!(stdout, crossterm::cursor::RestorePosition);
+    let _ = stdout.flush();
+}
+
+/// Render the top-level `● Reasoning` header and an opening `⎿ ` body row
+/// in scrollback. Subsequent reasoning chunks update the body row in-place
+/// via the same SavePosition/MoveUp/Clear/Print/RestorePosition pattern
+/// that the animation thread uses for tool durations. The cursor lives at
+/// the scrollback bottom (spinner is halted before this is called), so
+/// the rewrite uses the bare `total_sb - body_line_num` distance.
+///
+/// `agent_id` is appended when it identifies the coordinator or some other
+/// non-default agent (e.g., `● Reasoning - coordinator`); single-agent
+/// deployments with `agent_id == "main"` render just `● Reasoning`.
+///
+/// Caller must already hold `lock_term()`.
+fn open_top_level_reasoning_block(state: &mut LiveReasoning, agent_id: &str) {
+    let bullet_color = task_color_for(if agent_id.is_empty() {
+        "__orchestrator__"
+    } else {
+        agent_id
+    });
+    let header = if agent_id == "main" || agent_id.is_empty() {
+        "Reasoning".to_string()
+    } else {
+        format!("Reasoning - {agent_id}")
+    };
+    println!(
+        "{} {}",
+        "●"
+            .with(bullet_color)
+            .attribute(crossterm::style::Attribute::Bold),
+        header
+            .as_str()
+            .themed(AuraStyle::Primary)
+            .attribute(crossterm::style::Attribute::Bold),
+    );
+    crate::ui::prompt::increment_orch_scrollback();
+    // Body row: print "⎿ " (no content yet) and commit with a newline so
+    // the body has a stable scrollback index. The `⎿` corner is final —
+    // streaming chunks update only the body text (single-line, flattened);
+    // multi-line content remains visible via `/expand` replay.
+    print!("{} ", "⎿".themed(AuraStyle::Connector));
+    println!();
+    crate::ui::prompt::increment_orch_scrollback();
+    state.body_line_num = crate::ui::prompt::current_orch_scrollback() - 1;
+    state.body_line_text = String::new();
+    state.started = true;
+    // Trailing blank separator row — counted in scrollback so the next
+    // event (Plan/Task/Thinking) has a visible gap from the body row.
+    // The animation overlay is printed *below* this blank, so the
+    // separator stays visible during streaming AND after teardown.
+    println!();
+    crate::ui::prompt::increment_orch_scrollback();
+}
+
+/// Render the worker tree entry: `└─ ● Reasoning` + initial empty body row.
+/// Also upgrades any prior tool-call entry's connector from `└─` to `├─`
+/// (via `register_orch_reasoning_in_tree`) and registers this entry in
+/// `ORCH_LAST_TOOL_LINES` so the next tool call can upgrade reasoning's
+/// connector in turn. Caller must already hold `lock_term()`.
+fn open_worker_reasoning_block(state: &mut LiveReasoning, task_id: &str) {
+    crate::ui::orchestrator::register_orch_reasoning_in_tree(
+        task_id,
+        |bullet_line_num, body_line_num| {
+            state.body_line_num = body_line_num;
+            state.body_line_text = String::new();
+            state.started = true;
+            let _ = bullet_line_num;
+        },
+    );
+}
+
+/// Apply a chunk of content to the currently-open live block.
+/// Caller must already hold `lock_term()`.
+///
+/// Both top-level and worker reasoning use in-place body rewrites so the
+/// cursor never leaves the input line — the WaveAnimation thread can keep
+/// ticking in parallel. Both use the animation's `+3` offset (same as the
+/// in-flight tool duration updates in `ui/animation.rs`).
+///
+/// Newlines in incoming content are flattened to spaces — the live body
+/// stays on one terminal row to avoid wrapping into the animation rows.
+/// The full multi-line content is preserved in `DisplayEvent::Reasoning`
+/// for `/expand` replay.
+fn apply_reasoning_chunk(state: &mut LiveReasoning, delta: &str) {
+    state.combined.push_str(delta);
+    state.body_line_text.push_str(delta);
+    if state.is_worker {
+        let display = worker_reasoning_body_for_terminal(&state.body_line_text);
+        rewrite_worker_reasoning_body_inplace(state, &display);
+    } else {
+        let lines = top_level_reasoning_body_for_terminal(&state.body_line_text);
+        rewrite_top_level_reasoning_body_inplace(state, &lines);
+    }
+}
+
+/// Split top-level body content into one display string per visual row.
+/// Each logical line (separated by `\n` in the streamed content) is
+/// flattened (consecutive whitespace collapsed) and then word-wrapped to
+/// fit `term_width - 2` columns (the 2 columns are reserved for the
+/// `⎿ ` / `  ` row prefix). The wrap prefers word boundaries; if a single
+/// token is longer than the available width it hard-wraps in the middle.
+///
+/// Returns at least one (possibly empty) string so the body always has a
+/// visible row.
+fn top_level_reasoning_body_for_terminal(text: &str) -> Vec<String> {
+    let prefix_cols: usize = 2;
+    let (term_w, _) = crate::ui::prompt::term_size();
+    let avail = (term_w as usize).saturating_sub(prefix_cols).max(8);
+    let mut visual: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        let flat: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.is_empty() {
+            visual.push(String::new());
+            continue;
+        }
+        let chars: Vec<char> = flat.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let remaining = chars.len() - start;
+            if remaining <= avail {
+                let seg: String = chars[start..].iter().collect();
+                visual.push(seg);
+                break;
+            }
+            let hard_end = start + avail;
+            // Prefer a soft break at the last space within [start, hard_end).
+            let mut soft_end = hard_end;
+            while soft_end > start && chars[soft_end - 1] != ' ' {
+                soft_end -= 1;
+            }
+            let wrap_end = if soft_end > start { soft_end } else { hard_end };
+            let seg: String = chars[start..wrap_end].iter().collect();
+            // Strip the trailing space we broke at, if any.
+            visual.push(seg.trim_end().to_string());
+            start = wrap_end;
+            // Skip the run of spaces we just broke on.
+            while start < chars.len() && chars[start] == ' ' {
+                start += 1;
+            }
+        }
+    }
+    if visual.is_empty() {
+        visual.push(String::new());
+    }
+    visual
+}
+
+/// In-place rewrite of the top-level body. The WaveAnimation is running
+/// (cursor at the input line); we use the same `+3` offset that the
+/// animation thread uses for tool durations so `MoveUp` lands on the body's
+/// FIRST scrollback row, above the anim overlay. Subsequent body rows are
+/// rewritten by `MoveDown`-ing one row at a time.
+///
+/// `state.body_visual_rows` rows in scrollback are owned by the body — the
+/// caller must extend that allocation BEFORE calling this with more logical
+/// lines than the body currently has rows for (otherwise the trailing
+/// logical lines are silently dropped).
+fn rewrite_top_level_reasoning_body_inplace(state: &LiveReasoning, lines: &[String]) {
+    use std::io::Write;
+    let total_sb = crate::ui::prompt::current_orch_scrollback();
+    let body_up = (total_sb + 3).saturating_sub(state.body_line_num);
+    let (_, th) = crate::ui::prompt::term_size();
+    if body_up == 0 || body_up >= th as u32 {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, crossterm::cursor::SavePosition);
+    let _ = execute!(
+        stdout,
+        crossterm::cursor::MoveUp(body_up as u16),
+        crossterm::cursor::MoveToColumn(0)
+    );
+
+    let rows = state.body_visual_rows as usize;
+    for i in 0..rows {
+        let _ = execute!(
+            stdout,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine)
+        );
+        // First row gets the `⎿ ` connector (descent from the bullet);
+        // subsequent rows use 2 spaces so the body content stays aligned
+        // visually under the connector.
+        let connector = if i == 0 { "⎿" } else { " " };
+        let content = lines.get(i).map(|s| s.as_str()).unwrap_or("");
+        print!(
+            "{} {}",
+            connector.themed(AuraStyle::Connector),
+            content.themed(AuraStyle::Muted),
+        );
+        if i + 1 < rows {
+            let _ = execute!(
+                stdout,
+                crossterm::cursor::MoveDown(1),
+                crossterm::cursor::MoveToColumn(0)
+            );
+        }
+    }
+    let _ = execute!(stdout, crossterm::cursor::RestorePosition);
+    let _ = stdout.flush();
+}
+
+/// Persist the live reasoning block as a `DisplayEvent::Reasoning` so
+/// replay/resume see one block per agent stretch.
+///
+/// Returns `true` when a top-level block was flushed — the caller (the
+/// orchestrator-event handler) uses this to defer a separator blank row
+/// until AFTER `erase_input_frame` has run, so the println lands in
+/// scrollback rather than clobbering the live input frame.
+///
+/// No terminal output happens inside this function: the body row already
+/// lives in scrollback at `body_line_num`, and the deferred separator
+/// (when applicable) is committed by the caller.
+fn flush_live_reasoning(state: &Arc<Mutex<Option<LiveReasoning>>>) -> bool {
+    let Some(s) = state.lock().ok().and_then(|mut g| g.take()) else {
+        return false;
+    };
+    if s.combined.is_empty() {
+        return false;
+    }
+    let was_top_level = !s.is_worker;
+    let mut fields = s.fields;
+    fields.insert(
+        "content".to_string(),
+        serde_json::Value::String(s.combined.clone()),
+    );
+    push_display_event(DisplayEvent::Reasoning {
+        content: s.combined,
+        agent_id: s.agent_id,
+        fields,
+    });
+    was_top_level
+}
+
+/// Orchestrator events that actually `println!` scrollback content.
+/// `flush_live_reasoning` must run before these so the open reasoning block
+/// closes cleanly and the next event lands on its own row. Events that only
+/// touch the spinner sub-line or do in-place updates (`worker_reasoning`,
+/// `synthesizing`) are deliberately excluded — flushing on them would slice
+/// multi-chunk reasoning into separate `DisplayEvent::Reasoning` entries, one
+/// per delta.
+fn orch_event_prints_scrollback(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        event_names::PLAN_CREATED
+            | event_names::TASK_STARTED
+            | event_names::TOOL_CALL_STARTED
+            | event_names::TOOL_CALL_COMPLETED
+            | event_names::TASK_COMPLETED
+            | event_names::ITERATION_COMPLETE
+    )
+}
+
+/// Bare-word aliases for slash commands that are not themselves command names —
+/// abbreviations and editor-isms (vim's `:q`, a lone `?`) typed without a
+/// leading slash. Each maps to the canonical command name to suggest, resolved
+/// through [`registry`] at lookup time.
+///
+/// Inputs that match a command name directly (`clear`, `model`, …) resolve
+/// against the registry in [`command_hint`] and have no entry here.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("q", "/quit"),
+    (":q", "/quit"),
+    (":wq", "/quit"),
+    (":x", "/quit"),
+    ("bye", "/exit"),
+    ("logout", "/exit"),
+    ("?", "/help"),
+];
+
+/// Returns the slash command to suggest for a bare, slash-less word, or `None`
+/// when the input is neither a command name nor a known alias.
+///
+/// Matches case-insensitively against the trimmed input — first against
+/// registered command names (bare `clear` resolves to `/clear`), then against
+/// [`COMMAND_ALIASES`]. Multi-word input never matches. The result is advisory:
+/// a suggestion to surface, not a command to run.
+fn command_hint(input: &str) -> Option<&'static str> {
+    let trimmed = input.trim();
+    // A command word is a single token; multi-word input is ordinary chat.
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(cmd) = registry::lookup(&format!("/{lower}")) {
+        return Some(cmd.name);
+    }
+    COMMAND_ALIASES
+        .iter()
+        .find(|(bare, _)| *bare == lower)
+        .and_then(|(_, name)| registry::lookup(name))
+        .map(|cmd| cmd.name)
+}
 
 pub fn run_repl(
     rt: &Runtime,
@@ -258,60 +667,33 @@ pub fn run_repl(
                     reset_input_geometry();
                 }
 
-                if input == "/quit" || input == "/exit" {
-                    // Save before exiting, or delete if conversation was never started
-                    if let Some(ref store) = conv_store {
-                        if conversation.messages().len() > 1 {
-                            with_event_log(|log| {
-                                store.save_all(conversation.messages(), log, is_expanded_output())
-                            });
-                        } else {
-                            store.delete();
+                if input.starts_with('/') {
+                    let mut ctx = CommandContext {
+                        conversation: &mut conversation,
+                        conv_store: &mut conv_store,
+                        input_reader: &mut input_reader,
+                    };
+                    match registry::dispatch(&input, &mut ctx) {
+                        Some(CommandOutcome::Exit) => break,
+                        Some(CommandOutcome::Reinject(new_input)) => {
+                            initial_input = new_input;
+                            continue;
+                        }
+                        Some(CommandOutcome::Handled) => continue,
+                        None => {
+                            // Unknown command — don't send to API
+                            println!("Unknown command: {}", input);
+                            println!("Type /help for available commands.");
+                            redraw_input_frame();
+                            continue;
                         }
                     }
-                    break;
-                } else if input == "/clear" {
-                    commands::handle_clear(&mut conversation, &mut conv_store, &mut input_reader);
-                    continue;
-                } else if input == "/help" {
-                    commands::handle_help();
-                    continue;
-                } else if input == "/expand" {
-                    commands::handle_expand(&conversation, &conv_store);
-                    continue;
-                } else if input == "/stream" {
-                    commands::handle_stream();
-                    continue;
-                } else if input == "/conversations" {
-                    commands::handle_conversations();
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/rename") {
-                    commands::handle_rename(arg.trim(), &conv_store);
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/resume") {
-                    // In-REPL resume ignores CLI --model and --system-prompt;
-                    // uses whatever the resumed conversation had saved.
-                    if let Some(new_input) = commands::handle_resume(
-                        arg.trim(),
-                        &mut conversation,
-                        &mut conv_store,
-                        &mut input_reader,
-                        None,
-                    ) {
-                        initial_input = new_input;
-                    }
-                    continue;
-                } else if let Some(filter) = input.strip_prefix("/model") {
-                    let filter = filter.trim();
-                    commands::handle_model(filter, &conv_store);
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/style") {
-                    commands::handle_style(arg.trim());
-                    continue;
-                } else if input.starts_with('/') {
-                    // Unknown command — don't send to API
-                    println!("Unknown command: {}", input);
-                    println!("Type /help for available commands.");
+                } else if let Some(suggestion) = command_hint(&input) {
+                    println!(
+                        "{}",
+                        format!("This REPL uses slash commands. Did you mean {suggestion} ?")
+                            .themed(AuraStyle::Muted),
+                    );
                     redraw_input_frame();
                     continue;
                 }
@@ -355,17 +737,24 @@ pub fn run_repl(
                 set_processing(true);
                 crate::ui::prompt::clear_agent_reasoning();
                 crate::ui::prompt::reset_orch_tools();
+                // Per-turn status notices (e.g. MCP connection errors/warnings)
+                // are scoped to the current request; clear last turn's set.
+                crate::ui::prompt::clear_turn_notices();
 
                 // Per-turn event recording state
                 let pending_args: Arc<
                     Mutex<std::collections::HashMap<String, BTreeMap<String, serde_json::Value>>>,
                 > = Arc::new(Mutex::new(std::collections::HashMap::new()));
                 let turn_events: Arc<Mutex<Vec<DisplayEvent>>> = Arc::new(Mutex::new(Vec::new()));
-                let pending_args_for_tool = pending_args.clone();
-                let pending_args_for_complete = pending_args.clone();
-                let turn_events_for_complete = turn_events.clone();
-                let turn_events_for_usage = turn_events.clone();
                 let cancel_flag = Arc::new(AtomicBool::new(false));
+
+                // Live reasoning block — accumulated as chunks stream in,
+                // closed by `flush_live_reasoning` on the next non-reasoning
+                // event (or end of stream). Reasoning is NOT routed through
+                // `set_agent_reasoning` — that sub-line is reserved for the
+                // `_aura_reasoning` blurbs attached to tool calls and to
+                // `aura.progress` messages.
+                let live_reasoning: Arc<Mutex<Option<LiveReasoning>>> = Arc::new(Mutex::new(None));
 
                 let (anim, stop_flag) = WaveAnimation::start(
                     "Thinking",
@@ -377,43 +766,22 @@ pub fn run_repl(
                 prepare_input_line(&input_buf, Some(&cancel_flag));
 
                 let anim_cleared = Arc::new(AtomicBool::new(false));
-                let anim_cleared_for_complete = anim_cleared.clone();
-                let anim_cleared_for_orch = anim_cleared.clone();
-                let stop_flag_for_token = stop_flag.clone();
-                let stop_flag_for_orch = stop_flag.clone();
 
-                let cancel_for_complete = cancel_flag.clone();
                 let cancel_for_stream = cancel_flag.clone();
-                let cancel_for_orch = cancel_flag.clone();
 
                 #[allow(clippy::type_complexity)]
                 let post_tool_wave: Arc<
                     Mutex<Option<(WaveAnimation, Arc<AtomicBool>)>>,
                 > = Arc::new(Mutex::new(None));
-                let ptw_for_complete = post_tool_wave.clone();
-                let ptw_for_orch = post_tool_wave.clone();
-
-                let input_buf_for_complete = input_buf.clone();
-                let input_buf_for_orch = input_buf.clone();
 
                 // --- Orchestrator display state ---
-                struct OrchTaskInfo {
-                    header_line_num: u32,
-                    worker_id: String,
-                    tools: Vec<String>,
-                }
-                struct OrchDisplayState {
-                    tasks: std::collections::HashMap<String, OrchTaskInfo>,
-                }
                 let orch_state: Arc<Mutex<OrchDisplayState>> =
                     Arc::new(Mutex::new(OrchDisplayState {
                         tasks: std::collections::HashMap::new(),
                     }));
-                let orch_for_cb = orch_state.clone();
                 // Set after tool_call_completed; consumed before the next
                 // non-tool event to insert a blank line separator.
                 let needs_blank = Arc::new(AtomicBool::new(false));
-                let needs_blank_for_cb = needs_blank.clone();
 
                 // Build tool defs only when client tools are enabled. When
                 // disabled the CLI sends no `tools` field, the model has no
@@ -502,7 +870,6 @@ pub fn run_repl(
                 // Shared flag so streaming callbacks can suppress Shell display
                 // when the LLM is inside an Update group.
                 let in_update_group = Arc::new(AtomicBool::new(false));
-                let in_update_for_tool = in_update_group.clone();
 
                 // Tool execution loop: send request → process stream → if tool calls,
                 // execute locally and send results back → repeat until text response.
@@ -516,534 +883,34 @@ pub fn run_repl(
                         crate::api::session::SessionKind::Chat,
                     );
                     let result = rt.block_on(async {
-                        backend.stream_chat(
-                            conversation.messages(),
-                            tool_defs_arg,
-                            &chat_session_id,
-                            cancel_for_stream.clone(),
-                            // on_token — no-op: text is accumulated silently (not
-                            // displayed per-token), so the animation should keep
-                            // running to provide visual feedback. It will be stopped
-                            // by on_tool_complete, the ToolCalls handler, or
-                            // post-loop cleanup. The animation thread handles stdin.
-                            |_token| {},
-                            // on_tool_requested — record args; don't stop animation
-                            // (animation keeps running until something needs to display)
-                            //
-                            // Keyed by tool_id (not tool_name) so multiple invocations of the
-                            // same tool in one turn don't overwrite each other's arguments.
-                            |tool_id, tool_name, args| {
-                                // Record args for later pairing with on_tool_complete
-                                if let Ok(mut map) = pending_args_for_tool.lock() {
-                                    map.insert(tool_id.to_string(), args.clone());
-                                }
-                                // Track Update grouping flag for the execution loop
-                                if tool_name == "Update" {
-                                    in_update_for_tool.store(true, Ordering::Relaxed);
-                                } else if tool_name != "Shell"
-                                    || !in_update_for_tool.load(Ordering::Relaxed)
-                                {
-                                    // Non-Shell (or Shell outside Update) clears the flag
-                                    if tool_name != "Shell" {
-                                        in_update_for_tool.store(false, Ordering::Relaxed);
-                                    }
-                                }
-                            },
-                            // on_tool_start — no-op; animation keeps running
-                            |_tool_id, _tool_name| {},
-                            // on_tool_complete — show grouped summary for server-side tools
-                            |tool_id, tool_name, duration, result: Option<&str>| {
-                                // Stop animation: prefer ptw (later iterations), fall back
-                                // to initial animation (first iteration).
-                                let had_ptw = if let Ok(mut guard) = ptw_for_complete.lock() {
-                                    if let Some((ptw_anim, _)) = guard.take() {
-                                        ptw_anim.finish();
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-                                if !had_ptw && !anim_cleared_for_complete.load(Ordering::Relaxed) {
-                                    stop_and_clear_animation(&stop_flag_for_token);
-                                    anim_cleared_for_complete.store(true, Ordering::Relaxed);
-                                }
-                                // Show server-side tool result
-                                {
-                                    let _term = lock_term();
-                                    erase_input_frame();
-                                    let args = pending_args_for_complete
-                                        .lock()
-                                        .ok()
-                                        .and_then(|mut map| map.remove(tool_id))
-                                        .unwrap_or_default();
-                                    if is_expanded_output() {
-                                        print_tool_call_expanded(
-                                            tool_name,
-                                            &args,
-                                            duration,
-                                            result,
-                                        );
-                                    } else {
-                                        crate::ui::prompt::print_tool_call_summary(
-                                            tool_name,
-                                            &args,
-                                            Some(duration),
-                                        );
-                                        println!();
-                                    }
-                                    if let Ok(mut events) = turn_events_for_complete.lock() {
-                                        events.push(DisplayEvent::ToolCall {
-                                            tool_name: tool_name.to_string(),
-                                            arguments: args,
-                                            duration,
-                                            result: result.map(|s| s.to_string()),
-                                        });
-                                    }
-                                }
-                                // Start "Thinking" animation to fill gap until next event
-                                let (wave_anim, wave_stop) = {
-                                    let _term = lock_term();
-                                    WaveAnimation::start(
-                                        "Thinking",
-                                        vec![],
-                                        input_buf_for_complete.clone(),
-                                        Some(cancel_for_complete.clone()),
-                                    )
-                                };
-                                if let Ok(mut guard) = ptw_for_complete.lock() {
-                                    *guard = Some((wave_anim, wave_stop));
-                                }
-                                prepare_input_line(
-                                    &input_buf_for_complete,
-                                    Some(&cancel_for_complete),
-                                );
-                            },
-                            // on_usage
-                            |prompt_tokens, completion_tokens| {
-                                set_status_bar_tokens(prompt_tokens, completion_tokens);
-                                update_status_bar();
-                                if let Ok(mut events) = turn_events_for_usage.lock() {
-                                    events.push(DisplayEvent::Usage {
-                                        prompt_tokens,
-                                        completion_tokens,
-                                    });
-                                }
-                            },
-                            // on_raw_event — capture for stream panel and
-                            // record progress_token → tool_id so an incoming
-                            // aura.progress can be steered onto the right
-                            // active tool's running line.
-                            |event_name, event_data| {
-                                push_sse_event(event_name, event_data);
-                                if event_name == "aura.tool_start"
-                                    && let Ok(val) =
-                                        serde_json::from_str::<serde_json::Value>(event_data)
-                                    && let Some(tool_id) =
-                                        val.get("tool_id").and_then(|v| v.as_str())
-                                    && let Some(token) = val.get("progress_token")
-                                    && !token.is_null()
-                                {
-                                    crate::ui::prompt::record_tool_progress_token(
-                                        tool_id,
-                                        &token.to_string(),
-                                    );
-                                }
-                            },
-                            // on_orchestrator_event — display orchestrator events in chat
-                            |event_name, val| {
-                                // Handle aura.progress — prefer to attach the
-                                // message to the active orchestrator tool whose
-                                // progress_token matches; fall back to the
-                                // global "Thinking" sub-line when there's no
-                                // active tool to attach it to (single-agent
-                                // mode, or progress for a tool we never saw a
-                                // tool_start for).
-                                if event_name == "aura.progress" {
-                                    if let Some(message) = val.get("message").and_then(|v| v.as_str()) {
-                                        let token = val.get("progress_token").map(|t| t.to_string());
-                                        let attached = token
-                                            .as_deref()
-                                            .map(|t| {
-                                                crate::ui::prompt::set_orch_tool_progress_by_token(
-                                                    t, message,
-                                                )
-                                            })
-                                            .unwrap_or(false);
-                                        if !attached {
-                                            crate::ui::prompt::set_agent_reasoning(message);
-                                        }
-                                    }
-                                    return;
-                                }
-
-                                // Reflect the worker's current phase
-                                // (`Planning`/`Executing`/`Analyzing`) in the
-                                // task header. Overwrites in-place; the
-                                // task_completed handler later replaces this
-                                // with `done`.
-                                if event_name == "aura.worker_phase" {
-                                    let task_id = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                                    let phase = val.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-                                    if task_id.is_empty() || phase.is_empty() {
-                                        return;
-                                    }
-                                    let mut chars = phase.chars();
-                                    let phase_label: String = match chars.next() {
-                                        Some(c) => c.to_uppercase().chain(chars).collect(),
-                                        None => return,
-                                    };
-                                    let header_info = if let Ok(os) = orch_for_cb.lock() {
-                                        os.tasks
-                                            .get(task_id)
-                                            .map(|t| (t.header_line_num, t.worker_id.clone()))
-                                    } else {
-                                        None
-                                    };
-                                    if let Some((header_line, worker_id)) = header_info {
-                                        crate::ui::prompt::overwrite_orch_task_header(
-                                            header_line,
-                                            task_id,
-                                            &worker_id,
-                                            &phase_label,
-                                        );
-                                    }
-                                    return;
-                                }
-
-                                let sub = event_name.strip_prefix("aura.orchestrator.").unwrap_or(event_name);
-                                if event_name == "aura.session_info" || sub == event_name {
-                                    return;
-                                }
-
-
-                                // Stop current animation
-                                let had_ptw = if let Ok(mut guard) = ptw_for_orch.lock() {
-                                    if let Some((ptw_anim, _)) = guard.take() {
-                                        ptw_anim.finish();
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-                                if !had_ptw && !anim_cleared_for_orch.load(Ordering::Relaxed) {
-                                    stop_and_clear_animation(&stop_flag_for_orch);
-                                    anim_cleared_for_orch.store(true, Ordering::Relaxed);
-                                }
-                                {
-                                let _term = lock_term();
-                                erase_input_frame();
-
-                                // Emit a deferred blank line from a previous
-                                // tool_call_completed — but only if this event
-                                // isn't another tool starting directly after.
-                                if needs_blank_for_cb.swap(false, Ordering::Relaxed) && sub != "tool_call_started" {
-                                    println!();
-                                    crate::ui::prompt::increment_orch_scrollback();
-                                }
-
-                                // Helpers
-                                let get_str = |v: &serde_json::Value, field: &str| -> String {
-                                    let f = v.get(field)
-                                        .or_else(|| v.get("data").and_then(|d| d.get(field)));
-                                    match f {
-                                        Some(serde_json::Value::String(s)) => s.clone(),
-                                        Some(serde_json::Value::Number(n)) => n.to_string(),
-                                        Some(serde_json::Value::Bool(b)) => b.to_string(),
-                                        _ => String::new(),
-                                    }
-                                };
-                                let get_u64 = |v: &serde_json::Value, field: &str| -> u64 {
-                                    v.get(field)
-                                        .or_else(|| v.get("data").and_then(|d| d.get(field)))
-                                        .and_then(|f| f.as_u64())
-                                        .unwrap_or(0)
-                                };
-                                let fields: BTreeMap<String, serde_json::Value> = match val.as_object() {
-                                    Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                                    None => BTreeMap::new(),
-                                };
-                                let parse_args = |v: &serde_json::Value| -> Option<serde_json::Map<String, serde_json::Value>> {
-                                    v.get("arguments")
-                                        .or_else(|| v.get("data").and_then(|d| d.get("arguments")))
-                                        .and_then(|a| match a {
-                                            serde_json::Value::Object(obj) => Some(obj.clone()),
-                                            serde_json::Value::String(s) => serde_json::from_str(s).ok(),
-                                            _ => None,
-                                        })
-                                };
-
-                                // Per-orchestrator-entity bullet color. Keyed by task_id
-                                // (or `__orchestrator__` for coordinator-level events:
-                                // plan_created, synthesizing, iteration_complete).
-                                // Resolved through the active theme — switching themes
-                                // repaints automatically; no colors are persisted.
-                                let event_task_id = get_str(val, "task_id");
-                                let color_key: String = if !event_task_id.is_empty() {
-                                    event_task_id.clone()
-                                } else {
-                                    "__orchestrator__".to_string()
-                                };
-                                let bullet_color = task_color_for(&color_key);
-
-                                match sub {
-                                    "plan_created" => {
-                                        let goal = get_str(val, "goal");
-                                        // New plan resets reasoning
-                                        crate::ui::prompt::clear_agent_reasoning();
-                                        println!(
-                                            "{} {}",
-                                            "●".with(bullet_color).attribute(crossterm::style::Attribute::Bold),
-                                            format!("Plan - {goal}").attribute(crossterm::style::Attribute::Bold),
-                                        );
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        if is_expanded_output() {
-                                            // Count lines that print_fields_tree will emit
-                                            let field_lines = fields.values().map(|v| {
-                                                if let serde_json::Value::Object(obj) = v { 1 + obj.len() } else { 1 }
-                                            }).sum::<usize>();
-                                            print_fields_tree(&fields);
-                                            for _ in 0..field_lines {
-                                                crate::ui::prompt::increment_orch_scrollback();
-                                            }
-                                        }
-                                        println!();
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        push_display_event(DisplayEvent::OrchestratorPlanCreated { goal, fields });
-                                    }
-                                    "task_started" => {
-                                        let worker_id = get_str(val, "worker_id");
-                                        let task_id = get_str(val, "task_id");
-                                        let description = get_str(val, "description");
-                                        // Bullet color resolved per-task at render time —
-                                        // `task_color_for(&task_id)` returns the color the
-                                        // generic block (above) already computed via
-                                        // `bullet_color`, so reuse that directly.
-                                        crate::ui::prompt::set_agent_reasoning(&description);
-                                        let header_line = crate::ui::prompt::current_orch_scrollback();
-                                        println!(
-                                            "{} {} {} {}",
-                                            "●".with(bullet_color).attribute(crossterm::style::Attribute::Bold),
-                                            format!("Task {task_id}").attribute(crossterm::style::Attribute::Bold),
-                                            "-".themed(AuraStyle::Muted),
-                                            format!("Worker: {worker_id}").themed(AuraStyle::Muted),
-                                        );
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        // No blank line – tool calls follow directly
-                                        if let Ok(mut os) = orch_for_cb.lock() {
-                                            os.tasks.insert(task_id.clone(), OrchTaskInfo {
-                                                header_line_num: header_line,
-                                                worker_id: worker_id.clone(),
-                                                tools: Vec::new(),
-                                            });
-                                        }
-                                        push_display_event(DisplayEvent::OrchestratorTaskStarted {
-                                            worker_id, task_id, description, fields,
-                                        });
-                                    }
-                                    "tool_call_started" => {
-                                        let tool_name = get_str(val, "tool_name");
-                                        let tool_initiator_id = get_str(val, "tool_initiator_id");
-                                        let tool_call_id = get_str(val, "tool_call_id");
-                                        let task_id_str = get_str(val, "task_id");
-                                        let display_name = snake_to_pascal_case(&tool_name);
-                                        let args_obj = parse_args(val);
-                                        let args_summary = args_obj.as_ref()
-                                            .map(|obj| {
-                                                obj.iter()
-                                                    .filter(|(k, v)| {
-                                                        !k.starts_with('_')
-                                                            && !matches!(v, serde_json::Value::Null)
-                                                            && !matches!(v, serde_json::Value::String(s) if s.is_empty() || s == "null")
-                                                    })
-                                                    .take(3)
-                                                    .map(|(k, v)| {
-                                                        let val_str = match v {
-                                                            serde_json::Value::String(s) => {
-                                                                if s.chars().count() > 20 {
-                                                                    let prefix: String = s.chars().take(17).collect();
-                                                                    format!("\"{prefix}...\"")
-                                                                } else {
-                                                                    format!("\"{s}\"")
-                                                                }
-                                                            }
-                                                            other => {
-                                                                let s = other.to_string();
-                                                                if s.chars().count() > 20 {
-                                                                    let prefix: String = s.chars().take(17).collect();
-                                                                    format!("{prefix}...")
-                                                                } else {
-                                                                    s
-                                                                }
-                                                            }
-                                                        };
-                                                        format!("{k}: {val_str}")
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                                    .join(", ")
-                                            })
-                                            .unwrap_or_default();
-                                        let reasoning = args_obj.as_ref()
-                                            .and_then(|obj| obj.get("_aura_reasoning").and_then(|v| v.as_str()));
-                                        // Set reasoning in the Thinking animation sub-line
-                                        if let Some(text) = reasoning {
-                                            crate::ui::prompt::set_agent_reasoning(text);
-                                        }
-                                        // Print tool line indented under the task with live duration
-                                        let tool_display = format!("{display_name}({args_summary})");
-                                        // Use tool_call_id as primary key, fall back to tool_initiator_id
-                                        let match_id = if !tool_call_id.is_empty() { &tool_call_id } else { &tool_initiator_id };
-                                        crate::ui::prompt::register_orch_tool(
-                                            match_id,
-                                            &task_id_str,
-                                            &tool_display,
-                                            std::time::Instant::now(),
-                                            &fields,
-                                        );
-                                        // Track tool under its task
-                                        if let Ok(mut os) = orch_for_cb.lock() {
-                                            if let Some(task) = os.tasks.get_mut(&task_id_str) {
-                                                task.tools.push(tool_display);
-                                            } else if let Some(task) = os.tasks.get_mut(&tool_initiator_id) {
-                                                task.tools.push(tool_display);
-                                            }
-                                        }
-                                        push_display_event(DisplayEvent::OrchestratorToolCallStarted {
-                                            tool_name, tool_initiator_id, fields,
-                                        });
-                                    }
-                                    "tool_call_completed" => {
-                                        let tool_name = get_str(val, "tool_name");
-                                        let tool_initiator_id = get_str(val, "tool_initiator_id");
-                                        let tool_call_id = get_str(val, "tool_call_id");
-                                        let duration_ms_val = val.get("duration_ms")
-                                            .or_else(|| val.get("data").and_then(|d| d.get("duration_ms")))
-                                            .and_then(|v| v.as_u64());
-                                        let result_text = val.get("result")
-                                            .or_else(|| val.get("data").and_then(|d| d.get("result")))
-                                            .and_then(|v| v.as_str());
-                                        // Use tool_call_id as primary key, fall back to tool_initiator_id
-                                        let match_id = if !tool_call_id.is_empty() { &tool_call_id } else { &tool_initiator_id };
-                                        // Finalize tool display (solid color + completed duration + live result lines in /expand)
-                                        crate::ui::prompt::finalize_orch_tool(
-                                            match_id,
-                                            duration_ms_val,
-                                            result_text,
-                                        );
-                                        needs_blank_for_cb.store(true, Ordering::Relaxed);
-                                        push_display_event(DisplayEvent::OrchestratorToolCallCompleted {
-                                            tool_name, tool_initiator_id,
-                                            duration_ms: duration_ms_val, fields,
-                                        });
-                                    }
-                                    "task_completed" => {
-                                        let worker_id = get_str(val, "worker_id");
-                                        let task_id = get_str(val, "task_id");
-                                        let result = get_str(val, "result");
-                                        // Look up task info and overwrite the header line in-place
-                                        let task_info = if let Ok(mut os) = orch_for_cb.lock() {
-                                            os.tasks.remove(&task_id)
-                                        } else {
-                                            None
-                                        };
-                                        if let Some(info) = &task_info {
-                                            overwrite_orch_task_header_unlocked(
-                                                info.header_line_num,
-                                                &task_id,
-                                                &worker_id,
-                                                "done",
-                                            );
-                                        }
-                                        crate::ui::prompt::clear_orch_task_tools(&task_id);
-                                        // Blank line to separate from next task
-                                        println!();
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        push_display_event(DisplayEvent::OrchestratorTaskCompleted {
-                                            worker_id, task_id, result, fields,
-                                        });
-                                    }
-                                    "synthesizing" => {
-                                        crate::ui::prompt::clear_agent_reasoning();
-                                        push_display_event(DisplayEvent::OrchestratorSynthesizing);
-                                    }
-                                    "iteration_complete" => {
-                                        let iteration = get_u64(val, "iteration");
-                                        let quality_score = get_str(val, "quality_score");
-                                        let expanded = is_expanded_output();
-                                        let has_fields = expanded && !fields.is_empty();
-                                        crate::ui::prompt::clear_agent_reasoning();
-                                        println!(
-                                            "{} {}",
-                                            "●".with(bullet_color).attribute(crossterm::style::Attribute::Bold),
-                                            "Iteration complete".attribute(crossterm::style::Attribute::Bold),
-                                        );
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        println!(
-                                            "{} iteration: {}",
-                                            "├─".themed(AuraStyle::Connector),
-                                            iteration.to_string().as_str().themed(AuraStyle::Muted),
-                                        );
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        let quality_connector = if has_fields { "├─" } else { "└─" };
-                                        println!(
-                                            "{} quality: {}",
-                                            quality_connector.themed(AuraStyle::Connector),
-                                            quality_score.as_str().themed(AuraStyle::Muted),
-                                        );
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        if has_fields {
-                                            let field_lines = fields.values().map(|v| {
-                                                if let serde_json::Value::Object(obj) = v { 1 + obj.len() } else { 1 }
-                                            }).sum::<usize>();
-                                            print_fields_tree(&fields);
-                                            for _ in 0..field_lines {
-                                                crate::ui::prompt::increment_orch_scrollback();
-                                            }
-                                        }
-                                        println!();
-                                        crate::ui::prompt::increment_orch_scrollback();
-                                        push_display_event(DisplayEvent::OrchestratorIterationComplete {
-                                            iteration, quality_score, fields,
-                                        });
-                                    }
-                                    "scratchpad_usage" => {
-                                        let tokens_intercepted = get_u64(val, "tokens_intercepted");
-                                        let tokens_extracted = get_u64(val, "tokens_extracted");
-                                        crate::ui::prompt::add_scratchpad_usage(tokens_intercepted, tokens_extracted);
-                                        update_status_bar_unlocked();
-                                        push_display_event(DisplayEvent::OrchestratorScratchpadSavings {
-                                            tokens_intercepted, tokens_extracted,
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                                } // drop _term lock
-
-                                // Restart animation
-                                let anim_label = if sub == "synthesizing" { "Synthesizing" } else { "Thinking" };
-                                let (wave_anim, wave_stop) = {
-                                    let _term = lock_term();
-                                    WaveAnimation::start(
-                                        anim_label,
-                                        vec![],
-                                        input_buf_for_orch.clone(),
-                                        Some(cancel_for_orch.clone()),
-                                    )
-                                };
-                                if let Ok(mut guard) = ptw_for_orch.lock() {
-                                    *guard = Some((wave_anim, wave_stop));
-                                }
-                                prepare_input_line(
-                                    &input_buf_for_orch,
-                                    Some(&cancel_for_orch),
-                                );
-                            },
-                        )
-                        .await
+                        let mut handler = ReplStreamHandler {
+                            pending_args: pending_args.clone(),
+                            turn_events: turn_events.clone(),
+                            live_reasoning: live_reasoning.clone(),
+                            stop_flag: stop_flag.clone(),
+                            anim_cleared: anim_cleared.clone(),
+                            cancel: cancel_flag.clone(),
+                            post_tool_wave: post_tool_wave.clone(),
+                            input_buf: input_buf.clone(),
+                            orch_state: orch_state.clone(),
+                            needs_blank: needs_blank.clone(),
+                            in_update_group: in_update_group.clone(),
+                        };
+                        backend
+                            .stream_chat(
+                                conversation.messages(),
+                                tool_defs_arg,
+                                &chat_session_id,
+                                cancel_for_stream.clone(),
+                                &mut handler,
+                            )
+                            .await
                     });
+
+                    // Close any live reasoning block left open by the stream
+                    // (e.g., reasoning was the last thing the model emitted
+                    // before the stream ended without a usage/tool event).
+                    flush_live_reasoning(&live_reasoning);
 
                     // Check for cancellation
                     if cancel_flag.load(Ordering::Relaxed) {
@@ -1873,54 +1740,21 @@ pub fn run_repl(
                 // Done processing — restore status bar to token counts / default
                 set_processing(false);
 
-                // Check for pending commands set by mid-stream slash commands
-                if let Some(cmd) = take_pending_command() {
-                    match cmd {
-                        PendingCommand::Quit => {
-                            // Save before exiting, or delete if conversation was never started
-                            if let Some(ref store) = conv_store {
-                                if conversation.messages().len() > 1 {
-                                    with_event_log(|log| {
-                                        store.save_all(
-                                            conversation.messages(),
-                                            log,
-                                            is_expanded_output(),
-                                        )
-                                    });
-                                } else {
-                                    store.delete();
-                                }
-                            }
-                            break;
-                        }
-                        PendingCommand::Clear => {
-                            commands::handle_clear(
-                                &mut conversation,
-                                &mut conv_store,
-                                &mut input_reader,
-                            );
+                // Run any command deferred from mid-stream input through the
+                // same registry dispatch the prompt uses.
+                if let Some(pending) = take_pending_command() {
+                    let mut ctx = CommandContext {
+                        conversation: &mut conversation,
+                        conv_store: &mut conv_store,
+                        input_reader: &mut input_reader,
+                    };
+                    match (pending.command.handler)(&mut ctx, &pending.args) {
+                        CommandOutcome::Exit => break,
+                        CommandOutcome::Reinject(new_input) => {
+                            initial_input = new_input;
                             continue;
                         }
-                        PendingCommand::Resume(filter) => {
-                            let arg = filter.trim();
-                            if arg.is_empty() {
-                                // No argument — just continue normally
-                                redraw_input_frame();
-                                continue;
-                            }
-                            // In-REPL resume ignores CLI --model and --system-prompt
-                            if let Some(new_input) = commands::handle_resume(
-                                arg,
-                                &mut conversation,
-                                &mut conv_store,
-                                &mut input_reader,
-                                None,
-                            ) {
-                                initial_input = new_input;
-                            }
-                            redraw_input_frame();
-                            continue;
-                        }
+                        CommandOutcome::Handled => continue,
                     }
                 }
 
@@ -2006,4 +1840,1008 @@ pub fn run_repl(
 
     println!();
     Ok(())
+}
+
+/// Streaming event handler for the interactive REPL: drives the live
+/// "Thinking" animation, tool-call rendering, reasoning blocks, and the
+/// orchestrator task tree. State is shared via `Arc` so each turn's stream
+/// mutates the same terminal-display state the REPL reads between turns.
+struct ReplStreamHandler {
+    pending_args:
+        Arc<Mutex<std::collections::HashMap<String, BTreeMap<String, serde_json::Value>>>>,
+    turn_events: Arc<Mutex<Vec<DisplayEvent>>>,
+    live_reasoning: Arc<Mutex<Option<LiveReasoning>>>,
+    stop_flag: Arc<AtomicBool>,
+    anim_cleared: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    #[allow(clippy::type_complexity)]
+    post_tool_wave: Arc<Mutex<Option<(WaveAnimation, Arc<AtomicBool>)>>>,
+    input_buf: Arc<Mutex<String>>,
+    orch_state: Arc<Mutex<OrchDisplayState>>,
+    needs_blank: Arc<AtomicBool>,
+    in_update_group: Arc<AtomicBool>,
+}
+
+impl StreamHandler for ReplStreamHandler {
+    // on_token / on_tool_start stay no-ops (trait defaults): text is
+    // accumulated silently and the animation keeps running until a later
+    // event needs to display.
+
+    fn on_tool_requested(
+        &mut self,
+        tool_id: &str,
+        tool_name: &str,
+        args: &BTreeMap<String, serde_json::Value>,
+    ) {
+        // Record args for later pairing with on_tool_complete
+        if let Ok(mut map) = self.pending_args.lock() {
+            map.insert(tool_id.to_string(), args.clone());
+        }
+        // Track Update grouping flag for the execution loop
+        if tool_name == "Update" {
+            self.in_update_group.store(true, Ordering::Relaxed);
+        } else if tool_name != "Shell" || !self.in_update_group.load(Ordering::Relaxed) {
+            // Non-Shell (or Shell outside Update) clears the flag
+            if tool_name != "Shell" {
+                self.in_update_group.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn on_tool_complete(
+        &mut self,
+        tool_id: &str,
+        tool_name: &str,
+        duration: std::time::Duration,
+        result: Option<&str>,
+    ) {
+        flush_live_reasoning(&self.live_reasoning);
+        // Stop animation: prefer ptw (later iterations), fall back
+        // to initial animation (first iteration).
+        let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+            if let Some((ptw_anim, _)) = guard.take() {
+                ptw_anim.finish();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+            stop_and_clear_animation(&self.stop_flag);
+            self.anim_cleared.store(true, Ordering::Relaxed);
+        }
+        // Show server-side tool result
+        {
+            let _term = lock_term();
+            erase_input_frame();
+            let args = self
+                .pending_args
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(tool_id))
+                .unwrap_or_default();
+            if is_expanded_output() {
+                print_tool_call_expanded(tool_name, &args, duration, result);
+            } else {
+                crate::ui::prompt::print_tool_call_summary(tool_name, &args, Some(duration));
+                println!();
+            }
+            if let Ok(mut events) = self.turn_events.lock() {
+                events.push(DisplayEvent::ToolCall {
+                    tool_name: tool_name.to_string(),
+                    arguments: args,
+                    duration,
+                    result: result.map(|s| s.to_string()),
+                });
+            }
+        }
+        // Start "Thinking" animation to fill gap until next event
+        let (wave_anim, wave_stop) = {
+            let _term = lock_term();
+            WaveAnimation::start(
+                "Thinking",
+                vec![],
+                self.input_buf.clone(),
+                Some(self.cancel.clone()),
+            )
+        };
+        if let Ok(mut guard) = self.post_tool_wave.lock() {
+            *guard = Some((wave_anim, wave_stop));
+        }
+        prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+
+    fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+        set_status_bar_tokens(prompt_tokens, completion_tokens);
+        update_status_bar();
+        if let Ok(mut events) = self.turn_events.lock() {
+            events.push(DisplayEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+            });
+        }
+    }
+
+    fn on_reasoning(
+        &mut self,
+        content: &str,
+        agent_id: &str,
+        fields: &BTreeMap<String, serde_json::Value>,
+    ) {
+        if content.is_empty() {
+            return;
+        }
+
+        let parent_agent_id = fields
+            .get("parent_agent_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // Switching agents closes the previous block.
+        let agent_changed = match self.live_reasoning.lock() {
+            Ok(g) => g.as_ref().is_some_and(|s| s.agent_id != agent_id),
+            Err(_) => false,
+        };
+        if agent_changed {
+            flush_live_reasoning(&self.live_reasoning);
+        }
+
+        // Initialize the live block on the first chunk.
+        let need_init = match self.live_reasoning.lock() {
+            Ok(g) => g.is_none(),
+            Err(_) => return,
+        };
+        if need_init {
+            let is_worker = parent_agent_id.is_some();
+            let task_id = if is_worker {
+                self.orch_state.lock().ok().and_then(|os| {
+                    os.tasks
+                        .iter()
+                        .find(|(_, info)| info.worker_id == agent_id)
+                        .map(|(tid, _)| tid.clone())
+                })
+            } else {
+                None
+            };
+            // No matching task means we can't insert
+            // into the tree — fall back to top-level
+            // rendering so the reasoning isn't lost.
+            let effective_worker = is_worker && task_id.is_some();
+
+            // Stop the running animation and erase
+            // the input frame BEFORE printing any
+            // new scrollback rows — both top-level
+            // (`open_top_level_reasoning_block`) and
+            // worker (`open_worker_reasoning_block`
+            // → `register_orch_reasoning_in_tree`)
+            // emit `println!` rows. If we skip this,
+            // the println lands at the InputLine
+            // and the old anim/frame rows above are
+            // left stale in scrollback (the doubled
+            // "● Thinking" + duplicate body bug).
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                if let Some((ptw_anim, _)) = guard.take() {
+                    ptw_anim.finish();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+
+            let mut new_state = LiveReasoning {
+                agent_id: agent_id.to_string(),
+                parent_agent_id: parent_agent_id.clone(),
+                task_id: task_id.clone(),
+                combined: String::new(),
+                fields: fields.clone(),
+                started: false,
+                body_line_num: 0,
+                body_line_text: String::new(),
+                body_visual_rows: 1,
+                is_worker: effective_worker,
+            };
+            {
+                let _term = lock_term();
+                erase_input_frame();
+                if effective_worker {
+                    let tid = task_id.as_deref().unwrap_or("");
+                    open_worker_reasoning_block(&mut new_state, tid);
+                } else {
+                    open_top_level_reasoning_block(&mut new_state, agent_id);
+                }
+            }
+            // Restart the Thinking spinner so it
+            // stays visible while reasoning chunks
+            // stream in. `WaveAnimation::start`
+            // prints the anim overlay BELOW the
+            // body row, so the `MoveUp(3)` tick and
+            // the `(total_sb + 3) - body_line_num`
+            // in-place body rewrite both target
+            // rows below the body — body is safe.
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            // Animation is live again — the orch
+            // handler's "stop if not cleared"
+            // check needs to fire on the next
+            // event to finish this wave.
+            self.anim_cleared
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut guard) = self.live_reasoning.lock() {
+                *guard = Some(new_state);
+            }
+        }
+
+        // For top-level reasoning, decide whether
+        // this chunk grows the body row-count
+        // BEFORE we update state — extension needs
+        // to release the live_reasoning lock so
+        // the animation halt+restart can re-acquire
+        // it safely.
+        let extend_by: u32 = {
+            if let Ok(guard) = self.live_reasoning.lock() {
+                if let Some(state) = guard.as_ref() {
+                    if state.is_worker {
+                        0
+                    } else {
+                        let mut candidate = state.body_line_text.clone();
+                        candidate.push_str(content);
+                        let lines = top_level_reasoning_body_for_terminal(&candidate);
+                        let required = lines.len() as u32;
+                        required.saturating_sub(state.body_visual_rows)
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
+        if extend_by > 0 {
+            // Halt anim, extend scrollback by
+            // `extend_by` rows (overwriting the
+            // current trailing-blank separator with
+            // body content + appending a new
+            // separator at the end), restart anim.
+            // Same halt-restart shape as
+            // `tool_call_started`; spinner only
+            // pauses for the extension itself, not
+            // for the chunk.
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                if let Some((ptw_anim, _)) = guard.take() {
+                    ptw_anim.finish();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+            {
+                let _term = lock_term();
+                erase_input_frame();
+                // After `erase_input_frame`, the
+                // cursor sits where the frame's
+                // top border was — exactly one row
+                // below the existing trailing
+                // separator. Println `extend_by`
+                // blank rows from here: each
+                // println commits one new
+                // scrollback row below the prior
+                // separator. The old separator
+                // (still blank at its row) becomes
+                // the first new body row when
+                // `rewrite_top_level_reasoning_body_inplace`
+                // fills the expanded body region;
+                // the LAST println becomes the
+                // new trailing separator.
+                //
+                // Do NOT `MoveUp(1) + Clear` here:
+                // that overwrites the existing
+                // separator row WITHOUT committing
+                // a new scrollback row, but still
+                // increments the counter, leaving
+                // it ahead by 1 and making the
+                // next body rewrite's `MoveUp`
+                // land on the header.
+                for _ in 0..extend_by {
+                    println!();
+                    crate::ui::prompt::increment_orch_scrollback();
+                }
+            }
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            self.anim_cleared
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+
+            if let Ok(mut guard) = self.live_reasoning.lock()
+                && let Some(s) = guard.as_mut()
+            {
+                s.body_visual_rows += extend_by;
+            }
+        }
+
+        if let Ok(mut guard) = self.live_reasoning.lock() {
+            let Some(state) = guard.as_mut() else {
+                return;
+            };
+            let _term = lock_term();
+            apply_reasoning_chunk(state, content);
+            if state.is_worker {
+                // Keep `ORCH_LAST_TOOL_LINES` in sync
+                // so the next tool's upgrade redraws
+                // the body with the latest content.
+                if let Some(tid) = state.task_id.clone() {
+                    let body = worker_reasoning_body_for_terminal(&state.body_line_text);
+                    crate::ui::orchestrator::update_orch_last_tool_duration_text(&tid, &body);
+                }
+            }
+        }
+    }
+
+    fn on_raw_event(&mut self, event_name: &str, event_data: &str) {
+        push_sse_event(event_name, event_data);
+        if event_name == event_names::TOOL_START
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(event_data)
+            && let Some(tool_id) = val.get("tool_id").and_then(|v| v.as_str())
+            && let Some(token) = val.get("progress_token")
+            && !token.is_null()
+        {
+            crate::ui::prompt::record_tool_progress_token(tool_id, &token.to_string());
+        }
+    }
+
+    fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
+        // Per-turn MCP connection status. Surfaced two ways:
+        //  1. Persistent status notices below the token line, rendered when
+        //     this turn's frame is redrawn at turn end (data-only).
+        //  2. Immediately in the scrollback, so the user can react — e.g. stop
+        //     a doomed run — without waiting for the turn to finish.
+        if event_name == event_names::MCP_STATUS {
+            let notices = crate::api::mcp_status::notices_from_event(val);
+            if notices.is_empty() {
+                return;
+            }
+
+            // (1) Persistent status section.
+            for notice in &notices {
+                // Prefixes are padded so message text aligns
+                // ("error:   " / "warning: ").
+                let (style, line) = match notice {
+                    McpNotice::Error(message) => (AuraStyle::Error, format!("error:   {message}")),
+                    McpNotice::Warning(message) => {
+                        (AuraStyle::Warning, format!("warning: {message}"))
+                    }
+                };
+                crate::ui::prompt::add_turn_notice(style, line);
+            }
+
+            // (2) Immediate scrollback line(s). Mirror the on_tool_complete
+            // dance: stop the spinner, print above the frame, then restart
+            // "Thinking" so feedback continues until the next event/response.
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                guard.take().map(|(a, _)| a.finish()).is_some()
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+            {
+                let _term = lock_term();
+                erase_input_frame();
+                for notice in &notices {
+                    let (style, label, message) = match notice {
+                        McpNotice::Error(message) => (AuraStyle::Error, "Error", message),
+                        McpNotice::Warning(message) => (AuraStyle::Warning, "Warning", message),
+                    };
+                    // Theme the whole line, not just the marker/label.
+                    let line = format!("⏺ {label} - {message}");
+                    println!("{}", line.themed(style));
+                    crate::ui::prompt::increment_orch_scrollback();
+                }
+                println!();
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            return;
+        }
+
+        // Handle aura.progress — prefer to attach the
+        // message to the active orchestrator tool whose
+        // progress_token matches; fall back to the
+        // global "Thinking" sub-line when there's no
+        // active tool to attach it to (single-agent
+        // mode, or progress for a tool we never saw a
+        // tool_start for).
+        //
+        // These transient events (progress, worker_phase,
+        // session_info, non-orchestrator-prefixed) update
+        // the spinner sub-line or task header in-place —
+        // they don't add to scrollback, so they must NOT
+        // flush the live reasoning block. Flushing here
+        // would slice multi-chunk reasoning into multiple
+        // `● Reasoning - <agent>` blocks every time a
+        // worker phase changes.
+        if event_name == event_names::PROGRESS {
+            if let Some(message) = val.get("message").and_then(|v| v.as_str()) {
+                let token = val.get("progress_token").map(|t| t.to_string());
+                let attached = token
+                    .as_deref()
+                    .map(|t| crate::ui::prompt::set_orch_tool_progress_by_token(t, message))
+                    .unwrap_or(false);
+                if !attached {
+                    crate::ui::prompt::set_agent_reasoning(message);
+                }
+            }
+            return;
+        }
+
+        // Reflect the worker's current phase
+        // (`Planning`/`Executing`/`Analyzing`) in the
+        // task header. Overwrites in-place; the
+        // task_completed handler later replaces this
+        // with `done`.
+        if event_name == event_names::WORKER_PHASE {
+            let task_id = val.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let phase = val.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+            if task_id.is_empty() || phase.is_empty() {
+                return;
+            }
+            let mut chars = phase.chars();
+            let phase_label: String = match chars.next() {
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+                None => return,
+            };
+            let header_info = if let Ok(os) = self.orch_state.lock() {
+                os.tasks
+                    .get(task_id)
+                    .map(|t| (t.header_line_num, t.worker_id.clone()))
+            } else {
+                None
+            };
+            if let Some((header_line, worker_id)) = header_info {
+                crate::ui::prompt::overwrite_orch_task_header(
+                    header_line,
+                    task_id,
+                    &worker_id,
+                    &phase_label,
+                );
+            }
+            return;
+        }
+
+        // Scratchpad savings ride in on the base `aura.scratchpad_usage`
+        // event (not orchestrator-namespaced), so handle it here, before the
+        // orchestrator-prefix guard below. Accumulate into the status bar and
+        // record a DisplayEvent for history replay.
+        if event_name == event_names::SCRATCHPAD_USAGE {
+            let tokens_intercepted = val
+                .get("tokens_intercepted")
+                .or_else(|| val.get("data").and_then(|d| d.get("tokens_intercepted")))
+                .and_then(|f| f.as_u64())
+                .unwrap_or(0);
+            let tokens_extracted = val
+                .get("tokens_extracted")
+                .or_else(|| val.get("data").and_then(|d| d.get("tokens_extracted")))
+                .and_then(|f| f.as_u64())
+                .unwrap_or(0);
+            crate::ui::prompt::add_scratchpad_usage(tokens_intercepted, tokens_extracted);
+            update_status_bar_unlocked();
+            push_display_event(DisplayEvent::OrchestratorScratchpadSavings {
+                tokens_intercepted,
+                tokens_extracted,
+            });
+            return;
+        }
+
+        // Everything below acts only on `aura.orchestrator.*` events; bail
+        // out for anything else (e.g. session_info).
+        if !event_name.starts_with("aura.orchestrator.") {
+            return;
+        }
+
+        // The server emits `aura.orchestrator.worker_reasoning`
+        // alongside every `aura.reasoning` delta from a
+        // worker. We already render the reasoning via
+        // the dedicated `on_reasoning` path (which has
+        // the worker's agent_id and richer correlation
+        // context), and processing the orch mirror here
+        // would call `erase_input_frame` mid-stream and
+        // corrupt the running `● Reasoning - <agent>`
+        // block. Drop it before any frame work runs.
+        if event_name == event_names::WORKER_REASONING {
+            return;
+        }
+
+        // Non-printable orch subs (synthesizing and any
+        // future no-print subs) need their side effects but
+        // must NOT disturb the input frame mid-reasoning.
+        // Handle them inline and bail out before the
+        // `erase_input_frame` machinery runs.
+        if !orch_event_prints_scrollback(event_name) {
+            if event_name == event_names::SYNTHESIZING {
+                crate::ui::prompt::clear_agent_reasoning();
+                push_display_event(DisplayEvent::OrchestratorSynthesizing);
+            }
+            return;
+        }
+
+        // Past this point: event_name is in
+        // `orch_event_prints_scrollback`, so close the
+        // live reasoning block before the event lands.
+        // The block's trailing blank (committed in
+        // `open_top_level_reasoning_block`) is the
+        // separator — no extra println needed here.
+        let _ = flush_live_reasoning(&self.live_reasoning);
+
+        // Stop current animation
+        let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+            if let Some((ptw_anim, _)) = guard.take() {
+                ptw_anim.finish();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+            stop_and_clear_animation(&self.stop_flag);
+            self.anim_cleared.store(true, Ordering::Relaxed);
+        }
+        {
+            let _term = lock_term();
+            erase_input_frame();
+
+            // Emit a deferred blank line from a previous
+            // tool_call_completed — but only if this event
+            // isn't another tool starting directly after.
+            if self.needs_blank.swap(false, Ordering::Relaxed)
+                && event_name != event_names::TOOL_CALL_STARTED
+            {
+                println!();
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+
+            // Helpers
+            let get_str = |v: &serde_json::Value, field: &str| -> String {
+                let f = v
+                    .get(field)
+                    .or_else(|| v.get("data").and_then(|d| d.get(field)));
+                match f {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                    Some(serde_json::Value::Bool(b)) => b.to_string(),
+                    _ => String::new(),
+                }
+            };
+            let get_u64 = |v: &serde_json::Value, field: &str| -> u64 {
+                v.get(field)
+                    .or_else(|| v.get("data").and_then(|d| d.get(field)))
+                    .and_then(|f| f.as_u64())
+                    .unwrap_or(0)
+            };
+            let fields: BTreeMap<String, serde_json::Value> = match val.as_object() {
+                Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                None => BTreeMap::new(),
+            };
+            let parse_args =
+                |v: &serde_json::Value| -> Option<serde_json::Map<String, serde_json::Value>> {
+                    v.get("arguments")
+                        .or_else(|| v.get("data").and_then(|d| d.get("arguments")))
+                        .and_then(|a| match a {
+                            serde_json::Value::Object(obj) => Some(obj.clone()),
+                            serde_json::Value::String(s) => serde_json::from_str(s).ok(),
+                            _ => None,
+                        })
+                };
+
+            // Per-orchestrator-entity bullet color. Keyed by task_id
+            // (or `__orchestrator__` for coordinator-level events:
+            // plan_created, synthesizing, iteration_complete).
+            // Resolved through the active theme — switching themes
+            // repaints automatically; no colors are persisted.
+            let event_task_id = get_str(val, "task_id");
+            let color_key: String = if !event_task_id.is_empty() {
+                event_task_id.clone()
+            } else {
+                "__orchestrator__".to_string()
+            };
+            let bullet_color = task_color_for(&color_key);
+
+            match event_name {
+                event_names::PLAN_CREATED => {
+                    let goal = get_str(val, "goal");
+                    // New plan resets reasoning
+                    crate::ui::prompt::clear_agent_reasoning();
+                    println!(
+                        "{} {}",
+                        "●"
+                            .with(bullet_color)
+                            .attribute(crossterm::style::Attribute::Bold),
+                        format!("Plan - {goal}").attribute(crossterm::style::Attribute::Bold),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+                    if is_expanded_output() {
+                        // Count lines that print_fields_tree will emit
+                        let field_lines = fields
+                            .values()
+                            .map(|v| {
+                                if let serde_json::Value::Object(obj) = v {
+                                    1 + obj.len()
+                                } else {
+                                    1
+                                }
+                            })
+                            .sum::<usize>();
+                        print_fields_tree(&fields);
+                        for _ in 0..field_lines {
+                            crate::ui::prompt::increment_orch_scrollback();
+                        }
+                    }
+                    println!();
+                    crate::ui::prompt::increment_orch_scrollback();
+                    push_display_event(DisplayEvent::OrchestratorPlanCreated { goal, fields });
+                }
+                event_names::TASK_STARTED => {
+                    let worker_id = get_str(val, "worker_id");
+                    let task_id = get_str(val, "task_id");
+                    let description = get_str(val, "description");
+                    // Bullet color resolved per-task at render time —
+                    // `task_color_for(&task_id)` returns the color the
+                    // generic block (above) already computed via
+                    // `bullet_color`, so reuse that directly.
+                    crate::ui::prompt::set_agent_reasoning(&description);
+                    let header_line = crate::ui::prompt::current_orch_scrollback();
+                    println!(
+                        "{} {} {} {}",
+                        "●"
+                            .with(bullet_color)
+                            .attribute(crossterm::style::Attribute::Bold),
+                        format!("Task {task_id}").attribute(crossterm::style::Attribute::Bold),
+                        "-".themed(AuraStyle::Muted),
+                        format!("Worker: {worker_id}").themed(AuraStyle::Muted),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+                    // No blank line – tool calls follow directly
+                    if let Ok(mut os) = self.orch_state.lock() {
+                        os.tasks.insert(
+                            task_id.clone(),
+                            OrchTaskInfo {
+                                header_line_num: header_line,
+                                worker_id: worker_id.clone(),
+                                tools: Vec::new(),
+                            },
+                        );
+                    }
+                    push_display_event(DisplayEvent::OrchestratorTaskStarted {
+                        worker_id,
+                        task_id,
+                        description,
+                        fields,
+                    });
+                }
+                event_names::TOOL_CALL_STARTED => {
+                    let tool_name = get_str(val, "tool_name");
+                    let tool_initiator_id = get_str(val, "tool_initiator_id");
+                    let tool_call_id = get_str(val, "tool_call_id");
+                    let task_id_str = get_str(val, "task_id");
+                    let display_name = snake_to_pascal_case(&tool_name);
+                    let args_obj = parse_args(val);
+                    let args_summary = args_obj.as_ref()
+                                            .map(|obj| {
+                                                obj.iter()
+                                                    .filter(|(k, v)| {
+                                                        !k.starts_with('_')
+                                                            && !matches!(v, serde_json::Value::Null)
+                                                            && !matches!(v, serde_json::Value::String(s) if s.is_empty() || s == "null")
+                                                    })
+                                                    .take(3)
+                                                    .map(|(k, v)| {
+                                                        let val_str = match v {
+                                                            serde_json::Value::String(s) => {
+                                                                if s.chars().count() > 20 {
+                                                                    let prefix: String = s.chars().take(17).collect();
+                                                                    format!("\"{prefix}...\"")
+                                                                } else {
+                                                                    format!("\"{s}\"")
+                                                                }
+                                                            }
+                                                            other => {
+                                                                let s = other.to_string();
+                                                                if s.chars().count() > 20 {
+                                                                    let prefix: String = s.chars().take(17).collect();
+                                                                    format!("{prefix}...")
+                                                                } else {
+                                                                    s
+                                                                }
+                                                            }
+                                                        };
+                                                        format!("{k}: {val_str}")
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            })
+                                            .unwrap_or_default();
+                    let reasoning = args_obj
+                        .as_ref()
+                        .and_then(|obj| obj.get("_aura_reasoning").and_then(|v| v.as_str()));
+                    // Set reasoning in the Thinking animation sub-line
+                    if let Some(text) = reasoning {
+                        crate::ui::prompt::set_agent_reasoning(text);
+                    }
+                    // Print tool line indented under the task with live duration
+                    let tool_display = format!("{display_name}({args_summary})");
+                    // Use tool_call_id as primary key, fall back to tool_initiator_id
+                    let match_id = if !tool_call_id.is_empty() {
+                        &tool_call_id
+                    } else {
+                        &tool_initiator_id
+                    };
+                    crate::ui::prompt::register_orch_tool(
+                        match_id,
+                        &task_id_str,
+                        &tool_display,
+                        std::time::Instant::now(),
+                        &fields,
+                    );
+                    // Track tool under its task
+                    if let Ok(mut os) = self.orch_state.lock() {
+                        if let Some(task) = os.tasks.get_mut(&task_id_str) {
+                            task.tools.push(tool_display);
+                        } else if let Some(task) = os.tasks.get_mut(&tool_initiator_id) {
+                            task.tools.push(tool_display);
+                        }
+                    }
+                    push_display_event(DisplayEvent::OrchestratorToolCallStarted {
+                        tool_name,
+                        tool_initiator_id,
+                        fields,
+                    });
+                }
+                event_names::TOOL_CALL_COMPLETED => {
+                    let tool_name = get_str(val, "tool_name");
+                    let tool_initiator_id = get_str(val, "tool_initiator_id");
+                    let tool_call_id = get_str(val, "tool_call_id");
+                    let duration_ms_val = val
+                        .get("duration_ms")
+                        .or_else(|| val.get("data").and_then(|d| d.get("duration_ms")))
+                        .and_then(|v| v.as_u64());
+                    let result_text = val
+                        .get("result")
+                        .or_else(|| val.get("data").and_then(|d| d.get("result")))
+                        .and_then(|v| v.as_str());
+                    // Use tool_call_id as primary key, fall back to tool_initiator_id
+                    let match_id = if !tool_call_id.is_empty() {
+                        &tool_call_id
+                    } else {
+                        &tool_initiator_id
+                    };
+                    // Finalize tool display (solid color + completed duration + live result lines in /expand)
+                    crate::ui::prompt::finalize_orch_tool(match_id, duration_ms_val, result_text);
+                    self.needs_blank.store(true, Ordering::Relaxed);
+                    push_display_event(DisplayEvent::OrchestratorToolCallCompleted {
+                        tool_name,
+                        tool_initiator_id,
+                        duration_ms: duration_ms_val,
+                        fields,
+                    });
+                }
+                event_names::TASK_COMPLETED => {
+                    let worker_id = get_str(val, "worker_id");
+                    let task_id = get_str(val, "task_id");
+                    let result = get_str(val, "result");
+                    // Look up task info and overwrite the header line in-place
+                    let task_info = if let Ok(mut os) = self.orch_state.lock() {
+                        os.tasks.remove(&task_id)
+                    } else {
+                        None
+                    };
+                    if let Some(info) = &task_info {
+                        overwrite_orch_task_header_unlocked(
+                            info.header_line_num,
+                            &task_id,
+                            &worker_id,
+                            "done",
+                        );
+                    }
+                    crate::ui::prompt::clear_orch_task_tools(&task_id);
+                    // Blank line to separate from next task
+                    println!();
+                    crate::ui::prompt::increment_orch_scrollback();
+                    push_display_event(DisplayEvent::OrchestratorTaskCompleted {
+                        worker_id,
+                        task_id,
+                        result,
+                        fields,
+                    });
+                }
+                // `synthesizing` / `scratchpad_usage` /
+                // `worker_reasoning` are handled above
+                // the frame machinery so they don't
+                // disturb in-flight reasoning blocks.
+                event_names::ITERATION_COMPLETE => {
+                    let iteration = get_u64(val, "iteration");
+                    let quality_score = get_str(val, "quality_score");
+                    let expanded = is_expanded_output();
+                    let has_fields = expanded && !fields.is_empty();
+                    crate::ui::prompt::clear_agent_reasoning();
+                    println!(
+                        "{} {}",
+                        "●"
+                            .with(bullet_color)
+                            .attribute(crossterm::style::Attribute::Bold),
+                        "Iteration complete".attribute(crossterm::style::Attribute::Bold),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+                    println!(
+                        "{} iteration: {}",
+                        "├─".themed(AuraStyle::Connector),
+                        iteration.to_string().as_str().themed(AuraStyle::Muted),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+                    let quality_connector = if has_fields { "├─" } else { "└─" };
+                    println!(
+                        "{} quality: {}",
+                        quality_connector.themed(AuraStyle::Connector),
+                        quality_score.as_str().themed(AuraStyle::Muted),
+                    );
+                    crate::ui::prompt::increment_orch_scrollback();
+                    if has_fields {
+                        let field_lines = fields
+                            .values()
+                            .map(|v| {
+                                if let serde_json::Value::Object(obj) = v {
+                                    1 + obj.len()
+                                } else {
+                                    1
+                                }
+                            })
+                            .sum::<usize>();
+                        print_fields_tree(&fields);
+                        for _ in 0..field_lines {
+                            crate::ui::prompt::increment_orch_scrollback();
+                        }
+                    }
+                    println!();
+                    crate::ui::prompt::increment_orch_scrollback();
+                    push_display_event(DisplayEvent::OrchestratorIterationComplete {
+                        iteration,
+                        quality_score,
+                        fields,
+                    });
+                }
+                _ => {}
+            }
+        } // drop _term lock
+
+        // Restart animation
+        let anim_label = if event_name == event_names::SYNTHESIZING {
+            "Synthesizing"
+        } else {
+            "Thinking"
+        };
+        let (wave_anim, wave_stop) = {
+            let _term = lock_term();
+            WaveAnimation::start(
+                anim_label,
+                vec![],
+                self.input_buf.clone(),
+                Some(self.cancel.clone()),
+            )
+        };
+        if let Ok(mut guard) = self.post_tool_wave.lock() {
+            *guard = Some((wave_anim, wave_stop));
+        }
+        prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMAND_ALIASES, command_hint};
+    use crate::repl::registry;
+
+    #[test]
+    fn intercepts_every_registered_command() {
+        // A command added to the registry must not slip through unhinted
+        for cmd in registry::COMMANDS {
+            let bare = cmd.name.strip_prefix('/').unwrap();
+            assert_eq!(
+                command_hint(bare),
+                Some(cmd.name),
+                "{} is not captured as a bare word",
+                cmd.name,
+            );
+        }
+    }
+
+    #[test]
+    fn intercepts_aliases() {
+        assert_eq!(command_hint("q"), Some("/quit"));
+        assert_eq!(command_hint(":q"), Some("/quit"));
+        assert_eq!(command_hint(":wq"), Some("/quit"));
+        assert_eq!(command_hint(":x"), Some("/quit"));
+        assert_eq!(command_hint("bye"), Some("/exit"));
+        assert_eq!(command_hint("logout"), Some("/exit"));
+        assert_eq!(command_hint("?"), Some("/help"));
+    }
+
+    #[test]
+    fn is_case_insensitive_and_trims() {
+        assert_eq!(command_hint("EXIT"), Some("/exit"));
+        assert_eq!(command_hint("  Quit  "), Some("/quit"));
+        assert_eq!(command_hint(":Q"), Some("/quit"));
+        assert_eq!(command_hint("  Model "), Some("/model"));
+    }
+
+    #[test]
+    fn passes_through_real_chat_input() {
+        // Slash commands are handled before this lookup, and ordinary chat
+        // must never be intercepted.
+        assert_eq!(command_hint("/exit"), None);
+        assert_eq!(command_hint("exit the building"), None);
+        assert_eq!(command_hint("how do I quit vim"), None);
+        assert_eq!(command_hint("question?"), None);
+        assert_eq!(command_hint(""), None);
+    }
+
+    #[test]
+    fn every_alias_resolves_to_a_real_command() {
+        // Guards against the alias table drifting from the registry.
+        for (bare, target) in COMMAND_ALIASES {
+            assert!(
+                registry::lookup(target).is_some(),
+                "alias {bare:?} targets unknown command {target:?}",
+            );
+        }
+    }
 }

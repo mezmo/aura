@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Internal crates
+aura-config = { path = "../aura-config" }
+
 # Rig dependencies
 rig-core = { workspace = true }
 rig-bedrock = { workspace = true }
@@ -62,6 +65,9 @@ tiktoken-rs = "0.9.1"
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Integration test umbrella (mirrors aura-web-server pattern)
+integration = ["integration-stdio"]
+integration-stdio = []
 
 [dev-dependencies]
 tempfile = "3.23.0"

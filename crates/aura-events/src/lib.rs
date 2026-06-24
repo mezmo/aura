@@ -13,6 +13,7 @@
 //! Both enums derive `Serialize + Deserialize` so they can be used for
 //! producing SSE (server) and parsing SSE (client) with the same types.
 
+pub mod event_names;
 pub mod orchestration;
 
 use serde::{Deserialize, Serialize};
@@ -133,6 +134,35 @@ impl CorrelationContext {
             trace_id,
         }
     }
+}
+
+/// Marker the `aura` crate prepends to an HTTP status when an MCP transport
+/// fails (e.g. `"server returned HTTP 404 Not Found"`), surfaced in
+/// [`McpServerStatus::reason`].
+///
+/// Defined here, in the shared wire crate, so the producer (`aura`'s transport
+/// layer) and consumers (the CLI, which condenses the reason for display) match
+/// on a single source of truth rather than duplicated literals. Note the
+/// trailing space — callers format `"{HTTP_STATUS_MARKER}{status}"`.
+pub const HTTP_STATUS_MARKER: &str = "server returned HTTP ";
+
+/// Connection status of a single configured MCP server.
+///
+/// Wire projection of the aura crate's `ConnectionStatus`/`ServerInfo`. Kept as
+/// plain primitives so this lightweight crate stays free of agent/MCP deps.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerStatus {
+    /// Configured server name (e.g. "pagerduty").
+    pub server_name: String,
+    /// Transport kind: "http_streamable", "sse", or "stdio".
+    pub transport: String,
+    /// Connection outcome: "connected", "failed", or "not_attempted".
+    pub status: String,
+    /// Number of tools discovered (0 for failed or genuinely empty servers).
+    pub tools_count: usize,
+    /// Failure reason when `status == "failed"`; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Worker phase for multi-agent orchestration.
@@ -290,22 +320,34 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Emitted at stream start with the connection status of every configured
+    /// MCP server. Lets clients distinguish between "server connected", "server has no tools"
+    /// "server is configured but unavailable", (auth failure, connection refused), etc...
+    ///
+    /// Placed last in the enum: its unique required `servers` field keeps
+    /// `#[serde(untagged)]` deserialization unambiguous regardless of order.
+    McpStatus {
+        servers: Vec<McpServerStatus>,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
 }
 
 impl AuraStreamEvent {
     /// Get the SSE event name for this event type.
     pub fn event_name(&self) -> &'static str {
         match self {
-            Self::SessionInfo { .. } => "aura.session_info",
-            Self::ToolRequested { .. } => "aura.tool_requested",
-            Self::ToolStart { .. } => "aura.tool_start",
-            Self::ToolComplete { .. } => "aura.tool_complete",
-            Self::Reasoning { .. } => "aura.reasoning",
-            Self::Progress { .. } => "aura.progress",
-            Self::WorkerPhase { .. } => "aura.worker_phase",
-            Self::ToolUsage { .. } => "aura.tool_usage",
-            Self::Usage { .. } => "aura.usage",
-            Self::ScratchpadUsage { .. } => "aura.scratchpad_usage",
+            Self::SessionInfo { .. } => event_names::SESSION_INFO,
+            Self::ToolRequested { .. } => event_names::TOOL_REQUESTED,
+            Self::ToolStart { .. } => event_names::TOOL_START,
+            Self::ToolComplete { .. } => event_names::TOOL_COMPLETE,
+            Self::Reasoning { .. } => event_names::REASONING,
+            Self::Progress { .. } => event_names::PROGRESS,
+            Self::WorkerPhase { .. } => event_names::WORKER_PHASE,
+            Self::ToolUsage { .. } => event_names::TOOL_USAGE,
+            Self::Usage { .. } => event_names::USAGE,
+            Self::ScratchpadUsage { .. } => event_names::SCRATCHPAD_USAGE,
+            Self::McpStatus { .. } => event_names::MCP_STATUS,
         }
     }
 
@@ -467,6 +509,14 @@ impl AuraStreamEvent {
         }
     }
 
+    /// Create an McpStatus event (emitted at stream start).
+    pub fn mcp_status(servers: Vec<McpServerStatus>, correlation: CorrelationContext) -> Self {
+        Self::McpStatus {
+            servers,
+            correlation,
+        }
+    }
+
     /// Create a ScratchpadUsage event.
     pub fn scratchpad_usage(
         tokens_intercepted: usize,
@@ -528,6 +578,49 @@ mod tests {
                 assert_eq!(completion_tokens, 50);
             }
             other => panic!("expected Usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mcp_status_roundtrip_and_event_name() {
+        let event = AuraStreamEvent::mcp_status(
+            vec![
+                McpServerStatus {
+                    server_name: "pagerduty".to_string(),
+                    transport: "http_streamable".to_string(),
+                    status: "failed".to_string(),
+                    tools_count: 0,
+                    reason: Some("authentication failed (401 Unauthorized)".to_string()),
+                },
+                McpServerStatus {
+                    server_name: "mezmo".to_string(),
+                    transport: "http_streamable".to_string(),
+                    status: "connected".to_string(),
+                    tools_count: 7,
+                    reason: None,
+                },
+            ],
+            CorrelationContext::new("s1", None),
+        );
+        assert_eq!(event.event_name(), "aura.mcp_status");
+
+        let sse = event.format_sse();
+        assert!(sse.starts_with("event: aura.mcp_status\n"));
+        // A connected server omits the reason field entirely.
+        assert!(sse.contains("\"status\":\"connected\""));
+        assert!(sse.contains("\"reason\":\"authentication failed (401 Unauthorized)\""));
+
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: AuraStreamEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AuraStreamEvent::McpStatus { servers, .. } => {
+                assert_eq!(servers.len(), 2);
+                assert_eq!(servers[0].server_name, "pagerduty");
+                assert_eq!(servers[0].status, "failed");
+                assert_eq!(servers[1].tools_count, 7);
+                assert_eq!(servers[1].reason, None);
+            }
+            other => panic!("expected McpStatus, got {:?}", other),
         }
     }
 

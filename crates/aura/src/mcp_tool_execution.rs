@@ -144,16 +144,43 @@ pub async fn execute_mcp_tool(
         }
         Err(e) => {
             let err_str = e.to_string();
-            if err_str.contains("Request cancelled") {
-                info!("HTTP Streamable MCP tool '{}' cancelled", tool_name);
-            } else {
-                error!(
-                    "HTTP Streamable MCP tool '{}' failed: {}",
-                    tool_name, err_str
-                );
+            match bound_transport_error(&err_str) {
+                None => {
+                    // Cancellations must propagate unmodified — downstream
+                    // lifecycle handling keys off the original error.
+                    info!("HTTP Streamable MCP tool '{}' cancelled", tool_name);
+                    Err(ToolError::ToolCallError(e.into()))
+                }
+                Some(bounded) => {
+                    // Full detail is preserved in the log line; the agent only
+                    // ever sees the bounded message.
+                    error!(
+                        "HTTP Streamable MCP tool '{}' failed: {}",
+                        tool_name, err_str
+                    );
+                    Err(ToolError::ToolCallError(anyhow::anyhow!(bounded).into()))
+                }
             }
-            Err(ToolError::ToolCallError(e.into()))
         }
+    }
+}
+
+/// Decide how a transport-level MCP error should be surfaced to the agent.
+///
+/// Returns `None` for cancellations — those must propagate unmodified so the
+/// request lifecycle can react to the original error. Otherwise returns
+/// `Some(bounded)`, the message bounded to [`MAX_TOOL_ERROR_BYTES`] so a
+/// multi-KB transport/provider payload cannot flood a worker's context window.
+///
+/// [`MAX_TOOL_ERROR_BYTES`]: crate::mcp_response::MAX_TOOL_ERROR_BYTES
+fn bound_transport_error(err_str: &str) -> Option<String> {
+    if err_str.contains("Request cancelled") {
+        None
+    } else {
+        Some(crate::mcp_response::bound_error_content(
+            err_str.to_string(),
+            crate::mcp_response::MAX_TOOL_ERROR_BYTES,
+        ))
     }
 }
 
@@ -216,5 +243,36 @@ mod tests {
         assert!(preview.contains("(16 chars)"));
         // Should not include partial emoji
         assert!(!preview.contains("🎉"));
+    }
+
+    #[test]
+    fn test_bound_transport_error_cancellation_passthrough() {
+        // Cancellations must not be bounded/rewrapped — `execute_mcp_tool`
+        // returns the original error for these.
+        assert_eq!(
+            bound_transport_error("Request cancelled by client disconnect"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_bound_transport_error_small_passthrough() {
+        // A normal-sized transport error is surfaced verbatim.
+        let msg = "Tool execution failed: Connection refused (os error 61)";
+        assert_eq!(bound_transport_error(msg), Some(msg.to_string()));
+    }
+
+    #[test]
+    fn test_bound_transport_error_bounds_large() {
+        let huge = format!("Tool execution failed: {}", "stack frame\n".repeat(8000));
+        let bounded = bound_transport_error(&huge).expect("non-cancel error must be bounded");
+        assert!(
+            bounded.len() <= crate::mcp_response::MAX_TOOL_ERROR_BYTES + 128,
+            "bounded transport error must stay near the budget; got {} bytes",
+            bounded.len()
+        );
+        assert!(bounded.contains("[tool error truncated:"));
+        // The leading context (where categorization keywords live) survives.
+        assert!(bounded.starts_with("Tool execution failed:"));
     }
 }

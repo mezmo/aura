@@ -1,16 +1,22 @@
-# Aura
+# AURA
 
-Aura is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. Aura provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
+[![Slack](https://img.shields.io/badge/Slack-Join%20the%20community-4A154B?logo=slack&logoColor=white)](https://mezmo.com/r/slack-aura)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![MCP](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
+
+AURA is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
 
 - Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
-- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable and SSE transports
+- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable, SSE, and STDIO transports
 - Automatic schema sanitization for OpenAI function-calling compatibility
 - Vector search integration with Qdrant and AWS Bedrock Knowledge Base
 - Embeddable Rust core independent from configuration layer
 - Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
 - Dependency-aware multi-wave execution with plan/execute loops
+- [A2A protocol](https://github.com/a2a-protocol) support for agent-to-agent interoperability
 
 ## Table of Contents
 
@@ -35,11 +41,14 @@ Key capabilities:
 ## Quick Start
 
 ```bash
-cp .env.example .env          # set your LLM provider, model, and API key
-docker compose up -d           # starts Aura + LibreChat + Phoenix
+cp .env.example .env            # set your LLM provider, model, and API key
+docker compose up -d            # starts Aura (orchestrator mode) + LibreChat + Phoenix
+docker exec -it aura ./aura-cli # chat with the orchestrator from your terminal
 ```
 
-Open <http://localhost:3080> to chat, <http://localhost:6006> to inspect traces.
+Aura boots in **orchestrator mode**: a coordinator routes each request — answering simple ones directly and decomposing complex ones across specialized workers. The bundled `aura-cli` connects to the in-container server automatically and renders the coordinator's plan and worker activity as it streams.
+
+Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://localhost:6006> to inspect traces in Phoenix.
 
 **[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
 
@@ -71,7 +80,7 @@ aura/
 
 ## Development Setup
 
-For building Aura from source without Docker.
+For building AURA from source without Docker.
 
 1. Install Rust if needed:
    ```bash
@@ -132,6 +141,7 @@ Core server options:
 | `--config`                   | `CONFIG_PATH`              | `config.toml` | Path to TOML config file or directory |
 | `--host`                     | `HOST`                     | `127.0.0.1`   | Bind host                           |
 | `--port`                     | `PORT`                     | `8080`        | Bind port                           |
+| `--server-url`               | `AURA_SERVER_URL`          | host/port     | Canonical public origin published in the A2A agent card (see below) |
 | `--streaming-timeout-secs`   | `STREAMING_TIMEOUT_SECS`   | `900`         | Max SSE request duration            |
 | `--first-chunk-timeout-secs` | `FIRST_CHUNK_TIMEOUT_SECS` | `30`          | Max time to first provider chunk    |
 | `--streaming-buffer-size`    | `STREAMING_BUFFER_SIZE`    | `400`         | SSE backpressure buffer             |
@@ -173,6 +183,32 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ```
 
 SSE protocol details, event types, custom events, and client handling are documented in [docs/streaming-api-guide.md](docs/streaming-api-guide.md).
+
+#### A2A Protocol
+
+> **Disabled by default.** A2A endpoints are only activated when the server is started with `--enable-a2a` (or `AURA_ENABLE_A2A=true`). Omitting the flag means no A2A routes are registered and the agent card is not served.
+
+Aura exposes [A2A protocol](https://github.com/a2a-protocol) endpoints for agent-to-agent interoperability. This allows other A2A-compatible agents and clients to discover and interact with Aura agents using a standardized protocol.
+
+```bash
+# Agent card (capability discovery)
+curl http://localhost:8080/.well-known/agent-card.json
+
+# Send a message via REST
+curl -X POST http://localhost:8080/a2a/v1/message:send \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{"message": {"messageId": "msg-001", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}'
+
+# Send a message via JSON-RPC
+curl -X POST http://localhost:8080/a2a/v1/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc": "2.0", "method": "SendMessage", "params": {"message": {"messageId": "msg-002", "role": "ROLE_USER", "parts": [{"text": "Hello"}]}}, "id": 1}'
+```
+
+> **Set `AURA_SERVER_URL` when running behind a proxy, load balancer, or in Kubernetes.** The agent card must advertise **absolute** endpoint URLs, and A2A clients use those URLs directly — a relative or wrong-host URL makes `message:send` fail even though the card itself loads. Aura builds the card's URLs from `AURA_SERVER_URL` (or `--server-url`); set it to the externally-reachable origin clients use (e.g. `https://aura.example.com`). When unset, it falls back to the bind host/port, which is only correct for direct local access.
+
+A2A endpoints, transport modes, the agent card URL, task lifecycle, and testing examples are documented in [docs/a2a-implementation.md](docs/a2a-implementation.md).
 
 ### Client-Side Tools
 
@@ -258,7 +294,7 @@ When the loaded agent doesn't opt in (the default), any `tools` field on the req
 
 </details>
 
-`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, Aura loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
+`CONFIG_PATH` can point to a single TOML file or a directory of `.toml` files. When pointed at a directory, AURA loads every `.toml` file and serves each as a selectable agent. Clients choose an agent via the `model` field in chat completion requests — the same field that tools like LibreChat, OpenWebUI, and CLI clients use to present a model picker.
 
 ### Multiple Agents
 
@@ -298,12 +334,37 @@ Configuration sections:
 - `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
-Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
+Supported providers: OpenAI, Anthropic, Bedrock, Gemini, Ollama, and OpenRouter.
 
 Supported MCP transports:
 
 - `http_streamable` (recommended for production)
 - `sse`
+- `stdio` - launches a local child process per request. The [MCP specification](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports) defines this transport for client-side sidecars, not for server deployments. If you need high concurrency, use `http_streamable`.
+
+STDIO configuration uses `cmd` and `args`, both are lists. `cmd[0]` is the executable. Any additional elements in `cmd` are part of the command itself, such as a script path that needs an interpreter. `args` are passed to the spawned process separately:
+
+```toml
+# Binary with package arguments
+[mcp.servers.my_stdio]
+transport = "stdio"
+cmd = ["npx"]
+args = ["-y", "@modelcontextprotocol/server-everything"]
+
+# Script that needs an interpreter
+[mcp.servers.my_script]
+transport = "stdio"
+cmd = ["python3", "/opt/mcp-servers/weather.py"]
+args = ["--verbose"]
+
+# Direct binary
+[mcp.servers.my_binary]
+transport = "stdio"
+cmd = ["/usr/local/bin/mcp-server"]
+args = ["--config", "/etc/mcp/config.json"]
+```
+
+Tool names are not namespaced by server. If two servers register a tool with the same name, the first one loaded wins silently ([#186](https://github.com/mezmo/aura/issues/186)).
 
 `headers_from_request` can forward incoming request headers to MCP servers for per-request auth.
 
@@ -349,7 +410,7 @@ To validate your own config file, start the web server or CLI — both validate 
 cargo run -p aura-web-server -- --config your-config.toml
 
 # Validate via standalone CLI (exits on parse error before REPL)
-cargo run -p aura-cli --features standalone-cli -- --standalone --config your-config.toml
+cargo run -p aura-cli -- --config your-config.toml
 ```
 
 ### Orchestration
@@ -476,15 +537,17 @@ When multiple patterns match the same tool, the **longest (most specific) patter
 
 Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
 
+**Result artifacts and `read_artifact`:** in orchestration, large task results are saved to artifact files under `{memory_dir}/{run_id}/artifacts/`. When a worker reads one back with `read_artifact`, the same budget rules apply: an artifact that fits is returned inline, while one that exceeds the limit comes back as a scratchpad pointer the worker explores in place with the read tools (`head`, `grep`, `slice`, …) — the artifact is read directly from the artifacts directory, never copied into the scratchpad. (The coordinator has no scratchpad, so its `read_artifact` always returns inline content.)
+
 ### Ollama
 
-Aura supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
+AURA supports Ollama, including fallback tool-call parsing for models that emit tool calls as text. Full setup, parameter guidance, and model caveats are in [docs/ollama-guide.md](docs/ollama-guide.md).
 
 ### Observability
 
 OpenTelemetry support is enabled by default via the `otel` feature in both `aura` and `aura-web-server`. Configure your OTLP endpoint using standard environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export traces.
 
-Aura emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes Aura traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
+AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes AURA traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
 ## Development and Testing
 
@@ -552,10 +615,11 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
 - [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
+- [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
 
 ## Architecture
 
-Aura separates concerns across crates:
+AURA separates concerns across crates:
 
 - `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.

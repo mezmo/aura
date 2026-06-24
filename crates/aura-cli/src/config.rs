@@ -407,6 +407,7 @@ mod tests {
 
     fn default_args() -> Args {
         Args {
+            command: None,
             api_url: None,
             api_key: None,
             model: None,
@@ -457,6 +458,7 @@ mod tests {
         let (cwd, home) = empty_env();
         let global = empty_global(&home);
         let args = Args {
+            command: None,
             api_url: Some("https://custom.api".to_string()),
             api_key: Some("secret".to_string()),
             model: Some("gpt-4".to_string()),

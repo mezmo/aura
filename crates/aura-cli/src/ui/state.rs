@@ -15,6 +15,7 @@ use std::time::Instant;
 use crossterm::style::Color;
 
 use crate::api::types::DisplayEvent;
+use crate::repl::registry::PendingCommand;
 use crate::ui::welcome::WelcomeState;
 
 use super::orchestrator::{ActiveOrchTool, OrchLastToolInfo};
@@ -35,7 +36,7 @@ pub(crate) fn lock_term() -> std::sync::MutexGuard<'static, ()> {
     TERM_WRITE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) fn term_size() -> (u16, u16) {
+pub fn term_size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
 
@@ -45,6 +46,18 @@ pub(crate) fn term_size() -> (u16, u16) {
 
 pub(crate) static STATUS_BAR: Mutex<String> = Mutex::new(String::new());
 pub(crate) static STATUS_HINT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Per-turn status notices (pre-styled error/warning lines) shown below the
+/// token line in the status area while the REPL is idle. Populated during a
+/// turn (e.g. from `aura.mcp_status`) and cleared at the start of the next
+/// request. Hidden while a request is processing and while a hint overlay is
+/// active — this is the *persistent* surface that sticks after the turn ends.
+///
+/// For *immediate* visibility during the turn (so the user can react before it
+/// finishes), notices are also printed into the scrollback as `⏺ Error/Warning`
+/// lines when the event arrives — see the `aura.mcp_status` handler in
+/// `repl::loop`. The two surfaces are complementary: scrollback = immediate,
+/// status area = sticky.
+pub(crate) static TURN_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static CUMULATIVE_PROMPT: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_COMPLETION: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_INTERCEPTED: Mutex<u64> = Mutex::new(0);
@@ -79,7 +92,8 @@ pub(crate) static WELCOME_STATE: Mutex<Option<WelcomeState>> = Mutex::new(None);
 pub(crate) static LAST_ANIM_LINES: Mutex<(String, String)> =
     Mutex::new((String::new(), String::new()));
 
-/// Pending command from mid-stream input that needs main-loop execution.
+/// A registry command typed mid-stream that must run in the main loop after
+/// the stream tears down, already resolved so no re-parsing is needed.
 pub(crate) static PENDING_COMMAND: Mutex<Option<PendingCommand>> = Mutex::new(None);
 
 /// Flag set by a SIGINT handler so drain_stdin detects Ctrl-C even when ISIG
@@ -202,24 +216,6 @@ pub(crate) static TASK_COLOR_INDEXES: LazyLock<Mutex<HashMap<String, usize>>> =
 pub(crate) static STYLE_PREVIEW_ORIGINAL: Mutex<Option<&'static crate::theme::Theme>> =
     Mutex::new(None);
 
-// ---------------------------------------------------------------------------
-// Command list & input hint state
-// ---------------------------------------------------------------------------
-
-pub(crate) const COMMANDS: &[(&str, &str)] = &[
-    ("/quit", "exit the REPL"),
-    ("/exit", "exit the REPL"),
-    ("/clear", "start a new conversation"),
-    ("/help", "show available commands"),
-    ("/expand", "toggle expanded/compact tool call view"),
-    ("/stream", "toggle SSE event stream panel"),
-    ("/conversations", "list saved conversations"),
-    ("/resume", "resume a saved conversation"),
-    ("/rename", "rename the current conversation"),
-    ("/model", "select a model"),
-    ("/style", "switch the visual style"),
-];
-
 // Cached matches from the last /resume autocomplete lookup.
 pub(crate) static RESUME_MATCHES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
@@ -251,16 +247,6 @@ pub(crate) static TAB_SELECT_INDEX: Mutex<Option<usize>> = Mutex::new(None);
 pub(crate) static MODEL_FETCH_CONFIG: Mutex<
     Option<(String, Option<String>, Vec<(String, String)>)>,
 > = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// PendingCommand enum
-// ---------------------------------------------------------------------------
-
-pub enum PendingCommand {
-    Quit,
-    Clear,
-    Resume(String),
-}
 
 // ---------------------------------------------------------------------------
 // Basic accessor functions
@@ -322,11 +308,11 @@ pub fn cache_anim_lines(top: &str, bottom: &str) {
     }
 }
 
-pub fn set_pending_command(cmd: PendingCommand) {
+pub(crate) fn set_pending_command(cmd: PendingCommand) {
     *PENDING_COMMAND.lock().unwrap() = Some(cmd);
 }
 
-pub fn take_pending_command() -> Option<PendingCommand> {
+pub(crate) fn take_pending_command() -> Option<PendingCommand> {
     PENDING_COMMAND.lock().unwrap().take()
 }
 

@@ -12,9 +12,17 @@ ENV PATH="${PATH}:/home/aura/.bin"
 WORKDIR /home/aura
 
 RUN <<EOR
-  apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl nodejs npm
+  dpkg --add-architecture arm64
+  apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 curl nodejs npm \
+    gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64
   rm -rf /var/lib/apt/lists/*
 EOR
+
+# Install pinned MCP test fixture for STDIO integration tests.
+# Verified at build time; tests invoke `mcp-server-everything` directly.
+RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
+  && command -v mcp-server-everything
 
 USER 1000
 

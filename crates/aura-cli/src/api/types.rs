@@ -298,6 +298,19 @@ pub enum DisplayEvent {
         tokens_intercepted: u64,
         tokens_extracted: u64,
     },
+    /// LLM reasoning content (e.g. Anthropic extended thinking, Bedrock, etc...).
+    /// `agent_id` identifies which agent produced it — `"main"` for single-agent,
+    /// the worker name (e.g. `"log_worker"`) when emitted by an orchestration worker.
+    /// `content` holds the final accumulated text for the whole reasoning stretch
+    /// (one `DisplayEvent::Reasoning` per agent-contiguous stretch, not per delta).
+    /// `fields` carries the raw SSE payload (agent_id, content, parent_agent_id,
+    /// session_id, trace_id, ...) so /expand can render a complete fields tree.
+    Reasoning {
+        content: String,
+        agent_id: String,
+        #[serde(default)]
+        fields: BTreeMap<String, serde_json::Value>,
+    },
 }
 
 /// Convert a snake_case string to PascalCase. E.g. `get_me` → `GetMe`.

@@ -16,7 +16,7 @@ name = "aura-cli"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["standalone-cli"]
 standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util", "dep:thiserror"]
 
 [dependencies]
@@ -28,10 +28,13 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+dotenvy = { workspace = true }
+rpassword = "7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 aura-events = { path = "../aura-events" }
 eventsource-stream = "0.2"
 futures-util = "0.3"
+unicode-segmentation = "1"
 termimad = "0.34"
 crossterm = "0.29"
 rustyline = "17"

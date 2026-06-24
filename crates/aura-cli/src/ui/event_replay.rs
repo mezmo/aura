@@ -17,6 +17,7 @@ use crossterm::terminal;
 use crate::api::types::{DisplayEvent, snake_to_pascal_case};
 use crate::tools;
 use crate::ui::markdown::render_markdown;
+use crate::ui::text::truncate_with_ellipsis;
 
 use super::orchestrator::{
     TREE_END_BULLET, TREE_END_DURATION, TREE_MID_BULLET, TREE_MID_DURATION, format_orch_duration_ms,
@@ -329,13 +330,24 @@ pub fn replay_event_log_global() {
                 description,
                 ..
             } => {
-                #[allow(clippy::type_complexity)]
-                let mut task_tools: Vec<(
-                    String,
-                    BTreeMap<String, serde_json::Value>,
-                    Option<u64>,
-                    Option<String>,
-                )> = Vec::new();
+                // Collect every entry that belongs inside this task tree:
+                // tool calls and worker-reasoning blocks (whose `agent_id`
+                // matches the task's `worker_id`). Reasoning for a different
+                // agent ends the inner walk so the outer loop can render it
+                // separately.
+                enum TaskEntry {
+                    Tool {
+                        label: String,
+                        fields: BTreeMap<String, serde_json::Value>,
+                        duration_ms: Option<u64>,
+                        result: Option<String>,
+                    },
+                    Reasoning {
+                        content: String,
+                        fields: BTreeMap<String, serde_json::Value>,
+                    },
+                }
+                let mut entries: Vec<TaskEntry> = Vec::new();
                 let mut last_reasoning: Option<String> = None;
                 let mut j = i + 1;
                 while j < events.len() {
@@ -345,7 +357,12 @@ pub fn replay_event_log_global() {
                         } => {
                             let dn = snake_to_pascal_case(tool_name);
                             let args = format_orch_args_summary(fields);
-                            task_tools.push((format!("{dn}({args})"), fields.clone(), None, None));
+                            entries.push(TaskEntry::Tool {
+                                label: format!("{dn}({args})"),
+                                fields: fields.clone(),
+                                duration_ms: None,
+                                result: None,
+                            });
                             if let Some(r) = extract_aura_reasoning(fields) {
                                 last_reasoning = Some(r);
                             }
@@ -356,14 +373,37 @@ pub fn replay_event_log_global() {
                             fields,
                             ..
                         } => {
-                            if let Some(last) = task_tools.last_mut() {
-                                last.2 = *duration_ms;
-                                last.3 = fields.get("result").and_then(|v| match v {
+                            if let Some(TaskEntry::Tool {
+                                duration_ms: dm,
+                                result: r,
+                                ..
+                            }) = entries.last_mut()
+                            {
+                                *dm = *duration_ms;
+                                *r = fields.get("result").and_then(|v| match v {
                                     serde_json::Value::String(s) => Some(s.clone()),
                                     _ => None,
                                 });
                             }
                             j += 1;
+                        }
+                        DisplayEvent::Reasoning {
+                            content,
+                            agent_id,
+                            fields,
+                        } if agent_id == worker_id => {
+                            entries.push(TaskEntry::Reasoning {
+                                content: content.clone(),
+                                fields: fields.clone(),
+                            });
+                            last_reasoning = Some(content.clone());
+                            j += 1;
+                        }
+                        DisplayEvent::Reasoning { .. } => {
+                            // Reasoning for a different agent — bail so the
+                            // outer loop renders it separately. Don't advance
+                            // past the task_completed event yet either.
+                            break;
                         }
                         DisplayEvent::OrchestratorTaskCompleted { .. } => {
                             j += 1;
@@ -380,11 +420,7 @@ pub fn replay_event_log_global() {
                         Some(description.as_str())
                     });
                     if let Some(text) = reasoning_text {
-                        let display = if text.len() > 120 {
-                            format!("{}...", &text[..117])
-                        } else {
-                            text.to_string()
-                        };
+                        let display = truncate_with_ellipsis(text, 120);
                         println!(
                             "{} {}",
                             "●".with(bc).attribute(Attribute::Bold),
@@ -402,68 +438,110 @@ pub fn replay_event_log_global() {
                     "-".themed(AuraStyle::Muted),
                     "done".themed(AuraStyle::Muted),
                 );
-                let tool_count = task_tools.len();
-                for (idx, (tool_label, tool_fields, duration_ms, result_text)) in
-                    task_tools.iter().enumerate()
-                {
-                    let is_last_tool = idx == tool_count - 1;
-                    let (b_prefix, cont_prefix) = if is_last_tool {
+                let entry_count = entries.len();
+                for (idx, entry) in entries.iter().enumerate() {
+                    let is_last = idx == entry_count - 1;
+                    let (b_prefix, cont_prefix) = if is_last {
                         (TREE_END_BULLET, TREE_END_DURATION)
                     } else {
                         (TREE_MID_BULLET, TREE_MID_DURATION)
                     };
-                    println!(
-                        "{}{} {}",
-                        b_prefix.themed(AuraStyle::Connector),
-                        "●".with(bc),
-                        tool_label.as_str().themed(AuraStyle::Primary),
-                    );
-                    if expanded {
-                        let has_duration = duration_ms.is_some();
-                        let has_fields = !tool_fields.is_empty();
-                        if let Some(ms) = duration_ms {
-                            let dur_str = format_orch_duration_ms(*ms);
-                            let item_prefix = if has_fields { "├─" } else { "└─" };
+                    match entry {
+                        TaskEntry::Tool {
+                            label,
+                            fields: tool_fields,
+                            duration_ms,
+                            result,
+                        } => {
+                            println!(
+                                "{}{} {}",
+                                b_prefix.themed(AuraStyle::Connector),
+                                "●".with(bc),
+                                label.as_str().themed(AuraStyle::Primary),
+                            );
+                            if expanded {
+                                let has_duration = duration_ms.is_some();
+                                let has_fields = !tool_fields.is_empty();
+                                if let Some(ms) = duration_ms {
+                                    let dur_str = format_orch_duration_ms(*ms);
+                                    let item_prefix = if has_fields { "├─" } else { "└─" };
+                                    println!(
+                                        "{}{} {}",
+                                        cont_prefix.themed(AuraStyle::Connector),
+                                        item_prefix.themed(AuraStyle::Connector),
+                                        format!("completed in {dur_str}")
+                                            .as_str()
+                                            .themed(AuraStyle::Muted),
+                                    );
+                                }
+                                if has_fields {
+                                    super::orchestrator::print_fields_tree_indented(
+                                        tool_fields,
+                                        cont_prefix,
+                                        has_duration,
+                                    );
+                                }
+                                if let Some(text) = result.as_deref()
+                                    && !text.is_empty()
+                                {
+                                    let normalized = crate::tools::normalize_tool_result_text(text);
+                                    println!();
+                                    for line in normalized.lines() {
+                                        println!(
+                                            "{}  {}",
+                                            cont_prefix.themed(AuraStyle::Connector),
+                                            line.themed(AuraStyle::Muted),
+                                        );
+                                    }
+                                    println!();
+                                }
+                            } else if let Some(ms) = duration_ms {
+                                let dur_str = format_orch_duration_ms(*ms);
+                                println!(
+                                    "{}{} {}",
+                                    cont_prefix.themed(AuraStyle::Connector),
+                                    "⎿".themed(AuraStyle::Connector),
+                                    format!("completed in {dur_str}")
+                                        .as_str()
+                                        .themed(AuraStyle::Muted),
+                                );
+                            }
+                        }
+                        TaskEntry::Reasoning {
+                            content,
+                            fields: reasoning_fields,
+                        } => {
+                            println!(
+                                "{}{} {}",
+                                b_prefix.themed(AuraStyle::Connector),
+                                "●".with(bc),
+                                "Reasoning".themed(AuraStyle::Primary),
+                            );
+                            // Worker reasoning body is a single line in the
+                            // live display; flatten whitespace and truncate
+                            // for replay so we match what the user saw.
+                            let flattened: String =
+                                content.split_whitespace().collect::<Vec<_>>().join(" ");
+                            let display = if flattened.chars().count() > 200 {
+                                let prefix: String = flattened.chars().take(197).collect();
+                                format!("{prefix}...")
+                            } else {
+                                flattened
+                            };
                             println!(
                                 "{}{} {}",
                                 cont_prefix.themed(AuraStyle::Connector),
-                                item_prefix.themed(AuraStyle::Connector),
-                                format!("completed in {dur_str}")
-                                    .as_str()
-                                    .themed(AuraStyle::Muted),
+                                "⎿".themed(AuraStyle::Connector),
+                                display.as_str().themed(AuraStyle::Muted),
                             );
-                        }
-                        if has_fields {
-                            super::orchestrator::print_fields_tree_indented(
-                                tool_fields,
-                                cont_prefix,
-                                has_duration,
-                            );
-                        }
-                        if let Some(text) = result_text.as_deref()
-                            && !text.is_empty()
-                        {
-                            let normalized = crate::tools::normalize_tool_result_text(text);
-                            println!();
-                            for line in normalized.lines() {
-                                println!(
-                                    "{}  {}",
-                                    cont_prefix.themed(AuraStyle::Connector),
-                                    line.themed(AuraStyle::Muted),
+                            if expanded && !reasoning_fields.is_empty() {
+                                super::orchestrator::print_fields_tree_indented(
+                                    reasoning_fields,
+                                    cont_prefix,
+                                    false,
                                 );
                             }
-                            println!();
                         }
-                    } else if let Some(ms) = duration_ms {
-                        let dur_str = format_orch_duration_ms(*ms);
-                        println!(
-                            "{}{} {}",
-                            cont_prefix.themed(AuraStyle::Connector),
-                            "⎿".themed(AuraStyle::Connector),
-                            format!("completed in {dur_str}")
-                                .as_str()
-                                .themed(AuraStyle::Muted),
-                        );
                     }
                 }
                 println!();
@@ -479,6 +557,58 @@ pub fn replay_event_log_global() {
                 i += 1;
             }
             DisplayEvent::OrchestratorSynthesizing => {
+                i += 1;
+            }
+            DisplayEvent::Reasoning {
+                content,
+                agent_id,
+                fields,
+            } => {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let bc = task_color_for(if agent_id.is_empty() {
+                        "__orchestrator__"
+                    } else {
+                        agent_id.as_str()
+                    });
+                    let header = if agent_id == "main" || agent_id.is_empty() {
+                        "Reasoning".to_string()
+                    } else {
+                        format!("Reasoning - {agent_id}")
+                    };
+                    println!(
+                        "{} {}",
+                        "●".with(bc).attribute(Attribute::Bold),
+                        header
+                            .as_str()
+                            .themed(AuraStyle::Primary)
+                            .attribute(Attribute::Bold),
+                    );
+                    if expanded {
+                        // Show wire-level fields under the header (agent_id,
+                        // content, parent_agent_id, session_id, trace_id) so
+                        // /expand mirrors how other orchestrator events render
+                        // their fields. `content` in the tree is the full
+                        // accumulated reasoning text — we override the map's
+                        // value here just in case the persisted entry only
+                        // captured a single delta.
+                        let mut tree = fields.clone();
+                        tree.insert(
+                            "content".to_string(),
+                            serde_json::Value::String(content.clone()),
+                        );
+                        print_fields_tree(&tree);
+                    } else {
+                        for line in trimmed.lines() {
+                            println!(
+                                "{} {}",
+                                "│".themed(AuraStyle::Connector),
+                                line.themed(AuraStyle::Muted),
+                            );
+                        }
+                    }
+                    println!();
+                }
                 i += 1;
             }
             DisplayEvent::OrchestratorIterationComplete {
@@ -753,16 +883,20 @@ pub fn print_tool_call_expanded(
 }
 
 pub fn print_help() {
+    use crate::repl::registry::COMMANDS;
     println!("Available commands:");
-    println!("  /help            — Show this help message");
-    println!("  /clear           — Start a new conversation");
-    println!("  /expand          — Toggle expanded/compact tool call view");
-    println!("  /conversations   — List saved conversations");
-    println!("  /resume <filter> — Resume a saved conversation (by ID or name)");
-    println!("  /rename <name>   — Rename the current conversation");
-    println!("  /model <filter>  — Select a model for LLM requests");
-    println!("  /quit            — Exit the REPL");
-    println!("  /exit            — Exit the REPL");
+    let width = COMMANDS
+        .iter()
+        .map(|c| c.name.len() + c.usage_hint.map_or(0, |h| h.len() + 1))
+        .max()
+        .unwrap_or(0);
+    for cmd in COMMANDS {
+        let cell = match cmd.usage_hint {
+            Some(hint) => format!("{} {}", cmd.name, hint),
+            None => cmd.name.to_string(),
+        };
+        println!("  {cell:<width$} — {}", cmd.description);
+    }
 }
 
 pub fn list_conversations() {

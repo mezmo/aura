@@ -39,6 +39,7 @@ RUNNER_NO_ENV_CMD = $(DOCKER_RUN) $(if $(filter true, $(IS_CI)),,-t) -v $(PWD):/
 DOCKER_RUN_BUILD_ENV := $(RUNNER_CMD)
 BUILD_SLUG := $(call slugify, $(BUILD_TAG))
 AURA_RUNNER_IMAGE := local/aura-runner:$(BUILD_SLUG)
+DIST_DIR ?= $(PROJECT_ROOT)/dist
 
 RUN := $(if $(filter true, $(ENABLE_DOCKER)), $(RUNNER_CMD),)
 RUN_NO_ENV := $(if $(filter true, $(ENABLE_DOCKER)), $(RUNNER_NO_ENV_CMD),)

@@ -24,13 +24,35 @@ use std::sync::atomic::AtomicBool;
 use anyhow::Result;
 use tokio::runtime::Runtime;
 
-use crate::api::stream::StreamResult;
+use crate::api::mcp_status::{McpNotice, notices_from_event};
+use crate::api::stream::{StreamHandler, StreamResult};
 use crate::api::types::ToolCallInfo;
 use crate::backend::Backend;
 use crate::config::AppConfig;
 use crate::repl::history::ConversationHistory;
 use crate::tools;
 use crate::ui::prompt::set_selected_model;
+
+/// One-shot [`StreamHandler`] that ignores every event except
+/// `aura.mcp_status`, which it renders to **stderr** so degraded MCP servers
+/// are visible without polluting stdout (reserved for the assistant response
+/// per the output contract).
+struct OneshotStreamHandler;
+
+impl StreamHandler for OneshotStreamHandler {
+    fn on_orchestrator_event(&mut self, event_name: &str, value: &serde_json::Value) {
+        if event_name != "aura.mcp_status" {
+            return;
+        }
+        for notice in notices_from_event(value) {
+            let (prefix, message) = match &notice {
+                McpNotice::Error(message) => ("error:", message),
+                McpNotice::Warning(message) => ("warning:", message),
+            };
+            eprintln!("{prefix} {message}");
+        }
+    }
+}
 
 /// `rt` is the CLI's process-wide tokio runtime, owned by `main`. We
 /// don't build our own here — sharing the runtime with `main`'s OTel
@@ -78,10 +100,9 @@ pub fn run_oneshot(
         crate::api::session::SessionKind::Chat,
     );
 
-    // Tool execution loop. All on_* callbacks are deliberately no-ops:
-    // events like tool_requested / tool_complete / usage are REPL
-    // affordances; stdout in one-shot mode is reserved for the final
-    // assistant text.
+    // Tool execution loop. One-shot ignores nearly every stream event —
+    // stdout is reserved for the final assistant text — but degraded MCP
+    // servers are surfaced on stderr via `OneshotStreamHandler`.
     let result: Result<()> = loop {
         let stream_result = rt.block_on(async {
             backend
@@ -90,13 +111,7 @@ pub fn run_oneshot(
                     tool_defs_arg,
                     &chat_session_id,
                     Arc::new(AtomicBool::new(false)),
-                    |_token| {},
-                    |_tool_id, _tool_name, _args| {},
-                    |_tool_id, _tool_name| {},
-                    |_tool_id, _tool_name, _duration, _result: Option<&str>| {},
-                    |_prompt_tokens, _completion_tokens| {},
-                    |_event_name, _event_data| {},
-                    |_event_name, _val| {},
+                    &mut OneshotStreamHandler,
                 )
                 .await
         });

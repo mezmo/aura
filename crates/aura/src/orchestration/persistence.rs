@@ -68,6 +68,14 @@ pub fn sanitize_filename_component(s: &str) -> String {
     }
 }
 
+/// True when `s` is safe to use as a single path component: non-empty, no path
+/// separators, no parent references. Artifact filenames and run IDs come from
+/// untrusted tool/LLM input and are validated with this before being joined
+/// into a persistence path.
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
+}
+
 // ============================================================================
 // Run Manifest Types
 // ============================================================================
@@ -569,7 +577,7 @@ impl ExecutionPersistence {
     // ========================================================================
 
     /// Directory for result artifacts (run-level, not per-iteration).
-    fn artifacts_path(&self) -> PathBuf {
+    pub fn artifacts_path(&self) -> PathBuf {
         self.base_path.join("artifacts")
     }
 
@@ -644,7 +652,8 @@ impl ExecutionPersistence {
 
     /// Read an artifact file by filename.
     ///
-    /// Validates the filename to prevent path traversal.
+    /// Resolves the path via [`artifact_path`](Self::artifact_path) (which
+    /// validates against path traversal), then reads it.
     pub async fn read_artifact(&self, filename: &str) -> io::Result<String> {
         if !self.enabled {
             return Err(io::Error::new(
@@ -652,28 +661,16 @@ impl ExecutionPersistence {
                 "Persistence is disabled",
             ));
         }
-
-        // Path traversal check
-        if filename.contains('/')
-            || filename.contains('\\')
-            || filename.contains("..")
-            || filename.is_empty()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid artifact filename",
-            ));
-        }
-
-        let artifact_path = self.artifacts_path().join(filename);
+        let artifact_path = self.artifact_path(filename)?;
         fs::read_to_string(&artifact_path).await
     }
 
     /// Read an artifact from a different run in the same session.
     ///
-    /// Resolves against `{session_dir}/{run_id}/artifacts/{filename}` where
-    /// `session_dir` is the parent of the current run directory. Both `run_id`
-    /// and `filename` are validated to prevent path traversal.
+    /// Resolves the path via
+    /// [`artifact_path_cross_run`](Self::artifact_path_cross_run), then adds a
+    /// canonicalized containment check (the resolved path must stay under the
+    /// session directory) before reading.
     pub async fn read_artifact_cross_run(
         &self,
         filename: &str,
@@ -686,31 +683,15 @@ impl ExecutionPersistence {
             ));
         }
 
-        fn is_safe_component(s: &str) -> bool {
-            !s.is_empty() && !s.contains('/') && !s.contains('\\') && !s.contains("..")
-        }
+        let artifact_path = self.artifact_path_cross_run(filename, run_id)?;
 
-        if !is_safe_component(run_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid run_id for cross-run artifact read",
-            ));
-        }
-        if !is_safe_component(filename) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Invalid artifact filename",
-            ));
-        }
-
+        // Defense-in-depth: the resolved path must canonicalize to somewhere
+        // under the session directory (catches symlink escapes the lexical
+        // component checks in artifact_path_cross_run can't see).
         let session_dir = self
             .base_path
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No parent directory"))?;
-
-        let artifact_path = session_dir.join(run_id).join("artifacts").join(filename);
-
-        // Defense-in-depth: resolved path must be under the session directory
         let canonical_session = session_dir
             .canonicalize()
             .unwrap_or_else(|_| session_dir.to_path_buf());
@@ -725,6 +706,49 @@ impl ExecutionPersistence {
         }
 
         fs::read_to_string(&artifact_path).await
+    }
+
+    /// Resolve the absolute path of a current-run artifact.
+    ///
+    /// Validates `filename` against path traversal but does **not** check that
+    /// the file exists or read it. Used both by [`read_artifact`](Self::read_artifact)
+    /// and to build an in-place `file=` reference for the scratchpad read tools
+    /// when an artifact is too large to inline.
+    pub fn artifact_path(&self, filename: &str) -> io::Result<PathBuf> {
+        if !is_safe_path_component(filename) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid artifact filename",
+            ));
+        }
+        Ok(self.artifacts_path().join(filename))
+    }
+
+    /// Resolve the absolute path of a cross-run artifact within this session.
+    ///
+    /// Resolves against `{session_dir}/{run_id}/artifacts/{filename}` where
+    /// `session_dir` is the parent of the current run directory. Validates both
+    /// components against path traversal but does **not** check existence; the
+    /// caller (e.g. [`read_artifact_cross_run`](Self::read_artifact_cross_run))
+    /// performs the canonicalized containment check when it reads.
+    pub fn artifact_path_cross_run(&self, filename: &str, run_id: &str) -> io::Result<PathBuf> {
+        if !is_safe_path_component(run_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid run_id for cross-run artifact read",
+            ));
+        }
+        if !is_safe_path_component(filename) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid artifact filename",
+            ));
+        }
+        let session_dir = self
+            .base_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No parent directory"))?;
+        Ok(session_dir.join(run_id).join("artifacts").join(filename))
     }
 
     /// List all artifact filenames.
@@ -1104,6 +1128,56 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None).await;
         assert!(persistence.is_ok());
+    }
+
+    /// Layout invariant that `read_artifact`'s in-place pointer relies on: the
+    /// artifacts dir and every iteration's scratchpad dir live under the run
+    /// dir, and the run dir lives under the read root (the session dir, i.e.
+    /// the run dir's parent). If this drifts, a worker's scratchpad read_root
+    /// would no longer cover the artifacts dir and oversized artifacts would be
+    /// refused instead of explorable in place. Covers both layouts.
+    #[tokio::test]
+    async fn test_artifacts_under_read_root_invariant() {
+        for session in [None, Some("session-1".to_string())] {
+            let temp_dir = TempDir::new().unwrap();
+            let mut persistence =
+                ExecutionPersistence::new(temp_dir.path().join("memory"), session.clone())
+                    .await
+                    .unwrap();
+
+            let run_dir = persistence.run_path().to_path_buf();
+            // Read root used by worker scratchpad storage (orchestrator.rs).
+            let read_root = run_dir
+                .parent()
+                .expect("run dir has a parent")
+                .to_path_buf();
+
+            // Artifacts dir is under the run dir → under the read root.
+            assert!(
+                persistence.artifacts_path().starts_with(&run_dir),
+                "artifacts dir {} must be under run dir {}",
+                persistence.artifacts_path().display(),
+                run_dir.display(),
+            );
+            assert!(
+                persistence.artifacts_path().starts_with(&read_root),
+                "artifacts dir {} must be under read root {}",
+                persistence.artifacts_path().display(),
+                read_root.display(),
+            );
+
+            // Every iteration's scratchpad parent is under the run dir too, so a
+            // scratchpad rooted there can reach the artifacts via `../`.
+            for _ in 0..3 {
+                assert!(
+                    persistence.iteration_path().starts_with(&run_dir),
+                    "iteration dir {} must be under run dir {}",
+                    persistence.iteration_path().display(),
+                    run_dir.display(),
+                );
+                persistence.start_new_iteration();
+            }
+        }
     }
 
     #[tokio::test]

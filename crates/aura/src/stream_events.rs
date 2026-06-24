@@ -6,8 +6,8 @@
 
 // Re-export everything from aura-events so existing consumers don't break
 pub use aura_events::{
-    AgentContext, AuraStreamEvent, CorrelationContext, NumberOrString, ProgressToken, WorkerPhase,
-    format_named_sse,
+    AgentContext, AuraStreamEvent, CorrelationContext, McpServerStatus, NumberOrString,
+    ProgressToken, WorkerPhase, format_named_sse,
 };
 
 // Re-export orchestration event types
@@ -36,27 +36,10 @@ impl CorrelationContextExt for CorrelationContext {
     }
 }
 
-/// Constants for SSE event names on the base `aura.*` namespace.
-///
-/// Import these in tests or downstream consumers instead of hard-coding the
-/// string literals. Orchestration-specific events live in
-/// `orchestration::stream_events::event_names` under `aura.orchestrator.*`.
-pub mod event_names {
-    pub const SESSION_INFO: &str = "aura.session_info";
-    pub const TOOL_REQUESTED: &str = "aura.tool_requested";
-    pub const TOOL_START: &str = "aura.tool_start";
-    pub const TOOL_COMPLETE: &str = "aura.tool_complete";
-    pub const REASONING: &str = "aura.reasoning";
-    pub const PROGRESS: &str = "aura.progress";
-    pub const WORKER_PHASE: &str = "aura.worker_phase";
-    pub const TOOL_USAGE: &str = "aura.tool_usage";
-    pub const USAGE: &str = "aura.usage";
-    pub const SCRATCHPAD_USAGE: &str = "aura.scratchpad_usage";
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aura_events::event_names;
 
     #[test]
     fn test_agent_context_single_agent() {

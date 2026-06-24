@@ -1,5 +1,5 @@
 use crate::{
-    config::{AgentConfig, LlmConfig, McpServerConfig, VectorStoreType},
+    config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
     passthrough_tool::PassthroughTool,
@@ -161,7 +161,7 @@ impl Agent {
     /// in `Agent::stream_*_with_timeout`, not here, so this constructor
     /// stays free of request-shape parameters.
     async fn setup_single_agent_scratchpad(
-        config: &mut AgentConfig,
+        config: &mut AgentRuntimeConfig,
         mcp_manager: Option<&Arc<McpManager>>,
     ) -> Result<Option<scratchpad::ContextBudget>, Box<dyn std::error::Error + Send + Sync>> {
         if config.orchestration_enabled() {
@@ -237,6 +237,7 @@ impl Agent {
         let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
             sp_cfg: &sp_cfg,
             storage_dir: std::path::Path::new(&memory_dir),
+            read_root: None,
             scratchpad_tool_map,
             context_window,
             initial_used,
@@ -285,7 +286,7 @@ impl Agent {
     /// but the streaming layer terminates the stream when one is invoked so the
     /// client can execute the tool locally. Pass `None` to disable.
     pub async fn new(
-        config: &AgentConfig,
+        config: &AgentRuntimeConfig,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
         client_tools: Option<Vec<ClientTool>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -642,6 +643,56 @@ impl Agent {
 
                 ProviderAgent::Ollama(agent)
             }
+            LlmConfig::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                temperature,
+                additional_params,
+                ..
+            } => {
+                tracing::info!("Initializing OpenRouter provider");
+                tracing::debug!("  Model: {}", model);
+
+                let mut client_builder =
+                    rig::providers::openrouter::Client::<reqwest::Client>::builder()
+                        .api_key(api_key);
+
+                if let Some(url) = base_url {
+                    tracing::info!("  Using custom base URL: {}", url);
+                    client_builder = client_builder.base_url(url);
+                }
+
+                let client = client_builder.build()?;
+                tracing::info!("OpenRouter client initialized successfully");
+
+                let completion_model = client.completion_model(model);
+
+                let mut agent_builder = rig::agent::AgentBuilder::new(completion_model);
+                agent_builder = agent_builder.preamble(config.effective_preamble());
+                if let Some(temp) = temperature {
+                    agent_builder = agent_builder.temperature(*temp);
+                }
+                if let Some(max) = config.llm.max_tokens() {
+                    agent_builder = agent_builder.max_tokens(max);
+                }
+                if let Some(params) = additional_params {
+                    agent_builder = agent_builder.additional_params(params.clone());
+                }
+
+                let builder_state = BuilderState::Initial(agent_builder);
+                let builder_state = if let Some(ref tools) = client_tools {
+                    Self::add_passthrough_tools(builder_state, tools)
+                } else {
+                    builder_state
+                };
+                let builder_state =
+                    Self::add_all_tools(builder_state, config, &mcp_manager, additional_tools)
+                        .await?;
+                let agent = builder_state.build();
+
+                ProviderAgent::OpenRouter(agent)
+            }
         };
 
         let client_tool_names = client_tools
@@ -695,7 +746,7 @@ impl Agent {
     /// wrapped tool call.
     pub(crate) async fn add_all_tools<M>(
         mut builder_state: BuilderState<M>,
-        config: &AgentConfig,
+        config: &AgentRuntimeConfig,
         mcp_manager: &Option<Arc<McpManager>>,
         additional_tools: Vec<Box<dyn rig::tool::ToolDyn>>,
     ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
@@ -736,7 +787,7 @@ impl Agent {
                         let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
-                            client_arc.clone(),
+                            Arc::clone(&client_arc),
                         );
 
                         // Wrap with tool_wrapper if configured
@@ -769,7 +820,7 @@ impl Agent {
                         let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
                             mcp_tool.clone(),
                             server_name.clone(),
-                            client_arc.clone(),
+                            Arc::clone(&client_arc),
                         );
 
                         builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
@@ -822,42 +873,35 @@ impl Agent {
             tracing::info!("All vector stores configured successfully");
         }
 
-        // Add STDIO MCP tools using rmcp_tools
-        if let Some(mcp_manager) = mcp_manager.as_deref()
-            && !mcp_manager.tool_definitions.is_empty()
-        {
-            let filtered_definitions: Vec<_> = mcp_manager
-                .tool_definitions
-                .iter()
-                .filter(|(tool, _)| config.tool_matches_filter(&tool.name))
-                .collect();
-            log_filtered_tools(
-                "",
-                "STDIO",
-                "MCP servers",
-                filtered_definitions.len(),
-                mcp_manager.tool_definitions.len(),
-            );
+        // Add STDIO tools using dynamic adaptors
+        if let Some(mcp_manager) = mcp_manager.as_deref() {
+            for (server_name, client) in &mcp_manager.stdio_clients {
+                if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| config.tool_matches_filter(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "STDIO",
+                        server_name,
+                        filtered_tools.len(),
+                        server_tools.len(),
+                    );
 
-            // Group tools by client (rmcp_tools takes Vec<Tool> + one client)
-            use std::collections::HashMap;
-            let mut tools_by_client: HashMap<
-                String,
-                (Vec<rmcp::model::Tool>, rmcp::service::ServerSink),
-            > = HashMap::new();
+                    let client_arc = Arc::new(client.clone());
+                    for mcp_tool in filtered_tools {
+                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
 
-            for (tool, client) in filtered_definitions {
-                let client_key = format!("{client:?}");
-                tools_by_client
-                    .entry(client_key)
-                    .or_insert_with(|| (Vec::new(), client.clone()))
-                    .0
-                    .push(tool.clone());
-            }
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
+                            mcp_tool.clone(),
+                            server_name.clone(),
+                            Arc::clone(&client_arc),
+                        );
 
-            for (_key, (tools, client)) in tools_by_client {
-                tracing::info!("  Adding {} STDIO tools for client group", tools.len());
-                builder_state = builder_state.add_rmcp_tools(tools, client);
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                    }
+                }
             }
         }
 
@@ -882,9 +926,28 @@ impl Agent {
                 .add_tool(ReadTool::new(s.clone(), b.clone()));
         }
 
-        // Add read_artifact tool when orchestration persistence is available
+        // Add read_artifact tool when orchestration persistence is available.
+        // When the scratchpad is active, hand it the budget + storage so a
+        // large artifact is returned as an in-place pointer (explored with the
+        // scratchpad read tools).
         if let Some(ref persistence) = config.orchestration_persistence {
-            let read_artifact = crate::orchestration::ReadArtifactTool::new(persistence.clone());
+            let mut read_artifact =
+                crate::orchestration::ReadArtifactTool::new(persistence.clone());
+            if let Some(ref scratchpad) = config.scratchpad_tools_config {
+                let read_root = scratchpad.storage.read_root().to_path_buf();
+                let run_path = persistence.lock().await.run_path().to_path_buf();
+                if !run_path.starts_with(&read_root) {
+                    tracing::warn!(
+                        "read_artifact scratchpad read_root {} does not cover the artifacts \
+                         directory under {}; large artifacts will be refused instead of \
+                         explorable in place",
+                        read_root.display(),
+                        run_path.display(),
+                    );
+                }
+                read_artifact = read_artifact
+                    .with_scratchpad(scratchpad.budget.clone(), scratchpad.storage.clone());
+            }
             builder_state = builder_state.add_tool(read_artifact);
         }
 
@@ -917,7 +980,7 @@ impl Agent {
     fn add_mcp_tool<M, T>(
         builder_state: BuilderState<M>,
         tool: T,
-        config: &AgentConfig,
+        config: &AgentRuntimeConfig,
     ) -> BuilderState<M>
     where
         M: rig::completion::CompletionModel + Send + Sync,
@@ -1436,6 +1499,13 @@ impl StreamingAgent for Agent {
     fn context_window(&self) -> Option<u64> {
         self.context_window
     }
+
+    fn mcp_server_status(&self) -> Vec<aura_events::McpServerStatus> {
+        self.mcp_manager
+            .as_ref()
+            .map(|m| m.server_status_snapshot())
+            .unwrap_or_default()
+    }
 }
 
 /// Build the appropriate streaming agent based on configuration.
@@ -1449,7 +1519,7 @@ impl StreamingAgent for Agent {
 /// with a warning. In single-agent mode, they are attached to the agent only
 /// when `[agent].enable_client_tools = true` (filtered by `client_tool_filter`).
 pub async fn build_streaming_agent(
-    config: &crate::config::AgentConfig,
+    config: &crate::config::AgentRuntimeConfig,
     client_tools: Option<Vec<ClientTool>>,
 ) -> Result<Arc<dyn StreamingAgent>, Box<dyn std::error::Error + Send + Sync>> {
     use crate::orchestration::OrchestratorFactory;
@@ -1486,12 +1556,12 @@ pub async fn build_streaming_agent(
 
 /// Builder for constructing Rig agents from configuration
 pub struct AgentBuilder {
-    config: AgentConfig,
+    config: AgentRuntimeConfig,
 }
 
 impl AgentBuilder {
     /// Create a new builder from configuration
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new(config: AgentRuntimeConfig) -> Self {
         // Log the configuration for debugging
         tracing::info!("=== Agent Configuration ===");
 
@@ -1523,6 +1593,15 @@ impl AgentBuilder {
                 model, base_url, ..
             } => {
                 tracing::info!("LLM Provider: Ollama");
+                tracing::info!("LLM Model: {}", model);
+                if let Some(url) = base_url {
+                    tracing::info!("Base URL: {}", url);
+                }
+            }
+            LlmConfig::OpenRouter {
+                model, base_url, ..
+            } => {
+                tracing::info!("LLM Provider: OpenRouter");
                 tracing::info!("LLM Model: {}", model);
                 if let Some(url) = base_url {
                     tracing::info!("Base URL: {}", url);

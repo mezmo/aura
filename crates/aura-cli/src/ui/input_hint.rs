@@ -10,15 +10,16 @@ use std::time::Duration;
 use crossterm::style::Stylize;
 
 use crate::repl::conversations::ConversationStore;
+use crate::repl::registry::{COMMANDS, Command, lookup, split_command};
 
 use super::input_frame::resize_status_area;
 use super::state::{
-    COMMANDS, CTRLC_HINT_VISIBLE, LAST_HINT_LINE, MODEL_CACHE, MODEL_ERROR, MODEL_FETCH_CONFIG,
+    CTRLC_HINT_VISIBLE, LAST_HINT_LINE, MODEL_CACHE, MODEL_ERROR, MODEL_FETCH_CONFIG,
     MODEL_FETCH_IN_PROGRESS, MODEL_MATCHES, RESUME_MATCHES, STATUS_HINT, STATUS_ROWS,
     STREAM_CONV_DIR, STYLE_MATCHES, get_tab_select_index, lock_term, random_bullet_color,
     status_rows, term_size,
 };
-use super::status_bar::update_status_bar;
+use super::status_bar::{notice_status_rows, update_status_bar};
 use crate::theme::{AuraStyle, STYLE_NAMES, Themed, theme};
 
 /// Update the model cache from a successful fetch.
@@ -357,24 +358,29 @@ pub fn update_input_hint(line: &str) {
         if let Ok(mut guard) = RESUME_MATCHES.lock() {
             guard.clear();
         }
-        let matching: Vec<(&str, &str)> = COMMANDS
+        let matching: Vec<&Command> = COMMANDS
             .iter()
-            .filter(|(name, _)| name[1..].starts_with(prefix))
-            .copied()
+            .filter(|c| {
+                c.name
+                    .strip_prefix('/')
+                    .unwrap_or(c.name)
+                    .starts_with(prefix)
+            })
             .collect();
         if matching.is_empty() {
             vec![]
         } else if matching.len() == 1 {
             vec![format!(
                 "{}",
-                format!("{} — {}", matching[0].0, matching[0].1).themed(AuraStyle::Muted)
+                format!("{} — {}", matching[0].name, matching[0].description)
+                    .themed(AuraStyle::Muted)
             )]
         } else {
             vec![format!(
                 "{}",
                 matching
                     .iter()
-                    .map(|(name, _)| *name)
+                    .map(|c| c.name)
                     .collect::<Vec<_>>()
                     .join("  ")
                     .themed(AuraStyle::Muted)
@@ -386,9 +392,11 @@ pub fn update_input_hint(line: &str) {
         }
         vec![]
     };
-    // Compute new status row count and handle resizing
+    // Compute new status row count and handle resizing. When no hint is
+    // showing, fall back to the notice-aware baseline so any per-turn notices
+    // stay visible.
     let new_sr = if hint.is_empty() {
-        3u16
+        notice_status_rows()
     } else {
         (hint.len() as u16 + 1).max(3)
     };
@@ -422,74 +430,57 @@ pub fn clear_input_hint() {
     if let Ok(mut guard) = STATUS_HINT.lock() {
         guard.clear();
     }
-    if old_sr != 3 {
+    // Shrink back to the notice-aware baseline (3 when no notices), so notices
+    // collected this turn reappear once the command hint is dismissed.
+    let target = notice_status_rows();
+    if old_sr != target {
         let _term = lock_term();
-        STATUS_ROWS.store(3, Ordering::Relaxed);
-        resize_status_area(old_sr, 3);
+        STATUS_ROWS.store(target, Ordering::Relaxed);
+        resize_status_area(old_sr, target);
     }
 }
 
 /// Returns whether Enter should submit the current input line.
+///
+/// Enter always submits, except for a known command whose submission gate
+/// holds it back (e.g. an ambiguous `/resume` argument). Unknown or partial
+/// commands submit too, so dispatch can report them as unknown rather than
+/// Enter doing nothing.
 pub fn validate_command_input(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || !trimmed.starts_with('/') {
         return true;
     }
-    // Tab selection active -> allow Enter for /model and /resume
-    let tab_active = get_tab_select_index().is_some();
-    if trimmed == "/resume" || trimmed.starts_with("/resume ") {
-        if tab_active {
-            return true;
-        }
-        let count = RESUME_MATCHES.lock().map(|g| g.len()).unwrap_or(0);
-        return count == 1;
+    let (word, _) = split_command(trimmed);
+    match lookup(word) {
+        Some(cmd) => cmd.validate.is_none_or(|gate| gate(trimmed)),
+        None => true,
     }
-    if trimmed == "/model" || trimmed.starts_with("/model ") {
-        if tab_active {
-            return true;
-        }
-        let filter = trimmed.strip_prefix("/model").unwrap_or("").trim();
-        if filter.is_empty() {
-            let count = MODEL_MATCHES.lock().map(|g| g.len()).unwrap_or(0);
-            return count == 1;
-        }
-        return true;
-    }
-    if trimmed == "/style" || trimmed.starts_with("/style ") {
-        if tab_active {
-            return true;
-        }
-        let filter = trimmed.strip_prefix("/style").unwrap_or("").trim();
-        let count = STYLE_MATCHES.lock().map(|g| g.len()).unwrap_or(0);
-        // No-arg `/style` lists current + options (no selection to commit).
-        // Single match with a filter: Enter applies it.
-        return !filter.is_empty() && count == 1;
-    }
-    let cmd_word = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    let resolved = resolve_command_prefix(cmd_word);
-    COMMANDS.iter().any(|(name, _)| *name == resolved)
 }
 
-/// Resolve a possibly-abbreviated slash command to its full form (used by validate).
-fn resolve_command_prefix(input: &str) -> String {
-    if COMMANDS.iter().any(|(name, _)| *name == input) {
-        return input.to_string();
+#[cfg(test)]
+mod tests {
+    use super::validate_command_input;
+
+    #[test]
+    fn plain_text_submits() {
+        assert!(validate_command_input(""));
+        assert!(validate_command_input("   "));
+        assert!(validate_command_input("hello there"));
+        assert!(validate_command_input("what is /help"));
     }
-    let (cmd_part, args_part) = match input.find(' ') {
-        Some(pos) => (&input[..pos], Some(&input[pos..])),
-        None => (input, None),
-    };
-    let matches: Vec<&str> = COMMANDS
-        .iter()
-        .filter(|(name, _)| name.starts_with(cmd_part))
-        .map(|(name, _)| *name)
-        .collect();
-    if matches.len() == 1 {
-        match args_part {
-            Some(args) => format!("{}{}", matches[0], args),
-            None => matches[0].to_string(),
-        }
-    } else {
-        input.to_string()
+
+    #[test]
+    fn known_commands_submit() {
+        assert!(validate_command_input("/help"));
+        assert!(validate_command_input("/clear"));
+    }
+
+    #[test]
+    fn unknown_commands_submit() {
+        assert!(validate_command_input("/zzz"));
+        assert!(validate_command_input("/he"));
+        assert!(validate_command_input("/conv"));
+        assert!(validate_command_input("/e"));
     }
 }

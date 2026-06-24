@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{config::McpServerConfig, load_config_from_str};
-    use aura::ReasoningEffort;
+    use crate::{ReasoningEffort, config::McpServerConfig, load_config_from_str};
 
     const TEST_CONFIG: &str = r#"
 [[vector_stores]]
@@ -73,7 +72,7 @@ budget_tokens = 8000
         // Test LLM config
         println!("\n✅ Testing LLM config...");
         match &config.agent.llm {
-            aura::config::LlmConfig::OpenAI {
+            crate::config::LlmConfig::OpenAI {
                 api_key,
                 model,
                 base_url,
@@ -259,7 +258,7 @@ model = "claude-3-sonnet-20240229"
 
         println!("\n✅ Testing minimal config assertions...");
         match &config.agent.llm {
-            aura::config::LlmConfig::Anthropic {
+            crate::config::LlmConfig::Anthropic {
                 model, temperature, ..
             } => {
                 assert_eq!(model, "claude-3-sonnet-20240229");
@@ -377,7 +376,7 @@ model = "gpt-4"
 
         println!("\n✅ Testing environment variable resolution...");
         match &config.agent.llm {
-            aura::config::LlmConfig::OpenAI { api_key, .. } => {
+            crate::config::LlmConfig::OpenAI { api_key, .. } => {
                 assert_eq!(api_key, "mock_openai_key");
             }
             _ => panic!("Expected OpenAI LLM config"),
@@ -446,7 +445,7 @@ model = "llama3.2"
 
         println!("\n✅ Testing Ollama config assertions...");
         match &config.agent.llm {
-            aura::config::LlmConfig::Ollama {
+            crate::config::LlmConfig::Ollama {
                 model, base_url, ..
             } => {
                 assert_eq!(model, "llama3.2");
@@ -493,7 +492,7 @@ temperature = 0.8
 
         println!("\n✅ Testing Ollama custom URL config assertions...");
         match &config.agent.llm {
-            aura::config::LlmConfig::Ollama {
+            crate::config::LlmConfig::Ollama {
                 model,
                 base_url,
                 temperature,
@@ -532,7 +531,7 @@ top_p = 0.9
         println!("{config:#?}");
 
         match &config.agent.llm {
-            aura::config::LlmConfig::Ollama {
+            crate::config::LlmConfig::Ollama {
                 additional_params, ..
             } => {
                 let params = additional_params
@@ -582,7 +581,7 @@ seed = "{{ env.TEST_SEED }}"
         println!("{config:#?}");
 
         match &config.agent.llm {
-            aura::config::LlmConfig::Ollama {
+            crate::config::LlmConfig::Ollama {
                 additional_params, ..
             } => {
                 let params = additional_params
@@ -620,7 +619,7 @@ model = "llama3.2"
         println!("{config:#?}");
 
         match &config.agent.llm {
-            aura::config::LlmConfig::Ollama {
+            crate::config::LlmConfig::Ollama {
                 model,
                 additional_params,
                 ..
@@ -894,7 +893,7 @@ seed = 42
         println!("{config:#?}");
 
         match &config.agent.llm {
-            aura::config::LlmConfig::Ollama {
+            crate::config::LlmConfig::Ollama {
                 model,
                 base_url,
                 fallback_tool_parsing,
@@ -1333,7 +1332,7 @@ context_window = 200000
             .as_ref()
             .expect("worker should have explicit llm override");
         match worker_llm {
-            aura::config::LlmConfig::Anthropic {
+            crate::config::LlmConfig::Anthropic {
                 model,
                 context_window,
                 ..
@@ -1365,6 +1364,7 @@ context_window = 200000
             std::env::set_var("PAGERDUTY_API_TOKEN", "test-pagerduty");
             std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", "test-github");
             std::env::set_var("MCP_TOKEN", "test-mcp");
+            std::env::set_var("OPENROUTER_API_KEY", "test-openrouter");
         }
 
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1869,124 +1869,63 @@ max_extraction_tokens = 4000
         load_config_from_str(config).expect("valid orchestration config should parse");
     }
 
-    #[test]
-    fn scratchpad_effective_memory_dir_prefers_top_level() {
-        // When both top-level memory_dir AND [orchestration.artifacts].memory_dir
-        // are set, the top-level one wins.
-        let config = r#"
-memory_dir = "/tmp/top-level"
+    // ========================================================================
+    // Worker Name Validation Tests
+    // ========================================================================
 
-[agent]
-name = "Test"
-system_prompt = "Test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-context_window = 128000
-
-[orchestration]
-enabled = true
-
-[orchestration.artifacts]
-memory_dir = "/tmp/legacy"
-
-[orchestration.worker.alpha]
-description = "worker"
-preamble = "alpha"
-"#;
-        let loaded = load_config_from_str(config).expect("should parse");
-        let built = crate::RigBuilder::new(loaded).get_agent_config();
-        assert_eq!(
-            built.effective_memory_dir(),
-            Some("/tmp/top-level"),
-            "top-level memory_dir should win over legacy artifacts.memory_dir"
-        );
+    fn orch_with_workers(names: &[&str]) -> crate::OrchestrationConfig {
+        use crate::{OrchestrationConfig, WorkerConfig};
+        // Only the map keys matter to validate_worker_names; values are minimal.
+        let worker = WorkerConfig {
+            description: "d".to_string(),
+            preamble: "p".to_string(),
+            mcp_filter: Vec::new(),
+            vector_stores: Vec::new(),
+            turn_depth: None,
+            llm: None,
+            scratchpad: None,
+        };
+        let mut orch = OrchestrationConfig::default();
+        for name in names {
+            orch.workers.insert((*name).to_string(), worker.clone());
+        }
+        orch
     }
 
     #[test]
-    fn scratchpad_effective_memory_dir_falls_back_to_legacy() {
-        // No top-level memory_dir — should fall back to the legacy one.
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "Test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-context_window = 128000
-
-[orchestration]
-enabled = true
-
-[orchestration.artifacts]
-memory_dir = "/tmp/legacy"
-
-[orchestration.worker.alpha]
-description = "worker"
-preamble = "alpha"
-"#;
-        let loaded = load_config_from_str(config).expect("should parse");
-        let built = crate::RigBuilder::new(loaded).get_agent_config();
-        assert_eq!(built.effective_memory_dir(), Some("/tmp/legacy"));
+    fn test_validate_worker_names_ok() {
+        let orch = orch_with_workers(&["alpha", "beta"]);
+        assert!(orch.validate_worker_names().is_ok());
     }
 
     #[test]
-    fn scratchpad_effective_memory_dir_falls_back_in_single_agent_mode() {
-        // Orchestration section present but disabled. effective_memory_dir()
-        // should still honor the legacy artifacts fallback so single-agent
-        // scratchpad setup resolves memory_dir the same way orchestration
-        // persistence and config validation do.
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "Test"
-
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-context_window = 128000
-
-[agent.scratchpad]
-enabled = true
-
-[orchestration]
-enabled = false
-
-[orchestration.artifacts]
-memory_dir = "/tmp/legacy-single-agent"
-"#;
-        let loaded = load_config_from_str(config).expect("should parse");
-        let built = crate::RigBuilder::new(loaded).get_agent_config();
-        assert_eq!(
-            built.effective_memory_dir(),
-            Some("/tmp/legacy-single-agent"),
-            "single-agent mode must honor [orchestration.artifacts].memory_dir fallback",
-        );
-        assert!(
-            !built.orchestration_enabled(),
-            "orchestration should be disabled in this test",
-        );
+    fn test_validate_worker_names_rejects_case_insensitive_collision() {
+        // Distinct keys `Alpha` and `alpha` are separate HashMap entries, but
+        // would collide as filenames on macOS APFS or Windows NTFS.
+        let orch = orch_with_workers(&["Alpha", "alpha"]);
+        let err = match orch.validate_worker_names() {
+            Err(crate::ConfigError::Validation(msg)) => msg,
+            other => panic!("expected validation error, got: {other:?}"),
+        };
+        assert!(err.contains("Duplicate worker name"), "got: {err}");
+        assert!(err.contains("Alpha") && err.contains("alpha"), "got: {err}");
+        assert!(err.contains("[orchestration.worker.*]"), "got: {err}");
     }
 
     #[test]
-    fn scratchpad_effective_memory_dir_none_when_unset() {
-        let config = r#"
-[agent]
-name = "Test"
-system_prompt = "Test"
+    fn test_validate_worker_names_rejects_empty() {
+        let orch = orch_with_workers(&[""]);
+        let err = match orch.validate_worker_names() {
+            Err(crate::ConfigError::Validation(msg)) => msg,
+            other => panic!("expected validation error, got: {other:?}"),
+        };
+        assert!(err.contains("Empty worker name"), "got: {err}");
+    }
 
-[agent.llm]
-provider = "openai"
-api_key = "test"
-model = "gpt-4o"
-"#;
-        let loaded = load_config_from_str(config).expect("should parse");
-        let built = crate::RigBuilder::new(loaded).get_agent_config();
-        assert_eq!(built.effective_memory_dir(), None);
+    #[test]
+    fn test_validate_worker_names_empty_workers_ok() {
+        // No workers configured at all is fine.
+        let orch = crate::OrchestrationConfig::default();
+        assert!(orch.validate_worker_names().is_ok());
     }
 }

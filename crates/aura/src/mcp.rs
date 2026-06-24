@@ -1,14 +1,11 @@
 use crate::{config::McpServerConfig, error::BuilderError, mcp_streamable_http::McpClient};
 use futures::{StreamExt, stream::BoxStream};
-use rig::tool::rmcp::McpTool;
 use rig::{completion::ToolDefinition, tool::Tool as RigTool};
-use rmcp::ServiceExt;
-use rmcp::model::{ClientCapabilities, ClientInfo, Implementation, Tool};
 use rmcp::transport::streamable_http_client::StreamableHttpClient;
 use serde_json::Value;
 use sse_stream::{Sse, SseStream};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Simple error type for tool execution
@@ -39,18 +36,48 @@ impl From<&str> for ToolExecutionError {
     }
 }
 
-/// Custom HTTP client that supports Bearer token authentication
+/// Custom HTTP client that captures the underlying HTTP status when a request
+/// fails.
+///
+/// rmcp's streamable-HTTP transport runs in a background worker: when a request
+/// fails (e.g. 404/401), the worker logs the `reqwest` error and closes the
+/// channel, so `serve_client` only sees "channel closed" — the status code is
+/// lost. By implementing `StreamableHttpClient` ourselves we record the status
+/// into `first_error` *at the layer it occurs*, then read it back after the
+/// connection fails to produce a precise reason.
 #[derive(Clone, Default)]
 pub struct CustomHttpClient {
     client: reqwest::Client,
-    auth_token: Option<String>,
+    /// First failing HTTP status observed on this client, if any. Shared across
+    /// clones (the transport worker clones the client) via `Arc`.
+    first_error: Arc<Mutex<Option<String>>>,
 }
 
 impl CustomHttpClient {
-    pub fn new(auth_token: Option<String>) -> Self {
+    /// Wrap an existing `reqwest::Client` (already carrying any forwarded
+    /// headers, including auth) so transport HTTP errors can be captured.
+    pub fn from_reqwest(client: reqwest::Client) -> Self {
         Self {
-            client: reqwest::Client::new(),
-            auth_token,
+            client,
+            first_error: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Shared handle to the first captured failing HTTP status, if any.
+    pub fn first_error(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.first_error)
+    }
+
+    /// Record the first non-success HTTP status seen (first error wins, so the
+    /// root cause isn't overwritten by any follow-on failures).
+    fn record_http_status(&self, status: reqwest::StatusCode) {
+        if status.is_success() {
+            return;
+        }
+        if let Ok(mut guard) = self.first_error.lock()
+            && guard.is_none()
+        {
+            *guard = Some(format!("{}{status}", aura_events::HTTP_STATUS_MARKER));
         }
     }
 }
@@ -63,14 +90,14 @@ impl StreamableHttpClient for CustomHttpClient {
         uri: Arc<str>,
         session_id: Arc<str>,
         last_event_id: Option<String>,
-        _auth_token: Option<String>, // We use our own auth_token field
+        _auth_token: Option<String>, // auth flows through the client's default headers
     ) -> Result<
         BoxStream<'static, Result<Sse, sse_stream::Error>>,
         rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
     > {
         use reqwest::header::ACCEPT;
         use rmcp::transport::common::http_header::{
-            EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID,
+            EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
         };
 
         let mut request_builder = self
@@ -83,25 +110,28 @@ impl StreamableHttpClient for CustomHttpClient {
             request_builder = request_builder.header(HEADER_LAST_EVENT_ID, last_event_id);
         }
 
-        // Add Bearer token authentication if available
-        if let Some(ref auth_header) = self.auth_token {
-            request_builder = request_builder.bearer_auth(auth_header);
-        }
-
         let response = request_builder
             .send()
             .await
             .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
         if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            // Not a failure — the server just doesn't support the SSE GET.
             return Err(rmcp::transport::streamable_http_client::StreamableHttpError::ServerDoesNotSupportSse);
         }
+        self.record_http_status(response.status());
         let response = response
             .error_for_status()
             .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
 
         match response.headers().get(reqwest::header::CONTENT_TYPE) {
             Some(ct) => {
-                if !ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) {
+                // Accept both `text/event-stream` and `application/json`, matching
+                // rmcp's reference reqwest client — a server may answer the GET
+                // stream with either. Rejecting JSON here would mark an otherwise
+                // healthy server as `Failed`.
+                if !ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
+                    && !ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes())
+                {
                     return Err(rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedContentType(Some(
                         String::from_utf8_lossy(ct.as_bytes()).to_string(),
                     )));
@@ -120,18 +150,13 @@ impl StreamableHttpClient for CustomHttpClient {
         &self,
         uri: Arc<str>,
         session: Arc<str>,
-        _auth_token: Option<String>, // We use our own auth_token field
+        _auth_token: Option<String>, // auth flows through the client's default headers
     ) -> Result<(), rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>> {
         use rmcp::transport::common::http_header::HEADER_SESSION_ID;
 
-        let mut request_builder = self.client.delete(uri.as_ref());
-
-        // Add Bearer token authentication if available
-        if let Some(ref auth_header) = self.auth_token {
-            request_builder = request_builder.bearer_auth(auth_header);
-        }
-
-        let response = request_builder
+        let response = self
+            .client
+            .delete(uri.as_ref())
             .header(HEADER_SESSION_ID, session.as_ref())
             .send()
             .await
@@ -150,13 +175,13 @@ impl StreamableHttpClient for CustomHttpClient {
         &self,
         uri: Arc<str>,
         message: rmcp::model::ClientJsonRpcMessage,
-        _session_id: Option<Arc<str>>,
-        _auth_token: Option<String>, // We use our own auth_token field
+        session_id: Option<Arc<str>>,
+        _auth_token: Option<String>, // auth flows through the client's default headers
     ) -> Result<
         rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
         rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
     > {
-        use rmcp::transport::common::http_header::JSON_MIME_TYPE;
+        use rmcp::transport::common::http_header::{HEADER_SESSION_ID, JSON_MIME_TYPE};
 
         let mut request_builder = self
             .client
@@ -165,21 +190,46 @@ impl StreamableHttpClient for CustomHttpClient {
             .header(
                 reqwest::header::ACCEPT,
                 "application/json, text/event-stream",
-            )
-            .json(&message);
+            );
 
-        // Add Bearer token authentication if available
-        if let Some(ref auth_header) = self.auth_token {
-            request_builder = request_builder.bearer_auth(auth_header);
+        // Forward the negotiated session id on every post after `initialize`.
+        // The server returns the id in the initialize response and requires it
+        // on subsequent requests (`notifications/initialized`, tool calls, …);
+        // dropping it makes the server reject them (FastMCP: 400, rmcp: 422),
+        // which the transport worker then collapses into "channel closed".
+        if let Some(session_id) = session_id {
+            request_builder = request_builder.header(HEADER_SESSION_ID, session_id.as_ref());
         }
 
         let response = request_builder
+            .json(&message)
             .send()
             .await
             .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+        // Capture the status before error_for_status consumes the response — this
+        // is the initialize/JSON-RPC POST, where auth (401) and endpoint (404)
+        // failures surface, and where the transport worker would otherwise hide
+        // them behind a "channel closed" error.
+        let status = response.status();
+        self.record_http_status(status);
         let response = response
             .error_for_status()
             .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
+
+        // A notification/response-less POST (e.g. `notifications/initialized`)
+        // comes back as 202 Accepted / 204 No Content with an empty body. Some
+        // servers (FastMCP) still tag the empty body `application/json`; parsing
+        // it as a JSON-RPC message fails and the worker reports "channel closed".
+        // Short-circuit on these statuses before touching the body, matching
+        // rmcp's reference reqwest client.
+        if matches!(
+            status,
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT
+        ) {
+            return Ok(
+                rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted,
+            );
+        }
 
         // Extract session ID from headers before consuming response
         let session_id = response
@@ -188,13 +238,15 @@ impl StreamableHttpClient for CustomHttpClient {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string());
 
-        // Check response content type to determine how to handle it
-        let content_type = response.headers().get(reqwest::header::CONTENT_TYPE);
+        // Snapshot the content type as an owned string before consuming the
+        // response body in the branches below.
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|ct| String::from_utf8_lossy(ct.as_bytes()).to_string());
 
-        if let Some(ct) = content_type {
-            let ct_str = ct.to_str().unwrap_or("");
-            if ct_str.starts_with("application/json") {
-                // Parse JSON response
+        match content_type.as_deref() {
+            Some(ct) if ct.starts_with("application/json") => {
                 let json_text = response.text().await.map_err(
                     rmcp::transport::streamable_http_client::StreamableHttpError::Client,
                 )?;
@@ -202,44 +254,50 @@ impl StreamableHttpClient for CustomHttpClient {
                     serde_json::from_str(&json_text).map_err(
                         rmcp::transport::streamable_http_client::StreamableHttpError::Deserialize,
                     )?;
-
-                return Ok(
+                Ok(
                     rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Json(
                         json_message,
                         session_id,
                     ),
-                );
-            } else if ct_str.starts_with("text/event-stream") {
-                // Handle SSE stream - convert response to stream
+                )
+            }
+            Some(ct) if ct.starts_with("text/event-stream") => {
                 let event_stream =
                     sse_stream::SseStream::from_byte_stream(response.bytes_stream()).boxed();
-
-                return Ok(
+                Ok(
                     rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Sse(
                         event_stream,
                         session_id,
                     ),
-                );
+                )
             }
+            // A 2xx body that is neither JSON nor SSE (or carries no content
+            // type) is unexpected for a JSON-RPC request — the response-less
+            // 202/204 acks are already handled above. Surface it as an error
+            // like rmcp's reference client rather than silently reporting
+            // `Accepted`, which would drop the real response and hang the
+            // request until it times out.
+            other => Err(
+                rmcp::transport::streamable_http_client::StreamableHttpError::UnexpectedContentType(
+                    other.map(|s| s.to_string()),
+                ),
+            ),
         }
-
-        // Fallback to Accepted for other content types
-        Ok(rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted)
     }
 }
 
 /// MCP client for managing connections to MCP servers
 pub struct McpManager {
-    pub tools: Vec<McpTool>,
     pub server_info: HashMap<String, ServerInfo>,
-    /// Store raw tool definitions with their associated client for agent integration
-    pub tool_definitions: Vec<(Tool, rmcp::service::ServerSink)>,
     /// Store streamable HTTP clients for http_streamable transport
     pub streamable_clients: HashMap<String, McpClient>,
     pub streamable_tools: HashMap<String, Vec<rmcp::model::Tool>>,
     /// Store SSE clients for sse transport
     pub sse_clients: HashMap<String, McpClient>,
     pub sse_tools: HashMap<String, Vec<rmcp::model::Tool>>,
+    /// Store STDIO clients for stdio transport
+    pub stdio_clients: HashMap<String, McpClient>,
+    pub stdio_tools: HashMap<String, Vec<rmcp::model::Tool>>,
     /// Whether to sanitize tool schemas for OpenAI compatibility
     pub sanitize_schemas: bool,
 }
@@ -250,6 +308,8 @@ pub struct ServerInfo {
     pub description: Option<String>,
     pub tools_count: usize,
     pub status: ConnectionStatus,
+    /// Transport kind for this server: `"http_streamable"`, `"sse"`, or `"stdio"`.
+    pub transport: String,
 }
 
 #[derive(Debug, Clone)]
@@ -266,13 +326,13 @@ impl McpManager {
 
     pub fn with_sanitization(sanitize_schemas: bool) -> Self {
         Self {
-            tools: Vec::new(),
             server_info: HashMap::new(),
-            tool_definitions: Vec::new(),
             streamable_clients: HashMap::new(),
             streamable_tools: HashMap::new(),
             sse_clients: HashMap::new(),
             sse_tools: HashMap::new(),
+            stdio_clients: HashMap::new(),
+            stdio_tools: HashMap::new(),
             sanitize_schemas,
         }
     }
@@ -296,6 +356,7 @@ impl McpManager {
         for (server_name, server_config) in &mcp_config.servers {
             info!("Connecting to MCP server: {}", server_name);
 
+            let transport = Self::transport_label(server_config).to_string();
             match manager
                 .connect_and_discover_tools(server_name, server_config)
                 .await
@@ -308,6 +369,7 @@ impl McpManager {
                             description: manager.get_server_description(server_config),
                             tools_count,
                             status: ConnectionStatus::Connected,
+                            transport,
                         },
                     );
                     info!(
@@ -324,6 +386,7 @@ impl McpManager {
                             description: manager.get_server_description(server_config),
                             tools_count: 0,
                             status: ConnectionStatus::Failed(error_msg.clone()),
+                            transport,
                         },
                     );
                     warn!("{} - {}", server_name, error_msg);
@@ -332,9 +395,10 @@ impl McpManager {
         }
 
         // Count ALL tools across all transport types
-        let stdio_tools = manager.tools.len();
+        let stdio_tools: usize = manager.stdio_tools.values().map(|v| v.len()).sum();
         let streamable_tools: usize = manager.streamable_tools.values().map(|v| v.len()).sum();
-        let total_tools = stdio_tools + streamable_tools;
+        let sse_tools: usize = manager.sse_tools.values().map(|v| v.len()).sum();
+        let total_tools = stdio_tools + streamable_tools + sse_tools;
         let successful_connections = manager
             .server_info
             .values()
@@ -375,8 +439,7 @@ impl McpManager {
                 self.connect_sse(server_name, url, headers).await
             }
             McpServerConfig::Stdio { cmd, args, env, .. } => {
-                self.connect_stdio(server_name, std::slice::from_ref(cmd), args, env)
-                    .await
+                self.connect_stdio(server_name, cmd, args, env).await
             }
         }
     }
@@ -399,17 +462,20 @@ impl McpManager {
                 Ok(tools_count)
             }
             Err(e) => {
-                // Check if this is an authentication error
+                // Auth failures get a clearer, actionable message. Every other
+                // failure (connection refused, timeout, closed transport,
+                // unexpected content type, non-401 HTTP status, tool-discovery
+                // errors) bubbles up as an error so the server is recorded as
+                // `Failed`. A genuine empty server is represented by `Ok(0)`
+                // only after `discover_tools()` succeeds with an empty tool list.
                 if e.to_string().contains("401 Unauthorized")
                     || e.to_string().contains("HTTP status client error (401")
                 {
                     Err(BuilderError::McpInitError(format!(
-                        "HTTP MCP server '{server_name}' authentication failed (401 Unauthorized). Check that your forwarded headers and credentials are correct."
+                        "HTTP MCP server '{server_name}' authentication failed (401 Unauthorized). Check that your headers, forwarded headers, and/or credentials are correct."
                     )))
                 } else {
-                    warn!("  HTTP Streamable MCP connection failed: {}", e);
-                    // Continue without this server for now
-                    Ok(0)
+                    Err(e)
                 }
             }
         }
@@ -429,12 +495,14 @@ impl McpManager {
             info!("  Forwarding {} headers to MCP client", headers.len());
         }
 
-        // Use McpClient
+        // Use McpClient. Render with `{e:#}` so anyhow's full cause chain (e.g.
+        // the captured HTTP status → transport error) is included, not just the
+        // outermost context.
         let client = McpClient::new(url.to_string(), headers)
             .await
             .map_err(|e| {
                 BuilderError::McpInitError(format!(
-                    "Failed to connect to HTTP MCP server '{server_name}': {e}"
+                    "Failed to connect to HTTP MCP server '{server_name}': {e:#}"
                 ))
             })?;
 
@@ -447,7 +515,7 @@ impl McpManager {
         info!("  🔍 Discovering tools from server '{}'...", server_name);
         let tools = client.discover_tools().await.map_err(|e| {
             BuilderError::McpInitError(format!(
-                "Failed to discover tools from server '{server_name}': {e}"
+                "Failed to discover tools from server '{server_name}': {e:#}"
             ))
         })?;
 
@@ -491,11 +559,11 @@ impl McpManager {
                     || e.to_string().contains("HTTP status client error (401")
                 {
                     Err(BuilderError::McpInitError(format!(
-                        "SSE MCP server '{server_name}' authentication failed (401 Unauthorized). Check that your forwarded headers and credentials are correct."
+                        "SSE MCP server '{server_name}' authentication failed (401 Unauthorized). Check that your headers, forwarded headers, and/or credentials are correct."
                     )))
                 } else {
-                    warn!("  SSE MCP connection failed: {}", e);
-                    Ok(0)
+                    // Bubble the failure so the server is recorded as `Failed`.
+                    Err(e)
                 }
             }
         }
@@ -518,7 +586,7 @@ impl McpManager {
             .await
             .map_err(|e| {
                 BuilderError::McpInitError(format!(
-                    "Failed to establish SSE MCP connection to '{server_name}': {e}"
+                    "Failed to establish SSE MCP connection to '{server_name}': {e:#}"
                 ))
             })?;
 
@@ -526,7 +594,7 @@ impl McpManager {
 
         let tools = client.discover_tools().await.map_err(|e| {
             BuilderError::McpInitError(format!(
-                "Failed to discover tools from SSE server '{server_name}': {e}"
+                "Failed to discover tools from SSE server '{server_name}': {e:#}"
             ))
         })?;
 
@@ -563,8 +631,8 @@ impl McpManager {
             }
             Err(e) => {
                 warn!("  STDIO MCP connection failed: {}", e);
-                // For now, we'll continue without this server
-                Ok(0)
+                // Bubble the failure so the server is recorded as `Failed`.
+                Err(e)
             }
         }
     }
@@ -583,92 +651,57 @@ impl McpManager {
         // Build the command
         if cmd.is_empty() {
             return Err(BuilderError::McpInitError(
-                "Empty command for STDIO server".to_string(),
+                "Empty command for STDIO server".to_owned(),
             ));
         }
 
         let mut process = Command::new(&cmd[0]);
 
-        // Add additional command args if present
-        if cmd.len() > 1 {
-            for arg in &cmd[1..] {
-                process.arg(arg);
-            }
-        }
-
-        // Add the specified args
-        for arg in args {
-            process.arg(arg);
-        }
-
-        // Set environment variables
-        for (key, value) in env {
-            process.env(key, value);
-        }
+        process.args(&cmd[1..]);
+        process.args(args);
+        process.envs(env);
 
         debug!("  Spawning process: {:?}", process);
 
-        // Create the transport
-        let transport = TokioChildProcess::new(process).map_err(|e| {
-            BuilderError::McpInitError(format!("Failed to spawn MCP server process: {e}"))
-        })?;
+        // TokioChildProcess::new defaults stderr to Stdio::inherit(), which
+        // leaks MCP server debug output (often raw JSON-RPC frames) to the
+        // host terminal. Pipe stderr to null instead.
+        let (transport, _stderr) = TokioChildProcess::builder(process)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                BuilderError::McpInitError(format!("Failed to spawn MCP server process: {e}"))
+            })?;
 
-        // Create client info
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "aura-config".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Aura Configuration System".to_string()),
-                website_url: None,
-                icons: None,
-            },
-        };
+        let client = McpClient::from_transport(transport, format!("stdio://{server_name}"))
+            .await
+            .map_err(|e| {
+                BuilderError::McpInitError(format!(
+                    "Failed to establish STDIO MCP connection to '{server_name}': {e}"
+                ))
+            })?;
 
-        // Connect to the server
-        let client = client_info.serve(transport).await.map_err(|e| {
+        info!("  STDIO connection established, discovering tools");
+
+        let tools = client.discover_tools().await.map_err(|e| {
             BuilderError::McpInitError(format!(
-                "Failed to connect to MCP server '{server_name}': {e}"
+                "Failed to discover tools from STDIO server '{server_name}': {e}"
             ))
         })?;
 
-        // Get server info
-        let server_info = client.peer_info();
-        if let Some(init_result) = server_info {
-            info!(
-                "  Connected to MCP server '{}': {} v{}",
-                server_name, init_result.server_info.name, init_result.server_info.version
-            );
-        } else {
-            info!(
-                "  Connected to MCP server '{}' (no server info available)",
-                server_name
-            );
-        }
+        info!(
+            "  Discovered {} tools from STDIO server '{}'",
+            tools.len(),
+            server_name
+        );
 
-        // List available tools
-        let tools_response = client.list_tools(Default::default()).await.map_err(|e| {
-            BuilderError::McpInitError(format!("Failed to list tools from '{server_name}': {e}"))
-        })?;
-
-        let tools = tools_response.tools;
-        info!("  Discovered {} tools from '{}'", tools.len(), server_name);
-
-        // Store tools and their definitions for later integration
         let sanitized_tools =
             Self::sanitize_and_collect_tools(tools, self.sanitize_schemas, "STDIO");
+
         let tools_count = sanitized_tools.len();
-
-        for sanitized_tool in sanitized_tools {
-            self.tool_definitions
-                .push((sanitized_tool.clone(), client.clone()));
-            self.tools
-                .push(McpTool::from_mcp_server(sanitized_tool, client.clone()));
-        }
-
-        // Store the client for later use (client is already cloned above)
-        // self.clients.push(client);
+        let owned_name = server_name.to_string();
+        self.stdio_clients.insert(owned_name.clone(), client);
+        self.stdio_tools.insert(owned_name, sanitized_tools);
 
         Ok(tools_count)
     }
@@ -866,6 +899,45 @@ impl McpManager {
         }
     }
 
+    /// Stable transport label for a server config (used in status reporting).
+    fn transport_label(server_config: &McpServerConfig) -> &'static str {
+        match server_config {
+            McpServerConfig::HttpStreamable { .. } => "http_streamable",
+            McpServerConfig::Sse { .. } => "sse",
+            McpServerConfig::Stdio { .. } => "stdio",
+        }
+    }
+
+    /// Project the per-server connection state into wire-friendly status
+    /// records for the `aura.mcp_status` SSE event.
+    ///
+    /// This is a thin projection of `server_info` — the same state that drives
+    /// `log_summary()` — so degraded servers surface to the user with the same
+    /// reason string recorded at connection time. Sorted by server name for
+    /// deterministic output (the underlying map is unordered).
+    pub fn server_status_snapshot(&self) -> Vec<aura_events::McpServerStatus> {
+        let mut statuses: Vec<aura_events::McpServerStatus> = self
+            .server_info
+            .values()
+            .map(|info| {
+                let (status, reason) = match &info.status {
+                    ConnectionStatus::Connected => ("connected", None),
+                    ConnectionStatus::Failed(reason) => ("failed", Some(reason.clone())),
+                    ConnectionStatus::NotAttempted => ("not_attempted", None),
+                };
+                aura_events::McpServerStatus {
+                    server_name: info.name.clone(),
+                    transport: info.transport.clone(),
+                    status: status.to_string(),
+                    tools_count: info.tools_count,
+                    reason,
+                }
+            })
+            .collect();
+        statuses.sort_by(|a, b| a.server_name.cmp(&b.server_name));
+        statuses
+    }
+
     /// Log the summary of MCP connections and tools
     pub fn log_summary(&self) {
         info!("📊 MCP Manager Summary:");
@@ -883,13 +955,13 @@ impl McpManager {
             }
         }
         // Count ALL tools across all transport types
-        let total_tools = self.tools.len()
-            + self
-                .streamable_tools
-                .values()
-                .map(|v| v.len())
-                .sum::<usize>()
-            + self.sse_tools.values().map(|v| v.len()).sum::<usize>();
+        let total_tools = self
+            .streamable_tools
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>()
+            + self.sse_tools.values().map(|v| v.len()).sum::<usize>()
+            + self.stdio_tools.values().map(|v| v.len()).sum::<usize>();
         info!("  Total tools available: {}", total_tools);
     }
 
@@ -913,6 +985,17 @@ impl McpManager {
             if cancelled > 0 {
                 info!(
                     "Cancelled {} request(s) on SSE MCP server '{}' for HTTP request {}",
+                    cancelled, server_name, http_request_id
+                );
+            }
+            total_cancelled += cancelled;
+        }
+
+        for (server_name, client) in &self.stdio_clients {
+            let cancelled = client.cancel_all_for_request(http_request_id, reason).await;
+            if cancelled > 0 {
+                info!(
+                    "Cancelled {} request(s) on STDIO MCP server '{}' for HTTP request {}",
                     cancelled, server_name, http_request_id
                 );
             }
@@ -949,6 +1032,17 @@ impl McpManager {
             total_cancelled += cancelled;
         }
 
+        for (server_name, client) in &self.stdio_clients {
+            let cancelled = client.cancel_and_close(http_request_id, reason).await;
+            if cancelled > 0 {
+                info!(
+                    "Cancelled {} request(s) and closed STDIO MCP server '{}' for HTTP request {}",
+                    cancelled, server_name, http_request_id
+                );
+            }
+            total_cancelled += cancelled;
+        }
+
         total_cancelled
     }
 
@@ -960,7 +1054,11 @@ impl McpManager {
         for client in self.sse_clients.values() {
             client.set_current_request(http_request_id).await;
         }
-        let total_clients = self.streamable_clients.len() + self.sse_clients.len();
+        for client in self.stdio_clients.values() {
+            client.set_current_request(http_request_id).await;
+        }
+        let total_clients =
+            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
         debug!(
             "Set current HTTP request ID on {} MCP client(s): {}",
             total_clients, http_request_id
@@ -974,7 +1072,11 @@ impl McpManager {
         for client in self.sse_clients.values() {
             client.clear_current_request().await;
         }
-        let total_clients = self.streamable_clients.len() + self.sse_clients.len();
+        for client in self.stdio_clients.values() {
+            client.clear_current_request().await;
+        }
+        let total_clients =
+            self.streamable_clients.len() + self.sse_clients.len() + self.stdio_clients.len();
         debug!(
             "Cleared current HTTP request ID on {} MCP client(s)",
             total_clients
@@ -1002,8 +1104,10 @@ impl McpManager {
         }
 
         // STDIO tools
-        for (tool, _) in &self.tool_definitions {
-            names.push(tool.name.to_string());
+        for tools in self.stdio_tools.values() {
+            for tool in tools {
+                names.push(tool.name.to_string());
+            }
         }
 
         names
@@ -1020,23 +1124,15 @@ impl McpManager {
             .values()
             .flat_map(|tools| tools.iter())
             .chain(self.sse_tools.values().flat_map(|tools| tools.iter()))
-            .chain(self.tool_definitions.iter().map(|(tool, _)| tool))
+            .chain(self.stdio_tools.values().flat_map(|tools| tools.iter()))
     }
 
-    /// Returns a `server_name → tool_names` map for HTTP-streamable servers.
+    /// Returns a `server_name → tool_names` map for all transports.
     ///
     /// Used by the scratchpad layer to resolve per-server `min_tokens`
     /// patterns to concrete tool names at boot time, so the runtime
     /// interception lookup is a server-aware exact match (not a
     /// server-agnostic glob — see `scratchpad::scratchpad_tool_map`).
-    ///
-    /// STDIO tools are intentionally omitted: they're tracked in
-    /// `tool_definitions: Vec<(Tool, ServerSink)>` without a server-name
-    /// field, so we'd need a schema change to carry that through. STDIO
-    /// scratchpad support can be added later by attaching server_name to
-    /// each tool_definitions entry; until then STDIO tools fall through
-    /// the scratchpad interception path (same behavior as before this
-    /// refactor for STDIO).
     pub fn tool_names_per_server(&self) -> HashMap<String, Vec<String>> {
         let mut map: HashMap<String, Vec<String>> = self
             .streamable_tools
@@ -1047,6 +1143,10 @@ impl McpManager {
             })
             .collect();
         for (server_name, tools) in &self.sse_tools {
+            let names = tools.iter().map(|t| t.name.to_string()).collect();
+            map.insert(server_name.clone(), names);
+        }
+        for (server_name, tools) in &self.stdio_tools {
             let names = tools.iter().map(|t| t.name.to_string()).collect();
             map.insert(server_name.clone(), names);
         }
@@ -1103,42 +1203,16 @@ impl McpManager {
             }
         }
 
-        // Try STDIO tools
-        for (tool, client) in &self.tool_definitions {
-            if tool.name.as_ref() == tool_name {
+        // Try STDIO clients
+        for (server_name, client) in &self.stdio_clients {
+            if let Some(tools) = self.stdio_tools.get(server_name)
+                && tools.iter().any(|t| t.name.as_ref() == tool_name)
+            {
                 info!("Executing fallback tool '{}' via STDIO", tool_name);
-
-                // Convert HashMap to serde_json::Map for RMCP API
-                let args_json_map: serde_json::Map<String, Value> = args_map.into_iter().collect();
-
-                let call_request = rmcp::model::CallToolRequestParam {
-                    name: tool.name.clone(),
-                    arguments: Some(args_json_map),
-                };
-
-                let result = client
-                    .call_tool(call_request)
+                return client
+                    .call_tool(tool_name, args_map)
                     .await
-                    .map_err(|e| format!("STDIO tool execution failed: {}", e))?;
-
-                // Format the result - content items are Annotated<RawContent>
-                let content_strs: Vec<String> = result
-                    .content
-                    .iter()
-                    .map(|annotated| match &annotated.raw {
-                        rmcp::model::RawContent::Text(t) => t.text.to_string(),
-                        rmcp::model::RawContent::Image(_) => "[Image content]".to_string(),
-                        rmcp::model::RawContent::Audio(_) => "[Audio content]".to_string(),
-                        rmcp::model::RawContent::Resource(res) => {
-                            crate::mcp_response::extract_resource_contents(&res.resource)
-                        }
-                        rmcp::model::RawContent::ResourceLink(link) => {
-                            format!("[Resource link: {} ({})]", link.name, link.uri)
-                        }
-                    })
-                    .collect();
-
-                return Ok(content_strs.join("\n"));
+                    .map_err(|e| format!("Tool execution failed: {}", e));
             }
         }
 
@@ -1509,8 +1583,234 @@ impl RigTool for FallbackHttpMcpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{McpConfig, McpServerConfig};
     use serde_json::json;
     use std::collections::HashMap;
+
+    // ========================================
+    // Connection Status Tests
+    // ========================================
+
+    /// An unreachable HTTP-streamable server must be recorded as `Failed`, not
+    /// as a connected zero-tool server. This is the regression guard for the
+    /// bug where transport failures were swallowed into `Ok(0)` and logged as
+    /// "Connected successfully, 0 tools discovered".
+    #[tokio::test]
+    async fn unreachable_http_server_is_recorded_as_failed() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "pagerduty".to_string(),
+            McpServerConfig::HttpStreamable {
+                // Port 1 on loopback refuses connections immediately, so this
+                // exercises the transport/connection-error path deterministically.
+                url: "http://127.0.0.1:1/mcp".to_string(),
+                headers: HashMap::new(),
+                description: None,
+                headers_from_request: HashMap::new(),
+                scratchpad: HashMap::new(),
+            },
+        );
+        let config = McpConfig {
+            sanitize_schemas: true,
+            servers,
+        };
+
+        let manager = McpManager::initialize_from_config(&config)
+            .await
+            .expect("initialize_from_config should succeed even when a server fails");
+
+        let info = manager
+            .server_info
+            .get("pagerduty")
+            .expect("pagerduty server_info should be present");
+        assert!(
+            matches!(info.status, ConnectionStatus::Failed(_)),
+            "unreachable server should be Failed, got {:?}",
+            info.status
+        );
+        assert_eq!(info.tools_count, 0);
+        assert_eq!(info.transport, "http_streamable");
+
+        // The status snapshot (what the aura.mcp_status event projects) must
+        // surface the failure with a reason, distinct from an empty server.
+        let snapshot = manager.server_status_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].server_name, "pagerduty");
+        assert_eq!(snapshot[0].status, "failed");
+        assert_eq!(snapshot[0].transport, "http_streamable");
+        assert!(
+            snapshot[0].reason.is_some(),
+            "failed server should carry a reason"
+        );
+    }
+
+    /// `post_message` must (a) forward the negotiated `mcp-session-id` header on
+    /// every post after `initialize`, and (b) treat a `202 Accepted` /
+    /// `204 No Content` response as `Accepted` *without* parsing the (empty)
+    /// body — even when the server tags that empty body `application/json`
+    /// (FastMCP does).
+    ///
+    /// Both are regression guards for the `notifications/initialized` post:
+    /// dropping the session id makes the server reject it (FastMCP 400, rmcp
+    /// 422); parsing the empty 202 body as JSON-RPC fails to deserialize. Either
+    /// bug collapses into a generic "channel closed" and the whole server is
+    /// recorded as `Failed`, so no tools are available.
+    #[tokio::test]
+    async fn post_message_forwards_session_id_and_accepts_empty_202() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Capture the raw request bytes the server received so the test can
+        // assert the session-id header was actually sent on the wire.
+        let seen_request = Arc::new(Mutex::new(String::new()));
+        let seen_for_server = Arc::clone(&seen_request);
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            *seen_for_server.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+            // FastMCP-style ack: 202 Accepted, application/json content-type,
+            // and an empty body.
+            sock.write_all(
+                b"HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let _ = sock.flush().await;
+        });
+
+        let client = CustomHttpClient::from_reqwest(reqwest::Client::new());
+        let uri: Arc<str> = format!("http://{addr}/mcp").into();
+        let message: rmcp::model::ClientJsonRpcMessage = serde_json::from_value(
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .unwrap();
+        let session: Arc<str> = "test-session-abc123".into();
+
+        let result = client
+            .post_message(uri, message, Some(Arc::clone(&session)), None)
+            .await;
+
+        server.await.unwrap();
+
+        // (b) Empty 202 → Accepted, not a deserialize error.
+        assert!(
+            matches!(
+                result,
+                Ok(rmcp::transport::streamable_http_client::StreamableHttpPostResponse::Accepted)
+            ),
+            "empty 202 should yield Accepted, got {result:?}"
+        );
+
+        // (a) The session id was forwarded as the mcp-session-id header.
+        let request = seen_request.lock().unwrap();
+        let lowered = request.to_lowercase();
+        assert!(
+            lowered.contains("mcp-session-id: test-session-abc123"),
+            "post_message must forward the session id header; request was:\n{request}"
+        );
+    }
+
+    /// A server that responds with an HTTP error status must surface that
+    /// status in the failure reason — not the generic "Failed to establish MCP
+    /// client connection". Guards the `CustomHttpClient` status-capture path
+    /// (Level 2a): rmcp's transport worker would otherwise hide the 404 behind
+    /// a "channel closed" error.
+    #[tokio::test]
+    async fn http_error_status_surfaces_in_reason() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Minimal server: reply 404 to every request, then close. Loops so the
+        // transport worker sees a 404 on whatever request it makes first.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let mut servers = HashMap::new();
+        servers.insert(
+            "ghost".to_string(),
+            McpServerConfig::HttpStreamable {
+                url: format!("http://{addr}/mcp"),
+                headers: HashMap::new(),
+                description: None,
+                headers_from_request: HashMap::new(),
+                scratchpad: HashMap::new(),
+            },
+        );
+        let config = McpConfig {
+            sanitize_schemas: true,
+            servers,
+        };
+
+        let manager = McpManager::initialize_from_config(&config).await.unwrap();
+        server.abort();
+
+        let info = manager.server_info.get("ghost").unwrap();
+        let reason = match &info.status {
+            ConnectionStatus::Failed(reason) => reason.clone(),
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(
+            reason.contains("404"),
+            "reason should include the HTTP status code, got: {reason}"
+        );
+    }
+
+    /// A connected server with no tools projects as `connected` (status), not
+    /// `failed` — the distinction the issue asks us to preserve.
+    #[test]
+    fn snapshot_distinguishes_connected_empty_from_failed() {
+        let mut manager = McpManager::with_sanitization(true);
+        manager.server_info.insert(
+            "empty".to_string(),
+            ServerInfo {
+                name: "empty".to_string(),
+                description: None,
+                tools_count: 0,
+                status: ConnectionStatus::Connected,
+                transport: "http_streamable".to_string(),
+            },
+        );
+        manager.server_info.insert(
+            "down".to_string(),
+            ServerInfo {
+                name: "down".to_string(),
+                description: None,
+                tools_count: 0,
+                status: ConnectionStatus::Failed("connection refused".to_string()),
+                transport: "sse".to_string(),
+            },
+        );
+
+        let snapshot = manager.server_status_snapshot();
+        // Sorted by name: "down", then "empty".
+        assert_eq!(snapshot[0].server_name, "down");
+        assert_eq!(snapshot[0].status, "failed");
+        assert_eq!(snapshot[0].reason.as_deref(), Some("connection refused"));
+        assert_eq!(snapshot[1].server_name, "empty");
+        assert_eq!(snapshot[1].status, "connected");
+        assert_eq!(snapshot[1].tools_count, 0);
+        assert_eq!(snapshot[1].reason, None);
+    }
 
     // ========================================
     // Tool Conversion Tests

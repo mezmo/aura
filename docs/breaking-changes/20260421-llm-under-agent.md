@@ -168,7 +168,7 @@ LLM via [orchestration.worker.<name>.llm].
 
 ### `deny_unknown_fields` remains
 
-`aura_config::config::AgentConfig` and `aura::config::LlmConfig` still carry `#[serde(deny_unknown_fields)]`. Any stray field in `[agent]` or `[agent.llm]` (including the fields that were moved out of `[agent]` in the 10 April 2026 migration) still produces a hard parse error.
+`aura_config::AgentConfig` and `aura_config::LlmConfig` still carry `#[serde(deny_unknown_fields)]`. Any stray field in `[agent]` or `[agent.llm]` (including the fields that were moved out of `[agent]` in the 10 April 2026 migration) still produces a hard parse error.
 
 ### Worker LLM fields
 

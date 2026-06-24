@@ -1,0 +1,222 @@
+# A2A Integration
+
+This module wires the [A2A RC 1.0](https://github.com/a2a-protocol) protocol into the Aura web server via [`a2a-rs-server`](https://github.com/a2aproject/a2a-rs).
+
+## Enabling A2A
+
+A2A is **disabled by default**. Enable it with the `--enable-a2a` flag or `AURA_ENABLE_A2A` environment variable:
+
+| Flag | Env var | Default |
+|------|---------|---------|
+| `--enable-a2a` | `AURA_ENABLE_A2A` | `false` |
+
+```bash
+AURA_ENABLE_A2A=true cargo run --bin aura-web-server
+# or
+cargo run --bin aura-web-server -- --enable-a2a
+```
+
+When disabled, the A2A endpoints (`/a2a/v1/*`, `/.well-known/agent-card.json`) are not mounted and return 404.
+
+## Endpoints
+
+| Method | Path | Transport | Description |
+|--------|------|-----------|-------------|
+| `GET` | `/.well-known/agent-card.json` | — | Agent card (capability discovery) |
+| `GET` | `/health` | — | Health check |
+| `POST` | `/a2a/v1/message:send` | REST (HTTP+JSON) | Send a message; returns task in `Working` state immediately |
+| `POST` | `/a2a/v1/message:stream` | REST (SSE) | Send a message and stream task updates |
+| `GET` | `/a2a/v1/tasks` | REST | List tasks |
+| `GET` | `/a2a/v1/tasks/{id}` | REST | Get a task by ID |
+| `POST` | `/a2a/v1/tasks/{id}:cancel` | REST | Cancel a task |
+| `GET` | `/a2a/v1/tasks/{id}:subscribe` | REST (SSE) | Subscribe to task updates |
+| `GET/POST` | `/a2a/v1/tasks/{id}/subscribe` | REST (SSE) | Subscribe to task updates (legacy path) |
+| `POST` | `/a2a/v1/tasks/{id}/cancel` | REST | Cancel a task (legacy path) |
+| `POST` | `/a2a/v1/rpc` | JSON-RPC 2.0 | All of the above via JSON-RPC envelope |
+
+### `message:send` — immediate return
+
+`AuraRequestHandler` forces `return_immediately = true` on every `message:send` request. The HTTP response returns as soon as the task is queued in `Working` state, without waiting for the agent to finish. Poll `GET /a2a/v1/tasks/{id}` or subscribe via `message:stream` / `tasks/{id}:subscribe` to track completion.
+
+## Agent card URL (`AURA_SERVER_URL`)
+
+The agent card's `supportedInterfaces[].url` fields **must be absolute** (per the A2A spec). A2A clients read these URLs from the card and pass them straight to their HTTP layer, which rejects relative paths — so a client that fetches the card successfully will still fail on `message:send` if the advertised URLs are relative.
+
+Aura builds the interface URLs from a single canonical origin, configured via:
+
+| Flag | Env var | Default |
+|------|---------|---------|
+| `--server-url` | `AURA_SERVER_URL` | derived from `--host` / `--port` |
+
+When `AURA_SERVER_URL` is unset, the origin is derived from the bind host/port, with a wildcard bind (`0.0.0.0` / `::`) mapped to `127.0.0.1`. That default is fine for local development but **wrong whenever the server is reached at a different address than it binds** — behind a reverse proxy, load balancer, Kubernetes Service/Ingress, or when the container port is remapped. In those cases set `AURA_SERVER_URL` to the externally-reachable origin clients actually use (scheme + host + optional port, **no path**):
+
+```bash
+AURA_SERVER_URL=https://aura.example.com cargo run --bin aura-web-server
+```
+
+The card then advertises absolute endpoints under that origin:
+
+```jsonc
+{
+  "supportedInterfaces": [
+    { "url": "https://aura.example.com/a2a/v1",     "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0" },
+    { "url": "https://aura.example.com/a2a/v1/rpc", "protocolBinding": "JSONRPC",   "protocolVersion": "1.0" }
+  ]
+}
+```
+
+A trailing slash on `AURA_SERVER_URL` is trimmed before the paths are appended.
+
+## Model selection (`x-aura-model`)
+
+When the server is started with multiple agent configs (e.g. `--config agent-a.toml --config agent-b.toml`), A2A clients can target a specific agent by sending the `x-aura-model` request header. This mirrors the `model` field in the OpenAI-compatible `/v1/chat/completions` endpoint.
+
+| Scenario | Behavior |
+|----------|----------|
+| Single config loaded | Header is ignored — the only config is always used |
+| Multi-config, header present | Matches against `agent.alias` (if set), otherwise `agent.name` |
+| Multi-config, header absent | Falls back to the server's default agent (`--default-agent` / `AURA_DEFAULT_AGENT`) |
+| No matching config found | Returns an `invalid_params` A2A error |
+
+The error message when no config matches:
+- Header provided: `"no agent configuration found for model '<name>'"` (A2A `invalid_params`)
+- No header and no default: `"no agent configuration available"` (A2A `invalid_params`)
+
+`x-aura-model` is **not** part of the A2A spec — it is an Aura extension. Like all request headers, it is also forwarded to the agent's MCP connections via the `headers_from_request` mechanism.
+
+## Testing with curl
+
+Assumes the server is running on `localhost:8080`.
+
+### Agent card
+
+```bash
+curl http://localhost:8080/.well-known/agent-card.json | jq .
+```
+
+### Health check
+
+```bash
+curl http://localhost:8080/health
+```
+
+---
+
+### REST — send a message
+
+```bash
+# Single-config server — no x-aura-model needed
+curl -s -X POST http://localhost:8080/a2a/v1/message:send \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{
+    "message": {
+      "messageId": "msg-001",
+      "role": "ROLE_USER",
+      "parts": [{ "text": "What is 2 + 2?" }]
+    }
+  }' | jq .
+
+# Multi-config server — target a specific agent by alias or name
+curl -s -X POST http://localhost:8080/a2a/v1/message:send \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -H "x-aura-model: my-agent-alias" \
+  -d '{
+    "message": {
+      "messageId": "msg-001",
+      "role": "ROLE_USER",
+      "parts": [{ "text": "What is 2 + 2?" }]
+    }
+  }' | jq .
+```
+
+The response is a task object in `Working` state. Grab the `id` field for follow-up calls.
+
+### REST — get a task by ID
+
+```bash
+curl -s http://localhost:8080/a2a/v1/tasks/<task-id> | jq .
+```
+
+### REST — list tasks
+
+```bash
+curl -s http://localhost:8080/a2a/v1/tasks | jq .
+```
+
+### REST — cancel a task
+
+```bash
+curl -s -X POST http://localhost:8080/a2a/v1/tasks/<task-id>:cancel | jq .
+```
+
+---
+
+### JSON-RPC — send a message
+
+```bash
+curl -s -X POST http://localhost:8080/a2a/v1/rpc \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -H "x-aura-model: my-agent-alias" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "SendMessage",
+    "params": {
+      "message": {
+        "messageId": "msg-002",
+        "role": "ROLE_USER",
+        "parts": [{ "text": "Summarize the A2A protocol." }]
+      }
+    },
+    "id": 1
+  }' | jq .
+```
+
+### JSON-RPC — get a task
+
+```bash
+curl -s -X POST http://localhost:8080/a2a/v1/rpc \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "GetTask",
+    "params": { "id": "<task-id>" },
+    "id": 2
+  }' | jq .
+```
+
+### JSON-RPC — cancel a task
+
+```bash
+curl -s -X POST http://localhost:8080/a2a/v1/rpc \
+  -H "Content-Type: application/json" \
+  -H "A2A-Version: 1.0" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "CancelTask",
+    "params": { "id": "<task-id>" },
+    "id": 3
+  }' | jq .
+```
+
+---
+
+## Notes
+
+- **`A2A-Version` is optional** — when present on `/a2a/v1/rpc` requests, the version is validated. An unsupported value returns `-32009 Version not supported`. REST endpoints do not enforce the header.
+- **`messageId` and `role` are required** on the `Message` object — malformed bodies return `-32602 Invalid params`.
+- **Text-only parts** — the executor only accepts `text` parts; `file` and `data` parts return an error.
+- Tasks are stored in the `a2a-rs-server` in-memory `TaskStore` for the lifetime of the process. Use `GET /a2a/v1/tasks/{id}` or `GetTask` to poll after `message:send` returns.
+- Request headers passed to `/a2a/v1/message:send` are forwarded to the agent's MCP connections (same `headers_from_request` mechanism as the OpenAI-compatible endpoint). This includes `x-aura-model`.
+- **`x-aura-model` is an Aura extension**, not part of the A2A spec. It selects the agent configuration when multiple configs are loaded — see [Model selection](#model-selection-x-aura-model).
+
+## Module layout
+
+| File | Purpose |
+|------|---------|
+| `aura-web-server/src/a2a/mod.rs` | Module root — re-exports `AuraAgentExecutor` and `AuraRequestHandler` |
+| `aura-web-server/src/a2a/agent_executor.rs` | `AuraAgentExecutor` — implements the `AgentExecutor` trait; bridges A2A task execution to the Aura agent streaming pipeline and builds the agent card |
+| `aura-web-server/src/a2a/request_handler.rs` | `AuraRequestHandler` — wraps `DefaultRequestHandler` and forces `return_immediately = true` on every `message:send` so HTTP responses return immediately in `Working` state |

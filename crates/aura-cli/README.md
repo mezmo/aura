@@ -1,6 +1,6 @@
-# Aura CLI
+# AURA CLI
 
-A fast, interactive terminal client for chat completions with tool execution. Built primarily as the command line interface for [Aura by Mezmo](https://mezmo.com/aura), but works with **any OpenAI-compatible API** — plug in your own models, agents, or LLM endpoints.
+A fast, interactive terminal client for chat completions with tool execution. Built primarily as the command line interface for [AURA by Mezmo](https://mezmo.com/aura), but works with **any OpenAI-compatible API** — plug in your own models, agents, or LLM endpoints.
 
 ---
 
@@ -9,11 +9,11 @@ A fast, interactive terminal client for chat completions with tool execution. Bu
 ### Build from the mono-repo
 
 ```bash
-# HTTP-only mode (lightweight, connects to an aura-web-server)
+# Default build (standalone + HTTP — builds agents in-process from TOML config)
 cargo build -p aura-cli --release
 
-# Standalone mode (builds agents in-process from TOML config, no server needed)
-cargo build -p aura-cli --release --features standalone-cli
+# HTTP-only mode (lightweight, no agent/MCP dependencies)
+cargo build -p aura-cli --release --no-default-features
 ```
 
 The binary will be at `target/release/aura-cli`.
@@ -35,47 +35,92 @@ aura-cli --api-url "https://api.example.com" \
 
 #### Standalone mode (no server needed)
 
-When built with `--features standalone-cli`, the CLI can load agent configs directly and run without an HTTP server. Use the `--standalone` flag along with `--config`:
+Standalone mode is enabled by default. The CLI loads agent configs directly and runs without an HTTP server. When `--api-url` is not set, standalone mode activates automatically:
 
 ```bash
+# Uses config.toml in the current directory by default
+aura-cli
+
 # Single TOML config file
-aura-cli --standalone --config path/to/agent.toml
+aura-cli --config path/to/agent.toml
 
 # Directory of TOML configs (enables /model switching between agents)
-aura-cli --standalone --config configs/
+aura-cli --config configs/
 
 # One-shot query in standalone mode
-aura-cli --standalone --config agent.toml --query "hello"
+aura-cli --config agent.toml --query "hello"
 
 # Select a specific agent from a config directory
-aura-cli --standalone --config configs/ --model "Math Agent"
+aura-cli --config configs/ --model "Math Agent"
 ```
 
 In standalone mode, the CLI builds agents in-process using the same code paths as `aura-web-server`. MCP tools from the TOML config are available. CLI local tools (Shell, Read, Update, ...) become available when **both** sides opt in — pass `--enable-client-tools` and set `[agent].enable_client_tools = true` in the loaded TOML config (single-agent configs only; orchestrated configs drop client tools). See [Client-Side Tools](#client-side-tools) for details. The `/model` command works identically — it lists all loaded configs and lets you switch between them.
 
 ---
 
+## Generating a starter config (`aura-cli init`)
+
+New to AURA? `aura-cli init` walks you through creating a ready-to-run `config.toml` — no hand-editing TOML required.
+
+```bash
+aura-cli init                 # interactive; writes ./config.toml
+aura-cli init -o my.toml      # choose the output path
+```
+
+It will:
+
+- **Sense** your environment for a provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) and suggest that provider.
+- **Pick a provider** from a validated list (openai, anthropic, bedrock, gemini, ollama, openrouter).
+- **Handle the API key**: if the provider's conventional env var is already set it asks whether to use it; otherwise it prompts for the key (input is masked). The generated config references the key by its native env var (`api_key = "{{ env.OPENAI_API_KEY }}"`) — secrets are never written into `config.toml`.
+- **Verify & list models**: it queries the provider's live model list and shows a short, curated shortlist (newest per family — pick by number, accept the default, or type any id). For Ollama it lists whatever you have installed.
+- **Write** `config.toml`, plus a `.env` **only when you enter a new key** that isn't already in your environment. The `.env` holds a secret — add it to your `.gitignore`.
+
+`aura-web-server` and the standalone CLI load `.env` automatically at startup, so a config generated here runs as-is.
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <PATH>` | Output config path (default `config.toml`). |
+| `--provider <P>` | Provider: openai, anthropic, bedrock, gemini, ollama, openrouter. |
+| `--model <ID>` | Model id (skips the model picker). |
+| `--api-key-env <VAR>` | Env var to read the key from (default per provider). |
+| `--region <R>` | AWS region (bedrock only). |
+| `--base-url <URL>` | Base URL (ollama only; default `http://localhost:11434`). |
+| `--name <NAME>` | Agent name written to the config (default `assistant`). |
+| `--offline` | Skip live model-list verification. |
+| `--non-interactive` | Fail on missing values instead of prompting (automatic when stdin isn't a TTY). |
+| `--force` | Overwrite an existing config without asking. |
+
+For scripted/CI use, supply the required values as flags:
+
+```bash
+aura-cli init --provider openai --model gpt-4o --non-interactive
+```
+
+---
+
 ## Backends
 
-Aura CLI supports two backends, selected explicitly via the `--standalone` flag:
+AURA CLI supports two backends, selected by the presence of `--api-url`:
 
 | Backend                 | When                         | Dependencies                             | Tools                                                                            |
 | ----------------------- | ---------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
-| **HTTP** (default)      | No `--standalone` flag       | Lightweight — just HTTP client           | Server-side MCP tools always; CLI local tools when both sides opt in (see below) |
-| **Direct** (standalone) | `--standalone --config path` | Full aura stack (agents, MCP, providers) | MCP tools from TOML config; CLI local tools when `--enable-client-tools` is set  |
+| **Direct** (standalone, default) | No `--api-url` flag    | Full AURA stack (agents, MCP, providers) | MCP tools from TOML config; CLI local tools when `--enable-client-tools` is set  |
+| **HTTP**                         | `--api-url <URL>`      | Lightweight — just HTTP client           | Server-side MCP tools always; CLI local tools when both sides opt in (see below) |
 
 Both backends produce identical SSE event streams and share the same stream parser (`process_sse_events`), so all CLI features (stream panel, tool display, orchestration events, etc.) work identically regardless of backend.
 
 ### Feature flag: `standalone-cli`
 
-The `--standalone` and `--config` flags require the `standalone-cli` Cargo feature. Without it, the binary is a lightweight HTTP-only client with no agent or MCP dependencies.
+The `standalone-cli` Cargo feature is **enabled by default**. It includes the full agent framework, MCP integration, and provider support. To build a lightweight HTTP-only client with no agent or MCP dependencies, disable default features:
 
 ```bash
-# HTTP-only (default) — small binary, fast compile
+# Default build — standalone + HTTP
 cargo build -p aura-cli
 
-# Standalone — includes full agent framework
-cargo build -p aura-cli --features standalone-cli
+# HTTP-only — small binary, fast compile, no agent dependencies
+cargo build -p aura-cli --no-default-features
 ```
 
 ---
@@ -85,7 +130,7 @@ cargo build -p aura-cli --features standalone-cli
 - **Interactive REPL** with conversation history, streaming responses, and markdown rendering
 - **One-shot mode** for scripting and pipelines (`--query`) — stdout is the raw assistant response, no markers or markdown rendering
 - **Local tool execution** — the model can read files, search code, list directories, run shell commands, and edit files on your behalf
-- **Standalone mode** — run agents directly from TOML config without a web server (`--standalone --config`)
+- **Standalone mode** (default) — run agents directly from TOML config without a web server
 - **Conversation persistence** — pick up where you left off with `--resume` or `/resume`
 - **Tab completion** — cycle through matching models and conversations with `Tab` / `Shift+Tab`
 - **Model selection** — browse and select models from the server (or loaded configs in standalone mode)
@@ -128,8 +173,8 @@ aura-cli [OPTIONS]
 | `--force`                                  | —                                    | Bypass warnings and non-critical errors (useful in one-shot/query mode)                                  |
 | `--enable-client-tools[=<bool>]`           | `AURA_ENABLE_CLIENT_TOOLS`           | Advertise CLI local tools to the model (default: disabled — see [Client-Side Tools](#client-side-tools)) |
 | `--enable-final-response-summary[=<bool>]` | `AURA_ENABLE_FINAL_RESPONSE_SUMMARY` | Generate a one-line LLM title for each final response (adds an extra round-trip per turn; default: disabled) |
-| `--standalone`                             | —                                    | Run in standalone mode (requires `--config`, requires `standalone-cli` feature)                          |
-| `--config <PATH>`                          | —                                    | Path to TOML agent config file or directory (requires `--standalone`)                                    |
+| `--standalone`                             | —                                    | Force standalone mode (default when `--api-url` is absent; mutually exclusive with `--api-url` flag, but overrides `AURA_API_URL` env var) |
+| `--config <PATH>`                          | —                                    | Path to TOML agent config file or directory (standalone mode; defaults to `config.toml`)                 |
 | `--log-file <PATH>`                        | `AURA_LOG_FILE`                      | Append diagnostic tracing logs to this file. Omit for no logging (see [Logging](#logging))               |
 
 **Precedence:** CLI flags > environment variables > project `cli.toml` > global `cli.toml` > defaults.
@@ -153,7 +198,7 @@ wins. `$HOME` is explicitly skipped so the global file is never picked up twice.
 
 > **Renamed from `config.toml`.** Older versions read `~/.aura/config.toml`. The
 > file is still read with a one-time deprecation warning — rename it to `cli.toml`
-> at your convenience. The old name collided with Aura **agent** config TOMLs and
+> at your convenience. The old name collided with AURA **agent** config TOMLs and
 > will stop being read in a future release.
 
 ```toml
@@ -167,8 +212,8 @@ log_file = "/tmp/aura-cli.log"  # append-only; see Logging section below
 ```
 
 > **Note on system prompts:** In **HTTP mode**, `--system-prompt` is intended for
-> OpenAI-compatible backends that support system messages. **Aura's server ignores system
-> role messages** — the CLI will prompt you to confirm whether you're connecting to Aura
+> OpenAI-compatible backends that support system messages. **AURA's server ignores system
+> role messages** — the CLI will prompt you to confirm whether you're connecting to AURA
 > or another service. In **standalone mode**, `--system-prompt` can append to or replace
 > the agent's TOML-configured system prompt (you'll be asked which). In one-shot mode
 > (`--query`), standalone silently appends; HTTP mode requires `--force`.
@@ -285,7 +330,7 @@ In **HTTP mode**, the model list is fetched from the server's `/v1/models` endpo
 >
 > Disabled by default. Opting in is your decision and your responsibility.
 
-By default, Aura CLI is a **pure chat client** — no local tools are advertised to the model and the REPL never executes anything on the host. Pass `--enable-client-tools` (or set `AURA_ENABLE_CLIENT_TOOLS=true`) to opt in to local tool execution, at which point the model can call tools like `Shell`, `Read`, and `Update` and the REPL runs them locally with permission checks.
+By default, AURA CLI is a **pure chat client** — no local tools are advertised to the model and the REPL never executes anything on the host. Pass `--enable-client-tools` (or set `AURA_ENABLE_CLIENT_TOOLS=true`) to opt in to local tool execution, at which point the model can call tools like `Shell`, `Read`, and `Update` and the REPL runs them locally with permission checks.
 
 ```bash
 # Disabled (default) — chat only
@@ -326,7 +371,7 @@ If local tools never fire when you expect them to, check that **both** sides are
 
 ## Permissions
 
-Aura CLI includes a permission system that controls which local tools the model is allowed to execute. Permission rules only matter when client-side tools are enabled (see [Client-Side Tools](#client-side-tools)). Configure permissions by creating a `.aura/permissions.json` file in your project directory:
+AURA CLI includes a permission system that controls which local tools the model is allowed to execute. Permission rules only matter when client-side tools are enabled (see [Client-Side Tools](#client-side-tools)). Configure permissions by creating a `.aura/permissions.json` file in your project directory:
 
 ```json
 {
@@ -407,7 +452,7 @@ levels.
 
 ### Standalone-mode OpenTelemetry
 
-When built with `--features standalone-cli` and run with `--standalone`, the
+When running in standalone mode (the default when `--api-url` is absent), the
 CLI runs the agent in-process. Set `OTEL_EXPORTER_OTLP_ENDPOINT` and the CLI
 will install an OpenTelemetry layer alongside (or instead of) the file fmt
 layer — the same trace structure (`agent.stream` → `agent.turn` →
@@ -460,9 +505,9 @@ Events are shared types from the `aura-events` crate, ensuring identical parsing
 
 ## Compatibility
 
-Aura CLI speaks the standard [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) and works with any compatible backend:
+AURA CLI speaks the standard [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) and works with any compatible backend:
 
-- Aura by Mezmo
+- AURA by Mezmo
 - OpenAI API / Azure OpenAI
 - Local models via Ollama, LM Studio, vLLM, etc.
 - Any service implementing `/v1/chat/completions`
@@ -478,21 +523,21 @@ When `--enable-client-tools` is off, the CLI only sees server-side tool executio
 ## Building & Testing
 
 ```bash
-# Build (HTTP-only)
+# Build (default — standalone + HTTP)
 cargo build -p aura-cli
 
-# Build (standalone)
-cargo build -p aura-cli --features standalone-cli
+# Build (HTTP-only — lightweight, no agent dependencies)
+cargo build -p aura-cli --no-default-features
 
 # Run tests
-cargo test -p aura-cli                           # HTTP-only mode
-cargo test -p aura-cli --features standalone-cli  # + standalone tests
+cargo test -p aura-cli                       # default (standalone + HTTP)
+cargo test -p aura-cli --no-default-features  # HTTP-only path
 
 # Clippy
 cargo clippy -p aura-cli --all-targets
-cargo clippy -p aura-cli --features standalone-cli --all-targets
+cargo clippy -p aura-cli --no-default-features --all-targets
 
 # Run directly
-cargo run -p aura-cli -- --api-url "http://localhost:8080"
-cargo run -p aura-cli --features standalone-cli -- --standalone --config agent.toml
+cargo run -p aura-cli -- --config agent.toml                    # standalone (default)
+cargo run -p aura-cli -- --api-url "http://localhost:8080"      # HTTP mode
 ```

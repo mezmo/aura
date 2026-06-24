@@ -52,6 +52,27 @@ impl ActiveRequestTracker {
     }
 }
 
+/// RAII guard that increments the active request counter on creation and
+/// decrements it on drop. Pair with one construction per logical request so
+/// every code path (normal completion, early return, panic, consumer drop)
+/// produces exactly one decrement.
+pub struct ActiveRequestGuard {
+    tracker: Arc<ActiveRequestTracker>,
+}
+
+impl ActiveRequestGuard {
+    pub fn new(tracker: Arc<ActiveRequestTracker>) -> Self {
+        tracker.increment();
+        Self { tracker }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.tracker.decrement();
+    }
+}
+
 /// Application state
 pub struct AppState {
     pub configs: Arc<Vec<aura_config::Config>>,
