@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
-use crate::config::{AgentRuntimeConfig, LlmConfig};
+use crate::config::{AgentRuntimeConfig, LlmConfig, McpToolFilter};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
@@ -1875,13 +1875,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Build a Rig agent with the given completion model and coordinator tools.
     ///
     /// Shared helper that eliminates per-provider duplication in `create_coordinator`.
-    fn build_agent_with_tools<M: rig::completion::CompletionModel + Send + Sync>(
+    async fn build_agent_with_tools<M: rig::completion::CompletionModel + Send + Sync>(
+        &self,
         completion_model: M,
         preamble: &str,
         temperature: Option<f64>,
         additional_params: Option<serde_json::Value>,
         tools: CoordinatorTools,
-    ) -> rig::agent::Agent<M> {
+    ) -> Result<rig::agent::Agent<M>, Box<dyn std::error::Error + Send + Sync>> {
         let mut builder = rig::agent::AgentBuilder::new(completion_model);
         builder = builder.preamble(preamble);
         if let Some(temp) = temperature {
@@ -1909,7 +1910,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if let Some(list_prior_runs) = tools.list_prior_runs {
             state = state.add_tool(list_prior_runs);
         }
-        state.build()
+        let state = Agent::add_mcp_tools(
+            state,
+            &self.agent_config,
+            &self.mcp_manager,
+            McpToolFilter::deny_all_when_empty(&self.config.coordinator_mcp_filter),
+        )
+        .await?;
+
+        Ok(state.build())
     }
 
     /// Create a coordinator agent for planning tasks.
@@ -1958,6 +1967,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
             include_recon_tools,
             include_history_tools,
         );
+        if !self.config.coordinator_mcp_filter.is_empty() {
+            preamble.push_str(
+                "\n## Coordinator MCP Tool Use\n\n\
+                 You have access to a small configured set of MCP tools for lightweight \
+                 reconnaissance or simple remediation. Delegate large external fetches, \
+                 broad searches, long-running work, and multi-step tool workflows to workers \
+                 with `create_plan`.\n",
+            );
+        }
         let temperature = self.agent_config.llm.temperature();
 
         // Filter vector stores for coordinator (if any configured)
@@ -2064,12 +2082,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // post-execute continuation routing (13 calls in 5-prompt E2E suite).
         let max_depth = PLANNING_COORDINATOR_MAX_DEPTH;
 
+        let coordinator_mcp_manager = if self.config.coordinator_mcp_filter.is_empty() {
+            None
+        } else {
+            self.mcp_manager.clone()
+        };
+
         Ok(AgentWithPreamble {
             agent: Agent {
                 inner: provider_agent,
                 model: model_name,
                 max_depth,
-                mcp_manager: None, // Coordinator doesn't have MCP tools
+                mcp_manager: coordinator_mcp_manager,
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
                 context_window: None,
@@ -2110,13 +2134,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build OpenAI coordinator: {}", e))?
                     .completions_api()
                     .completion_model(model);
-                Ok(ProviderAgent::OpenAI(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                Ok(ProviderAgent::OpenAI(
+                    self.build_agent_with_tools(
+                        cm,
+                        preamble,
+                        temperature,
+                        additional_params,
+                        tools,
+                    )
+                    .await?,
+                ))
             }
             LlmConfig::Anthropic {
                 api_key,
@@ -2133,13 +2160,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .build()
                     .map_err(|e| format!("Failed to build Anthropic coordinator: {}", e))?
                     .completion_model(model);
-                Ok(ProviderAgent::Anthropic(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                Ok(ProviderAgent::Anthropic(
+                    self.build_agent_with_tools(
+                        cm,
+                        preamble,
+                        temperature,
+                        additional_params,
+                        tools,
+                    )
+                    .await?,
+                ))
             }
             LlmConfig::Bedrock {
                 model,
@@ -2164,13 +2194,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     &sdk_config,
                 ))
                 .completion_model(model);
-                Ok(ProviderAgent::Bedrock(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                Ok(ProviderAgent::Bedrock(
+                    self.build_agent_with_tools(
+                        cm,
+                        preamble,
+                        temperature,
+                        additional_params,
+                        tools,
+                    )
+                    .await?,
+                ))
             }
             LlmConfig::Gemini {
                 api_key,
@@ -2187,13 +2220,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .build()
                     .map_err(|e| format!("Failed to build Gemini coordinator: {}", e))?
                     .completion_model(model);
-                Ok(ProviderAgent::Gemini(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                Ok(ProviderAgent::Gemini(
+                    self.build_agent_with_tools(
+                        cm,
+                        preamble,
+                        temperature,
+                        additional_params,
+                        tools,
+                    )
+                    .await?,
+                ))
             }
             LlmConfig::Ollama {
                 model, base_url, ..
@@ -2205,13 +2241,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .build()
                     .map_err(|e| format!("Failed to build Ollama coordinator: {}", e))?
                     .completion_model(model);
-                Ok(ProviderAgent::Ollama(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                Ok(ProviderAgent::Ollama(
+                    self.build_agent_with_tools(
+                        cm,
+                        preamble,
+                        temperature,
+                        additional_params,
+                        tools,
+                    )
+                    .await?,
+                ))
             }
             LlmConfig::OpenRouter {
                 api_key,
@@ -2228,13 +2267,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .build()
                     .map_err(|e| format!("Failed to build OpenRouter coordinator: {}", e))?
                     .completion_model(model);
-                Ok(ProviderAgent::OpenRouter(Self::build_agent_with_tools(
-                    cm,
-                    preamble,
-                    temperature,
-                    additional_params,
-                    tools,
-                )))
+                Ok(ProviderAgent::OpenRouter(
+                    self.build_agent_with_tools(
+                        cm,
+                        preamble,
+                        temperature,
+                        additional_params,
+                        tools,
+                    )
+                    .await?,
+                ))
             }
         }
     }

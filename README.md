@@ -427,6 +427,8 @@ max_planning_cycles = 3
 tools_in_planning = "summary"
 allow_direct_answers = true
 allow_clarification = true
+# Optional: lightweight coordinator MCP access; empty means no MCP tools.
+coordinator_mcp_filter = ["ops_get_status"]
 
 [orchestration.worker.operations]
 description = "Operational analysis and diagnostics"
@@ -459,7 +461,7 @@ Execution loop:
 - `Execute`: dependency-ready tasks run in parallel waves on worker agents.
 - `Continue`: coordinator consolidates worker outputs and routes to a final response, replan, or clarification.
 
-Workers run with isolated task context windows and filtered MCP/vector-store access based on each worker block.
+Workers run with isolated task context windows and filtered MCP/vector-store access based on each worker block. The coordinator has no MCP tools by default; set `coordinator_mcp_filter` only for lightweight coordinator reconnaissance or simple remediation, and keep large fetches or multi-step tool workflows delegated to workers.
 
 For a fuller multi-worker example, see [configs/example-math-orchestration.toml](configs/example-math-orchestration.toml).
 
@@ -477,6 +479,7 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `duplicate_call_nudge_threshold` | int | `3` | Consecutive identical tool calls before appending guidance annotation |
 | `duplicate_call_block_threshold` | int | `5` | Consecutive identical tool calls before appending abort annotation and setting escalation flag |
 | `worker_system_prompt` | string | — | Optional global system prompt prepended to all workers |
+| `coordinator_mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools the coordinator can call directly; empty means none |
 | `coordinator_vector_stores` | list | `[]` | Vector stores available to the coordinator agent |
 | `result_artifact_threshold` | int | `4000` | Character count above which worker results are saved as artifacts |
 | `result_summary_length` | int | `2000` | Max characters for artifact summaries passed to coordinator |
@@ -493,6 +496,8 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 | `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
 | `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |
 | `scratchpad` | table | inherits `[agent.scratchpad]` | Optional per-worker scratchpad config override |
+
+Unlike `coordinator_mcp_filter`, an omitted or empty worker `mcp_filter` grants that worker all MCP tools for backward compatibility. Use a non-matching pattern such as `["__none__"]` for a worker that should have no MCP tools.
 
 ### Scratchpad (Context Window Management)
 

@@ -261,6 +261,13 @@ pub struct OrchestrationConfig {
     pub workers: HashMap<String, WorkerConfig>,
 
     // --- Coordinator ---
+    /// Glob patterns for MCP tools the coordinator may call directly.
+    ///
+    /// Empty by default, which grants the coordinator no MCP tools. This applies
+    /// only to MCP tools; coordinator vector stores are configured separately via
+    /// `coordinator_vector_stores`.
+    pub coordinator_mcp_filter: Vec<String>,
+
     /// Vector stores available to the coordinator agent.
     pub coordinator_vector_stores: Vec<String>,
 
@@ -302,6 +309,7 @@ impl Default for OrchestrationConfig {
             max_plan_parse_retries: default_max_plan_parse_retries(),
             worker_system_prompt: None,
             workers: HashMap::new(),
+            coordinator_mcp_filter: Vec::new(),
             coordinator_vector_stores: Vec::new(),
             allow_direct_answers: true,
             allow_clarification: true,
@@ -472,6 +480,8 @@ struct RawOrchestrationConfig {
     workers: HashMap<String, WorkerConfig>,
     #[serde(default)]
     coordinator_vector_stores: Vec<String>,
+    #[serde(default)]
+    coordinator_mcp_filter: Vec<String>,
     #[serde(default = "default_true")]
     allow_direct_answers: bool,
     #[serde(default = "default_true")]
@@ -545,6 +555,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             max_plan_parse_retries: raw.max_plan_parse_retries,
             worker_system_prompt: raw.worker_system_prompt,
             workers: raw.workers,
+            coordinator_mcp_filter: raw.coordinator_mcp_filter,
             coordinator_vector_stores: raw.coordinator_vector_stores,
             allow_direct_answers: raw.allow_direct_answers,
             allow_clarification: raw.allow_clarification,
@@ -629,6 +640,7 @@ mod tests {
         assert!(!config.has_workers());
         assert_eq!(config.tools_in_planning, ToolVisibility::Summary);
         assert_eq!(config.max_tools_per_worker, 10);
+        assert!(config.coordinator_mcp_filter.is_empty());
         assert!(config.coordinator_vector_stores.is_empty());
         assert_eq!(config.per_call_timeout_secs(), 0);
         assert_eq!(config.result_artifact_threshold(), 4000);
@@ -866,6 +878,27 @@ mod tests {
             config
                 .coordinator_vector_stores
                 .contains(&"procedures".to_string())
+        );
+    }
+
+    #[test]
+    fn test_coordinator_mcp_filter() {
+        let toml = r#"
+            enabled = true
+            coordinator_mcp_filter = ["k8s_get_*", "prometheus_[qt]uery"]
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.coordinator_mcp_filter.len(), 2);
+        assert!(
+            config
+                .coordinator_mcp_filter
+                .contains(&"k8s_get_*".to_string())
+        );
+        assert!(
+            config
+                .coordinator_mcp_filter
+                .contains(&"prometheus_[qt]uery".to_string())
         );
     }
 

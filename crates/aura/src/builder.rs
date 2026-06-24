@@ -1,5 +1,5 @@
 use crate::{
-    config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, VectorStoreType},
+    config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, McpToolFilter, VectorStoreType},
     error::{BuilderError, BuilderResult},
     mcp::McpManager,
     passthrough_tool::PassthroughTool,
@@ -755,78 +755,19 @@ impl Agent {
         if config.tool_wrapper.is_some() {
             tracing::info!("Tool wrapper configured");
         }
-        let effective_filter = config
+        let empty = &[];
+        let patterns = config
             .mcp_filter
-            .as_ref()
-            .or(config.agent.mcp_filter.as_ref());
-        if let Some(patterns) = effective_filter {
-            tracing::info!("MCP filter: {} pattern(s): {:?}", patterns.len(), patterns);
-        }
-
-        // Add HTTP streamable tools using dynamic adaptors
-        if let Some(mcp_manager) = mcp_manager.as_deref() {
-            for (server_name, client) in &mcp_manager.streamable_clients {
-                if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
-                    let filtered_tools: Vec<_> = server_tools
-                        .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
-                        .collect();
-                    log_filtered_tools(
-                        "",
-                        "HTTP streamable",
-                        server_name,
-                        filtered_tools.len(),
-                        server_tools.len(),
-                    );
-
-                    let client_arc = Arc::new(client.clone());
-                    for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
-
-                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
-                            mcp_tool.clone(),
-                            server_name.clone(),
-                            Arc::clone(&client_arc),
-                        );
-
-                        // Wrap with tool_wrapper if configured
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
-                    }
-                }
-            }
-        }
-
-        // Add SSE tools using dynamic adaptors
-        if let Some(mcp_manager) = mcp_manager.as_deref() {
-            for (server_name, client) in &mcp_manager.sse_clients {
-                if let Some(server_tools) = mcp_manager.sse_tools.get(server_name) {
-                    let filtered_tools: Vec<_> = server_tools
-                        .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
-                        .collect();
-                    log_filtered_tools(
-                        "",
-                        "SSE",
-                        server_name,
-                        filtered_tools.len(),
-                        server_tools.len(),
-                    );
-
-                    let client_arc = Arc::new(client.clone());
-                    for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name);
-
-                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
-                            mcp_tool.clone(),
-                            server_name.clone(),
-                            Arc::clone(&client_arc),
-                        );
-
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
-                    }
-                }
-            }
-        }
+            .as_deref()
+            .or(config.agent.mcp_filter.as_deref())
+            .unwrap_or(empty);
+        builder_state = Self::add_mcp_tools(
+            builder_state,
+            config,
+            mcp_manager,
+            McpToolFilter::allow_all_when_empty(patterns),
+        )
+        .await?;
 
         // Add filesystem tools if configured
         if let Some(tools_config) = &config.tools
@@ -870,38 +811,6 @@ impl Agent {
             }
 
             tracing::info!("All vector stores configured successfully");
-        }
-
-        // Add STDIO tools using dynamic adaptors
-        if let Some(mcp_manager) = mcp_manager.as_deref() {
-            for (server_name, client) in &mcp_manager.stdio_clients {
-                if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
-                    let filtered_tools: Vec<_> = server_tools
-                        .iter()
-                        .filter(|t| config.tool_matches_filter(&t.name))
-                        .collect();
-                    log_filtered_tools(
-                        "",
-                        "STDIO",
-                        server_name,
-                        filtered_tools.len(),
-                        server_tools.len(),
-                    );
-
-                    let client_arc = Arc::new(client.clone());
-                    for mcp_tool in filtered_tools {
-                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
-
-                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
-                            mcp_tool.clone(),
-                            server_name.clone(),
-                            Arc::clone(&client_arc),
-                        );
-
-                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
-                    }
-                }
-            }
         }
 
         if let Some(ref scratchpad) = config.scratchpad_tools_config {
@@ -948,6 +857,120 @@ impl Agent {
         if !additional_tools.is_empty() {
             tracing::info!("Adding {} additional custom tools", additional_tools.len());
             builder_state = builder_state.add_tools_dyn(additional_tools);
+        }
+
+        Ok(builder_state)
+    }
+
+    /// Add only MCP tools to a builder state.
+    pub(crate) async fn add_mcp_tools<M>(
+        mut builder_state: BuilderState<M>,
+        config: &AgentRuntimeConfig,
+        mcp_manager: &Option<Arc<McpManager>>,
+        filter: McpToolFilter<'_>,
+    ) -> Result<BuilderState<M>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        M: rig::completion::CompletionModel + Send + Sync,
+    {
+        let patterns = filter.patterns();
+        if !patterns.is_empty() {
+            tracing::info!("MCP filter: {} pattern(s): {:?}", patterns.len(), patterns);
+        }
+
+        // Add HTTP streamable tools using dynamic adaptors
+        if let Some(mcp_manager) = mcp_manager.as_deref() {
+            for (server_name, client) in &mcp_manager.streamable_clients {
+                if let Some(server_tools) = mcp_manager.streamable_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| filter.matches(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "HTTP streamable",
+                        server_name,
+                        filtered_tools.len(),
+                        server_tools.len(),
+                    );
+
+                    let client_arc = Arc::new(client.clone());
+                    for mcp_tool in filtered_tools {
+                        tracing::info!("  Adding dynamic HTTP tool: {}", mcp_tool.name);
+
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
+                            mcp_tool.clone(),
+                            server_name.clone(),
+                            Arc::clone(&client_arc),
+                        );
+
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                    }
+                }
+            }
+        }
+
+        // Add SSE tools using dynamic adaptors
+        if let Some(mcp_manager) = mcp_manager.as_deref() {
+            for (server_name, client) in &mcp_manager.sse_clients {
+                if let Some(server_tools) = mcp_manager.sse_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| filter.matches(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "SSE",
+                        server_name,
+                        filtered_tools.len(),
+                        server_tools.len(),
+                    );
+
+                    let client_arc = Arc::new(client.clone());
+                    for mcp_tool in filtered_tools {
+                        tracing::info!("  Adding dynamic SSE tool: {}", mcp_tool.name);
+
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
+                            mcp_tool.clone(),
+                            server_name.clone(),
+                            Arc::clone(&client_arc),
+                        );
+
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                    }
+                }
+            }
+        }
+
+        // Add STDIO tools using dynamic adaptors
+        if let Some(mcp_manager) = mcp_manager.as_deref() {
+            for (server_name, client) in &mcp_manager.stdio_clients {
+                if let Some(server_tools) = mcp_manager.stdio_tools.get(server_name) {
+                    let filtered_tools: Vec<_> = server_tools
+                        .iter()
+                        .filter(|t| filter.matches(&t.name))
+                        .collect();
+                    log_filtered_tools(
+                        "",
+                        "STDIO",
+                        server_name,
+                        filtered_tools.len(),
+                        server_tools.len(),
+                    );
+
+                    let client_arc = Arc::new(client.clone());
+                    for mcp_tool in filtered_tools {
+                        tracing::info!("  Adding dynamic STDIO tool: {}", mcp_tool.name);
+
+                        let tool_adaptor = crate::mcp_dynamic::McpToolAdaptor::new(
+                            mcp_tool.clone(),
+                            server_name.clone(),
+                            Arc::clone(&client_arc),
+                        );
+
+                        builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
+                    }
+                }
+            }
         }
 
         Ok(builder_state)

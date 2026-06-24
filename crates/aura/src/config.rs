@@ -21,6 +21,46 @@ pub use aura_config::{
 /// Type alias for tool context factory function.
 pub type ToolContextFactory = Arc<dyn Fn(&str) -> ToolCallContext + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyToolFilterBehavior {
+    AllowAll,
+    DenyAll,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct McpToolFilter<'a> {
+    patterns: &'a [String],
+    empty_behavior: EmptyToolFilterBehavior,
+}
+
+impl<'a> McpToolFilter<'a> {
+    pub(crate) fn allow_all_when_empty(patterns: &'a [String]) -> Self {
+        Self {
+            patterns,
+            empty_behavior: EmptyToolFilterBehavior::AllowAll,
+        }
+    }
+
+    pub(crate) fn deny_all_when_empty(patterns: &'a [String]) -> Self {
+        Self {
+            patterns,
+            empty_behavior: EmptyToolFilterBehavior::DenyAll,
+        }
+    }
+
+    pub(crate) fn matches(&self, tool_name: &str) -> bool {
+        if self.patterns.is_empty() {
+            return matches!(self.empty_behavior, EmptyToolFilterBehavior::AllowAll);
+        }
+
+        self.patterns.iter().any(|p| glob_match(p, tool_name))
+    }
+
+    pub(crate) fn patterns(&self) -> &'a [String] {
+        self.patterns
+    }
+}
+
 /// Runtime build context for constructing agents.
 ///
 /// This composes the pure TOML-parsed config types from `aura-config` with
@@ -193,12 +233,13 @@ impl AgentRuntimeConfig {
     /// - `*` matches any sequence of characters
     /// - `?` matches any single character
     pub fn tool_matches_filter(&self, tool_name: &str) -> bool {
-        let effective = self.mcp_filter.as_ref().or(self.agent.mcp_filter.as_ref());
-        match effective {
-            None => true,
-            Some(patterns) if patterns.is_empty() => true,
-            Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
-        }
+        let empty = &[];
+        let patterns = self
+            .mcp_filter
+            .as_deref()
+            .or(self.agent.mcp_filter.as_deref())
+            .unwrap_or(empty);
+        McpToolFilter::allow_all_when_empty(patterns).matches(tool_name)
     }
 
     /// Check if a client-side tool name matches the configured filter.
@@ -263,6 +304,22 @@ mod tests {
         assert!(config.tool_matches_filter("mezmo_pipelines"));
         assert!(config.tool_matches_filter("QueryKnowledgeBases"));
         assert!(!config.tool_matches_filter("other_tool"));
+    }
+
+    #[test]
+    fn test_mcp_tool_filter_deny_all_when_empty() {
+        let patterns: Vec<String> = vec![];
+        let filter = McpToolFilter::deny_all_when_empty(&patterns);
+        assert!(!filter.matches("any_tool"));
+    }
+
+    #[test]
+    fn test_mcp_tool_filter_full_glob() {
+        let patterns = vec!["tool_[ab]".to_string()];
+        let filter = McpToolFilter::deny_all_when_empty(&patterns);
+        assert!(filter.matches("tool_a"));
+        assert!(filter.matches("tool_b"));
+        assert!(!filter.matches("tool_c"));
     }
 
     #[test]

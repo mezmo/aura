@@ -21,6 +21,7 @@ tracing = { workspace = true }
 # Environment variables
 dotenv = { workspace = true }
 regex = { workspace = true }
+glob = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

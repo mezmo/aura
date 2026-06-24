@@ -364,9 +364,41 @@ impl Config {
 
         // Scratchpad validation
         self.validate_scratchpad()?;
+        self.validate_glob_patterns()?;
 
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_glob_patterns(&self) -> Result<(), crate::ConfigError> {
+        if let Some(patterns) = self.agent.mcp_filter.as_deref() {
+            validate_glob_patterns(patterns, "agent.mcp_filter")?;
+        }
+        if let Some(patterns) = self.agent.client_tool_filter.as_deref() {
+            validate_glob_patterns(patterns, "agent.client_tool_filter")?;
+        }
+
+        if let Some(orch) = &self.orchestration {
+            validate_glob_patterns(
+                &orch.coordinator_mcp_filter,
+                "orchestration.coordinator_mcp_filter",
+            )?;
+            for (name, worker) in &orch.workers {
+                validate_glob_patterns(
+                    &worker.mcp_filter,
+                    &format!("orchestration.worker.{name}.mcp_filter"),
+                )?;
+            }
+        }
+
+        if let Some(mcp) = &self.mcp {
+            for (server_name, server_config) in &mcp.servers {
+                let patterns: Vec<&String> = server_config.scratchpad().keys().collect();
+                validate_glob_patterns(patterns, &format!("mcp.servers.{server_name}.scratchpad"))?;
+            }
         }
 
         Ok(())
@@ -762,37 +794,27 @@ impl Default for AgentSettings {
 /// - `*Query*` matches `ListQuery`, `QueryKnowledgeBases`
 /// - `tool_?` matches `tool_a`, `tool_b`
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
-
-    fn match_recursive(pattern: &[char], text: &[char]) -> bool {
-        match (pattern.first(), text.first()) {
-            // Both exhausted - match!
-            (None, None) => true,
-            // Pattern exhausted but text remains - no match
-            (None, Some(_)) => false,
-            // Wildcard * - try matching zero or more characters
-            (Some('*'), _) => {
-                // Try matching zero characters (skip *)
-                if match_recursive(&pattern[1..], text) {
-                    return true;
-                }
-                // Try matching one character and continue with *
-                if !text.is_empty() && match_recursive(pattern, &text[1..]) {
-                    return true;
-                }
-                false
-            }
-            // Text exhausted but pattern has non-* remaining - check for trailing *s
-            (Some(p), None) => *p == '*' && match_recursive(&pattern[1..], text),
-            // Single character wildcard ?
-            (Some('?'), Some(_)) => match_recursive(&pattern[1..], &text[1..]),
-            // Literal character match
-            (Some(p), Some(t)) => *p == *t && match_recursive(&pattern[1..], &text[1..]),
+    match glob::Pattern::new(pattern) {
+        Ok(pattern) => pattern.matches(text),
+        Err(err) => {
+            tracing::warn!(pattern, %err, "invalid glob pattern");
+            false
         }
     }
+}
 
-    match_recursive(&pattern, &text)
+fn validate_glob_patterns<'a, I>(patterns: I, location: &str) -> Result<(), crate::ConfigError>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    for pattern in patterns {
+        glob::Pattern::new(pattern).map_err(|err| {
+            crate::ConfigError::Validation(format!(
+                "Invalid glob pattern '{pattern}' in {location}: {err}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -830,8 +852,41 @@ mod tests {
     }
 
     #[test]
+    fn test_glob_match_character_class() {
+        assert!(glob_match("tool_[ab]", "tool_a"));
+        assert!(glob_match("tool_[ab]", "tool_b"));
+        assert!(!glob_match("tool_[ab]", "tool_c"));
+    }
+
+    #[test]
     fn test_glob_match_star_only() {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn test_invalid_coordinator_mcp_filter_fails_validation() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+
+            [agent.llm]
+            provider = "ollama"
+            model = "qwen"
+
+            [orchestration]
+            enabled = true
+            coordinator_mcp_filter = ["tool_["]
+        "#;
+
+        let err = Config::parse_toml(toml).unwrap_err();
+        match err {
+            crate::ConfigError::Validation(msg) => {
+                assert!(msg.contains("orchestration.coordinator_mcp_filter"));
+                assert!(msg.contains("tool_["));
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
     }
 }
