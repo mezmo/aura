@@ -87,9 +87,8 @@ pub struct Args {
 
     /// Run in standalone mode — builds agents in-process from TOML config
     /// instead of connecting to an aura-web-server over HTTP. This is the
-    /// default when --api-url is not provided; pass --standalone explicitly
-    /// when you want standalone mode *and* --api-url is set (e.g. for
-    /// debugging).
+    /// default when --api-url is not provided. Mutually exclusive with the
+    /// --api-url flag, but overrides the AURA_API_URL env var.
     #[cfg(feature = "standalone-cli")]
     #[arg(long)]
     pub standalone: bool,
@@ -167,28 +166,34 @@ pub fn check_standalone_flag() {
 /// Returns `true` if standalone mode should be used.
 #[cfg(feature = "standalone-cli")]
 pub fn resolve_standalone(args: &Args) -> bool {
-    let api_url_set = args.api_url.is_some()
-        || std::env::var("AURA_API_URL")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some();
+    // clap merges --api-url and AURA_API_URL into args.api_url, so we
+    // check raw argv to distinguish the CLI flag from the env var.
+    let api_url_from_flag =
+        std::env::args().any(|a| a == "--api-url" || a.starts_with("--api-url="));
+    let api_url_from_env = std::env::var("AURA_API_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_some();
 
-    if args.standalone && api_url_set && args.agent_config.is_none() {
+    if args.standalone && api_url_from_flag {
         eprintln!(
-            "error: --standalone with --api-url requires --config\n\n\
-             When both --standalone and --api-url are set, standalone mode is \
-             explicit and needs a TOML config. Provide --config <path>, or drop \
-             --standalone to use HTTP mode."
+            "error: --standalone and --api-url are mutually exclusive\n\n\
+             Standalone mode builds agents in-process and never contacts a \
+             remote server. Drop one of the two flags.\n\n\
+             If AURA_API_URL is set in your environment and you want \
+             standalone mode, pass --standalone (without --api-url) to \
+             override the env var."
         );
         std::process::exit(2);
     }
 
+    // --standalone overrides AURA_API_URL env var
     if args.standalone {
         return true;
     }
 
-    // No --api-url and no explicit --standalone → standalone by default
-    if !api_url_set {
+    // No API URL from either source → standalone by default
+    if args.api_url.is_none() && !api_url_from_env {
         return true;
     }
 
