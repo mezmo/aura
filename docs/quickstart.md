@@ -171,6 +171,21 @@ Restart with `docker compose up -d`. Clients that support model selection (Libre
 > appropriate keys to your `.env` — they're automatically loaded into the container
 > via `env_file`. See `.env.example` for the full list.
 
+#### Hide an agent from discovery
+
+Set `hidden = true` in an agent's `[agent]` block to keep it out of discovery listings. AURA omits a hidden agent from the `GET /v1/models` response and from the CLI's `/model` list, so it won't appear in client model pickers. The agent stays fully usable. Any caller that already knows its name or alias can still select it by sending that value as the `model` field. This helps when an agent isn't ready yet, or when you want only known callers to invoke it during development/testing/production.
+
+```toml
+[agent]
+name = "hidden agent"
+hidden = true
+system_prompt = "You are a hidden agent that does not show up in listings, but still invokable by known callers."
+```
+
+The `hidden` field defaults to `false`. It accepts either a TOML boolean (`true` or `false`) or the quoted strings `"true"` and `"false"`. The quoted form is convenient when a templating tool such as Helm renders the value as a string.
+
+> **Note:** If you load only a single hidden agent, both `GET /v1/models` and the CLI `/model` list come back empty even though the agent is still the active, invocable default.
+
 ### Customize orchestration
 
 `quickstart.toml` ships with orchestration enabled: a coordinator and two tool-free workers (`researcher` and `writer`) that reason with the LLM alone. The coordinator's routing is controlled by the `[orchestration]` block:
