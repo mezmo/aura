@@ -338,6 +338,26 @@ pub fn set_processing(active: bool) {
     PROCESSING.store(active, Ordering::Relaxed);
 }
 
+/// Whether a request is currently being processed.
+pub fn is_processing() -> bool {
+    PROCESSING.load(Ordering::Relaxed)
+}
+
+/// Whether the REPL is currently blocked in `readline()` waiting for input
+/// (i.e. idle at the prompt). The resize watcher only redraws the frame while
+/// this is true, so it never interleaves with mid-turn output or streaming.
+pub(crate) static READLINE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark whether the REPL is blocked in `readline()` (idle at the prompt).
+pub fn set_readline_active(active: bool) {
+    READLINE_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Whether the REPL is idle in `readline()`.
+pub fn is_readline_active() -> bool {
+    READLINE_ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Store text as the queued next input (replaces any previous value).
 pub fn set_queued_input(text: String) {
     if let Ok(mut g) = QUEUED_INPUT.lock() {
