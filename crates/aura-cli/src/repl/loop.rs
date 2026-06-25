@@ -27,20 +27,107 @@ use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::prompt::{
     WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
     erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
-    get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output,
-    last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
+    get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output, is_processing,
+    is_readline_active, last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
-    push_mid_stream_history, push_sse_event, random_bullet_color, redraw_input_frame,
-    replay_event_log_global, reset_ctrlc_state, reset_input_geometry, restore_terminal_mode,
-    seed_model_cache, seed_status_bar_tokens, set_expanded_output, set_mid_stream_history,
-    set_noncanonical_noecho, set_processing, set_selected_model, set_startup_status,
-    set_status_bar_tokens, set_stream_conv_dir, set_welcome_state, setup_terminal,
-    stop_and_clear_animation, styled_prompt, take_pending_command, take_queued_input,
-    task_color_for, text_lines, update_status_bar, update_status_bar_unlocked, with_event_log,
-    with_event_log_mut,
+    push_mid_stream_history, push_sse_event, random_bullet_color, rebuild_status_bar,
+    redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
+    restore_terminal_mode, seed_model_cache, seed_status_bar_tokens, set_expanded_output,
+    set_mid_stream_history, set_noncanonical_noecho, set_processing, set_readline_active,
+    set_selected_model, set_startup_status, set_status_bar_tokens, set_stream_conv_dir,
+    set_welcome_state, setup_terminal, stop_and_clear_animation, styled_prompt,
+    take_pending_command, take_queued_input, task_color_for, text_lines, update_status_bar,
+    update_status_bar_unlocked, with_event_log, with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
+
+/// Event-driven watcher that repaints the frame after a terminal resize while
+/// the REPL is idle in `readline()`.
+///
+/// rustyline wakes on SIGWINCH but only repaints its own input line, and only
+/// when that line is long enough to need it — so at an idle/short prompt the
+/// frame borders and status row stay drawn at the old width until the next
+/// keystroke. We get our own SIGWINCH notification by blocking on a
+/// `signal_hook` `Signals` stream (no polling): because rustyline is built with
+/// its `signal-hook` feature, it registers SIGWINCH via signal_hook's chaining
+/// pipe, so our consumer fires on the same signal even while readline is
+/// blocked.
+///
+/// On each resize we rebuild the status bar at the new width then do a full,
+/// absolute repaint: clear the screen + replay the conversation + redraw the
+/// frame (the same primitive `/style` uses), wrapped in a synchronized update
+/// so it doesn't flicker. We deliberately avoid the incremental
+/// `handle_resize_frame` used by the keystroke path: it relies on
+/// `SavePosition`/`RestorePosition`, and when a resize reflow scrolls the
+/// screen the saved absolute row is stale, so the frame drifts (ending up near
+/// the top with cumulative scroll). The absolute clear+replay can't drift, and
+/// for an idle single-line prompt rustyline's forced refresh re-anchors to the
+/// cursor we leave at the input line. We only act while idle in `readline()`
+/// with no request processing, so it never interleaves with mid-turn output or
+/// the streaming animation (which has its own resize handling).
+struct ResizeWatcher {
+    handle: signal_hook::iterator::Handle,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ResizeWatcher {
+    fn spawn() -> std::io::Result<Self> {
+        let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
+        let handle = signals.handle();
+        let join = std::thread::spawn(move || {
+            // Width we last repainted at. Each SIGWINCH redraws to the current
+            // width, so rapid resizes simply track the latest size with no
+            // stale-frame lag; identical-width signals are skipped.
+            let mut drawn_width = crate::ui::prompt::term_size().0;
+            // `forever()` blocks until a signal arrives and ends when the
+            // handle is closed on drop.
+            for _ in signals.forever() {
+                // Only repaint while genuinely idle at the prompt. Otherwise keep
+                // the baseline current so we don't repaint spuriously once idle.
+                if !is_readline_active() || is_processing() {
+                    drawn_width = crate::ui::prompt::term_size().0;
+                    continue;
+                }
+                let width = crate::ui::prompt::term_size().0;
+                if width == drawn_width {
+                    continue;
+                }
+                // Re-pad the status to the new width before redrawing so it
+                // doesn't wrap (data-only; no lock needed).
+                rebuild_status_bar();
+                let _term = lock_term();
+                // Re-check under the lock: a turn may have started between the
+                // signal and acquiring the terminal write lock.
+                if is_readline_active() && !is_processing() {
+                    let mut stdout = io::stdout();
+                    // Batch the clear+repaint into one atomic update where the
+                    // terminal supports it, so the redraw doesn't flicker.
+                    let _ = execute!(stdout, crossterm::terminal::BeginSynchronizedUpdate);
+                    replay_event_log_global();
+                    redraw_input_frame();
+                    let _ = execute!(stdout, crossterm::terminal::EndSynchronizedUpdate);
+                    // Make rustyline fully repaint its line on the next key.
+                    crate::ui::state::FORCE_REPAINT.store(true, Ordering::Relaxed);
+                }
+                drawn_width = width;
+            }
+        });
+        Ok(Self {
+            handle,
+            join: Some(join),
+        })
+    }
+}
+
+impl Drop for ResizeWatcher {
+    fn drop(&mut self) {
+        self.handle.close();
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
 
 /// Orchestrator task tracking — promoted to module scope so reasoning
 /// helpers can look up which task a worker's reasoning belongs to.
@@ -616,6 +703,11 @@ pub fn run_repl(
         redraw_input_frame();
     }
 
+    // Redraw the frame on terminal resize while idle at the prompt. Dropped
+    // (which stops the thread) when `run_repl` returns via any path. If signal
+    // registration fails we simply skip auto-redraw rather than abort the REPL.
+    let _resize_watcher = ResizeWatcher::spawn().ok();
+
     let input_buf: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     // Restore any partially-typed input from a previous session
     let mut initial_input = conv_store
@@ -637,9 +729,14 @@ pub fn run_repl(
             auto_submit = false;
             Ok(queued)
         } else if initial_input.is_empty() {
-            input_reader.readline(&styled_prompt())
+            set_readline_active(true);
+            let result = input_reader.readline(&styled_prompt());
+            set_readline_active(false);
+            result
         } else {
+            set_readline_active(true);
             let result = input_reader.readline_with_initial(&styled_prompt(), (&initial_input, ""));
+            set_readline_active(false);
             initial_input.clear();
             result
         };

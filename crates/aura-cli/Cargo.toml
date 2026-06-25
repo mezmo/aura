@@ -42,7 +42,10 @@ futures-util = "0.3"
 unicode-segmentation = "1"
 termimad = "0.34"
 crossterm = "0.29"
-rustyline = "17"
+# `signal-hook` makes rustyline register SIGWINCH via signal_hook's chaining
+# pipe instead of a raw sigaction, so our own SIGWINCH consumer (the resize
+# watcher in repl/loop.rs) can coexist and fire while readline is blocked.
+rustyline = { version = "17", features = ["signal-hook"] }
 dirs = "6"
 libc = "0.2"
 signal-hook = "0.3"

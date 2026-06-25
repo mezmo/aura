@@ -267,6 +267,29 @@ fn refresh_status_bar_from_counters() {
     set_status_bar(set_status_with_right_text(&left, &right));
 }
 
+/// Rebuild the idle status-bar text at the *current* terminal width.
+///
+/// The stored status string is pre-padded for right-alignment at the width it
+/// was built for ([`set_status_with_right_text`]), so after a resize it must be
+/// regenerated — otherwise reprinting it in a narrower window wraps to an extra
+/// row and scrolls the frame. Reproduces the pristine branding-only line until
+/// tokens have accrued (matching `setup_terminal`), then the token line.
+///
+/// Data-only (no terminal I/O); safe to call before taking the terminal lock.
+pub(crate) fn rebuild_status_bar() {
+    let prompt = CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0);
+    let completion = CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0);
+    let intercepted = CUMULATIVE_SCRATCHPAD_INTERCEPTED
+        .lock()
+        .map(|g| *g)
+        .unwrap_or(0);
+    if prompt == 0 && completion == 0 && intercepted == 0 {
+        set_status_bar(set_status_with_right_text("", "Aura, by Mezmo!"));
+    } else {
+        refresh_status_bar_from_counters();
+    }
+}
+
 /// Build the left portion of the status bar text.
 fn build_status_left(cumulative_prompt: u64, cumulative_completion: u64, total: u64) -> String {
     let base = format!(
