@@ -17,7 +17,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.29.0"
+version = "1.30.0"
 edition = "2024"
 authors = ["Mezmo <support@mezmo.com>"]
 license = "Apache-2.0"

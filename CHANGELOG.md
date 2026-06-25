@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.30.0](https://github.com/mezmo/aura/compare/v1.29.0...v1.30.0) (2026-06-25)
+
+
+### Features
+
+* **gh-templates**: add bug and feature issue templates [10b3c3c](https://github.com/mezmo/aura/commit/10b3c3c53f0e86cd7bb0b4921159da14bf06cd38) - Justin Gross [#templates](https://github.com/mezmo/aura/issues/templates) [#139](https://github.com/mezmo/aura/issues/139)
+
 # [1.29.0](https://github.com/mezmo/aura/compare/v1.28.0...v1.29.0) (2026-06-25)
 
 
