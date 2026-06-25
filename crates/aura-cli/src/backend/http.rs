@@ -49,4 +49,10 @@ impl HttpBackend {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         self.client.list_models().await
     }
+
+    /// Describe the connected server for the startup banner (base URL plus
+    /// version when the server reports one).
+    pub async fn connection_summary(&self) -> String {
+        self.client.connection_summary().await
+    }
 }

@@ -852,6 +852,7 @@ pub async fn health() -> Response {
     Json(serde_json::json!({
         "status": "healthy",
         "timestamp": Utc::now().to_rfc3339(),
+        "aura_version": env!("CARGO_PKG_VERSION"),
         "a2a_server": {
             "version": VERSION,
         },

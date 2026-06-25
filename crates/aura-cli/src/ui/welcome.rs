@@ -558,11 +558,17 @@ fn is_valid_env_key(key: &str) -> bool {
     !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Replace `{{KEY}}` tokens with the corresponding environment variable value.
-/// Only valid env-var names (alphanumeric + underscore) are interpolated;
-/// other `{{...}}` patterns are kept literally.
-/// Unset vars become empty strings. Unclosed `{{` is kept literally.
-fn interpolate_env_vars(content: String) -> String {
+/// Replace `{{KEY}}` tokens with their values. `{{AURA_STATUS}}` resolves to
+/// the startup status line (cli version + connected server); any other valid
+/// env-var name (alphanumeric + underscore) resolves to that environment
+/// variable. The legacy `{{PWD}}` trailer that older seeded `.welcome` files
+/// carry is migrated to `{{AURA_STATUS}}` so the banner shows status, not the
+/// working directory. Other `{{...}}` patterns are kept literally; unset vars
+/// become empty strings; an unclosed `{{` is kept literally.
+fn interpolate_tokens(content: String, status: &str) -> String {
+    // Migrate the legacy working-directory trailer to the status token.
+    let content = content.replace("{{PWD}}", "{{AURA_STATUS}}");
+
     let mut result = String::with_capacity(content.len());
     let mut rest = content.as_str();
 
@@ -572,7 +578,11 @@ fn interpolate_env_vars(content: String) -> String {
         if let Some(close) = after_open.find("}}") {
             let key = &after_open[..close];
             if is_valid_env_key(key) {
-                let value = std::env::var(key).unwrap_or_default();
+                let value = if key == "AURA_STATUS" {
+                    status.to_string()
+                } else {
+                    std::env::var(key).unwrap_or_default()
+                };
                 result.push(ENV_START);
                 result.push_str(&value);
                 result.push(ENV_END);
@@ -610,5 +620,39 @@ fn pick_welcome_file() -> Option<String> {
     };
 
     let content = content.filter(|c| !c.trim().is_empty())?;
-    Some(interpolate_env_vars(content))
+    Some(interpolate_tokens(content, &super::state::startup_status()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strip the ENV_START/ENV_END markers that wrap interpolated values so
+    /// tests can assert on the plain substituted text.
+    fn unmark(s: &str) -> String {
+        s.chars()
+            .filter(|c| *c != ENV_START && *c != ENV_END)
+            .collect()
+    }
+
+    #[test]
+    fn aura_status_token_is_substituted() {
+        let out = interpolate_tokens("{{AURA_STATUS}}".to_string(), "aura-cli v1 · standalone");
+        assert_eq!(unmark(&out), "aura-cli v1 · standalone");
+    }
+
+    #[test]
+    fn legacy_pwd_token_migrates_to_status() {
+        // Older seeded `.welcome` files end in `{{PWD}}`; it now renders status.
+        let out = interpolate_tokens("art\n\n{{PWD}}".to_string(), "aura-cli v1 · standalone");
+        assert_eq!(unmark(&out), "art\n\naura-cli v1 · standalone");
+    }
+
+    #[test]
+    fn other_env_tokens_still_interpolate() {
+        unsafe { std::env::set_var("AURA_WELCOME_TEST_VAR", "hello") };
+        let out = interpolate_tokens("{{AURA_WELCOME_TEST_VAR}}".to_string(), "status");
+        assert_eq!(unmark(&out), "hello");
+        unsafe { std::env::remove_var("AURA_WELCOME_TEST_VAR") };
+    }
 }

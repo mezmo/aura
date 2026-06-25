@@ -102,6 +102,17 @@ impl Backend {
         }
     }
 
+    /// Human-readable description of what this CLI is connected to, for the
+    /// startup banner. Standalone mode runs the agent in-process (no remote
+    /// server); HTTP mode reports the server's base URL and version.
+    pub async fn connection_summary(&self) -> String {
+        match self {
+            Self::Http(http) => http.connection_summary().await,
+            #[cfg(feature = "standalone-cli")]
+            Self::Direct(_) => "standalone".to_string(),
+        }
+    }
+
     /// Access the direct backend (standalone mode only). Panics if not Direct.
     #[cfg(feature = "standalone-cli")]
     pub fn as_direct(&self) -> &direct::DirectBackend {

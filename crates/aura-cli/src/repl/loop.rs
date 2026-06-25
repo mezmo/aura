@@ -34,10 +34,11 @@ use crate::ui::prompt::{
     push_mid_stream_history, push_sse_event, random_bullet_color, redraw_input_frame,
     replay_event_log_global, reset_ctrlc_state, reset_input_geometry, restore_terminal_mode,
     seed_model_cache, seed_status_bar_tokens, set_expanded_output, set_mid_stream_history,
-    set_noncanonical_noecho, set_processing, set_selected_model, set_status_bar_tokens,
-    set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
-    styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
-    update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
+    set_noncanonical_noecho, set_processing, set_selected_model, set_startup_status,
+    set_status_bar_tokens, set_stream_conv_dir, set_welcome_state, setup_terminal,
+    stop_and_clear_animation, styled_prompt, take_pending_command, take_queued_input,
+    task_color_for, text_lines, update_status_bar, update_status_bar_unlocked, with_event_log,
+    with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
 
@@ -540,6 +541,16 @@ pub fn run_repl(
         HISTORY_COUNT.store(0, Ordering::Relaxed);
         set_mid_stream_history(Vec::new());
     }
+
+    // Build the banner status line (cli version + connected server) once; the
+    // welcome template renders it where the working directory used to appear.
+    // `/clear` and `/resume` re-pick the welcome, so stash it for reuse.
+    let server = rt.block_on(backend.connection_summary());
+    set_startup_status(format!(
+        "aura-cli v{} · {}",
+        env!("CARGO_PKG_VERSION"),
+        server
+    ));
 
     // Pick the welcome content + colors once; reused on /expand and /resume replays.
     set_welcome_state(WelcomeState::pick());

@@ -191,6 +191,34 @@ impl ChatClient {
 
         Ok(model_list.data.into_iter().map(|m| m.id).collect())
     }
+
+    /// Describe the connected server for the startup banner: the base URL and,
+    /// when the server advertises it via `/health`, its version. Best-effort —
+    /// an unreachable or older server (no `aura_version` field) yields just the
+    /// base URL. Uses a short timeout so startup never stalls on a dead server.
+    pub async fn connection_summary(&self) -> String {
+        let base = self.config.api_url.trim_end_matches('/').to_string();
+        match self.server_version().await {
+            Some(version) => format!("{base} (server v{version})"),
+            None => base,
+        }
+    }
+
+    /// Fetch the server's reported aura version from `/health`, or `None` if the
+    /// server is unreachable or doesn't report one.
+    async fn server_version(&self) -> Option<String> {
+        let response = self
+            .build_request(reqwest::Method::GET, &self.config.health_url(), None)
+            .timeout(std::time::Duration::from_millis(1500))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = response.json().await.ok()?;
+        body.get("aura_version")?.as_str().map(str::to_string)
+    }
 }
 
 #[cfg(test)]
