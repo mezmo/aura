@@ -26,6 +26,8 @@ aura-cli --config path/to/agent.toml
 
 If you omit `--config`, the CLI loads `config.toml` from the current directory, so a bare `aura-cli` runs the local config.
 
+On first run, if that config is missing (for example, a bare `aura-cli` in a directory with no `config.toml`), the CLI doesn't dump a raw filesystem error. Instead, it reports the path it looked for and offers three ways forward: run `aura-cli init` to generate a config in the current directory, pass `--config <path>` to point at an existing config file or directory, or set `--api-url <url>` (or `AURA_API_URL`) to connect to a running aura-web-server instead.
+
 **HTTP mode** (connect to an aura-web-server) is selected when you set `--api-url` (or `AURA_API_URL`):
 
 ```bash
