@@ -754,6 +754,7 @@ pub enum CancelReasonWire {
     ClientDisconnected,
     Shutdown,
     SenderDropped,
+    TaskTimedOut,
 }
 
 /// `approval_requested`: an approval was raised (emitted on both routes).

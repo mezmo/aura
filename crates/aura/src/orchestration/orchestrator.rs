@@ -83,6 +83,11 @@ const PLANNING_COORDINATOR_MAX_DEPTH: usize = 6;
 /// Attempt 1 = normal execution. Attempt 2 = retry with correction prompt.
 const MAX_WORKER_ATTEMPTS: usize = 2;
 
+/// After a worker timeout cancels an active HITL approval, briefly poll the
+/// worker stream so the approval route can emit completion and clean registry
+/// state before the worker future is dropped.
+const HITL_TASK_TIMEOUT_CLEANUP: Duration = Duration::from_secs(1);
+
 // ============================================================================
 // Helper Structs
 // ============================================================================
@@ -329,6 +334,7 @@ pub struct Orchestrator {
 struct StreamContext<'a> {
     task_id: usize,
     worker_id: &'a str,
+    worker_name: Option<&'a str>,
 }
 
 /// Shared parameters for streaming LLM calls (`stream_and_forward` / `stream_and_collect`).
@@ -1039,9 +1045,35 @@ impl Orchestrator {
         if timeout_secs == 0 {
             stream_future.await
         } else {
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), stream_future).await {
-                Ok(result) => result,
-                Err(_elapsed) => {
+            tokio::pin!(stream_future);
+            tokio::select! {
+                result = &mut stream_future => result,
+                _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                    if let (Some(ctx), Some(hitl)) =
+                        (stream_context.as_ref(), self.agent_config.hitl.as_ref())
+                        && let Some(active) =
+                            hitl.cancel_worker_task_timeout(ctx.task_id, ctx.worker_name)
+                    {
+                        tracing::warn!(
+                            task_id = ctx.task_id,
+                            worker_id = ctx.worker_id,
+                            decision_id = %active.decision_id,
+                            tool_name = %active.tool_name,
+                            "{} timed out after {}s while waiting for HITL approval",
+                            phase,
+                            timeout_secs,
+                        );
+                        let _ = tokio::time::timeout(
+                            HITL_TASK_TIMEOUT_CLEANUP,
+                            &mut stream_future,
+                        )
+                        .await;
+                        return Err(format!(
+                            "{} timed out after {}s while waiting for HITL approval {} for tool '{}' [approval_task_timeout]",
+                            phase, timeout_secs, active.decision_id, active.tool_name
+                        )
+                        .into());
+                    }
                     tracing::warn!(
                         "{} timed out after {}s (per_call_timeout_secs={})",
                         phase,
@@ -2908,9 +2940,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         phase: "Worker task",
                         event_tx,
                     },
-                    worker_name.map(|name| StreamContext {
+                    Some(StreamContext {
                         task_id,
-                        worker_id: name,
+                        worker_id: worker_name.unwrap_or(&self.orchestrator_id),
+                        worker_name: *worker_name,
                     }),
                     || {
                         let srd = srd.clone();
@@ -3194,7 +3227,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Revisit if/when we replace rig.
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
-        if lower.contains("timed out") {
+        if lower.contains("approval_task_timeout") {
+            FailureCategory::ApprovalTaskTimeout
+        } else if lower.contains("timed out") {
             FailureCategory::AgentTimeout
         } else if (lower.contains("context")
             && (lower.contains("limit")
@@ -5112,6 +5147,12 @@ mod tests {
         assert_eq!(
             Orchestrator::categorize_failure_error("Request timed out after 30s"),
             FailureCategory::AgentTimeout
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Worker task timed out while waiting for HITL [approval_task_timeout]"
+            ),
+            FailureCategory::ApprovalTaskTimeout
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("context limit exceeded"),

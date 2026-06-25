@@ -862,12 +862,18 @@ fn test_continuation_failed_task_no_artifact_refs() {
 fn test_continuation_all_failure_categories() {
     let categories = vec![
         (FailureCategory::AgentTimeout, "agent_timeout"),
+        (
+            FailureCategory::ApprovalTaskTimeout,
+            "approval_task_timeout",
+        ),
         (FailureCategory::ContextOverflow, "context_overflow"),
         (FailureCategory::DepthExhausted, "depth_exhausted"),
         (FailureCategory::LoopDetected, "loop_detected"),
         (FailureCategory::ProviderOverloaded, "provider_overloaded"),
         (FailureCategory::ProviderAuthError, "provider_auth_error"),
+        (FailureCategory::ProviderNotFound, "provider_not_found"),
         (FailureCategory::DependencyFailed, "dependency_failed"),
+        (FailureCategory::SoftFailure, "soft_failure"),
         (FailureCategory::AgentError, "agent_error"),
     ];
 

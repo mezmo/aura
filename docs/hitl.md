@@ -204,7 +204,11 @@ contains the attended prompt payload that an Aura-aware client renders before
 posting a decision. `aura.approval_completed` includes `decision_id`, terminal
 `outcome`, `duration_ms`, and `scope`. Outcome kinds are `approved`, `denied`,
 `timed_out`, `cancelled`, and `errored`; `errored` means the approval channel
-failed before a human decision was obtained.
+failed before a human decision was obtained. `cancelled` includes the reason:
+`client_disconnected`, `shutdown`, `sender_dropped`, or `task_timed_out`. The
+`task_timed_out` reason means an orchestration worker's per-call timeout expired
+while the approval was still pending; the task is reported to the coordinator as
+`approval_task_timeout`, not a generic agent timeout.
 
 ## Conversational route
 

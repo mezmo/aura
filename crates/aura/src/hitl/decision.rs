@@ -69,6 +69,7 @@ pub enum CancelReason {
     ClientDisconnected,
     Shutdown,
     SenderDropped,
+    TaskTimedOut,
 }
 
 /// The terminal outcome of a parked approval.

@@ -5,12 +5,14 @@
 //! [`DecisionRoute::decide`] holds the shared semantics (deadline, fail-closed
 //! mapping, event emission) in one place instead of per-impl.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aura_config::{DecisionRouteConfig, GlobPattern, HitlConfig, WebhookUrl};
+use tokio_util::sync::CancellationToken;
 
-use super::decision::{ApprovalDecision, ApprovalOutcome};
+use super::decision::{AgentScope, ApprovalDecision, ApprovalOutcome, CancelReason, DecisionId};
 use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
@@ -32,6 +34,7 @@ const WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct HitlRuntime {
     pub patterns: Arc<[GlobPattern]>,
     pub route: Arc<DecisionRoute>,
+    active: ActiveApprovalTracker,
 }
 
 impl HitlRuntime {
@@ -40,20 +43,157 @@ impl HitlRuntime {
     /// its connection pool are created here).
     #[must_use]
     pub fn from_config(config: &HitlConfig, pending_approvals: &PendingApprovals) -> Self {
+        let active = ActiveApprovalTracker::new();
         let route = match &config.route {
             DecisionRouteConfig::Webhook { url, timeout_secs } => DecisionRoute::Webhook {
                 client: WebhookClient::new(build_webhook_client(), url.clone()),
                 timeout: Duration::from_secs(*timeout_secs),
+                active: active.clone(),
             },
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
                 registry: pending_approvals.clone(),
                 timeout: Duration::from_secs(*timeout_secs),
+                active: active.clone(),
             },
         };
         Self {
             patterns: Arc::from(config.require_approval.clone()),
             route: Arc::new(route),
+            active,
         }
+    }
+
+    /// Cancel an active worker approval because the worker task budget expired.
+    /// Returns the cancelled approval so callers can report the precise cause.
+    pub fn cancel_worker_task_timeout(
+        &self,
+        task_id: usize,
+        worker: Option<&str>,
+    ) -> Option<ActiveApprovalSnapshot> {
+        self.active.cancel_worker_task_timeout(task_id, worker)
+    }
+}
+
+#[derive(Clone)]
+pub struct ActiveApprovalTracker(Arc<ActiveApprovalTrackerInner>);
+
+struct ActiveApprovalTrackerInner {
+    entries: Mutex<HashMap<DecisionId, ActiveApproval>>,
+}
+
+struct ActiveApproval {
+    scope: AgentScope,
+    tool_name: String,
+    cancel: CancellationToken,
+}
+
+/// Snapshot of an approval that was active when a worker timeout fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveApprovalSnapshot {
+    pub decision_id: DecisionId,
+    pub scope: AgentScope,
+    pub tool_name: String,
+}
+
+struct ActiveApprovalGuard {
+    id: DecisionId,
+    tracker: ActiveApprovalTracker,
+    cancel: CancellationToken,
+}
+
+impl ActiveApprovalTracker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(ActiveApprovalTrackerInner {
+            entries: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    fn register(&self, request: &ApprovalRequest) -> ActiveApprovalGuard {
+        let cancel = CancellationToken::new();
+        let id = request.decision_id;
+        let tool_name = request
+            .items
+            .first()
+            .map(|item| item.tool_name.clone())
+            .unwrap_or_default();
+        self.0
+            .entries
+            .lock()
+            .expect("active approval lock poisoned")
+            .insert(
+                id,
+                ActiveApproval {
+                    scope: request.scope.clone(),
+                    tool_name,
+                    cancel: cancel.clone(),
+                },
+            );
+        ActiveApprovalGuard {
+            id,
+            tracker: self.clone(),
+            cancel,
+        }
+    }
+
+    fn remove(&self, id: DecisionId) {
+        self.0
+            .entries
+            .lock()
+            .expect("active approval lock poisoned")
+            .remove(&id);
+    }
+
+    fn cancel_worker_task_timeout(
+        &self,
+        task_id: usize,
+        worker: Option<&str>,
+    ) -> Option<ActiveApprovalSnapshot> {
+        let snapshot = {
+            let entries = self
+                .0
+                .entries
+                .lock()
+                .expect("active approval lock poisoned");
+            entries
+                .iter()
+                .find_map(|(decision_id, active)| match &active.scope {
+                    AgentScope::Worker { task, .. }
+                        if task.task_id == task_id && task.worker.as_deref() == worker =>
+                    {
+                        Some((
+                            *decision_id,
+                            active.scope.clone(),
+                            active.tool_name.clone(),
+                            active.cancel.clone(),
+                        ))
+                    }
+                    AgentScope::Single { .. }
+                    | AgentScope::Worker { .. }
+                    | AgentScope::Coordinator { .. } => None,
+                })
+        };
+
+        snapshot.map(|(decision_id, scope, tool_name, cancel)| {
+            cancel.cancel();
+            ActiveApprovalSnapshot {
+                decision_id,
+                scope,
+                tool_name,
+            }
+        })
+    }
+}
+
+impl ActiveApprovalGuard {
+    fn cancelled(&self) -> tokio_util::sync::WaitForCancellationFuture<'_> {
+        self.cancel.cancelled()
+    }
+}
+
+impl Drop for ActiveApprovalGuard {
+    fn drop(&mut self) {
+        self.tracker.remove(self.id);
     }
 }
 
@@ -78,11 +218,13 @@ pub enum DecisionRoute {
     Conversational {
         registry: PendingApprovals,
         timeout: Duration,
+        active: ActiveApprovalTracker,
     },
     /// Unattended: one synchronous HTTP round-trip to a webhook.
     Webhook {
         client: WebhookClient,
         timeout: Duration,
+        active: ActiveApprovalTracker,
     },
 }
 
@@ -100,7 +242,11 @@ impl DecisionRoute {
         let scope = request.scope.clone();
 
         match self {
-            Self::Conversational { registry, timeout } => {
+            Self::Conversational {
+                registry,
+                timeout,
+                active,
+            } => {
                 approval_event_broker::publish(
                     &request_id,
                     ApprovalLifecycleEvent::Requested((&request).into()),
@@ -111,6 +257,7 @@ impl DecisionRoute {
                     + chrono::Duration::from_std(*timeout)
                         .expect("approval timeout fits in chrono");
                 let pending_event = events::pending(&request, &expires_at);
+                let active_guard = active.register(&request);
                 let handle = registry.register(request, *timeout);
 
                 approval_event_broker::publish(
@@ -119,7 +266,13 @@ impl DecisionRoute {
                 )
                 .await;
 
-                let outcome = handle.outcome(cancel).await;
+                let outcome = tokio::select! {
+                    biased;
+                    _ = active_guard.cancelled() => {
+                        ApprovalOutcome::Cancelled(CancelReason::TaskTimedOut)
+                    }
+                    outcome = handle.outcome(cancel) => outcome,
+                };
                 if matches!(
                     outcome,
                     ApprovalOutcome::TimedOut { .. } | ApprovalOutcome::Cancelled(_)
@@ -137,14 +290,25 @@ impl DecisionRoute {
 
                 Ok(outcome)
             }
-            Self::Webhook { client, timeout } => {
+            Self::Webhook {
+                client,
+                timeout,
+                active,
+            } => {
                 approval_event_broker::publish(
                     &request_id,
                     ApprovalLifecycleEvent::Requested((&request).into()),
                 )
                 .await;
 
-                let result = client.request_approval(&request, *timeout).await;
+                let active_guard = active.register(&request);
+                let result = tokio::select! {
+                    biased;
+                    _ = active_guard.cancelled() => {
+                        Ok(ApprovalOutcome::Cancelled(CancelReason::TaskTimedOut))
+                    }
+                    result = client.request_approval(&request, *timeout) => result,
+                };
                 let completed = match &result {
                     Ok(outcome) => {
                         events::completed(decision_id, outcome, &scope, started.elapsed())
@@ -240,7 +404,7 @@ mod tests {
     use super::super::protocol::{
         ApprovalDecisionWire, ApprovalItem, ApprovalRequest, ApprovalRequestWire, PROTOCOL_VERSION,
     };
-    use super::DecisionRoute;
+    use super::{ActiveApprovalTracker, DecisionRoute};
 
     #[test]
     fn single_agent_request_wire_shape() {
@@ -348,6 +512,7 @@ mod tests {
         let route = DecisionRoute::Conversational {
             registry: registry.clone(),
             timeout: Duration::from_secs(60),
+            active: ActiveApprovalTracker::new(),
         };
         let decision_id = DecisionId::generate();
         let request = ApprovalRequest {
@@ -394,6 +559,7 @@ mod tests {
         let route = DecisionRoute::Conversational {
             registry: registry.clone(),
             timeout: Duration::from_secs(60),
+            active: ActiveApprovalTracker::new(),
         };
         let decision_id = DecisionId::generate();
         let request = ApprovalRequest {
@@ -447,6 +613,7 @@ mod tests {
         let route = DecisionRoute::Conversational {
             registry: registry.clone(),
             timeout: Duration::from_secs(5),
+            active: ActiveApprovalTracker::new(),
         };
         let decision_id = DecisionId::generate();
         let request = ApprovalRequest {
@@ -486,6 +653,7 @@ mod tests {
         let route = DecisionRoute::Conversational {
             registry,
             timeout: Duration::from_secs(60),
+            active: ActiveApprovalTracker::new(),
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -515,6 +683,63 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn conversational_decide_cancelled_when_worker_task_times_out() {
+        use super::super::registry::{PendingApprovals, ResolveError};
+        use crate::orchestration::{RunId, TaskIdentity};
+        use std::time::Duration;
+
+        let registry = PendingApprovals::new();
+        let active = ActiveApprovalTracker::new();
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(60),
+            active: active.clone(),
+        };
+        let decision_id = DecisionId::generate();
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id,
+            request_id: "conv-req-task-timeout".into(),
+            scope: AgentScope::Worker {
+                run_id: "0191e8c0-1111-7000-8000-000000000000"
+                    .parse::<RunId>()
+                    .unwrap(),
+                task: TaskIdentity::new(7, Some("ops".into())),
+                session_id: None,
+            },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "dangerous_*".into(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "dangerous_apply".into(),
+                arguments: serde_json::json!({}),
+            }],
+        };
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+        let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
+            tokio::spawn(async move { route.decide(request, &cancel).await });
+
+        loop {
+            tokio::task::yield_now().await;
+            if active.cancel_worker_task_timeout(7, Some("ops")).is_some() {
+                break;
+            }
+        }
+
+        let result = decide_handle.await.unwrap().unwrap();
+        assert_eq!(
+            result,
+            ApprovalOutcome::Cancelled(super::super::decision::CancelReason::TaskTimedOut)
+        );
+        assert_eq!(
+            registry.resolve(&decision_id, ApprovalDecision::Approved),
+            Err(ResolveError::NotFound),
+            "late decisions for task-timed-out approvals must be rejected",
+        );
+    }
+
     #[tokio::test]
     async fn webhook_route_emits_requested_and_completed_on_channel_error() {
         let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
@@ -525,6 +750,7 @@ mod tests {
                 aura_config::WebhookUrl::new("http://127.0.0.1:9").unwrap(),
             ),
             timeout: std::time::Duration::from_secs(1),
+            active: ActiveApprovalTracker::new(),
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,

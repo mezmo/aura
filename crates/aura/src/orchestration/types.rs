@@ -489,6 +489,8 @@ pub enum TaskStatus {
 pub enum FailureCategory {
     /// Worker timed out before completing.
     AgentTimeout,
+    /// Worker task budget expired while a HITL approval was pending.
+    ApprovalTaskTimeout,
     /// Worker hit its context window limit.
     ContextOverflow,
     /// Worker exhausted its maximum tool call depth.
@@ -2421,11 +2423,16 @@ mod tests {
     fn test_failure_category_all_variants_serde_roundtrip() {
         let variants = [
             (FailureCategory::AgentTimeout, "agent_timeout"),
+            (
+                FailureCategory::ApprovalTaskTimeout,
+                "approval_task_timeout",
+            ),
             (FailureCategory::ContextOverflow, "context_overflow"),
             (FailureCategory::DepthExhausted, "depth_exhausted"),
             (FailureCategory::LoopDetected, "loop_detected"),
             (FailureCategory::ProviderOverloaded, "provider_overloaded"),
             (FailureCategory::ProviderAuthError, "provider_auth_error"),
+            (FailureCategory::ProviderNotFound, "provider_not_found"),
             (FailureCategory::DependencyFailed, "dependency_failed"),
             (FailureCategory::SoftFailure, "soft_failure"),
             (FailureCategory::AgentError, "agent_error"),

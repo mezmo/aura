@@ -180,6 +180,9 @@ fn outcome_to_wire(outcome: &ApprovalOutcome) -> ApprovalOutcomeWire {
         ApprovalOutcome::Cancelled(CancelReason::SenderDropped) => ApprovalOutcomeWire::Cancelled {
             reason: CancelReasonWire::SenderDropped,
         },
+        ApprovalOutcome::Cancelled(CancelReason::TaskTimedOut) => ApprovalOutcomeWire::Cancelled {
+            reason: CancelReasonWire::TaskTimedOut,
+        },
     }
 }
 
@@ -225,5 +228,20 @@ mod tests {
 
         let json = serde_json::to_value(&completed).unwrap();
         assert_eq!(json["outcome"]["reason"], "client_disconnected");
+    }
+
+    #[test]
+    fn task_timed_out_outcome_serializes_as_task_timed_out() {
+        let id = DecisionId::generate();
+        let scope = AgentScope::Single { session_id: None };
+        let completed = completed(
+            id,
+            &ApprovalOutcome::Cancelled(CancelReason::TaskTimedOut),
+            &scope,
+            std::time::Duration::from_millis(10),
+        );
+
+        let json = serde_json::to_value(&completed).unwrap();
+        assert_eq!(json["outcome"]["reason"], "task_timed_out");
     }
 }

@@ -122,6 +122,7 @@ mod tests {
 
     use aura_config::WebhookUrl;
 
+    use super::super::ActiveApprovalTracker;
     use super::super::decision::CancelReason;
     use super::super::route::{WebhookClient, build_webhook_client};
     use super::*;
@@ -136,6 +137,7 @@ mod tests {
                     WebhookUrl::new("http://localhost:9").unwrap(),
                 ),
                 timeout: Duration::from_secs(1),
+                active: ActiveApprovalTracker::new(),
             }),
             AgentScope::Single { session_id: None },
             "t".into(),
@@ -160,6 +162,7 @@ mod tests {
                     WebhookUrl::new("http://127.0.0.1:9").unwrap(),
                 ),
                 timeout: Duration::from_secs(2),
+                active: ActiveApprovalTracker::new(),
             }),
             AgentScope::Single { session_id: None },
             "req-test".into(),

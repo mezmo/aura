@@ -43,5 +43,5 @@ pub use decision::{
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
-pub use route::{ApprovalError, DecisionRoute, HitlRuntime, WebhookClient};
+pub use route::{ActiveApprovalTracker, ApprovalError, DecisionRoute, HitlRuntime, WebhookClient};
 pub use tool::{RequestApprovalArgs, RequestApprovalTool};
