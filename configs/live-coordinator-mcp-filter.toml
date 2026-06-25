@@ -1,0 +1,95 @@
+# Live smoke config for validating coordinator MCP filtering in orchestration mode.
+#
+# Intended use:
+#   CONFIG_PATH=configs/live-coordinator-mcp-filter.toml cargo run --bin aura-web-server
+#
+# Defaults are local-friendly: Ollama needs no API key, and the MCP endpoint can
+# be overridden with K8S_SRE_MCP_URL when running against a live AURA/SRE stack.
+
+memory_dir = "/tmp/aura-live-coordinator-mcp-filter"
+
+[agent]
+name = "Live Coordinator MCP Filter"
+alias = "live-coordinator-mcp-filter"
+system_prompt = """
+You are an SRE coordinator validating limited coordinator-side MCP access.
+Use coordinator MCP tools only for quick status checks. Delegate broad cluster
+inspection, metric analysis, and configuration changes to specialized workers.
+"""
+turn_depth = 8
+
+# This top-level agent filter intentionally conflicts with the empty worker
+# filter on `all-tools-compat`. That worker should still receive all MCP tools,
+# proving worker runtime filters override the inherited agent filter.
+mcp_filter = ["agent_filter_should_not_limit_workers"]
+
+[agent.llm]
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+base_url = "{{ env.OLLAMA_BASE_URL | default: 'http://127.0.0.1:11434' }}"
+temperature = 0.2
+context_window = 32768
+
+[mcp]
+sanitize_schemas = true
+
+[mcp.servers.k8s-sre]
+transport = "http_streamable"
+url = "{{ env.K8S_SRE_MCP_URL | default: 'http://127.0.0.1:8082/mcp' }}"
+headers = {}
+description = "Kubernetes SRE tools for live coordinator MCP filter validation"
+
+[orchestration]
+enabled = true
+max_planning_cycles = 2
+allow_direct_answers = true
+allow_clarification = true
+tools_in_planning = "full"
+max_tools_per_worker = 12
+
+# Coordinator gets only light-read/status tools. It should not receive broad
+# discovery, apply, alert creation, or metric query tools unless added here.
+coordinator_mcp_filter = [
+  "k8s_list_namespaces",
+  "prometheus_targets",
+  "alertmanager_get_status",
+]
+
+[orchestration.timeouts]
+per_call_timeout_secs = 90
+
+[orchestration.worker.discovery]
+description = "Kubernetes workload and service discovery"
+turn_depth = 8
+mcp_filter = ["k8s_list_*", "k8s_get_*"]
+preamble = """
+You are a Kubernetes discovery worker. Use Kubernetes tools to inspect live
+cluster state. Do not fabricate workloads, services, namespaces, labels, or ports.
+"""
+
+[orchestration.worker.metrics]
+description = "Prometheus metrics and target analysis"
+turn_depth = 6
+mcp_filter = ["prometheus_*"]
+preamble = """
+You are a Prometheus metrics worker. Use Prometheus tools for queries, targets,
+metadata, and label values. Report the exact query and summarized results.
+"""
+
+[orchestration.worker.monitoring]
+description = "Monitoring configuration and alerting changes"
+turn_depth = 8
+mcp_filter = ["k8s_apply_manifest", "k8s_list_service_monitors", "alertmanager_*"]
+preamble = """
+You are a monitoring configuration worker. Verify current state before creating
+or changing ServiceMonitors and alerting rules.
+"""
+
+[orchestration.worker.all-tools-compat]
+description = "Compatibility worker for proving empty worker mcp_filter still grants all MCP tools"
+turn_depth = 4
+mcp_filter = []
+preamble = """
+You are a compatibility test worker. Use this worker only when explicitly asked
+to verify that an empty worker mcp_filter still exposes all MCP tools.
+"""

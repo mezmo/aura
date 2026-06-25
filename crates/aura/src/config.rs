@@ -291,6 +291,20 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_matches_filter_empty_runtime_filter_overrides_agent_filter() {
+        let config = AgentRuntimeConfig {
+            agent: AgentSettings {
+                mcp_filter: Some(vec!["only_this".to_string()]),
+                ..AgentSettings::default()
+            },
+            mcp_filter: Some(vec![]),
+            ..Default::default()
+        };
+
+        assert!(config.tool_matches_filter("any_tool"));
+    }
+
+    #[test]
     fn test_tool_matches_filter_patterns() {
         let config = AgentRuntimeConfig {
             mcp_filter: Some(vec![

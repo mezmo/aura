@@ -439,7 +439,7 @@ vector_stores = []
 [orchestration.worker.knowledge]
 description = "Documentation and procedures"
 preamble = "You are a knowledge specialist."
-mcp_filter = []
+mcp_filter = ["__none__"]
 vector_stores = ["docs"]
 ```
 

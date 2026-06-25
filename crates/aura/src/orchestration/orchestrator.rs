@@ -614,9 +614,7 @@ impl Orchestrator {
             let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
                 .replace("{{worker_system_prompt}}", &worker.preamble);
             worker_config.preamble_override = Some(full_preamble);
-            if !worker.mcp_filter.is_empty() {
-                worker_config.mcp_filter = Some(worker.mcp_filter.clone());
-            }
+            worker_config.mcp_filter = Some(worker.mcp_filter.clone());
 
             // Filter vector stores: worker only gets stores explicitly assigned to it
             // Empty vector_stores = no RAG access (must opt-in)
