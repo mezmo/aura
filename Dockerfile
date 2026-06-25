@@ -2,6 +2,13 @@
 ### 000 Rust
 FROM rust:1.95 AS core
 
+# Native build deps for crates that compile C/C++ from source. sentencepiece-sys
+# (pulled in via gemini-tokenizer) builds its C++ library with cmake, so cmake
+# and a C++ compiler are required on top of the base C toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake g++ \
+  && rm -rf /var/lib/apt/lists/*
+
 ### 001 Runner
 FROM core AS runner
 
@@ -50,7 +57,7 @@ RUN <<EOR
 EOR
 
 # 003: linting & testing
-FROM rust:1.95 AS release-lint-test
+FROM core AS release-lint-test
 
 WORKDIR /usr/src/app
 
