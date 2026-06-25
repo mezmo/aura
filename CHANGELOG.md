@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.29.0](https://github.com/mezmo/aura/compare/v1.28.0...v1.29.0) (2026-06-25)
+
+
+### Features
+
+* **agent**: ability to hide agent [a042ad2](https://github.com/mezmo/aura/commit/a042ad2b6c586e3661c635dc0f5a91790a546ebe) - Dominic McAllister [#280](https://github.com/mezmo/aura/issues/280)
+
 # [1.28.0](https://github.com/mezmo/aura/compare/v1.27.0...v1.28.0) (2026-06-24)
 
 
