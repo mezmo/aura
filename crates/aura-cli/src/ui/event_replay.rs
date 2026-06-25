@@ -16,7 +16,7 @@ use crossterm::terminal;
 
 use crate::api::types::{DisplayEvent, snake_to_pascal_case};
 use crate::tools;
-use crate::ui::markdown::render_markdown;
+use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::text::truncate_with_ellipsis;
 
 use super::orchestrator::{
@@ -142,11 +142,7 @@ pub fn replay_event_log_global() {
             }
             DisplayEvent::AssistantResponse { summary, text } => {
                 if !summary.is_empty() {
-                    println!(
-                        "{} {}",
-                        "●".with(random_bullet_color()).attribute(Attribute::Bold),
-                        summary.as_str().attribute(Attribute::Bold),
-                    );
+                    render_summary(summary);
                 }
                 if !text.is_empty() {
                     println!();

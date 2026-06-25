@@ -23,7 +23,7 @@ use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{self, HISTORY_COUNT, HISTORY_DEPTH, LAST_READLINE_INPUT};
 use crate::repl::registry::{self, CommandContext, CommandOutcome};
 use crate::tools;
-use crate::ui::markdown::render_markdown;
+use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::prompt::{
     WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
     erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
@@ -1756,13 +1756,7 @@ pub fn run_repl(
                         });
 
                         if !summary.is_empty() {
-                            println!(
-                                "{} {}",
-                                "●"
-                                    .with(random_bullet_color())
-                                    .attribute(crossterm::style::Attribute::Bold),
-                                summary.attribute(crossterm::style::Attribute::Bold),
-                            );
+                            render_summary(&summary);
                         }
                         if !displayed_text.is_empty() {
                             println!();

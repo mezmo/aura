@@ -14,3 +14,4 @@ pub(crate) mod state;
 pub(crate) mod status_bar;
 pub(crate) mod stream_panel;
 pub(crate) mod text;
+pub(crate) mod wrap;
