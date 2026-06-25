@@ -57,6 +57,30 @@ impl DirectBackend {
         config_path: &str,
         extra_headers: Vec<(String, String)>,
     ) -> Result<Self> {
+        // Surface a friendly, actionable message when the config is simply
+        // missing, instead of leaking a raw "No such file or directory" IO
+        // error. This is the common first-run case: `aura-cli` defaults to
+        // `config.toml` in the current directory when neither `--config` nor
+        // `--api-url` is given.
+        if !std::path::Path::new(config_path).exists() {
+            // Derive the program name from the running executable rather than
+            // hardcoding it, so the suggested command stays correct if the
+            // binary is renamed (e.g. `aura-cli` -> `aura`).
+            let prog = std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "aura".to_string());
+            anyhow::bail!(
+                "No agent config found at `{config_path}`.\n\n\
+                 Standalone mode needs a TOML agent config. To get started:\n  \
+                 • run `{prog} init` to generate one in the current directory\n  \
+                 • pass `--config <path>` to point at an existing config file or directory\n  \
+                 • set `--api-url <url>` (or AURA_API_URL) to connect to a running aura-web-server instead"
+            );
+        }
+
         let configs =
             aura_config::load_config(config_path).context("Failed to load agent config")?;
         if configs.is_empty() {

@@ -238,9 +238,8 @@ fn standalone_otel_init_does_not_panic_without_collector() {
     // The actual failure should be the missing config — confirms we
     // got *past* OTel setup before hitting the expected error.
     assert!(
-        stderr.contains("Failed to load agent config")
-            || stderr.contains("No such file or directory"),
-        "expected config-load failure on stderr; got:\n{stderr}"
+        stderr.contains("No agent config found at"),
+        "expected friendly missing-config message on stderr; got:\n{stderr}"
     );
 }
 
