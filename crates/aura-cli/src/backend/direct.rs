@@ -106,6 +106,7 @@ impl DirectBackend {
         self.app_state
             .configs
             .iter()
+            .filter(|c| !c.agent.hidden)
             .map(|c| {
                 c.agent
                     .alias
@@ -514,6 +515,25 @@ mod tests {
             make_config("Code Agent", None, ""),
         ]);
         assert_eq!(backend.model_ids(), vec!["math", "Code Agent"]);
+    }
+
+    #[test]
+    fn model_ids_excludes_hidden_agents() {
+        let mut hidden = make_config("Secret Agent", None, "");
+        hidden.agent.hidden = true;
+        let backend = make_backend(vec![make_config("Visible Agent", None, ""), hidden]);
+        assert_eq!(backend.model_ids(), vec!["Visible Agent"]);
+    }
+
+    #[test]
+    fn find_matching_model_finds_hidden_agents() {
+        let mut hidden = make_config("Secret Agent", None, "");
+        hidden.agent.hidden = true;
+        let backend = make_backend(vec![hidden]);
+        assert_eq!(
+            backend.find_matching_model("Secret Agent"),
+            Some("Secret Agent".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1,3 +1,4 @@
+use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
 use crate::scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
@@ -669,6 +670,11 @@ pub struct AgentConfig {
     /// provide `[orchestration.worker.<name>.scratchpad]`.
     #[serde(default)]
     pub scratchpad: Option<ScratchpadConfig>,
+    /// Indicates an agent should be hidden from a models list endpoint.
+    /// Useful when a model is not ready to be  or should only be invoked
+    /// by known callers (default: false)
+    #[serde(default, deserialize_with = "lenient_bool::deserialize_bool")]
+    pub hidden: bool,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -697,6 +703,7 @@ impl Default for AgentConfig {
             client_tool_filter: None,
             llm: LlmConfig::default(),
             scratchpad: None,
+            hidden: bool::default(),
         }
     }
 }

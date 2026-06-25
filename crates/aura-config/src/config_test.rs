@@ -921,6 +921,40 @@ seed = 42
     }
 
     #[test]
+    fn test_hidden_property() {
+        let test_cases: Vec<(&str, bool)> = vec![
+            //missing
+            ("", false),
+            // boolean
+            ("hidden = false", false),
+            ("hidden = true", true),
+            // string representation
+            ("hidden = \"false\"", false),
+            ("hidden = \"true\"", true),
+        ];
+
+        for (input, expected) in &test_cases {
+            let config_str = format!(
+                r#"
+[agent]
+name = "Test"
+system_prompt = "meh"
+{}
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
+"#,
+                input
+            );
+            let config_str = config_str.as_str();
+            let config = load_config_from_str(config_str).expect("config should have parsed");
+            assert_eq!(config.agent.hidden, *expected);
+        }
+    }
+
+    #[test]
     fn test_bedrock_embedding_config_parsing() {
         let config_str = r#"
 [agent.llm]

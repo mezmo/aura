@@ -1,6 +1,7 @@
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod lenient_bool;
 pub mod lenient_int;
 pub mod loader;
 pub mod orchestration;

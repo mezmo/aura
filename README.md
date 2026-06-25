@@ -323,6 +323,15 @@ system_prompt = "You are a DevOps expert."
 model_owner = "mezmo"        # override owned_by in /v1/models (defaults to LLM provider)
 ```
 
+**Hidden agents** are excluded from `GET /v1/models` and the CLI's `/model` list but remain fully accessible when a caller targets them by exact name or alias. Set `hidden = true` to hide agents that are in development, restricted to known callers, or should not appear in model pickers (LibreChat, OpenWebUI, etc.):
+
+```toml
+[agent]
+name = "Internal Triage Agent"
+hidden = true         # excluded from /v1/models and CLI model list; still callable by name
+system_prompt = "..."
+```
+
 Aliases must be unique across all loaded configs. If two configs share the same `name` and neither has an alias, loading fails with a validation error.
 
 ### Configuration Sections
