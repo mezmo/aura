@@ -15,8 +15,8 @@ pub use super::state::{
     print_welcome_state, print_welcome_state_animated, push_display_event, push_mid_stream_history,
     random_bullet_color, reset_input_geometry, reset_task_colors, restore_style_preview_original,
     set_expanded_output, set_mid_stream_history, set_pretty, set_processing, set_queued_input,
-    set_selected_model, set_welcome_state, take_queued_input, task_color_for, term_size,
-    text_lines, with_event_log, with_event_log_mut,
+    set_selected_model, set_startup_status, set_welcome_state, take_queued_input, task_color_for,
+    term_size, text_lines, with_event_log, with_event_log_mut,
 };
 pub(crate) use super::state::{lock_term, take_pending_command};
 

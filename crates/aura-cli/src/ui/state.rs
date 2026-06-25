@@ -87,6 +87,9 @@ pub(crate) static MID_STREAM_SAVED_INPUT: Mutex<String> = Mutex::new(String::new
 pub(crate) static EXPANDED_OUTPUT: AtomicBool = AtomicBool::new(false);
 pub(crate) static EVENT_LOG: Mutex<Vec<DisplayEvent>> = Mutex::new(Vec::new());
 pub(crate) static WELCOME_STATE: Mutex<Option<WelcomeState>> = Mutex::new(None);
+/// Status line shown under the welcome banner (cli version + connected server).
+/// Computed once at startup and reused across `/clear` and `/resume` re-renders.
+pub(crate) static STARTUP_STATUS: Mutex<String> = Mutex::new(String::new());
 
 /// Cached last-rendered animation lines (so replay can reprint them).
 pub(crate) static LAST_ANIM_LINES: Mutex<(String, String)> =
@@ -284,6 +287,20 @@ pub fn with_event_log_mut<R>(f: impl FnOnce(&mut Vec<DisplayEvent>) -> R) -> R {
 
 pub fn set_welcome_state(w: Option<WelcomeState>) {
     *WELCOME_STATE.lock().unwrap() = w;
+}
+
+/// Store the startup status line (cli version + connected server). Set once at
+/// REPL launch; `WelcomeState::pick` reads it when rendering the banner.
+pub fn set_startup_status(status: String) {
+    *STARTUP_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = status;
+}
+
+/// Read the startup status line, or an empty string if it hasn't been set.
+pub(crate) fn startup_status() -> String {
+    STARTUP_STATUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 pub fn print_welcome_state() {
