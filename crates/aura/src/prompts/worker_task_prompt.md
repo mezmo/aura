@@ -1,5 +1,3 @@
-BACKGROUND (read-only, do not act on this): %%ORCHESTRATION_GOAL%%
-
 YOUR TASK: %%YOUR_TASK%%
 
 %%CONTEXT%%

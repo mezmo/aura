@@ -70,10 +70,6 @@ pub struct AgentRuntimeConfig {
     pub orchestration_persistence:
         Option<Arc<tokio::sync::Mutex<crate::orchestration::ExecutionPersistence>>>,
 
-    /// Shared conversation history for injecting `get_conversation_context` tool into workers.
-    /// When set, workers can retrieve conversation history on demand.
-    pub orchestration_chat_history: Option<Arc<Vec<rig::completion::Message>>>,
-
     /// Session ID for grouping orchestration runs under a shared namespace.
     /// When set, persistence paths become `{memory_dir}/{session_id}/{run_id}/...`.
     /// Threaded from the web server's `chat_session_id`.
@@ -105,7 +101,6 @@ impl Clone for AgentRuntimeConfig {
             preamble_override: self.preamble_override.clone(),
             mcp_filter: self.mcp_filter.clone(),
             orchestration_persistence: self.orchestration_persistence.clone(),
-            orchestration_chat_history: self.orchestration_chat_history.clone(),
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
@@ -139,13 +134,6 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .orchestration_persistence
                     .as_ref()
                     .map(|_| "<persistence>"),
-            )
-            .field(
-                "orchestration_chat_history",
-                &self
-                    .orchestration_chat_history
-                    .as_ref()
-                    .map(|h| format!("<{} messages>", h.len())),
             )
             .field("session_id", &self.session_id)
             .field(

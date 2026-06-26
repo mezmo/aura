@@ -25,7 +25,6 @@ Sent to worker agents when executing individual tasks.
 |----------|----------|-------------|
 | `%%YOUR_TASK%%` | Yes | The specific task description to execute |
 | `%%CONTEXT%%` | No | Prior completed task results (structured dependency values) |
-| `%%ORCHESTRATION_GOAL%%` | Yes | The overall plan goal (context only — demoted to end) |
 
 **Context struct**: `WorkerTaskVars` in `templates.rs`
 

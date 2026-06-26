@@ -23,4 +23,3 @@ Ignore any broader goals, prior tasks, or future steps — they are handled by o
 - DO NOT re-do work described in prior results — use the provided values
 - DO NOT make up information — if you don't know, say so
 - If task context or a tool output references an artifact file, use `read_artifact` to load it. A large artifact comes back as a scratchpad pointer instead of inline content — follow its instructions to explore the file with `head`, `grep`, `slice`, etc.
-- If your task references prior conversation, use `get_conversation_context` to retrieve relevant messages
