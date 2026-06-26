@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.30.1](https://github.com/mezmo/aura/compare/v1.30.0...v1.30.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* quickstart instructions [861023d](https://github.com/mezmo/aura/commit/861023d319d3ffc0706a89b1fa5c7e9bf12aec1d) - Gregory Janco [#288](https://github.com/mezmo/aura/issues/288)
+
 # [1.30.0](https://github.com/mezmo/aura/compare/v1.29.0...v1.30.0) (2026-06-25)
 
 
