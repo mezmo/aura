@@ -289,7 +289,6 @@ pipeline {
                 , dockerfile: "Dockerfile"
                 , args: [RELEASE_VERSION: FEATURE_TAG]
                 , docker_repo: DOCKER_REPO
-                , tooling: true
               )
               publishChecks(
                   name: 'Feature Container Build'

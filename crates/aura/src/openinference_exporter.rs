@@ -138,8 +138,10 @@ fn transform_span(mut span: SpanData) -> SpanData {
 
     // 2. Translate gen_ai.* → llm.* / tool.* (additive)
     let mut extra_attrs: Vec<KeyValue> = Vec::new();
+    let mut deferred_turn_prompt: Option<String> = None;
     let mut deferred_response: Option<String> = None;
     let mut deferred_reasoning: Option<String> = None;
+    let mut has_input_messages = false;
 
     for kv in &span.attributes {
         let key = kv.key.as_str();
@@ -167,18 +169,20 @@ fn transform_span(mut span: SpanData) -> SpanData {
             }
             // Agent turn attributes → OpenInference input/output for CHAIN and LLM spans
             "gen_ai.turn.prompt" if kind == "CHAIN" || kind == "LLM" => {
-                extra_attrs.push(KeyValue::new(ATTR_INPUT_VALUE, kv.value.clone()));
+                deferred_turn_prompt = Some(kv.value.to_string());
             }
             "gen_ai.turn.response" if kind == "CHAIN" || kind == "LLM" => {
                 deferred_response = Some(kv.value.to_string());
             }
             // Expand structured messages for LLM spans
             "gen_ai.input.messages" if kind == "LLM" => {
+                let before = extra_attrs.len();
                 expand_messages(
                     &kv.value.to_string(),
                     "llm.input_messages",
                     &mut extra_attrs,
                 );
+                has_input_messages = extra_attrs.len() > before;
             }
             "gen_ai.output.messages" if kind == "LLM" => {
                 expand_messages(
@@ -212,6 +216,14 @@ fn transform_span(mut span: SpanData) -> SpanData {
                 deferred_reasoning = Some(kv.value.to_string());
             }
             _ => {}
+        }
+    }
+
+    if let Some(prompt) = deferred_turn_prompt {
+        let normalized = normalize_turn_prompt(&prompt);
+        extra_attrs.push(KeyValue::new(ATTR_INPUT_VALUE, normalized.input_value));
+        if kind == "LLM" && !has_input_messages {
+            emit_messages("llm.input_messages", &normalized.messages, &mut extra_attrs);
         }
     }
 
@@ -278,32 +290,154 @@ fn truncate_string_values(attrs: &mut [KeyValue], limit: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Message parsing and normalization
+// ---------------------------------------------------------------------------
+
+struct NormalizedTurnPrompt {
+    input_value: String,
+    messages: Vec<ParsedMessage>,
+}
+
+struct ParsedMessage {
+    role: String,
+    content: String,
+}
+
+/// Decode a `gen_ai.turn.prompt` value into a display string and optional
+/// structured messages, unwrapping up to two levels of JSON string escaping.
+///
+/// Returns `input_value` for the `input.value` attribute and `messages` for
+/// optional `llm.input_messages.*` backfill when `gen_ai.input.messages` is
+/// absent or malformed.
+fn normalize_turn_prompt(raw: &str) -> NormalizedTurnPrompt {
+    let Some(value) = parse_json_value(raw) else {
+        return NormalizedTurnPrompt {
+            input_value: raw.to_owned(),
+            messages: Vec::new(),
+        };
+    };
+
+    if let Some(messages) = parse_messages(&value)
+        && !messages.is_empty()
+    {
+        let input_value = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        return NormalizedTurnPrompt {
+            input_value,
+            messages,
+        };
+    }
+
+    NormalizedTurnPrompt {
+        input_value: value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| raw.to_owned()),
+        messages: Vec::new(),
+    }
+}
+
 /// Parse a JSON array of `[{"role":"...","content":"..."},...]` and emit
 /// flattened OpenInference message attributes.
 ///
 /// Handles both raw JSON strings and strings that may arrive with surrounding
 /// quotes from `Display`-formatted OTel values (e.g. `"[{...}]"`).
 fn expand_messages(json_str: &str, prefix: &str, out: &mut Vec<KeyValue>) {
-    // Try raw first, then fall back to stripping surrounding quotes
-    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str).or_else(|_| {
-        let trimmed = json_str.trim_matches('"');
-        serde_json::from_str::<Vec<serde_json::Value>>(trimmed)
-    }) else {
+    let Some(value) = parse_json_value(json_str) else {
         return;
     };
-    for (i, msg) in arr.iter().enumerate() {
-        if let Some(role) = msg.get("role").and_then(|v| v.as_str()) {
-            out.push(KeyValue::new(
-                format!("{prefix}.{i}.message.role"),
-                role.to_string(),
-            ));
+    if let Some(messages) = parse_messages(&value) {
+        emit_messages(prefix, &messages, out);
+    }
+}
+
+/// Flatten parsed messages into `{prefix}.{i}.message.role` and
+/// `{prefix}.{i}.message.content` OpenInference attributes.
+fn emit_messages(prefix: &str, messages: &[ParsedMessage], out: &mut Vec<KeyValue>) {
+    for (i, message) in messages.iter().enumerate() {
+        out.push(KeyValue::new(
+            format!("{prefix}.{i}.message.role"),
+            message.role.clone(),
+        ));
+        out.push(KeyValue::new(
+            format!("{prefix}.{i}.message.content"),
+            message.content.clone(),
+        ));
+    }
+}
+
+/// Try to parse `raw` as JSON, unwrapping up to two levels of string escaping.
+///
+/// Handles three cases:
+/// 1. Raw JSON: `[{"role":"user",...}]` — parsed directly
+/// 2. Quoted JSON: `"[{\"role\":\"user\",...}]"` — outer quotes stripped
+/// 3. Double-escaped: parsed as string, then the inner string re-parsed
+fn parse_json_value(raw: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+        return parse_nested_json_string(value);
+    }
+
+    let trimmed = raw.trim_matches('"');
+    if trimmed != raw
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+    {
+        return parse_nested_json_string(value);
+    }
+
+    None
+}
+
+/// If the value is a JSON string that itself contains valid JSON, unwrap one
+/// level. Otherwise return the value as-is.
+fn parse_nested_json_string(value: serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::String(inner) => serde_json::from_str::<serde_json::Value>(&inner)
+            .ok()
+            .or(Some(serde_json::Value::String(inner))),
+        value => Some(value),
+    }
+}
+
+/// Extract messages from a JSON value — an array of message objects or a
+/// single message object.
+fn parse_messages(value: &serde_json::Value) -> Option<Vec<ParsedMessage>> {
+    match value {
+        serde_json::Value::Array(messages) => {
+            Some(messages.iter().filter_map(parse_message).collect())
         }
-        if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-            out.push(KeyValue::new(
-                format!("{prefix}.{i}.message.content"),
-                content.to_string(),
-            ));
+        serde_json::Value::Object(_) => parse_message(value).map(|message| vec![message]),
+        _ => None,
+    }
+}
+
+/// Extract role and content from a single `{"role":"...","content":"..."}` object.
+fn parse_message(value: &serde_json::Value) -> Option<ParsedMessage> {
+    let role = value.get("role")?.as_str()?.to_owned();
+    let content = parse_message_content(value.get("content")?)?;
+    Some(ParsedMessage { role, content })
+}
+
+/// Extract text from a message content field — either a plain string or a
+/// Rig-style `[{"type":"text","text":"..."}]` content-parts array.
+fn parse_message_content(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(content) => Some(content.clone()),
+        serde_json::Value::Array(parts) => {
+            let text_parts: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| {
+                    (part.get("type").and_then(|value| value.as_str()) == Some("text"))
+                        .then(|| part.get("text").and_then(|value| value.as_str()))
+                        .flatten()
+                })
+                .collect();
+            (!text_parts.is_empty()).then(|| text_parts.join("\n\n"))
         }
+        _ => None,
     }
 }
 
@@ -368,86 +502,10 @@ mod tests {
         assert_eq!(infer_span_kind("unknown_span"), "CHAIN");
     }
 
+    /// Verify gen_ai.* LLM attributes are translated to OpenInference equivalents,
+    /// original attributes are stripped, and keys match logging.rs constants.
     #[test]
-    fn test_adds_span_kind() {
-        let span = make_span("chat", vec![]);
-        let result = transform_span(span);
-        assert_eq!(
-            find_attr(&result, "openinference.span.kind")
-                .unwrap()
-                .to_string(),
-            "LLM"
-        );
-    }
-
-    #[test]
-    fn test_translates_gen_ai_system() {
-        let span = make_span("chat", vec![KeyValue::new("gen_ai.system", "openai")]);
-        let result = transform_span(span);
-        assert_eq!(
-            find_attr(&result, "llm.system").unwrap().to_string(),
-            "openai"
-        );
-        // Original gen_ai.* attribute should be removed
-        assert!(find_attr(&result, "gen_ai.system").is_none());
-    }
-
-    #[test]
-    fn test_translates_gen_ai_request_model() {
-        let span = make_span("chat", vec![KeyValue::new("gen_ai.request.model", "gpt-4")]);
-        let result = transform_span(span);
-        assert_eq!(
-            find_attr(&result, "llm.model_name").unwrap().to_string(),
-            "gpt-4"
-        );
-    }
-
-    #[test]
-    fn test_translates_token_counts() {
-        let span = make_span(
-            "agent.stream",
-            vec![
-                KeyValue::new("gen_ai.usage.input_tokens", 100i64),
-                KeyValue::new("gen_ai.usage.output_tokens", 50i64),
-            ],
-        );
-        let result = transform_span(span);
-        assert!(find_attr(&result, "llm.token_count.prompt").is_some());
-        assert!(find_attr(&result, "llm.token_count.completion").is_some());
-    }
-
-    /// Verify that transform_span output uses the same attribute names defined
-    /// as constants in `logging.rs`. This catches drift where someone changes
-    /// a constant value but forgets to update the exporter (or vice versa).
-    #[test]
-    fn test_tool_attributes_match_logging_constants() {
-        use crate::logging::{ATTR_TOOL_NAME, ATTR_TOOL_PARAMETERS};
-
-        let span = make_span(
-            "execute_tool",
-            vec![
-                KeyValue::new("gen_ai.tool.name", "search"),
-                KeyValue::new("gen_ai.tool.call.arguments", r#"{"q":"test"}"#),
-            ],
-        );
-        let result = transform_span(span);
-
-        // The translated attribute keys must exactly match the logging constants
-        assert!(
-            find_attr(&result, ATTR_TOOL_NAME).is_some(),
-            "tool.name attribute must use ATTR_TOOL_NAME constant (\"{}\")",
-            ATTR_TOOL_NAME
-        );
-        assert!(
-            find_attr(&result, ATTR_TOOL_PARAMETERS).is_some(),
-            "tool.parameters attribute must use ATTR_TOOL_PARAMETERS constant (\"{}\")",
-            ATTR_TOOL_PARAMETERS
-        );
-    }
-
-    /// Verify LLM attribute names in transform_span match logging.rs constants.
-    #[test]
-    fn test_llm_attributes_match_logging_constants() {
+    fn test_translates_llm_attributes() {
         use crate::logging::{
             ATTR_LLM_MODEL_NAME, ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT,
         };
@@ -463,26 +521,58 @@ mod tests {
         );
         let result = transform_span(span);
 
-        assert!(
-            find_attr(&result, ATTR_LLM_SYSTEM).is_some(),
-            "must use ATTR_LLM_SYSTEM constant (\"{}\")",
-            ATTR_LLM_SYSTEM
+        // Values translated correctly
+        assert_eq!(
+            find_attr(&result, "llm.system").unwrap().to_string(),
+            "openai"
         );
-        assert!(
-            find_attr(&result, ATTR_LLM_MODEL_NAME).is_some(),
-            "must use ATTR_LLM_MODEL_NAME constant (\"{}\")",
-            ATTR_LLM_MODEL_NAME
+        assert_eq!(
+            find_attr(&result, "llm.model_name").unwrap().to_string(),
+            "gpt-4"
         );
-        assert!(
-            find_attr(&result, ATTR_LLM_TOKEN_PROMPT).is_some(),
-            "must use ATTR_LLM_TOKEN_PROMPT constant (\"{}\")",
-            ATTR_LLM_TOKEN_PROMPT
+        assert!(find_attr(&result, "llm.token_count.prompt").is_some());
+        assert!(find_attr(&result, "llm.token_count.completion").is_some());
+
+        // Keys match logging.rs constants (drift guard)
+        assert!(find_attr(&result, ATTR_LLM_SYSTEM).is_some());
+        assert!(find_attr(&result, ATTR_LLM_MODEL_NAME).is_some());
+        assert!(find_attr(&result, ATTR_LLM_TOKEN_PROMPT).is_some());
+        assert!(find_attr(&result, ATTR_LLM_TOKEN_COMPLETION).is_some());
+
+        // Originals stripped
+        assert!(find_attr(&result, "gen_ai.system").is_none());
+        assert!(find_attr(&result, "gen_ai.request.model").is_none());
+    }
+
+    /// Verify gen_ai.tool.* attributes are translated, keys match logging.rs constants.
+    #[test]
+    fn test_translates_tool_attributes() {
+        use crate::logging::{ATTR_TOOL_NAME, ATTR_TOOL_PARAMETERS};
+
+        let span = make_span(
+            "execute_tool",
+            vec![
+                KeyValue::new("gen_ai.tool.name", "search"),
+                KeyValue::new("gen_ai.tool.call.arguments", r#"{"q":"test"}"#),
+                KeyValue::new("gen_ai.tool.call.result", "found it"),
+            ],
         );
-        assert!(
-            find_attr(&result, ATTR_LLM_TOKEN_COMPLETION).is_some(),
-            "must use ATTR_LLM_TOKEN_COMPLETION constant (\"{}\")",
-            ATTR_LLM_TOKEN_COMPLETION
+        let result = transform_span(span);
+
+        // Values translated correctly
+        assert_eq!(
+            find_attr(&result, "tool.name").unwrap().to_string(),
+            "search"
         );
+        assert!(find_attr(&result, "tool.parameters").is_some());
+        assert_eq!(
+            find_attr(&result, "output.value").unwrap().to_string(),
+            "found it"
+        );
+
+        // Keys match logging.rs constants (drift guard)
+        assert!(find_attr(&result, ATTR_TOOL_NAME).is_some());
+        assert!(find_attr(&result, ATTR_TOOL_PARAMETERS).is_some());
     }
 
     /// Verify I/O attribute names in transform_span match logging.rs constants.
@@ -513,39 +603,6 @@ mod tests {
             "must use ATTR_OUTPUT_VALUE constant (\"{}\")",
             ATTR_OUTPUT_VALUE
         );
-    }
-
-    #[test]
-    fn test_translates_tool_attributes() {
-        let span = make_span(
-            "execute_tool",
-            vec![
-                KeyValue::new("gen_ai.tool.name", "search"),
-                KeyValue::new("gen_ai.tool.call.arguments", r#"{"q":"test"}"#),
-                KeyValue::new("gen_ai.tool.call.result", "found it"),
-            ],
-        );
-        let result = transform_span(span);
-        assert_eq!(
-            find_attr(&result, "tool.name").unwrap().to_string(),
-            "search"
-        );
-        assert!(find_attr(&result, "tool.parameters").is_some());
-        assert_eq!(
-            find_attr(&result, "output.value").unwrap().to_string(),
-            "found it"
-        );
-    }
-
-    #[test]
-    fn test_tool_result_only_on_tool_spans() {
-        // On a non-TOOL span, gen_ai.tool.call.result should NOT produce output.value
-        let span = make_span(
-            "chat",
-            vec![KeyValue::new("gen_ai.tool.call.result", "some result")],
-        );
-        let result = transform_span(span);
-        assert!(find_attr(&result, "output.value").is_none());
     }
 
     #[test]
@@ -605,15 +662,26 @@ mod tests {
     }
 
     #[test]
-    fn test_messages_only_expanded_on_llm_spans() {
+    fn test_expand_messages_escaped_json_string() {
         let messages = r#"[{"role":"user","content":"hello"}]"#;
+        let escaped_messages = serde_json::to_string(messages).unwrap();
         let span = make_span(
-            "agent.stream",
-            vec![KeyValue::new("gen_ai.input.messages", messages)],
+            "chat",
+            vec![KeyValue::new("gen_ai.input.messages", escaped_messages)],
         );
         let result = transform_span(span);
-        // AGENT span — messages should NOT be expanded
-        assert!(find_attr(&result, "llm.input_messages.0.message.role").is_none());
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "user"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            "hello"
+        );
     }
 
     #[test]
@@ -633,37 +701,104 @@ mod tests {
             find_attr(&result, "input.value").unwrap().to_string(),
             "What is Rust?"
         );
+        assert!(find_attr(&result, "llm.input_messages.0.message.role").is_none());
     }
 
     #[test]
-    fn test_agent_turn_response_goes_to_output_messages_not_output_value() {
+    fn test_agent_turn_rig_message_prompt_populates_input_messages() {
+        let prompt = "BACKGROUND (read-only, do not act on this): Create /app/hello.txt\n\nYOUR TASK: Run the command.";
+        let prompt_json = serde_json::to_string(prompt).unwrap();
+        let rig_message =
+            format!(r#"{{"role":"user","content":[{{"type":"text","text":{prompt_json}}}]}}"#);
+
         let span = make_span(
             "agent.turn",
-            vec![KeyValue::new(
-                "gen_ai.turn.response",
-                "Rust is a systems programming language.",
-            )],
+            vec![KeyValue::new("gen_ai.turn.prompt", rig_message)],
         );
         let result = transform_span(span);
-        // LLM span: response goes to llm.output_messages, NOT output.value
-        assert!(find_attr(&result, "output.value").is_none());
+
         assert_eq!(
-            find_attr(&result, "llm.output_messages.0.message.content")
+            find_attr(&result, "input.value").unwrap().to_string(),
+            prompt
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.role")
                 .unwrap()
                 .to_string(),
-            "Rust is a systems programming language."
+            "user"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            prompt
         );
     }
 
     #[test]
-    fn test_agent_turn_prompt_not_translated_on_tool_span() {
+    fn test_agent_turn_escaped_rig_message_prompt_populates_input_messages() {
+        let prompt = "Create /app/hello.txt with the content \"Hello, world!\"";
+        let prompt_json = serde_json::to_string(prompt).unwrap();
+        let rig_message =
+            format!(r#"{{"role":"user","content":[{{"type":"text","text":{prompt_json}}}]}}"#);
+        let escaped_rig_message = serde_json::to_string(&rig_message).unwrap();
+
         let span = make_span(
-            "execute_tool",
-            vec![KeyValue::new("gen_ai.turn.prompt", "hello")],
+            "agent.turn",
+            vec![KeyValue::new("gen_ai.turn.prompt", escaped_rig_message)],
         );
         let result = transform_span(span);
-        // TOOL span — turn.prompt should NOT become input.value
-        assert!(find_attr(&result, "input.value").is_none());
+
+        assert_eq!(
+            find_attr(&result, "input.value").unwrap().to_string(),
+            prompt
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "user"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_agent_turn_prompt_backfills_when_input_messages_are_malformed() {
+        let prompt = "Run the diagnostic command.";
+        let prompt_json = serde_json::to_string(prompt).unwrap();
+        let rig_message =
+            format!(r#"{{"role":"user","content":[{{"type":"text","text":{prompt_json}}}]}}"#);
+
+        let span = make_span(
+            "agent.turn",
+            vec![
+                KeyValue::new("gen_ai.input.messages", "not json"),
+                KeyValue::new("gen_ai.turn.prompt", rig_message),
+            ],
+        );
+        let result = transform_span(span);
+
+        assert_eq!(
+            find_attr(&result, "input.value").unwrap().to_string(),
+            prompt
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "user"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            prompt
+        );
     }
 
     #[test]
@@ -786,7 +921,8 @@ mod tests {
             )],
         );
         let result = transform_span(span);
-        // Assistant message at index 0
+        // LLM span: response goes to output_messages, NOT output.value
+        assert!(find_attr(&result, "output.value").is_none());
         assert_eq!(
             find_attr(&result, "llm.output_messages.0.message.role")
                 .unwrap()
@@ -803,9 +939,32 @@ mod tests {
         assert!(find_attr(&result, "llm.output_messages.1.message.role").is_none());
     }
 
+    /// Verify that span-kind-specific attributes are NOT emitted on wrong span kinds.
     #[test]
-    fn test_non_llm_span_no_output_messages() {
-        // TOOL span with gen_ai.turn.reasoning should NOT produce llm.output_messages
+    fn test_span_kind_gating() {
+        // tool.call.result → output.value only on TOOL spans
+        let span = make_span(
+            "chat",
+            vec![KeyValue::new("gen_ai.tool.call.result", "some result")],
+        );
+        assert!(find_attr(&transform_span(span), "output.value").is_none());
+
+        // input.messages only expanded on LLM spans
+        let messages = r#"[{"role":"user","content":"hello"}]"#;
+        let span = make_span(
+            "agent.stream",
+            vec![KeyValue::new("gen_ai.input.messages", messages)],
+        );
+        assert!(find_attr(&transform_span(span), "llm.input_messages.0.message.role").is_none());
+
+        // turn.prompt → input.value only on CHAIN/LLM spans
+        let span = make_span(
+            "execute_tool",
+            vec![KeyValue::new("gen_ai.turn.prompt", "hello")],
+        );
+        assert!(find_attr(&transform_span(span), "input.value").is_none());
+
+        // turn.reasoning + output_messages only on CHAIN/LLM spans
         let span = make_span(
             "execute_tool",
             vec![KeyValue::new(
@@ -815,7 +974,6 @@ mod tests {
         );
         let result = transform_span(span);
         assert!(find_attr(&result, "llm.output_messages.0.message.role").is_none());
-        // Also verify turn.reasoning is NOT emitted for TOOL spans
         assert!(find_attr(&result, "turn.reasoning").is_none());
     }
 
@@ -1212,6 +1370,49 @@ mod pipeline_tests {
                 .iter()
                 .all(|kv| !kv.key.as_str().starts_with("gen_ai.")),
             "gen_ai.* attributes should be stripped"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_agent_turn_rig_message_prompt() {
+        let (subscriber, memory) = build_pipeline();
+        let prompt = "BACKGROUND (read-only, do not act on this): Create /app/hello.txt\n\nYOUR TASK: Run the command.";
+        let prompt_json = serde_json::to_string(prompt).unwrap();
+        let rig_message =
+            format!(r#"{{"role":"user","content":[{{"type":"text","text":{prompt_json}}}]}}"#);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "agent.turn",
+                "gen_ai.agent.name" = "Worker Agent",
+                "gen_ai.turn.prompt" = %rig_message,
+                "gen_ai.turn.response" = tracing::field::Empty,
+            );
+            let _guard = span.enter();
+            span.record("gen_ai.turn.response", "Created the file successfully.");
+        });
+
+        let spans = collect_spans(&memory);
+        let turn = find_span_by_name(&spans, "agent.turn");
+
+        assert_eq!(find_attr(turn, "input.value").unwrap().to_string(), prompt);
+        assert_eq!(
+            find_attr(turn, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "user"
+        );
+        assert_eq!(
+            find_attr(turn, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            prompt
+        );
+        assert_eq!(
+            find_attr(turn, "llm.output_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            "Created the file successfully."
         );
     }
 
