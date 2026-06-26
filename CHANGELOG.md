@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.30.3](https://github.com/mezmo/aura/compare/v1.30.2...v1.30.3) (2026-06-26)
+
+
+### Bug Fixes
+
+* **otel**: decode agent turn prompts [1ab3f6a](https://github.com/mezmo/aura/commit/1ab3f6a98fc8c96ec6d8aacedb3cf0a71cc6da8d) - Mike Shearer [#273](https://github.com/mezmo/aura/issues/273)
+
 ## [1.30.2](https://github.com/mezmo/aura/compare/v1.30.1...v1.30.2) (2026-06-26)
 
 
