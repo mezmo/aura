@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.30.4](https://github.com/mezmo/aura/compare/v1.30.3...v1.30.4) (2026-06-26)
+
+
+### Bug Fixes
+
+* **orchestration**: remove worker prompt scope leakage [18258aa](https://github.com/mezmo/aura/commit/18258aa0e3e6211043f8fe67d4bd3b619862d3d7) - Justin Gross [#215](https://github.com/mezmo/aura/issues/215) [#216](https://github.com/mezmo/aura/issues/216)
+
 ## [1.30.3](https://github.com/mezmo/aura/compare/v1.30.2...v1.30.3) (2026-06-26)
 
 
