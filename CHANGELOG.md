@@ -1,5 +1,12 @@
 ## Changelog
 
+## [1.30.2](https://github.com/mezmo/aura/compare/v1.30.1...v1.30.2) (2026-06-26)
+
+
+### Bug Fixes
+
+* **feature**: feature builds needs to work [ada4cf8](https://github.com/mezmo/aura/commit/ada4cf8ae5be2b463ba0182addce16fa9f467932) - Phil Ciampini
+
 ## [1.30.1](https://github.com/mezmo/aura/compare/v1.30.0...v1.30.1) (2026-06-26)
 
 
