@@ -668,15 +668,10 @@ fn test_worker_task_context_with_dependency_results() {
         [Full result (3200 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
 
     let rendered = render_worker_task_prompt(&WorkerTaskVars {
-        orchestration_goal: "Investigate error rates in payments service",
         context,
         your_task: "Analyze connection pool metrics for the services identified in Task 0",
     });
 
-    assert!(
-        rendered.contains("Investigate error rates"),
-        "goal in worker prompt"
-    );
     assert!(
         rendered.contains("Analyze connection pool"),
         "task description"
@@ -1109,13 +1104,11 @@ fn test_preamble_empty_system_prompt() {
 #[test]
 fn test_worker_task_empty_context() {
     let rendered = render_worker_task_prompt(&WorkerTaskVars {
-        orchestration_goal: "Investigate error rates",
         context: "",
         your_task: "Search logs for error patterns",
     });
 
     assert!(rendered.contains("YOUR TASK: Search logs"), "task present");
-    assert!(rendered.contains("Investigate error rates"), "goal present");
     assert!(
         rendered.contains("submit_result"),
         "submit_result instruction"

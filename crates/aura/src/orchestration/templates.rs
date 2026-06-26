@@ -14,7 +14,6 @@
 //!
 //! ```ignore
 //! let rendered = render_worker_task_prompt(&WorkerTaskVars {
-//!     orchestration_goal: "Analyze logs",
 //!     context: "",
 //!     your_task: "List all error entries",
 //! });
@@ -44,17 +43,15 @@ pub trait TemplateVars {
 /// Variables for the worker task prompt.
 #[derive(Debug, Clone)]
 pub struct WorkerTaskVars<'a> {
-    pub orchestration_goal: &'a str,
     pub context: &'a str,
     pub your_task: &'a str,
 }
 
 impl TemplateVars for WorkerTaskVars<'_> {
-    const VARS: &'static [&'static str] = &["ORCHESTRATION_GOAL", "CONTEXT", "YOUR_TASK"];
+    const VARS: &'static [&'static str] = &["CONTEXT", "YOUR_TASK"];
 
     fn render(&self, template: &str) -> String {
         template
-            .replace("%%ORCHESTRATION_GOAL%%", self.orchestration_goal)
             .replace("%%CONTEXT%%", self.context)
             .replace("%%YOUR_TASK%%", self.your_task)
     }
@@ -204,18 +201,16 @@ mod tests {
     #[test]
     fn test_render_basic_substitution() {
         let vars = WorkerTaskVars {
-            orchestration_goal: "test goal",
             context: "test context",
             your_task: "test task",
         };
-        let rendered = vars.render("Goal: %%ORCHESTRATION_GOAL%%, Task: %%YOUR_TASK%%");
-        assert_eq!(rendered, "Goal: test goal, Task: test task");
+        let rendered = vars.render("Context: %%CONTEXT%%, Task: %%YOUR_TASK%%");
+        assert_eq!(rendered, "Context: test context, Task: test task");
     }
 
     #[test]
     fn test_render_empty_value() {
         let vars = WorkerTaskVars {
-            orchestration_goal: "test",
             context: "",
             your_task: "test",
         };
@@ -226,13 +221,12 @@ mod tests {
     #[test]
     fn test_render_preserves_json_braces() {
         let vars = WorkerTaskVars {
-            orchestration_goal: "test",
             context: "test",
             your_task: "test",
         };
-        let template = r#"{"goal": "%%ORCHESTRATION_GOAL%%", "nested": {"key": "value"}}"#;
+        let template = r#"{"task": "%%YOUR_TASK%%", "nested": {"key": "value"}}"#;
         let rendered = vars.render(template);
-        assert_eq!(rendered, r#"{"goal": "test", "nested": {"key": "value"}}"#);
+        assert_eq!(rendered, r#"{"task": "test", "nested": {"key": "value"}}"#);
     }
 
     // =========================================================================
@@ -563,7 +557,6 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         );
         let _ = writeln!(out, "{separator}\n");
         let task0 = render_worker_task_prompt(&WorkerTaskVars {
-            orchestration_goal: "Calculate (3+7)*2 and find files in /data",
             context: "",
             your_task: "Calculate (3 + 7) * 2 using mock_tool",
         });
@@ -576,7 +569,6 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         );
         let _ = writeln!(out, "{separator}\n");
         let task1 = render_worker_task_prompt(&WorkerTaskVars {
-            orchestration_goal: "Calculate (3+7)*2 and find files in /data",
             context: "COMPLETED — Task 0 (arithmetic): (3+7)*2 = 20\n\n",
             your_task: "List files in the /data directory using list_files",
         });

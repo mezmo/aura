@@ -5,7 +5,6 @@
 //! when a request arrives, ensuring MCP progress notifications route correctly
 //! and avoiding duplicate resource allocation.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,14 +50,11 @@ impl OrchestratorFactory {
         request_id: String,
         usage_state: crate::UsageState,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
-        let mut agent_config = self.agent_config.clone();
+        let agent_config = self.agent_config.clone();
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
-
-        // Inject conversation history for worker access
-        agent_config.orchestration_chat_history = Some(Arc::new(chat_history.clone()));
 
         let cancel_token_clone = cancel_token.clone();
         // Capture parent span so child spans nest correctly in tracing.

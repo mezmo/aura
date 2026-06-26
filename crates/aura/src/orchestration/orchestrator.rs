@@ -92,7 +92,6 @@ struct TaskExecutionParams<'a> {
     task_description: &'a str,
     task_context: &'a Option<String>,
     worker_name: Option<&'a str>,
-    plan_goal: &'a str,
 }
 
 /// Result from `execute_task` including structured output from `submit_result`.
@@ -2481,9 +2480,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
-        // Capture the plan goal to pass to each worker
-        let plan_goal = plan.goal.clone();
-
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
@@ -2535,25 +2531,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Execute all ready tasks in parallel using FuturesUnordered
-            // Each task receives the plan goal for context
-            let goal = plan_goal.clone();
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
-                .map(|(task_id, task_desc, task_context, worker_name)| {
-                    let goal = goal.clone();
-                    async move {
+                .map(
+                    |(task_id, task_desc, task_context, worker_name)| async move {
                         let start_time = Instant::now();
                         let params = TaskExecutionParams {
                             task_description: &task_desc,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
-                            plan_goal: &goal,
                         };
                         let result = self.execute_task(task_id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
-                    }
-                })
+                    },
+                )
                 .collect();
 
             // Collect results as they complete and update plan
@@ -2775,7 +2767,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             task_description,
             task_context,
             worker_name,
-            plan_goal,
         } = params;
 
         {
@@ -2794,7 +2785,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .unwrap_or_default();
         let base_worker_prompt =
             super::templates::render_worker_task_prompt(&super::templates::WorkerTaskVars {
-                orchestration_goal: plan_goal,
                 context: &context_str,
                 your_task: task_description,
             });
@@ -4969,74 +4959,6 @@ mod tests {
             assert!(output.found);
             assert_eq!(output.content, format!("result {}", i));
         }
-    }
-
-    // ========================================================================
-    // Conversation context tool tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_conversation_context_large_n() {
-        use super::super::tools::get_conversation_context::{
-            GetConversationContextArgs, GetConversationContextTool,
-        };
-        use rig::completion::Message;
-        use rig::tool::Tool;
-
-        // last_n larger than history returns all messages
-        let history = Arc::new(vec![Message::user("hello"), Message::assistant("hi there")]);
-        let tool = GetConversationContextTool::new(history);
-        let result = tool
-            .call(GetConversationContextArgs {
-                last_n: Some(100),
-                max_chars: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_conversation_context_zero_n() {
-        use super::super::tools::get_conversation_context::{
-            GetConversationContextArgs, GetConversationContextTool,
-        };
-        use rig::completion::Message;
-        use rig::tool::Tool;
-
-        // last_n of 0 returns all messages
-        let history = Arc::new(vec![Message::user("hello"), Message::assistant("hi there")]);
-        let tool = GetConversationContextTool::new(history);
-        let result = tool
-            .call(GetConversationContextArgs {
-                last_n: Some(0),
-                max_chars: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_conversation_context_single_message() {
-        use super::super::tools::get_conversation_context::{
-            GetConversationContextArgs, GetConversationContextTool,
-        };
-        use rig::completion::Message;
-        use rig::tool::Tool;
-
-        let history = Arc::new(vec![Message::user("what is 2+2?")]);
-        let tool = GetConversationContextTool::new(history);
-        let result = tool
-            .call(GetConversationContextArgs {
-                last_n: None,
-                max_chars: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.count, 1);
-        assert_eq!(result.messages[0].role, "user");
-        assert!(result.messages[0].content.contains("2+2"));
     }
 
     // ========================================================================

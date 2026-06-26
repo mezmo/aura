@@ -957,13 +957,6 @@ impl Agent {
             builder_state = builder_state.add_tool(submit_tool);
         }
 
-        // Add get_conversation_context tool when chat history is available
-        if let Some(ref history) = config.orchestration_chat_history {
-            let context_tool =
-                crate::orchestration::GetConversationContextTool::new(history.clone());
-            builder_state = builder_state.add_tool(context_tool);
-        }
-
         // Add additional custom tools (e.g., CLI local tools in standalone mode)
         if !additional_tools.is_empty() {
             tracing::info!("Adding {} additional custom tools", additional_tools.len());

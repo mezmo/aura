@@ -1683,12 +1683,8 @@ pub fn is_scratchpad_tool(tool_name: &str) -> bool {
 /// Orchestration-internal tool names that are not MCP tools and therefore
 /// not covered by `ObserverWrapper`. Used alongside `is_scratchpad_tool`
 /// to gate event emission in `stream_and_forward`.
-static ORCHESTRATION_INTERNAL_TOOLS: &[&str] = &[
-    "read_artifact",
-    "submit_result",
-    "list_prior_runs",
-    "get_conversation_context",
-];
+static ORCHESTRATION_INTERNAL_TOOLS: &[&str] =
+    &["read_artifact", "submit_result", "list_prior_runs"];
 
 /// True for any tool that is NOT an MCP tool — scratchpad exploration tools
 /// and orchestration-internal tools. These are not wrapped by
