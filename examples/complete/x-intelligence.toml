@@ -1,0 +1,43 @@
+# X intelligence agent - Xquik MCP.
+# Searches public X data and helps analyze accounts, posts, and trends.
+#
+# Prerequisites:
+#   export OPENAI_API_KEY="sk-..."
+#   export XQUIK_API_KEY="..."
+#
+# Usage:
+#   CONFIG_PATH=examples/complete/x-intelligence.toml cargo run --bin aura-web-server
+
+[mcp]
+sanitize_schemas = true
+
+# Xquik - X data search and analysis
+# Uses Xquik's hosted Streamable HTTP MCP endpoint.
+[mcp.servers.xquik]
+transport = "http_streamable"
+url = "https://xquik.com/mcp"
+description = "X data search, account lookup, and public post analysis"
+
+[mcp.servers.xquik.headers]
+Authorization = "Bearer {{ env.XQUIK_API_KEY | default: '' }}"
+
+[agent]
+name = "X Intelligence Agent"
+alias = "x-intelligence"
+model_owner = "mezmo"
+system_prompt = """
+You are an X intelligence assistant with access to Xquik.
+Help users research public X accounts, posts, topics, and audience signals.
+
+Workflow:
+1. Use Xquik tools for current X data instead of guessing.
+2. Summarize findings with source handles, post links, and timestamps.
+3. Separate observed data from interpretation.
+4. Ask for a narrower account, topic, or date range when needed.
+"""
+turn_depth = 10
+
+[agent.llm]
+provider = "openai"
+api_key = "{{ env.OPENAI_API_KEY }}"
+model = "gpt-5.2"

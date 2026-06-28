@@ -49,6 +49,7 @@ Full agent compositions that combine an LLM provider with real MCP tool servers 
 | [`incident-response-mezmo.toml`](complete/incident-response-mezmo.toml) | PagerDuty + Mezmo |
 | [`incident-response-datadog.toml`](complete/incident-response-datadog.toml) | PagerDuty + Datadog |
 | [`kubernetes-sre.toml`](complete/kubernetes-sre.toml) | K8s MCP + Prometheus |
+| [`x-intelligence.toml`](complete/x-intelligence.toml) | Xquik MCP |
 
 ### Serving Multiple Agents
 
