@@ -25,7 +25,7 @@ use super::orchestrator::{
 use super::state::{
     EVENT_LOG, EXPANDED_OUTPUT, WELCOME_STATE, random_bullet_color, task_color_for,
 };
-use super::status_bar::{reset_status_bar_tokens, set_status_bar_tokens};
+use super::status_bar::{reset_status_bar_tokens, set_context_window_usage, set_status_bar_tokens};
 
 /// Clear the terminal and replay all recorded events.
 pub fn replay_event_log_global() {
@@ -188,6 +188,14 @@ pub fn replay_event_log_global() {
                 completion_tokens,
             } => {
                 set_status_bar_tokens(*prompt_tokens, *completion_tokens);
+                i += 1;
+            }
+            DisplayEvent::ContextUsage {
+                context_tokens,
+                response_tokens,
+                context_window,
+            } => {
+                set_context_window_usage(*context_tokens, *response_tokens, *context_window);
                 i += 1;
             }
             DisplayEvent::OrchestratorScratchpadSavings {

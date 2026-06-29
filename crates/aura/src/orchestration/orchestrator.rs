@@ -2884,6 +2884,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
             // stream_and_forward, so failed attempts also contribute.
             if let Ok(ref response) = stream_result {
                 last_usage = response.usage;
+
+                // Emit this agent's context-window occupancy from its final
+                // response turn — provider-reported, no local tokenizer.
+                if let Some(tx) = event_tx {
+                    let agent_id = worker_name
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| self.orchestrator_id.clone());
+                    let _ = tx
+                        .send(Ok(StreamItem::ContextUsage {
+                            agent_id,
+                            context_tokens: response.usage.input_tokens,
+                            response_tokens: response.usage.output_tokens,
+                            context_window: worker.context_window,
+                        }))
+                        .await;
+                }
             }
 
             // Detect context overflow and other errors — don't retry hard errors

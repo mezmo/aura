@@ -355,6 +355,9 @@ impl AgentExecutor for AuraAgentExecutor {
                     Ok(StreamItem::TurnUsage(_)) => {
                         event!(Level::DEBUG, request_id, "turn usage");
                     }
+                    Ok(StreamItem::ContextUsage { .. }) => {
+                        event!(Level::DEBUG, request_id, "context usage");
+                    }
                     Ok(StreamItem::OrchestratorEvent(_)) => {
                         event!(Level::DEBUG, request_id, "orchestration event");
                     }

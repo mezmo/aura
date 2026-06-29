@@ -26,18 +26,19 @@ use crate::tools;
 use crate::ui::markdown::render_markdown;
 use crate::ui::prompt::{
     WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
-    erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
-    get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output,
-    last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
+    erase_input_frame, extend_display_events, frame_lines, get_context_tokens,
+    get_cumulative_tokens, get_selected_model, handle_ctrlc, install_sigint_handler,
+    is_expanded_output, last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
     push_mid_stream_history, push_sse_event, random_bullet_color, redraw_input_frame,
     replay_event_log_global, reset_ctrlc_state, reset_input_geometry, restore_terminal_mode,
-    seed_model_cache, seed_status_bar_tokens, set_expanded_output, set_mid_stream_history,
-    set_noncanonical_noecho, set_processing, set_selected_model, set_status_bar_tokens,
-    set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
-    styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
-    update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
+    seed_model_cache, seed_status_bar_tokens, set_context_window_usage, set_expanded_output,
+    set_mid_stream_history, set_noncanonical_noecho, set_processing, set_selected_model,
+    set_status_bar_tokens, set_stream_conv_dir, set_welcome_state, setup_terminal,
+    stop_and_clear_animation, styled_prompt, take_pending_command, take_queued_input,
+    task_color_for, text_lines, update_status_bar, update_status_bar_unlocked, with_event_log,
+    with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
 
@@ -919,8 +920,8 @@ pub fn run_repl(
 
                     match result {
                         Ok(StreamResult::TextResponse(text)) => {
-                            // Check for auto-compaction trigger
-                            let tokens = get_cumulative_tokens();
+                            // Check for auto-compaction trigger (context pressure)
+                            let tokens = get_context_tokens();
                             if tokens >= 8_000_000
                                 && text.contains(
                                     "My tools returned more data than I can work with at once",
@@ -1677,7 +1678,7 @@ pub fn run_repl(
                     conversation.add_assistant(&final_text);
 
                     // Check if we've crossed a 2M token boundary — nudge on next turn
-                    let current_tokens = get_cumulative_tokens();
+                    let current_tokens = get_context_tokens();
                     if current_tokens >= last_compact_prompt_threshold {
                         while last_compact_prompt_threshold <= current_tokens {
                             last_compact_prompt_threshold += 2_000_000;
@@ -1960,6 +1961,23 @@ impl StreamHandler for ReplStreamHandler {
             events.push(DisplayEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+            });
+        }
+    }
+
+    fn on_context_usage(
+        &mut self,
+        context_tokens: u64,
+        response_tokens: u64,
+        context_window: Option<u64>,
+    ) {
+        set_context_window_usage(context_tokens, response_tokens, context_window);
+        update_status_bar();
+        if let Ok(mut events) = self.turn_events.lock() {
+            events.push(DisplayEvent::ContextUsage {
+                context_tokens,
+                response_tokens,
+                context_window,
             });
         }
     }

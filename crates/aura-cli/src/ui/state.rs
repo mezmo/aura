@@ -60,6 +60,11 @@ pub(crate) static STATUS_HINT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static TURN_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static CUMULATIVE_PROMPT: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_COMPLETION: Mutex<u64> = Mutex::new(0);
+/// Absolute context-window occupancy from the latest `aura.context_usage`
+/// event (input + output of the agent's final turn). Drives the "Context left"
+/// indicator and auto-compaction pressure, independent of cumulative *billed*
+/// tokens (`CUMULATIVE_PROMPT`/`CUMULATIVE_COMPLETION`). 0 until first reported.
+pub(crate) static CONTEXT_OCCUPANCY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_INTERCEPTED: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_EXTRACTED: Mutex<u64> = Mutex::new(0);
 pub(crate) static PROCESSING: AtomicBool = AtomicBool::new(false);

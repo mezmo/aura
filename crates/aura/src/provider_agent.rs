@@ -400,6 +400,22 @@ pub enum StreamItem {
         /// Tokens extracted from scratchpad back into context.
         tokens_extracted: usize,
     },
+    /// Per-agent context-window occupancy report.
+    ///
+    /// Emitted after an orchestration agent finishes, carrying the provider's
+    /// final-turn input/output. The web server handler converts this to an
+    /// `aura.context_usage` SSE event, filling in correlation context from the
+    /// request.
+    ContextUsage {
+        /// The agent that produced this usage (worker name, coordinator id, etc.).
+        agent_id: String,
+        /// Provider-reported input tokens of the final turn (context size).
+        context_tokens: u64,
+        /// Provider-reported output tokens of the final turn.
+        response_tokens: u64,
+        /// Model context-window limit, when known.
+        context_window: Option<u64>,
+    },
     /// MCP server connection status snapshot.
     ///
     /// Emitted once near the start of an orchestration run (after the shared

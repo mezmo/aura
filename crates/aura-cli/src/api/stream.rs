@@ -71,7 +71,22 @@ pub trait StreamHandler {
     }
 
     /// Called with (prompt_tokens, completion_tokens) from `aura.usage` events.
+    /// These are cumulative provider-billed totals for the request, not context
+    /// size — use [`on_context_usage`](Self::on_context_usage) for the context
+    /// window indicator.
     fn on_usage(&mut self, _prompt_tokens: u64, _completion_tokens: u64) {}
+
+    /// Called with (context_tokens, response_tokens, context_window) from
+    /// `aura.context_usage` events. `context_tokens` is the absolute size of the
+    /// context carried into the agent's final turn — the value to display as
+    /// context-window occupancy.
+    fn on_context_usage(
+        &mut self,
+        _context_tokens: u64,
+        _response_tokens: u64,
+        _context_window: Option<u64>,
+    ) {
+    }
 
     /// Called for `aura.reasoning` events, with (content, agent_id, fields).
     fn on_reasoning(
@@ -234,6 +249,17 @@ where
                     }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
                     {
                         handler.on_usage(prompt_tokens, completion_tokens);
+                    }
+                }
+                event_names::CONTEXT_USAGE => {
+                    if let Ok(AuraStreamEvent::ContextUsage {
+                        context_tokens,
+                        response_tokens,
+                        context_window,
+                        ..
+                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    {
+                        handler.on_context_usage(context_tokens, response_tokens, context_window);
                     }
                 }
                 event_names::TOOL_USAGE => {
