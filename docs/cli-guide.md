@@ -14,26 +14,26 @@ cargo build -p aura-cli --release
 cargo build -p aura-cli --release --no-default-features
 ```
 
-The binary is at `target/release/aura-cli`. The `standalone-cli` feature is on by default, so the standard build runs both backends. Use `--no-default-features` only when you want an HTTP-only client.
+The binary is at `target/release/aura`. The `standalone-cli` feature is on by default, so the standard build runs both backends. Use `--no-default-features` only when you want an HTTP-only client.
 
 ### Run it
 
 **Standalone mode** (no server needed) is the default when you don't set `--api-url`:
 
 ```bash
-aura-cli --config path/to/agent.toml
+aura --config path/to/agent.toml
 ```
 
-If you omit `--config`, the CLI loads `config.toml` from the current directory, so a bare `aura-cli` runs the local config.
+If you omit `--config`, the CLI loads `config.toml` from the current directory, so a bare `aura` runs the local config.
 
-On first run, if that config is missing (for example, a bare `aura-cli` in a directory with no `config.toml`), the CLI doesn't dump a raw filesystem error. Instead, it reports the path it looked for and offers three ways forward: run `aura-cli init` to generate a config in the current directory, pass `--config <path>` to point at an existing config file or directory, or set `--api-url <url>` (or `AURA_API_URL`) to connect to a running aura-web-server instead.
+On first run, if that config is missing (for example, a bare `aura` in a directory with no `config.toml`), the CLI doesn't dump a raw filesystem error. Instead, it reports the path it looked for and offers three ways forward: run `aura init` to generate a config in the current directory, pass `--config <path>` to point at an existing config file or directory, or set `--api-url <url>` (or `AURA_API_URL`) to connect to a running aura-web-server instead.
 
 **HTTP mode** (connect to an aura-web-server) is selected when you set `--api-url` (or `AURA_API_URL`):
 
 ```bash
 export AURA_API_URL="https://api.example.com"
 export AURA_API_KEY="your-api-key"
-aura-cli
+aura
 ```
 
 The default build includes standalone support. You only need the `--standalone` flag when `AURA_API_URL` is set in your environment but you want to run standalone anyway. Passing `--standalone` overrides the env var. The `--standalone` flag is mutually exclusive with the `--api-url` flag, so never pass both. When you omit `--config` in standalone mode, the CLI loads `config.toml` from the current directory.
@@ -95,7 +95,7 @@ api_key = "your-api-key"
 model = "gpt-4o"
 system_prompt = "You are a helpful assistant."
 enable_client_tools = false
-log_file = "/tmp/aura-cli.log"  # append-only; see Logging section
+log_file = "/tmp/aura.log"  # append-only; see Logging section
 ```
 
 Keep secrets in `~/.aura/cli.toml` or environment variables, not in project configs that might be committed to version control.
@@ -113,9 +113,9 @@ Everything else goes to **stderr**:
 Standard pipe usage works without scrubbing:
 
 ```bash
-aura-cli --query "summarize the README" > summary.md
-aura-cli --query "list three ideas as JSON" | jq .
-aura-cli --query "what's the version?" 2>/dev/null | tee log.txt
+aura --query "summarize the README" > summary.md
+aura --query "list three ideas as JSON" | jq .
+aura --query "what's the version?" 2>/dev/null | tee log.txt
 ```
 
 Exit code `0` means stdout contains the complete response; non-zero means stderr explains why and stdout is empty.
@@ -130,9 +130,9 @@ Three sources can supply the path, in precedence order:
 
 | Source | Form |
 |--------|------|
-| CLI flag | `--log-file /tmp/aura-cli.log` |
-| Environment | `AURA_LOG_FILE=/tmp/aura-cli.log` |
-| `cli.toml` | `log_file = "/tmp/aura-cli.log"` |
+| CLI flag | `--log-file /tmp/aura.log` |
+| Environment | `AURA_LOG_FILE=/tmp/aura.log` |
+| `cli.toml` | `log_file = "/tmp/aura.log"` |
 
 The file is opened in **append mode** and created if missing. The default filter mirrors `aura-web-server`'s verbose mode (info-level for aura crates and rig request handling); override with `RUST_LOG`.
 
@@ -193,7 +193,7 @@ Conversations are saved to `~/.aura/conversations/` and can be resumed:
 
 ```bash
 # From CLI
-aura-cli --resume abc123
+aura --resume abc123
 
 # From REPL
 /conversations          # List saved conversations
@@ -217,7 +217,7 @@ In HTTP mode, models come from `/v1/models`. In standalone mode, they come from 
 
 > **USE AT YOUR OWN RISK**
 >
-> Enabling client-side tools gives an LLM the ability to execute commands on your machine with the same privileges as the user running `aura-cli`. This includes running shell commands, reading and modifying files, and searching your filesystem.
+> Enabling client-side tools gives an LLM the ability to execute commands on your machine with the same privileges as the user running `aura`. This includes running shell commands, reading and modifying files, and searching your filesystem.
 >
 > The risks include prompt injection (anything the model reads can contain instructions that hijack it into running destructive commands), hallucination (the model can call the wrong tool with wrong arguments), and lack of sandboxing (tools run directly on the host).
 >
@@ -227,11 +227,11 @@ By default, the CLI is a pure chat client with no local tools. Pass `--enable-cl
 
 ```bash
 # Enable local tools
-aura-cli --enable-client-tools
-AURA_ENABLE_CLIENT_TOOLS=true aura-cli
+aura --enable-client-tools
+AURA_ENABLE_CLIENT_TOOLS=true aura
 
 # Explicitly disable (overrides config file)
-aura-cli --enable-client-tools=false
+aura --enable-client-tools=false
 ```
 
 ### Available Tools
