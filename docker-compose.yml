@@ -15,7 +15,7 @@ services:
       PORT: "8080"
       CONFIG_PATH: "/app/config/quickstart.toml"
 
-      # Streaming — custom events enabled so aura-cli can render the
+      # Streaming — custom events enabled so aura can render the
       # orchestrator's plan/worker events. Safe for LibreChat as of v0.8.6,
       # whose SSE parser skips unknown event types (aura.session_info, etc.)
       # instead of crashing on them (danny-avila/LibreChat#12919).

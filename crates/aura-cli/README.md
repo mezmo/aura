@@ -16,7 +16,7 @@ cargo build -p aura-cli --release
 cargo build -p aura-cli --release --no-default-features
 ```
 
-The binary will be at `target/release/aura-cli`.
+The binary will be at `target/release/aura`.
 
 ### Run it
 
@@ -26,10 +26,10 @@ The binary will be at `target/release/aura-cli`.
 # Using environment variables
 export AURA_API_URL="https://api.example.com"
 export AURA_API_KEY="your-api-key"
-aura-cli
+aura
 
 # Or pass flags directly
-aura-cli --api-url "https://api.example.com" \
+aura --api-url "https://api.example.com" \
          --api-key "your-api-key"
 ```
 
@@ -39,32 +39,32 @@ Standalone mode is enabled by default. The CLI loads agent configs directly and 
 
 ```bash
 # Uses config.toml in the current directory by default
-aura-cli
+aura
 
 # Single TOML config file
-aura-cli --config path/to/agent.toml
+aura --config path/to/agent.toml
 
 # Directory of TOML configs (enables /model switching between agents)
-aura-cli --config configs/
+aura --config configs/
 
 # One-shot query in standalone mode
-aura-cli --config agent.toml --query "hello"
+aura --config agent.toml --query "hello"
 
 # Select a specific agent from a config directory
-aura-cli --config configs/ --model "Math Agent"
+aura --config configs/ --model "Math Agent"
 ```
 
 In standalone mode, the CLI builds agents in-process using the same code paths as `aura-web-server`. MCP tools from the TOML config are available. CLI local tools (Shell, Read, Update, ...) become available when **both** sides opt in — pass `--enable-client-tools` and set `[agent].enable_client_tools = true` in the loaded TOML config (single-agent configs only; orchestrated configs drop client tools). See [Client-Side Tools](#client-side-tools) for details. The `/model` command works identically — it lists all loaded configs and lets you switch between them.
 
 ---
 
-## Generating a starter config (`aura-cli init`)
+## Generating a starter config (`aura init`)
 
-New to AURA? `aura-cli init` walks you through creating a ready-to-run `config.toml` — no hand-editing TOML required.
+New to AURA? `aura init` walks you through creating a ready-to-run `config.toml` — no hand-editing TOML required.
 
 ```bash
-aura-cli init                 # interactive; writes ./config.toml
-aura-cli init -o my.toml      # choose the output path
+aura init                 # interactive; writes ./config.toml
+aura init -o my.toml      # choose the output path
 ```
 
 It will:
@@ -95,7 +95,7 @@ It will:
 For scripted/CI use, supply the required values as flags:
 
 ```bash
-aura-cli init --provider openai --model gpt-4o --non-interactive
+aura init --provider openai --model gpt-4o --non-interactive
 ```
 
 ---
@@ -159,7 +159,7 @@ cargo build -p aura-cli --no-default-features
 ## Command Line Arguments
 
 ```
-aura-cli [OPTIONS]
+aura [OPTIONS]
 ```
 
 | Flag                                       | Env Equivalent                       | Description                                                                                              |
@@ -208,7 +208,7 @@ api_key = "your-api-key"
 model = "gpt-4o"
 system_prompt = "You are a helpful assistant."
 enable_client_tools = true   # opt in to local tool execution; default is false
-log_file = "/tmp/aura-cli.log"  # append-only; see Logging section below
+log_file = "/tmp/aura.log"  # append-only; see Logging section below
 ```
 
 > **Note on system prompts:** In **HTTP mode**, `--system-prompt` is intended for
@@ -245,9 +245,9 @@ Anything that isn't the response goes to **stderr**:
 This means typical pipe usage works without scrubbing:
 
 ```bash
-aura-cli --query "summarize the README" > summary.md
-aura-cli --query "list three ideas as JSON" | jq .
-aura-cli --query "what's the version?" 2>/dev/null | tee log.txt
+aura --query "summarize the README" > summary.md
+aura --query "list three ideas as JSON" | jq .
+aura --query "what's the version?" 2>/dev/null | tee log.txt
 ```
 
 Exit code follows the standard contract: `0` ⇒ stdout is the complete
@@ -315,7 +315,7 @@ In **HTTP mode**, the model list is fetched from the server's `/v1/models` endpo
 > # **USE AT YOUR OWN RISK**
 > ---
 >
-> **Enabling client-side tools gives an LLM the ability to execute commands on your machine.** That includes running shell commands, reading and modifying files, and searching your filesystem — with the same privileges as the user running `aura-cli`. Treat `--enable-client-tools` as functionally equivalent to handing the model a shell prompt.
+> **Enabling client-side tools gives an LLM the ability to execute commands on your machine.** That includes running shell commands, reading and modifying files, and searching your filesystem — with the same privileges as the user running `aura`. Treat `--enable-client-tools` as functionally equivalent to handing the model a shell prompt.
 >
 > **The risks are real:**
 > - **Prompt injection.** Anything the model reads — a file, a tool output, an MCP response, a webpage retrieved by another tool — can contain instructions that hijack the model into running destructive commands (`rm -rf`, exfiltrating secrets, modifying source code, etc.).
@@ -334,14 +334,14 @@ By default, AURA CLI is a **pure chat client** — no local tools are advertised
 
 ```bash
 # Disabled (default) — chat only
-aura-cli
+aura
 
 # Enabled — local tools available, gated by the permission system
-aura-cli --enable-client-tools
-AURA_ENABLE_CLIENT_TOOLS=true aura-cli
+aura --enable-client-tools
+AURA_ENABLE_CLIENT_TOOLS=true aura
 
 # Explicitly disable (overrides config file)
-aura-cli --enable-client-tools=false
+aura --enable-client-tools=false
 ```
 
 ### How it works
@@ -417,7 +417,7 @@ every local tool call prompts.
 Conversations are automatically saved to `~/.aura/conversations/` and can be resumed:
 
 ```bash
-aura-cli --resume abc123           # from the CLI
+aura --resume abc123               # from the CLI
 /conversations                     # list saved conversations
 /resume abc123                     # resume by ID prefix
 /rename my chat                    # name the current conversation
@@ -436,9 +436,9 @@ Three places can supply the path, in precedence order:
 
 | Source          | Form                                  |
 | --------------- | ------------------------------------- |
-| CLI flag        | `--log-file /tmp/aura-cli.log`        |
-| Environment     | `AURA_LOG_FILE=/tmp/aura-cli.log`     |
-| `cli.toml`      | `log_file = "/tmp/aura-cli.log"`      |
+| CLI flag        | `--log-file /tmp/aura.log`        |
+| Environment     | `AURA_LOG_FILE=/tmp/aura.log`     |
+| `cli.toml`      | `log_file = "/tmp/aura.log"`      |
 
 The file is opened in **append mode** and created if missing. The default
 filter mirrors `aura-web-server`'s verbose mode (info-level for aura crates

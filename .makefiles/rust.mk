@@ -97,9 +97,9 @@ $(DIST_DIR):
 .PHONY: build-release-binary-amd64
 build-release-binary-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build release binaries for linux/amd64
 	$(RUN) cargo build --release --bin aura-web-server
-	$(RUN) cargo build --release -p aura-cli --bin aura-cli
+	$(RUN) cargo build --release -p aura-cli --bin aura
 	cp target/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
-	cp target/release/aura-cli $(DIST_DIR)/aura-cli-linux-amd64
+	cp target/release/aura $(DIST_DIR)/aura-linux-amd64
 
 .PHONY: build-release-binary-arm64
 build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release binaries for linux/arm64
@@ -109,9 +109,9 @@ build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release b
 		export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
 		export PKG_CONFIG_ALLOW_CROSS=1; \
 		cargo build --release --target aarch64-unknown-linux-gnu --bin aura-web-server && \
-		cargo build --release --target aarch64-unknown-linux-gnu -p aura-cli --bin aura-cli"
+		cargo build --release --target aarch64-unknown-linux-gnu -p aura-cli --bin aura"
 	cp target/aarch64-unknown-linux-gnu/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
-	cp target/aarch64-unknown-linux-gnu/release/aura-cli $(DIST_DIR)/aura-cli-linux-arm64
+	cp target/aarch64-unknown-linux-gnu/release/aura $(DIST_DIR)/aura-linux-arm64
 
 .PHONY: build-release-binaries
 build-release-binaries: ## Build release binaries for all platforms

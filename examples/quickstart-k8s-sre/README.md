@@ -152,15 +152,15 @@ kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=aura --timeout=
 
 ### 5. Try it out
 
-Launch [AURA CLI](https://hub.docker.com/r/mezmo/aura-cli) inside the cluster,
+Launch [AURA CLI](https://hub.docker.com/r/mezmo/aura) inside the cluster,
 pointed at the AURA service:
 
 ```bash
-kubectl run -it --rm aura-cli \
-  --image=mezmo/aura-cli \
+kubectl run -it --rm aura \
+  --image=mezmo/aura \
   --restart=Never \
-  --env="AURA_AGENT_API_URL=http://aura:80" \
-  --env="AURA_AGENT_MODEL=kubernetes-sre"
+  --command -- ./aura --api-url http://aura:80 \
+  --model "kubernetes-sre"
 ```
 
 This drops you into an interactive REPL. Try these queries:

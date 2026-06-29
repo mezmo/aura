@@ -60,10 +60,10 @@
 //! the caller's span instead of creating its own `invoke_agent` span,
 //! keeping `agent.turn` as a direct child of `agent.stream`.
 //!
-//! The `aura-cli` standalone backend
+//! The `aura` standalone backend
 //! (`crates/aura-cli/src/backend/direct.rs`) wraps its
 //! `execute_completion` spawn with the same `agent.stream` instrumentation,
-//! so traces emitted from `aura-cli --standalone` produce the same shape as
+//! so traces emitted from `aura --standalone` produce the same shape as
 //! the web server's. The CLI does not emit the `chat_completions` /
 //! `streaming_completion` HTTP-infrastructure spans because it has no HTTP
 //! layer; those spans live on a separate trace in the server.
@@ -237,7 +237,7 @@ where
 /// Returns `None` when the env var is absent.
 ///
 /// Public so binaries that compose their own subscriber stack (e.g.
-/// `aura-cli` in standalone mode) can register the provider before attaching
+/// `aura` in standalone mode) can register the provider before attaching
 /// an `OpenTelemetryLayer`. Subsequent calls reuse the cached provider.
 #[cfg(feature = "otel")]
 pub fn init_otel_provider() -> Option<&'static TracerProvider> {

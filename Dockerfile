@@ -91,7 +91,7 @@ COPY crates/ ./crates/
 RUN <<EOR
   cargo clean
   cargo build --release --bin aura-web-server
-  cargo build --release -p aura-cli --bin aura-cli
+  cargo build --release -p aura-cli --bin aura
 EOR
 
 # 005: release - Runtime stage with newer glibc
@@ -111,7 +111,7 @@ RUN mkdir -p /app/config && chown -R appuser:appuser /app
 
 # Copy binaries from release-build stage
 COPY --from=release-build /usr/src/app/target/release/aura-web-server /app/
-COPY --from=release-build /usr/src/app/target/release/aura-cli /app/
+COPY --from=release-build /usr/src/app/target/release/aura /app/
 
 # Switch to app user
 USER appuser

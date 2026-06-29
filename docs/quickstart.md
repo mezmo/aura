@@ -31,7 +31,7 @@ AURA boots in orchestrator mode: a coordinator routes each request — answering
 The [AURA CLI](../crates/aura-cli/README.md) ships in the same Docker image and connects to the in-container server automatically. Exec into the running container:
 
 ```bash
-docker exec -it aura ./aura-cli
+docker exec -it aura ./aura
 ```
 
 It renders the coordinator's plan and worker activity as the response streams.
@@ -54,14 +54,14 @@ Prefer to build locally instead of using the bundled binary? Connect to the quic
 
 ```bash
 cargo build -p aura-cli --release
-./target/release/aura-cli
+./target/release/aura
 ```
 
 The CLI defaults to **standalone mode** — it runs agents in-process from a TOML config, no server needed:
 
 ```bash
 cargo build -p aura-cli --release
-./target/release/aura-cli --config quickstart.toml
+./target/release/aura --config quickstart.toml
 ```
 
 See the [CLI README](../crates/aura-cli/README.md) for the full feature set.
@@ -249,7 +249,7 @@ Once the basic quickstart is running, try these more advanced setups:
 ```mermaid
 graph TD
     Browser -->|":3080"| LibreChat
-    Terminal -->|"docker exec"| CLI["aura-cli"]
+    Terminal -->|"docker exec"| CLI["aura"]
     LibreChat <-->|"/v1/chat/completions"| AURA
     CLI <-->|"/v1/chat/completions"| AURA
     AURA -->|"OTel gRPC :4317"| Phoenix
@@ -267,7 +267,7 @@ graph TD
     end
 ```
 
-- **aura-cli** runs inside the AURA container (`docker exec`) and talks to the same OpenAI-compatible `/v1/chat/completions` endpoint, rendering coordinator and worker events as they stream.
+- **aura** runs inside the AURA container (`docker exec`) and talks to the same OpenAI-compatible `/v1/chat/completions` endpoint, rendering coordinator and worker events as they stream.
 - **LibreChat** sends chat requests to AURA's OpenAI-compatible `/v1/chat/completions` endpoint. MongoDB is used by LibreChat internally for user accounts and conversation history — AURA does not use it.
 - **AURA** runs the coordinator that routes each request, dispatches workers, executes MCP tools, calls the configured LLM provider, and streams responses back.
 - **Phoenix** receives OpenTelemetry traces from AURA so you can inspect every coordinator and worker step.

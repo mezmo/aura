@@ -11,7 +11,7 @@ pub enum Command {
 
 /// Aura CLI — interactive chat completions REPL
 #[derive(Parser, Debug)]
-#[command(name = "aura-cli", version, about)]
+#[command(name = "aura", version, about)]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -141,7 +141,7 @@ pub fn check_standalone_flag() {
         };
         eprintln!(
             "error: {flag} requires the standalone-cli feature\n\n\
-             This build of aura-cli is HTTP-only and cannot load agent configs \
+             This build of aura is HTTP-only and cannot load agent configs \
              directly. Standalone mode (the default) is not available.\n\n\
              Pass --api-url to connect to an aura-web-server over HTTP, or \
              rebuild with the standalone-cli feature (enabled by default)."
@@ -158,7 +158,7 @@ pub fn check_standalone_flag() {
     if !has_api_url {
         eprintln!(
             "error: --api-url is required (standalone mode unavailable)\n\n\
-             This build of aura-cli was compiled without the standalone-cli \
+             This build of aura was compiled without the standalone-cli \
              feature, so it cannot run agents in-process. Provide --api-url \
              to connect to an aura-web-server, or rebuild with the default \
              features to enable standalone mode."
