@@ -15,10 +15,11 @@ use crate::theme::{AuraStyle, Themed};
 
 use super::animation::render_queued_wave;
 use super::state::{
-    AUTO_COMPACT_CEILING, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION,
-    CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED,
-    CURSOR_ROW, FRAME_LINES, LAST_CTRLC, PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, STATUS_BAR,
-    STATUS_HINT, STATUS_ROWS, TURN_NOTICES, lock_term, status_rows, term_size,
+    AUTO_COMPACT_CEILING, CONTEXT_OCCUPANCY, CONTEXT_OCCUPANCY_FRESH, CTRLC_HINT_VISIBLE,
+    CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED,
+    CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, FRAME_LINES, LAST_CTRLC, PROCESSING,
+    QUEUED_INPUT, QUEUED_WAVE_POS, STATUS_BAR, STATUS_HINT, STATUS_ROWS, TURN_NOTICES, lock_term,
+    status_rows, term_size,
 };
 
 /// Format a number with comma separators (e.g. 1234 -> "1,234").
@@ -228,9 +229,10 @@ pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
 
     let left = build_status_left(cumulative_prompt, cumulative_completion, total);
 
+    let pressure = context_pressure_tokens(total);
     let ceiling = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    let right = if ceiling > 0 && total < ceiling {
-        let remaining_pct = ((ceiling - total) as f64 / ceiling as f64 * 100.0).round() as u64;
+    let right = if ceiling > 0 && pressure < ceiling {
+        let remaining_pct = ((ceiling - pressure) as f64 / ceiling as f64 * 100.0).round() as u64;
         format!("Context left: {remaining_pct}%")
     } else {
         "AURA, by Mezmo!".to_string()
@@ -257,9 +259,10 @@ fn refresh_status_bar_from_counters() {
 
     let left = build_status_left(cumulative_prompt, cumulative_completion, total);
 
+    let pressure = context_pressure_tokens(total);
     let ceiling = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    let right = if ceiling > 0 && total < ceiling {
-        let remaining_pct = ((ceiling - total) as f64 / ceiling as f64 * 100.0).round() as u64;
+    let right = if ceiling > 0 && pressure < ceiling {
+        let remaining_pct = ((ceiling - pressure) as f64 / ceiling as f64 * 100.0).round() as u64;
         format!("Context left: {remaining_pct}%")
     } else {
         "AURA, by Mezmo!".to_string()
@@ -335,11 +338,81 @@ pub fn set_auto_compact_ceiling(ceiling: u64) {
     AUTO_COMPACT_CEILING.store(ceiling, Ordering::Relaxed);
 }
 
-/// Return the current cumulative total tokens.
+/// Return the current cumulative total *billed* tokens (left-side display).
 pub fn get_cumulative_tokens() -> u64 {
     let prompt = CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0);
     let completion = CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0);
     prompt + completion
+}
+
+/// Tokens used to gauge context-window pressure: the reported context
+/// occupancy when available, otherwise the cumulative billed total as a
+/// pre-`aura.context_usage` fallback.
+fn context_pressure_tokens(cumulative_total: u64) -> u64 {
+    let occupancy = CONTEXT_OCCUPANCY.load(Ordering::Relaxed);
+    if occupancy > 0 {
+        occupancy
+    } else {
+        cumulative_total
+    }
+}
+
+/// Mark the occupancy reading as belonging to a previous turn.
+///
+/// The reading itself is kept: it is the closest estimate available while the
+/// current turn streams, and dropping it would fall back to cumulative billed
+/// tokens, which exceed the window and blank the indicator. Decisions that must
+/// not act on a previous turn's context use
+/// [`fresh_context_fill_ratio`] instead.
+pub fn begin_turn_context_tracking() {
+    CONTEXT_OCCUPANCY_FRESH.store(false, Ordering::Relaxed);
+}
+
+/// Occupied fraction of the model's context window.
+///
+/// `None` when either the occupancy or the window is unknown — no
+/// `aura.context_usage` has arrived, or the model's window was never
+/// configured — which callers treat as "fall back to token-count thresholds".
+pub fn context_fill_ratio() -> Option<f64> {
+    let occupancy = CONTEXT_OCCUPANCY.load(Ordering::Relaxed);
+    let window = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
+    (occupancy > 0 && window > 0).then(|| occupancy as f64 / window as f64)
+}
+
+/// [`context_fill_ratio`] restricted to a reading the current turn reported.
+///
+/// `None` once a turn passes without an `aura.context_usage` event, so callers
+/// fall back to token-count thresholds rather than acting on a fill fraction
+/// that describes an earlier turn's context.
+pub fn fresh_context_fill_ratio() -> Option<f64> {
+    if !CONTEXT_OCCUPANCY_FRESH.load(Ordering::Relaxed) {
+        return None;
+    }
+    context_fill_ratio()
+}
+
+/// Context-window pressure in tokens — used for auto-compaction decisions.
+/// Reflects actual context occupancy (not cumulative billed usage).
+pub fn get_context_tokens() -> u64 {
+    context_pressure_tokens(get_cumulative_tokens())
+}
+
+/// Record context-window occupancy from an `aura.context_usage` event.
+///
+/// Sets the absolute occupancy that drives the "Context left" indicator and
+/// auto-compaction, and, when the model's context window is known, points the
+/// ceiling at it so the percentage reflects the real window.
+pub fn set_context_window_usage(
+    context_tokens: u64,
+    response_tokens: u64,
+    context_window: Option<u64>,
+) {
+    CONTEXT_OCCUPANCY.store(context_tokens + response_tokens, Ordering::Relaxed);
+    CONTEXT_OCCUPANCY_FRESH.store(true, Ordering::Relaxed);
+    if let Some(window) = context_window {
+        AUTO_COMPACT_CEILING.store(window, Ordering::Relaxed);
+    }
+    refresh_status_bar_from_counters();
 }
 
 /// Seed cumulative token counters (used when resuming).
@@ -369,6 +442,8 @@ pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_EXTRACTED.lock() {
         *g = 0;
     }
+    CONTEXT_OCCUPANCY.store(0, Ordering::Relaxed);
+    CONTEXT_OCCUPANCY_FRESH.store(false, Ordering::Relaxed);
     set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
 }
 
@@ -434,4 +509,28 @@ pub fn reset_ctrlc_state() {
         h.clear();
     }
     update_status_bar();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_previous_turns_reading_still_displays_but_stops_driving_decisions() {
+        set_context_window_usage(100_000, 5_000, Some(200_000));
+        assert_eq!(fresh_context_fill_ratio(), Some(0.525));
+
+        // A later turn starts without reporting: the gauge keeps showing the
+        // last known occupancy rather than blanking...
+        begin_turn_context_tracking();
+        assert_eq!(CONTEXT_OCCUPANCY.load(Ordering::Relaxed), 105_000);
+        assert_eq!(context_fill_ratio(), Some(0.525));
+
+        // ...while compaction decisions see no usable reading and fall back.
+        assert_eq!(fresh_context_fill_ratio(), None);
+
+        // A reading from the current turn drives decisions again.
+        set_context_window_usage(150_000, 5_000, Some(200_000));
+        assert_eq!(fresh_context_fill_ratio(), Some(0.775));
+    }
 }

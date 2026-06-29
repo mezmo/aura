@@ -428,6 +428,61 @@ struct StreamCallParams<'a> {
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
 }
 
+/// Agent id for the conversation-level context an orchestration run carries,
+/// matching the single-agent id so clients key context pressure the same way
+/// in both modes.
+const COORDINATOR_AGENT_ID: &str = "main";
+
+/// Every exit path of a stream loop must route its turns through
+/// [`TurnTally::record`]: a turn counted locally but not into the shared
+/// `UsageState` is billed usage the client never sees.
+#[derive(Default)]
+struct TurnTally {
+    total: rig::completion::Usage,
+    last: rig::completion::Usage,
+}
+
+impl TurnTally {
+    fn record(&mut self, turn: &rig::completion::Usage, usage_state: &crate::UsageState) {
+        self.total.input_tokens += turn.input_tokens;
+        self.total.output_tokens += turn.output_tokens;
+        self.total.total_tokens += turn.total_tokens;
+        self.last = rig::completion::Usage {
+            input_tokens: turn.input_tokens,
+            output_tokens: turn.output_tokens,
+            total_tokens: turn.total_tokens,
+        };
+        usage_state.accumulate_usage(turn.input_tokens, turn.output_tokens);
+    }
+
+    /// Reconcile against a loop total the provider reported separately.
+    ///
+    /// Returns what the total carries beyond the recorded turns, saturating at
+    /// zero. Non-zero means turns reached the provider without reaching
+    /// [`record`](Self::record) — the caller accumulates the difference so
+    /// billing stays whole, and warns because occupancy cannot be recovered.
+    fn reconcile(&self, reported_total: &rig::completion::Usage) -> rig::completion::Usage {
+        let input_tokens = reported_total
+            .input_tokens
+            .saturating_sub(self.total.input_tokens);
+        let output_tokens = reported_total
+            .output_tokens
+            .saturating_sub(self.total.output_tokens);
+        rig::completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
+}
+
+struct ForwardedRun {
+    response: crate::provider_agent::CompletionResponse,
+    /// Provider-reported usage of the loop's last turn — context-window
+    /// occupancy, as opposed to `response.usage`'s loop total.
+    last_turn: rig::completion::Usage,
+}
+
 /// One guarded step of a deadline-wrapped stream loop.
 enum LoopStep {
     End,
@@ -942,6 +997,219 @@ impl Orchestrator {
         })
     }
 
+    /// Drive one agent loop's stream, forwarding events and tallying usage.
+    ///
+    /// Split from [`Self::stream_and_forward`] so tests can drive the arms with
+    /// a scripted stream; every exit path here must record turns through
+    /// [`TurnTally::record`].
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_forward_loop(
+        mut stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+        usage_state: &crate::UsageState,
+        inactivity_secs: u64,
+        scratchpad_budget: Option<&scratchpad::ContextBudget>,
+        phase: &str,
+        event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+        stream_context: Option<StreamContext<'_>>,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
+        use crate::provider_agent::{
+            CompletionResponse, StreamedAssistantContent, StreamedUserContent,
+        };
+        use futures::StreamExt;
+        use rig::completion::Usage;
+        use std::collections::HashMap;
+
+        let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
+        let mut content = String::new();
+        let mut tally = TurnTally::default();
+        // Set only by the Final arm, whose reported loop total supersedes
+        // the per-turn sum as the response's authoritative usage.
+        let mut final_total: Option<Usage> = None;
+        // Start times for tools forwarded manually here (skills, orchestration
+        // operations, and scratchpad tools when enabled) so the matching
+        // ToolResult can report a duration. Membership also gates completion:
+        // only IDs we started get completed, so MCP tools (covered by
+        // ObserverWrapper) are never double-emitted.
+        let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+
+        // Two guarded phases per iteration, so the body (its sends and the
+        // decision-ready branch's inner `next()`) runs under the deadline
+        // state the received item implies, not the previous item's state.
+        // A ToolCall's suspension lands after its body, covering exactly
+        // the next receive, where rig executes the tool.
+        //
+        // new_disarmed(): the per-call budget already bounds the wait for
+        // the first token, so this window governs only silence between
+        // stream items; the first touch arms it.
+        let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
+            Duration::from_secs(inactivity_secs),
+        );
+        loop {
+            let item = tokio::select! {
+                biased;
+                _ = deadline.expired() => {
+                    return Err(deadline.stall_error(phase));
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
+            let liveness = liveness_of(&item);
+            match liveness {
+                // `touch` is ignored while suspended, so a finished tool
+                // must resume explicitly.
+                Liveness::ToolFinished => deadline.resume(),
+                _ => deadline.touch(),
+            }
+            let body = async {
+                match item {
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                        content.push_str(&t);
+                    }
+                    Ok(StreamItem::StreamAssistantItem(
+                        StreamedAssistantContent::ReasoningDelta { delta, .. },
+                    )) => {
+                        if let Some(tx) = event_tx {
+                            if let Some(ref ctx) = stream_context {
+                                let _ = tx
+                                    .send(Ok(StreamItem::OrchestratorEvent(
+                                        OrchestratorEvent::WorkerReasoning {
+                                            task_id: ctx.task_id,
+                                            worker_id: ctx.worker_id.to_string(),
+                                            content: delta,
+                                        },
+                                    )))
+                                    .await;
+                            } else {
+                                let _ = tx
+                                    .send(Ok(StreamItem::StreamAssistantItem(
+                                        StreamedAssistantContent::ReasoningDelta {
+                                            delta,
+                                            id: None,
+                                        },
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(_))) => {
+                        // Final reasoning block — already forwarded as deltas above.
+                        // Skip to avoid double-emission.
+                    }
+                    // Forward calls to the non-MCP tools ObserverWrapper does not
+                    // cover: skills and orchestration operations always, scratchpad
+                    // tools only when the debug flag is on. The matching completion
+                    // is emitted from the ToolResult arm below.
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
+                        ref tc,
+                    ))) if scratchpad::should_forward_tool_event(
+                        &tc.name,
+                        emit_scratchpad_events,
+                    ) =>
+                    {
+                        let (task_id, worker_id) = match stream_context.as_ref() {
+                            Some(w) => (Some(w.task_id), w.worker_id),
+                            None => (None, "main"),
+                        };
+                        forward_internal_tool_started(
+                            event_tx,
+                            task_id,
+                            worker_id,
+                            &tc.id,
+                            &tc.name,
+                            &tc.arguments,
+                            &mut internal_tool_starts,
+                        )
+                        .await;
+                    }
+                    Ok(StreamItem::Final(info)) => {
+                        let unrecorded = tally.reconcile(&info.usage);
+                        if unrecorded.input_tokens > 0 || unrecorded.output_tokens > 0 {
+                            tracing::warn!(
+                                "{}: {} input / {} output tokens reached the provider \
+                                 without a TurnUsage item; billing reconciled, occupancy \
+                                 may understate the final turn",
+                                phase,
+                                unrecorded.input_tokens,
+                                unrecorded.output_tokens
+                            );
+                            usage_state.accumulate_usage(
+                                unrecorded.input_tokens,
+                                unrecorded.output_tokens,
+                            );
+                        }
+                        content = info.content;
+                        final_total = Some(info.usage);
+                        return Ok(LoopStep::End);
+                    }
+                    Ok(StreamItem::FinalMarker) => {
+                        // Per-turn marker — not end-of-stream. Continue collecting.
+                    }
+                    Ok(StreamItem::TurnUsage(turn)) => {
+                        tally.record(&turn, usage_state);
+                        if let Some(budget) = scratchpad_budget {
+                            budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                        // No-op unless a start was tracked above; emitting here (not
+                        // in a dedicated arm) keeps the decision short-circuit intact
+                        // for tools like submit_result.
+                        forward_internal_tool_completed(
+                            event_tx,
+                            stream_context.as_ref().map(|w| w.task_id),
+                            &tr.id,
+                            &tr.result,
+                            &mut internal_tool_starts,
+                        )
+                        .await;
+                        tracing::debug!(
+                            "{}: tool result received (id={}, call_id={})",
+                            phase,
+                            tr.id,
+                            tr.call_id.as_deref().unwrap_or("-")
+                        );
+                        if decision_ready().await {
+                            tracing::debug!("{}: decision captured, reading turn usage", phase);
+                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
+                                tally.record(&turn, usage_state);
+                            }
+                            return Ok(LoopStep::End);
+                        }
+                    }
+                    _ => {} // ToolCall, ToolCallDelta — rig handles execution
+                }
+                Ok(LoopStep::Continue)
+            };
+            let step = tokio::select! {
+                biased;
+                _ = deadline.expired() => {
+                    return Err(deadline.stall_error(phase));
+                }
+                step = body => step?,
+            };
+            if matches!(step, LoopStep::End) {
+                break;
+            }
+            if matches!(liveness, Liveness::ToolStarted) {
+                deadline.suspend();
+            }
+        }
+
+        Ok(ForwardedRun {
+            response: CompletionResponse {
+                content,
+                usage: final_total.unwrap_or(tally.total),
+            },
+            last_turn: tally.last,
+        })
+    }
+
     /// Stream a full ReAct chat, forwarding reasoning events and collecting the final response.
     ///
     /// Runs the full multi-turn tool loop at the agent's configured
@@ -958,15 +1226,7 @@ impl Orchestrator {
         params: StreamCallParams<'_>,
         stream_context: Option<StreamContext<'_>>,
         decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
-    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
-    {
-        use crate::provider_agent::{
-            CompletionResponse, StreamedAssistantContent, StreamedUserContent,
-        };
-        use futures::StreamExt;
-        use rig::completion::Usage;
-        use std::collections::HashMap;
-
+    ) -> Result<ForwardedRun, Box<dyn std::error::Error + Send + Sync>> {
         let StreamCallParams {
             prompt,
             history,
@@ -974,183 +1234,19 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
-        let inactivity_secs = self.config.stream_inactivity_timeout_secs();
-        let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
-            let mut stream = agent.stream_chat(prompt, history).await;
-            let mut content = String::new();
-            let mut usage = Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-            };
-            // Start times for tools forwarded manually here (skills, orchestration
-            // operations, and scratchpad tools when enabled) so the matching
-            // ToolResult can report a duration. Membership also gates completion:
-            // only IDs we started get completed, so MCP tools (covered by
-            // ObserverWrapper) are never double-emitted.
-            let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
-
-            // Two guarded phases per iteration, so the body (its sends and the
-            // decision-ready branch's inner `next()`) runs under the deadline
-            // state the received item implies, not the previous item's state.
-            // A ToolCall's suspension lands after its body, covering exactly
-            // the next receive, where rig executes the tool.
-            //
-            // new_disarmed(): the per-call budget already bounds the wait for
-            // the first token, so this window governs only silence between
-            // stream items; the first touch arms it.
-            let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
-                Duration::from_secs(inactivity_secs),
-            );
-            loop {
-                let item = tokio::select! {
-                    biased;
-                    _ = deadline.expired() => {
-                        return Err(deadline.stall_error(phase));
-                    }
-                    item = stream.next() => item,
-                };
-                let Some(item) = item else {
-                    break;
-                };
-                let liveness = liveness_of(&item);
-                match liveness {
-                    // `touch` is ignored while suspended, so a finished tool
-                    // must resume explicitly.
-                    Liveness::ToolFinished => deadline.resume(),
-                    _ => deadline.touch(),
-                }
-                let body = async {
-                    match item {
-                        Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                            content.push_str(&t);
-                        }
-                        Ok(StreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::ReasoningDelta { delta, .. },
-                        )) => {
-                            if let Some(tx) = event_tx {
-                                if let Some(ref ctx) = stream_context {
-                                    let _ = tx
-                                        .send(Ok(StreamItem::OrchestratorEvent(
-                                            OrchestratorEvent::WorkerReasoning {
-                                                task_id: ctx.task_id,
-                                                worker_id: ctx.worker_id.to_string(),
-                                                content: delta,
-                                            },
-                                        )))
-                                        .await;
-                                } else {
-                                    let _ = tx
-                                        .send(Ok(StreamItem::StreamAssistantItem(
-                                            StreamedAssistantContent::ReasoningDelta {
-                                                delta,
-                                                id: None,
-                                            },
-                                        )))
-                                        .await;
-                                }
-                            }
-                        }
-                        Ok(StreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::Reasoning(_),
-                        )) => {
-                            // Final reasoning block — already forwarded as deltas above.
-                            // Skip to avoid double-emission.
-                        }
-                        // Forward calls to the non-MCP tools ObserverWrapper does not
-                        // cover: skills and orchestration operations always, scratchpad
-                        // tools only when the debug flag is on. The matching completion
-                        // is emitted from the ToolResult arm below.
-                        Ok(StreamItem::StreamAssistantItem(
-                            StreamedAssistantContent::ToolCall(ref tc),
-                        )) if scratchpad::should_forward_tool_event(
-                            &tc.name,
-                            emit_scratchpad_events,
-                        ) =>
-                        {
-                            let (task_id, worker_id) = match stream_context.as_ref() {
-                                Some(w) => (Some(w.task_id), w.worker_id),
-                                None => (None, "main"),
-                            };
-                            forward_internal_tool_started(
-                                event_tx,
-                                task_id,
-                                worker_id,
-                                &tc.id,
-                                &tc.name,
-                                &tc.arguments,
-                                &mut internal_tool_starts,
-                            )
-                            .await;
-                        }
-                        Ok(StreamItem::Final(info)) => {
-                            content = info.content;
-                            usage = info.usage;
-                            return Ok(LoopStep::End);
-                        }
-                        Ok(StreamItem::FinalMarker) => {
-                            // Per-turn marker — not end-of-stream. Continue collecting.
-                        }
-                        Ok(StreamItem::TurnUsage(turn)) => {
-                            usage.input_tokens += turn.input_tokens;
-                            usage.output_tokens += turn.output_tokens;
-                            usage.total_tokens += turn.total_tokens;
-                            self.usage_state
-                                .accumulate_usage(turn.input_tokens, turn.output_tokens);
-                            if let Some(ref budget) = agent.scratchpad_budget {
-                                budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
-                            }
-                        }
-                        Err(e) => return Err(e),
-                        Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
-                            // No-op unless a start was tracked above; emitting here (not
-                            // in a dedicated arm) keeps the decision short-circuit intact
-                            // for tools like submit_result.
-                            forward_internal_tool_completed(
-                                event_tx,
-                                stream_context.as_ref().map(|w| w.task_id),
-                                &tr.id,
-                                &tr.result,
-                                &mut internal_tool_starts,
-                            )
-                            .await;
-                            tracing::debug!(
-                                "{}: tool result received (id={}, call_id={})",
-                                phase,
-                                tr.id,
-                                tr.call_id.as_deref().unwrap_or("-")
-                            );
-                            if decision_ready().await {
-                                tracing::debug!("{}: decision captured, reading turn usage", phase);
-                                if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                    usage.input_tokens += turn.input_tokens;
-                                    usage.output_tokens += turn.output_tokens;
-                                    usage.total_tokens += turn.total_tokens;
-                                }
-                                return Ok(LoopStep::End);
-                            }
-                        }
-                        _ => {} // ToolCall, ToolCallDelta — rig handles execution
-                    }
-                    Ok(LoopStep::Continue)
-                };
-                let step = tokio::select! {
-                    biased;
-                    _ = deadline.expired() => {
-                        return Err(deadline.stall_error(phase));
-                    }
-                    step = body => step?,
-                };
-                if matches!(step, LoopStep::End) {
-                    break;
-                }
-                if matches!(liveness, Liveness::ToolStarted) {
-                    deadline.suspend();
-                }
-            }
-
-            Ok(CompletionResponse { content, usage })
+            let stream = agent.stream_chat(prompt, history).await;
+            Self::drive_forward_loop(
+                stream,
+                &self.usage_state,
+                self.config.stream_inactivity_timeout_secs(),
+                agent.scratchpad_budget.as_ref(),
+                phase,
+                event_tx,
+                stream_context,
+                decision_ready,
+            )
+            .await
         };
 
         if timeout_secs == 0 {
@@ -1217,11 +1313,10 @@ impl Orchestrator {
                 .stream_chat_with_depth(prompt, history, agent.max_depth)
                 .await;
             let mut content = String::new();
-            let mut usage = Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-            };
+            let mut tally = TurnTally::default();
+            // Set only by the Final arm, whose reported loop total supersedes
+            // the per-turn sum as the response's authoritative usage.
+            let mut final_total: Option<Usage> = None;
             // The coordinator is not ObserverWrapped, so forward the same non-MCP
             // tool calls a worker does (skills, orchestration operations), attributed
             // to the main agent.
@@ -1312,27 +1407,33 @@ impl Orchestrator {
                             if decision_ready().await {
                                 tracing::debug!("{}: decision captured, reading turn usage", phase);
                                 if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                    usage.input_tokens += turn.input_tokens;
-                                    usage.output_tokens += turn.output_tokens;
-                                    usage.total_tokens += turn.total_tokens;
-                                    self.usage_state
-                                        .accumulate_usage(turn.input_tokens, turn.output_tokens);
+                                    tally.record(&turn, &self.usage_state);
                                 }
                                 return Ok(LoopStep::End);
                             }
                         }
                         // Final response — authoritative content + usage
                         Ok(StreamItem::Final(info)) => {
+                            let unrecorded = tally.reconcile(&info.usage);
+                            if unrecorded.input_tokens > 0 || unrecorded.output_tokens > 0 {
+                                tracing::warn!(
+                                    "{}: {} input / {} output tokens reached the provider \
+                                     without a TurnUsage item; billing reconciled",
+                                    phase,
+                                    unrecorded.input_tokens,
+                                    unrecorded.output_tokens
+                                );
+                                self.usage_state.accumulate_usage(
+                                    unrecorded.input_tokens,
+                                    unrecorded.output_tokens,
+                                );
+                            }
                             content = info.content;
-                            usage = info.usage;
+                            final_total = Some(info.usage);
                             return Ok(LoopStep::End);
                         }
                         Ok(StreamItem::TurnUsage(turn)) => {
-                            usage.input_tokens += turn.input_tokens;
-                            usage.output_tokens += turn.output_tokens;
-                            usage.total_tokens += turn.total_tokens;
-                            self.usage_state
-                                .accumulate_usage(turn.input_tokens, turn.output_tokens);
+                            tally.record(&turn, &self.usage_state);
                         }
                         Ok(StreamItem::FinalMarker) => return Ok(LoopStep::End),
                         // MaxDepthError: success if decision was captured, error otherwise
@@ -1366,7 +1467,25 @@ impl Orchestrator {
                     deadline.suspend();
                 }
             }
-            Ok(CompletionResponse { content, usage })
+            // Coordinator occupancy under the same agent id single-agent uses,
+            // so clients track one conversation context across both modes. The
+            // last planning cycle runs after the workers, so its event is the
+            // one that lands last.
+            if let Some(tx) = event_tx.filter(|_| tally.last.input_tokens > 0) {
+                let _ = tx
+                    .send(Ok(StreamItem::ContextUsage {
+                        agent_id: COORDINATOR_AGENT_ID.to_string(),
+                        context_tokens: tally.last.input_tokens,
+                        response_tokens: tally.last.output_tokens,
+                        context_window: agent.context_window,
+                    }))
+                    .await;
+            }
+
+            Ok(CompletionResponse {
+                content,
+                usage: final_total.unwrap_or(tally.total),
+            })
         };
 
         if timeout_secs == 0 {
@@ -2330,7 +2449,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 mcp_manager: None, // Coordinator doesn't have MCP tools
                 fallback_tool_parsing: false,
                 fallback_tool_names: vec![],
-                context_window: None,
+                context_window: self.agent_config.llm.context_window(),
                 scratchpad_budget: None,
                 client_tool_names: Default::default(),
                 turn_nudge: None,
@@ -3240,9 +3359,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
             }
 
+            // Emit this agent's context-window occupancy from its final
+            // response turn — provider-reported, no local tokenizer.
+            if let (Ok(run), Some(tx)) = (&stream_result, event_tx) {
+                let agent_id = worker_name
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| self.orchestrator_id.clone());
+                let _ = tx
+                    .send(Ok(StreamItem::ContextUsage {
+                        agent_id,
+                        context_tokens: run.last_turn.input_tokens,
+                        response_tokens: run.last_turn.output_tokens,
+                        context_window: worker.context_window,
+                    }))
+                    .await;
+            }
+
             // Detect context overflow and other errors — don't retry hard errors
             let result = match stream_result {
-                Ok(r) => Ok(r.content),
+                Ok(r) => Ok(r.response.content),
                 Err(e) if is_context_overflow_error(e.as_ref()) => {
                     let suggestion = context_overflow_suggestion("worker");
                     Err(format!(
@@ -4619,6 +4754,252 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage(input_tokens: u64, output_tokens: u64) -> rig::completion::Usage {
+        rig::completion::Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
+
+    /// Turn figures are AWS Bedrock invocation-log records for one `arithmetic`
+    /// worker loop: 2012/115 then 2152/124.
+    #[test]
+    fn test_tally_records_every_turn_into_shared_usage_state() {
+        let usage_state = crate::UsageState::new();
+        let mut tally = TurnTally::default();
+
+        tally.record(&usage(2012, 115), &usage_state);
+        tally.record(&usage(2152, 124), &usage_state);
+
+        // Billed usage is the whole loop.
+        assert_eq!(usage_state.get_final_usage(), (4164, 239, 4403));
+        assert_eq!(tally.total.input_tokens, 4164);
+        // Occupancy is the last turn alone, not the loop total.
+        assert_eq!(tally.last.input_tokens, 2152);
+        assert_eq!(tally.last.output_tokens, 124);
+    }
+
+    #[test]
+    fn test_tally_reconciles_to_zero_when_every_turn_was_recorded() {
+        let usage_state = crate::UsageState::new();
+        let mut tally = TurnTally::default();
+        tally.record(&usage(2012, 115), &usage_state);
+        tally.record(&usage(2152, 124), &usage_state);
+
+        // The provider's loop total for these turns — nothing bypassed record().
+        let unrecorded = tally.reconcile(&usage(4164, 239));
+
+        assert_eq!(unrecorded.input_tokens, 0);
+        assert_eq!(unrecorded.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_tally_reconcile_surfaces_turns_that_bypassed_record() {
+        let usage_state = crate::UsageState::new();
+        let mut tally = TurnTally::default();
+        tally.record(&usage(2012, 115), &usage_state);
+
+        let unrecorded = tally.reconcile(&usage(4164, 239));
+
+        assert_eq!(unrecorded.input_tokens, 2152);
+        assert_eq!(unrecorded.output_tokens, 124);
+    }
+
+    #[test]
+    fn test_tally_reconcile_saturates_when_total_trails_recorded() {
+        let usage_state = crate::UsageState::new();
+        let mut tally = TurnTally::default();
+        tally.record(&usage(4164, 239), &usage_state);
+
+        let unrecorded = tally.reconcile(&usage(100, 10));
+
+        assert_eq!(unrecorded.input_tokens, 0);
+        assert_eq!(unrecorded.output_tokens, 0);
+    }
+
+    /// A two-worker orchestration run replayed from its Bedrock
+    /// invocation-log records: coordinator 3258/270 planning and 4133/308
+    /// synthesis, arithmetic 2012/115 + 2152/124, reporter 2085/313 + 2584/278.
+    /// Billed usage must equal the provider's own sum, 16224/1408.
+    #[test]
+    fn test_orchestration_run_accumulates_to_the_provider_total() {
+        let usage_state = crate::UsageState::new();
+
+        for turns in [
+            vec![usage(3258, 270)],
+            vec![usage(2012, 115), usage(2152, 124)],
+            vec![usage(2085, 313), usage(2584, 278)],
+            vec![usage(4133, 308)],
+        ] {
+            let mut tally = TurnTally::default();
+            for turn in &turns {
+                tally.record(turn, &usage_state);
+            }
+        }
+
+        let (prompt, completion, total) = usage_state.get_final_usage();
+        assert_eq!(prompt, 16224, "billed input must match the provider sum");
+        assert_eq!(
+            completion, 1408,
+            "billed output must match the provider sum"
+        );
+        assert_eq!(total, 17632);
+    }
+
+    // ========================================================================
+    // Scripted-stream harness
+    //
+    // Drives the real `drive_forward_loop` arms so a future exit path that
+    // forgets `TurnTally::record` fails here rather than in production.
+    // ========================================================================
+
+    fn scripted(
+        items: Vec<Result<StreamItem, StreamError>>,
+    ) -> std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamItem, StreamError>> + Send>>
+    {
+        Box::pin(futures::stream::iter(items))
+    }
+
+    fn turn(input_tokens: u64, output_tokens: u64) -> Result<StreamItem, StreamError> {
+        Ok(StreamItem::TurnUsage(usage(input_tokens, output_tokens)))
+    }
+
+    fn tool_result(id: &str) -> Result<StreamItem, StreamError> {
+        Ok(StreamItem::StreamUserItem(
+            crate::provider_agent::StreamedUserContent::ToolResult(
+                crate::provider_agent::ToolResult {
+                    id: id.to_string(),
+                    call_id: Some(id.to_string()),
+                    result: "ok".to_string(),
+                },
+            ),
+        ))
+    }
+
+    fn never_ready()
+    -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+        || Box::pin(async { false })
+    }
+
+    fn always_ready()
+    -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+        || Box::pin(async { true })
+    }
+
+    async fn drive(
+        items: Vec<Result<StreamItem, StreamError>>,
+        usage_state: &crate::UsageState,
+        decision_ready: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    ) -> ForwardedRun {
+        Orchestrator::drive_forward_loop(
+            scripted(items),
+            usage_state,
+            0,
+            None,
+            "test",
+            None,
+            None,
+            decision_ready,
+        )
+        .await
+        .expect("scripted stream should drive to completion")
+    }
+
+    /// Turn figures are Bedrock invocation-log records for one `arithmetic`
+    /// worker loop: 2012/115 then 2152/124.
+    #[tokio::test]
+    async fn test_loop_bills_every_turn_and_reports_the_last_as_occupancy() {
+        let usage_state = crate::UsageState::new();
+
+        let run = drive(
+            vec![
+                turn(2012, 115),
+                turn(2152, 124),
+                Ok(StreamItem::Final(
+                    crate::provider_agent::FinalResponseInfo {
+                        content: "done".to_string(),
+                        usage: usage(4164, 239),
+                    },
+                )),
+            ],
+            &usage_state,
+            never_ready(),
+        )
+        .await;
+
+        assert_eq!(usage_state.get_final_usage(), (4164, 239, 4403));
+        assert_eq!(run.last_turn.input_tokens, 2152);
+        assert_eq!(run.last_turn.output_tokens, 124);
+        assert_eq!(run.response.content, "done");
+    }
+
+    /// The `submit_result` exit consumes a turn off the stream itself; before
+    /// this path recorded through the tally it was billed to nobody.
+    #[tokio::test]
+    async fn test_submit_result_exit_bills_the_turn_it_consumes() {
+        let usage_state = crate::UsageState::new();
+
+        let run = drive(
+            vec![
+                turn(2012, 115),
+                tool_result("submit_result"),
+                turn(2152, 124),
+            ],
+            &usage_state,
+            always_ready(),
+        )
+        .await;
+
+        assert_eq!(
+            usage_state.get_final_usage(),
+            (4164, 239, 4403),
+            "the turn consumed by the early exit must reach UsageState"
+        );
+        assert_eq!(run.last_turn.input_tokens, 2152);
+        assert_eq!(run.response.usage.input_tokens, 4164);
+    }
+
+    /// A loop total larger than the recorded turns means a turn bypassed the
+    /// tally; billing is reconciled from the remainder.
+    #[tokio::test]
+    async fn test_loop_reconciles_a_total_that_exceeds_recorded_turns() {
+        let usage_state = crate::UsageState::new();
+
+        drive(
+            vec![
+                turn(2012, 115),
+                Ok(StreamItem::Final(
+                    crate::provider_agent::FinalResponseInfo {
+                        content: "done".to_string(),
+                        usage: usage(4164, 239),
+                    },
+                )),
+            ],
+            &usage_state,
+            never_ready(),
+        )
+        .await;
+
+        assert_eq!(usage_state.get_final_usage(), (4164, 239, 4403));
+    }
+
+    #[tokio::test]
+    async fn test_loop_without_a_final_reports_the_summed_turns() {
+        let usage_state = crate::UsageState::new();
+
+        let run = drive(
+            vec![turn(2012, 115), turn(2152, 124)],
+            &usage_state,
+            never_ready(),
+        )
+        .await;
+
+        assert_eq!(run.response.usage.input_tokens, 4164);
+        assert_eq!(run.response.usage.output_tokens, 239);
+        assert_eq!(usage_state.get_final_usage(), (4164, 239, 4403));
+    }
 
     #[test]
     fn test_truncate_query_short() {

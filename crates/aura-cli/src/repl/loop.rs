@@ -27,21 +27,58 @@ use crate::tools;
 use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::prompt::{
     WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
-    erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
-    get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output, is_processing,
-    is_readline_active, last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
+    erase_input_frame, extend_display_events, frame_lines, fresh_context_fill_ratio,
+    get_context_tokens, get_cumulative_tokens, get_selected_model, handle_ctrlc,
+    install_sigint_handler, is_expanded_output, is_processing, is_readline_active,
+    last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
     push_mid_stream_history, push_sse_event, random_bullet_color, rebuild_status_bar,
     redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
-    restore_terminal_mode, seed_model_cache, seed_status_bar_tokens, set_expanded_output,
-    set_mid_stream_history, set_noncanonical_noecho, set_processing, set_readline_active,
-    set_selected_model, set_startup_status, set_status_bar_tokens, set_stream_conv_dir,
-    set_welcome_state, setup_terminal, stop_and_clear_animation, styled_prompt,
-    take_pending_command, take_queued_input, task_color_for, text_lines, update_status_bar,
-    update_status_bar_unlocked, with_event_log, with_event_log_mut,
+    restore_terminal_mode, seed_model_cache, seed_status_bar_tokens, set_context_window_usage,
+    set_expanded_output, set_mid_stream_history, set_noncanonical_noecho, set_processing,
+    set_readline_active, set_selected_model, set_startup_status, set_status_bar_tokens,
+    set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
+    styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
+    update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
+
+/// Agent id carrying the conversation's own context — `"main"` in single-agent
+/// mode and for an orchestration coordinator; workers report other ids.
+const CONVERSATION_AGENT_ID: &str = "main";
+
+/// Context fill at which an over-long tool result is retried against a
+/// compacted conversation.
+const AUTO_COMPACT_FILL: f64 = 0.85;
+/// Context fill at which the user is nudged to compact.
+const COMPACT_NUDGE_FILL: f64 = 0.75;
+/// Fill the conversation must drop back below before a further nudge is armed,
+/// so one long conversation does not nudge on every turn.
+const COMPACT_NUDGE_REARM_FILL: f64 = 0.6;
+
+// Re-arming has to sit below the nudge, and the nudge below the retry, or a
+// conversation is compacted with no warning first.
+const _: () = assert!(COMPACT_NUDGE_REARM_FILL < COMPACT_NUDGE_FILL);
+const _: () = assert!(COMPACT_NUDGE_FILL < AUTO_COMPACT_FILL);
+const _: () = assert!(AUTO_COMPACT_FILL < 1.0);
+
+/// Whether to nudge at this fill, updating the armed flag.
+///
+/// Hysteresis between [`COMPACT_NUDGE_FILL`] and [`COMPACT_NUDGE_REARM_FILL`]
+/// replaces the token-count bands used when the window size is unknown: a
+/// conversation hovering near the threshold nudges once, and compacting it
+/// re-arms the next one.
+fn should_nudge_at_fill(fill: f64, armed: &mut bool) -> bool {
+    if *armed && fill >= COMPACT_NUDGE_FILL {
+        *armed = false;
+        return true;
+    }
+    if fill < COMPACT_NUDGE_REARM_FILL {
+        *armed = true;
+    }
+    false
+}
 
 /// Repaints the frame after a terminal resize while idle at the prompt.
 ///
@@ -598,6 +635,7 @@ pub fn run_repl(
 
     // Context compaction state
     let mut last_compact_prompt_threshold: u64 = 2_000_000;
+    let mut compact_nudge_armed = true;
     let mut compact_hint_pending = false;
 
     // Handle --resume flag: load conversation from disk
@@ -933,6 +971,7 @@ pub fn run_repl(
                 // Per-turn status notices (e.g. MCP connection errors/warnings)
                 // are scoped to the current request; clear last turn's set.
                 crate::ui::prompt::clear_turn_notices();
+                crate::ui::prompt::begin_turn_context_tracking();
 
                 // Per-turn event recording state
                 let pending_args: Arc<
@@ -1143,9 +1182,15 @@ pub fn run_repl(
 
                     match result {
                         Ok(StreamResult::TextResponse(text)) => {
-                            // Check for auto-compaction trigger
-                            let tokens = get_cumulative_tokens();
-                            if tokens >= 8_000_000
+                            // Check for auto-compaction trigger (context pressure).
+                            // Occupancy is bounded by the window, so it is
+                            // judged as a fill fraction; the token count only
+                            // applies when no window-relative reading exists.
+                            let under_pressure = match fresh_context_fill_ratio() {
+                                Some(fill) => fill >= AUTO_COMPACT_FILL,
+                                None => get_cumulative_tokens() >= 8_000_000,
+                            };
+                            if under_pressure
                                 && text.contains(
                                     "My tools returned more data than I can work with at once",
                                 )
@@ -1179,10 +1224,10 @@ pub fn run_repl(
                                             .attribute(crossterm::style::Attribute::Bold),
                                     );
                                     println!(
-                                        "{} Context limit reached — removed {} messages ({} total tokens)",
+                                        "{} Context limit reached — removed {} messages ({} tokens in context)",
                                         "└─".themed(AuraStyle::Connector),
                                         removed,
-                                        tokens,
+                                        get_context_tokens(),
                                     );
                                     println!();
 
@@ -1901,15 +1946,24 @@ pub fn run_repl(
 
                     conversation.add_assistant(&final_text);
 
-                    // Check if we've crossed a 2M token boundary — nudge on next turn
-                    let current_tokens = get_cumulative_tokens();
-                    if current_tokens >= last_compact_prompt_threshold {
-                        while last_compact_prompt_threshold <= current_tokens {
-                            last_compact_prompt_threshold += 2_000_000;
+                    // Nudge on the next turn once the context is filling up.
+                    match fresh_context_fill_ratio() {
+                        Some(fill) => {
+                            if should_nudge_at_fill(fill, &mut compact_nudge_armed) {
+                                compact_hint_pending = true;
+                            }
                         }
-                        compact_hint_pending = true;
-                        // Show "Context left: N%" in the status bar from now on
-                        crate::ui::prompt::set_auto_compact_ceiling(8_000_000);
+                        None => {
+                            let current_tokens = get_cumulative_tokens();
+                            if current_tokens >= last_compact_prompt_threshold {
+                                while last_compact_prompt_threshold <= current_tokens {
+                                    last_compact_prompt_threshold += 2_000_000;
+                                }
+                                compact_hint_pending = true;
+                                // Show "Context left: N%" in the status bar from now on
+                                crate::ui::prompt::set_auto_compact_ceiling(8_000_000);
+                            }
+                        }
                     }
                 }
 
@@ -2402,6 +2456,29 @@ impl StreamHandler for ReplStreamHandler {
             events.push(DisplayEvent::Usage {
                 prompt_tokens,
                 completion_tokens,
+            });
+        }
+    }
+
+    fn on_context_usage(
+        &mut self,
+        context_tokens: u64,
+        response_tokens: u64,
+        context_window: Option<u64>,
+        agent_id: &str,
+    ) {
+        // Orchestration workers report their own sub-context; only the
+        // conversation-level agent's occupancy belongs on the status bar, and
+        // worker completion order is nondeterministic.
+        if agent_id == CONVERSATION_AGENT_ID {
+            set_context_window_usage(context_tokens, response_tokens, context_window);
+            update_status_bar();
+        }
+        if let Ok(mut events) = self.turn_events.lock() {
+            events.push(DisplayEvent::ContextUsage {
+                context_tokens,
+                response_tokens,
+                context_window,
             });
         }
     }
@@ -3566,8 +3643,35 @@ impl StreamHandler for ReplStreamHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMAND_ALIASES, ReplTelemetryLifecycle, command_hint};
+    use super::{
+        COMMAND_ALIASES, COMPACT_NUDGE_FILL, ReplTelemetryLifecycle, command_hint,
+        should_nudge_at_fill,
+    };
     use crate::repl::registry;
+
+    #[test]
+    fn nudges_once_while_the_context_stays_full() {
+        let mut armed = true;
+
+        assert!(!should_nudge_at_fill(0.50, &mut armed));
+        assert!(should_nudge_at_fill(COMPACT_NUDGE_FILL, &mut armed));
+        // Still full on later turns — one nudge per fill-up, not one per turn.
+        assert!(!should_nudge_at_fill(0.80, &mut armed));
+        assert!(!should_nudge_at_fill(0.95, &mut armed));
+    }
+
+    #[test]
+    fn compacting_below_the_rearm_fill_arms_the_next_nudge() {
+        let mut armed = true;
+        assert!(should_nudge_at_fill(0.90, &mut armed));
+
+        // Hovering between re-arm and nudge does not re-arm.
+        assert!(!should_nudge_at_fill(0.70, &mut armed));
+        // A compaction drops the fill; the next fill-up nudges again.
+        assert!(!should_nudge_at_fill(0.30, &mut armed));
+        assert!(should_nudge_at_fill(0.78, &mut armed));
+    }
+
     use aura_telemetry::events::{CliSessionStarted, ExitReason};
     use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
     use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryState};

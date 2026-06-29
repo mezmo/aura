@@ -60,6 +60,10 @@ pub(crate) static STATUS_HINT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static TURN_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static CUMULATIVE_PROMPT: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_COMPLETION: Mutex<u64> = Mutex::new(0);
+/// Context-window occupancy in tokens: input plus output of an agent's final turn.
+pub(crate) static CONTEXT_OCCUPANCY: AtomicU64 = AtomicU64::new(0);
+/// Whether [`CONTEXT_OCCUPANCY`] was reported during the current turn.
+pub(crate) static CONTEXT_OCCUPANCY_FRESH: AtomicBool = AtomicBool::new(false);
 pub(crate) static CUMULATIVE_SCRATCHPAD_INTERCEPTED: Mutex<u64> = Mutex::new(0);
 pub(crate) static CUMULATIVE_SCRATCHPAD_EXTRACTED: Mutex<u64> = Mutex::new(0);
 pub(crate) static PROCESSING: AtomicBool = AtomicBool::new(false);
