@@ -54,7 +54,7 @@ It renders the coordinator's plan and worker activity as the response streams.
 curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-The script downloads pre-built binaries for your platform, verifies checksums when available, and installs to `~/.local/bin`. Customize with environment variables:
+The script downloads pre-built binaries for your platform, verifies checksums when available, and installs them to `~/.local/bin`. It supports Linux on `amd64` and `arm64`. On macOS, download the binaries manually (see below). You can customize the install with environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -69,9 +69,9 @@ Install only the CLI to a custom directory:
 AURA_INSTALL=/usr/local/bin AURA_COMPONENT=cli curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-**Manual download:** Pre-built binaries (`aura-cli`, `aura-web-server`) for `linux-amd64` and `linux-arm64` are available on the [GitHub Releases](https://github.com/mezmo/aura/releases) page with SHA-256 checksums.
+**Manual download:** Pre-built `aura-cli` and `aura-web-server` binaries are published on the [GitHub Releases](https://github.com/mezmo/aura/releases) page. Builds are available for Linux (`linux-amd64` and `linux-arm64`) and macOS (`darwin-amd64` and `darwin-arm64`). Each binary has a SHA-256 checksum in `checksums.txt`.
 
-### Build from source
+### Build the CLI from source
 
 Prefer to build locally instead of using the bundled binary? Connect to the quickstart server:
 
@@ -80,11 +80,11 @@ cargo build -p aura-cli --release
 ./target/release/aura-cli
 ```
 
-The CLI also supports a **standalone mode** that runs agents in-process from a TOML config — no server needed:
+The CLI defaults to **standalone mode** — it runs agents in-process from a TOML config, no server needed:
 
 ```bash
-cargo build -p aura-cli --release --features standalone-cli
-./target/release/aura-cli --standalone --config quickstart.toml
+cargo build -p aura-cli --release
+./target/release/aura-cli --config quickstart.toml
 ```
 
 See the [CLI README](../crates/aura-cli/README.md) for the full feature set.
@@ -193,6 +193,21 @@ Restart with `docker compose up -d`. Clients that support model selection (Libre
 > (e.g. `OPENAI_API_KEY`) rather than the quickstart's `LLM_API_KEY`. Add the
 > appropriate keys to your `.env` — they're automatically loaded into the container
 > via `env_file`. See `.env.example` for the full list.
+
+#### Hide an agent from discovery
+
+Set `hidden = true` in an agent's `[agent]` block to keep it out of discovery listings. AURA omits a hidden agent from the `GET /v1/models` response and from the CLI's `/model` list, so it won't appear in client model pickers. The agent stays fully usable. Any caller that already knows its name or alias can still select it by sending that value as the `model` field. This helps when an agent isn't ready yet, or when you want only known callers to invoke it during development/testing/production.
+
+```toml
+[agent]
+name = "hidden agent"
+hidden = true
+system_prompt = "You are a hidden agent that does not show up in listings, but still invokable by known callers."
+```
+
+The `hidden` field defaults to `false`. It accepts either a TOML boolean (`true` or `false`) or the quoted strings `"true"` and `"false"`. The quoted form is convenient when a templating tool such as Helm renders the value as a string.
+
+> **Note:** If you load only a single hidden agent, both `GET /v1/models` and the CLI `/model` list come back empty even though the agent is still the active, invocable default.
 
 ### Customize orchestration
 
