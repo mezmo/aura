@@ -1,7 +1,7 @@
 use std::process::Command;
 
 fn aura_cli() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_aura-cli"))
+    Command::new(env!("CARGO_BIN_EXE_aura"))
 }
 
 #[test]
@@ -10,7 +10,7 @@ fn help_flag_exits_zero() {
     assert!(output.status.success(), "expected exit 0 for --help");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("aura-cli"),
+        stdout.contains("aura"),
         "help should mention the binary name"
     );
     assert!(
@@ -27,7 +27,7 @@ fn version_flag_exits_zero() {
     assert!(output.status.success(), "expected exit 0 for --version");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("aura-cli"),
+        stdout.contains("aura"),
         "version output should mention the binary name"
     );
 }

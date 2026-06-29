@@ -1844,7 +1844,7 @@ pub fn run_repl(
         let short_id = &store.uuid[..8.min(store.uuid.len())];
         println!(
             "Resume this conversation with: {} {}",
-            "aura-cli --resume".themed(AuraStyle::Identifier),
+            "aura --resume".themed(AuraStyle::Identifier),
             short_id.themed(AuraStyle::Identifier),
         );
     }

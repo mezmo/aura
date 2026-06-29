@@ -1,4 +1,4 @@
-//! `aura-cli init` — generate a starter configuration.
+//! `aura init` — generate a starter configuration.
 //!
 //! The flow:
 //!

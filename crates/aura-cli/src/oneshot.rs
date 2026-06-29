@@ -6,7 +6,7 @@
 //! Stdout in one-shot mode contains **only the raw assistant response**.
 //! No bullet markers, no styled headers, no tool-execution summaries, no
 //! markdown rendering. The output is the verbatim text the model produced
-//! so callers can pipe it (`aura-cli --query ... | jq`, `... | tee`,
+//! so callers can pipe it (`aura --query ... | jq`, `... | tee`,
 //! `... > out.md`) without scrubbing decorations off.
 //!
 //! Everything else — tracing logs (when `--log-file` is set), permission

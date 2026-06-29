@@ -12,7 +12,7 @@ name = "aura_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "aura-cli"
+name = "aura"
 path = "src/main.rs"
 
 [features]

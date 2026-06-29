@@ -462,6 +462,6 @@ pub(crate) fn create_input_reader() -> rustyline::Result<Editor<AuraHelper, Defa
 
 pub(crate) fn get_history_path() -> Option<String> {
     let data_dir = dirs::data_local_dir()?;
-    let path = data_dir.join("aura-cli").join("history.txt");
+    let path = data_dir.join("aura").join("history.txt");
     path.to_str().map(|s| s.to_string())
 }

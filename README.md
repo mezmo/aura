@@ -43,10 +43,10 @@ Key capabilities:
 ```bash
 cp .env.example .env                                              # set your LLM provider, model, and API key
 docker compose up -d                                              # starts Aura (orchestrator mode) + LibreChat + Phoenix
-docker exec -it aura ./aura-cli --api-url http://localhost:8080   # chat with the orchestrator from your terminal
+docker exec -it aura ./aura --api-url http://localhost:8080       # chat with the orchestrator from your terminal
 ```
 
-Aura boots in **orchestrator mode**: a coordinator routes each request — answering simple ones directly and decomposing complex ones across specialized workers. The bundled `aura-cli` connects to the in-container server automatically and renders the coordinator's plan and worker activity as it streams.
+Aura boots in **orchestrator mode**: a coordinator routes each request — answering simple ones directly and decomposing complex ones across specialized workers. The bundled `aura` connects to the in-container server automatically and renders the coordinator's plan and worker activity as it streams.
 
 Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://localhost:6006> to inspect traces in Phoenix.
 
@@ -216,7 +216,7 @@ A2A endpoints, transport modes, the agent card URL, task lifecycle, and testing 
 > # **USE AT YOUR OWN RISK**
 > ---
 >
-> **Setting `enable_client_tools = true` on an agent grants the LLM the ability to call tools that execute on the *client's* machine.** When clients (e.g. `aura-cli`) advertise tools like `Shell`, `Read`, or `Update`, the LLM can invoke them and the client will execute them with the privileges of the user running the client. This is functionally equivalent to giving the model a shell prompt on every connecting client.
+> **Setting `enable_client_tools = true` on an agent grants the LLM the ability to call tools that execute on the *client's* machine.** When clients (e.g. `aura`) advertise tools like `Shell`, `Read`, or `Update`, the LLM can invoke them and the client will execute them with the privileges of the user running the client. This is functionally equivalent to giving the model a shell prompt on every connecting client.
 >
 > **The risks are real:**
 > - **Prompt injection.** Anything the model reads — a file, an MCP tool output, a vector-store hit, a URL — can contain instructions that hijack the model into running destructive commands. The server cannot tell a legitimate request from an injected one.
@@ -231,7 +231,7 @@ A2A endpoints, transport modes, the agent card URL, task lifecycle, and testing 
 >
 > Disabled by default. Opting an agent in is your decision and your responsibility — and your users'.
 >
-> See [aura-cli's matching warning](crates/aura-cli/README.md#client-side-tools) for the client-side perspective.
+> See [aura's matching warning](crates/aura-cli/README.md#client-side-tools) for the client-side perspective.
 
 > **Single-agent configurations only.** Client-side tools are not supported in orchestrated (multi-agent) configurations — when `[orchestration].enabled = true`, any `tools` array on the request is dropped with a warning. The reason: the passthrough mechanism requires terminating the user-facing SSE stream with `finish_reason: "tool_calls"`, which doesn't compose with the coordinator/worker pipeline. If you need local tools, use a single-agent config.
 
@@ -282,7 +282,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-When the loaded agent doesn't opt in (the default), any `tools` field on the request is silently dropped; the server runs MCP tools as usual but never asks the client to execute anything. Per-agent opt-in is the design — accepting client-supplied tool definitions means trusting the client to execute them, so it should be a deliberate config decision. See [aura-cli](crates/aura-cli/README.md#client-side-tools) for the matching client-side flag (`--enable-client-tools`) and how the two halves coordinate.
+When the loaded agent doesn't opt in (the default), any `tools` field on the request is silently dropped; the server runs MCP tools as usual but never asks the client to execute anything. Per-agent opt-in is the design — accepting client-supplied tool definitions means trusting the client to execute them, so it should be a deliberate config decision. See [aura](crates/aura-cli/README.md#client-side-tools) for the matching client-side flag (`--enable-client-tools`) and how the two halves coordinate.
 
 ## Configuration
 

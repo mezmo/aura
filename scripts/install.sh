@@ -38,7 +38,7 @@ main() {
         install_binary "${tmpdir}" "aura-web-server"
     fi
     if [[ "${COMPONENT}" != "server" ]]; then
-        install_binary "${tmpdir}" "aura-cli"
+        install_binary "${tmpdir}" "aura"
     fi
 
     echo ""
