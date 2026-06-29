@@ -94,31 +94,90 @@ fmt-rust:: $(REPORT_DIR)                 ## Format code with rustfmt
 $(DIST_DIR):
 	@mkdir -p $(@)
 
-.PHONY: build-release-binary-amd64
-build-release-binary-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build release binaries for linux/amd64
-	$(RUN) cargo build --release --bin aura-web-server
-	$(RUN) cargo build --release -p aura-cli --bin aura
-	cp target/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
-	cp target/release/aura $(DIST_DIR)/aura-linux-amd64
+# Cargo build profile for the packaged binaries: "release" or "debug". Selects
+# both the cargo flag and the target/ output subdirectory cargo writes to.
+PROFILE ?= release
+ifeq ($(filter $(PROFILE),release debug),)
+$(error PROFILE must be 'release' or 'debug' (got '$(PROFILE)'))
+endif
+CARGO_PROFILE_FLAG := $(if $(filter release,$(PROFILE)),--release,)
 
-.PHONY: build-release-binary-arm64
-build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release binaries for linux/arm64
+# Shell snippet that aborts unless the build host matches $(1)=uname -s and
+# $(2)=uname -m ($(2) empty = any arch). Inlined into a build's bash -c so the
+# check runs against the same context that compiles.
+require_host = os=\$$(uname -s); arch=\$$(uname -m); if [ \$$os != $(1) ]$(if $(2), || [ \$$arch != $(2) ],); then echo error: $@ must be built on $(1)$(if $(2), $(2),), build host is \$$os \$$arch >&2; exit 1; fi;
+
+.PHONY: build-binary-linux-amd64
+build-binary-linux-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/amd64 (PROFILE=release|debug)
 	$(RUN) bash -c "\
+		$(call require_host,Linux,x86_64) \
+		cargo build $(CARGO_PROFILE_FLAG) --bin aura-web-server && \
+		cargo build $(CARGO_PROFILE_FLAG) -p aura-cli --bin aura"
+	cp target/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
+	cp target/$(PROFILE)/aura $(DIST_DIR)/aura-linux-amd64
+
+.PHONY: build-binary-linux-arm64
+build-binary-linux-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/arm64 (PROFILE=release|debug)
+	$(RUN) bash -c "\
+		$(call require_host,Linux,x86_64) \
 		rustup target add aarch64-unknown-linux-gnu 2>/dev/null; \
 		export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
 		export CC_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-gcc; \
 		export CXX_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-g++; \
 		export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
 		export PKG_CONFIG_ALLOW_CROSS=1; \
-		cargo build --release --target aarch64-unknown-linux-gnu --bin aura-web-server && \
-		cargo build --release --target aarch64-unknown-linux-gnu -p aura-cli --bin aura"
-	cp target/aarch64-unknown-linux-gnu/release/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
-	cp target/aarch64-unknown-linux-gnu/release/aura $(DIST_DIR)/aura-linux-arm64
+		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu --bin aura-web-server && \
+		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu -p aura-cli --bin aura"
+	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
+	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura $(DIST_DIR)/aura-linux-arm64
 
-.PHONY: build-release-binaries
-build-release-binaries: ## Build release binaries for all platforms
-	$(MAKE) -j2 build-release-binary-amd64 build-release-binary-arm64
+.PHONY: build-binary-darwin-amd64
+build-binary-darwin-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for darwin/amd64 (PROFILE=release|debug)
+	$(RUN) bash -c "\
+		$(call require_host,Darwin,) \
+		rustup target add x86_64-apple-darwin 2>/dev/null; \
+		cargo build $(CARGO_PROFILE_FLAG) --target x86_64-apple-darwin --bin aura-web-server && \
+		cargo build $(CARGO_PROFILE_FLAG) --target x86_64-apple-darwin -p aura-cli --bin aura"
+	cp target/x86_64-apple-darwin/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-darwin-amd64
+	cp target/x86_64-apple-darwin/$(PROFILE)/aura $(DIST_DIR)/aura-darwin-amd64
+
+.PHONY: build-binary-darwin-arm64
+build-binary-darwin-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for darwin/arm64 (PROFILE=release|debug)
+	$(RUN) bash -c "\
+		$(call require_host,Darwin,) \
+		rustup target add aarch64-apple-darwin 2>/dev/null; \
+		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-apple-darwin --bin aura-web-server && \
+		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-apple-darwin -p aura-cli --bin aura"
+	cp target/aarch64-apple-darwin/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-darwin-arm64
+	cp target/aarch64-apple-darwin/$(PROFILE)/aura $(DIST_DIR)/aura-darwin-arm64
+
+.PHONY: build-binaries-linux
+build-binaries-linux: ## Build binaries for linux (amd64 + arm64, PROFILE=release|debug)
+	$(MAKE) build-binary-linux-amd64 build-binary-linux-arm64
+
+.PHONY: build-binaries-darwin
+build-binaries-darwin: ## Build binaries for darwin (amd64 + arm64, PROFILE=release|debug)
+	$(MAKE) build-binary-darwin-amd64 build-binary-darwin-arm64
+
+.PHONY: build-checksums
+build-checksums: ## Write sha256 checksums for the binaries in dist
 	cd $(DIST_DIR) && sha256sum aura-* > checksums.txt
+
+# Every binary a complete release must contain, across all platforms.
+EXPECTED_BINARIES := \
+	aura-linux-amd64 aura-web-server-linux-amd64 \
+	aura-linux-arm64 aura-web-server-linux-arm64 \
+	aura-darwin-amd64 aura-web-server-darwin-amd64 \
+	aura-darwin-arm64 aura-web-server-darwin-arm64
+
+.PHONY: verify-binaries
+verify-binaries: build-checksums ## Verify every expected binary is present and checksummed correctly
+	@cd $(DIST_DIR) && \
+	for f in $(EXPECTED_BINARIES); do \
+		[ -f "$$f" ] || { echo "error: missing binary: $$f" >&2; exit 1; }; \
+		grep -q " $$f\$$" checksums.txt || { echo "error: $$f absent from checksums.txt" >&2; exit 1; }; \
+	done
+	cd $(DIST_DIR) && sha256sum -c checksums.txt
 
 clean:: clean-dist
 
