@@ -15,10 +15,11 @@ use crate::theme::{AuraStyle, Themed};
 
 use super::animation::render_queued_wave;
 use super::state::{
-    AUTO_COMPACT_CEILING, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION,
-    CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED,
-    CURSOR_ROW, FRAME_LINES, LAST_CTRLC, PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, STATUS_BAR,
-    STATUS_HINT, STATUS_ROWS, TURN_NOTICES, lock_term, status_rows, term_size,
+    AUTO_COMPACT_CEILING, CONTEXT_OCCUPANCY, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP,
+    CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT, CUMULATIVE_SCRATCHPAD_EXTRACTED,
+    CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, FRAME_LINES, LAST_CTRLC, PROCESSING,
+    QUEUED_INPUT, QUEUED_WAVE_POS, STATUS_BAR, STATUS_HINT, STATUS_ROWS, TURN_NOTICES, lock_term,
+    status_rows, term_size,
 };
 
 /// Format a number with comma separators (e.g. 1234 -> "1,234").
@@ -228,9 +229,10 @@ pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
 
     let left = build_status_left(cumulative_prompt, cumulative_completion, total);
 
+    let pressure = context_pressure_tokens(total);
     let ceiling = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    let right = if ceiling > 0 && total < ceiling {
-        let remaining_pct = ((ceiling - total) as f64 / ceiling as f64 * 100.0).round() as u64;
+    let right = if ceiling > 0 && pressure < ceiling {
+        let remaining_pct = ((ceiling - pressure) as f64 / ceiling as f64 * 100.0).round() as u64;
         format!("Context left: {remaining_pct}%")
     } else {
         "Aura, by Mezmo!".to_string()
@@ -257,9 +259,10 @@ fn refresh_status_bar_from_counters() {
 
     let left = build_status_left(cumulative_prompt, cumulative_completion, total);
 
+    let pressure = context_pressure_tokens(total);
     let ceiling = AUTO_COMPACT_CEILING.load(Ordering::Relaxed);
-    let right = if ceiling > 0 && total < ceiling {
-        let remaining_pct = ((ceiling - total) as f64 / ceiling as f64 * 100.0).round() as u64;
+    let right = if ceiling > 0 && pressure < ceiling {
+        let remaining_pct = ((ceiling - pressure) as f64 / ceiling as f64 * 100.0).round() as u64;
         format!("Context left: {remaining_pct}%")
     } else {
         "Aura, by Mezmo!".to_string()
@@ -312,11 +315,46 @@ pub fn set_auto_compact_ceiling(ceiling: u64) {
     AUTO_COMPACT_CEILING.store(ceiling, Ordering::Relaxed);
 }
 
-/// Return the current cumulative total tokens.
+/// Return the current cumulative total *billed* tokens (left-side display).
 pub fn get_cumulative_tokens() -> u64 {
     let prompt = CUMULATIVE_PROMPT.lock().map(|g| *g).unwrap_or(0);
     let completion = CUMULATIVE_COMPLETION.lock().map(|g| *g).unwrap_or(0);
     prompt + completion
+}
+
+/// Tokens used to gauge context-window pressure: the reported context
+/// occupancy when available, otherwise the cumulative billed total as a
+/// pre-`aura.context_usage` fallback.
+fn context_pressure_tokens(cumulative_total: u64) -> u64 {
+    let occupancy = CONTEXT_OCCUPANCY.load(Ordering::Relaxed);
+    if occupancy > 0 {
+        occupancy
+    } else {
+        cumulative_total
+    }
+}
+
+/// Context-window pressure in tokens — used for auto-compaction decisions.
+/// Reflects actual context occupancy (not cumulative billed usage).
+pub fn get_context_tokens() -> u64 {
+    context_pressure_tokens(get_cumulative_tokens())
+}
+
+/// Record context-window occupancy from an `aura.context_usage` event.
+///
+/// Sets the absolute occupancy that drives the "Context left" indicator and
+/// auto-compaction, and, when the model's context window is known, points the
+/// ceiling at it so the percentage reflects the real window.
+pub fn set_context_window_usage(
+    context_tokens: u64,
+    response_tokens: u64,
+    context_window: Option<u64>,
+) {
+    CONTEXT_OCCUPANCY.store(context_tokens + response_tokens, Ordering::Relaxed);
+    if let Some(window) = context_window {
+        AUTO_COMPACT_CEILING.store(window, Ordering::Relaxed);
+    }
+    refresh_status_bar_from_counters();
 }
 
 /// Seed cumulative token counters (used when resuming).
@@ -346,6 +384,7 @@ pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_EXTRACTED.lock() {
         *g = 0;
     }
+    CONTEXT_OCCUPANCY.store(0, Ordering::Relaxed);
     set_status_bar(set_status_with_right_text("", "Aura, by Mezmo!"));
 }
 

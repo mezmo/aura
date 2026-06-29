@@ -415,7 +415,7 @@ async fn send_final_events(
         }
     }
 
-    // Emit aura.usage at stream end
+    // Emit aura.usage (cumulative billed) and aura.context_usage at stream end.
     if emit_custom_events {
         let (prompt, completion, total) = callbacks.usage_state.get_final_usage();
         if prompt > 0 {
@@ -428,6 +428,22 @@ async fn send_final_events(
             let usage_event =
                 AuraStreamEvent::usage(prompt, completion, total, ctx.correlation.clone());
             let _ = tx.send(Ok(Bytes::from(usage_event.format_sse()))).await;
+        }
+
+        // Single-agent context-window occupancy from the final turn. The
+        // orchestration path emits per-agent context_usage during execution and
+        // leaves the shared usage_state's context counters at zero, so this
+        // emission fires only for single-agent requests.
+        let (context_tokens, response_tokens) = callbacks.usage_state.get_context_usage();
+        if context_tokens > 0 {
+            let context_event = AuraStreamEvent::context_usage(
+                context_tokens,
+                response_tokens,
+                callbacks.agent.context_window(),
+                aura::stream_events::AgentContext::single_agent(),
+                ctx.correlation.clone(),
+            );
+            let _ = tx.send(Ok(Bytes::from(context_event.format_sse()))).await;
         }
     }
 
@@ -643,6 +659,32 @@ fn handle_stream_item(
             let event = AuraStreamEvent::scratchpad_usage(
                 *tokens_intercepted,
                 *tokens_extracted,
+                agent_ctx,
+                ctx.correlation.clone(),
+            );
+            vec![Bytes::from(event.format_sse())]
+        }
+        StreamItem::ContextUsage {
+            agent_id,
+            context_tokens,
+            response_tokens,
+            context_window,
+        } => {
+            tracing::debug!(
+                "Context usage for agent {}: context={} tokens, response={} tokens",
+                agent_id,
+                context_tokens,
+                response_tokens,
+            );
+            let agent_ctx = aura::stream_events::AgentContext {
+                agent_id: agent_id.clone(),
+                agent_name: None,
+                parent_agent_id: None,
+            };
+            let event = AuraStreamEvent::context_usage(
+                *context_tokens,
+                *response_tokens,
+                *context_window,
                 agent_ctx,
                 ctx.correlation.clone(),
             );

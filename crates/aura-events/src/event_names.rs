@@ -15,3 +15,4 @@ pub const WORKER_PHASE: &str = "aura.worker_phase";
 pub const TOOL_USAGE: &str = "aura.tool_usage";
 pub const USAGE: &str = "aura.usage";
 pub const SCRATCHPAD_USAGE: &str = "aura.scratchpad_usage";
+pub const CONTEXT_USAGE: &str = "aura.context_usage";
