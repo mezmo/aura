@@ -2,9 +2,6 @@
 
 const config = require('@mezmoinc/release-config-docker')
 
-const buildReleaseBinariesCmd = 'make build-release-binaries'
-
-
 const plugins = config.plugins.map((plugin) => {
   const [name, config = {}] = plugin
   // there is a config name clash with github + git
@@ -29,10 +26,7 @@ module.exports = {
   branches: ['main'],
 
   // https://github.com/semantic-release/exec
-  prepareCmd: `./scripts/set-version.sh \${nextRelease.version}; sleep 2; ${buildReleaseBinariesCmd}`,
-  // On a dry run (no prepare step), build the release binaries during verify so
-  // a broken cross-compile is caught before the change reaches the release branch.
-  verifyReleaseCmd: `if [ "\${options.dryRun}" = "true" ]; then ${buildReleaseBinariesCmd}; fi`,
+  prepareCmd: `./scripts/set-version.sh \${nextRelease.version}`,
   // https://github.com/esatterwhite/semantic-release-docker
   dockerProject: 'mezmo',
   dockerImage: 'aura',

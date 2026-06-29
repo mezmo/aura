@@ -60,7 +60,7 @@ pipeline {
         jiraSendBuildInfo site: 'logdna.atlassian.net'
         sh 'ls -alh -R report'
         archiveArtifacts allowEmptyArchive: true, artifacts: 'report/ci/**', caseSensitive: false, followSymlinks: false
-        sh: 'make clean'
+        sh 'make clean'
         if (env.SANITY_BUILD == 'true') {
           notifySlack(
             currentBuild.currentResult,
@@ -231,26 +231,81 @@ pipeline {
                 }
               }
 
-              environment {
-                 GIT_BRANCH = "${CURRENT_BRANCH}"
-                 BRANCH_NAME = "${CURRENT_BRANCH}"
-                 CHANGE_ID = ''
-              }
+              stages {
+                stage('Build Release Artifacts') {
+                  stages {
+                    stage('Build Linux Artifacts') {
+                      steps {
+                        sh 'make build-binaries-linux PROFILE=debug'
 
-              steps {
-                script {
-                  def releaseCmd = 'npm run release:dry'
-                  if (env.CHANGE_FORK) {
-                    sh "git checkout -B ${CURRENT_BRANCH}"
-                    releaseCmd = "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/release-notes-generator"
+                        stash(
+                          name: 'linux-release-artifacts',
+                          includes: 'dist/**',
+                          allowEmpty: false
+                        )
+                      }
+                    }
+
+                    stage('Build Darwin Artifacts') {
+                      agent {
+                        node {
+                          label 'ec2-fleet-oss-macos'
+                          customWorkspace("/tmp/workspace/${BUILD_SLUG}-darwin")
+                        }
+                      }
+
+                      environment {
+                        ENABLE_DOCKER = 'false'
+                      }
+
+                      steps {
+                        sh 'make build-binaries-darwin PROFILE=debug'
+
+                        stash(
+                          name: 'darwin-release-artifacts',
+                          includes: 'dist/**',
+                          allowEmpty: false
+                        )
+                      }
+                    }
                   }
-                  docker.withRegistry(
-                      'https://index.docker.io/v1/',
-                      'dockerhub-token-mezmo'
-                  ) {
-                    withCredentials(RELEASE_CREDENTIALS) {
-                      buildx {
-                        withReport('Release Test', releaseCmd)
+                }
+
+                stage('Verify Release Artifacts') {
+                  steps {
+                    sh 'rm -rf dist'
+                    sh 'mkdir -p dist'
+
+                    unstash 'linux-release-artifacts'
+                    unstash 'darwin-release-artifacts'
+
+                    sh 'make verify-binaries'
+                  }
+                }
+
+                stage('Semantic Release Dry Run') {
+                  environment {
+                    GIT_BRANCH = "${CURRENT_BRANCH}"
+                    BRANCH_NAME = "${CURRENT_BRANCH}"
+                    CHANGE_ID = ''
+                  }
+
+                  steps {
+                    script {
+                      def releaseCmd = 'npm run release:dry'
+                      if (env.CHANGE_FORK) {
+                        sh "git checkout -B ${CURRENT_BRANCH}"
+                        releaseCmd = "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/release-notes-generator"
+                      }
+                      docker.withRegistry(
+                          'https://index.docker.io/v1/',
+                          'dockerhub-token-mezmo'
+                      ) {
+                        withCredentials(RELEASE_CREDENTIALS) {
+                          buildx {
+                            withReport('Release Test', releaseCmd)
+                          }
+                        }
                       }
                     }
                   }
@@ -313,19 +368,70 @@ pipeline {
         }
       }
 
-      steps {
-        script {
-          docker.withRegistry(
-              'https://index.docker.io/v1/',
-              'dockerhub-token-mezmo'
-          ) {
-            withCredentials(RELEASE_CREDENTIALS) {
-              buildx(
-                tooling: true,
-                project: PROJECT_NAME,
-                versionFn: { -> npm.semver().version }
+      stages {
+        stage('Build Release Artifacts') {
+          parallel {
+            stage('Build Linux Artifacts') {
+              steps {
+                sh 'make build-binaries-linux'
+
+                stash(
+                  name: 'linux-release-artifacts',
+                  includes: 'dist/**',
+                  allowEmpty: false
+                )
+              }
+            }
+
+            stage('Build Darwin Artifacts') {
+              agent {
+                node {
+                  label 'ec2-fleet-oss-macos'
+                  customWorkspace("/tmp/workspace/${BUILD_SLUG}-darwin")
+                }
+              }
+
+              environment {
+                ENABLE_DOCKER = 'false'
+              }
+
+              steps {
+                sh 'make build-binaries-darwin'
+
+                stash(
+                  name: 'darwin-release-artifacts',
+                  includes: 'dist/**',
+                  allowEmpty: false
+                )
+              }
+            }
+          }
+        }
+
+        stage('Semantic Release') {
+          steps {
+            sh 'rm -rf dist'
+            sh 'mkdir -p dist'
+
+            unstash 'linux-release-artifacts'
+            unstash 'darwin-release-artifacts'
+
+            sh 'make verify-binaries'
+
+            script {
+              docker.withRegistry(
+                'https://index.docker.io/v1/',
+                'dockerhub-token-mezmo'
               ) {
-                withReport('Release', 'npm run release')
+                withCredentials(RELEASE_CREDENTIALS) {
+                  buildx(
+                    tooling: true,
+                    project: PROJECT_NAME,
+                    versionFn: { -> npm.semver().version }
+                  ) {
+                    withReport('Release', 'npm run release')
+                  }
+                }
               }
             }
           }
