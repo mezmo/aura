@@ -50,26 +50,24 @@ const MAX_PENDING_TOOL_IDS: usize = 256;
 
 /// Shared usage state that survives hook cloning.
 ///
-/// Tracks context window position across multi-turn tool call loops.
-/// The UI needs to know context size for warning thresholds.
-///
-/// Context window = what will be sent in the NEXT request:
-/// - `initial_prompt_tokens`: First LLM turn's input (system + history + user message)
-/// - `accumulated_completion_tokens`: SUM of all LLM turn outputs (all streamed to frontend)
-/// - `tool_completion_tokens`: Subset of accumulated_completion spent generating tool call JSON
-///
-/// All completion tokens are accumulated because everything streams to the frontend
-/// and gets stored in the thread history for the next request.
+/// Tracks two quantities clients read independently: **billed usage** (input and
+/// output summed across every turn, surfaced as `aura.usage`) and **context
+/// occupancy** (the most recent turn's input/output, surfaced as
+/// `aura.context_usage`).
 #[derive(Clone, Default)]
 pub struct UsageState {
-    /// Whether initial_prompt_tokens has been set (first turn captured)
+    /// Whether any usage has been recorded.
     initialized: Arc<AtomicBool>,
-    /// Prompt tokens from the FIRST LLM turn (system + history + user message)
-    initial_prompt_tokens: Arc<AtomicU64>,
-    /// Accumulated completion tokens across ALL LLM turns (all stream to frontend)
+    /// Cumulative provider-billed input tokens across all LLM turns.
+    billed_prompt_tokens: Arc<AtomicU64>,
+    /// Cumulative provider-billed output tokens across all LLM turns.
     accumulated_completion_tokens: Arc<AtomicU64>,
-    /// Completion tokens spent on tool-call turns (subset of accumulated_completion_tokens)
+    /// Completion tokens spent on tool-call turns.
     tool_completion_tokens: Arc<AtomicU64>,
+    /// Input tokens of the most recent turn.
+    last_input_tokens: Arc<AtomicU64>,
+    /// Output tokens of the most recent turn.
+    last_output_tokens: Arc<AtomicU64>,
     /// Tool IDs completed since the last usage event (for aura.tool_usage correlation)
     pending_tool_ids: Arc<Mutex<Vec<String>>>,
 }
@@ -80,19 +78,25 @@ impl UsageState {
         Self::default()
     }
 
-    /// Get the final usage values for context window calculation.
-    ///
-    /// Returns (prompt_tokens, completion_tokens, total_tokens) where:
-    /// - prompt_tokens: Initial input from first LLM turn (system + history + user msg)
-    /// - completion_tokens: Accumulated output across ALL LLM turns (all stream to frontend)
-    /// - total_tokens: prompt + completion = context window position for next request
-    ///
-    /// This gives accurate context tracking since all completions stream to frontend
-    /// and get stored in thread history.
+    /// Cumulative provider-billed usage for the whole request as
+    /// `(prompt, completion, total)`, summed across every LLM turn. Powers
+    /// `aura.usage`. See [`get_context_usage`](Self::get_context_usage) for
+    /// context-window occupancy.
     pub fn get_final_usage(&self) -> (u64, u64, u64) {
-        let prompt = self.initial_prompt_tokens.load(Ordering::Acquire);
+        let prompt = self.billed_prompt_tokens.load(Ordering::Acquire);
         let completion = self.accumulated_completion_tokens.load(Ordering::Acquire);
         (prompt, completion, prompt + completion)
+    }
+
+    /// The most recent turn's context-window occupancy as
+    /// `(context_tokens, response_tokens)` — the provider-reported input/output
+    /// of the last LLM call. `(0, 0)` until a turn is recorded via `store_usage`,
+    /// so the orchestration path (`accumulate_usage`) reports zero here.
+    pub fn get_context_usage(&self) -> (u64, u64) {
+        (
+            self.last_input_tokens.load(Ordering::Acquire),
+            self.last_output_tokens.load(Ordering::Acquire),
+        )
     }
 
     /// Get the completion tokens spent on tool-call turns.
@@ -103,22 +107,21 @@ impl UsageState {
         self.tool_completion_tokens.load(Ordering::Acquire)
     }
 
-    /// Store usage values from a completion response.
-    ///
-    /// On first call: captures initial_prompt_tokens (the actual frontend input).
-    /// On each call: accumulates completion tokens (all LLM output streams to frontend).
-    /// When `is_tool_turn` is true, also accumulates into the tool completion counter.
-    ///
-    /// The `_total` parameter is ignored - we calculate total as prompt + accumulated_completion.
+    /// Record one completion turn (single-agent path): accumulate billed
+    /// prompt/completion across turns and overwrite the latest context-window
+    /// occupancy with this turn's input/output. `is_tool_turn` also accumulates
+    /// the tool-completion counter. `_total` is ignored — derived as
+    /// prompt + completion.
     pub fn store_usage(&self, prompt: u64, completion: u64, _total: u64, is_tool_turn: bool) {
-        // Only set initial_prompt_tokens on first call
-        if !self.initialized.swap(true, Ordering::AcqRel) {
-            self.initial_prompt_tokens.store(prompt, Ordering::Release);
-            tracing::debug!(
-                "Captured initial prompt tokens: {} (first LLM turn)",
-                prompt
-            );
-        }
+        self.initialized.store(true, Ordering::Release);
+
+        // Cumulative billed input across every turn.
+        self.billed_prompt_tokens
+            .fetch_add(prompt, Ordering::AcqRel);
+
+        // Latest turn defines current context-window occupancy.
+        self.last_input_tokens.store(prompt, Ordering::Release);
+        self.last_output_tokens.store(completion, Ordering::Release);
 
         // Accumulate all completion tokens (everything streams to frontend)
         let prev = self
@@ -139,20 +142,16 @@ impl UsageState {
         }
     }
 
-    /// Accumulate usage additively across multiple LLM calls.
+    /// Accumulate billed usage across independent LLM calls (orchestration path).
     ///
-    /// Unlike [`store_usage`](Self::store_usage), which captures only the *first*
-    /// turn's prompt, this adds to both prompt and completion counters. Use when
-    /// the caller already aggregates usage across independent LLM calls (e.g. the
-    /// orchestrator summing planning, workers, synthesis, and evaluation turns)
-    /// and needs the final `aura.usage` event to reflect *total billed* tokens
-    /// rather than a single-turn snapshot.
-    ///
-    /// Marks the state as initialized so the stream handler emits `aura.usage`
-    /// even when prompt was only ever accumulated through this method.
+    /// Adds to the billed counters like [`store_usage`](Self::store_usage) but
+    /// does not touch context-window occupancy: the orchestrator sums usage
+    /// across planning, workers, and synthesis — separate context windows — so a
+    /// single "latest turn" is meaningless. Per-agent `aura.context_usage` is
+    /// emitted from each agent's final response instead.
     pub fn accumulate_usage(&self, prompt: u64, completion: u64) {
         self.initialized.store(true, Ordering::Release);
-        self.initial_prompt_tokens
+        self.billed_prompt_tokens
             .fetch_add(prompt, Ordering::AcqRel);
         self.accumulated_completion_tokens
             .fetch_add(completion, Ordering::AcqRel);
@@ -712,6 +711,44 @@ mod tests {
     }
 
     #[test]
+    fn test_store_usage_accumulates_billed_and_tracks_last_turn() {
+        let usage_state = UsageState::new();
+
+        // Multi-turn single-agent loop: prompt grows each turn, final turn is
+        // the response after a tool turn.
+        usage_state.store_usage(1000, 80, 0, true); // tool turn
+        usage_state.store_usage(1300, 250, 0, false); // final response turn
+
+        // Billed usage sums every turn's input and output.
+        let (prompt, completion, total) = usage_state.get_final_usage();
+        assert_eq!(prompt, 2300, "billed prompt = sum of all turn inputs");
+        assert_eq!(
+            completion, 330,
+            "billed completion = sum of all turn outputs"
+        );
+        assert_eq!(total, 2630);
+
+        // Context occupancy reflects only the latest turn.
+        assert_eq!(
+            usage_state.get_context_usage(),
+            (1300, 250),
+            "context usage = most recent turn's input/output"
+        );
+    }
+
+    #[test]
+    fn test_accumulate_usage_leaves_context_usage_zero() {
+        // Orchestration path: billed usage accrues, but context occupancy stays
+        // zero so the single-agent context_usage emission is correctly skipped.
+        let usage_state = UsageState::new();
+        usage_state.accumulate_usage(5000, 200);
+        usage_state.accumulate_usage(8000, 400);
+
+        assert_eq!(usage_state.get_final_usage(), (13_000, 600, 13_600));
+        assert_eq!(usage_state.get_context_usage(), (0, 0));
+    }
+
+    #[test]
     fn test_usage_state_accumulate_marks_initialized() {
         let usage_state = UsageState::new();
         // Before any usage, get_final_usage returns 0 — handler would skip aura.usage.
@@ -913,59 +950,48 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_turn_context_window_tracking() {
-        // Simulates a multi-turn tool call scenario within a SINGLE request:
-        // Turn 1: LLM decides to call a tool (streams to frontend)
-        // Turn 2: LLM calls another tool (streams to frontend)
-        // Turn 3: Final text response (streams to frontend)
-        //
-        // All completions stream to frontend and go into thread history,
-        // so we accumulate ALL completion tokens.
+    fn test_multi_turn_billed_and_context_tracking() {
+        // Multi-turn tool-call scenario within a SINGLE request:
+        // Turn 1: LLM calls a tool, Turn 2: another tool, Turn 3: final text.
+        // Billed usage sums every turn; context occupancy follows the latest turn.
         let usage_state = UsageState::new();
 
-        // Turn 1: LLM receives initial request, decides to call a tool
-        // prompt=5000 (history + system + user), completion=50 (tool call JSON)
+        // Turn 1: tool call. prompt=5000 (history + system + user), completion=50.
         usage_state.store_usage(5000, 50, 5050, true);
+        assert_eq!(usage_state.get_final_usage(), (5000, 50, 5050));
+        assert_eq!(usage_state.get_context_usage(), (5000, 50));
+        assert_eq!(usage_state.get_tool_completion_tokens(), 50);
 
-        let (prompt, completion, total) = usage_state.get_final_usage();
-        assert_eq!(prompt, 5000, "First turn captures initial prompt");
-        assert_eq!(completion, 50, "Completion accumulated: 50");
-        assert_eq!(total, 5050, "Total = initial_prompt + accumulated");
-        assert_eq!(
-            usage_state.get_tool_completion_tokens(),
-            50,
-            "Tool completion: 50"
-        );
-
-        // Turn 2: LLM receives tool result, calls another tool
-        // prompt=7000 (inflated internally), completion=60 (another tool call)
+        // Turn 2: another tool call. prompt grows to 7000 as the context fills.
         usage_state.store_usage(7000, 60, 7060, true);
-
-        let (prompt, completion, total) = usage_state.get_final_usage();
-        assert_eq!(prompt, 5000, "Initial prompt unchanged");
-        assert_eq!(completion, 110, "Completion accumulated: 50 + 60");
-        assert_eq!(total, 5110, "Total = 5000 + 110");
         assert_eq!(
-            usage_state.get_tool_completion_tokens(),
-            110,
-            "Tool completion: 50 + 60"
+            usage_state.get_final_usage(),
+            (12_000, 110, 12_110),
+            "billed = (5000+7000, 50+60)"
         );
+        assert_eq!(
+            usage_state.get_context_usage(),
+            (7000, 60),
+            "context follows the most recent turn"
+        );
+        assert_eq!(usage_state.get_tool_completion_tokens(), 110);
 
-        // Turn 3: Final response (no more tool calls)
-        // prompt=9000 (inflated internally), completion=200 (final text)
+        // Turn 3: final response (no tool call). prompt=9000.
         usage_state.store_usage(9000, 200, 9200, false);
-
-        let (prompt, completion, total) = usage_state.get_final_usage();
-        assert_eq!(prompt, 5000, "Initial prompt still unchanged");
-        assert_eq!(completion, 310, "Completion accumulated: 50 + 60 + 200");
         assert_eq!(
-            total, 5310,
-            "Context window = initial_prompt(5000) + all_completions(310)"
+            usage_state.get_final_usage(),
+            (21_000, 310, 21_310),
+            "billed = (5000+7000+9000, 50+60+200)"
+        );
+        assert_eq!(
+            usage_state.get_context_usage(),
+            (9000, 200),
+            "final turn defines context-window occupancy"
         );
         assert_eq!(
             usage_state.get_tool_completion_tokens(),
             110,
-            "Tool completion unchanged after final response turn"
+            "tool completion unchanged after the final response turn"
         );
     }
 }

@@ -132,7 +132,8 @@ AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `aura.mcp_status` | Per-server MCP connection status emitted at stream start (connected/failed/not_attempted, with failure reason) | ✅ Implemented |
 | `aura.worker_phase` | Worker phase transitions in multi-agent mode (planning/executing/analyzing) | ✅ Implemented |
 | `aura.tool_usage` | Usage snapshot after tool execution (associates tool IDs with token counts) | ✅ Implemented |
-| `aura.usage` | Final token usage emitted at stream end (prompt/completion/total) | ✅ Implemented |
+| `aura.usage` | Cumulative provider-billed tokens at stream end (Σ prompt/completion/total across all turns), identical in single-agent and orchestration | ✅ Implemented |
+| `aura.context_usage` | Per-agent context-window occupancy (final-turn `context_tokens`/`response_tokens` + optional `context_window`), derived from provider usage | ✅ Implemented |
 | `aura.scratchpad_usage` | Per-agent scratchpad usage summary (single-agent or worker), emitted when an agent finishes with scratchpad activity | ✅ Implemented |
 | `aura.approval_requested` | HITL approval request raised for a gated tool or `request_approval` call | ✅ Implemented for webhook and conversational routes |
 | `aura.approval_pending` | HITL approval is waiting for an attended decision | ✅ Implemented for conversational route |
@@ -345,7 +346,7 @@ data:
 
 Emitted from the `on_stream_completion_response_finish` hook when usage data is available. Associates the completed tool IDs with a token usage snapshot. No `agent_id` field (only `CorrelationContext`).
 
-**Usage** (final token usage at stream end):
+**Usage** (cumulative provider-billed tokens at stream end):
 ```
 event: aura.usage
 data:
@@ -359,7 +360,34 @@ data:
 }
 ```
 
-Use `prompt_tokens` with `model_context_limit` from `aura.session_info` to calculate context window fill percentage: `(prompt_tokens / model_context_limit) * 100`. No `agent_id` field (only `CorrelationContext`).
+`aura.usage` reports the **billed cost** of the request: `prompt_tokens` and
+`completion_tokens` are summed across *every* LLM turn (including tool turns),
+with identical semantics in single-agent and orchestration mode. It is **not**
+the context-window size — use `aura.context_usage` below for that. No `agent_id`
+field (only `CorrelationContext`).
+
+**Context usage** (per-agent context-window occupancy):
+```
+event: aura.context_usage
+data:
+```
+```json
+{
+  "context_tokens": 18777,
+  "response_tokens": 342,
+  "context_window": 200000,
+  "agent_id": "main",
+  "session_id": "sess_xyz"
+}
+```
+
+`context_tokens` is the provider-reported input of the agent's final turn — the
+size of the context carried into the last call — and `response_tokens` its
+output. Compute context-window fill as `context_tokens / context_window`
+(falling back to `model_context_limit` from `aura.session_info` if
+`context_window` is absent). Emitted per agent: single-agent requests emit one
+(`agent_id: "main"`); orchestration emits one per worker and the coordinator.
+Derived from provider usage, never a local tokenizer.
 
 **Scratchpad usage** (per-agent report when an agent finishes with scratchpad activity):
 ```
