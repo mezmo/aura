@@ -130,6 +130,16 @@ pub trait StreamingAgent: Send + Sync {
         None
     }
 
+    /// Snapshot the connection status of every configured MCP server.
+    ///
+    /// Used by the streaming handler to emit an `aura.mcp_status` event at
+    /// stream start so clients can distinguish degraded/unavailable/available servers.
+    /// Defaults to empty (no MCP servers, or an implementor without MCP — e.g. the orchestrator,
+    /// whose workers own their own managers).
+    fn mcp_server_status(&self) -> Vec<aura_events::McpServerStatus> {
+        Vec::new()
+    }
+
     /// Whether this agent is an orchestrator (emits per-phase LLM spans).
     ///
     /// Returned `true` by the multi-agent `OrchestratorFactory`. The web-server

@@ -1,9 +1,9 @@
 use a2a::VERSION;
+use aura::RigBuilder;
 use aura::{
     RequestCancellation, ResponseContent, StreamingAgent, UsageState, request_progress_subscribe,
     tool_event_subscribe, tool_usage_subscribe,
 };
-use aura_config::RigBuilder;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -852,6 +852,7 @@ pub async fn health() -> Response {
     Json(serde_json::json!({
         "status": "healthy",
         "timestamp": Utc::now().to_rfc3339(),
+        "aura_version": env!("CARGO_PKG_VERSION"),
         "a2a_server": {
             "version": VERSION,
         },
@@ -861,10 +862,12 @@ pub async fn health() -> Response {
 
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
+/// Filters out `hidden` agents
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let models: Vec<serde_json::Value> = state
         .configs
         .iter()
+        .filter(|config| !config.agent.hidden)
         .map(|config| {
             let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
             let created = config.agent.created_at / 1000;
@@ -1140,6 +1143,73 @@ mod tests {
         ];
         let (_, history) = convert_chat_messages(&messages, true).unwrap();
         assert_eq!(history.len(), 1);
+    }
+
+    // --- list_models tests ---
+
+    fn make_state(configs: Vec<aura_config::Config>) -> Arc<AppState> {
+        Arc::new(AppState {
+            configs: Arc::new(configs),
+            tool_result_mode: crate::streaming::ToolResultMode::None,
+            tool_result_max_length: 0,
+            streaming_buffer_size: 32,
+            aura_custom_events: false,
+            aura_emit_reasoning: false,
+            streaming_timeout_secs: 0,
+            first_chunk_timeout_secs: 0,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
+            active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
+            default_agent: None,
+            additional_tools: Arc::new(Vec::new),
+        })
+    }
+
+    fn parse_config(toml: &str) -> aura_config::Config {
+        aura_config::Config::parse_toml(toml).expect("invalid test config")
+    }
+
+    #[tokio::test]
+    async fn test_list_models_returns_non_hidden_agents() {
+        let hidden = parse_config(
+            r#"
+[agent]
+name = "hidden-agent"
+system_prompt = "You are hidden."
+hidden = true
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+
+        let visible = parse_config(
+            r#"
+[agent]
+name = "visible-agent"
+system_prompt = "You are visible."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+
+        let state = make_state(vec![hidden, visible]);
+        let resp = list_models(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "visible-agent");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "openai");
     }
 
     // --- streaming / response builder tests ---

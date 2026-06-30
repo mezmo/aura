@@ -1,5 +1,10 @@
 # AURA
 
+[![Slack](https://img.shields.io/badge/Slack-Join%20the%20community-4A154B?logo=slack&logoColor=white)](https://mezmo.com/r/slack-aura)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![MCP](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
+
 AURA is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
 Key capabilities:
@@ -36,9 +41,9 @@ Key capabilities:
 ## Quick Start
 
 ```bash
-cp .env.example .env            # set your LLM provider, model, and API key
-docker compose up -d            # starts Aura (orchestrator mode) + LibreChat + Phoenix
-docker exec -it aura ./aura-cli # chat with the orchestrator from your terminal
+cp .env.example .env                                              # set your LLM provider, model, and API key
+docker compose up -d                                              # starts Aura (orchestrator mode) + LibreChat + Phoenix
+docker exec -it aura ./aura-cli --api-url http://localhost:8080   # chat with the orchestrator from your terminal
 ```
 
 Aura boots in **orchestrator mode**: a coordinator routes each request — answering simple ones directly and decomposing complex ones across specialized workers. The bundled `aura-cli` connects to the in-container server automatically and renders the coordinator's plan and worker activity as it streams.
@@ -318,6 +323,15 @@ system_prompt = "You are a DevOps expert."
 model_owner = "mezmo"        # override owned_by in /v1/models (defaults to LLM provider)
 ```
 
+**Hidden agents** are excluded from `GET /v1/models` and the CLI's `/model` list but remain fully accessible when a caller targets them by exact name or alias. Set `hidden = true` to hide agents that are in development, restricted to known callers, or should not appear in model pickers (LibreChat, OpenWebUI, etc.):
+
+```toml
+[agent]
+name = "Internal Triage Agent"
+hidden = true         # excluded from /v1/models and CLI model list; still callable by name
+system_prompt = "..."
+```
+
 Aliases must be unique across all loaded configs. If two configs share the same `name` and neither has an alias, loading fails with a validation error.
 
 ### Configuration Sections
@@ -329,7 +343,7 @@ Configuration sections:
 - `[[vector_stores]]`: optional vector search configuration.
 - `[mcp]` and `[mcp.servers.*]`: MCP configuration, schema sanitization, and transports.
 
-Supported providers: OpenAI, Anthropic, Bedrock, Gemini, and Ollama.
+Supported providers: OpenAI, Anthropic, Bedrock, Gemini, Ollama, and OpenRouter.
 
 Supported MCP transports:
 
@@ -405,7 +419,7 @@ To validate your own config file, start the web server or CLI — both validate 
 cargo run -p aura-web-server -- --config your-config.toml
 
 # Validate via standalone CLI (exits on parse error before REPL)
-cargo run -p aura-cli --features standalone-cli -- --standalone --config your-config.toml
+cargo run -p aura-cli -- --config your-config.toml
 ```
 
 ### Orchestration
@@ -531,6 +545,8 @@ When multiple patterns match the same tool, the **longest (most specific) patter
 **Per-call extraction limit (`max_extraction_tokens`, default 10_000):** every exploration tool checks the size of its result before returning. If a single call would exceed this cap (or the cumulative `ContextBudget`), the tool returns a structured JSON error like `{"error": "head_too_large", "estimated_tokens": ..., "suggestions": [...]}` instead of the content. The LLM sees this as a successful tool result and retries with smaller params — each retry consumes a turn, which is why `turn_depth_bonus` exists.
 
 Each agent (single-agent or orchestration worker) gets a **fresh `ContextBudget`** scoped to that agent's effective LLM's `context_window`. LLM-reported per-turn token counts feed back into the budget as ground truth, so `remaining()` reflects actual context pressure (orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook). A per-agent `aura.scratchpad_usage` SSE event is emitted when the agent finishes — the same event name fires for both single-agent and worker contexts (it lives in the base `aura.*` namespace, not `aura.orchestrator.*`).
+
+**Result artifacts and `read_artifact`:** in orchestration, large task results are saved to artifact files under `{memory_dir}/{run_id}/artifacts/`. When a worker reads one back with `read_artifact`, the same budget rules apply: an artifact that fits is returned inline, while one that exceeds the limit comes back as a scratchpad pointer the worker explores in place with the read tools (`head`, `grep`, `slice`, …) — the artifact is read directly from the artifacts directory, never copied into the scratchpad. (The coordinator has no scratchpad, so its `read_artifact` always returns inline content.)
 
 ### Ollama
 

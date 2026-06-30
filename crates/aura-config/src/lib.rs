@@ -1,8 +1,11 @@
-pub mod builder;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod lenient_bool;
+pub mod lenient_int;
 pub mod loader;
+pub mod orchestration;
+pub mod scratchpad;
 
 #[cfg(test)]
 mod config_test;
@@ -10,11 +13,14 @@ mod config_test;
 #[cfg(test)]
 mod test_env_lock;
 
-pub use builder::RigBuilder;
 pub use config::*;
 pub use env::resolve_env_vars;
 pub use error::ConfigError;
 pub use loader::ConfigLoader;
+pub use orchestration::{
+    ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
+};
+pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 
 use std::collections::HashSet;
 use std::fs;

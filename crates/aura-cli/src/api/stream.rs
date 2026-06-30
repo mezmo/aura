@@ -266,7 +266,10 @@ where
                 }
                 _ => {
                     // aura.orchestrator.*, aura.session_info, aura.progress,
-                    // aura.worker_phase, and any future events
+                    // aura.worker_phase, aura.mcp_status, and any future events.
+                    // Consumers (REPL status notices, one-shot stderr) handle
+                    // these via the orchestrator-event callback; on_raw_event
+                    // above also captures them into the stream panel.
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&event.data) {
                         handler.on_orchestrator_event(event_name, &val);
                     }

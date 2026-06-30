@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::event_replay::{list_conversations, print_help, replay_event_log_global};
 use super::input_frame::{erase_input_frame, redraw_input_frame};
 use super::input_hint::update_input_hint;
-use super::state::{COMMANDS, PendingCommand};
 use super::state::{
     CTRLC_HINT_VISIBLE, EXPANDED_OUTPUT, LAST_ANIM_LINES, MID_STREAM_HISTORY,
     MID_STREAM_HISTORY_POS, MID_STREAM_SAVED_INPUT, PROCESSING, QUEUED_INPUT, RESUME_MATCHES,
@@ -29,6 +28,7 @@ use super::stream_panel::{
     scroll_stream_page_up, scroll_stream_up, set_stream_show_all, toggle_stream_expand,
     toggle_stream_panel,
 };
+use crate::repl::registry::{MidStream, PendingCommand, QUIT_COMMAND, lookup, split_command};
 
 const PROMPT_COLS: usize = 2; // "❯ " occupies 2 display columns
 
@@ -57,137 +57,108 @@ enum ImmediateResult {
     NotHandled,
 }
 
-/// Resolve a possibly-abbreviated slash command to its full form.
-fn resolve_command_prefix(input: &str) -> String {
-    if COMMANDS.iter().any(|(name, _)| *name == input) {
-        return input.to_string();
+/// Handle a slash command typed while a response streams: run live commands
+/// now, defer the rest to the main loop. Non-commands return `NotHandled` so
+/// the caller queues them as the next message.
+fn execute_immediate_command(input: &str) -> ImmediateResult {
+    if !input.starts_with('/') {
+        return ImmediateResult::NotHandled;
     }
-    let (cmd_part, args_part) = match input.find(' ') {
-        Some(pos) => (&input[..pos], Some(&input[pos..])),
-        None => (input, None),
-    };
-    let matches: Vec<&str> = COMMANDS
-        .iter()
-        .filter(|(name, _)| name.starts_with(cmd_part))
-        .map(|(name, _)| *name)
-        .collect();
-    if matches.len() == 1 {
-        match args_part {
-            Some(args) => format!("{}{}", matches[0], args),
-            None => matches[0].to_string(),
-        }
-    } else {
-        input.to_string()
+    let (word, args) = split_command(input);
+    match lookup(word) {
+        Some(cmd) => match cmd.mid_stream {
+            MidStream::Live(run) => {
+                run(args);
+                ImmediateResult::Handled
+            }
+            MidStream::Defer => {
+                set_pending_command(PendingCommand {
+                    command: cmd,
+                    args: args.to_string(),
+                });
+                ImmediateResult::HandledCancel
+            }
+        },
+        None => ImmediateResult::NotHandled,
     }
 }
 
-/// Execute a command immediately during processing.
-fn execute_immediate_command(input: &str) -> ImmediateResult {
-    let resolved = resolve_command_prefix(input);
-    match resolved.as_str() {
-        "/stream" => {
-            clear_stream_panel_in_place();
-            toggle_stream_panel();
-            erase_input_frame();
-            redraw_input_frame();
-            ImmediateResult::Handled
-        }
-        "/expand" => {
-            let expanded = !EXPANDED_OUTPUT.load(Ordering::Relaxed);
-            EXPANDED_OUTPUT.store(expanded, Ordering::Relaxed);
-            set_stream_show_all(expanded);
-            replay_event_log_global();
-            reprint_cached_anim_lines();
-            redraw_input_frame();
-            ImmediateResult::Handled
-        }
-        "/help" => {
-            replay_event_log_global();
-            print_help();
-            reprint_cached_anim_lines();
-            redraw_input_frame();
-            ImmediateResult::Handled
-        }
-        "/conversations" => {
-            replay_event_log_global();
-            list_conversations();
-            reprint_cached_anim_lines();
-            redraw_input_frame();
-            ImmediateResult::Handled
-        }
-        "/quit" | "/exit" => {
-            set_pending_command(PendingCommand::Quit);
-            ImmediateResult::HandledCancel
-        }
-        "/clear" => {
-            set_pending_command(PendingCommand::Clear);
-            ImmediateResult::HandledCancel
-        }
-        _ if input.starts_with("/resume") => {
-            let arg = input
-                .strip_prefix("/resume")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            set_pending_command(PendingCommand::Resume(arg));
-            ImmediateResult::HandledCancel
-        }
-        _ if input == "/model" || input.starts_with("/model ") => {
-            replay_event_log_global();
-            let current = get_selected_model();
-            match current {
-                Some(m) => println!("Current model: {}", m),
-                None => println!("No model selected (using server default)"),
+pub(crate) fn live_stream(_args: &str) {
+    clear_stream_panel_in_place();
+    toggle_stream_panel();
+    erase_input_frame();
+    redraw_input_frame();
+}
+
+pub(crate) fn live_expand(_args: &str) {
+    let expanded = !EXPANDED_OUTPUT.load(Ordering::Relaxed);
+    EXPANDED_OUTPUT.store(expanded, Ordering::Relaxed);
+    set_stream_show_all(expanded);
+    replay_event_log_global();
+    reprint_cached_anim_lines();
+    redraw_input_frame();
+}
+
+pub(crate) fn live_help(_args: &str) {
+    replay_event_log_global();
+    print_help();
+    reprint_cached_anim_lines();
+    redraw_input_frame();
+}
+
+pub(crate) fn live_conversations(_args: &str) {
+    replay_event_log_global();
+    list_conversations();
+    reprint_cached_anim_lines();
+    redraw_input_frame();
+}
+
+pub(crate) fn live_model(_args: &str) {
+    replay_event_log_global();
+    match get_selected_model() {
+        Some(m) => println!("Current model: {}", m),
+        None => println!("No model selected (using server default)"),
+    }
+    reprint_cached_anim_lines();
+    redraw_input_frame();
+}
+
+pub(crate) fn live_style(args: &str) {
+    // A tab pick (set by the Tab handler in `drain_stdin`) wins over a typed
+    // arg; with neither, the in-progress animation is left untouched. Tab
+    // cycling already applied a live preview, so Enter just commits by
+    // dropping the captured revert target.
+    let tab_pick = get_tab_select_index()
+        .and_then(|i| STYLE_MATCHES.lock().ok().and_then(|g| g.get(i).cloned()));
+    set_tab_select_index(None);
+    clear_style_preview_original();
+    let chosen: Option<String> = tab_pick.or_else(|| {
+        if args.is_empty() {
+            None
+        } else {
+            let lower = args.to_ascii_lowercase();
+            let matches: Vec<&&str> = crate::theme::STYLE_NAMES
+                .iter()
+                .filter(|n| n.starts_with(&lower))
+                .collect();
+            if matches.len() == 1 {
+                Some((*matches[0]).to_string())
+            } else {
+                Some(args.to_string())
             }
-            reprint_cached_anim_lines();
-            redraw_input_frame();
-            ImmediateResult::Handled
         }
-        _ if input == "/style" || input.starts_with("/style ") => {
-            // Mid-stream theme switching is fully client-side. A tab pick
-            // (set by the Tab handler in `drain_stdin`) wins over a typed
-            // arg; with no pick and no arg we leave the in-progress
-            // animation untouched. Tab cycling already applied a live preview
-            // — Enter just commits by dropping the captured "revert target".
-            let arg = input.strip_prefix("/style").unwrap_or("").trim();
-            let tab_pick = get_tab_select_index()
-                .and_then(|i| STYLE_MATCHES.lock().ok().and_then(|g| g.get(i).cloned()));
-            set_tab_select_index(None);
-            clear_style_preview_original();
-            let chosen: Option<String> = tab_pick.or_else(|| {
-                if arg.is_empty() {
-                    None
-                } else {
-                    let lower = arg.to_ascii_lowercase();
-                    let matches: Vec<&&str> = crate::theme::STYLE_NAMES
-                        .iter()
-                        .filter(|n| n.starts_with(&lower))
-                        .collect();
-                    if matches.len() == 1 {
-                        Some((*matches[0]).to_string())
-                    } else {
-                        Some(arg.to_string())
-                    }
-                }
-            });
-            if let Some(name) = chosen
-                && let Some(t) = crate::theme::theme_by_name(&name)
-            {
-                crate::theme::set_theme(t);
-                replay_event_log_global();
-                reprint_cached_anim_lines();
-                redraw_input_frame();
-                // Persist mid-stream commits too. Failure prints a warning
-                // to stderr; never goes through `push_display_event` so it
-                // stays out of the saved chat log.
-                let public_name = crate::theme::theme_public_name(crate::theme::theme());
-                if let Err(e) = crate::config::save_style_to_global_cli_toml(public_name) {
-                    eprintln!("warning: could not persist style to ~/.aura/cli.toml: {e}");
-                }
-            }
-            ImmediateResult::Handled
+    });
+    if let Some(name) = chosen
+        && let Some(t) = crate::theme::theme_by_name(&name)
+    {
+        crate::theme::set_theme(t);
+        replay_event_log_global();
+        reprint_cached_anim_lines();
+        redraw_input_frame();
+        let public_name = crate::theme::theme_public_name(crate::theme::theme());
+        if let Err(e) = crate::config::save_style_to_global_cli_toml(public_name) {
+            eprintln!("warning: could not persist style to ~/.aura/cli.toml: {e}");
         }
-        _ => ImmediateResult::NotHandled,
     }
 }
 
@@ -304,7 +275,10 @@ fn mid_stream_cycle_matches(buf: &str, forward: bool) -> bool {
 pub fn drain_stdin(buf: &mut String) -> bool {
     let mut esc_pressed = false;
     if SIGINT_RECEIVED.swap(false, Ordering::Relaxed) && handle_ctrlc() {
-        set_pending_command(PendingCommand::Quit);
+        set_pending_command(PendingCommand {
+            command: &QUIT_COMMAND,
+            args: String::new(),
+        });
         esc_pressed = true;
     }
     #[cfg(unix)]
@@ -328,7 +302,10 @@ pub fn drain_stdin(buf: &mut String) -> bool {
                 let b = bytes[i];
                 if b == 0x03 {
                     if handle_ctrlc() {
-                        set_pending_command(PendingCommand::Quit);
+                        set_pending_command(PendingCommand {
+                            command: &QUIT_COMMAND,
+                            args: String::new(),
+                        });
                         esc_pressed = true;
                     }
                     i += 1;

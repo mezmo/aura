@@ -144,14 +144,17 @@ fn format_budget_error(
 }
 
 /// Result of a budget check — either Ok or one of two exceeded variants.
-enum BudgetCheckError {
+pub(crate) enum BudgetCheckError {
     ExtractionLimit(super::context_budget::ExtractionLimitExceeded),
     BudgetExceeded(super::context_budget::BudgetExceeded),
 }
 
 /// Check budget and record usage. Returns `Ok(())` if within budget,
 /// or `Err` with details for the caller to format.
-fn check_and_record_budget(budget: &ContextBudget, content: &str) -> Result<(), BudgetCheckError> {
+pub(crate) fn check_and_record_budget(
+    budget: &ContextBudget,
+    content: &str,
+) -> Result<(), BudgetCheckError> {
     // Per-call extraction limit check first
     if let Some(limit) = budget.max_extraction_tokens() {
         let tokens = budget.count_tokens(content);
@@ -1680,12 +1683,8 @@ pub fn is_scratchpad_tool(tool_name: &str) -> bool {
 /// Orchestration-internal tool names that are not MCP tools and therefore
 /// not covered by `ObserverWrapper`. Used alongside `is_scratchpad_tool`
 /// to gate event emission in `stream_and_forward`.
-static ORCHESTRATION_INTERNAL_TOOLS: &[&str] = &[
-    "read_artifact",
-    "submit_result",
-    "list_prior_runs",
-    "get_conversation_context",
-];
+static ORCHESTRATION_INTERNAL_TOOLS: &[&str] =
+    &["read_artifact", "submit_result", "list_prior_runs"];
 
 /// True for any tool that is NOT an MCP tool — scratchpad exploration tools
 /// and orchestration-internal tools. These are not wrapped by

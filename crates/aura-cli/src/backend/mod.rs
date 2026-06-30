@@ -27,17 +27,19 @@ pub enum Backend {
 impl Backend {
     /// Create the appropriate backend based on config.
     ///
-    /// If `--standalone` is set, uses `DirectBackend` with the config from `--config`.
+    /// When `is_standalone` is true, uses `DirectBackend` with the config from
+    /// `--config` (or `config.toml` in the current directory if omitted).
     /// Otherwise, uses `HttpBackend` (HTTP/SSE to aura-web-server).
     pub fn from_config(
         _rt: &tokio::runtime::Runtime,
         config: &AppConfig,
         _args: &Args,
+        _is_standalone: bool,
     ) -> Result<Self> {
         #[cfg(feature = "standalone-cli")]
-        if _args.standalone {
-            // validate_standalone_args guarantees --config is present when --standalone is set
-            let config_path = _args.agent_config.as_ref().unwrap();
+        if _is_standalone {
+            let default_config = String::from("config.toml");
+            let config_path = _args.agent_config.as_ref().unwrap_or(&default_config);
             let direct = _rt.block_on(direct::DirectBackend::from_toml(
                 config_path,
                 config.extra_headers.clone(),
@@ -97,6 +99,17 @@ impl Backend {
             Self::Http(http) => http.list_models().await,
             #[cfg(feature = "standalone-cli")]
             Self::Direct(direct) => direct.list_models().await,
+        }
+    }
+
+    /// Human-readable description of what this CLI is connected to, for the
+    /// startup banner. Standalone mode runs the agent in-process (no remote
+    /// server); HTTP mode reports the server's base URL and version.
+    pub async fn connection_summary(&self) -> String {
+        match self {
+            Self::Http(http) => http.connection_summary().await,
+            #[cfg(feature = "standalone-cli")]
+            Self::Direct(_) => "standalone".to_string(),
         }
     }
 

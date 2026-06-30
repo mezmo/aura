@@ -762,6 +762,41 @@ async fn test_sequential_tasks_share_context() {
         .and_then(|v| v.as_str())
         .expect("First task did not contain 'contextId' field");
 
+    // Wait for task 1 to complete so its full history (tool call, tool result,
+    // assistant response) is persisted in the task store before task 2 starts.
+    let poll_interval = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Task 1 did not reach TASK_STATE_COMPLETED within timeout"
+        );
+        let poll_resp = client
+            .get(format!("{}/a2a/v1/tasks/{}", AURA_SERVER, task1_id))
+            .header("A2A-Version", "1.0")
+            .timeout(TEST_TIMEOUT)
+            .send()
+            .await
+            .expect("Failed to poll task1 status");
+        let body = poll_resp
+            .text()
+            .await
+            .expect("Failed to read task1 poll response");
+        let polled: Task =
+            serde_json::from_str(&body).expect("Task1 poll response was not valid JSON");
+        match polled.status.state {
+            TaskState::Completed => break,
+            TaskState::Failed | TaskState::Canceled => {
+                panic!(
+                    "Task 1 ended in unexpected state: {:?}",
+                    polled.status.state
+                )
+            }
+            _ => tokio::time::sleep(poll_interval).await,
+        }
+    }
+    println!("Task 1 completed, proceeding with task 2");
+
     // second message links to the same context via message.contextId
     let message_id_2 = format!("{}", uuid::Uuid::new_v4());
     let request_text_2 = "Tell me what was asked in the first call for this context.";
@@ -910,13 +945,13 @@ async fn test_sequential_tasks_share_context() {
         })
         .expect("'Final Info' artifact has no text part");
 
-    // Example: "In the first call, you asked to call `mock_tool` with:\n\n`message='context-test-bf34de53-5fbe-45fd-865d-52a93d805793'`."
-    // The history artifact should have something like this example, but
-    // shortening the lookup as it might not be consistent.
-    let expected = format!("message='context-test-{}'", message_id_1);
+    // The LLM may paraphrase (backticks, quotes, no quotes), so just check
+    // for the UUID substring anywhere in the response.
+    let expected_uuid = format!("context-test-{}", message_id_1);
     assert!(
-        part_text.contains(&*expected),
-        "Final Info part does not contain \"message='context-text'\": {}",
+        part_text.contains(&expected_uuid),
+        "Final Info part does not contain the context UUID '{}': {}",
+        expected_uuid,
         part_text
     );
 }

@@ -1,0 +1,74 @@
+name: Bug Report
+description: File a bug report.
+title: "[BUG]: "
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! Please make sure there are no similar issue prior to submitting a new one!
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: |
+        A clear and concise summary of what the bug is.
+      placeholder: List the behavior you observed and the behavior you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        A clear and concise set of steps and pre-requisites for reproducing the bug.
+      placeholder: |
+        **Pre-requisites**
+        - A configuration file that uses XYZ model
+
+        **Steps**
+        1. Start`aura-web-server` with config file
+        2. Connect to server with AURA CLI 
+        3. Enter the /model command
+        4. [BUG]  Expect to see a list of models but no models are listed
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Provide any additional information you think is helpful. This is formatted as markdown so feel free to use markdown syntax.
+      placeholder: Add any other context about the issue here.
+    validations:
+      required: false
+  - type: upload
+    id: screenshots
+    attributes:
+      label: Upload screenshots
+      description: If applicable, add screenshots to help explain your problem.
+    validations:
+      required: false
+  - type: checkboxes
+    id: searched-other-issues
+    attributes:
+      label: Searched Issues
+      description: Please look through existing issues before submitting a new issue. Check this box if you have NOT found a similar issue.
+      options:
+        - label: No similar issues found
+          required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/mezmo/aura/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow this project's Code of Conduct
+          required: true

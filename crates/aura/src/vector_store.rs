@@ -1,6 +1,6 @@
 use crate::{
     bedrock_embedding::AuraBedrockEmbeddingModel as BedrockEmbeddingModel,
-    config::{EmbeddingModelConfig, VectorStoreConfig, VectorStoreType},
+    config::{EmbeddingConfig, VectorStoreConfig, VectorStoreType},
     error::BuilderError,
 };
 use qdrant_client::{Qdrant, qdrant::QueryPoints};
@@ -131,7 +131,7 @@ impl VectorStoreManager {
     /// Create an in-memory vector store
     async fn create_in_memory_store(
         config: &VectorStoreConfig,
-        embedding: &EmbeddingModelConfig,
+        embedding: &EmbeddingConfig,
     ) -> Result<Self, BuilderError> {
         info!(
             "Creating in-memory vector store with {} embeddings",
@@ -140,10 +140,10 @@ impl VectorStoreManager {
 
         // Validate the embedding provider can be initialized
         match embedding {
-            EmbeddingModelConfig::OpenAI { api_key, model, .. } => {
+            EmbeddingConfig::OpenAI { api_key, model, .. } => {
                 Self::create_openai_embedding_model(api_key, model)?;
             }
-            EmbeddingModelConfig::Bedrock {
+            EmbeddingConfig::Bedrock {
                 model,
                 region,
                 profile,
@@ -178,7 +178,7 @@ impl VectorStoreManager {
     /// Create a Qdrant vector store
     async fn create_qdrant_store(
         config: &VectorStoreConfig,
-        embedding: &EmbeddingModelConfig,
+        embedding: &EmbeddingConfig,
         url: &str,
         collection_name: &str,
     ) -> Result<Self, BuilderError> {
@@ -214,12 +214,12 @@ impl VectorStoreManager {
 
         // Create embedding model and Qdrant store based on provider
         let qdrant_store = match embedding {
-            EmbeddingModelConfig::OpenAI { api_key, model, .. } => {
+            EmbeddingConfig::OpenAI { api_key, model, .. } => {
                 let embedding_model = Self::create_openai_embedding_model(api_key, model)?;
                 let store = QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
                 QdrantStoreKind::OpenAI(store)
             }
-            EmbeddingModelConfig::Bedrock {
+            EmbeddingConfig::Bedrock {
                 model,
                 region,
                 profile,

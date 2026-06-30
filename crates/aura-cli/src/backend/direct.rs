@@ -57,6 +57,30 @@ impl DirectBackend {
         config_path: &str,
         extra_headers: Vec<(String, String)>,
     ) -> Result<Self> {
+        // Surface a friendly, actionable message when the config is simply
+        // missing, instead of leaking a raw "No such file or directory" IO
+        // error. This is the common first-run case: `aura-cli` defaults to
+        // `config.toml` in the current directory when neither `--config` nor
+        // `--api-url` is given.
+        if !std::path::Path::new(config_path).exists() {
+            // Derive the program name from the running executable rather than
+            // hardcoding it, so the suggested command stays correct if the
+            // binary is renamed (e.g. `aura-cli` -> `aura`).
+            let prog = std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "aura".to_string());
+            anyhow::bail!(
+                "No agent config found at `{config_path}`.\n\n\
+                 Standalone mode needs a TOML agent config. To get started:\n  \
+                 • run `{prog} init` to generate one in the current directory\n  \
+                 • pass `--config <path>` to point at an existing config file or directory\n  \
+                 • set `--api-url <url>` (or AURA_API_URL) to connect to a running aura-web-server instead"
+            );
+        }
+
         let configs =
             aura_config::load_config(config_path).context("Failed to load agent config")?;
         if configs.is_empty() {
@@ -106,6 +130,7 @@ impl DirectBackend {
         self.app_state
             .configs
             .iter()
+            .filter(|c| !c.agent.hidden)
             .map(|c| {
                 c.agent
                     .alias
@@ -514,6 +539,25 @@ mod tests {
             make_config("Code Agent", None, ""),
         ]);
         assert_eq!(backend.model_ids(), vec!["math", "Code Agent"]);
+    }
+
+    #[test]
+    fn model_ids_excludes_hidden_agents() {
+        let mut hidden = make_config("Secret Agent", None, "");
+        hidden.agent.hidden = true;
+        let backend = make_backend(vec![make_config("Visible Agent", None, ""), hidden]);
+        assert_eq!(backend.model_ids(), vec!["Visible Agent"]);
+    }
+
+    #[test]
+    fn find_matching_model_finds_hidden_agents() {
+        let mut hidden = make_config("Secret Agent", None, "");
+        hidden.agent.hidden = true;
+        let backend = make_backend(vec![hidden]);
+        assert_eq!(
+            backend.find_matching_model("Secret Agent"),
+            Some("Secret Agent".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------

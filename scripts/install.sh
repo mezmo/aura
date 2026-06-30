@@ -15,19 +15,24 @@ REPO="mezmo/aura"
 VERSION="${AURA_VERSION:-latest}"
 INSTALL_DIR="${AURA_INSTALL:-${HOME}/.local/bin}"
 COMPONENT="${AURA_COMPONENT:-all}"
-GITHUB_API="https://api.github.com"
+BASE_URL="https://github.com/${REPO}/releases"
 
 main() {
     detect_platform
     resolve_version
-    fetch_release_metadata
 
     echo "Installing AURA ${VERSION} (${OS}/${ARCH}) to ${INSTALL_DIR}"
     mkdir -p "${INSTALL_DIR}"
 
-    local tmpdir
     tmpdir=$(mktemp -d)
     trap 'rm -rf "${tmpdir}"' EXIT
+
+    if [[ -n "${AURA_CHECKSUMS:-}" ]]; then
+        cp "${AURA_CHECKSUMS}" "${tmpdir}/checksums.txt"
+    else
+        local checksums_url="${BASE_URL}/download/v${VERSION}/checksums.txt"
+        curl -fsSL -o "${tmpdir}/checksums.txt" "${checksums_url}" 2>/dev/null || true
+    fi
 
     if [[ "${COMPONENT}" != "cli" ]]; then
         install_binary "${tmpdir}" "aura-web-server"
@@ -69,9 +74,11 @@ detect_platform() {
 
 resolve_version() {
     if [[ "${VERSION}" == "latest" ]]; then
-        VERSION=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" \
-            "${GITHUB_API}/repos/${REPO}/releases/latest" \
-            | grep -o '"tag_name" *: *"[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+        local location
+        location=$(curl -fsSI "${BASE_URL}/latest" 2>/dev/null \
+            | grep -i '^location:' | tail -1 | tr -d '\r')
+        VERSION="${location##*/}"
+        VERSION="${VERSION#v}"
         if [[ -z "${VERSION}" ]]; then
             echo "Error: could not determine latest version."
             exit 1
@@ -79,28 +86,36 @@ resolve_version() {
     fi
 }
 
-RELEASE_JSON=""
-
-fetch_release_metadata() {
-    RELEASE_JSON=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" \
-        "${GITHUB_API}/repos/${REPO}/releases/tags/v${VERSION}")
-}
-
-get_asset_digest() {
-    local asset_name="$1"
-    echo "${RELEASE_JSON}" \
-        | grep -o "\"name\" *: *\"${asset_name}\"[^}]*\"digest\" *: *\"sha256:[a-f0-9]*\"" \
-        | grep -o 'sha256:[a-f0-9]*' \
-        | cut -d: -f2
-}
-
 download() {
     local dest="$1" name="$2"
-    local url="https://github.com/${REPO}/releases/download/v${VERSION}/${name}"
+    local url="${BASE_URL}/download/v${VERSION}/${name}"
     if ! curl -fsSL -o "${dest}" "${url}"; then
         echo "Error: failed to download ${url}"
+        return 1
+    fi
+}
+
+verify_checksum() {
+    local file="$1" asset_name="$2" checksums="$3"
+    if [[ ! -f "${checksums}" ]]; then
+        echo "  Warning: no checksums file, skipping verification"
+        return 0
+    fi
+    local expected
+    expected=$(grep "  ${asset_name}\$" "${checksums}" | cut -d' ' -f1 || true)
+    if [[ -z "${expected}" ]]; then
+        echo "  Warning: no checksum for ${asset_name}, skipping verification"
+        return 0
+    fi
+    local actual
+    actual=$(sha256sum "${file}" | cut -d' ' -f1)
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "Error: checksum mismatch for ${asset_name}"
+        echo "  expected: ${expected}"
+        echo "  actual:   ${actual}"
         exit 1
     fi
+    echo "  Verified checksum: OK"
 }
 
 install_binary() {
@@ -109,22 +124,7 @@ install_binary() {
 
     echo "  Downloading ${asset_name}..."
     download "${tmpdir}/${asset_name}" "${asset_name}"
-
-    local expected
-    expected=$(get_asset_digest "${asset_name}")
-    if [[ -n "${expected}" ]]; then
-        local actual
-        actual=$(sha256sum "${tmpdir}/${asset_name}" | cut -d' ' -f1)
-        if [[ "${actual}" != "${expected}" ]]; then
-            echo "Error: checksum mismatch for ${asset_name}"
-            echo "  expected: ${expected}"
-            echo "  actual:   ${actual}"
-            exit 1
-        fi
-        echo "  Verified checksum: OK"
-    else
-        echo "  Warning: no digest found for ${asset_name}, skipping verification"
-    fi
+    verify_checksum "${tmpdir}/${asset_name}" "${asset_name}" "${tmpdir}/checksums.txt"
 
     chmod +x "${tmpdir}/${asset_name}"
     mv "${tmpdir}/${asset_name}" "${INSTALL_DIR}/${binary}"

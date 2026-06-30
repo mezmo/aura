@@ -1,0 +1,49 @@
+name: Feature Report
+description: File a feature report.
+title: "[FEATURE]: "
+labels: ["enhancement", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this feature report! Please make sure there are no similar issue prior to submitting a new one!
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: |
+        A clear and concise summary of what feature or enhancement you'd like to see.
+      placeholder: Feature XYZ is missing!
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Provide any additional information you think is helpful. This is formatted as markdown so feel free to use markdown syntax.
+      placeholder: Add any other context about the issue here.
+    validations:
+      required: false
+  - type: upload
+    id: screenshots
+    attributes:
+      label: Upload screenshots
+      description: If applicable, add screenshots to help explain.
+    validations:
+      required: false
+  - type: checkboxes
+    id: searched-other-issues
+    attributes:
+      label: Searched Issues
+      description: Please look through existing issues before submitting a new issue. Check this box if you have NOT found a similar issue.
+      options:
+        - label: No similar issues found
+          required: true
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/mezmo/aura/blob/main/CODE_OF_CONDUCT.md).
+      options:
+        - label: I agree to follow this project's Code of Conduct
+          required: true

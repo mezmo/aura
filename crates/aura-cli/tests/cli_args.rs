@@ -238,9 +238,8 @@ fn standalone_otel_init_does_not_panic_without_collector() {
     // The actual failure should be the missing config — confirms we
     // got *past* OTel setup before hitting the expected error.
     assert!(
-        stderr.contains("Failed to load agent config")
-            || stderr.contains("No such file or directory"),
-        "expected config-load failure on stderr; got:\n{stderr}"
+        stderr.contains("No agent config found at"),
+        "expected friendly missing-config message on stderr; got:\n{stderr}"
     );
 }
 
@@ -261,35 +260,72 @@ fn help_includes_standalone_and_config_flags() {
 
 #[cfg(feature = "standalone-cli")]
 #[test]
-fn standalone_without_config_exits_with_error() {
+fn standalone_without_config_defaults_to_config_toml() {
+    // --standalone without --config should try to load config.toml (will fail
+    // because the file doesn't exist, but it should NOT error about missing flags)
     let output = aura_cli().arg("--standalone").output().unwrap();
-    assert!(
-        !output.status.success(),
-        "--standalone without --config should fail"
-    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--standalone requires --config"),
-        "should explain that --config is required"
+        !stderr.contains("requires --config"),
+        "should not require --config; defaults to config.toml"
     );
 }
 
 #[cfg(feature = "standalone-cli")]
 #[test]
-fn config_without_standalone_exits_with_error() {
+fn config_without_standalone_implies_standalone() {
+    // --config without --standalone and without --api-url should enter
+    // standalone mode (will fail to load the file, but shouldn't error
+    // about missing --standalone)
     let output = aura_cli()
+        .arg("--config")
+        .arg("some/path.toml")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("requires --standalone"),
+        "should not require --standalone; standalone is default without --api-url"
+    );
+}
+
+#[cfg(feature = "standalone-cli")]
+#[test]
+fn config_with_api_url_warns_ignored() {
+    // --config + --api-url (without --standalone) → HTTP mode, warns about --config
+    let output = aura_cli()
+        .arg("--api-url")
+        .arg("http://localhost:9999")
+        .arg("--config")
+        .arg("some/path.toml")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--config is ignored in HTTP mode"),
+        "should warn that --config is ignored when --api-url is set"
+    );
+}
+
+#[cfg(feature = "standalone-cli")]
+#[test]
+fn standalone_and_api_url_flags_are_mutually_exclusive() {
+    let output = aura_cli()
+        .arg("--standalone")
+        .arg("--api-url")
+        .arg("http://localhost:9999")
         .arg("--config")
         .arg("some/path.toml")
         .output()
         .unwrap();
     assert!(
         !output.status.success(),
-        "--config without --standalone should fail"
+        "--standalone and --api-url together should fail"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--config requires --standalone"),
-        "should explain that --standalone is required"
+        stderr.contains("mutually exclusive"),
+        "should explain that --standalone and --api-url are mutually exclusive"
     );
 }
 

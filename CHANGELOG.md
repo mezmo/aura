@@ -1,5 +1,216 @@
 ## Changelog
 
+## [1.30.4](https://github.com/mezmo/aura/compare/v1.30.3...v1.30.4) (2026-06-26)
+
+
+### Bug Fixes
+
+* **orchestration**: remove worker prompt scope leakage [18258aa](https://github.com/mezmo/aura/commit/18258aa0e3e6211043f8fe67d4bd3b619862d3d7) - Justin Gross [#215](https://github.com/mezmo/aura/issues/215) [#216](https://github.com/mezmo/aura/issues/216)
+
+## [1.30.3](https://github.com/mezmo/aura/compare/v1.30.2...v1.30.3) (2026-06-26)
+
+
+### Bug Fixes
+
+* **otel**: decode agent turn prompts [1ab3f6a](https://github.com/mezmo/aura/commit/1ab3f6a98fc8c96ec6d8aacedb3cf0a71cc6da8d) - Mike Shearer [#273](https://github.com/mezmo/aura/issues/273)
+
+## [1.30.2](https://github.com/mezmo/aura/compare/v1.30.1...v1.30.2) (2026-06-26)
+
+
+### Bug Fixes
+
+* **feature**: feature builds needs to work [ada4cf8](https://github.com/mezmo/aura/commit/ada4cf8ae5be2b463ba0182addce16fa9f467932) - Phil Ciampini
+
+## [1.30.1](https://github.com/mezmo/aura/compare/v1.30.0...v1.30.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* quickstart instructions [861023d](https://github.com/mezmo/aura/commit/861023d319d3ffc0706a89b1fa5c7e9bf12aec1d) - Gregory Janco [#288](https://github.com/mezmo/aura/issues/288)
+
+# [1.30.0](https://github.com/mezmo/aura/compare/v1.29.0...v1.30.0) (2026-06-25)
+
+
+### Features
+
+* **gh-templates**: add bug and feature issue templates [10b3c3c](https://github.com/mezmo/aura/commit/10b3c3c53f0e86cd7bb0b4921159da14bf06cd38) - Justin Gross [#templates](https://github.com/mezmo/aura/issues/templates) [#139](https://github.com/mezmo/aura/issues/139)
+
+# [1.29.0](https://github.com/mezmo/aura/compare/v1.28.0...v1.29.0) (2026-06-25)
+
+
+### Features
+
+* **agent**: ability to hide agent [a042ad2](https://github.com/mezmo/aura/commit/a042ad2b6c586e3661c635dc0f5a91790a546ebe) - Dominic McAllister [#280](https://github.com/mezmo/aura/issues/280)
+
+# [1.28.0](https://github.com/mezmo/aura/compare/v1.27.0...v1.28.0) (2026-06-24)
+
+
+### Bug Fixes
+
+* **cli**: make --standalone and --api-url mutually exclusive [249201e](https://github.com/mezmo/aura/commit/249201e34595ab43adea0fe66ecb0848706cdb88) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+### Documentation
+
+* **cli**: update docs for standalone-as-default and add CI guard [a5d8dc9](https://github.com/mezmo/aura/commit/a5d8dc9ad61e57f89c89acb6821642be9e11e2b9) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+### Features
+
+* **cli**: default to standalone mode when --api-url is absent [170d957](https://github.com/mezmo/aura/commit/170d9572c94e409eb6cabe5881c003bdc701919e) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+### Style
+
+* **cli**: fix rustfmt chain indentation in cli.rs [b930960](https://github.com/mezmo/aura/commit/b9309609cca5b7e7abc4ad02756356891e6d79a6) - Tony Rogers [#268](https://github.com/mezmo/aura/issues/268)
+
+# [1.27.0](https://github.com/mezmo/aura/compare/v1.26.2...v1.27.0) (2026-06-23)
+
+
+### Features
+
+* **init**: generate sre orchestrator config as default [b699e1a](https://github.com/mezmo/aura/commit/b699e1a1abe2453e0d9afc334f554713911ac353) - Chip Johnson [#analyst](https://github.com/mezmo/aura/issues/analyst) [#266](https://github.com/mezmo/aura/issues/266)
+
+## [1.26.2](https://github.com/mezmo/aura/compare/v1.26.1...v1.26.2) (2026-06-22)
+
+
+### Code Refactoring
+
+* **cli**: modularize init.rs into focused submodules [e94ca84](https://github.com/mezmo/aura/commit/e94ca84a7a93bd13c8213105ee347d4d707e29d3) - Mike Shearer [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
+## [1.26.1](https://github.com/mezmo/aura/compare/v1.26.0...v1.26.1) (2026-06-22)
+
+
+### Bug Fixes
+
+* **context-flood**: route read_artifact through the scratchpad [0596c43](https://github.com/mezmo/aura/commit/0596c43c4e1a41464181771c55b0649e0d8cc9b7) - Justin Gross [#125](https://github.com/mezmo/aura/issues/125)
+
+# [1.26.0](https://github.com/mezmo/aura/compare/v1.25.0...v1.26.0) (2026-06-19)
+
+
+### Bug Fixes
+
+* **cli**: clarify unverified key and document init in the README [52f5490](https://github.com/mezmo/aura/commit/52f54905750476ade7e27dcf62b3b8925e1bc256) - Mike Shearer* **cli**: correct init env-file note, verify wording, ollama listing [6f74adb](https://github.com/mezmo/aura/commit/6f74adb8e4e5e09fdaed6ef11d7bde56ec5ad87d) - Mike Shearer* **cli**: mask api-key prompt and migrate dotenv to dotenvy [3ef546c](https://github.com/mezmo/aura/commit/3ef546cc823715eaf41d7a5aca41d19e439d43a8) - Mike Shearer* **cli**: recommend only gpt-5.5 for openai [5b546a8](https://github.com/mezmo/aura/commit/5b546a820cb859ec0a6cf9939fcae3655b9b9215) - Mike Shearer* **cli**: rework init api key flow and drop bootstrap references [b6d8f5d](https://github.com/mezmo/aura/commit/b6d8f5dafe9ae8f2fdc7e2f37e3828026824fb21) - Mike Shearer* **cli**: send Gemini API key via header, not query string [78368aa](https://github.com/mezmo/aura/commit/78368aa588253a8c50c8628d23412ecf6aa1728d) - Mike Shearer
+
+### Chores
+
+* **config**: drop the unused [bootstrap] config table [7ed4e27](https://github.com/mezmo/aura/commit/7ed4e2791f167785f0324ca2afe617f1326e7c74) - Mike Shearer
+
+### Code Refactoring
+
+* **cli**: make the init provider a clap ValueEnum [9bc4593](https://github.com/mezmo/aura/commit/9bc4593be185321ffa95d14b14e34f6e08a97b90) - Mike Shearer* **cli**: tidy init after a quality pass [19e48d5](https://github.com/mezmo/aura/commit/19e48d5c3933bb7317edb2ce7fb570fd3079b7ae) - Mike Shearer
+
+### Features
+
+* **cli**: add init subcommand with live model discovery [985c41b](https://github.com/mezmo/aura/commit/985c41b300f9dedcc6438532bb24495403b7e453) - Mike Shearer* **cli**: curate init model selection per provider [c9916da](https://github.com/mezmo/aura/commit/c9916dadc320e17de131c83457cdf584eaa73d1d) - Mike Shearer* **cli**: polish the init wizard intro and overwrite flow [c63fa38](https://github.com/mezmo/aura/commit/c63fa38713097cc644bcf167abac196701c57eb5) - Mike Shearer* **cli**: source init config from .env and prompt for the api key [e23ba43](https://github.com/mezmo/aura/commit/e23ba43913d0a2cc9ca8fc3c0f44bd03073ebfff) - Mike Shearer* **cli**: update init model recommendations per review [72caf95](https://github.com/mezmo/aura/commit/72caf95b25cd3ce6f2f01cf93b8dcdb6a29e1495) - Mike Shearer* **config**: add [bootstrap] config table [ab859ea](https://github.com/mezmo/aura/commit/ab859ea03bbbc2a276d50b22ff63960ee727bdb7) - Mike Shearer
+
+### Style
+
+* **cli**: rustfmt the reworked init and drop an unused binding [cec0ab4](https://github.com/mezmo/aura/commit/cec0ab46ac5536b02c2b7b644b922997e3ba17a6) - Mike Shearer
+
+# [1.25.0](https://github.com/mezmo/aura/compare/v1.24.3...v1.25.0) (2026-06-18)
+
+
+### Features
+
+* **cli**: suggest slash command for bare command-word input [da8d7a0](https://github.com/mezmo/aura/commit/da8d7a01a8441c64f40897ee9f432d96f2fe1c81) - Jacob Hull [#178](https://github.com/mezmo/aura/issues/178)
+
+## [1.24.3](https://github.com/mezmo/aura/compare/v1.24.2...v1.24.3) (2026-06-18)
+
+
+### Bug Fixes
+
+* **mcp**: suppress stdio MCP server stderr output [5f3d7ea](https://github.com/mezmo/aura/commit/5f3d7eadc6f94decf852dbfeb192511e31561cc4) - Tony Rogers
+
+## [1.24.2](https://github.com/mezmo/aura/compare/v1.24.1...v1.24.2) (2026-06-17)
+
+
+### Code Refactoring
+
+* consolidate slash-command handling into one registry [3178e8d](https://github.com/mezmo/aura/commit/3178e8d5937a5c2ef7a40fe5ec1e87f36c6c9cec) - Jacob Hull [#177](https://github.com/mezmo/aura/issues/177)
+
+### Documentation
+
+* **adr**: record hitl approval architecture decision [ec21337](https://github.com/mezmo/aura/commit/ec21337c85fec7117be0f79bb99f2dbc34c35382) - Mike Shearer [#191](https://github.com/mezmo/aura/issues/191)* **design**: add hitl implementation note [4c86ef4](https://github.com/mezmo/aura/commit/4c86ef4a9d1501116c53ed781f75516640b0581f) - Mike Shearer [#191](https://github.com/mezmo/aura/issues/191)
+
+## [1.24.1](https://github.com/mezmo/aura/compare/v1.24.0...v1.24.1) (2026-06-17)
+
+
+### Bug Fixes
+
+* **ci**: create local branch ref for fork PR release dry-run [aab616c](https://github.com/mezmo/aura/commit/aab616cffe61f0045398395874ac44991013f431) - Tony Rogers
+
+# [1.24.0](https://github.com/mezmo/aura/compare/v1.23.0...v1.24.0) (2026-06-17)
+
+
+### Features
+
+* **a2a**: add header to request model [a036c19](https://github.com/mezmo/aura/commit/a036c19536187eea64f4c0840f9ba0d2207e912c) - Dominic McAllister [#253](https://github.com/mezmo/aura/issues/253)
+
+# [1.23.0](https://github.com/mezmo/aura/compare/v1.22.3...v1.23.0) (2026-06-12)
+
+
+### Bug Fixes
+
+* **mcp**: bound tool error content before it reaches an agent [bedfba5](https://github.com/mezmo/aura/commit/bedfba5e5ee874824891284bc9c29eb153c56c53) - Justin Gross [#18](https://github.com/mezmo/aura/issues/18)
+
+### Features
+
+* **mcp**: surface and report failed MCP server connections [8ba8573](https://github.com/mezmo/aura/commit/8ba85733d326578a27a4192599550bb42ad80884) - Justin Gross [#154](https://github.com/mezmo/aura/issues/154)
+
+## [1.22.3](https://github.com/mezmo/aura/compare/v1.22.2...v1.22.3) (2026-06-12)
+
+
+### Documentation
+
+* **readme**: add slack, license, rust, and mcp badges [fbe3d57](https://github.com/mezmo/aura/commit/fbe3d5786c1071d657e297e00c3d0bbbcd0d3bd0) - Mike Shearer [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
+### Tests
+
+* **a2a**: fix flaky test_sequential_tasks_share_context [36a7f35](https://github.com/mezmo/aura/commit/36a7f354d1ae7c4e5efb09dbd8f60e7cafd6f2df) - Mike Shearer [#245](https://github.com/mezmo/aura/issues/245)
+
+## [1.22.2](https://github.com/mezmo/aura/compare/v1.22.1...v1.22.2) (2026-06-11)
+
+
+### Code Refactoring
+
+* **config**: move pure config types into aura-config [537dcb9](https://github.com/mezmo/aura/commit/537dcb9d3a9b7524a22647d9eb7b5e228fb1dd7a) - Justin Gross [#174](https://github.com/mezmo/aura/issues/174)
+
+## [1.22.1](https://github.com/mezmo/aura/compare/v1.22.0...v1.22.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* **ci**: rewrite install script to avoid json parsing [578007d](https://github.com/mezmo/aura/commit/578007d72c42de9f2fcc6112f2542e4a149d52dd) - Tony Rogers
+
+# [1.22.0](https://github.com/mezmo/aura/compare/v1.21.0...v1.22.0) (2026-06-10)
+
+
+### Bug Fixes
+
+* **a2a**: add feature gate [a001a3c](https://github.com/mezmo/aura/commit/a001a3c784c9b27af0f4af3ce670ed9b46a2b241) - Dominic McAllister [LOG-23822](https://mezmo.atlassian.net/browse/LOG-23822)* **a2a**: forward headers to mcps [be2dab9](https://github.com/mezmo/aura/commit/be2dab98d151b11259928569cf4b7cac577069cd) - Dominic McAllister [LOG-23822](https://mezmo.atlassian.net/browse/LOG-23822)* **a2a**: propagate mcp notifications/cancelled and gate completed yield [a9f855c](https://github.com/mezmo/aura/commit/a9f855c0351278a85cf8a801feaeba4b0bb487aa) - Dominic McAllister [LOG-23822](https://mezmo.atlassian.net/browse/LOG-23822)* **a2a**: publish absolute urls in agent card [6eaf05e](https://github.com/mezmo/aura/commit/6eaf05e61cc933f3962a2efb5dd3af439213075d) - Dominic McAllister [LOG-23822](https://mezmo.atlassian.net/browse/LOG-23822)* **aura-cli**: remove the hard-coded version string in welcome display [c7c0726](https://github.com/mezmo/aura/commit/c7c07269ffd0c39fe48e624b9a7b755c98180608) - Justin Gross [#167](https://github.com/mezmo/aura/issues/167)* **ci**: run cargo update via make target in runner container [95bbb10](https://github.com/mezmo/aura/commit/95bbb103fa9fd82f10b44f5ac233cb51c2dd9307) - Tony Rogers* **config**: validate worker names case-insensitively [fd659e4](https://github.com/mezmo/aura/commit/fd659e4e79d18f57ec29123a5fdd2537bb05a2e8) - Justin Gross [LOG-23844](https://mezmo.atlassian.net/browse/LOG-23844)
+
+### Chores
+
+* **aura-cli**: update the messaging when user interupts AURA [5dc8348](https://github.com/mezmo/aura/commit/5dc834870fde3a72fbadda8049d68f347e8276e3) - Justin Gross* Capitalize AURA [045bc3f](https://github.com/mezmo/aura/commit/045bc3fe67727d6f61edbd5818ae2e3d6ba9a240) - Gregory Janco [#175](https://github.com/mezmo/aura/issues/175)* **ci**: Disable concurrency and limit history [6eb4bf8](https://github.com/mezmo/aura/commit/6eb4bf81d1f7db226bf4498e67706ec6a8ed5d1d) - Jon Moses* **lint**: Fix hadolint issues with dockerfile [feb868f](https://github.com/mezmo/aura/commit/feb868f6f5176baad12b9ff0029c25a3483ff8d3) - Jon Moses
+
+### Continuous Integration
+
+* attach pre-built binaries to github releases [3bcbf15](https://github.com/mezmo/aura/commit/3bcbf15815f43dd86cd5b11d7a586fbf643678c3) - Tony Rogers* attach pre-built binaries to github releases [0c3e3a5](https://github.com/mezmo/aura/commit/0c3e3a5d85f170dbc8e5e38e2e67f4fbd99a0568) - Tony Rogers* **release**: include files in dist on github releases [fcd51ee](https://github.com/mezmo/aura/commit/fcd51eed5ef9632ad8cf12bdefb806cb78dadf3b) - Tony Rogers
+
+### Documentation
+
+* **compose**: correct stale mock-mcp stub comments [a37894d](https://github.com/mezmo/aura/commit/a37894dddbb28c063d787f21bf8c8659d9ee6232) - Mike Shearer* **quickstart**: reframe orchestration fallback gap as known issue [7fd6333](https://github.com/mezmo/aura/commit/7fd63335e1e863554564f875ea455795a579c20a) - Chip Johnson [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)
+
+### Features
+
+* **a2a**: initial implementation [349014d](https://github.com/mezmo/aura/commit/349014dccff4affea48109e2282a4cec2b7235fc) - Dominic McAllister [LOG-23822](https://mezmo.atlassian.net/browse/LOG-23822)* **aura-cli**: display LLM reasoning output for coordinator and workers [5a22443](https://github.com/mezmo/aura/commit/5a224438f3b9ec27a7b36e9f7864bebd58e5a5e4) - Justin Gross [#114](https://github.com/mezmo/aura/issues/114)* **ci**: Add hadolint check [2d1958c](https://github.com/mezmo/aura/commit/2d1958c3dde1687557164c98ed24db6fc60e9afa) - Jon Moses* **mcp**: add legacy SSE transport support [0155fc5](https://github.com/mezmo/aura/commit/0155fc549317875ac22b6ef284fc27d172fc7b6f) - Mike Shearer [#153](https://github.com/mezmo/aura/issues/153)* **mcp**: bring stdio transport to parity with http streamable and sse [7dffbee](https://github.com/mezmo/aura/commit/7dffbeee4cce3ea7e44c7fa474c0754216c947cb) - Mike Shearer [#163](https://github.com/mezmo/aura/issues/163)* **provider**: add openrouter support [adeec58](https://github.com/mezmo/aura/commit/adeec58969f545247232e5b9d5c563ac41f02df4) - Mike Shearer [#166](https://github.com/mezmo/aura/issues/166)* **quickstart**: default to cli-driven orchestrator mode [1d1fab1](https://github.com/mezmo/aura/commit/1d1fab19d17eb5c265cd6428571fe781131608f3) - Chip Johnson [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)* **scratchpad**: add item_schema pagination and budget hints [c26cdf4](https://github.com/mezmo/aura/commit/c26cdf47e8c804be5ccef1662794882cdb0218ba) - Justin Gross [LOG-23845](https://mezmo.atlassian.net/browse/LOG-23845)
+
+### Service
+
+* **setup**: Update stage names to be correct [960b7dd](https://github.com/mezmo/aura/commit/960b7dd8e05741d879df815eb7d027f19e521111) - Jon Moses
+
+### Tests
+
+* **a2a**: de-flake header forwarding assertion [d0081c0](https://github.com/mezmo/aura/commit/d0081c0f5feb6e3a4951ca4b71f4f34a6f9047c8) - Justin Gross [#195](https://github.com/mezmo/aura/issues/195)
+
 # [1.21.0](https://github.com/mezmo/aura/compare/v1.20.8...v1.21.0) (2026-05-20)
 
 

@@ -16,16 +16,30 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Validate --standalone + --config pairing when feature is enabled.
-    #[cfg(feature = "standalone-cli")]
-    aura_cli::cli::validate_standalone_args(&args);
+    // Subcommands run before any backend/REPL setup (and before the tokio
+    // runtime exists — init uses blocking HTTP for model discovery).
+    if let Some(aura_cli::cli::Command::Init(init_args)) = &args.command {
+        return aura_cli::init::run_init(init_args);
+    }
 
-    let mut config = AppConfig::load(&args)?;
+    // Load .env so a config's {{ env.* }} references resolve without manual
+    // exporting. CWD first, then the config file's directory (init writes
+    // .env next to the config). dotenvy never overwrites — shell exports and
+    // earlier .env entries win.
+    dotenvy::dotenv().ok();
+    #[cfg(feature = "standalone-cli")]
+    if let Some(cfg) = &args.agent_config
+        && let Some(dir) = std::path::Path::new(cfg).parent()
+    {
+        dotenvy::from_path(dir.join(".env")).ok();
+    }
 
     #[cfg(feature = "standalone-cli")]
-    let is_standalone = args.standalone;
+    let is_standalone = aura_cli::cli::resolve_standalone(&args);
     #[cfg(not(feature = "standalone-cli"))]
     let is_standalone = false;
+
+    let mut config = AppConfig::load(&args)?;
 
     // One process-wide tokio runtime, owned by `main` and threaded into
     // `Backend::from_config`, `run_oneshot`, and `run_repl`.
@@ -64,7 +78,7 @@ fn main() -> Result<()> {
     // `render_queued_wave` in `ui::animation`.
     aura_cli::ui::prompt::set_pretty(config.pretty);
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
-    let mut backend = Backend::from_config(&rt, &config, &args)?;
+    let mut backend = Backend::from_config(&rt, &config, &args, is_standalone)?;
 
     let is_query = config.query.is_some();
 

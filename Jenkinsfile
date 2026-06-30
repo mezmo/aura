@@ -239,13 +239,18 @@ pipeline {
 
               steps {
                 script {
+                  def releaseCmd = 'npm run release:dry'
+                  if (env.CHANGE_FORK) {
+                    sh "git checkout -B ${CURRENT_BRANCH}"
+                    releaseCmd = "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/release-notes-generator"
+                  }
                   docker.withRegistry(
                       'https://index.docker.io/v1/',
                       'dockerhub-token-mezmo'
                   ) {
                     withCredentials(RELEASE_CREDENTIALS) {
                       buildx {
-                        withReport('Release Test', 'npm run release:dry')
+                        withReport('Release Test', releaseCmd)
                       }
                     }
                   }
@@ -284,7 +289,6 @@ pipeline {
                 , dockerfile: "Dockerfile"
                 , args: [RELEASE_VERSION: FEATURE_TAG]
                 , docker_repo: DOCKER_REPO
-                , tooling: true
               )
               publishChecks(
                   name: 'Feature Container Build'
@@ -385,7 +389,7 @@ def withReport(checkName, command, callback = null) {
 
   try {
     if (command) {
-      sh script: "${command} 2>&1 | tee ${logFile}"
+      sh script: "set -o pipefail; ${command} 2>&1 | tee ${logFile}"
     }
     if(callback) {
       callback()

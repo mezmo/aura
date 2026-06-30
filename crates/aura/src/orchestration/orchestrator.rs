@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
-use crate::config::{AgentConfig, LlmConfig};
+use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
@@ -92,7 +92,6 @@ struct TaskExecutionParams<'a> {
     task_description: &'a str,
     task_context: &'a Option<String>,
     worker_name: Option<&'a str>,
-    plan_goal: &'a str,
 }
 
 /// Result from `execute_task` including structured output from `submit_result`.
@@ -288,7 +287,7 @@ pub struct Orchestrator {
     config: OrchestrationConfig,
 
     /// The underlying agent configuration (for creating workers)
-    agent_config: AgentConfig,
+    agent_config: AgentRuntimeConfig,
 
     /// Tool call observer for coordinator visibility into worker tool execution.
     /// Wired to emit OrchestratorEvent for real-time SSE streaming via spawn_tool_event_forwarder.
@@ -345,7 +344,7 @@ struct StreamCallParams<'a> {
 impl Orchestrator {
     /// Create a new orchestrator from configuration.
     pub async fn new(
-        agent_config: AgentConfig,
+        agent_config: AgentRuntimeConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let orchestration_config = agent_config.orchestration.clone().unwrap_or_default();
 
@@ -568,16 +567,17 @@ impl Orchestrator {
                     &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
                 ) + mcp_tool_tokens;
 
-                // Hold the persistence lock only long enough to copy iteration_path
-                // (sync method). Drop the guard before any .await on storage.
-                let iter_dir = {
+                let (iter_dir, read_root) = {
                     let persistence = self.persistence.lock().await;
-                    persistence.iteration_path()
+                    let run_dir = persistence.run_path().to_path_buf();
+                    let read_root = run_dir.parent().map(|p| p.to_path_buf()).unwrap_or(run_dir);
+                    (persistence.iteration_path(), read_root)
                 };
 
                 let build = scratchpad::build_scratchpad(scratchpad::ScratchpadBuildInputs {
                     sp_cfg,
                     storage_dir: &iter_dir,
+                    read_root: Some(&read_root),
                     scratchpad_tool_map,
                     context_window,
                     initial_used,
@@ -655,7 +655,8 @@ impl Orchestrator {
                 )
             }));
         } else {
-            worker_config.preamble_override = Some(self.config.build_worker_preamble());
+            worker_config.preamble_override =
+                Some(super::config::build_worker_preamble(&self.config));
             let orchestrator_id_copy = self.orchestrator_id.clone();
 
             // Orchestrator provides context factory with task metadata
@@ -1170,8 +1171,12 @@ impl Orchestrator {
              Analyze this user query and decide on the best approach.\n\n\
              USER QUERY: {query}{worker_section}\n\n\
              You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
-             1. **respond_directly** — For simple factual questions answerable from general knowledge.\n\
-                NEVER use for queries about system data, logs, metrics, or anything requiring tools.\n\n\
+             1. **respond_directly** — For simple factual questions answerable from general knowledge, \
+                OR when the relevant workers have no tools configured (tools show \"none configured\") \
+                and the query requires external data. In that case, explain the limitation and suggest \
+                configuring MCP servers.\n\
+                Do not use for queries about system data, logs, metrics, or anything requiring tools \
+                when workers DO have tools available.\n\n\
              2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
                 When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.\n\n\
              3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
@@ -1586,7 +1591,10 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
             let tool_list = self.format_tool_list(&tools, max_tools);
 
             let section = if tool_list.is_empty() {
-                format!("## {}\n{}", name, config.description)
+                format!(
+                    "## {}\n{}\nTools: (none configured — this worker cannot query external systems)",
+                    name, config.description
+                )
             } else {
                 format!("## {}\n{}\nTools: {}", name, config.description, tool_list)
             };
@@ -1952,7 +1960,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // Build coordinator preamble: orchestration framework template + user system prompt
         let include_history_tools = self.config.memory_dir().is_some()
             && self.persistence.lock().await.session_id().is_some();
-        let mut preamble = self.config.build_coordinator_preamble(
+        let mut preamble = super::config::build_coordinator_preamble(
             self.agent_config.effective_preamble(),
             include_recon_tools,
             include_history_tools,
@@ -2212,6 +2220,29 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     tools,
                 )))
             }
+            LlmConfig::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                ..
+            } => {
+                let mut cb = rig::providers::openrouter::Client::<reqwest::Client>::builder()
+                    .api_key(api_key);
+                if let Some(url) = base_url {
+                    cb = cb.base_url(url);
+                }
+                let cm = cb
+                    .build()
+                    .map_err(|e| format!("Failed to build OpenRouter coordinator: {}", e))?
+                    .completion_model(model);
+                Ok(ProviderAgent::OpenRouter(Self::build_agent_with_tools(
+                    cm,
+                    preamble,
+                    temperature,
+                    additional_params,
+                    tools,
+                )))
+            }
         }
     }
 
@@ -2223,7 +2254,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// passthrough tools — see `create_worker` for the rationale.
     async fn build_worker_provider_agent(
         &self,
-        worker_config: &AgentConfig,
+        worker_config: &AgentRuntimeConfig,
     ) -> Result<(ProviderAgent, String), Box<dyn std::error::Error + Send + Sync>> {
         let preamble = worker_config.effective_preamble();
         let temperature = worker_config.llm.temperature();
@@ -2400,6 +2431,37 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
+            LlmConfig::OpenRouter {
+                api_key,
+                model,
+                base_url,
+                additional_params,
+                ..
+            } => {
+                let mut cb = rig::providers::openrouter::Client::<reqwest::Client>::builder()
+                    .api_key(api_key);
+                if let Some(url) = base_url {
+                    cb = cb.base_url(url);
+                }
+                let cm = cb
+                    .build()
+                    .map_err(|e| format!("Failed to build OpenRouter worker: {}", e))?
+                    .completion_model(model);
+                let mut builder = rig::agent::AgentBuilder::new(cm);
+                builder = builder.preamble(preamble);
+                if let Some(temp) = temperature {
+                    builder = builder.temperature(temp);
+                }
+                if let Some(max) = worker_config.llm.max_tokens() {
+                    builder = builder.max_tokens(max);
+                }
+                if let Some(params) = additional_params {
+                    builder = builder.additional_params(params.clone());
+                }
+                let state = BuilderState::Initial(builder);
+                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
+            }
         }
     }
 
@@ -2417,9 +2479,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> Result<(), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
-
-        // Capture the plan goal to pass to each worker
-        let plan_goal = plan.goal.clone();
 
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
@@ -2472,25 +2531,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
 
             // Execute all ready tasks in parallel using FuturesUnordered
-            // Each task receives the plan goal for context
-            let goal = plan_goal.clone();
             let mut futures: FuturesUnordered<_> = ready_tasks
                 .into_iter()
-                .map(|(task_id, task_desc, task_context, worker_name)| {
-                    let goal = goal.clone();
-                    async move {
+                .map(
+                    |(task_id, task_desc, task_context, worker_name)| async move {
                         let start_time = Instant::now();
                         let params = TaskExecutionParams {
                             task_description: &task_desc,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
-                            plan_goal: &goal,
                         };
                         let result = self.execute_task(task_id, &params, Some(event_tx)).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
-                    }
-                })
+                    },
+                )
                 .collect();
 
             // Collect results as they complete and update plan
@@ -2712,7 +2767,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             task_description,
             task_context,
             worker_name,
-            plan_goal,
         } = params;
 
         {
@@ -2731,7 +2785,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .unwrap_or_default();
         let base_worker_prompt =
             super::templates::render_worker_task_prompt(&super::templates::WorkerTaskVars {
-                orchestration_goal: plan_goal,
                 context: &context_str,
                 your_task: task_description,
             });
@@ -4906,74 +4959,6 @@ mod tests {
             assert!(output.found);
             assert_eq!(output.content, format!("result {}", i));
         }
-    }
-
-    // ========================================================================
-    // Conversation context tool tests
-    // ========================================================================
-
-    #[tokio::test]
-    async fn test_conversation_context_large_n() {
-        use super::super::tools::get_conversation_context::{
-            GetConversationContextArgs, GetConversationContextTool,
-        };
-        use rig::completion::Message;
-        use rig::tool::Tool;
-
-        // last_n larger than history returns all messages
-        let history = Arc::new(vec![Message::user("hello"), Message::assistant("hi there")]);
-        let tool = GetConversationContextTool::new(history);
-        let result = tool
-            .call(GetConversationContextArgs {
-                last_n: Some(100),
-                max_chars: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_conversation_context_zero_n() {
-        use super::super::tools::get_conversation_context::{
-            GetConversationContextArgs, GetConversationContextTool,
-        };
-        use rig::completion::Message;
-        use rig::tool::Tool;
-
-        // last_n of 0 returns all messages
-        let history = Arc::new(vec![Message::user("hello"), Message::assistant("hi there")]);
-        let tool = GetConversationContextTool::new(history);
-        let result = tool
-            .call(GetConversationContextArgs {
-                last_n: Some(0),
-                max_chars: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_conversation_context_single_message() {
-        use super::super::tools::get_conversation_context::{
-            GetConversationContextArgs, GetConversationContextTool,
-        };
-        use rig::completion::Message;
-        use rig::tool::Tool;
-
-        let history = Arc::new(vec![Message::user("what is 2+2?")]);
-        let tool = GetConversationContextTool::new(history);
-        let result = tool
-            .call(GetConversationContextArgs {
-                last_n: None,
-                max_chars: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.count, 1);
-        assert_eq!(result.messages[0].role, "user");
-        assert!(result.messages[0].content.contains("2+2"));
     }
 
     // ========================================================================

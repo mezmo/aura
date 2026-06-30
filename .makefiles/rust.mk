@@ -54,6 +54,15 @@ nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
 
+.PHONY: check-cli-http-only
+check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features) aura-cli still builds
+	$(RUN) cargo clippy -p aura-cli --no-default-features --all-targets -- -D warnings
+	$(RUN) cargo test -p aura-cli --no-default-features
+
+.PHONY: update-lockfile
+update-lockfile: $(DOCKER_ENV) ## Regenerate Cargo.lock after version changes
+	$(RUN) cargo update --quiet --workspace
+
 .PHONY:clean-rust
 clean-rust: ## Clean up rust build artifacts
 	$(RUN_NO_ENV) cargo clean
@@ -107,6 +116,7 @@ build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release b
 .PHONY: build-release-binaries
 build-release-binaries: ## Build release binaries for all platforms
 	$(MAKE) -j2 build-release-binary-amd64 build-release-binary-arm64
+	cd $(DIST_DIR) && sha256sum aura-* > checksums.txt
 
 clean:: clean-dist
 

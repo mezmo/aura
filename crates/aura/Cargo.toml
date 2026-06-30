@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Internal crates
+aura-config = { path = "../aura-config" }
+
 # Rig dependencies
 rig-core = { workspace = true }
 rig-bedrock = { workspace = true }
@@ -58,6 +61,8 @@ strum = { workspace = true }
 
 # Tokenization for scratchpad context budget
 tiktoken-rs = "0.9.1"
+# Exact local Gemini tokenizer (embeds the Gemma 3 SentencePiece model)
+gemini-tokenizer = "0.2.0"
 
 [features]
 default = ["otel"]

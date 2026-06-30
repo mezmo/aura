@@ -4,10 +4,17 @@
 //! remaining-budget hints to prevent context window overflow.
 //!
 //! Uses real tokenizers for accurate token counting via the `TokenCounter`
-//! trait. Currently all providers use `tiktoken-rs` — OpenAI models resolve
-//! to their exact tokenizer, others default to `o200k_base`. Additional
-//! provider-specific tokenizers can be added by implementing `TokenCounter`
-//! and updating `token_counter_for_provider`.
+//! trait. Counting is provider-aware:
+//!
+//! - **OpenAI** — `tiktoken-rs` resolves the exact tokenizer per model.
+//! - **Gemini** — `gemini-tokenizer` runs the embedded Gemma 3 SentencePiece
+//!   model locally (exact, matches Google's official SDK).
+//! - **Anthropic / Bedrock-Claude** — Claude ships no public tokenizer, so a
+//!   calibrated `cl100k_base` approximation is used (see [`ClaudeApproxCounter`]).
+//! - **Everything else** — `o200k_base` as a conservative fallback floor.
+//!
+//! Additional provider-specific tokenizers can be added by implementing
+//! `TokenCounter` and updating `token_counter_for_provider`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -88,17 +95,105 @@ impl TokenCounter for TiktokenCounter {
     }
 }
 
+/// Exact local token counter for Gemini models.
+///
+/// Wraps `gemini-tokenizer`, which embeds the Gemma 3 SentencePiece model
+/// (262,144-token vocab) and produces counts identical to Google's official
+/// Python SDK. Fully local — no network or external files.
+///
+/// The configured model id is passed through to the tokenizer so counts follow
+/// whatever vocabulary the crate maps that model to. A model id the crate
+/// doesn't recognize falls back to a current Gemini model rather than failing.
+pub struct GeminiCounter {
+    tokenizer: gemini_tokenizer::LocalTokenizer,
+}
+
+impl GeminiCounter {
+    /// Model used when the configured Gemini model isn't recognized by the
+    /// tokenizer crate — a best-effort fallback so an unknown id still yields a
+    /// Gemini estimate instead of erroring.
+    const FALLBACK_MODEL: &'static str = "gemini-2.5-pro";
+
+    /// Create a counter for a specific Gemini model.
+    pub fn for_model(model: &str) -> Self {
+        let tokenizer = gemini_tokenizer::LocalTokenizer::new(model)
+            .or_else(|_| gemini_tokenizer::LocalTokenizer::new(Self::FALLBACK_MODEL))
+            .expect("embedded Gemini SentencePiece model must load");
+        Self { tokenizer }
+    }
+}
+
+impl TokenCounter for GeminiCounter {
+    fn count_tokens(&self, text: &str) -> usize {
+        self.tokenizer.count_tokens(text, None).total_tokens
+    }
+}
+
+/// Calibrated approximate token counter for Claude models.
+///
+/// Claude 3+ models do not ship a public tokenizer. This counter scales a
+/// local `cl100k_base` BPE count by an empirically measured correction factor,
+/// which is materially closer to Claude's true tokenization than the raw
+/// `o200k_base` fallback while staying fully local and synchronous.
+///
+/// The count is an estimate, not an exact figure.
+pub struct ClaudeApproxCounter {
+    bpe: &'static tiktoken_rs::CoreBPE,
+}
+
+/// Multiplier applied to `cl100k_base` counts to approximate Claude tokenization.
+///
+/// Claude's tokenizer is unavailable publicly; community measurements put it at
+/// roughly 10% above `cl100k_base` on typical mixed text. This is an
+/// approximation, not an exact factor.
+const CLAUDE_CORRECTION_FACTOR: f64 = 1.1;
+
+impl ClaudeApproxCounter {
+    /// Create a Claude approximation counter.
+    pub fn new() -> Self {
+        Self {
+            bpe: tiktoken_rs::cl100k_base_singleton(),
+        }
+    }
+}
+
+impl Default for ClaudeApproxCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TokenCounter for ClaudeApproxCounter {
+    fn count_tokens(&self, text: &str) -> usize {
+        let base = self.bpe.encode_with_special_tokens(text).len();
+        ((base as f64) * CLAUDE_CORRECTION_FACTOR).ceil() as usize
+    }
+}
+
+/// Best-effort counter for providers without a dedicated tokenizer.
+///
+/// Covers Ollama, OpenRouter, non-Claude Bedrock models, and any unrecognized
+/// provider. Resolves the model id against tiktoken when it is recognized,
+/// otherwise `o200k_base`. These all sit close to an o200k-family tokenizer,
+/// so the residual error is small — unlike Gemini and Claude, whose
+/// tokenizers differ enough to warrant the dedicated counters above.
+fn fallback_token_counter(model: &str) -> TiktokenCounter {
+    TiktokenCounter::for_model(model)
+}
+
 /// Create a token counter for the given provider and model.
 ///
-/// Currently uses tiktoken-rs for all providers. OpenAI models resolve to
-/// their exact tokenizer; others default to `o200k_base`. To add a
-/// provider-specific tokenizer, implement `TokenCounter` and add a match arm.
+/// Each arm names how that provider is counted: an exact tokenizer where one
+/// exists, the calibrated Claude approximation for Claude models (native or
+/// Bedrock-hosted), or [`fallback_token_counter`] for everything else. To add
+/// a provider-specific tokenizer, implement `TokenCounter` and add a match arm.
 pub fn token_counter_for_provider(provider: &str, model: &str) -> Arc<dyn TokenCounter> {
     match provider {
         "openai" => Arc::new(TiktokenCounter::for_model(model)),
-        // Future: add dedicated tokenizers for other providers here
-        // "anthropic" => Arc::new(ClaudeCounter::new()),
-        _ => Arc::new(TiktokenCounter::for_model(model)),
+        "gemini" => Arc::new(GeminiCounter::for_model(model)),
+        // Only Claude ids match — Bedrock's non-Claude vendors fall through.
+        "anthropic" | "bedrock" if model.contains("claude") => Arc::new(ClaudeApproxCounter::new()),
+        _ => Arc::new(fallback_token_counter(model)),
     }
 }
 
@@ -451,16 +546,80 @@ mod tests {
         assert!(tokens < 10);
     }
 
+    /// Invariants any real tokenizer must honor, independent of provider or
+    /// the specific vocabulary behind it.
+    fn assert_counter_invariants(counter: &dyn TokenCounter) {
+        assert_eq!(counter.count_tokens(""), 0, "empty text is zero tokens");
+        assert!(
+            counter.count_tokens("hello world") > 0,
+            "non-empty text is a positive number of tokens"
+        );
+        let short = counter.count_tokens("the quick brown fox");
+        let long = counter.count_tokens("the quick brown fox jumps over the lazy dog repeatedly");
+        assert!(long > short, "more text yields more tokens");
+    }
+
     #[test]
     fn test_token_counter_for_provider() {
-        let openai = token_counter_for_provider("openai", "gpt-5.2");
-        assert!(openai.count_tokens("test") > 0);
+        // Every provider/model — including unknown ones — must yield a usable counter.
+        let cases = [
+            ("openai", "gpt-4o"),
+            ("gemini", "gemini-2.5-pro"),
+            // Unrecognized Gemini id must hit the fallback, not error.
+            ("gemini", "gemini-9.9-not-a-real-model"),
+            ("anthropic", "claude-3-5-sonnet"),
+            ("bedrock", "us.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            ("bedrock", "meta.llama3-70b-instruct-v1:0"),
+            ("ollama", "llama3"),
+            ("openrouter", "anthropic/claude-3-opus"),
+            ("some-future-provider", "whatever-model"),
+        ];
+        for (provider, model) in cases {
+            assert_counter_invariants(&*token_counter_for_provider(provider, model));
+        }
+    }
 
-        let anthropic = token_counter_for_provider("anthropic", "claude-3-opus");
-        assert!(anthropic.count_tokens("test") > 0);
+    #[test]
+    fn test_bedrock_routing_by_model_id() {
+        let text = "tokenize this representative prompt for comparison";
+        let claude =
+            token_counter_for_provider("bedrock", "us.anthropic.claude-3-5-sonnet-20241022-v2:0");
+        let llama = token_counter_for_provider("bedrock", "meta.llama3-70b-instruct-v1:0");
+        assert_eq!(
+            claude.count_tokens(text),
+            ClaudeApproxCounter::new().count_tokens(text)
+        );
+        assert_eq!(
+            llama.count_tokens(text),
+            fallback_token_counter("meta.llama3-70b-instruct-v1:0").count_tokens(text)
+        );
+    }
 
-        let ollama = token_counter_for_provider("ollama", "llama3");
-        assert!(ollama.count_tokens("test") > 0);
+    #[test]
+    fn test_bedrock_claude_uses_anthropic_counter() {
+        let text = "Count these tokens the Claude way, whichever provider hosts the model.";
+        let bedrock =
+            token_counter_for_provider("bedrock", "us.anthropic.claude-3-5-sonnet-20241022-v2:0");
+        let anthropic = token_counter_for_provider("anthropic", "claude-3-5-sonnet");
+        assert_eq!(bedrock.count_tokens(text), anthropic.count_tokens(text));
+    }
+
+    #[test]
+    fn test_claude_counter_not_below_cl100k_baseline() {
+        // Holds for any correction factor >= 1, so it doesn't pin the factor value.
+        let claude = ClaudeApproxCounter::new();
+        let baseline = tiktoken_rs::cl100k_base_singleton();
+        for text in [
+            "fn main() { println!(\"hi\"); }",
+            "The quick brown fox jumps over the lazy dog.",
+            "λx. x + 1  — unicode and whitespace   spread out",
+        ] {
+            let bpe = baseline.encode_with_special_tokens(text).len();
+            assert!(
+                claude.count_tokens(text) >= bpe,
+                "Claude approximation must not fall below its BPE baseline for {text:?}"
+            );
+        }
     }
 
     #[test]

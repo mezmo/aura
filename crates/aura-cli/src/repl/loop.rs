@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
+use crate::api::mcp_status::McpNotice;
 use crate::api::stream::{StreamHandler, StreamResult};
 use crate::api::types::{DisplayEvent, ShellCallDetail, ToolCallInfo, snake_to_pascal_case};
 use crate::backend::Backend;
@@ -20,11 +21,12 @@ use crate::repl::commands;
 use crate::repl::conversations::ConversationStore;
 use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{self, HISTORY_COUNT, HISTORY_DEPTH, LAST_READLINE_INPUT};
+use crate::repl::registry::{self, CommandContext, CommandOutcome};
 use crate::tools;
 use crate::ui::markdown::render_markdown;
 use crate::ui::prompt::{
-    PendingCommand, WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint,
-    drain_stdin, erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
+    WaveAnimation, cleanup_terminal, clear_display_events, clear_input_hint, drain_stdin,
+    erase_input_frame, extend_display_events, frame_lines, get_cumulative_tokens,
     get_selected_model, handle_ctrlc, install_sigint_handler, is_expanded_output,
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
@@ -32,10 +34,11 @@ use crate::ui::prompt::{
     push_mid_stream_history, push_sse_event, random_bullet_color, redraw_input_frame,
     replay_event_log_global, reset_ctrlc_state, reset_input_geometry, restore_terminal_mode,
     seed_model_cache, seed_status_bar_tokens, set_expanded_output, set_mid_stream_history,
-    set_noncanonical_noecho, set_processing, set_selected_model, set_status_bar_tokens,
-    set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
-    styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
-    update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
+    set_noncanonical_noecho, set_processing, set_selected_model, set_startup_status,
+    set_status_bar_tokens, set_stream_conv_dir, set_welcome_state, setup_terminal,
+    stop_and_clear_animation, styled_prompt, take_pending_command, take_queued_input,
+    task_color_for, text_lines, update_status_bar, update_status_bar_unlocked, with_event_log,
+    with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
 
@@ -404,6 +407,47 @@ fn orch_event_prints_scrollback(event_name: &str) -> bool {
     )
 }
 
+/// Bare-word aliases for slash commands that are not themselves command names —
+/// abbreviations and editor-isms (vim's `:q`, a lone `?`) typed without a
+/// leading slash. Each maps to the canonical command name to suggest, resolved
+/// through [`registry`] at lookup time.
+///
+/// Inputs that match a command name directly (`clear`, `model`, …) resolve
+/// against the registry in [`command_hint`] and have no entry here.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("q", "/quit"),
+    (":q", "/quit"),
+    (":wq", "/quit"),
+    (":x", "/quit"),
+    ("bye", "/exit"),
+    ("logout", "/exit"),
+    ("?", "/help"),
+];
+
+/// Returns the slash command to suggest for a bare, slash-less word, or `None`
+/// when the input is neither a command name nor a known alias.
+///
+/// Matches case-insensitively against the trimmed input — first against
+/// registered command names (bare `clear` resolves to `/clear`), then against
+/// [`COMMAND_ALIASES`]. Multi-word input never matches. The result is advisory:
+/// a suggestion to surface, not a command to run.
+fn command_hint(input: &str) -> Option<&'static str> {
+    let trimmed = input.trim();
+    // A command word is a single token; multi-word input is ordinary chat.
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(cmd) = registry::lookup(&format!("/{lower}")) {
+        return Some(cmd.name);
+    }
+    COMMAND_ALIASES
+        .iter()
+        .find(|(bare, _)| *bare == lower)
+        .and_then(|(_, name)| registry::lookup(name))
+        .map(|cmd| cmd.name)
+}
+
 pub fn run_repl(
     rt: &Runtime,
     config: AppConfig,
@@ -497,6 +541,16 @@ pub fn run_repl(
         HISTORY_COUNT.store(0, Ordering::Relaxed);
         set_mid_stream_history(Vec::new());
     }
+
+    // Build the banner status line (cli version + connected server) once; the
+    // welcome template renders it where the working directory used to appear.
+    // `/clear` and `/resume` re-pick the welcome, so stash it for reuse.
+    let server = rt.block_on(backend.connection_summary());
+    set_startup_status(format!(
+        "aura-cli v{} · {}",
+        env!("CARGO_PKG_VERSION"),
+        server
+    ));
 
     // Pick the welcome content + colors once; reused on /expand and /resume replays.
     set_welcome_state(WelcomeState::pick());
@@ -624,60 +678,33 @@ pub fn run_repl(
                     reset_input_geometry();
                 }
 
-                if input == "/quit" || input == "/exit" {
-                    // Save before exiting, or delete if conversation was never started
-                    if let Some(ref store) = conv_store {
-                        if conversation.messages().len() > 1 {
-                            with_event_log(|log| {
-                                store.save_all(conversation.messages(), log, is_expanded_output())
-                            });
-                        } else {
-                            store.delete();
+                if input.starts_with('/') {
+                    let mut ctx = CommandContext {
+                        conversation: &mut conversation,
+                        conv_store: &mut conv_store,
+                        input_reader: &mut input_reader,
+                    };
+                    match registry::dispatch(&input, &mut ctx) {
+                        Some(CommandOutcome::Exit) => break,
+                        Some(CommandOutcome::Reinject(new_input)) => {
+                            initial_input = new_input;
+                            continue;
+                        }
+                        Some(CommandOutcome::Handled) => continue,
+                        None => {
+                            // Unknown command — don't send to API
+                            println!("Unknown command: {}", input);
+                            println!("Type /help for available commands.");
+                            redraw_input_frame();
+                            continue;
                         }
                     }
-                    break;
-                } else if input == "/clear" {
-                    commands::handle_clear(&mut conversation, &mut conv_store, &mut input_reader);
-                    continue;
-                } else if input == "/help" {
-                    commands::handle_help();
-                    continue;
-                } else if input == "/expand" {
-                    commands::handle_expand(&conversation, &conv_store);
-                    continue;
-                } else if input == "/stream" {
-                    commands::handle_stream();
-                    continue;
-                } else if input == "/conversations" {
-                    commands::handle_conversations();
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/rename") {
-                    commands::handle_rename(arg.trim(), &conv_store);
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/resume") {
-                    // In-REPL resume ignores CLI --model and --system-prompt;
-                    // uses whatever the resumed conversation had saved.
-                    if let Some(new_input) = commands::handle_resume(
-                        arg.trim(),
-                        &mut conversation,
-                        &mut conv_store,
-                        &mut input_reader,
-                        None,
-                    ) {
-                        initial_input = new_input;
-                    }
-                    continue;
-                } else if let Some(filter) = input.strip_prefix("/model") {
-                    let filter = filter.trim();
-                    commands::handle_model(filter, &conv_store);
-                    continue;
-                } else if let Some(arg) = input.strip_prefix("/style") {
-                    commands::handle_style(arg.trim());
-                    continue;
-                } else if input.starts_with('/') {
-                    // Unknown command — don't send to API
-                    println!("Unknown command: {}", input);
-                    println!("Type /help for available commands.");
+                } else if let Some(suggestion) = command_hint(&input) {
+                    println!(
+                        "{}",
+                        format!("This REPL uses slash commands. Did you mean {suggestion} ?")
+                            .themed(AuraStyle::Muted),
+                    );
                     redraw_input_frame();
                     continue;
                 }
@@ -721,6 +748,9 @@ pub fn run_repl(
                 set_processing(true);
                 crate::ui::prompt::clear_agent_reasoning();
                 crate::ui::prompt::reset_orch_tools();
+                // Per-turn status notices (e.g. MCP connection errors/warnings)
+                // are scoped to the current request; clear last turn's set.
+                crate::ui::prompt::clear_turn_notices();
 
                 // Per-turn event recording state
                 let pending_args: Arc<
@@ -1721,54 +1751,21 @@ pub fn run_repl(
                 // Done processing — restore status bar to token counts / default
                 set_processing(false);
 
-                // Check for pending commands set by mid-stream slash commands
-                if let Some(cmd) = take_pending_command() {
-                    match cmd {
-                        PendingCommand::Quit => {
-                            // Save before exiting, or delete if conversation was never started
-                            if let Some(ref store) = conv_store {
-                                if conversation.messages().len() > 1 {
-                                    with_event_log(|log| {
-                                        store.save_all(
-                                            conversation.messages(),
-                                            log,
-                                            is_expanded_output(),
-                                        )
-                                    });
-                                } else {
-                                    store.delete();
-                                }
-                            }
-                            break;
-                        }
-                        PendingCommand::Clear => {
-                            commands::handle_clear(
-                                &mut conversation,
-                                &mut conv_store,
-                                &mut input_reader,
-                            );
+                // Run any command deferred from mid-stream input through the
+                // same registry dispatch the prompt uses.
+                if let Some(pending) = take_pending_command() {
+                    let mut ctx = CommandContext {
+                        conversation: &mut conversation,
+                        conv_store: &mut conv_store,
+                        input_reader: &mut input_reader,
+                    };
+                    match (pending.command.handler)(&mut ctx, &pending.args) {
+                        CommandOutcome::Exit => break,
+                        CommandOutcome::Reinject(new_input) => {
+                            initial_input = new_input;
                             continue;
                         }
-                        PendingCommand::Resume(filter) => {
-                            let arg = filter.trim();
-                            if arg.is_empty() {
-                                // No argument — just continue normally
-                                redraw_input_frame();
-                                continue;
-                            }
-                            // In-REPL resume ignores CLI --model and --system-prompt
-                            if let Some(new_input) = commands::handle_resume(
-                                arg,
-                                &mut conversation,
-                                &mut conv_store,
-                                &mut input_reader,
-                                None,
-                            ) {
-                                initial_input = new_input;
-                            }
-                            redraw_input_frame();
-                            continue;
-                        }
+                        CommandOutcome::Handled => continue,
                     }
                 }
 
@@ -2240,6 +2237,74 @@ impl StreamHandler for ReplStreamHandler {
     }
 
     fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
+        // Per-turn MCP connection status. Surfaced two ways:
+        //  1. Persistent status notices below the token line, rendered when
+        //     this turn's frame is redrawn at turn end (data-only).
+        //  2. Immediately in the scrollback, so the user can react — e.g. stop
+        //     a doomed run — without waiting for the turn to finish.
+        if event_name == event_names::MCP_STATUS {
+            let notices = crate::api::mcp_status::notices_from_event(val);
+            if notices.is_empty() {
+                return;
+            }
+
+            // (1) Persistent status section.
+            for notice in &notices {
+                // Prefixes are padded so message text aligns
+                // ("error:   " / "warning: ").
+                let (style, line) = match notice {
+                    McpNotice::Error(message) => (AuraStyle::Error, format!("error:   {message}")),
+                    McpNotice::Warning(message) => {
+                        (AuraStyle::Warning, format!("warning: {message}"))
+                    }
+                };
+                crate::ui::prompt::add_turn_notice(style, line);
+            }
+
+            // (2) Immediate scrollback line(s). Mirror the on_tool_complete
+            // dance: stop the spinner, print above the frame, then restart
+            // "Thinking" so feedback continues until the next event/response.
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                guard.take().map(|(a, _)| a.finish()).is_some()
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+            {
+                let _term = lock_term();
+                erase_input_frame();
+                for notice in &notices {
+                    let (style, label, message) = match notice {
+                        McpNotice::Error(message) => (AuraStyle::Error, "Error", message),
+                        McpNotice::Warning(message) => (AuraStyle::Warning, "Warning", message),
+                    };
+                    // Theme the whole line, not just the marker/label.
+                    let line = format!("⏺ {label} - {message}");
+                    println!("{}", line.themed(style));
+                    crate::ui::prompt::increment_orch_scrollback();
+                }
+                println!();
+                crate::ui::prompt::increment_orch_scrollback();
+            }
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            return;
+        }
+
         // Handle aura.progress — prefer to attach the
         // message to the active orchestrator tool whose
         // progress_token matches; fall back to the
@@ -2728,5 +2793,66 @@ impl StreamHandler for ReplStreamHandler {
             *guard = Some((wave_anim, wave_stop));
         }
         prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMAND_ALIASES, command_hint};
+    use crate::repl::registry;
+
+    #[test]
+    fn intercepts_every_registered_command() {
+        // A command added to the registry must not slip through unhinted
+        for cmd in registry::COMMANDS {
+            let bare = cmd.name.strip_prefix('/').unwrap();
+            assert_eq!(
+                command_hint(bare),
+                Some(cmd.name),
+                "{} is not captured as a bare word",
+                cmd.name,
+            );
+        }
+    }
+
+    #[test]
+    fn intercepts_aliases() {
+        assert_eq!(command_hint("q"), Some("/quit"));
+        assert_eq!(command_hint(":q"), Some("/quit"));
+        assert_eq!(command_hint(":wq"), Some("/quit"));
+        assert_eq!(command_hint(":x"), Some("/quit"));
+        assert_eq!(command_hint("bye"), Some("/exit"));
+        assert_eq!(command_hint("logout"), Some("/exit"));
+        assert_eq!(command_hint("?"), Some("/help"));
+    }
+
+    #[test]
+    fn is_case_insensitive_and_trims() {
+        assert_eq!(command_hint("EXIT"), Some("/exit"));
+        assert_eq!(command_hint("  Quit  "), Some("/quit"));
+        assert_eq!(command_hint(":Q"), Some("/quit"));
+        assert_eq!(command_hint("  Model "), Some("/model"));
+    }
+
+    #[test]
+    fn passes_through_real_chat_input() {
+        // Slash commands are handled before this lookup, and ordinary chat
+        // must never be intercepted.
+        assert_eq!(command_hint("/exit"), None);
+        assert_eq!(command_hint("exit the building"), None);
+        assert_eq!(command_hint("how do I quit vim"), None);
+        assert_eq!(command_hint("question?"), None);
+        assert_eq!(command_hint(""), None);
+    }
+
+    #[test]
+    fn every_alias_resolves_to_a_real_command() {
+        // Guards against the alias table drifting from the registry.
+        for (bare, target) in COMMAND_ALIASES {
+            assert!(
+                registry::lookup(target).is_some(),
+                "alias {bare:?} targets unknown command {target:?}",
+            );
+        }
     }
 }

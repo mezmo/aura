@@ -19,6 +19,9 @@ use std::sync::Arc;
 pub struct ScratchpadBuildInputs<'a> {
     pub sp_cfg: &'a ScratchpadConfig,
     pub storage_dir: &'a Path,
+    /// Read boundary for the scratchpad tools.
+    /// `None` confines reads to the scratchpad dir.
+    pub read_root: Option<&'a Path>,
     pub scratchpad_tool_map: HashMap<String, usize>,
     pub context_window: usize,
     pub initial_used: usize,
@@ -27,7 +30,7 @@ pub struct ScratchpadBuildInputs<'a> {
 
 /// Output of `build_scratchpad`: the budget the caller records on its `Agent`
 /// struct, the wrapper it composes into its tool pipeline, the storage handle,
-/// and a ready-to-assign `ScratchpadToolsConfig` for `AgentConfig`.
+/// and a ready-to-assign `ScratchpadToolsConfig` for `AgentRuntimeConfig`.
 pub struct ScratchpadBuild {
     pub budget: ContextBudget,
     pub storage: Arc<ScratchpadStorage>,
@@ -50,7 +53,11 @@ pub async fn build_scratchpad(
     )
     .with_max_extraction_tokens(inputs.sp_cfg.max_extraction_tokens);
 
-    let storage = Arc::new(ScratchpadStorage::in_dir(inputs.storage_dir).await?);
+    let mut storage = ScratchpadStorage::in_dir(inputs.storage_dir).await?;
+    if let Some(read_root) = inputs.read_root {
+        storage = storage.with_read_root(read_root.to_path_buf());
+    }
+    let storage = Arc::new(storage);
     tracing::info!(
         "Scratchpad active (dir={}, context_window={}, max_extraction_tokens={}, tool_patterns={})",
         inputs.storage_dir.display(),
@@ -268,6 +275,7 @@ mod tests {
         let build = build_scratchpad(ScratchpadBuildInputs {
             sp_cfg: &sp_cfg,
             storage_dir: tmp.path(),
+            read_root: None,
             scratchpad_tool_map: tool_map,
             context_window: 128_000,
             initial_used: 1_000,

@@ -214,6 +214,11 @@ impl AppConfig {
     pub fn models_url(&self) -> String {
         format!("{}/v1/models", self.api_url.trim_end_matches('/'))
     }
+
+    /// Build the health endpoint URL from the base URL.
+    pub fn health_url(&self) -> String {
+        format!("{}/health", self.api_url.trim_end_matches('/'))
+    }
 }
 
 /// Persist the user's selected style to `~/.aura/cli.toml`. Updates the
@@ -407,6 +412,7 @@ mod tests {
 
     fn default_args() -> Args {
         Args {
+            command: None,
             api_url: None,
             api_key: None,
             model: None,
@@ -457,6 +463,7 @@ mod tests {
         let (cwd, home) = empty_env();
         let global = empty_global(&home);
         let args = Args {
+            command: None,
             api_url: Some("https://custom.api".to_string()),
             api_key: Some("secret".to_string()),
             model: Some("gpt-4".to_string()),

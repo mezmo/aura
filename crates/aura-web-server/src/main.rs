@@ -181,6 +181,12 @@ async fn main() -> std::io::Result<()> {
 async fn run() -> std::io::Result<()> {
     let args = Args::parse();
 
+    // Load .env from the working directory before resolving config templates, so
+    // {{ env.* }} references work without manual exporting (parity with the
+    // Docker quickstart's `env_file: .env`). Shell exports take precedence; an
+    // absent .env is not an error.
+    dotenvy::dotenv().ok();
+
     // Initialize logging using shared module
     aura::logging::init_logging(args.debug, args.verbose, "aura_web_server");
 

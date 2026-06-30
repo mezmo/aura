@@ -27,14 +27,15 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use aura::{AgentConfig, OrchestratorFactory, StreamingAgent};
+//! use aura::{RigBuilder, StreamingAgent};
+//! use aura_config::load_config_from_str;
 //!
-//! let config = AgentConfig::from_file("config.toml")?;
-//! let agent: Box<dyn StreamingAgent> = if config.orchestration_enabled() {
-//!     Box::new(OrchestratorFactory::new(config))
-//! } else {
-//!     Box::new(Agent::new(&config).await?)
-//! };
+//! // `RigBuilder` returns an `Orchestrator` (wrapped as `StreamingAgent`) when
+//! // `orchestration.enabled = true`, or a standard `Agent` otherwise.
+//! let config = load_config_from_str(toml_str)?;
+//! let agent: std::sync::Arc<dyn StreamingAgent> = RigBuilder::new(config)
+//!     .build_streaming_agent_with_headers(None, None, None)
+//!     .await?;
 //!
 //! let stream = agent.stream(query, history, cancel_token, "req_123").await?;
 //! ```
@@ -58,6 +59,7 @@ mod types;
 
 pub use config::{
     ArtifactsConfig, OrchestrationConfig, TimeoutsConfig, ToolVisibility, WorkerConfig,
+    build_coordinator_preamble, build_vector_store_context, build_worker_preamble,
 };
 pub use events::{OrchestratorEvent, RoutingMode};
 pub use factory::OrchestratorFactory;
@@ -71,7 +73,6 @@ pub use persistence_wrapper::PersistenceWrapper;
 pub use stream_events::EventContext;
 pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;
-pub use tools::GetConversationContextTool;
 pub use tools::ListPriorRunsTool;
 pub use tools::ReadArtifactTool;
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};

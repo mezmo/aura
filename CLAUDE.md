@@ -34,8 +34,8 @@ CONFIG_PATH=configs/example-math-orchestration.toml AURA_CUSTOM_EVENTS=true carg
 # Build and run CLI (HTTP mode — connects to aura-web-server)
 cargo run -p aura-cli -- --api-url http://localhost:8080
 
-# Build and run CLI (standalone mode — no server needed)
-cargo run -p aura-cli --features standalone-cli -- --standalone --config configs/my-agent.toml
+# Build and run CLI (standalone mode — no server needed, default when --api-url absent)
+cargo run -p aura-cli -- --config configs/my-agent.toml
 
 # Run integration tests (local, requires Docker)
 make test-integration-local                        # base integration
@@ -67,7 +67,7 @@ aura/
 ### Configuration System
 - TOML-based declarative configuration
 - Environment variable resolution (`{{ env.VAR }}`)
-- Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama)
+- Support for multiple LLM providers (OpenAI, Anthropic, Bedrock, Gemini, Ollama, OpenRouter)
 - Dynamic tool registration
 
 ### MCP Integration
@@ -76,11 +76,12 @@ aura/
 - **STDIO Transport**: Tool discovery
 - **Header Forwarding**: `headers_from_request` mappings with static TOML `headers` as fallback
 - **Cancellation**: `notifications/cancelled` propagation on client disconnect
+- **Status reporting**: per-server connection state (`Connected`/`Failed(reason)`/`NotAttempted`) is tracked in `McpManager::server_info` and projected to clients via the `aura.mcp_status` SSE event. Transport/auth failures bubble as errors.
 
 ### Streaming
 - OpenAI-compatible SSE streaming (`/v1/chat/completions`)
 - Custom `aura.*` events (opt-in via `AURA_CUSTOM_EVENTS=true`):
-  - `aura.session_info`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.scratchpad_usage`
+  - `aura.session_info`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.scratchpad_usage`
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 
@@ -88,7 +89,7 @@ aura/
 - Intercepts large MCP tool outputs and saves them to disk instead of filling the context window
 - Eight read-only exploration tools: `head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`
 - Per-tool token thresholds configured via `[mcp.servers.<name>.scratchpad]` TOML sections (`min_tokens`, default `5_120`). Keys are **glob patterns** matched against tool names at interception time; when multiple patterns match the same tool, the longest (most specific) wins, ties broken by smallest threshold
-- Token counting uses **tiktoken-rs** (real BPE tokenization, not heuristics) — `o200k_base` for GPT-5/4o/o-series, `cl100k_base` for older OpenAI models, `o200k_base` fallback for other providers
+- Token counting is provider-aware (real tokenization, not heuristics): **OpenAI** via tiktoken-rs (`o200k_base` for GPT-5/4o/o-series, `cl100k_base` for older models); **Gemini** via the `gemini-tokenizer` crate's embedded Gemma 3 SentencePiece model (exact, fully local); **Anthropic/Bedrock-Claude** via a calibrated `cl100k_base × 1.1` approximation (Claude ships no public tokenizer); `o200k_base` fallback for everything else. Dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); Bedrock routes to the Claude counter only for Claude model ids
 - **Works in both single-agent and orchestration mode**:
   - Single-agent: configure `[agent.scratchpad]` with top-level `memory_dir = "..."` — storage lands under `{memory_dir}/scratchpad/`, budget built from `[agent.llm].context_window`
   - Orchestration: `[agent.scratchpad]` provides defaults, `[orchestration.worker.<name>.scratchpad]` overrides per worker; top-level `memory_dir` also roots orchestration persistence (legacy `[orchestration.artifacts].memory_dir` still works as a fallback)
@@ -96,6 +97,8 @@ aura/
 - Workers never share an "orchestrator-level" budget; budgets are created at `create_worker()` time and live on `Agent.scratchpad_budget`
 - LLM-reported usage feedback (`input_tokens` + `output_tokens`) feeds into the budget as ground truth each turn — orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook's `on_stream_completion_response_finish`
 - Per-call extraction limit (`max_extraction_tokens`, default 10k) prevents single reads from flooding context
+- The scratchpad read tools resolve files anywhere under a per-agent **read root**, not just the scratchpad subdir. Single-agent: read root = the scratchpad dir. Orchestration workers: read root = the session dir, so result artifacts (`{memory_dir}/{session}/{run}/artifacts/`) are explorable **in place** without copying. Writes stay confined to the scratchpad dir (`ScratchpadStorage::with_read_root`)
+- Orchestration `read_artifact` is budget-aware (shares `check_and_record_budget` with the read tools): a result artifact that fits is inlined and recorded against the budget; one that exceeds the limit is returned as a scratchpad pointer (built via the same `build_file_pointer` helper as intercepted MCP output) referencing the artifact in place. The coordinator has no scratchpad, so its `read_artifact` always returns inline content
 - Auto-increased `turn_depth` when scratchpad is active (`turn_depth_bonus`, default 6) — applied in both single-agent and worker contexts
 - `aura.scratchpad_usage` SSE event emitted per-agent with `agent_id`, `tokens_intercepted`, `tokens_extracted` — fires in both single-agent and orchestration contexts (lives in base `aura.*` namespace, not `aura.orchestrator.*`)
 - Storage (orchestration): `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`
@@ -112,8 +115,8 @@ aura/
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
 - **One-shot output contract** (`--query`): stdout is the **raw assistant response only** — no `●` markers, no markdown rendering, no tool-execution summaries, no response-summary header, no `backend.summarize` round-trip. Errors, permission prompts, and warnings go to stderr (with `error:` / `warning:` prefixes, no markers). Exit code 0 ⇒ stdout is the full response; non-zero ⇒ stderr explains and stdout is empty. The REPL retains rich formatting; the strict-output rules apply only to `--query` mode. See `crates/aura-cli/src/oneshot.rs`.
-- **Two backends:** HTTP mode (default) and standalone mode (`--standalone --config`, builds agents in-process)
-- Standalone mode requires `--features standalone-cli` at build time and explicit `--standalone` flag at runtime
+- **Two backends:** standalone mode (default when `--api-url` absent) and HTTP mode (`--api-url`)
+- Standalone mode is enabled by the `standalone-cli` default feature; `--standalone` flag overrides `AURA_API_URL` env var but is mutually exclusive with the `--api-url` flag. HTTP-only builds: `--no-default-features`
 - `--model` works in both modes: HTTP passes it as starting model; standalone matches against agent.name/agent.alias in configs
 - `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for AURA vs OpenAI-compatible service
 - `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
@@ -125,7 +128,7 @@ aura/
 - `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
 - Env vars: `AURA_API_URL`, `AURA_API_KEY`, `AURA_MODEL`, `AURA_EXTRA_HEADERS`, `AURA_LOG_FILE`
 - **Diagnostic logs**: opt-in via `--log-file <path>` / `AURA_LOG_FILE` / `cli.toml` `log_file` (precedence: CLI > env > project > global > none). Events are appended to the file (no rotation — user-managed) in **both REPL and one-shot mode**, so stdout stays a clean pipe. Default filter is `warn,aura=info,aura_cli=info,aura_config=info,rig::agent::prompt_request=info`; override with `RUST_LOG`.
-- **OpenTelemetry (standalone only)**: when built with `--features standalone-cli` and run with `--standalone`, the CLI installs an OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace shape mirrors the web server — `agent.stream` root span via `direct.rs`, with `agent.turn` / `mcp.tool_call` / `orchestration.*` nesting under it. CLI omits the HTTP-infrastructure spans (`chat_completions`, `streaming_completion`) since it has no HTTP layer.
+- **OpenTelemetry (standalone only)**: when running in standalone mode, the CLI installs an OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace shape mirrors the web server — `agent.stream` root span via `direct.rs`, with `agent.turn` / `mcp.tool_call` / `orchestration.*` nesting under it. CLI omits the HTTP-infrastructure spans (`chat_completions`, `streaming_completion`) since it has no HTTP layer.
 - **Single shared tokio runtime**: `main` owns one `tokio::runtime::Runtime` and threads it into `Backend::from_config`, `run_oneshot`, and `run_repl`. `logging::init` runs inside `rt.enter()` so the OTLP gRPC exporter can call `Handle::current()` during `with_tonic()` construction; the `BatchSpanProcessor` worker lives on the same runtime that handles every subsequent request. `main` calls `aura::logging::shutdown_tracer()` via `rt.block_on(...)` before returning to flush buffered spans.
 - SSE event parsing uses shared types from `aura-events` crate (not in `default-members`, build explicitly with `cargo build -p aura-cli`)
 - See `crates/aura-cli/README.md` for full documentation
@@ -141,6 +144,7 @@ aura/
 ```bash
 export OPENAI_API_KEY="your-key"
 export ANTHROPIC_API_KEY="your-key"  # Optional
+export OPENROUTER_API_KEY="your-key" # Optional
 export MEZMO_API_KEY="your-key"       # For Mezmo MCP
 export AWS_PROFILE="your-profile"     # For Knowledge Base
 export AWS_REGION="your-region"       # For Knowledge Base

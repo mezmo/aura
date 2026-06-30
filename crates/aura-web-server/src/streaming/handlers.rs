@@ -134,6 +134,24 @@ where
             callbacks.model_name,
             context_limit
         );
+
+        // Emit aura.mcp_status so clients can distinguish degraded/unavailable and available
+        // MCP servers. Skipped when no servers are configured (single-agent without MCP,
+        // orchestrator).
+        let mcp_servers = callbacks.agent.mcp_server_status();
+        if !mcp_servers.is_empty() {
+            let failed = mcp_servers.iter().filter(|s| s.status == "failed").count();
+            let mcp_status = AuraStreamEvent::mcp_status(mcp_servers, ctx.correlation.clone());
+            if tx
+                .send(Ok(Bytes::from(mcp_status.format_sse())))
+                .await
+                .is_err()
+            {
+                tracing::info!("Client disconnected during mcp_status emit");
+                return StreamTermination::Disconnected;
+            }
+            tracing::debug!("Emitted aura.mcp_status: {} failed server(s)", failed);
+        }
     }
 
     // Safety net timeout
@@ -628,6 +646,22 @@ fn handle_stream_item(
                 agent_ctx,
                 ctx.correlation.clone(),
             );
+            vec![Bytes::from(event.format_sse())]
+        }
+        StreamItem::McpStatus(servers) => {
+            // Orchestration emits this mid-stream once its shared McpManager is
+            // built; the single-agent path emits the same event at stream start.
+            // Gated on custom events to match that path.
+            if !config.emit_custom_events {
+                return vec![];
+            }
+
+            let count = servers.len();
+            let failed = servers.iter().filter(|s| s.status == "failed").count();
+            tracing::debug!(
+                "aura.mcp_status (orchestration): {failed} failed server connections for {count} total servers"
+            );
+            let event = AuraStreamEvent::mcp_status(servers.clone(), ctx.correlation.clone());
             vec![Bytes::from(event.format_sse())]
         }
     }

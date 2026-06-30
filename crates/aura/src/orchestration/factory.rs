@@ -5,7 +5,6 @@
 //! when a request arrives, ensuring MCP progress notifications route correctly
 //! and avoiding duplicate resource allocation.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,7 +12,7 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::AgentConfig;
+use crate::config::AgentRuntimeConfig;
 use crate::provider_agent::{StreamError, StreamItem};
 use crate::streaming::StreamingAgent;
 
@@ -26,11 +25,11 @@ use super::orchestrator::{
 /// Defers `Orchestrator` construction to `stream()` to avoid duplicate resource
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
-    agent_config: AgentConfig,
+    agent_config: AgentRuntimeConfig,
 }
 
 impl OrchestratorFactory {
-    pub fn new(agent_config: AgentConfig) -> Self {
+    pub fn new(agent_config: AgentRuntimeConfig) -> Self {
         Self { agent_config }
     }
 
@@ -51,14 +50,11 @@ impl OrchestratorFactory {
         request_id: String,
         usage_state: crate::UsageState,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
-        let mut agent_config = self.agent_config.clone();
+        let agent_config = self.agent_config.clone();
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel::<Result<StreamItem, StreamError>>(100);
-
-        // Inject conversation history for worker access
-        agent_config.orchestration_chat_history = Some(Arc::new(chat_history.clone()));
 
         let cancel_token_clone = cancel_token.clone();
         // Capture parent span so child spans nest correctly in tracing.
@@ -76,9 +72,16 @@ impl OrchestratorFactory {
                 // are visible to the streaming handler (UsageState is Arc-backed).
                 orchestrator.usage_state = usage_state;
 
-                // Set MCP request ID for progress notification routing
+                // Set MCP request ID for progress notification routing, and
+                // surface per-server connection status so degraded/unavailable
+                // MCP servers are visible in orchestration mode too (workers
+                // share this one manager).
                 if let Some(ref mcp_manager) = orchestrator.mcp_manager {
                     mcp_manager.set_current_request(&request_id).await;
+                    let snapshot = mcp_manager.server_status_snapshot();
+                    if !snapshot.is_empty() {
+                        let _ = event_tx.send(Ok(StreamItem::McpStatus(snapshot))).await;
+                    }
                 }
 
                 // Forward tool call events from workers to SSE stream
