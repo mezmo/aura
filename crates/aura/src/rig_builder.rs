@@ -640,4 +640,78 @@ source = '/nonexistent/path/to/worker/skills'
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
+
+    /// End-to-end proof that `[agent.skills]` config reaches the coordinator's
+    /// inputs. Parses a real TOML config with an agent-level skill source, runs
+    /// the production discovery conversion (`discovered_agent_config` — the same
+    /// path the server/CLI use to build `agent_config`), then calls the *exact*
+    /// functions `Orchestrator::create_coordinator` invokes on
+    /// `agent_config.agent.skills`:
+    ///   - `render_skill_catalog` -> appended to the coordinator preamble
+    ///   - `SkillToolset::new`     -> `load_skill` + `read_skill_file` tools
+    /// A populated catalog and a `Some` toolset prove both the in-preamble skill
+    /// guidance and the skill tools materialize from config for the coordinator.
+    #[test]
+    fn agent_skills_reach_coordinator_inputs() {
+        let _env_lock = SKILLS_ENV_LOCK.lock().unwrap();
+        let skills_dir = tempfile::TempDir::new().unwrap();
+        write_skill(
+            skills_dir.path(),
+            "secret-decoder",
+            "Use when asked for the secret passphrase.",
+        );
+
+        let config_str = format!(
+            r#"
+[agent]
+name = "Orchestrator"
+system_prompt = "You coordinate."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-5.1"
+
+[[agent.skills.local]]
+source = '{}'
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.solver]
+description = "Solves tasks"
+preamble = "You solve."
+"#,
+            skills_dir.path().display()
+        );
+
+        let config = aura_config::Config::parse_toml(&config_str).expect("config should parse");
+        let agent_config = RigBuilder::new(config)
+            .discovered_agent_config()
+            .expect("discovery should succeed");
+
+        // 1. Config -> discovery populated the field create_coordinator reads.
+        assert_eq!(agent_config.agent.skills.len(), 1);
+        assert_eq!(agent_config.agent.skills[0].name, "secret-decoder");
+
+        // 2. The exact catalog create_coordinator appends to its preamble.
+        let catalog = crate::skill_tool::render_skill_catalog(&agent_config.agent.skills)
+            .expect("configured skills must render a catalog");
+        assert!(
+            catalog
+                .contains("Available skills (use the `load_skill` tool to load before answering)"),
+            "coordinator preamble catalog missing the guidance line: {catalog:?}"
+        );
+        assert!(
+            catalog.contains("- secret-decoder: Use when asked for the secret passphrase."),
+            "catalog missing the discovered skill entry: {catalog:?}"
+        );
+
+        // 3. The exact toolset create_coordinator attaches: `Some` means both
+        //    load_skill and read_skill_file were built from the same skills.
+        assert!(
+            crate::skill_tool::SkillToolset::new(&agent_config.agent.skills).is_some(),
+            "configured skills must yield a coordinator skill toolset"
+        );
+    }
 }
