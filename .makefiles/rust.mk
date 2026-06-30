@@ -106,6 +106,8 @@ build-release-binary-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Cross-compile release b
 	$(RUN) bash -c "\
 		rustup target add aarch64-unknown-linux-gnu 2>/dev/null; \
 		export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
+		export CC_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-gcc; \
+		export CXX_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-g++; \
 		export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
 		export PKG_CONFIG_ALLOW_CROSS=1; \
 		cargo build --release --target aarch64-unknown-linux-gnu --bin aura-web-server && \
