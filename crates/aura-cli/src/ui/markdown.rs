@@ -76,20 +76,11 @@ pub fn render_markdown(text: &str) {
     }
 }
 
-/// Available text columns for a wrapped summary line: terminal width minus the
-/// "● "/"  " 2-column gutter and the right margin (at least 1).
 fn summary_text_width(term_w: usize) -> usize {
     term_w.saturating_sub(INDENT.len() + RIGHT_MARGIN).max(1)
 }
 
-/// Print the assistant summary headline: a colored "● " marker followed by the
-/// summary in bold, word-wrapped to the terminal width so it never breaks
-/// mid-word. Continuation lines use a 2-space hanging indent so they align
-/// under the headline text (matching the markdown body's indent). A
-/// [`RIGHT_MARGIN`] column is reserved on the right.
-///
-/// The marker and indent are both 2 columns wide, so every line shares the
-/// same available text width.
+/// Print the assistant summary headline, word-wrapped to terminal width.
 pub fn render_summary(summary: &str) {
     use crate::ui::state::random_bullet_color;
     use crate::ui::wrap::wrap_plain;

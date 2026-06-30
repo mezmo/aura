@@ -343,9 +343,8 @@ pub fn is_processing() -> bool {
     PROCESSING.load(Ordering::Relaxed)
 }
 
-/// Whether the REPL is currently blocked in `readline()` waiting for input
-/// (i.e. idle at the prompt). The resize watcher only redraws the frame while
-/// this is true, so it never interleaves with mid-turn output or streaming.
+/// Whether the REPL is idle in `readline()`. Gates the resize watcher so it
+/// doesn't repaint mid-turn.
 pub(crate) static READLINE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Mark whether the REPL is blocked in `readline()` (idle at the prompt).

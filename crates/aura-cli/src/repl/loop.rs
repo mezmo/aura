@@ -42,30 +42,11 @@ use crate::ui::prompt::{
 };
 use crate::ui::welcome::WelcomeState;
 
-/// Event-driven watcher that repaints the frame after a terminal resize while
-/// the REPL is idle in `readline()`.
+/// Repaints the frame after a terminal resize while idle at the prompt.
 ///
-/// rustyline wakes on SIGWINCH but only repaints its own input line, and only
-/// when that line is long enough to need it — so at an idle/short prompt the
-/// frame borders and status row stay drawn at the old width until the next
-/// keystroke. We get our own SIGWINCH notification by blocking on a
-/// `signal_hook` `Signals` stream (no polling): because rustyline is built with
-/// its `signal-hook` feature, it registers SIGWINCH via signal_hook's chaining
-/// pipe, so our consumer fires on the same signal even while readline is
-/// blocked.
-///
-/// On each resize we rebuild the status bar at the new width then do a full,
-/// absolute repaint: clear the screen + replay the conversation + redraw the
-/// frame (the same primitive `/style` uses), wrapped in a synchronized update
-/// so it doesn't flicker. We deliberately avoid the incremental
-/// `handle_resize_frame` used by the keystroke path: it relies on
-/// `SavePosition`/`RestorePosition`, and when a resize reflow scrolls the
-/// screen the saved absolute row is stale, so the frame drifts (ending up near
-/// the top with cumulative scroll). The absolute clear+replay can't drift, and
-/// for an idle single-line prompt rustyline's forced refresh re-anchors to the
-/// cursor we leave at the input line. We only act while idle in `readline()`
-/// with no request processing, so it never interleaves with mid-turn output or
-/// the streaming animation (which has its own resize handling).
+/// Uses an absolute clear+replay+redraw rather than the incremental
+/// resize path, which drifts when a reflow scrolls the screen (the
+/// saved cursor position becomes stale).
 struct ResizeWatcher {
     handle: signal_hook::iterator::Handle,
     join: Option<std::thread::JoinHandle<()>>,
