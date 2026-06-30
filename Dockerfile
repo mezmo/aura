@@ -6,7 +6,7 @@ FROM rust:1.95 AS core
 # (pulled in via gemini-tokenizer) builds its C++ library with cmake, so cmake
 # and a C++ compiler are required on top of the base C toolchain.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ \
+    cmake g++ g++-aarch64-linux-gnu \
   && rm -rf /var/lib/apt/lists/*
 
 ### 001 Runner
@@ -22,7 +22,7 @@ RUN <<EOR
   dpkg --add-architecture arm64
   apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 curl nodejs npm \
-    gcc-aarch64-linux-gnu libc6-dev-arm64-cross libssl-dev:arm64
+    libc6-dev-arm64-cross libssl-dev:arm64
   rm -rf /var/lib/apt/lists/*
 EOR
 
