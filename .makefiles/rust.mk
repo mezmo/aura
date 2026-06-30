@@ -55,8 +55,11 @@ lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
 
 .PHONY: check-release
-check-release: $(DOCKER_ENV) ## Verify release-mode compilation (catches cmake / native build issues)
+check-release: $(DOCKER_ENV) ## Verify release-mode compilation for amd64 and arm64
 	$(RUN) cargo check --release --workspace
+	$(RUN) bash -c "rustup target add aarch64-unknown-linux-gnu 2>/dev/null; \
+		export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
+		cargo check --release --target aarch64-unknown-linux-gnu --workspace"
 
 .PHONY: check-cli-http-only
 check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features) aura-cli still builds
