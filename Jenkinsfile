@@ -171,6 +171,12 @@ pipeline {
             }
           }
         }
+
+        stage("Release Check") {
+          steps {
+            withReport('Release Check', 'make check-release')
+          }
+        }
       } // End Parallel
     } // End Validate
 
