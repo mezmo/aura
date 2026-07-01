@@ -1,25 +1,25 @@
 # Human-in-the-loop approval gates
 
-Human-in-the-loop (HITL) approval gates let an orchestration worker ask for
-permission before running selected MCP tools. Use them for operations that need
-a human decision before execution, such as production changes or destructive
-actions.
+Human-in-the-loop (HITL) approval gates let an agent ask for permission before
+running selected MCP tools. They compose in both single-agent and orchestration
+mode. Use them for operations that need a human decision before execution, such
+as production changes or destructive actions.
 
 Current behavior:
 
-- Webhook routing works for unattended orchestration-worker approvals.
-- Conversational routing works for attended orchestration-worker approvals over
-  an open SSE stream. The AURA CLI in HTTP mode is the first attended client.
-- Matching worker tool calls are blocked until the configured route approves
-  them.
-- Human denials are returned to the model as normal tool feedback, so the worker
+- Gates compose in both single-agent mode and for orchestration workers. A
+  single-agent run reports `scope.kind = "single"`; an orchestration worker
+  reports `scope.kind = "worker"`.
+- Webhook routing works for unattended approvals.
+- Conversational routing works for attended approvals over an open SSE stream.
+  The AURA CLI in HTTP mode is the first attended client.
+- Matching tool calls are blocked until the configured route approves them.
+- Human denials are returned to the model as normal tool feedback, so the agent
   can explain the denial without treating it as a transport failure.
 - Timeouts, cancellation, and webhook channel failures still fail closed as tool
   errors.
 - Conversational HITL requires `stream=true`; non-streaming requests are
   rejected because approval prompts are delivered over SSE.
-- Single-agent config gates are not composed in this phase. HITL gates are for
-  orchestration workers.
 - Approval lifecycle events emit on streaming responses. Webhook emits
   `aura.approval_requested` and `aura.approval_completed`; conversational also
   emits `aura.approval_pending` while the tool call is parked.
@@ -153,9 +153,9 @@ Fields:
 | `version` | Approval webhook protocol version. |
 | `decision_id` | Unique id for this approval decision. |
 | `request_id` | Aura request id for the chat completion. |
-| `scope` | Agent surface asking for approval. Phase 1 emits worker scope for orchestration gates. |
-| `origin` | Why approval was requested. Config gates use `kind = "config_gate"` with the matched glob. |
-| `items` | Tool call payloads awaiting approval. Phase 1 sends one item per request. |
+| `scope` | Which agent surface is asking, independent of why. `kind = "single"` for a single-agent run or `kind = "worker"` for an orchestration worker. Both HITL origins carry a scope. |
+| `origin` | Why approval was requested. `kind = "config_gate"` (a configured glob matched the tool call, carries the matched glob) or `kind = "agent_requested"` (the agent called `request_approval`, carries the reason). |
+| `items` | Tool call payloads awaiting approval. One item per request. |
 
 ## Webhook response
 
