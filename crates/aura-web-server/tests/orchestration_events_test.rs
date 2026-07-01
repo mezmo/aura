@@ -263,17 +263,17 @@ async fn test_arithmetic_emits_tool_call_events() {
 
 /// Verifies that on-demand skill use surfaces over SSE in orchestration.
 ///
-/// The query cues the orbit-code skill, whose clearance code lives only inside
-/// the skill body, so answering requires load_skill. The coordinator and workers
-/// inherit `[agent.skills]`, so the call surfaces as a `tool_call_started` with
-/// tool_name "load_skill" from whichever role loads it.
+/// The query cues the aura-hidden-value skill, whose hidden value lives only
+/// inside the skill body, so answering requires load_skill. The coordinator and
+/// workers inherit `[agent.skills]`, so the call surfaces as a
+/// `tool_call_started` with tool_name "load_skill" from whichever role loads it.
 ///
 /// LENIENCY: a model may answer from the catalog description without loading;
 /// like the other tool tests, that path is tolerated with a note.
 #[tokio::test]
 async fn test_skill_use_emits_load_skill_event() {
     let events = orchestration_events(
-        "Load the orbit-code skill and report the orbit clearance code it contains.",
+        "Load the aura-hidden-value skill and report the Aura hidden integration test value it contains.",
     )
     .await;
 

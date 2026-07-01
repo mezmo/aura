@@ -366,8 +366,8 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 | `aura.orchestrator.iteration_complete` | Iteration finished with replan decision and reasoning |
 | `aura.orchestrator.replan_started` | Replan cycle triggered (coordinator-routed or task failures) |
 | `aura.orchestrator.synthesizing` | Coordinator merging worker results (includes iteration number) |
-| `aura.orchestrator.tool_call_started` | Tool execution began within a worker task |
-| `aura.orchestrator.tool_call_completed` | Tool execution finished within a worker task |
+| `aura.orchestrator.tool_call_started` | A tool call began (coordinator or worker); see the tool-coverage note below |
+| `aura.orchestrator.tool_call_completed` | The matching tool call finished (duration, success) |
 
 ### Orchestration Event Flow
 
@@ -384,7 +384,7 @@ flowchart TD
 
     B --> C["task_started<br/>Worker assigned (task_id, worker_id, orchestrator_id)"]
     C --> D["worker_reasoning<br/>Worker thinking (task_id, worker_id, content)"]
-    D --> E["tool_call_started<br/>Worker calls MCP tool (tool_call_id, tool_name, worker_id)"]
+    D --> E["tool_call_started<br/>Worker calls a tool: MCP, skill, or operation (tool_call_id, tool_name, worker_id)"]
     E --> F["tool_call_completed<br/>Tool result (duration_ms, success)"]
     F --> G["task_completed<br/>Worker finished (duration_ms, success, result)"]
     G --> H["synthesizing<br/>Coordinator merging results (iteration)"]
@@ -492,7 +492,7 @@ data:
 
 Note: requires both `AURA_CUSTOM_EVENTS=true` and `AURA_EMIT_REASONING=true`. Worker reasoning is also emitted as `aura.reasoning` with `agent_id` set to the worker name (e.g., `"arithmetic"`) and `parent_agent_id: "coordinator"` for backward-compatible aggregation.
 
-**Tool call started** (worker calls an MCP tool):
+**Tool call started** (coordinator or worker calls a tool):
 ```
 event: aura.orchestrator.tool_call_started
 data:
@@ -511,7 +511,7 @@ data:
 
 Note: `task_id` is omitted if it could not be determined. `arguments` is omitted when not available.
 
-**Tool call completed** (tool execution finished within a worker task):
+**Tool call completed** (the matching tool call finished):
 ```
 event: aura.orchestrator.tool_call_completed
 data:
@@ -529,6 +529,8 @@ data:
 ```
 
 Note: `task_id` is omitted if it could not be determined. `result` is truncated per `TOOL_RESULT_MAX_LENGTH` and omitted when empty.
+
+**Tool coverage:** these events fire for the coordinator (`worker_id: "main"`) as well as workers. They cover MCP tools, the skill tools (`load_skill`, `read_skill_file`), and orchestration operations (`read_artifact`, `submit_result`, `list_prior_runs`). Scratchpad exploration tools are suppressed by default and emit only when `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` is set.
 
 **Task completed** (worker finished with result):
 ```

@@ -123,7 +123,6 @@ EXPOSE 3030
 ENV HOST=0.0.0.0
 ENV PORT=3030
 ENV CONFIG_PATH=/app/config/config.toml
-ENV AURA_SKILLS_DIR=/app/skills
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
