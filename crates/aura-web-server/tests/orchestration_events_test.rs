@@ -261,6 +261,59 @@ async fn test_arithmetic_emits_tool_call_events() {
     }
 }
 
+/// Verifies that on-demand skill use surfaces over SSE in orchestration.
+///
+/// The query cues the orbit-code skill, whose clearance code lives only inside
+/// the skill body, so answering requires load_skill. The coordinator and workers
+/// inherit `[agent.skills]`, so the call surfaces as a `tool_call_started` with
+/// tool_name "load_skill" from whichever role loads it.
+///
+/// LENIENCY: a model may answer from the catalog description without loading;
+/// like the other tool tests, that path is tolerated with a note.
+#[tokio::test]
+async fn test_skill_use_emits_load_skill_event() {
+    let events = orchestration_events(
+        "Load the orbit-code skill and report the orbit clearance code it contains.",
+    )
+    .await;
+
+    let load_skill_started: Vec<&SseEvent> =
+        events_by_type(&events, event_names::TOOL_CALL_STARTED)
+            .into_iter()
+            .filter(|e| {
+                serde_json::from_str::<Value>(&e.data)
+                    .ok()
+                    .and_then(|j| j["tool_name"].as_str().map(|n| n == "load_skill"))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+    if load_skill_started.is_empty() {
+        println!("Note: no load_skill event; the model may have answered from the catalog.");
+        assert_any_routing_event(&events);
+        return;
+    }
+
+    let completed = events_by_type(&events, event_names::TOOL_CALL_COMPLETED);
+    for started in &load_skill_started {
+        assert_event_fields(started, &["tool_call_id", "tool_name", "worker_id"]);
+        let tool_call_id = serde_json::from_str::<Value>(&started.data).unwrap()["tool_call_id"]
+            .as_str()
+            .expect("load_skill tool_call_started missing tool_call_id")
+            .to_string();
+        let matched = completed.iter().any(|e| {
+            serde_json::from_str::<Value>(&e.data)
+                .ok()
+                .and_then(|j| j["tool_call_id"].as_str().map(|id| id == tool_call_id))
+                .unwrap_or(false)
+        });
+        assert!(
+            matched,
+            "load_skill {tool_call_id} started but never completed"
+        );
+    }
+}
+
 /// Verifies that multi-worker execution emits iteration_complete plus a
 /// terminal routing event from the post-execute continuation coordinator.
 ///
