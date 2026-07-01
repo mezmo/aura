@@ -1680,19 +1680,33 @@ pub fn is_scratchpad_tool(tool_name: &str) -> bool {
     SCRATCHPAD_TOOL_NAME_SET.contains(tool_name)
 }
 
-/// Orchestration-internal tool names that are not MCP tools and therefore
-/// not covered by `ObserverWrapper`. Used alongside `is_scratchpad_tool`
-/// to gate event emission in `stream_and_forward`.
-static ORCHESTRATION_INTERNAL_TOOLS: &[&str] =
+/// Orchestration operations exposed as non-MCP tools: reading a prior task
+/// result, submitting an answer, listing prior runs. Unlike the scratchpad
+/// exploration tools, these carry task meaning, so their calls surface over SSE
+/// unconditionally.
+static ALWAYS_VISIBLE_INTERNAL_TOOLS: &[&str] =
     &["read_artifact", "submit_result", "list_prior_runs"];
 
-/// True for any tool that is NOT an MCP tool — scratchpad exploration tools
-/// and orchestration-internal tools. These are not wrapped by
-/// `ObserverWrapper` and need explicit event forwarding in
-/// `stream_and_forward` when `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` is enabled.
-pub fn is_internal_tool(tool_name: &str) -> bool {
-    SCRATCHPAD_TOOL_NAME_SET.contains(tool_name)
-        || ORCHESTRATION_INTERNAL_TOOLS.contains(&tool_name)
+/// True for a non-MCP tool whose calls always surface over SSE: the orchestration
+/// operations above plus the skill tools. The worker `ObserverWrapper` covers only
+/// MCP tools, so the orchestration streaming loops forward these explicitly.
+pub fn is_always_visible_internal_tool(tool_name: &str) -> bool {
+    ALWAYS_VISIBLE_INTERNAL_TOOLS.contains(&tool_name)
+        || crate::skill_tool::is_skill_tool(tool_name)
+}
+
+/// Whether the orchestration streaming loops should forward an SSE tool event for
+/// `tool_name`. Two kinds of non-MCP tool need explicit forwarding (MCP tools go
+/// through `ObserverWrapper` instead):
+///
+/// - always-visible internal tools (skills + orchestration operations): forwarded
+///   unconditionally, matching how single-agent surfaces the same calls;
+/// - scratchpad exploration tools: forwarded only when `emit_scratchpad_events`
+///   (`AURA_EMIT_SCRATCHPAD_TOOL_EVENTS`) is set, since they are high-volume debug
+///   output kept off by default.
+pub fn should_forward_tool_event(tool_name: &str, emit_scratchpad_events: bool) -> bool {
+    is_always_visible_internal_tool(tool_name)
+        || (emit_scratchpad_events && is_scratchpad_tool(tool_name))
 }
 
 /// Cached `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` flag, parsed via the canonical
@@ -2699,5 +2713,31 @@ mod tests {
                 "is_scratchpad_tool must NOT match '{name}'"
             );
         }
+    }
+
+    #[test]
+    fn test_should_forward_tool_event_categories() {
+        // Skills and orchestration operations forward regardless of the flag.
+        for name in [
+            "load_skill",
+            "read_skill_file",
+            "read_artifact",
+            "submit_result",
+        ] {
+            assert!(
+                should_forward_tool_event(name, false),
+                "{name} always forwards"
+            );
+            assert!(
+                should_forward_tool_event(name, true),
+                "{name} always forwards"
+            );
+        }
+        // Scratchpad exploration tools forward only when the flag is on.
+        assert!(!should_forward_tool_event("grep", false));
+        assert!(should_forward_tool_event("grep", true));
+        // MCP tools are covered by ObserverWrapper, never forwarded here.
+        assert!(!should_forward_tool_event("some_mcp_tool", false));
+        assert!(!should_forward_tool_event("some_mcp_tool", true));
     }
 }

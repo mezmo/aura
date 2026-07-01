@@ -26,6 +26,20 @@ const SKILL_SIZE_WARN_THRESHOLD: usize = 524_288; // 512 KB
 /// Resource subdirectories defined by the Agent Skills specification.
 const RESOURCE_DIRS: [&str; 3] = ["references", "scripts", "assets"];
 
+/// Tool name for the on-demand skill loader.
+pub const LOAD_SKILL_TOOL_NAME: &str = "load_skill";
+/// Tool name for the skill resource-file reader.
+pub const READ_SKILL_FILE_TOOL_NAME: &str = "read_skill_file";
+
+/// True when `tool_name` is one of the skill tools.
+///
+/// Skills are ordinary Rig tools, not MCP tools, so the orchestration worker's
+/// `ObserverWrapper` does not cover them; the streaming loops use this to forward
+/// skill-tool calls over SSE explicitly.
+pub fn is_skill_tool(tool_name: &str) -> bool {
+    tool_name == LOAD_SKILL_TOOL_NAME || tool_name == READ_SKILL_FILE_TOOL_NAME
+}
+
 /// Tool that loads skill content on demand from disk.
 ///
 /// The LLM sees a catalog of available skills in the tool description
@@ -205,7 +219,7 @@ pub struct ReadSkillFileArgs {
 }
 
 impl Tool for ReadSkillFileTool {
-    const NAME: &'static str = "read_skill_file";
+    const NAME: &'static str = READ_SKILL_FILE_TOOL_NAME;
     type Error = SkillError;
     type Args = ReadSkillFileArgs;
     type Output = String;
@@ -307,7 +321,7 @@ impl LoadSkillTool {
 }
 
 impl Tool for LoadSkillTool {
-    const NAME: &'static str = "load_skill";
+    const NAME: &'static str = LOAD_SKILL_TOOL_NAME;
     type Error = SkillError;
     type Args = LoadSkillArgs;
     type Output = String;
@@ -736,5 +750,16 @@ mod tests {
     #[test]
     fn test_skill_toolset_empty() {
         assert!(SkillToolset::new(&[]).is_none());
+    }
+
+    #[test]
+    fn test_is_skill_tool() {
+        assert!(is_skill_tool(LOAD_SKILL_TOOL_NAME));
+        assert!(is_skill_tool(READ_SKILL_FILE_TOOL_NAME));
+        assert!(is_skill_tool(<LoadSkillTool as Tool>::NAME));
+        assert!(is_skill_tool(<ReadSkillFileTool as Tool>::NAME));
+        assert!(!is_skill_tool("read_artifact"));
+        assert!(!is_skill_tool("grep"));
+        assert!(!is_skill_tool("some_mcp_tool"));
     }
 }

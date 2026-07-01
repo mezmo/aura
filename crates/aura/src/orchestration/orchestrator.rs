@@ -255,6 +255,69 @@ fn tool_event_to_orchestrator_event(
     }
 }
 
+/// Forward a `ToolCallStarted` event for a non-MCP tool the worker
+/// `ObserverWrapper` does not cover: skills, orchestration operations, and
+/// scratchpad tools when enabled (see [`scratchpad::should_forward_tool_event`]).
+/// Records the start instant so the completion can report a duration. No-op
+/// without an event channel. Used by both `stream_and_forward` (workers) and
+/// `stream_and_collect` (coordinator) so skill use surfaces in both roles.
+async fn forward_internal_tool_started(
+    event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    task_id: Option<usize>,
+    worker_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    raw_arguments: &str,
+    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+) {
+    let Some(tx) = event_tx else { return };
+    let tool_call_id = tool_call_id.to_string();
+    starts.insert(tool_call_id.clone(), std::time::Instant::now());
+    let arguments = serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let _ = tx
+        .send(Ok(StreamItem::OrchestratorEvent(
+            OrchestratorEvent::ToolCallStarted {
+                task_id,
+                tool_call_id,
+                tool_name: tool_name.to_string(),
+                worker_id: worker_id.to_string(),
+                arguments,
+            },
+        )))
+        .await;
+}
+
+/// Companion to [`forward_internal_tool_started`]. No-op unless a prior start
+/// tracked this call, so it is safe to invoke on every tool result: MCP results
+/// (tracked by `ObserverWrapper`, not here) are left untouched.
+async fn forward_internal_tool_completed(
+    event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    task_id: Option<usize>,
+    tool_call_id: &str,
+    result: &str,
+    starts: &mut std::collections::HashMap<String, std::time::Instant>,
+) {
+    let Some(start) = starts.remove(tool_call_id) else {
+        return;
+    };
+    let Some(tx) = event_tx else { return };
+    let success = matches!(
+        crate::tool_error_detection::detect_tool_error(result),
+        crate::tool_error_detection::ToolResultStatus::Success
+    );
+    let _ = tx
+        .send(Ok(StreamItem::OrchestratorEvent(
+            OrchestratorEvent::ToolCallCompleted {
+                task_id,
+                tool_call_id: tool_call_id.to_string(),
+                success,
+                duration_ms: start.elapsed().as_millis() as u64,
+                result: result.to_string(),
+            },
+        )))
+        .await;
+}
+
 /// Spawn a task that forwards tool call events to the SSE stream.
 ///
 /// Listens on the observer's broadcast channel and converts `ToolEvent`s
@@ -855,7 +918,6 @@ impl Orchestrator {
         use crate::provider_agent::{
             CompletionResponse, StreamedAssistantContent, StreamedUserContent,
         };
-        use crate::tool_error_detection::{ToolResultStatus, detect_tool_error};
         use futures::StreamExt;
         use rig::completion::Usage;
         use std::collections::HashMap;
@@ -876,13 +938,12 @@ impl Orchestrator {
                 output_tokens: 0,
                 total_tokens: 0,
             };
-            // Track scratchpad-tool start times so the matching ToolResult
-            // can compute a duration. Membership also gates the ToolResult
-            // branch — only IDs we emitted a `ToolCallStarted` for are
-            // forwarded as `ToolCallCompleted`, preventing accidental
-            // double-emission for MCP tools (which the ObserverWrapper
-            // already covers).
-            let mut scratchpad_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
+            // Start times for tools forwarded manually here (skills, orchestration
+            // operations, and scratchpad tools when enabled) so the matching
+            // ToolResult can report a duration. Membership also gates completion:
+            // only IDs we started get completed, so MCP tools (covered by
+            // ObserverWrapper) are never double-emitted.
+            let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -919,65 +980,31 @@ impl Orchestrator {
                         // Final reasoning block — already forwarded as deltas above.
                         // Skip to avoid double-emission.
                     }
-                    // Debug toggle: when `AURA_EMIT_SCRATCHPAD_TOOL_EVENTS` is on,
-                    // forward scratchpad exploration tool calls as
-                    // `OrchestratorEvent::ToolCallStarted` so they surface in
-                    // `aura.orchestrator.tool_call_started`. MCP tools are
-                    // intentionally NOT forwarded here — the orchestrator's
-                    // `ObserverWrapper` already covers them via the observer
-                    // broadcast channel, and forwarding them again would
-                    // double-emit.
+                    // Forward calls to the non-MCP tools ObserverWrapper does not
+                    // cover: skills and orchestration operations always, scratchpad
+                    // tools only when the debug flag is on. The matching completion
+                    // is emitted from the ToolResult arm below.
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
                         ref tc,
-                    ))) if emit_scratchpad_events && scratchpad::is_internal_tool(&tc.name) => {
-                        if let Some(tx) = event_tx {
-                            scratchpad_tool_starts.insert(tc.id.clone(), std::time::Instant::now());
-                            let arguments: serde_json::Value = serde_json::from_str(&tc.arguments)
-                                .unwrap_or(serde_json::json!({}));
-                            let (task_id, worker_id) = match stream_context.as_ref() {
-                                Some(w) => (Some(w.task_id), w.worker_id.to_string()),
-                                None => (None, "main".to_string()),
-                            };
-                            let _ = tx
-                                .send(Ok(StreamItem::OrchestratorEvent(
-                                    OrchestratorEvent::ToolCallStarted {
-                                        task_id,
-                                        tool_call_id: tc.id.clone(),
-                                        tool_name: tc.name.clone(),
-                                        worker_id,
-                                        arguments,
-                                    },
-                                )))
-                                .await;
-                        }
-                    }
-                    // Companion to the ToolCall branch above. Membership in
-                    // `scratchpad_tool_starts` gates emission so MCP results
-                    // (already covered by `ObserverWrapper`) don't duplicate.
-                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr)))
-                        if emit_scratchpad_events
-                            && scratchpad_tool_starts.contains_key(&tr.id) =>
+                    ))) if scratchpad::should_forward_tool_event(
+                        &tc.name,
+                        emit_scratchpad_events,
+                    ) =>
                     {
-                        if let Some(tx) = event_tx {
-                            let duration_ms = scratchpad_tool_starts
-                                .remove(&tr.id)
-                                .map(|start| start.elapsed().as_millis() as u64)
-                                .unwrap_or(0);
-                            let task_id = stream_context.as_ref().map(|w| w.task_id);
-                            let success =
-                                matches!(detect_tool_error(&tr.result), ToolResultStatus::Success);
-                            let _ = tx
-                                .send(Ok(StreamItem::OrchestratorEvent(
-                                    OrchestratorEvent::ToolCallCompleted {
-                                        task_id,
-                                        tool_call_id: tr.id.clone(),
-                                        success,
-                                        duration_ms,
-                                        result: tr.result.clone(),
-                                    },
-                                )))
-                                .await;
-                        }
+                        let (task_id, worker_id) = match stream_context.as_ref() {
+                            Some(w) => (Some(w.task_id), w.worker_id),
+                            None => (None, "main"),
+                        };
+                        forward_internal_tool_started(
+                            event_tx,
+                            task_id,
+                            worker_id,
+                            &tc.id,
+                            &tc.name,
+                            &tc.arguments,
+                            &mut internal_tool_starts,
+                        )
+                        .await;
                     }
                     Ok(StreamItem::Final(info)) => {
                         content = info.content;
@@ -999,6 +1026,17 @@ impl Orchestrator {
                     }
                     Err(e) => return Err(e),
                     Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                        // No-op unless a start was tracked above; emitting here (not
+                        // in a dedicated arm) keeps the decision short-circuit intact
+                        // for tools like submit_result.
+                        forward_internal_tool_completed(
+                            event_tx,
+                            stream_context.as_ref().map(|w| w.task_id),
+                            &tr.id,
+                            &tr.result,
+                            &mut internal_tool_starts,
+                        )
+                        .await;
                         tracing::debug!(
                             "{}: tool result received (id={}, call_id={})",
                             phase,
@@ -1069,6 +1107,7 @@ impl Orchestrator {
         };
         use futures::StreamExt;
         use rig::completion::Usage;
+        use std::collections::HashMap;
 
         let StreamCallParams {
             prompt,
@@ -1077,6 +1116,7 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
+        let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
             let mut stream = agent
                 .stream_chat_with_depth(prompt, history, agent.max_depth)
@@ -1087,6 +1127,10 @@ impl Orchestrator {
                 output_tokens: 0,
                 total_tokens: 0,
             };
+            // The coordinator is not ObserverWrapped, so forward the same non-MCP
+            // tool calls a worker does (skills, orchestration operations), attributed
+            // to the main agent.
+            let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1113,8 +1157,36 @@ impl Orchestrator {
                                 .await;
                         }
                     }
+                    // Forward non-MCP tool calls (skills, orchestration operations)
+                    // so coordinator skill use surfaces over SSE like a worker's.
+                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
+                        ref tc,
+                    ))) if scratchpad::should_forward_tool_event(
+                        &tc.name,
+                        emit_scratchpad_events,
+                    ) =>
+                    {
+                        forward_internal_tool_started(
+                            event_tx,
+                            None,
+                            "main",
+                            &tc.id,
+                            &tc.name,
+                            &tc.arguments,
+                            &mut internal_tool_starts,
+                        )
+                        .await;
+                    }
                     // Tool result — check decision, short-circuit (fixes ReAct loop waste)
                     Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                        forward_internal_tool_completed(
+                            event_tx,
+                            None,
+                            &tr.id,
+                            &tr.result,
+                            &mut internal_tool_starts,
+                        )
+                        .await;
                         tracing::debug!(
                             "{}: tool result received (id={}, call_id={})",
                             phase,
@@ -1160,7 +1232,7 @@ impl Orchestrator {
                         return Err(format!("{}: {}", phase, e).into());
                     }
                     Err(e) => return Err(e),
-                    _ => {} // ToolCall, ToolCallDelta — rig handles execution
+                    _ => {} // ToolCall (non-forwarded), ToolCallDelta — rig handles execution
                 }
             }
             Ok(CompletionResponse { content, usage })
