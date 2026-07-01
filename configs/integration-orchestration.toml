@@ -21,6 +21,11 @@ api_key = "{{ env.OPENAI_API_KEY }}"
 model = "gpt-5.1"
 temperature = 0.3
 
+# Exercises on-demand skills in orchestration: the coordinator and workers
+# inherit this source, so a skill query surfaces load_skill over SSE.
+[[agent.skills.local]]
+source = "./skills"
+
 [mcp]
 sanitize_schemas = true
 
