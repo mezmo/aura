@@ -1164,6 +1164,7 @@ mod tests {
             aura_emit_reasoning: false,
             streaming_timeout_secs: 0,
             first_chunk_timeout_secs: 0,
+            config_dir: std::path::PathBuf::from("."),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
