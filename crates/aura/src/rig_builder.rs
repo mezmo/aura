@@ -649,6 +649,7 @@ source = '/nonexistent/path/to/worker/skills'
     /// `agent_config.agent.skills`:
     ///   - `render_skill_catalog` -> appended to the coordinator preamble
     ///   - `SkillToolset::new`     -> `load_skill` + `read_skill_file` tools
+    ///
     /// A populated catalog and a `Some` toolset prove both the in-preamble skill
     /// guidance and the skill tools materialize from config for the coordinator.
     #[test]
