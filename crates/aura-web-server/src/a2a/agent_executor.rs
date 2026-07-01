@@ -146,7 +146,6 @@ impl AgentExecutor for AuraAgentExecutor {
                 }));
             }
         };
-        let config_dir = self.app_state.config_dir.clone();
         let stream_shutdown_token = self.app_state.stream_shutdown_token.clone();
         let task_cancel_state = self.task_cancel_state.clone();
         let active_request_tracker = self.app_state.active_requests.clone();
@@ -180,7 +179,7 @@ impl AgentExecutor for AuraAgentExecutor {
             }));
 
             let session_id = Some(context_id.clone());
-            let builder = RigBuilder::new(config).with_config_dir(config_dir);
+            let builder = RigBuilder::new(config);
             let agent = match builder
                 .build_streaming_agent_with_headers(Some(&req_headers), session_id, None)
                 .await
@@ -651,7 +650,6 @@ mod tests {
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(ActiveRequestTracker::default()),
             additional_tools: Arc::new(Vec::new),
-            config_dir: std::path::PathBuf::from("."),
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }

@@ -3,13 +3,13 @@
 //! Skills follow the Agent Skills specification
 //! (<https://agentskills.io/specification>): each skill is a directory
 //! containing a `SKILL.md` file with YAML frontmatter. Discovery validates
-//! names against the spec and resolves relative sources against the config
-//! file's directory.
+//! names against the spec and resolves relative sources against the process
+//! current working directory.
 
 use crate::ConfigError;
 use crate::config::{LocalSkillSource, SkillConfig};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// YAML frontmatter parsed from SKILL.md files.
 ///
@@ -164,30 +164,15 @@ fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter, ConfigErro
 ///
 /// Scans each source directory for subdirectories containing a `SKILL.md` file.
 /// The `name` field in frontmatter must match the directory name (per the spec).
-pub fn discover_skills(
-    sources: &[LocalSkillSource],
-    config_dir: Option<&Path>,
-) -> Result<Vec<SkillConfig>, ConfigError> {
+pub fn discover_skills(sources: &[LocalSkillSource]) -> Result<Vec<SkillConfig>, ConfigError> {
     let mut skills = Vec::new();
 
     for source in sources {
         let source_path = &source.source;
-        let resolved = if source_path.is_absolute() {
-            source_path.clone()
-        } else if let Some(base) = config_dir {
-            base.join(source_path)
-        } else {
-            std::env::current_dir()
-                .map_err(|e| {
-                    ConfigError::Validation(format!("Cannot resolve relative skill path: {e}"))
-                })?
-                .join(source_path)
-        };
-
-        let resolved = resolved.canonicalize().map_err(|e| {
+        let resolved = source_path.canonicalize().map_err(|e| {
             ConfigError::Validation(format!(
                 "Skill source directory '{}' not found: {e}",
-                resolved.display()
+                source_path.display()
             ))
         })?;
 
@@ -447,7 +432,7 @@ allowed-tools: Bash(git:*) Read
         let sources = vec![LocalSkillSource {
             source: dir.path().to_path_buf(),
         }];
-        let skills = discover_skills(&sources, None).unwrap();
+        let skills = discover_skills(&sources).unwrap();
 
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].name, "alpha");
@@ -464,7 +449,7 @@ allowed-tools: Bash(git:*) Read
         let sources = vec![LocalSkillSource {
             source: dir.path().to_path_buf(),
         }];
-        let skills = discover_skills(&sources, None).unwrap();
+        let skills = discover_skills(&sources).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "real-skill");
@@ -495,7 +480,7 @@ Content."#,
         let sources = vec![LocalSkillSource {
             source: dir.path().to_path_buf(),
         }];
-        let skills = discover_skills(&sources, None).unwrap();
+        let skills = discover_skills(&sources).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "full-spec");
@@ -520,7 +505,7 @@ Content."#,
         let sources = vec![LocalSkillSource {
             source: dir.path().to_path_buf(),
         }];
-        let err = discover_skills(&sources, None).unwrap_err();
+        let err = discover_skills(&sources).unwrap_err();
         assert!(err.to_string().contains("does not match directory name"));
     }
 
@@ -539,26 +524,45 @@ Content."#,
                 source: dir2.path().to_path_buf(),
             },
         ];
-        let skills = discover_skills(&sources, None).unwrap();
+        let skills = discover_skills(&sources).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "First copy");
     }
 
     #[test]
-    fn discover_skills_relative_path_with_config_dir() {
+    fn discover_skills_relative_path_from_cwd() {
+        // Relative sources resolve from the process current working directory.
+        // To avoid parallel-test CWD flakiness, serialize CWD mutation and
+        // restore it in a guard.
+        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = CWD_LOCK.lock().unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
         let base = TempDir::new().unwrap();
         let skills_dir = base.path().join("my-skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
         write_skill(&skills_dir, "test-skill", "A test");
 
+        std::env::set_current_dir(base.path()).unwrap();
+        let _guard = CwdGuard(original_cwd);
+
         let sources = vec![LocalSkillSource {
             source: "my-skills".into(),
         }];
-        let skills = discover_skills(&sources, Some(base.path())).unwrap();
+        let skills = discover_skills(&sources).unwrap();
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "test-skill");
+    }
+
+    /// Restores the original working directory when dropped.
+    struct CwdGuard(std::path::PathBuf);
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
     }
 
     #[test]
@@ -566,7 +570,7 @@ Content."#,
         let sources = vec![LocalSkillSource {
             source: "/nonexistent/path/to/skills".into(),
         }];
-        let err = discover_skills(&sources, None).unwrap_err();
+        let err = discover_skills(&sources).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 }

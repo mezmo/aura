@@ -325,6 +325,38 @@ model = "gpt-4"
     }
 
     #[test]
+    fn test_worker_empty_skill_source_fails_validation() {
+        let config = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.test]
+description = "Test worker"
+preamble = "You test."
+
+[[orchestration.worker.test.skills.local]]
+source = ""
+"#;
+        let result = load_config_from_str(config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Skill source path cannot be empty for worker 'test'")
+        );
+    }
+
+    #[test]
     fn test_environment_variable_placeholders() {
         let _env_lock = crate::test_env_lock::lock();
         println!("\n=== TEST_ENVIRONMENT_VARIABLE_PLACEHOLDERS ===");

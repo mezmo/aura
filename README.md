@@ -559,7 +559,7 @@ Rather than inlining every skill into the system prompt, AURA appends only a cat
 ```toml
 [agent.skills]
 local = [
-  { source = "./skills" },               # relative paths resolve against this config file
+  { source = "./skills" },               # relative paths resolve from the process CWD
   { source = "/opt/aura/shared-skills" }
 ]
 ```
@@ -575,7 +575,7 @@ skills/
     └── assets/
 ```
 
-Discovery runs at agent build time and validates each skill against the specification; the frontmatter `name` must match the directory name. Directories without a `SKILL.md` are skipped. When two sources provide the same skill name, the first one loaded wins and a warning is logged. Relative sources resolve against the config file's directory in every mode (web server, standalone CLI, and A2A).
+Discovery runs at agent build time and validates each skill against the specification; the frontmatter `name` must match the directory name. Directories without a `SKILL.md` are skipped. When two sources provide the same skill name, the first one loaded wins and a warning is logged. Relative sources resolve from the process current working directory in every mode (web server, standalone CLI, and A2A). `CONFIG_PATH` / `--config` locate the TOML file only; they do not change how paths inside TOML are resolved.
 
 In orchestration mode the coordinator inherits `[agent.skills]`. Workers inherit it too, unless `[orchestration.worker.<name>.skills]` provides their own sources; an explicit empty list disables skills for that worker:
 
@@ -586,8 +586,6 @@ local = [{ source = "./knowledge-skills" }]   # worker-specific skills
 [orchestration.worker.operations.skills]
 local = []                                    # no skills for this worker
 ```
-
-The `AURA_SKILLS_DIR` environment variable names a fallback source directory, used only when `[agent.skills]` configures no sources. It applies at the agent level only; per-worker overrides never fall back to it.
 
 ### Ollama
 

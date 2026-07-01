@@ -33,9 +33,9 @@ services:
     volumes:
       # Mount orchestration test config (instead of standard test config)
       - ../configs/integration-orchestration.toml:/app/config/test-orchestration.toml:ro
-      # Skill sources resolve against the config file's directory (/app/config),
-      # so the fixture must land at /app/config/skills for discovery to find it.
-      - ../configs/skills:/app/config/skills:ro
+      # Skill sources resolve from the process working directory (/app), so the
+      # fixture must land at /app/skills for discovery to find it.
+      - ../tests/integration/skills:/app/skills:ro
     depends_on:
       math-mcp:
         condition: service_healthy

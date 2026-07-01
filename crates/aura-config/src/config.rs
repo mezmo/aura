@@ -330,6 +330,15 @@ impl Config {
                 if let Some(worker_llm) = &worker.llm {
                     validate_llm_api_key(worker_llm, &format!("orchestration.worker.{name}.llm"))?;
                 }
+                if let Some(skills) = &worker.skills {
+                    for source in &skills.local {
+                        if source.source.as_os_str().is_empty() {
+                            return Err(crate::ConfigError::Validation(format!(
+                                "Skill source path cannot be empty for worker '{name}'"
+                            )));
+                        }
+                    }
+                }
             }
         }
 
@@ -630,7 +639,7 @@ pub struct SkillsConfig {
 /// One `[[agent.skills.local]]` entry.
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LocalSkillSource {
-    /// Path to directory containing skill subdirectories (absolute or relative to config file)
+    /// Path to directory containing skill subdirectories (absolute or relative to the process CWD)
     pub source: std::path::PathBuf,
 }
 
