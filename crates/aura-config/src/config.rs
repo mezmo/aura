@@ -325,6 +325,33 @@ impl Config {
         self.orchestration.as_ref().is_some_and(|o| o.enabled)
     }
 
+    /// Worker overview for this config, sorted by name. Empty when
+    /// orchestration is disabled. A worker's `model` is set only when it
+    /// differs from the coordinator's, so the CLI annotates only overrides.
+    pub fn worker_overview(&self) -> Vec<WorkerOverview> {
+        let Some(orch) = self.orchestration.as_ref().filter(|o| o.enabled) else {
+            return Vec::new();
+        };
+
+        let coordinator_model = self.agent.llm.model_info().1;
+
+        let mut workers: Vec<WorkerOverview> = orch
+            .workers
+            .iter()
+            .map(|(name, w)| {
+                let worker_model = w.llm.as_ref().unwrap_or(&self.agent.llm).model_info().1;
+                let model = (worker_model != coordinator_model).then(|| worker_model.to_string());
+                WorkerOverview {
+                    name: name.clone(),
+                    description: w.description.clone(),
+                    model,
+                }
+            })
+            .collect();
+        workers.sort_by(|a, b| a.name.cmp(&b.name));
+        workers
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         validate_llm_api_key(&self.agent.llm, "agent.llm")?;
@@ -848,6 +875,15 @@ impl Default for AgentSettings {
             skills: Vec::new(),
         }
     }
+}
+
+/// One row of the worker overview surfaced in the CLI startup banner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerOverview {
+    pub name: String,
+    pub description: String,
+    /// Set only when the worker overrides the coordinator model; else `None`.
+    pub model: Option<String>,
 }
 
 /// Simple glob pattern matching for tool name filtering.

@@ -372,6 +372,47 @@ impl DirectBackend {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         Ok(self.model_ids())
     }
+
+    /// Build the worker overviews from the loaded configs. Mirrors
+    /// `prepare_request`: a lone config is the default and serves any requested
+    /// model; several configs have no default.
+    pub(crate) fn worker_overviews(&self) -> crate::worker::WorkerOverviews {
+        let effective_id = |c: &aura_config::Config| {
+            c.agent
+                .alias
+                .as_deref()
+                .unwrap_or(&c.agent.name)
+                .to_string()
+        };
+
+        let single_config = self.app_state.configs.len() == 1;
+        let default_model = single_config.then(|| effective_id(&self.app_state.configs[0]));
+
+        let by_model = self
+            .app_state
+            .configs
+            .iter()
+            .filter(|c| !c.agent.hidden)
+            .map(|c| {
+                let workers = c
+                    .worker_overview()
+                    .into_iter()
+                    .map(|w| crate::worker::WorkerOverview {
+                        name: w.name,
+                        description: w.description,
+                        model: w.model,
+                    })
+                    .collect();
+                (effective_id(c), workers)
+            })
+            .collect();
+
+        crate::worker::WorkerOverviews {
+            by_model,
+            default_model,
+            routes_any_model: single_config,
+        }
+    }
 }
 
 /// Map the CLI-side `Message` (OpenAI-shaped, with role as a string) to the
@@ -689,6 +730,93 @@ mod tests {
         let msgs = vec![Message::user("hi")];
         let req = DirectBackend::build_chat_request(&msgs, None, None);
         assert!(req.model.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_worker_overviews_maps_by_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orch.toml");
+        std::fs::write(
+            &path,
+            r#"
+[agent]
+name = "orch"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "Alpha"
+preamble = "p"
+"#,
+        )
+        .unwrap();
+
+        let backend = DirectBackend::from_toml(path.to_str().unwrap(), vec![])
+            .await
+            .unwrap();
+        let overviews = backend.worker_overviews();
+        assert_eq!(overviews.by_model.get("orch").map(|v| v.len()), Some(1));
+        assert_eq!(overviews.by_model["orch"][0].name, "alpha");
+        // the sole config is the standalone default (prepare_request auto-selects it)
+        assert_eq!(overviews.default_model.as_deref(), Some("orch"));
+        // single config routes any model to it, so an unmatched model still shows workers
+        assert!(overviews.routes_any_model);
+        assert_eq!(overviews.resolve(Some("gpt-4o")).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn direct_worker_overviews_no_default_with_multiple_configs() {
+        // >1 config: prepare_request requires an explicit model, so no default.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("orch.toml"),
+            r#"
+[agent]
+name = "orch"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "Alpha"
+preamble = "p"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("solo.toml"),
+            r#"
+[agent]
+name = "solo"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#,
+        )
+        .unwrap();
+
+        let backend = DirectBackend::from_toml(dir.path().to_str().unwrap(), vec![])
+            .await
+            .unwrap();
+        let overviews = backend.worker_overviews();
+        assert_eq!(overviews.by_model.len(), 2);
+        assert_eq!(overviews.default_model, None);
+        assert!(!overviews.routes_any_model);
+        assert!(overviews.resolve(None).is_empty());
+        assert_eq!(overviews.resolve(Some("orch")).len(), 1);
     }
 
     #[test]

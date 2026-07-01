@@ -569,3 +569,53 @@ pub fn check_resize() -> Option<u16> {
         None
     }
 }
+
+// ---------------------------------------------------------------------------
+// Worker overviews
+// ---------------------------------------------------------------------------
+
+pub(crate) static WORKER_OVERVIEWS: LazyLock<Mutex<crate::worker::WorkerOverviews>> =
+    LazyLock::new(|| Mutex::new(crate::worker::WorkerOverviews::default()));
+
+/// Seed the backend's worker overviews (built once at REPL launch).
+pub fn set_worker_overviews(overviews: crate::worker::WorkerOverviews) {
+    if let Ok(mut g) = WORKER_OVERVIEWS.lock() {
+        *g = overviews;
+    }
+}
+
+/// Worker overview for `model`; see [`crate::worker::WorkerOverviews::resolve`]
+/// for the selection rules.
+pub fn worker_overviews_for(model: Option<&str>) -> Vec<crate::worker::WorkerOverview> {
+    match WORKER_OVERVIEWS.lock() {
+        Ok(g) => g.resolve(model),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::worker::{WorkerOverview, WorkerOverviews};
+
+    use super::{set_worker_overviews, worker_overviews_for};
+
+    // Selection rules are unit-tested on `WorkerOverviews::resolve` (worker.rs);
+    // this only checks the global set/get plumbing round-trips.
+    #[test]
+    fn set_and_read_worker_overviews_global() {
+        set_worker_overviews(WorkerOverviews {
+            by_model: std::collections::HashMap::from([(
+                "orch".to_string(),
+                vec![WorkerOverview {
+                    name: "alpha".into(),
+                    description: "d".into(),
+                    model: None,
+                }],
+            )]),
+            default_model: Some("orch".to_string()),
+            routes_any_model: false,
+        });
+        assert_eq!(worker_overviews_for(Some("orch")).len(), 1);
+        assert_eq!(worker_overviews_for(None).len(), 1);
+    }
+}

@@ -113,6 +113,16 @@ impl Backend {
         }
     }
 
+    /// Worker overviews for the startup banner. Empty when no workers are
+    /// configured or the HTTP fetch fails.
+    pub async fn all_worker_overviews(&self) -> crate::worker::WorkerOverviews {
+        match self {
+            Self::Http(http) => http.worker_overviews().await,
+            #[cfg(feature = "standalone-cli")]
+            Self::Direct(direct) => direct.worker_overviews(),
+        }
+    }
+
     /// Access the direct backend (standalone mode only). Panics if not Direct.
     #[cfg(feature = "standalone-cli")]
     pub fn as_direct(&self) -> &direct::DirectBackend {

@@ -552,6 +552,9 @@ pub fn run_repl(
         server
     ));
 
+    let worker_overviews = rt.block_on(backend.all_worker_overviews());
+    crate::ui::state::set_worker_overviews(worker_overviews);
+
     // Pick the welcome content + colors once; reused on /expand and /resume replays.
     set_welcome_state(WelcomeState::pick());
     // Visual flourish gate: only run the fade-in animation under `--pretty`.
@@ -560,6 +563,13 @@ pub fn run_repl(
         print_welcome_state_animated();
     } else {
         crate::ui::prompt::print_welcome_state();
+    }
+    let workers = crate::ui::state::worker_overviews_for(get_selected_model().as_deref());
+    for line in crate::worker::worker_block_lines(&workers) {
+        println!("{line}");
+    }
+    if !workers.is_empty() {
+        println!();
     }
     setup_terminal();
 

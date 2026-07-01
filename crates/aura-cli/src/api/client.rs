@@ -176,6 +176,41 @@ impl ChatClient {
         Ok((summary, usage))
     }
 
+    /// Fetch the server's worker overviews from `/v1/models`. Best-effort: any
+    /// error yields an empty result so the banner degrades silently. Runs on
+    /// the blocking startup path, so it uses a short timeout to avoid hanging
+    /// launch on a stalled server.
+    pub async fn list_worker_overviews(&self) -> crate::worker::WorkerOverviews {
+        let resp = match self
+            .build_request(reqwest::Method::GET, &self.config.models_url(), None)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::debug!(status = %r.status(), "worker overview fetch: non-success status");
+                return crate::worker::WorkerOverviews::default();
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "worker overview fetch: request failed");
+                return crate::worker::WorkerOverviews::default();
+            }
+        };
+        let list: ModelList = match resp.json().await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(error = %e, "worker overview fetch: parse failed");
+                return crate::worker::WorkerOverviews::default();
+            }
+        };
+        crate::worker::WorkerOverviews {
+            default_model: list.default,
+            routes_any_model: list.routes_any_model,
+            by_model: list.data.into_iter().map(|m| (m.id, m.workers)).collect(),
+        }
+    }
+
     /// Fetch the list of available model IDs from the server.
     #[allow(dead_code)]
     pub async fn list_models(&self) -> Result<Vec<String>> {

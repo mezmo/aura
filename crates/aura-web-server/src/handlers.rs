@@ -950,6 +950,44 @@ pub async fn health() -> Response {
     .into_response()
 }
 
+/// Build the `/v1/models` JSON entry for one config, including the optional
+/// `workers` array when the agent runs in orchestration mode.
+fn model_entry_json(config: &aura_config::Config) -> serde_json::Value {
+    let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
+    let created = config.agent.created_at / 1000;
+    let owned_by = config.agent.model_owner.clone().unwrap_or_else(|| {
+        let (provider, _) = config.agent.llm.model_info();
+        provider.to_string()
+    });
+
+    let mut entry = serde_json::json!({
+        "id": id,
+        "object": "model",
+        "created": created,
+        "owned_by": owned_by,
+    });
+
+    let workers = config.worker_overview();
+    if !workers.is_empty() {
+        entry["workers"] = serde_json::json!(
+            workers
+                .iter()
+                .map(|w| {
+                    let mut wj = serde_json::json!({
+                        "name": w.name,
+                        "description": w.description,
+                    });
+                    if let Some(model) = &w.model {
+                        wj["model"] = serde_json::json!(model);
+                    }
+                    wj
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    entry
+}
+
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
 /// Filters out `hidden` agents
@@ -958,27 +996,41 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
         .configs
         .iter()
         .filter(|config| !config.agent.hidden)
-        .map(|config| {
-            let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
-            let created = config.agent.created_at / 1000;
-            let owned_by = config.agent.model_owner.clone().unwrap_or_else(|| {
-                let (provider, _) = config.agent.llm.model_info();
-                provider.to_string()
-            });
-            serde_json::json!({
-                "id": id,
-                "object": "model",
-                "created": created,
-                "owned_by": owned_by
-            })
-        })
+        .map(model_entry_json)
         .collect();
 
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "object": "list",
         "data": models
-    }))
-    .into_response()
+    });
+    // Advertise the model a model-less request routes to, mirroring
+    // prepare_request: a lone config, else default_agent (else nothing).
+    let default_model = if state.configs.len() == 1 {
+        let c = &state.configs[0];
+        Some(
+            c.agent
+                .alias
+                .as_deref()
+                .unwrap_or(&c.agent.name)
+                .to_string(),
+        )
+    } else {
+        state.default_agent.clone()
+    };
+    // Suppress a default that isn't in the visible list: it would leak a hidden
+    // agent id (a lone hidden config, or default_agent pointing at one).
+    let default_model =
+        default_model.filter(|d| models.iter().any(|m| m["id"].as_str() == Some(d.as_str())));
+    // Gate on the visible default too, so a lone hidden config stays out of
+    // discovery entirely.
+    let routes_any_model = state.configs.len() == 1 && default_model.is_some();
+    if let Some(default_model) = default_model {
+        body["default"] = serde_json::json!(default_model);
+    }
+    if routes_any_model {
+        body["routes_any_model"] = serde_json::json!(true);
+    }
+    Json(body).into_response()
 }
 
 /// Resolve a parked conversational approval by decision id.
@@ -1490,6 +1542,13 @@ mod tests {
     // --- list_models tests ---
 
     fn make_state(configs: Vec<aura_config::Config>) -> Arc<AppState> {
+        make_state_with_default(configs, None)
+    }
+
+    fn make_state_with_default(
+        configs: Vec<aura_config::Config>,
+        default_agent: Option<String>,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: crate::streaming::ToolResultMode::None,
@@ -1502,7 +1561,7 @@ mod tests {
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
-            default_agent: None,
+            default_agent,
             additional_tools: Arc::new(Vec::new),
             pending_approvals: aura::hitl::PendingApprovals::new(),
         })
@@ -1553,6 +1612,162 @@ model = "gpt-4o"
         assert_eq!(data[0]["id"], "visible-agent");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "openai");
+        // configs.len() != 1 and no default_agent: prepare_request rejects a
+        // model-less request, so no default and no passthrough are advertised.
+        assert!(json.get("default").is_none());
+        assert!(json.get("routes_any_model").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_advertises_lone_config_as_default() {
+        let only = parse_config(
+            r#"
+[agent]
+name = "solo-agent"
+system_prompt = "You are solo."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+        let state = make_state(vec![only]);
+        let resp = list_models(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // prepare_request always routes a lone config, so it is the default and
+        // it accepts any requested model.
+        assert_eq!(json["default"], "solo-agent");
+        assert_eq!(json["routes_any_model"], true);
+    }
+
+    #[tokio::test]
+    async fn test_list_models_omits_default_for_lone_hidden_config() {
+        let hidden = parse_config(
+            r#"
+[agent]
+name = "hidden-solo"
+hidden = true
+system_prompt = "You are hidden."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+        let state = make_state(vec![hidden]);
+        let resp = list_models(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Discovery lists no visible agents, so neither a default nor the
+        // passthrough flag may reveal that a lone hidden agent exists.
+        assert!(json["data"].as_array().unwrap().is_empty());
+        assert!(json.get("default").is_none());
+        assert!(json.get("routes_any_model").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_omits_default_when_default_agent_is_hidden() {
+        let hidden = parse_config(
+            r#"
+[agent]
+name = "hidden-agent"
+hidden = true
+system_prompt = "You are hidden."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+        let visible = parse_config(
+            r#"
+[agent]
+name = "visible-agent"
+system_prompt = "You are visible."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+        // default_agent points at the hidden config.
+        let state =
+            make_state_with_default(vec![visible, hidden], Some("hidden-agent".to_string()));
+        let resp = list_models(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The hidden default id is not in the visible list, so it is suppressed.
+        assert_eq!(json["data"].as_array().unwrap().len(), 1);
+        assert_eq!(json["data"][0]["id"], "visible-agent");
+        assert!(json.get("default").is_none());
+    }
+
+    // --- model_entry_json tests ---
+
+    #[test]
+    fn test_model_entry_includes_workers() {
+        let toml = r#"
+[agent]
+name = "orch"
+system_prompt = "You are an orchestrator."
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.alpha]
+description = "Alpha worker"
+preamble = "p"
+
+[orchestration.worker.zeta]
+description = "Zeta worker"
+preamble = "p"
+[orchestration.worker.zeta.llm]
+provider = "openai"
+model = "gpt-4o-mini"
+api_key = "k"
+"#;
+        let config = aura_config::load_config_from_str(toml).unwrap();
+        let entry = model_entry_json(&config);
+        let workers = entry["workers"].as_array().expect("workers array present");
+        assert_eq!(workers.len(), 2);
+        // alpha inherits the coordinator model -> no "model" key
+        assert_eq!(workers[0]["name"], "alpha");
+        assert_eq!(workers[0]["description"], "Alpha worker");
+        assert!(workers[0].get("model").is_none());
+        // zeta overrides -> annotated with its model
+        assert_eq!(workers[1]["name"], "zeta");
+        assert_eq!(workers[1]["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_model_entry_omits_workers_for_plain_agent() {
+        let toml = r#"
+[agent]
+name = "solo"
+system_prompt = "You are a solo agent."
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#;
+        let config = aura_config::load_config_from_str(toml).unwrap();
+        let entry = model_entry_json(&config);
+        assert!(entry.get("workers").is_none());
     }
 
     // --- streaming / response builder tests ---

@@ -55,4 +55,8 @@ impl HttpBackend {
     pub async fn connection_summary(&self) -> String {
         self.client.connection_summary().await
     }
+
+    pub async fn worker_overviews(&self) -> crate::worker::WorkerOverviews {
+        self.client.list_worker_overviews().await
+    }
 }

@@ -5,11 +5,20 @@ use std::time::Duration;
 #[derive(Debug, Deserialize)]
 pub struct ModelList {
     pub data: Vec<ModelEntry>,
+    /// The model a request without an explicit one routes to; absent when none.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// True when the server routes any requested model to `default` (a
+    /// single-config server that ignores the model field).
+    #[serde(default)]
+    pub routes_any_model: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
+    #[serde(default)]
+    pub workers: Vec<crate::worker::WorkerOverview>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,5 +652,50 @@ mod tests {
         assert!(json.contains("1234"));
         let parsed: ShellCallDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.duration, Duration::from_millis(1234));
+    }
+
+    #[test]
+    fn model_entry_parses_workers() {
+        let json = r#"{
+          "object": "list",
+          "default": "orch",
+          "data": [
+            { "id": "orch", "object": "model",
+              "workers": [
+                { "name": "alpha", "description": "a" },
+                { "name": "zeta", "description": "z", "model": "gpt-4o-mini" }
+              ] },
+            { "id": "solo", "object": "model" }
+          ]
+        }"#;
+        let list: ModelList = serde_json::from_str(json).unwrap();
+        assert_eq!(list.data.len(), 2);
+        assert_eq!(list.data[0].workers.len(), 2);
+        assert_eq!(list.data[0].workers[0].name, "alpha");
+        // model absent -> None; present -> parsed
+        assert_eq!(list.data[0].workers[0].model, None);
+        assert_eq!(
+            list.data[0].workers[1].model.as_deref(),
+            Some("gpt-4o-mini")
+        );
+        assert!(list.data[1].workers.is_empty());
+        assert_eq!(list.default.as_deref(), Some("orch"));
+        assert!(!list.routes_any_model);
+    }
+
+    #[test]
+    fn model_list_default_and_flags_absent_parse_to_defaults() {
+        let json = r#"{ "object": "list", "data": [ { "id": "solo", "object": "model" } ] }"#;
+        let list: ModelList = serde_json::from_str(json).unwrap();
+        assert!(list.default.is_none());
+        assert!(!list.routes_any_model);
+    }
+
+    #[test]
+    fn model_list_parses_routes_any_model() {
+        let json = r#"{ "object": "list", "default": "orch", "routes_any_model": true,
+                        "data": [ { "id": "orch", "object": "model" } ] }"#;
+        let list: ModelList = serde_json::from_str(json).unwrap();
+        assert!(list.routes_any_model);
     }
 }

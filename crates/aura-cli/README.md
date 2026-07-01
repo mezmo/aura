@@ -134,6 +134,7 @@ cargo build -p aura-cli --no-default-features
 - **Conversation persistence** — pick up where you left off with `--resume` or `/resume`
 - **Tab completion** — cycle through matching models and conversations with `Tab` / `Shift+Tab`
 - **Model selection** — browse and select models from the server (or loaded configs in standalone mode)
+- **Worker overview** — for orchestration agents, the startup banner lists the configured workers and their descriptions (from loaded configs in standalone mode, or the `/v1/models` `workers` field in HTTP mode). A worker that overrides the coordinator's model is annotated with that model, e.g. `• planner — … (gpt-4o-mini)`
 - **Permission system** — control which local tools are allowed, denied, or prompted before execution
 - **SSE streaming** — real-time token-by-token output with a toggleable event panel
 - **Auto-compaction** — automatic context management when conversations grow large

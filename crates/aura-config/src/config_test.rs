@@ -1995,4 +1995,104 @@ max_extraction_tokens = 4000
         let orch = crate::OrchestrationConfig::default();
         assert!(orch.validate_worker_names().is_ok());
     }
+
+    #[test]
+    fn test_worker_overview_empty_when_orchestration_disabled() {
+        let toml = r#"
+[agent]
+name = "solo"
+system_prompt = "You are solo."
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#;
+        let config = crate::load_config_from_str(toml).unwrap();
+        assert!(config.worker_overview().is_empty());
+    }
+
+    #[test]
+    fn test_worker_overview_lists_workers_sorted_by_name() {
+        let toml = r#"
+[agent]
+name = "orch"
+system_prompt = "You are orch."
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.beta]
+description = "Beta worker"
+preamble = "You are beta."
+
+[orchestration.worker.alpha]
+description = "Alpha worker"
+preamble = "You are alpha."
+mcp_filter = ["mezmo_*"]
+"#;
+        let config = crate::load_config_from_str(toml).unwrap();
+        let workers = config.worker_overview();
+        assert_eq!(workers.len(), 2);
+        // sorted by name regardless of declaration order
+        assert_eq!(workers[0].name, "alpha");
+        assert_eq!(workers[0].description, "Alpha worker");
+        assert_eq!(workers[1].name, "beta");
+        assert_eq!(workers[1].description, "Beta worker");
+        // both inherit [agent.llm] -> no model annotation
+        assert_eq!(workers[0].model, None);
+        assert_eq!(workers[1].model, None);
+    }
+
+    #[test]
+    fn test_worker_overview_annotates_model_only_on_override() {
+        let toml = r#"
+[agent]
+name = "orch"
+system_prompt = "You are orch."
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[orchestration]
+enabled = true
+
+# inherits the coordinator model
+[orchestration.worker.inherits]
+description = "Inherits coordinator model"
+preamble = "p"
+
+# overrides to a different model -> annotated
+[orchestration.worker.overrides]
+description = "Runs a different model"
+preamble = "p"
+[orchestration.worker.overrides.llm]
+provider = "openai"
+model = "gpt-4o-mini"
+api_key = "k"
+
+# overrides but to the SAME model as the coordinator -> not annotated
+[orchestration.worker.samemodel]
+description = "Overrides to the same model"
+preamble = "p"
+[orchestration.worker.samemodel.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#;
+        let config = crate::load_config_from_str(toml).unwrap();
+        let by_name: std::collections::HashMap<_, _> = config
+            .worker_overview()
+            .into_iter()
+            .map(|w| (w.name.clone(), w.model))
+            .collect();
+        assert_eq!(by_name["inherits"], None);
+        assert_eq!(by_name["overrides"], Some("gpt-4o-mini".to_string()));
+        // an override that resolves to the coordinator model shows nothing
+        assert_eq!(by_name["samemodel"], None);
+    }
 }

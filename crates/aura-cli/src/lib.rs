@@ -12,3 +12,4 @@ pub mod repl;
 pub mod theme;
 pub mod tools;
 pub mod ui;
+pub mod worker;
