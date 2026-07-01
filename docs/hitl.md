@@ -39,27 +39,14 @@ timeout_secs = 300
 ```
 
 `require_approval` is a list of glob patterns matched against MCP tool names.
-When an orchestration worker calls a matching tool, Aura posts an approval
-request to the webhook before the MCP tool runs.
+When an agent calls a matching tool, Aura requests approval through the
+configured route before the MCP tool runs.
 
-Patterns are matched in **config order, first-match wins**. The first glob that
-matches a tool name triggers the approval request; later patterns are not
-checked. A broad early pattern shadows a later, more specific one:
-
-```toml
-# k8s_* matches first for every k8s tool, including k8s_get_*.
-# The k8s_get_* pattern never fires.
-require_approval = ["k8s_*", "k8s_get_*"]
-
-# Reorder so read-only tools are NOT gated. k8s_get_* matches first
-# and short-circuits; k8s_* gates the rest.
-require_approval = ["k8s_get_*", "k8s_*"]
-```
-
-This differs from the scratchpad subsystem, which uses longest-match (most
-specific glob wins). HITL uses first-match because approval gating is a
-security decision where explicit config ordering gives the operator direct
-control over which pattern applies.
+A tool is gated if it matches **any** pattern in the list, so pattern order does
+not affect whether a tool is gated. To leave a tool ungated, do not list a
+pattern that matches it. When more than one pattern matches, the first in config
+order is reported as `origin.matched_pattern` in the webhook payload and SSE
+events; that is the only effect of ordering.
 
 The `request_approval` tool is never matched by these globs. It is excluded from
 the gate so the agent can ask for approval without triggering the gate itself.

@@ -50,6 +50,8 @@ impl HitlApprovalWrapper {
 
     /// First configured glob that matches `tool_name`, never gating the
     /// approval tool itself ("request_approval" == RequestApprovalTool::NAME).
+    /// Any match gates the call; the returned pattern is only the reported
+    /// `origin.matched_pattern`, so pattern order has no effect on gating.
     fn matched_pattern(&self, tool_name: &str) -> Option<&str> {
         if tool_name == "request_approval" {
             return None;
