@@ -30,8 +30,8 @@ pub use setup::{
 pub use storage::ScratchpadStorage;
 pub use tools::{
     GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool, SchemaTool,
-    SliceTool, all_tool_definitions, emit_scratchpad_tool_events_enabled, is_internal_tool,
-    is_scratchpad_tool,
+    SliceTool, all_tool_definitions, emit_scratchpad_tool_events_enabled,
+    is_always_visible_internal_tool, is_scratchpad_tool, should_forward_tool_event,
 };
 pub use wrapper::ScratchpadWrapper;
 
