@@ -1,5 +1,20 @@
 ## Changelog
 
+# [1.31.0](https://github.com/mezmo/aura/compare/v1.30.4...v1.31.0) (2026-07-01)
+
+
+### Bug Fixes
+
+* **cli**: friendly error when standalone config is missing [3f4323c](https://github.com/mezmo/aura/commit/3f4323cb5e365a101e95c3ae587929a7af78d653) - Mike Shearer
+
+### Continuous Integration
+
+* always rebuild runner image and verify release build on dry run [be059ea](https://github.com/mezmo/aura/commit/be059ea6bb6fc98841832796e75fb01dbb6e3ee9) - Jacob Hull [#301](https://github.com/mezmo/aura/issues/301)
+
+### Features
+
+* **cli**: rename distributed binary from aura-cli to aura [9f1b514](https://github.com/mezmo/aura/commit/9f1b5147a070250fa491e1e5b5a8f1f651c256fc) - Chip Johnson [#296](https://github.com/mezmo/aura/issues/296)* **cli**: show version and server in startup banner [a2a8111](https://github.com/mezmo/aura/commit/a2a8111528d3d9857cfd9a1b10a50ed08865e6e1) - Mike Shearer* **scratchpad**: provider-accurate token counting for gemini and claude [f9cae12](https://github.com/mezmo/aura/commit/f9cae12bc98a58970199ddf624e3864a4662c561) - Jacob Hull [#257](https://github.com/mezmo/aura/issues/257)
+
 ## [1.30.4](https://github.com/mezmo/aura/compare/v1.30.3...v1.30.4) (2026-06-26)
 
 
