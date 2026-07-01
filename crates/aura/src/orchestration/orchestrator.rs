@@ -5379,17 +5379,14 @@ mod tests {
             worker_config.agent.skills
         };
 
-        // A worker without a map entry inherits [agent.skills]
         let inherited = resolve("inheriting");
         assert_eq!(inherited.len(), 1);
         assert_eq!(inherited[0].name, "agent-skill");
 
-        // A present entry replaces the agent skills entirely
         let replaced = resolve("overriding");
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].name, "worker-skill");
 
-        // An empty entry disables skills for this worker
         assert!(resolve("disabling").is_empty());
     }
 

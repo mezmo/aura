@@ -88,12 +88,6 @@ impl PartialEq<String> for SkillName {
 }
 
 /// Validate a skill name per the Agent Skills specification.
-///
-/// Rules:
-/// - 1-64 characters
-/// - Lowercase alphanumeric and hyphens only
-/// - Must not start or end with a hyphen
-/// - Must not contain consecutive hyphens
 fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 64 {
         return Err(format!(
@@ -456,7 +450,6 @@ allowed-tools: Bash(git:*) Read
         let skills = discover_skills(&sources, None).unwrap();
 
         assert_eq!(skills.len(), 2);
-        // Should be sorted by name
         assert_eq!(skills[0].name, "alpha");
         assert_eq!(skills[1].name, "beta");
     }
@@ -465,9 +458,7 @@ allowed-tools: Bash(git:*) Read
     fn discover_skills_skips_non_skill_dirs() {
         let dir = TempDir::new().unwrap();
         write_skill(dir.path(), "real-skill", "A real skill");
-        // Create a directory without SKILL.md
         std::fs::create_dir_all(dir.path().join("not-a-skill")).unwrap();
-        // Create a plain file (not a directory)
         std::fs::write(dir.path().join("readme.md"), "# README").unwrap();
 
         let sources = vec![LocalSkillSource {
@@ -550,7 +541,6 @@ Content."#,
         ];
         let skills = discover_skills(&sources, None).unwrap();
 
-        // Duplicate should be dropped, keeping first
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "First copy");
     }
