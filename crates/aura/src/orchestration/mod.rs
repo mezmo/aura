@@ -41,6 +41,7 @@
 //! ```
 
 mod config;
+pub mod context;
 mod duplicate_call_guard;
 mod events;
 mod factory;
@@ -77,7 +78,7 @@ pub use tools::ListPriorRunsTool;
 pub use tools::ReadArtifactTool;
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
-pub use prompt_constants::{context, fields, sections};
+pub use prompt_constants::{fields, sections};
 pub use types::{
     Plan, PlanningResponse, StepInput, StructuredTaskOutput, Task, TaskJson, TaskState, TaskStatus,
 };
