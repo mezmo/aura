@@ -8,7 +8,7 @@
 //! is unrepresentable.
 
 use super::error::ContextError;
-use super::label::{Attestation, CorrelationLabel};
+use super::label::{CorrelationLabel, WorkerClaim};
 use super::rendered::RenderedContext;
 use crate::orchestration::types::FailureCategory;
 
@@ -158,7 +158,7 @@ impl std::fmt::Display for ArtifactRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactStandIn {
     /// The worker's own attested summary, used whenever `submit_result` ran.
-    Attested(Attestation),
+    Claim(WorkerClaim),
     /// A bounded preview of the raw result, used when the worker attested
     /// nothing (`ARCHITECTURE.md` section 3.3, "otherwise a bounded raw
     /// preview plus footer").
@@ -175,12 +175,12 @@ pub enum ArtifactStandIn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceEntry {
     /// Worker result text inlined in the entry, with the worker's
-    /// attestation when `submit_result` ran.
+    /// claim when `submit_result` ran.
     InlineResult {
         /// The worker's own result text.
         result: EvidenceText,
         /// The worker's `submit_result` claim, when one exists.
-        attestation: Option<Attestation>,
+        claim: Option<WorkerClaim>,
     },
     /// The result spilled to an artifact: a distilled stand-in plus the
     /// pointer to the full result.
@@ -196,7 +196,7 @@ pub enum EvidenceEntry {
     /// section 8).
     SummaryOnly {
         /// The worker's `submit_result` claim.
-        attestation: Attestation,
+        claim: WorkerClaim,
     },
 }
 
@@ -217,7 +217,7 @@ impl EvidenceEntry {
     )]
     pub fn from_completed_result(
         result_text: &str,
-        attestation: Option<Attestation>,
+        claim: Option<WorkerClaim>,
     ) -> Result<Self, ContextError> {
         todo!()
     }
@@ -302,7 +302,7 @@ pub enum FailureReport {
     /// any artifact footer (`ARCHITECTURE.md` section 1.3, soft failures).
     Soft {
         /// The worker's `submit_result` claim.
-        attestation: Attestation,
+        claim: WorkerClaim,
         /// Pointer to a spilled body, when one exists.
         artifact: Option<SpilledArtifact>,
     },

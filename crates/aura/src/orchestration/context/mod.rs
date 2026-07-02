@@ -45,10 +45,10 @@ pub use evidence::{
 };
 pub use failure_history::{FailureHandle, FailureRecord};
 pub use frame::{
-    AncestorDistance, DependencyRelation, PriorWorkEntry, TokenBudget, WorkerContextFrame,
+    AncestorDistance, DependencyRelation, PriorWorkEntry, PriorWorkFrame, TokenBudget,
 };
 pub use goal::PinnedGoal;
-pub use label::{Attestation, CorrelationLabel, IterationNumber, TaskId, WorkerRole};
+pub use label::{CorrelationLabel, IterationNumber, TaskId, WorkerClaim, WorkerRole};
 pub use rendered::RenderedContext;
 pub use turn::{
     ClarificationQuestion, CoordinatorTurn, FinalResponse, PlanShape, RoutingRationale,

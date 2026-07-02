@@ -1,4 +1,4 @@
-//! Correlation labels: task identity, worker role, and worker attestation.
+//! Correlation labels: task identity, worker role, and worker claim.
 //!
 //! Per-task entries in the continuation prompt and the worker prior-work
 //! frame identify a task by correlation labels only — task id and worker
@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 
 use super::error::ContextError;
 use crate::orchestration::tools::submit_result::Confidence;
+use crate::orchestration::types::StructuredTaskOutput;
 
 /// Identity of a task within a plan, used to correlate an evidence entry
 /// with its dispatch.
@@ -112,17 +113,17 @@ impl std::fmt::Display for IterationNumber {
 /// unrepresentable, mirroring the collapse already encoded by
 /// `StructuredTaskOutput` in `orchestration::types`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Attestation {
+pub struct WorkerClaim {
     summary: String,
     confidence: Confidence,
 }
 
-impl Attestation {
-    /// Parse a worker attestation from its `submit_result` fields.
+impl WorkerClaim {
+    /// Parse a worker claim from its `submit_result` fields.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::EmptyAttestationSummary`] when the summary is
+    /// Returns [`ContextError::EmptyWorkerClaimSummary`] when the summary is
     /// empty or whitespace-only.
     #[expect(
         unused_variables,
@@ -140,5 +141,21 @@ impl Attestation {
     /// The worker's stated confidence.
     pub fn confidence(&self) -> Confidence {
         self.confidence
+    }
+}
+
+/// Parse a claim from a worker's structured `submit_result` output, the
+/// canonical source of summary-plus-confidence pairs. Fails with
+/// [`ContextError::EmptyWorkerClaimSummary`] when the summary is empty or
+/// whitespace-only.
+impl TryFrom<&StructuredTaskOutput> for WorkerClaim {
+    type Error = ContextError;
+
+    #[expect(
+        unused_variables,
+        reason = "R2 type skeleton: parsing body lands with the implementation cards"
+    )]
+    fn try_from(output: &StructuredTaskOutput) -> Result<Self, Self::Error> {
+        todo!()
     }
 }

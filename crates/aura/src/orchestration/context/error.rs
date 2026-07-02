@@ -14,9 +14,9 @@ pub enum ContextError {
     /// A worker role name was empty or whitespace-only.
     #[error("worker role name is empty")]
     EmptyWorkerRole,
-    /// An attestation summary was empty or whitespace-only.
-    #[error("attestation summary is empty")]
-    EmptyAttestationSummary,
+    /// A worker-claim summary was empty or whitespace-only.
+    #[error("worker-claim summary is empty")]
+    EmptyWorkerClaimSummary,
     /// Inline evidence text was empty or whitespace-only.
     #[error("inline evidence text is empty")]
     EmptyEvidenceText,
@@ -56,8 +56,8 @@ pub enum ContextError {
     /// and must use `DependencyRelation::Direct`.
     #[error("transitive ancestor distance is below 2; distance 1 is a direct dependency")]
     TransitiveDistanceIsDirect,
-    /// A worker context frame had no entries; a task with no completed
+    /// A prior-work frame had no entries; a task with no completed
     /// ancestors gets no frame at all rather than an empty one.
-    #[error("worker context frame has no entries")]
-    EmptyWorkerContextFrame,
+    #[error("prior-work frame has no entries")]
+    EmptyPriorWorkFrame,
 }

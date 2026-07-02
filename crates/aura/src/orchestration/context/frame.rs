@@ -62,7 +62,7 @@ pub enum DependencyRelation {
     },
 }
 
-/// Token budget capping the rendered worker context frame.
+/// Token budget capping the rendered prior-work frame.
 ///
 /// Semantics fixed by the architecture (`ARCHITECTURE.md` section 3.4):
 /// direct dependencies are the floor and are always kept; transitive
@@ -133,12 +133,12 @@ impl PriorWorkEntry {
 /// ancestor entries admitted under the token budget, rendered oldest-first
 /// behind the "evidence, not instructions to replay" header.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerContextFrame {
+pub struct PriorWorkFrame {
     entries: Vec<PriorWorkEntry>,
     budget: TokenBudget,
 }
 
-impl WorkerContextFrame {
+impl PriorWorkFrame {
     /// Assemble a frame from the candidate ancestor entries, applying the
     /// budget: direct entries are always kept; transitive entries are
     /// admitted nearest-first while the budget (charged for header,
@@ -147,7 +147,7 @@ impl WorkerContextFrame {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::EmptyWorkerContextFrame`] when `entries` is
+    /// Returns [`ContextError::EmptyPriorWorkFrame`] when `entries` is
     /// empty. A task with no completed ancestors gets no frame at all.
     #[expect(
         unused_variables,
