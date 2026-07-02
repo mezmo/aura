@@ -235,13 +235,19 @@ pub struct ErrorPreview {
 }
 
 impl ErrorPreview {
-    /// Truncate raw error text to at most `max_chars` characters, recording
-    /// whether anything was cut.
+    /// Hard cap on preview length, in characters. Matches the default
+    /// `result_summary_length` width that today's renderer reuses for error
+    /// truncation; owning the bound here decouples error width from that
+    /// config knob (R2 gate decision Q6).
+    pub const MAX_CHARS: usize = 2000;
+
+    /// Truncate raw error text to at most [`Self::MAX_CHARS`] characters,
+    /// recording whether anything was cut.
     #[expect(
         unused_variables,
         reason = "R2 type skeleton: truncation body lands with the implementation cards"
     )]
-    pub fn new(raw_error: &str, max_chars: usize) -> Self {
+    pub fn new(raw_error: &str) -> Self {
         todo!()
     }
 

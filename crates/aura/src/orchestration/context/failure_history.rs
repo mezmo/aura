@@ -7,7 +7,10 @@ use super::rendered::RenderedContext;
 use crate::orchestration::types::FailureCategory;
 
 /// Stable identity for a failed task: the first line of its description,
-/// hard-capped at 120 characters with a trailing `...` marker when cut.
+/// cut at 120 characters, with a trailing `...` marker appended after the
+/// cut (R2 gate decision Q4: the marker sits outside the cap, so a cut
+/// handle is `MAX_CHARS` plus the marker, identically in display and in
+/// the grouping key).
 ///
 /// The handle is derived once, at record time, so a re-issued identical
 /// task produces an identical handle and repeat detection still fires
@@ -17,10 +20,11 @@ use crate::orchestration::types::FailureCategory;
 pub struct FailureHandle(String);
 
 impl FailureHandle {
-    /// Hard cap on handle length, in characters.
+    /// Hard cap on the retained first-line text, in characters; the
+    /// truncation marker is appended after this cap.
     pub const MAX_CHARS: usize = 120;
 
-    /// Marker appended when truncation cut the first line.
+    /// Marker appended after the cap when truncation cut the first line.
     pub const TRUNCATION_MARKER: &'static str = "...";
 
     /// Derive the handle from a coordinator task description: first line,
