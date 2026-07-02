@@ -207,3 +207,11 @@ make lint           # Run clippy + fmt check
 - `docs/rig-tool-execution-order.md` - Tool execution order analysis
 - `docs/rig-fork-changes.md` - Rig fork changes and rationale
 - `docs/orchestration-tickets.md` - Epic ticket table, dependency graph, research references, implementation plan
+
+## Coordinator Context Redesign
+
+This worktree is the implementation branch for the coordinator context
+redesign program. Program state, board, and process:
+/Users/mshearer/dev/terminalbench-aura/docs/redesign/PROCESS.md then
+/Users/mshearer/dev/terminalbench-aura/docs/redesign/BOARD.md. The board is
+the source of truth; recover dead sessions from those files.
