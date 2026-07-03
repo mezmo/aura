@@ -8,13 +8,15 @@
 //! (`docs/redesign/ARCHITECTURE.md` in the program repo), and every public
 //! type here maps to one business rule in `docs/redesign/TYPE_PLAN.md`.
 //!
-//! # Skeleton status
+//! # Implementation status
 //!
-//! This is the R2 type skeleton: signatures are the contract, and every body
-//! that carries parsing or rendering logic is `todo!()` until the
-//! implementation cards land (R3a continuation rendering, R3b decision
-//! turns, R3c worker frame). Plain data definitions are complete. The two
-//! implemented `Display` bodies ([`SpilledArtifact`], [`ArtifactRef`])
+//! R2 landed this module as a type skeleton; card R3a implemented the
+//! continuation-rendering bodies: the parsing constructors in `goal`,
+//! `label`, `evidence`, and `failure_history`, and the render methods
+//! for completed, failed, and blocked entries and failure records. The
+//! decision-turn bodies (`turn`, card R3b) and the worker prior-work
+//! frame (`frame`, card R3c) are still `todo!()` stubs. The
+//! format-bearing `Display` bodies ([`SpilledArtifact`], [`ArtifactRef`])
 //! reproduce today's artifact footer and inventory line formats, which the
 //! architecture pins as unchanged.
 //!

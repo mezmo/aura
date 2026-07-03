@@ -673,6 +673,13 @@ pub struct IterationContext {
     pub iteration: usize,
     /// The plan from the previous iteration.
     pub previous_plan: Plan,
+    /// The verbatim original user query, pinned for the continuation goal
+    /// line (`docs/redesign/ARCHITECTURE.md` section 1.2). The orchestrator
+    /// pins it at the post-execute construction site; contexts that never
+    /// render a continuation (plan carry-forward) leave it `None`, and the
+    /// renderer falls back to `previous_plan.goal`.
+    #[serde(default)]
+    pub pinned_goal: Option<super::context::PinnedGoal>,
     /// Failure summary populated only when the iteration had failures or
     /// blocked tasks. `None` on the clean-success path.
     pub failure_summary: Option<FailureSummary>,
@@ -697,29 +704,63 @@ impl IterationContext {
         Self {
             iteration,
             previous_plan,
+            pinned_goal: None,
             failure_summary,
             failure_history,
             tool_traces,
         }
     }
 
+    /// Pin the continuation goal line to the verbatim original user query,
+    /// replacing the coordinator's own drifting `previous_plan.goal`
+    /// (`docs/redesign/ARCHITECTURE.md` section 1.2).
+    #[must_use]
+    pub fn with_pinned_goal(mut self, goal: super::context::PinnedGoal) -> Self {
+        self.pinned_goal = Some(goal);
+        self
+    }
+
     /// Build the continuation section for the post-execute coordinator call.
     ///
     /// Renders the previous iteration's per-task state (completed, failed,
-    /// blocked), optional failure summary, accumulated failure history with
-    /// repeated-failure detection, and a conditional reuse hint. Uses the
-    /// `.md` template in `crates/aura/src/prompts/continuation_prompt.md`.
+    /// blocked) as evidence-framed entries — correlation label plus the
+    /// worker's own reported evidence, never the coordinator's task
+    /// description (`docs/redesign/ARCHITECTURE.md` section 1.3) — plus the
+    /// optional failure summary, accumulated failure history with
+    /// repeated-failure detection keyed by truncated handle (section 1.5),
+    /// and a conditional reuse hint. Uses the `.md` template in
+    /// `crates/aura/src/prompts/continuation_prompt.md`.
     ///
-    /// Per-task completed results are inlined fully when no artifact was
-    /// created (result ≤ threshold). When the result was spilled to an
-    /// artifact, shows summary + artifact pointer instead.
+    /// The goal line renders the pinned original user query when one is set
+    /// (section 1.2), falling back to `previous_plan.goal` when no goal was
+    /// pinned. Completed results are inlined fully when
+    /// no artifact was created (result at or under the threshold, R2 gate
+    /// decision 2); a spilled result shows its stand-in plus the artifact
+    /// pointer instead.
+    ///
+    /// `_content_max_length` is no longer read: error previews own their
+    /// 2000-character bound (`ErrorPreview::MAX_CHARS`, R2 gate decision 6).
+    /// The parameter stays until the orchestrator call site is updated by a
+    /// later card.
     pub fn build_continuation_prompt(
         &self,
         max_iterations: usize,
         show_tool_chain: bool,
-        content_max_length: usize,
+        _content_max_length: usize,
     ) -> String {
+        use super::context::{
+            BlockedEntry, CompletedEntry, CorrelationLabel, ErrorPreview, EvidenceEntry,
+            FailedEntry, FailureHandle, FailureRecord, FailureReport, IterationNumber, PinnedGoal,
+            SpilledArtifact, TaskId, WorkerClaim, WorkerRole,
+        };
         use super::templates::{ContinuationVars, render_continuation_prompt};
+
+        // Correlation labels carry task id and worker role only; a blank
+        // worker name is an unassigned task, which the label renders bare.
+        let correlation_label = |t: &Task| CorrelationLabel {
+            task: TaskId::new(t.id),
+            worker: t.worker.as_deref().and_then(|w| WorkerRole::new(w).ok()),
+        };
 
         // Categorize tasks
         let mut completed_lines = Vec::new();
@@ -728,45 +769,38 @@ impl IterationContext {
         let mut has_failed_tasks = false;
 
         for t in &self.previous_plan.tasks {
+            // An empty submit_result summary carries no claim.
+            let claim = t
+                .structured_output
+                .as_ref()
+                .and_then(|so| WorkerClaim::try_from(so).ok());
             match &t.state {
                 TaskState::Complete { result } => {
-                    let has_artifact = extract_artifact_footer(result).is_some();
-                    if has_artifact {
-                        // Result exceeded threshold — artifact on disk.
-                        // Show summary/preview + artifact pointer.
-                        let confidence = t
-                            .structured_output
-                            .as_ref()
-                            .map(|so| format!(" (confidence: {})", so.confidence))
-                            .unwrap_or_default();
-                        let body = if let Some(ref so) = t.structured_output {
-                            let footer = extract_artifact_footer(result).unwrap();
-                            format!("    {}\n    {}", so.summary, footer)
-                        } else {
-                            indent_lines(result)
-                        };
-                        completed_lines.push(format!(
-                            "- Task {}: {}{}\n{}",
-                            t.id, t.description, confidence, body
-                        ));
-                    } else {
-                        // Result fits in context — inline it fully.
-                        let confidence = t
-                            .structured_output
-                            .as_ref()
-                            .map(|so| format!(" (confidence: {})", so.confidence))
-                            .unwrap_or_default();
-                        completed_lines.push(format!(
-                            "- Task {}: {}{}\n{}",
-                            t.id,
-                            t.description,
-                            confidence,
-                            indent_lines(result)
-                        ));
-                    }
-                    for line in render_artifact_lines(self.tool_traces.get(&t.id)) {
-                        completed_lines.push(format!("    {}", line));
-                    }
+                    let artifacts = artifact_refs(self.tool_traces.get(&t.id));
+                    let entry = match EvidenceEntry::from_completed_result(result, claim) {
+                        Ok(evidence) => String::from(
+                            CompletedEntry {
+                                label: correlation_label(t),
+                                evidence,
+                                artifacts,
+                            }
+                            .render(),
+                        ),
+                        // A whitespace-only result has no evidence to show;
+                        // the label still records that the task ran, and the
+                        // artifact inventory stays visible.
+                        Err(_) => {
+                            let mut line = format!("- Task {}", t.id);
+                            if let Some(worker) = correlation_label(t).worker {
+                                line.push_str(&format!(" ({worker})"));
+                            }
+                            for artifact in &artifacts {
+                                line.push_str(&format!("\n    {artifact}"));
+                            }
+                            line
+                        }
+                    };
+                    completed_lines.push(entry);
                     if show_tool_chain {
                         for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
                             completed_lines.push(format!("    {}", line));
@@ -775,44 +809,36 @@ impl IterationContext {
                 }
                 TaskState::Failed { error, category } => {
                     has_failed_tasks = true;
-                    let line = match (category, &t.structured_output) {
-                        (FailureCategory::SoftFailure, Some(so)) if !so.summary.is_empty() => {
-                            let has_artifact = extract_artifact_footer(error).is_some();
-                            if has_artifact {
-                                let footer = extract_artifact_footer(error).unwrap();
-                                format!(
-                                    "- Task {}: {} → soft_failure ({} confidence)\n    {}\n    {}",
-                                    t.id, t.description, so.confidence, so.summary, footer
-                                )
-                            } else {
-                                format!(
-                                    "- Task {}: {} → soft_failure ({} confidence)\n{}",
-                                    t.id,
-                                    t.description,
-                                    so.confidence,
-                                    indent_lines(&so.summary)
-                                )
-                            }
-                        }
-                        (cat, _) => {
-                            let (truncated_error, was_truncated) =
-                                crate::string_utils::safe_truncate(error, content_max_length);
-                            let suffix = if was_truncated { " [truncated]" } else { "" };
-                            format!(
-                                "- Task {}: {} → failed [{}]: {}{}",
-                                t.id, t.description, cat, truncated_error, suffix
-                            )
-                        }
+                    let report = match (category, claim) {
+                        // Soft failures keep today's rendering: the worker's
+                        // own claim plus any artifact footer from the spill
+                        // path.
+                        (FailureCategory::SoftFailure, Some(claim)) => FailureReport::Soft {
+                            claim,
+                            artifact: SpilledArtifact::parse_trailing(error),
+                        },
+                        (category, _) => FailureReport::Hard {
+                            category: *category,
+                            error: ErrorPreview::new(error),
+                        },
                     };
-                    redesign_lines.push(line);
+                    redesign_lines.push(String::from(
+                        FailedEntry {
+                            label: correlation_label(t),
+                            report,
+                        }
+                        .render(),
+                    ));
                     for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
                         redesign_lines.push(format!("    {}", line));
                     }
                 }
                 TaskState::Pending | TaskState::Running => {
-                    blocked_lines.push(format!(
-                        "- Task {}: {} → blocked (dependency failed)",
-                        t.id, t.description
+                    blocked_lines.push(String::from(
+                        BlockedEntry {
+                            label: correlation_label(t),
+                        }
+                        .render(),
                     ));
                 }
             }
@@ -853,52 +879,56 @@ impl IterationContext {
             None => String::new(),
         };
 
-        // Build failure history
-        let failure_history = if self.failure_history.is_empty() {
+        // Build failure history. Each record's display identity and its
+        // repeat-detection grouping key are the same truncated handle
+        // (`docs/redesign/ARCHITECTURE.md` section 1.5); records with no
+        // identity to render (empty description, iteration zero) are
+        // dropped rather than rendered blank.
+        let records: Vec<FailureRecord> = self
+            .failure_history
+            .iter()
+            .filter_map(|record| {
+                Some(FailureRecord {
+                    iteration: IterationNumber::new(record.iteration).ok()?,
+                    handle: FailureHandle::from_description(&record.description).ok()?,
+                    worker: record
+                        .worker
+                        .as_deref()
+                        .and_then(|w| WorkerRole::new(w).ok()),
+                    category: record.category,
+                    error: ErrorPreview::new(&record.error),
+                })
+            })
+            .collect();
+        let failure_history = if records.is_empty() {
             String::new()
         } else {
             let mut fh = String::from(hdr::FAILURE_HISTORY);
-            for record in &self.failure_history {
-                let worker_info = record
-                    .worker
-                    .as_deref()
-                    .map(|w| format!(" (worker: {w})"))
-                    .unwrap_or_default();
-                let (truncated_error, was_truncated) =
-                    crate::string_utils::safe_truncate(&record.error, content_max_length);
-                let suffix = if was_truncated { " [truncated]" } else { "" };
-                fh.push_str(&format!(
-                    "\n- Iteration {}: \"{}\"{} — [{}] {}{}",
-                    record.iteration,
-                    record.description,
-                    worker_info,
-                    record.category,
-                    truncated_error,
-                    suffix,
-                ));
+            for record in &records {
+                fh.push('\n');
+                fh.push_str(record.render().as_str());
             }
 
-            // Identify repeated failures — group by (description, category)
-            // so the same task failing with different categories is not flagged.
-            let mut desc_counts: std::collections::HashMap<(&str, FailureCategory), usize> =
+            // Identify repeated failures — group by (handle, category) so
+            // the same task failing with different categories is not
+            // flagged.
+            let mut handle_counts: std::collections::HashMap<_, usize> =
                 std::collections::HashMap::new();
-            for record in &self.failure_history {
-                *desc_counts
-                    .entry((&record.description, record.category))
-                    .or_insert(0) += 1;
+            for record in &records {
+                *handle_counts.entry(record.repeat_key()).or_insert(0) += 1;
             }
-            let repeated: Vec<_> = desc_counts
+            let repeated: Vec<_> = handle_counts
                 .into_iter()
                 .filter(|(_, count)| *count > 1)
                 .collect();
             if !repeated.is_empty() {
-                fh.push_str(&format!("\n\n{}:", hdr::OBSERVED_PATTERNS));
-                for ((desc, cat), count) in &repeated {
+                fh.push_str(&format!("\n\n{}", hdr::OBSERVED_PATTERNS));
+                for ((handle, category), count) in &repeated {
                     fh.push_str(&format!(
                         "\n- \"{}\" has failed {} times with [{}]{}",
-                        desc,
+                        handle.as_str(),
                         count,
-                        cat,
+                        category,
                         hdr::REPEATED_FAILURE_SUFFIX,
                     ));
                 }
@@ -927,13 +957,21 @@ impl IterationContext {
             ""
         };
 
+        // The goal line is the pinned original user query (section 1.2); a
+        // context with no pinned goal falls back to the plan goal.
+        let goal = self
+            .pinned_goal
+            .as_ref()
+            .map(PinnedGoal::as_str)
+            .unwrap_or(&self.previous_plan.goal);
+
         render_continuation_prompt(&ContinuationVars {
             iteration: &iteration_str,
             max_iterations: &max_iter_str,
             urgency: &urgency,
             succeeded: &succeeded_str,
             total: &total_str,
-            goal: &self.previous_plan.goal,
+            goal,
             completed_section: &completed_section,
             blocked_section: &blocked_section,
             redesign_section: &redesign_section,
@@ -944,43 +982,26 @@ impl IterationContext {
     }
 }
 
-/// Extract the artifact footer from a result string, if present.
-///
-/// Returns the full `[Full result (N chars) saved to artifact: FILE]` string.
-fn extract_artifact_footer(result: &str) -> Option<&str> {
-    const FOOTER_PREFIX: &str = "[Full result (";
-    result.rfind(FOOTER_PREFIX).map(|idx| &result[idx..])
-}
-
-/// Indent each line of `text` by 4 spaces for nesting under a task header.
-fn indent_lines(text: &str) -> String {
-    text.lines()
-        .map(|line| format!("    {}", line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Render artifact inventory lines from pre-loaded traces.
+/// Collect artifact inventory refs from pre-loaded traces.
 ///
 /// Always rendered in the continuation prompt so the coordinator has a
-/// deterministic list of filenames available via `read_artifact`.
-fn render_artifact_lines(traces: Option<&Vec<super::persistence::ToolTraceEntry>>) -> Vec<String> {
+/// deterministic list of filenames available via `read_artifact`
+/// (`docs/redesign/ARCHITECTURE.md` section 1.4).
+fn artifact_refs(
+    traces: Option<&Vec<super::persistence::ToolTraceEntry>>,
+) -> Vec<super::context::ArtifactRef> {
     use super::persistence::ToolOutcome;
 
-    let traces = match traces.filter(|v| !v.is_empty()) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
-    let mut lines = Vec::new();
-    for t in traces {
-        if let (Some(filename), ToolOutcome::Success { output_bytes }) =
-            (&t.artifact_filename, &t.outcome)
-        {
-            lines.push(format!("[Artifact: {} ({} bytes)]", filename, output_bytes));
-        }
-    }
-    lines
+    traces
+        .into_iter()
+        .flatten()
+        .filter_map(|t| match (&t.artifact_filename, &t.outcome) {
+            (Some(filename), ToolOutcome::Success { output_bytes }) => {
+                super::context::ArtifactRef::new(filename, *output_bytes).ok()
+            }
+            (_, ToolOutcome::Success { .. } | ToolOutcome::Error { .. }) => None,
+        })
+        .collect()
 }
 
 /// Render verbose tool chain + artifact ref lines from pre-loaded traces.
@@ -1045,6 +1066,7 @@ pub(crate) enum IterationOutcome {
 
 #[cfg(test)]
 mod tests {
+    use super::super::context::{ErrorPreview, FailureHandle, PinnedGoal};
     use super::*;
 
     #[test]
@@ -1383,18 +1405,22 @@ mod tests {
             gaps: vec!["Missing root cause".into(), "No remediation steps".into()],
         };
 
-        let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
+        let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new())
+            .with_pinned_goal(PinnedGoal::new("Investigate the issue").expect("non-empty query"));
         let prompt = ctx.build_continuation_prompt(3, false, 2000);
 
         // Verify key sections are present
         assert!(prompt.contains("ITERATION 1 of 3"));
-        assert!(prompt.contains("Goal: Investigate the issue"));
+        assert!(
+            prompt.contains("Goal (verbatim from the original request): Investigate the issue")
+        );
         // No evaluator vocabulary — no "Quality Score"
         assert!(!prompt.contains("Quality Score"));
         assert!(prompt.contains("COMPLETED TASKS"));
-        assert!(prompt.contains("Task 0: Gather logs"));
-        // Completed task results appear inline, truncated to the inline budget
-        assert!(prompt.contains("Here are the logs..."));
+        // Evidence-framed entry: correlation label plus the worker's own
+        // result; the coordinator task description is not replayed.
+        assert!(prompt.contains("- Task 0\n    Here are the logs..."));
+        assert!(!prompt.contains("Gather logs"));
         assert!(prompt.contains("FAILURE SUMMARY:"));
         assert!(prompt.contains("Response lacks detail"));
         assert!(prompt.contains("AREAS NEEDING ATTENTION:"));
@@ -1671,13 +1697,17 @@ mod tests {
         let ctx = IterationContext::new(1, plan, Some(fs), vec![], HashMap::new());
         let prompt = ctx.build_continuation_prompt(3, false, 2000);
 
-        // All three sections should be present
+        // All three sections should be present, each entry a correlation
+        // label plus evidence — no coordinator task-description replay.
         assert!(prompt.contains("COMPLETED TASKS"));
-        assert!(prompt.contains("Task 0: Completed task"));
+        assert!(prompt.contains("- Task 0\n    Good result"));
         assert!(prompt.contains("FAILED TASKS"));
-        assert!(prompt.contains("Task 1: Failed task"));
+        assert!(prompt.contains("- Task 1 -> failed [agent_error]: Connection refused"));
         assert!(prompt.contains("BLOCKED TASKS"));
-        assert!(prompt.contains("Task 2: Blocked task"));
+        assert!(prompt.contains("- Task 2 -> blocked (dependency failed)"));
+        assert!(!prompt.contains("Completed task"));
+        assert!(!prompt.contains("Failed task"));
+        assert!(!prompt.contains("Blocked task"));
 
         // Verify ordering: completed before blocked before failed (redesign)
         let completed_pos = prompt.find("COMPLETED TASKS").unwrap();
@@ -1685,6 +1715,180 @@ mod tests {
         let redesign_pos = prompt.find("FAILED TASKS").unwrap();
         assert!(completed_pos < blocked_pos);
         assert!(blocked_pos < redesign_pos);
+    }
+
+    // ========================================================================
+    // R3a acceptance: evidence-framed continuation rendering
+    // ========================================================================
+
+    // ARCHITECTURE.md section 1.2: the goal line is the verbatim original
+    // user query on every iteration, not the coordinator's drifting
+    // plan.goal.
+    #[test]
+    fn continuation_goal_line_is_original_query_across_iterations() {
+        let query = "Run Windows 3.11 for Workgroups in a virtual machine using qemu";
+        for iteration in 1..=3 {
+            let mut plan = Plan::new(format!("Drifted iteration-{iteration} plan goal"));
+            let mut task = Task::new(0, "Launch the VM", "advance the goal");
+            task.complete("VM launched; VNC on 5901");
+            plan.add_task(task);
+
+            let ctx = IterationContext::new(iteration, plan, None, vec![], HashMap::new())
+                .with_pinned_goal(PinnedGoal::new(query).expect("non-empty query"));
+            let prompt = ctx.build_continuation_prompt(4, false, 2000);
+
+            let goal_line = prompt
+                .lines()
+                .find(|line| line.starts_with("Goal"))
+                .expect("goal line rendered");
+            assert_eq!(
+                goal_line,
+                format!("Goal (verbatim from the original request): {query}"),
+                "iteration {iteration}: goal line equals the original user query"
+            );
+            assert!(
+                !prompt.contains("Drifted iteration"),
+                "the coordinator's own plan goal must not render"
+            );
+        }
+    }
+
+    // ARCHITECTURE.md section 1.3: per-task entries carry a correlation
+    // label and worker evidence only; replaying the coordinator's task
+    // description next to that evidence is the confirmed blur mechanism.
+    #[test]
+    fn completed_entries_carry_no_task_description() {
+        let completed_description = "Install QEMU and launch Windows 3.11 with full configuration.";
+        let mut plan = Plan::new("goal");
+        let mut completed =
+            Task::new(0, completed_description, "set up the VM").with_worker("operator");
+        completed.complete("Installed qemu-system-i386. VM launched in tmux window 'qemu'.");
+        completed.structured_output = Some(StructuredTaskOutput {
+            summary: "QEMU running with VNC".into(),
+            confidence: super::super::tools::submit_result::Confidence::High,
+        });
+        plan.add_task(completed);
+        let mut failed =
+            Task::new(1, "Verify the desktop booted", "confirm boot").with_worker("verifier");
+        failed.fail("boom", FailureCategory::AgentError);
+        plan.add_task(failed);
+        let blocked = Task::new(2, "Correlate results", "correlate")
+            .with_dependency(1)
+            .with_worker("operator");
+        plan.add_task(blocked);
+
+        let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
+        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+        assert!(prompt.contains(
+            "- Task 0 (operator, confidence: high)\n    Installed qemu-system-i386. VM launched in tmux window 'qemu'."
+        ));
+        assert!(prompt.contains("- Task 1 (verifier) -> failed [agent_error]: boom"));
+        assert!(prompt.contains("- Task 2 (operator) -> blocked (dependency failed)"));
+        for description in [
+            completed_description,
+            "Verify the desktop booted",
+            "Correlate results",
+        ] {
+            assert!(
+                !prompt.contains(description),
+                "task description must not render: {description}"
+            );
+        }
+        // R2 gate decision 2: a claim tags a result; it does not replace a
+        // result that fits inline.
+        assert!(!prompt.contains("QEMU running with VNC"));
+    }
+
+    // ARCHITECTURE.md sections 1.4 and 1.5: the artifact inventory and the
+    // accumulated failure history survive the evidence reframing.
+    #[test]
+    fn artifact_inventory_and_failure_history_are_preserved() {
+        let mut plan = Plan::new("goal");
+        let mut task = Task::new(0, "task", "produce data").with_worker("operator");
+        task.complete(format!(
+            "{}\n\n[Full result (8123 chars) saved to artifact: task-0-operator-iter-1-result.txt]",
+            "x".repeat(100)
+        ));
+        task.structured_output = Some(StructuredTaskOutput {
+            summary: "worker summary of the spilled result".into(),
+            confidence: super::super::tools::submit_result::Confidence::High,
+        });
+        plan.add_task(task);
+
+        let mut traces = HashMap::new();
+        let mut entry = make_trace("log_search", "searching", 1000, None);
+        entry.artifact_filename = Some("task-0-operator-iter-1-log_search-0-output.txt".into());
+        traces.insert(0, vec![entry]);
+
+        let failures = vec![FailedTaskRecord {
+            description: "Gather logs".to_string(),
+            error: "Timeout contacting service".to_string(),
+            iteration: 1,
+            worker: Some("operations".to_string()),
+            category: FailureCategory::AgentTimeout,
+        }];
+
+        let ctx = IterationContext::new(2, plan, None, failures, traces);
+        let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+        // Spilled result: attested summary + footer, raw body not replayed.
+        assert!(prompt.contains(
+            "    worker summary of the spilled result\n    [Full result (8123 chars) saved to artifact: task-0-operator-iter-1-result.txt]"
+        ));
+        assert!(!prompt.contains(&"x".repeat(100)));
+        // Artifact inventory line preserved verbatim.
+        assert!(
+            prompt.contains(
+                "[Artifact: task-0-operator-iter-1-log_search-0-output.txt (1024 bytes)]"
+            )
+        );
+        // Failure history preserved, keyed by handle.
+        assert!(prompt.contains("FAILURE HISTORY:"));
+        assert!(prompt.contains(
+            "- Iteration 1: \"Gather logs\" (worker: operations) - [agent_timeout] Timeout contacting service"
+        ));
+    }
+
+    // R2 gate decision 4 through the full render: repeat detection groups
+    // by the marker-after-cap handle, and the full description never
+    // renders.
+    #[test]
+    fn repeated_failures_group_by_truncated_handle() {
+        let long_description = format!(
+            "Install QEMU and launch Windows 3.11 with full configuration. {}",
+            "Then run the next step. ".repeat(10)
+        );
+        let record = |iteration| FailedTaskRecord {
+            description: long_description.clone(),
+            error: "boom".to_string(),
+            iteration,
+            worker: None,
+            category: FailureCategory::AgentError,
+        };
+        let mut plan = Plan::new("goal");
+        let mut task = Task::new(0, "task", "retry");
+        task.fail("boom", FailureCategory::AgentError);
+        plan.add_task(task);
+
+        let ctx = IterationContext::new(2, plan, None, vec![record(1), record(2)], HashMap::new());
+        let prompt = ctx.build_continuation_prompt(4, false, 2000);
+
+        let handle = FailureHandle::from_description(&long_description).expect("non-empty");
+        assert_eq!(
+            handle.as_str().chars().count(),
+            FailureHandle::MAX_CHARS + FailureHandle::TRUNCATION_MARKER.chars().count(),
+            "cut handle is the cap plus the marker"
+        );
+        assert!(prompt.contains("OBSERVED PATTERNS:"));
+        assert!(prompt.contains(&format!(
+            "- \"{}\" has failed 2 times with [agent_error]",
+            handle.as_str()
+        )));
+        assert!(
+            !prompt.contains(&long_description),
+            "the full task description never renders"
+        );
     }
 
     // ========================================================================
@@ -2128,10 +2332,16 @@ mod tests {
                 category: FailureCategory::AgentError,
             }],
             HashMap::new(),
-        );
+        )
+        .with_pinned_goal(PinnedGoal::new("original user query").unwrap());
         let json = serde_json::to_string(&ctx).unwrap();
         let deserialized: IterationContext = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.iteration, 1);
+        assert_eq!(
+            deserialized.pinned_goal.as_ref().map(|g| g.as_str()),
+            Some("original user query"),
+            "pinned goal survives the round trip"
+        );
         let fs = deserialized
             .failure_summary
             .as_ref()
@@ -2226,6 +2436,8 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
+        // The legacy width argument is ignored: error previews own their
+        // bound (R2 gate decision 6).
         let prompt = ctx.build_continuation_prompt(3, false, 200);
 
         assert!(
@@ -2234,8 +2446,12 @@ mod tests {
             prompt
         );
         assert!(
-            !prompt.contains(&"x".repeat(5000)),
-            "prompt should not contain full 5000-char error"
+            !prompt.contains(&"x".repeat(ErrorPreview::MAX_CHARS + 1)),
+            "errors are cut at the ErrorPreview bound"
+        );
+        assert!(
+            prompt.contains(&"x".repeat(ErrorPreview::MAX_CHARS)),
+            "the bounded preview itself renders"
         );
         assert!(
             prompt.contains("[context_overflow]"),

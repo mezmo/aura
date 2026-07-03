@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use super::config::build_coordinator_preamble;
+use super::context::PinnedGoal;
 use super::events::RoutingMode;
 use super::orchestrator::Orchestrator;
 use super::persistence::build_session_context;
@@ -255,7 +256,10 @@ fn test_continuation_full_scenario() {
         gaps: vec!["Deployment history unavailable due to permissions".into()],
     };
 
-    let ctx = IterationContext::new(2, plan, Some(fs), failure_history, traces);
+    let ctx = IterationContext::new(2, plan, Some(fs), failure_history, traces).with_pinned_goal(
+        PinnedGoal::new("Investigate elevated error rates in payments service")
+            .expect("non-empty query"),
+    );
     let prompt = ctx.build_continuation_prompt(3, true, 2000);
 
     // Header
@@ -265,8 +269,26 @@ fn test_continuation_full_scenario() {
         prompt
     );
     assert!(
-        prompt.contains("Goal: Investigate elevated error rates"),
-        "goal"
+        prompt.contains(
+            "Goal (verbatim from the original request): Investigate elevated error rates"
+        ),
+        "goal line pinned to the original query"
+    );
+
+    // Evidence framing: no coordinator task description replays next to
+    // worker evidence in any per-task section.
+    assert!(
+        !prompt.contains("Search prod logs"),
+        "completed task description must not render: {}",
+        prompt
+    );
+    assert!(
+        !prompt.contains("Query deployments"),
+        "failed task description must not render"
+    );
+    assert!(
+        !prompt.contains("Correlate events"),
+        "blocked task description must not render"
     );
 
     // Completed task with structured output + confidence

@@ -59,6 +59,7 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
+use super::context::PinnedGoal;
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
@@ -3746,6 +3747,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_history.clone(),
             tool_traces,
         );
+        // Pin the continuation goal line to the verbatim original user
+        // query (docs/redesign/ARCHITECTURE.md section 1.2). A query that
+        // cannot pin (empty/whitespace-only) leaves the goal unpinned and
+        // the renderer on its plan-goal fallback instead of failing the
+        // run.
+        let post_execute_ctx = match PinnedGoal::new(query) {
+            Ok(goal) => post_execute_ctx.with_pinned_goal(goal),
+            Err(_) => post_execute_ctx,
+        };
         Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
         let decision_start = Instant::now();
         let routing = self

@@ -1,6 +1,6 @@
 ITERATION %%ITERATION%% of %%MAX_ITERATIONS%%%%URGENCY%%
 
-Goal: %%GOAL%%
+Goal (verbatim from the original request): %%GOAL%%
 Outcome: %%SUCCEEDED%% of %%TOTAL%% tasks succeeded.
 
 %%COMPLETED_SECTION%%%%BLOCKED_SECTION%%%%REDESIGN_SECTION%%%%FAILURE_SECTION%%%%FAILURE_HISTORY%%%%REUSE_GUIDANCE%%

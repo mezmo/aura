@@ -46,12 +46,11 @@ impl WorkerRole {
     ///
     /// Returns [`ContextError::EmptyWorkerRole`] when the name is empty or
     /// whitespace-only.
-    #[expect(
-        unused_variables,
-        reason = "R2 type skeleton: parsing body lands with the implementation cards"
-    )]
     pub fn new(name: &str) -> Result<Self, ContextError> {
-        todo!()
+        if name.trim().is_empty() {
+            return Err(ContextError::EmptyWorkerRole);
+        }
+        Ok(Self(name.to_owned()))
     }
 
     /// The role name.
@@ -91,12 +90,10 @@ impl IterationNumber {
     /// # Errors
     ///
     /// Returns [`ContextError::ZeroIterationNumber`] for zero.
-    #[expect(
-        unused_variables,
-        reason = "R2 type skeleton: parsing body lands with the implementation cards"
-    )]
     pub fn new(iteration: usize) -> Result<Self, ContextError> {
-        todo!()
+        NonZeroUsize::new(iteration)
+            .map(Self)
+            .ok_or(ContextError::ZeroIterationNumber)
     }
 }
 
@@ -125,12 +122,14 @@ impl WorkerClaim {
     ///
     /// Returns [`ContextError::EmptyWorkerClaimSummary`] when the summary is
     /// empty or whitespace-only.
-    #[expect(
-        unused_variables,
-        reason = "R2 type skeleton: parsing body lands with the implementation cards"
-    )]
     pub fn new(summary: &str, confidence: Confidence) -> Result<Self, ContextError> {
-        todo!()
+        if summary.trim().is_empty() {
+            return Err(ContextError::EmptyWorkerClaimSummary);
+        }
+        Ok(Self {
+            summary: summary.to_owned(),
+            confidence,
+        })
     }
 
     /// The worker's distilled summary of its own result.
@@ -151,11 +150,57 @@ impl WorkerClaim {
 impl TryFrom<&StructuredTaskOutput> for WorkerClaim {
     type Error = ContextError;
 
-    #[expect(
-        unused_variables,
-        reason = "R2 type skeleton: parsing body lands with the implementation cards"
-    )]
     fn try_from(output: &StructuredTaskOutput) -> Result<Self, Self::Error> {
-        todo!()
+        Self::new(&output.summary, output.confidence)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_worker_role_is_rejected() {
+        assert_eq!(WorkerRole::new(""), Err(ContextError::EmptyWorkerRole));
+        assert_eq!(WorkerRole::new(" \t"), Err(ContextError::EmptyWorkerRole));
+        assert_eq!(
+            WorkerRole::new("operator").expect("valid role").as_str(),
+            "operator"
+        );
+    }
+
+    #[test]
+    fn iteration_numbers_are_one_indexed() {
+        assert_eq!(
+            IterationNumber::new(0),
+            Err(ContextError::ZeroIterationNumber)
+        );
+        let one = IterationNumber::new(1).expect("iteration 1 is valid");
+        assert_eq!(one.to_string(), "1");
+    }
+
+    #[test]
+    fn worker_claim_requires_summary() {
+        assert_eq!(
+            WorkerClaim::new("", Confidence::High),
+            Err(ContextError::EmptyWorkerClaimSummary)
+        );
+
+        let empty_output = StructuredTaskOutput {
+            summary: "  ".into(),
+            confidence: Confidence::Low,
+        };
+        assert_eq!(
+            WorkerClaim::try_from(&empty_output),
+            Err(ContextError::EmptyWorkerClaimSummary)
+        );
+
+        let output = StructuredTaskOutput {
+            summary: "Found 47 error groups".into(),
+            confidence: Confidence::High,
+        };
+        let claim = WorkerClaim::try_from(&output).expect("summary present");
+        assert_eq!(claim.summary(), "Found 47 error groups");
+        assert_eq!(claim.confidence(), Confidence::High);
     }
 }
