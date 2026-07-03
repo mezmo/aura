@@ -59,7 +59,7 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
-use super::context::PinnedGoal;
+use super::context::{CoordinatorTurn, PinnedGoal};
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
@@ -1304,6 +1304,36 @@ impl Orchestrator {
         format!("Current time: {timestamp}\n\n{base}")
     }
 
+    /// The assistant turn recorded after a routing decision: the compact
+    /// decision text — variant, rationale, and plan shape for `create_plan`;
+    /// the model's actual response or question text for the terminal
+    /// variants — never the pretty-printed `PlanningResponse` JSON, which
+    /// duplicated every task description into the conversation
+    /// (`docs/redesign/ARCHITECTURE.md` sections 2.2-2.3).
+    ///
+    /// A decision the compact recorder rejects (empty rationale, empty
+    /// plan, empty response or question text) degrades to the model's own
+    /// streamed text, then to the bare variant name, rather than failing
+    /// the run. The variant-name tier is structurally task-body-free; the
+    /// model-text tier records narration that can mention tasks, matching
+    /// the old primary recording, so the at-most-once property still holds
+    /// because the continuation adds no second copy.
+    pub(crate) fn compact_decision_turn(decision: &PlanningResponse, model_text: &str) -> String {
+        match CoordinatorTurn::try_from(decision) {
+            Ok(turn) => String::from(turn.render()),
+            Err(e) => {
+                tracing::warn!(
+                    "Routing decision has no compact turn ({e}); recording fallback text"
+                );
+                if model_text.trim().is_empty() {
+                    decision.variant_name().to_owned()
+                } else {
+                    model_text.to_owned()
+                }
+            }
+        }
+    }
+
     /// Plan with routing tool support via persistent conversation.
     ///
     /// Uses the coordinator from `CoordinatorState` (created once at
@@ -1449,14 +1479,10 @@ impl Orchestrator {
             let decision = coordinator_state.routing_decision.lock().await.take();
 
             if let Some(planning_response) = decision {
-                let response_text = if response.content.trim().is_empty() {
-                    serde_json::to_string_pretty(&planning_response)
-                        .unwrap_or_else(|_| response.content.clone())
-                } else {
-                    response.content.clone()
-                };
+                let response_text =
+                    Self::compact_decision_turn(&planning_response, &response.content);
 
-                // Grow conversation: assistant turn (serialized routing decision)
+                // Grow conversation: assistant turn (compact routing decision)
                 coordinator_state
                     .conversation
                     .push(rig::completion::Message::assistant(&response_text));

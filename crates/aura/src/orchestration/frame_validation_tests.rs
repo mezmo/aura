@@ -19,8 +19,8 @@ use super::persistence::{
 };
 use super::templates::{WorkerTaskVars, render_worker_task_prompt};
 use super::types::{
-    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, Plan,
-    StructuredTaskOutput, Task, TaskStatus,
+    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, Plan, PlanningResponse,
+    StepInput, StructuredTaskOutput, Task, TaskStatus,
 };
 
 // ========================================================================
@@ -1063,6 +1063,76 @@ fn test_planning_wrapper_multi_worker_guidelines() {
     assert!(prompt.contains("\"sre\", \"dev\""), "multiple worker names");
     assert!(prompt.contains("## sre"), "sre worker section");
     assert!(prompt.contains("## dev"), "dev worker section");
+}
+
+// ========================================================================
+// Frame 2b — Decision turn recording (R3b acceptance)
+// ========================================================================
+
+/// R3b acceptance: after a `create_plan` decision, the task description
+/// appears at most once across the accumulated conversation and the next
+/// continuation prompt (`docs/redesign/ARCHITECTURE.md` section 2.3).
+///
+/// The accumulated conversation for the planning iteration is exactly what
+/// `plan_with_routing` records: the planning prompt as the user turn (built
+/// before the plan exists, so it cannot carry the description) and the
+/// compact decision text as the assistant turn.
+#[test]
+fn test_task_description_appears_at_most_once_across_conversation_and_continuation() {
+    const TASK_DESCRIPTION: &str = "Inventory the VLAN-4093 switch fabric and capture \
+         firmware versions from every distribution switch";
+    let query = "Audit the network fabric for firmware drift";
+
+    let decision = PlanningResponse::StepsPlan {
+        goal: query.to_string(),
+        steps: vec![
+            StepInput::LeafTask {
+                task: TASK_DESCRIPTION.to_string(),
+                worker: Some("operator".to_string()),
+            },
+            StepInput::LeafTask {
+                task: "Compare captured firmware versions against the golden baseline".to_string(),
+                worker: Some("verifier".to_string()),
+            },
+        ],
+        routing_rationale: "Firmware inventory requires switch access through tools.".to_string(),
+        planning_summary: "Inventory the fabric, then verify against baseline.".to_string(),
+    };
+
+    // The conversation as plan_with_routing accumulates it for iteration 1.
+    let planning_prompt = Orchestrator::build_planning_wrapper(query, "", "");
+    let decision_turn = Orchestrator::compact_decision_turn(&decision, "");
+    assert_eq!(
+        decision_turn,
+        "create_plan: 2 tasks (operator, verifier). \
+         Rationale: Firmware inventory requires switch access through tools.",
+        "the recorded assistant turn is the compact decision text"
+    );
+
+    // Execute the plan and render the next continuation prompt.
+    let mut plan = decision.into_plan().expect("two-leaf plan flattens");
+    plan.tasks[0].complete(
+        "Collected firmware versions from 14 distribution switches; 3 lag the baseline."
+            .to_string(),
+    );
+    plan.tasks[1].complete("All 3 lagging switches confirmed below golden baseline.".to_string());
+    let ctx = IterationContext::new(1, plan, None, Vec::new(), HashMap::new())
+        .with_pinned_goal(PinnedGoal::new(query).expect("non-empty query"));
+    let continuation = ctx.build_continuation_prompt(3, false, 2000);
+
+    assert!(
+        !decision_turn.contains(TASK_DESCRIPTION),
+        "recorded decision turn must not replay the task description"
+    );
+    assert!(
+        !continuation.contains(TASK_DESCRIPTION),
+        "continuation prompt must not replay the task description"
+    );
+    let accumulated = format!("{planning_prompt}\n{decision_turn}\n{continuation}");
+    assert!(
+        accumulated.matches(TASK_DESCRIPTION).count() <= 1,
+        "task description appears at most once across conversation + continuation"
+    );
 }
 
 // ========================================================================
