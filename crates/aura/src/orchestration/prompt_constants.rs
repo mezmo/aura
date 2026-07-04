@@ -12,6 +12,7 @@
 
 /// Section headers for worker prompts.
 pub mod sections {
+    #[allow(dead_code)]
     pub const PRIOR_WORK: &str = "COMPLETED";
 }
 
@@ -28,6 +29,7 @@ pub mod fields {
 
 /// Context formatting constants.
 pub mod context {
+    #[allow(dead_code)]
     pub const DEPENDENCY_SEPARATOR: &str = "\n\n---\n\n";
 }
 

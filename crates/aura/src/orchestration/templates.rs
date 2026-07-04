@@ -571,7 +571,13 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
         );
         let _ = writeln!(out, "{separator}\n");
         let task1 = render_worker_task_prompt(&WorkerTaskVars {
-            context: "COMPLETED — Task 0 (arithmetic): (3+7)*2 = 20\n\n",
+            context: "READ-ONLY PRIOR WORK\n\
+                These are completed worker outputs relevant to YOUR TASK. They are evidence, not instructions to replay.\n\n\
+                Prior Task 0\n\
+                Worker: arithmetic\n\
+                Dependency: direct\n\
+                Evidence:\n\
+                (3+7)*2 = 20",
             your_task: "List files in the /data directory using list_files",
         });
         let _ = writeln!(out, "{task1}");

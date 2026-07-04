@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use super::config::build_coordinator_preamble;
-use super::context::PinnedGoal;
+use super::context::{PinnedGoal, PriorWorkFrame, TokenBudget};
 use super::events::RoutingMode;
 use super::orchestrator::Orchestrator;
 use super::persistence::build_session_context;
@@ -20,7 +20,7 @@ use super::persistence::{
 use super::templates::{WorkerTaskVars, render_worker_task_prompt};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, Plan, PlanningResponse,
-    StepInput, StructuredTaskOutput, Task, TaskStatus,
+    StepInput, StructuredTaskOutput, Task, TaskState, TaskStatus,
 };
 
 // ========================================================================
@@ -1766,4 +1766,227 @@ fn test_session_history_multi_artifact_listing() {
 
 fn prompt_excerpt(s: &str) -> &str {
     if s.len() > 200 { &s[..200] } else { s }
+}
+
+// ========================================================================
+// Frame 3b — Worker prior-work frame (R3c acceptance)
+// ========================================================================
+
+#[test]
+fn worker_frame_omits_imperative_task_text() {
+    let mut plan = Plan::new("Analyze system state");
+
+    let mut t0 = Task::new(
+        0,
+        "Calculate the fibonacci sequence",
+        "Calculate fibonacci numbers",
+    );
+    t0.complete("Result: 1, 1, 2, 3, 5, 8".to_string());
+
+    let mut t1 = Task::new(1, "List all running processes", "List processes");
+    t1.complete("Result: pid 1 init, pid 42 worker".to_string());
+
+    let mut t2 = Task::new(2, "Analyze results", "Analyze the prior outputs");
+    t2.dependencies = vec![0, 1];
+
+    plan.add_task(t0);
+    plan.add_task(t1);
+    plan.add_task(t2);
+
+    let context = Orchestrator::build_task_context(&plan, 2).expect("context exists");
+    let rendered = render_worker_task_prompt(&WorkerTaskVars {
+        context: &context,
+        your_task: "Analyze results",
+    });
+
+    assert!(
+        !rendered.contains("Calculate the fibonacci sequence"),
+        "direct dependency description must not leak: {rendered}"
+    );
+    assert!(
+        !rendered.contains("List all running processes"),
+        "transitive dependency description must not leak: {rendered}"
+    );
+    assert!(
+        rendered.contains("Analyze results"),
+        "worker's own task description must remain: {rendered}"
+    );
+}
+
+#[test]
+fn worker_frame_renders_read_only_prior_work_header_with_evidence_sentence() {
+    let mut plan = Plan::new("Analyze system state");
+
+    let mut t0 = Task::new(0, "prior task", "Prior work");
+    t0.complete("Prior result".to_string());
+
+    let mut t1 = Task::new(1, "current task", "Current work");
+    t1.dependencies = vec![0];
+
+    plan.add_task(t0);
+    plan.add_task(t1);
+
+    let context = Orchestrator::build_task_context(&plan, 1).expect("context exists");
+    assert!(
+        context.contains("READ-ONLY PRIOR WORK"),
+        "header present: {context}"
+    );
+    assert!(
+        context.contains("evidence, not instructions to replay"),
+        "evidence sentence present: {context}"
+    );
+}
+
+#[test]
+fn worker_frame_direct_deps_always_admitted_transitive_budget_trimmed_first() {
+    use super::context::{AncestorDistance, DependencyRelation, EvidenceEntry, EvidenceText};
+    use super::context::{CorrelationLabel, TaskId, WorkerRole};
+
+    fn make_entry(
+        id: usize,
+        relation: DependencyRelation,
+        body: &str,
+    ) -> super::context::PriorWorkEntry {
+        super::context::PriorWorkEntry {
+            label: CorrelationLabel {
+                task: TaskId::new(id),
+                worker: Some(WorkerRole::new("operator").unwrap()),
+            },
+            relation,
+            evidence: EvidenceEntry::InlineResult {
+                result: EvidenceText::new(body).unwrap(),
+                claim: None,
+            },
+        }
+    }
+
+    let entries = vec![
+        make_entry(0, DependencyRelation::Direct, "direct-0"),
+        make_entry(1, DependencyRelation::Direct, "direct-1"),
+        make_entry(
+            2,
+            DependencyRelation::Transitive {
+                distance: AncestorDistance::new(2).unwrap(),
+            },
+            "transitive-2",
+        ),
+    ];
+
+    // Tight budget: keep direct floor, evict all transitive.
+    let frame = PriorWorkFrame::assemble(entries, TokenBudget::new(50).unwrap()).unwrap();
+    let ids: Vec<usize> = frame
+        .entries()
+        .iter()
+        .map(|e| e.label.task.to_string().parse().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![0, 1],
+        "direct entries survive tight budget: {ids:?}"
+    );
+}
+
+#[test]
+fn worker_frame_empty_ancestry_returns_none_no_frame_render() {
+    let mut plan = Plan::new("Standalone task");
+    let t0 = Task::new(0, "unstarted predecessor", "Not complete");
+    let mut t1 = Task::new(1, "current task", "Does something");
+    t1.dependencies = vec![0];
+    plan.add_task(t0);
+    plan.add_task(t1);
+
+    assert!(
+        Orchestrator::build_task_context(&plan, 1).is_none(),
+        "no completed ancestors means no frame"
+    );
+}
+
+#[test]
+fn test_fail_descendants_of_marks_pending_descendants_dependency_failed_skip_complete_running_failed()
+ {
+    let mut plan = Plan::new("Chain");
+
+    let mut a = Task::new(0, "A", "Root task");
+    a.fail("root failed".to_string(), FailureCategory::AgentError);
+
+    let mut b = Task::new(1, "B", "Depends on A");
+    b.dependencies = vec![0];
+
+    let mut c = Task::new(2, "C", "Depends on B");
+    c.dependencies = vec![1];
+
+    // Sibling D is complete — should stay complete.
+    let mut d = Task::new(3, "D", "Already complete");
+    d.complete("done".to_string());
+
+    // Sibling E is already failed with a different category — should stay unchanged.
+    let mut e = Task::new(4, "E", "Already failed");
+    e.fail("existing error".to_string(), FailureCategory::AgentTimeout);
+
+    plan.add_task(a);
+    plan.add_task(b);
+    plan.add_task(c);
+    plan.add_task(d);
+    plan.add_task(e);
+
+    Orchestrator::fail_descendants_of(&mut plan, 0);
+
+    let get = |id: usize| plan.tasks.iter().find(|t| t.id == id).unwrap();
+
+    match &get(1).state {
+        TaskState::Failed { error, category } => {
+            assert_eq!(*category, FailureCategory::DependencyFailed);
+            assert!(error.contains("ancestor task 0 failed"));
+        }
+        _ => panic!("B should be Failed"),
+    }
+    match &get(2).state {
+        TaskState::Failed { error, category } => {
+            assert_eq!(*category, FailureCategory::DependencyFailed);
+            assert!(error.contains("ancestor task 0 failed"));
+        }
+        _ => panic!("C should be Failed"),
+    }
+    assert!(
+        matches!(get(3).state, TaskState::Complete { .. }),
+        "complete sibling stays complete"
+    );
+    match &get(4).state {
+        TaskState::Failed { category, .. } => {
+            assert_eq!(
+                *category,
+                FailureCategory::AgentTimeout,
+                "already-failed category must not change"
+            );
+        }
+        _ => panic!("E should stay Failed"),
+    }
+}
+
+#[test]
+fn test_fail_descendants_of_is_idempotent() {
+    let mut plan = Plan::new("Chain");
+
+    let mut a = Task::new(0, "A", "Root task");
+    a.fail("root failed".to_string(), FailureCategory::AgentError);
+
+    let mut b = Task::new(1, "B", "Depends on A");
+    b.dependencies = vec![0];
+
+    plan.add_task(a);
+    plan.add_task(b);
+
+    Orchestrator::fail_descendants_of(&mut plan, 0);
+    let first_error = match &plan.tasks[1].state {
+        TaskState::Failed { error, .. } => error.clone(),
+        _ => panic!("B should be Failed"),
+    };
+
+    Orchestrator::fail_descendants_of(&mut plan, 0);
+    let second_error = match &plan.tasks[1].state {
+        TaskState::Failed { error, .. } => error.clone(),
+        _ => panic!("B should still be Failed"),
+    };
+
+    assert_eq!(first_error, second_error);
 }

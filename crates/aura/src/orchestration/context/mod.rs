@@ -14,8 +14,10 @@
 //! continuation-rendering bodies: the parsing constructors in `goal`,
 //! `label`, `evidence`, and `failure_history`, and the render methods
 //! for completed, failed, and blocked entries and failure records.
-//! Card R3b implemented the decision-turn bodies (`turn`); the worker
-//! prior-work frame (`frame`, card R3c) is still a `todo!()` stub. The
+//! Card R3b implemented the decision-turn bodies (`turn`); card R3c
+//! implemented the worker prior-work frame (`frame`) and the
+//! `EvidenceEntry::ArtifactPointerOnly` variant for spilled results with
+//! no inline content. The
 //! format-bearing `Display` bodies ([`SpilledArtifact`], [`ArtifactRef`])
 //! reproduce today's artifact footer and inventory line formats, which the
 //! architecture pins as unchanged.

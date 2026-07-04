@@ -59,7 +59,10 @@ use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
-use super::context::{CoordinatorTurn, PinnedGoal};
+use super::context::{
+    AncestorDistance, CoordinatorTurn, CorrelationLabel, DependencyRelation, EvidenceEntry,
+    PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim, WorkerRole,
+};
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
@@ -2623,7 +2626,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .ready_tasks()
                 .iter()
                 .map(|t| {
-                    let context = self.build_task_context(plan, t.id);
+                    let context = Self::build_task_context(plan, t.id);
                     (t.id, t.description.clone(), context, t.worker.clone())
                 })
                 .collect();
@@ -2707,6 +2710,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             }
                             t.structured_output = exec_result.structured_output;
                         }
+                        if !success {
+                            Self::fail_descendants_of(plan, task_id);
+                        }
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
                                 OrchestratorEvent::TaskCompleted {
@@ -2737,6 +2743,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(err_str.clone(), category);
                         }
+                        Self::fail_descendants_of(plan, task_id);
                         let _ = event_tx
                             .send(Ok(StreamItem::OrchestratorEvent(
                                 OrchestratorEvent::TaskCompleted {
@@ -2831,55 +2838,146 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
     }
 
-    /// Build context for a task from its completed dependencies and the plan goal.
+    /// Build the read-only prior-work context for a worker task.
     ///
-    /// Includes:
-    /// - For each dependency: description, rationale, and result
-    /// - The current task's rationale (how this task advances the goal)
+    /// Walks the completed ancestor closure of `task_id`, builds a
+    /// [`PriorWorkEntry`] for each completed ancestor, and assembles them
+    /// under the default token budget. Direct dependencies are the floor;
+    /// transitive ancestors fill remaining budget nearest-first.
     ///
-    /// This ensures workers understand not just WHAT to do, but WHY.
-    ///
-    /// # Research Inspirations
-    ///
-    /// Based on patterns from:
-    /// - LangChain's Write-Select-Compress-Isolate framework
-    /// - LlamaIndex's Sub-Question Query Engine
-    /// - Anthropic's context engineering principles
-    fn build_task_context(&self, plan: &Plan, task_id: usize) -> Option<String> {
-        use super::prompt_constants::{context, sections};
+    /// Returns `None` when the task has no completed ancestors, so the
+    /// `%%CONTEXT%%` slot is left empty.
+    pub(crate) fn build_task_context(plan: &Plan, task_id: usize) -> Option<String> {
+        let ancestors = Self::completed_ancestors(plan, task_id);
+        if ancestors.is_empty() {
+            return None;
+        }
 
-        let task = plan.tasks.iter().find(|t| t.id == task_id)?;
+        let entries: Vec<PriorWorkEntry> = ancestors
+            .into_iter()
+            .filter_map(|(ancestor_id, distance)| {
+                let ancestor = plan.tasks.iter().find(|t| t.id == ancestor_id)?;
+                let result = match &ancestor.state {
+                    TaskState::Complete { result } => result,
+                    _ => return None,
+                };
 
-        // Build structured dependency context — compact format to prevent scope creep
+                let label = CorrelationLabel {
+                    task: TaskId::new(ancestor_id),
+                    worker: ancestor
+                        .worker
+                        .as_deref()
+                        .and_then(|w| WorkerRole::new(w).ok()),
+                };
 
-        if !task.dependencies.is_empty() {
-            let dep_parts: Vec<String> = task
-                .dependencies
-                .iter()
-                .filter_map(|dep_id| {
-                    plan.tasks
-                        .iter()
-                        .find(|t| t.id == *dep_id)
-                        .and_then(|dep_task| match &dep_task.state {
-                            TaskState::Complete { result } => Some(format!(
-                                "{} — Task {} ({}):\n{}",
-                                sections::PRIOR_WORK,
-                                dep_task.id,
-                                dep_task.description,
-                                result
-                            )),
-                            _ => None,
-                        })
+                let claim = ancestor
+                    .structured_output
+                    .as_ref()
+                    .and_then(|so| WorkerClaim::try_from(so).ok());
+
+                let evidence = match EvidenceEntry::from_completed_result(result, claim) {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to build evidence entry for task {}: {}",
+                            ancestor_id,
+                            e
+                        );
+                        return None;
+                    }
+                };
+
+                let relation = if distance == 1 {
+                    DependencyRelation::Direct
+                } else {
+                    DependencyRelation::Transitive {
+                        distance: AncestorDistance::new(distance)
+                            .expect("distance >= 2 for transitive"),
+                    }
+                };
+
+                Some(PriorWorkEntry {
+                    label,
+                    relation,
+                    evidence,
                 })
-                .collect();
+            })
+            .collect();
 
-            if dep_parts.is_empty() {
-                None
-            } else {
-                Some(dep_parts.join(context::DEPENDENCY_SEPARATOR))
+        if entries.is_empty() {
+            return None;
+        }
+
+        let frame = PriorWorkFrame::assemble(entries, TokenBudget::default()).ok()?;
+        Some(String::from(frame.render()))
+    }
+
+    /// Find all completed ancestors of `task_id` with their shortest edge
+    /// distance. Distance 1 is a direct dependency; larger distances are
+    /// transitive. Results are returned in plan order (ascending task id).
+    pub(crate) fn completed_ancestors(plan: &Plan, task_id: usize) -> Vec<(usize, usize)> {
+        use std::collections::{HashMap, VecDeque};
+
+        let mut best_distance: HashMap<usize, usize> = HashMap::new();
+        let mut queue = VecDeque::new();
+        best_distance.insert(task_id, 0);
+        queue.push_back(task_id);
+
+        while let Some(current_id) = queue.pop_front() {
+            let current_distance = best_distance[&current_id];
+            if let Some(current_task) = plan.tasks.iter().find(|t| t.id == current_id) {
+                for &dep_id in &current_task.dependencies {
+                    let next_distance = current_distance + 1;
+                    match best_distance.entry(dep_id) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            if next_distance < *e.get() {
+                                e.insert(next_distance);
+                                queue.push_back(dep_id);
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(next_distance);
+                            queue.push_back(dep_id);
+                        }
+                    }
+                }
             }
-        } else {
-            None
+        }
+
+        best_distance.remove(&task_id);
+
+        let mut completed: Vec<(usize, usize)> = best_distance
+            .into_iter()
+            .filter(|(id, _)| {
+                plan.tasks
+                    .iter()
+                    .any(|t| t.id == *id && matches!(t.state, TaskState::Complete { .. }))
+            })
+            .collect();
+        completed.sort_by_key(|(id, _)| *id);
+        completed
+    }
+
+    /// Mark all transitive pending descendants of `failed_task_id` as failed
+    /// with [`FailureCategory::DependencyFailed`]. Complete, Running, and
+    /// already-Failed descendants are skipped. Calling this twice on the same
+    /// failed task is a no-op for already-failed descendants.
+    pub(crate) fn fail_descendants_of(plan: &mut Plan, failed_task_id: usize) {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(failed_task_id);
+
+        while let Some(current_id) = queue.pop_front() {
+            for task in plan.tasks.iter_mut() {
+                if task.dependencies.contains(&current_id)
+                    && matches!(task.state, TaskState::Pending)
+                {
+                    task.fail(
+                        format!("ancestor task {} failed", failed_task_id),
+                        FailureCategory::DependencyFailed,
+                    );
+                    queue.push_back(task.id);
+                }
+            }
         }
     }
 

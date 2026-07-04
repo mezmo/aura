@@ -54,7 +54,7 @@ fn label_suffix(worker: Option<&WorkerRole>, confidence: Option<Confidence>) -> 
 
 /// Indent each line of worker-reported text by 4 spaces for nesting under
 /// the entry's label line.
-fn indent(text: &str) -> String {
+pub(super) fn indent(text: &str) -> String {
     text.lines()
         .map(|line| format!("    {line}"))
         .collect::<Vec<_>>()
@@ -259,6 +259,13 @@ pub enum EvidenceEntry {
         /// The worker's `submit_result` claim.
         claim: WorkerClaim,
     },
+    /// A spilled result whose prefix before the artifact footer is
+    /// whitespace-only. The footer pointer is preserved and the render
+    /// notes that no inline preview is available.
+    ArtifactPointerOnly {
+        /// Pointer to the spilled full result.
+        artifact: SpilledArtifact,
+    },
 }
 
 impl EvidenceEntry {
@@ -271,6 +278,9 @@ impl EvidenceEntry {
     /// same text can never parse as both, because [`EvidenceText::new`]
     /// rejects exactly what the footer parser accepts (R2 gate decision 5).
     ///
+    /// A footered result whose prefix is whitespace-only becomes
+    /// [`EvidenceEntry::ArtifactPointerOnly`] so the pointer is not lost.
+    ///
     /// # Errors
     ///
     /// Propagates the constructor errors of the selected variant's fields.
@@ -280,14 +290,16 @@ impl EvidenceEntry {
     ) -> Result<Self, ContextError> {
         match parse_trailing_footer(result_text) {
             Some(footer) => {
+                let prefix = result_text[..footer.start].trim_end();
+                if prefix.is_empty() {
+                    return Ok(Self::spilled_no_preview(footer.artifact));
+                }
                 let stand_in = match claim {
                     Some(claim) => ArtifactStandIn::Claim(claim),
                     // The spill path stores a bounded preview ahead of the
                     // footer; that prefix is the stand-in when no claim
                     // exists.
-                    None => ArtifactStandIn::Preview(ResultPreview::new(
-                        result_text[..footer.start].trim_end(),
-                    )?),
+                    None => ArtifactStandIn::Preview(ResultPreview::new(prefix)?),
                 };
                 Ok(Self::ArtifactPointer {
                     stand_in,
@@ -298,6 +310,42 @@ impl EvidenceEntry {
                 result: EvidenceText::new(result_text)?,
                 claim,
             }),
+        }
+    }
+
+    /// Build an artifact-pointer entry with no inline preview.
+    pub fn spilled_no_preview(artifact: SpilledArtifact) -> Self {
+        Self::ArtifactPointerOnly { artifact }
+    }
+
+    /// The worker's claim carried by this evidence, if any.
+    pub(super) fn claim(&self) -> Option<&WorkerClaim> {
+        match self {
+            Self::InlineResult { claim, .. } => claim.as_ref(),
+            Self::ArtifactPointer { stand_in, .. } => match stand_in {
+                ArtifactStandIn::Claim(claim) => Some(claim),
+                ArtifactStandIn::Preview(_) => None,
+            },
+            Self::SummaryOnly { claim } => Some(claim),
+            Self::ArtifactPointerOnly { .. } => None,
+        }
+    }
+
+    /// Render the worker-reported body of this entry as unindented text.
+    pub(crate) fn render_body(&self) -> String {
+        match self {
+            Self::InlineResult { result, .. } => result.as_str().to_owned(),
+            Self::ArtifactPointer { stand_in, artifact } => {
+                let stand_in_text = match stand_in {
+                    ArtifactStandIn::Claim(claim) => claim.summary(),
+                    ArtifactStandIn::Preview(preview) => preview.as_str(),
+                };
+                format!("{stand_in_text}\n{artifact}")
+            }
+            Self::SummaryOnly { claim } => claim.summary().to_owned(),
+            Self::ArtifactPointerOnly { artifact } => {
+                format!("(no inline preview)\n{artifact}")
+            }
         }
     }
 }
@@ -384,34 +432,14 @@ impl CompletedEntry {
     /// label line, the indented worker evidence, and the artifact inventory
     /// lines (`ARCHITECTURE.md` sections 1.3 and 1.4).
     pub fn render(&self) -> RenderedContext {
-        let confidence = match &self.evidence {
-            EvidenceEntry::InlineResult { claim, .. } => {
-                claim.as_ref().map(WorkerClaim::confidence)
-            }
-            EvidenceEntry::ArtifactPointer { stand_in, .. } => match stand_in {
-                ArtifactStandIn::Claim(claim) => Some(claim.confidence()),
-                ArtifactStandIn::Preview(_) => None,
-            },
-            EvidenceEntry::SummaryOnly { claim } => Some(claim.confidence()),
-        };
+        let confidence = self.evidence.claim().map(WorkerClaim::confidence);
         let mut text = format!(
             "- Task {}{}",
             self.label.task,
             label_suffix(self.label.worker.as_ref(), confidence)
         );
-        let body = match &self.evidence {
-            EvidenceEntry::InlineResult { result, .. } => indent(result.as_str()),
-            EvidenceEntry::ArtifactPointer { stand_in, artifact } => {
-                let stand_in_text = match stand_in {
-                    ArtifactStandIn::Claim(claim) => indent(claim.summary()),
-                    ArtifactStandIn::Preview(preview) => indent(preview.as_str()),
-                };
-                format!("{stand_in_text}\n    {artifact}")
-            }
-            EvidenceEntry::SummaryOnly { claim } => indent(claim.summary()),
-        };
         text.push('\n');
-        text.push_str(&body);
+        text.push_str(&indent(&self.evidence.render_body()));
         for artifact in &self.artifacts {
             text.push_str(&format!("\n    {artifact}"));
         }
@@ -701,6 +729,45 @@ mod tests {
         assert_eq!(
             unassigned.render().as_str(),
             "- Task 0 -> blocked (dependency failed)"
+        );
+    }
+
+    #[test]
+    fn from_completed_result_whitespace_only_prefix_returns_artifact_pointer_only() {
+        let text = format!("   \n\n{FOOTER}");
+        let entry = EvidenceEntry::from_completed_result(&text, None)
+            .expect("whitespace-only prefix parses");
+        assert!(
+            matches!(entry, EvidenceEntry::ArtifactPointerOnly { .. }),
+            "expected ArtifactPointerOnly, got {entry:?}"
+        );
+        assert!(entry.render_body().contains(FOOTER));
+    }
+
+    #[test]
+    fn from_completed_result_whitespace_only_prefix_renders_no_inline_preview_tag_and_footer() {
+        let text = format!("   \n\n{FOOTER}");
+        let entry = EvidenceEntry::from_completed_result(&text, None).expect("parses");
+        let rendered = CompletedEntry {
+            label: label(Some("operator")),
+            evidence: entry,
+            artifacts: vec![],
+        }
+        .render();
+        let rendered = rendered.as_str();
+        assert!(
+            rendered.contains("(no inline preview)"),
+            "missing tag: {rendered}"
+        );
+        assert!(rendered.contains(FOOTER), "missing footer: {rendered}");
+    }
+
+    #[test]
+    fn bare_label_fallback_unreachable_for_whitespace_only_prefix() {
+        let text = format!("   \n\n{FOOTER}");
+        assert!(
+            EvidenceEntry::from_completed_result(&text, None).is_ok(),
+            "whitespace-only prefix + footer must parse successfully"
         );
     }
 }
