@@ -71,6 +71,7 @@ services:
       OTEL_CONTENT_MAX_LENGTH:
       OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT:
       OTEL_SERVICE_NAME:
+      AURA_PROMPT_JOURNAL:
     env_file:
       - ./env/test.env
     volumes:
