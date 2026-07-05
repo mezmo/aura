@@ -1406,6 +1406,12 @@ impl Orchestrator {
             // Build full history: external chat + accumulated coordinator conversation
             let mut full_history = chat_history.to_vec();
             full_history.extend(coordinator_state.conversation.iter().cloned());
+            crate::logging::set_coordinator_input_attributes(
+                &tracing::Span::current(),
+                &coordinator_state.preamble,
+                &full_history,
+                &prompt,
+            );
 
             self.journal_record(
                 JournalPhase::Planning {

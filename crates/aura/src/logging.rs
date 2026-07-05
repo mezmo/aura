@@ -123,6 +123,12 @@ pub const ATTR_OUTPUT_MIME_TYPE: &str = "output.mime_type";
 pub const ATTR_OUTPUT_LENGTH: &str = "output.length";
 pub const ATTR_OUTPUT_VALUE: &str = "output.value";
 
+pub const ATTR_COORDINATOR_INPUT_HISTORY_MESSAGES: &str = "coordinator.input.history_message_count";
+pub const ATTR_COORDINATOR_INPUT_PREAMBLE_LENGTH: &str = "coordinator.input.preamble_length";
+pub const ATTR_COORDINATOR_INPUT_PROMPT_LENGTH: &str = "coordinator.input.prompt_length";
+pub const ATTR_COORDINATOR_INPUT_CONTENT_RECORDED: &str = "coordinator.input.content_recorded";
+pub const ATTR_COORDINATOR_INPUT_CONTENT_TRUNCATED: &str = "coordinator.input.content_truncated";
+
 // Tool-level attributes (used by `mcp_tool_execution.rs` and `openinference_exporter.rs`)
 pub const ATTR_TOOL_NAME: &str = "tool.name";
 pub const ATTR_TOOL_PARAMETERS: &str = "tool.parameters";
@@ -172,6 +178,12 @@ pub fn init_content_config() {
     {
         CONTENT_MAX_LENGTH.store(n, Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn set_content_config_for_tests(record_content: bool, max_length: usize) {
+    RECORD_CONTENT.store(record_content, Ordering::Relaxed);
+    CONTENT_MAX_LENGTH.store(max_length, Ordering::Relaxed);
 }
 
 /// Custom formatter that truncates long log lines to prevent overwhelming output
@@ -518,6 +530,66 @@ pub fn set_output_attributes(span: &tracing::Span, _text: &str) {
     let _ = span;
 }
 
+/// Render the coordinator input exactly as Aura can observe it: system preamble,
+/// folded message history, then the current coordinator user prompt.
+pub fn render_coordinator_input(
+    preamble: &str,
+    history: &[rig::completion::Message],
+    current_prompt: &str,
+) -> String {
+    let history_json = serde_json::to_string(history).unwrap_or_else(|err| {
+        tracing::warn!("Failed to render coordinator history for OTel: {err}");
+        format!("[history serialization failed: {err}]")
+    });
+
+    format!(
+        "SYSTEM PREAMBLE:\n{preamble}\n\nHISTORY JSON (oldest to newest):\n{history_json}\n\nCURRENT USER PROMPT:\n{current_prompt}"
+    )
+}
+
+/// Record the full coordinator input on the current planning span.
+pub fn set_coordinator_input_attributes(
+    span: &tracing::Span,
+    preamble: &str,
+    history: &[rig::completion::Message],
+    current_prompt: &str,
+) {
+    let rendered = render_coordinator_input(preamble, history, current_prompt);
+    let content_recorded = should_record_content();
+    let content_truncated = content_recorded && rendered.len() > content_max_length();
+
+    set_span_attribute(span, ATTR_INPUT_MIME_TYPE, "text/plain");
+    set_span_attribute(span, ATTR_INPUT_LENGTH, rendered.len() as i64);
+    set_span_attribute(
+        span,
+        ATTR_COORDINATOR_INPUT_HISTORY_MESSAGES,
+        history.len() as i64,
+    );
+    set_span_attribute(
+        span,
+        ATTR_COORDINATOR_INPUT_PREAMBLE_LENGTH,
+        preamble.len() as i64,
+    );
+    set_span_attribute(
+        span,
+        ATTR_COORDINATOR_INPUT_PROMPT_LENGTH,
+        current_prompt.len() as i64,
+    );
+    set_span_attribute(
+        span,
+        ATTR_COORDINATOR_INPUT_CONTENT_RECORDED,
+        content_recorded,
+    );
+    set_span_attribute(
+        span,
+        ATTR_COORDINATOR_INPUT_CONTENT_TRUNCATED,
+        content_truncated,
+    );
+    if content_recorded {
+        set_span_attribute(span, ATTR_INPUT_VALUE, truncate_for_otel(&rendered));
+    }
+}
+
 /// Force-flush all pending spans to the OTLP exporter.
 ///
 /// The `BatchSpanProcessor` buffers spans and exports on a timer (default 5 s)
@@ -585,3 +657,37 @@ pub async fn shutdown_tracer() {
 
 #[cfg(not(feature = "otel"))]
 pub async fn shutdown_tracer() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinator_input_render_preserves_message_order() {
+        let history = vec![
+            rig::completion::Message::user("initial query"),
+            rig::completion::Message::assistant("create_plan: 1 task"),
+            rig::completion::Message::tool_result("route-1", "tool accepted the plan"),
+        ];
+
+        let rendered = render_coordinator_input("coordinate carefully", &history, "continue now");
+
+        let preamble = rendered.find("coordinate carefully").unwrap();
+        let first = rendered.find("initial query").unwrap();
+        let assistant = rendered.find("create_plan: 1 task").unwrap();
+        let tool = rendered.find("tool accepted the plan").unwrap();
+        let current = rendered.find("continue now").unwrap();
+        assert!(preamble < first);
+        assert!(first < assistant);
+        assert!(assistant < tool);
+        assert!(tool < current);
+    }
+
+    #[test]
+    fn coordinator_input_render_marks_empty_history() {
+        let rendered = render_coordinator_input("system", &[], "prompt");
+        assert!(rendered.contains("SYSTEM PREAMBLE:\nsystem"));
+        assert!(rendered.contains("HISTORY JSON (oldest to newest):\n[]"));
+        assert!(rendered.contains("CURRENT USER PROMPT:\nprompt"));
+    }
+}

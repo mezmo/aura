@@ -1068,6 +1068,8 @@ mod pipeline_tests {
     use opentelemetry_sdk::trace::{SimpleSpanProcessor, TracerProvider};
     use std::sync::{Arc, Mutex};
 
+    static CONTENT_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
     // -- InMemoryExporter: collects exported spans for assertions -----------
 
     #[derive(Clone, Debug)]
@@ -1472,6 +1474,110 @@ mod pipeline_tests {
                 .to_string(),
             "The user wants a simple explanation."
         );
+    }
+
+    #[test]
+    fn test_pipeline_planning_span_carries_coordinator_input_metrics() {
+        let _content_guard = CONTENT_CONFIG_LOCK.lock().unwrap();
+        crate::logging::set_content_config_for_tests(false, 1000);
+        let (subscriber, memory) = build_pipeline();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("orchestration.planning");
+            let _guard = span.enter();
+            let history = vec![
+                rig::completion::Message::user("original request"),
+                rig::completion::Message::assistant("create_plan: 1 task"),
+            ];
+            crate::logging::set_coordinator_input_attributes(
+                &tracing::Span::current(),
+                "system preamble",
+                &history,
+                "continuation prompt",
+            );
+        });
+
+        let spans = collect_spans(&memory);
+        let planning = find_span_by_name(&spans, "orchestration.planning");
+        assert_eq!(
+            find_attr(planning, "openinference.span.kind")
+                .unwrap()
+                .to_string(),
+            "CHAIN"
+        );
+        assert!(find_attr(planning, "input.length").is_some());
+        assert_eq!(
+            find_attr(
+                planning,
+                crate::logging::ATTR_COORDINATOR_INPUT_HISTORY_MESSAGES
+            )
+            .unwrap()
+            .to_string(),
+            "2"
+        );
+        assert_eq!(
+            find_attr(
+                planning,
+                crate::logging::ATTR_COORDINATOR_INPUT_CONTENT_RECORDED
+            )
+            .unwrap()
+            .to_string(),
+            "false"
+        );
+        assert!(
+            find_attr(planning, "input.value").is_none(),
+            "content is gated by OTEL_RECORD_CONTENT"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_planning_span_records_coordinator_input_when_content_enabled() {
+        let _content_guard = CONTENT_CONFIG_LOCK.lock().unwrap();
+        crate::logging::set_content_config_for_tests(true, 10_000);
+        let (subscriber, memory) = build_pipeline();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("orchestration.planning");
+            let _guard = span.enter();
+            let history = vec![
+                rig::completion::Message::user("original request"),
+                rig::completion::Message::assistant("create_plan: 1 task"),
+            ];
+            crate::logging::set_coordinator_input_attributes(
+                &tracing::Span::current(),
+                "system preamble",
+                &history,
+                "continuation prompt",
+            );
+        });
+
+        let spans = collect_spans(&memory);
+        let planning = find_span_by_name(&spans, "orchestration.planning");
+        let input_value = find_attr(planning, "input.value")
+            .expect("content should be recorded")
+            .to_string();
+        assert!(input_value.contains("system preamble"));
+        assert!(input_value.contains("original request"));
+        assert!(input_value.contains("continuation prompt"));
+        assert_eq!(
+            find_attr(
+                planning,
+                crate::logging::ATTR_COORDINATOR_INPUT_CONTENT_RECORDED
+            )
+            .unwrap()
+            .to_string(),
+            "true"
+        );
+        assert_eq!(
+            find_attr(
+                planning,
+                crate::logging::ATTR_COORDINATOR_INPUT_CONTENT_TRUNCATED
+            )
+            .unwrap()
+            .to_string(),
+            "false"
+        );
+        crate::logging::set_content_config_for_tests(false, 1000);
     }
 
     // -- Pipeline test: Empty fields that are never recorded are omitted ---

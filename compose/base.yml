@@ -65,6 +65,12 @@ services:
       AURA_ENABLE_A2A: true
       # Logging
       RUST_LOG: warn
+      # Optional host-provided OTel settings for local integration gates.
+      OTEL_EXPORTER_OTLP_ENDPOINT:
+      OTEL_RECORD_CONTENT:
+      OTEL_CONTENT_MAX_LENGTH:
+      OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT:
+      OTEL_SERVICE_NAME:
     env_file:
       - ./env/test.env
     volumes:
