@@ -452,7 +452,7 @@ When `orchestration.enabled = true` and `AURA_CUSTOM_EVENTS=true`, the server em
 | `aura.orchestrator.task_started` | Worker began executing a task |
 | `aura.orchestrator.task_completed` | Worker finished task (success/failure with duration) |
 | `aura.orchestrator.worker_reasoning` | Worker reasoning content with task/worker attribution |
-| `aura.orchestrator.iteration_complete` | Iteration finished with replan decision and reasoning |
+| `aura.orchestrator.iteration_complete` | Iteration finished with replan decision, reasoning, and phase timing (planning/execution/tool ms) |
 | `aura.orchestrator.replan_started` | Replan cycle triggered (coordinator-routed or task failures) |
 | `aura.orchestrator.synthesizing` | Coordinator merging worker results (includes iteration number) |
 | `aura.orchestrator.tool_call_started` | A tool call began (coordinator or worker); see the tool-coverage note below |
@@ -649,12 +649,27 @@ data:
   "iteration": 1,
   "will_replan": false,
   "reasoning": "All tasks completed successfully",
+  "planning_ms": 1180,
+  "execution_ms": 4620,
+  "task_compute_ms": 4500,
+  "tool_ms": 820,
   "agent_id": "coordinator",
   "session_id": "sess_xyz"
 }
 ```
 
 The `reasoning` and `gaps` fields are included only when non-empty (i.e., when replanning is triggered).
+
+**Phase timing fields** (all milliseconds, present on every `iteration_complete`):
+
+| Field | Meaning |
+|-------|---------|
+| `planning_ms` | Prompt → plan created. Includes planning-correction retries. For replanned iterations this is the prior iteration's continuation-decision latency (that call produced this iteration's plan). |
+| `execution_ms` | Plan ready → continuation-prompt entrypoint — one iteration's execution span (worker waves + persistence drain + result consolidation), measured as wall-clock. |
+| `task_compute_ms` | Sum of per-task wall durations across the iteration (aggregate compute; exceeds `execution_ms` when tasks run in parallel). |
+| `tool_ms` | Sum of tool-call durations recorded for the iteration's tasks. |
+
+To separate time the LLM spent *deciding what to call* from time spent *executing tools*, compute `execution_ms - tool_ms` ≈ LLM-thinking time. This is exact for single-task routes; for parallel waves it is approximate, since `tool_ms` and `task_compute_ms` are summed compute rather than wall-clock — compare them against `execution_ms` to gauge overlap. The same four fields are written to the run manifest (`phase_timings`) and recorded as `orchestration.{planning,execution,task_compute,tool}_ms` attributes on the `orchestration.iteration` OTel span.
 
 **Replan started** (new planning cycle triggered):
 ```

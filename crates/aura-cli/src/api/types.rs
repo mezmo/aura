@@ -291,7 +291,8 @@ pub enum DisplayEvent {
     OrchestratorSynthesizing,
     OrchestratorIterationComplete {
         iteration: u64,
-        quality_score: String,
+        /// Pre-rendered phase-timing summary line (planning/execution/tool/compute).
+        timing_line: String,
         fields: BTreeMap<String, serde_json::Value>,
     },
     OrchestratorScratchpadSavings {

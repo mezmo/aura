@@ -137,6 +137,8 @@ pub enum OrchestrationStreamEvent {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         gaps: Vec<String>,
         #[serde(flatten)]
+        timings: crate::orchestration::types::IterationTimings,
+        #[serde(flatten)]
         context: EventContext,
     },
     /// Emitted when orchestrator starts a replan cycle.
@@ -308,6 +310,7 @@ impl OrchestrationStreamEvent {
         will_replan: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
+        timings: crate::orchestration::types::IterationTimings,
         context: EventContext,
     ) -> Self {
         Self::IterationComplete {
@@ -315,6 +318,7 @@ impl OrchestrationStreamEvent {
             will_replan,
             reasoning,
             gaps,
+            timings,
             context,
         }
     }
@@ -515,12 +519,21 @@ mod tests {
             false,
             Some("Single-task plan completed successfully".to_string()),
             vec![],
+            crate::orchestration::types::IterationTimings {
+                planning_ms: 1200,
+                execution_ms: 4500,
+                task_compute_ms: 4500,
+                tool_ms: 800,
+            },
             test_ctx(),
         );
         let sse = event.format_sse();
 
         assert!(sse.contains("\"will_replan\":false"));
         assert!(sse.contains("\"iteration\":1"));
+        assert!(sse.contains("\"planning_ms\":1200"));
+        assert!(sse.contains("\"execution_ms\":4500"));
+        assert!(sse.contains("\"tool_ms\":800"));
     }
 
     #[test]

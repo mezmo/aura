@@ -113,6 +113,8 @@ pub enum OrchestratorEvent {
         reasoning: String,
         /// Identified gaps or issues (empty if not replanning)
         gaps: Vec<String>,
+        /// Phase-level wall-clock timings for this iteration.
+        timings: super::types::IterationTimings,
     },
     /// The orchestrator is starting a replan cycle.
     ///

@@ -613,7 +613,7 @@ pub fn replay_event_log_global() {
             }
             DisplayEvent::OrchestratorIterationComplete {
                 iteration,
-                quality_score,
+                timing_line,
                 fields,
             } => {
                 let bc = task_color_for("__orchestrator__");
@@ -623,16 +623,18 @@ pub fn replay_event_log_global() {
                     "Iteration complete".attribute(Attribute::Bold),
                 );
                 let has_fields = expanded && !fields.is_empty();
+                // Order mirrors the live render in `repl/loop.rs`: timing first,
+                // iteration last, so both paths look identical.
+                println!(
+                    "{} timing: {}",
+                    "├─".themed(AuraStyle::Connector),
+                    timing_line.as_str().themed(AuraStyle::Muted),
+                );
+                let iteration_connector = if has_fields { "├─" } else { "└─" };
                 println!(
                     "{} iteration: {}",
-                    "├─".themed(AuraStyle::Connector),
+                    iteration_connector.themed(AuraStyle::Connector),
                     iteration.to_string().as_str().themed(AuraStyle::Muted),
-                );
-                let quality_connector = if has_fields { "├─" } else { "└─" };
-                println!(
-                    "{} quality: {}",
-                    quality_connector.themed(AuraStyle::Connector),
-                    quality_score.as_str().themed(AuraStyle::Muted),
                 );
                 if has_fields {
                     print_fields_tree(fields);

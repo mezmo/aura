@@ -186,6 +186,50 @@ make docker-build   # Build Docker image
 make lint           # Run clippy + fmt check
 ```
 
+## Code Comment Conventions
+
+- **Document behavior where it lives, not on data.** A comment describing *what
+  happens* (how a value is produced, consumed, derived, or interpreted) belongs
+  on the function/branch that implements it — not on a struct, field, enum
+  variant, or other type definition. Type-level comments state only *what the
+  value is* (its meaning/unit), never cross-referenced runtime behavior.
+  - **The drift test — apply it to every type-level comment:** if the comment
+    would have to change when code in *a different function* changes, it is in
+    the wrong place. Move it to that function.
+  - **Red-flag words on a type definition.** These almost always signal behavior
+    narration that belongs elsewhere: "when", "if", "unless", "for … that",
+    "absent/`None`/empty when", "set/populated when", "becomes", "used by",
+    "consumed by", "so that", "which lets", "approximates", "exceeds",
+    "falls back". Seeing one on a struct/field/enum is a prompt to move it.
+  - **`Option`, enums, and defaults describe their own shape — don't narrate it.**
+    The `Option` already says the value can be absent; the enum already lists its
+    variants. Do *not* document *when* each state occurs (`None when …`,
+    `Empty for …`) on the type — that condition lives at the code that sets it.
+  - Bad (on a struct field): `execution_ms - tool_ms approximates LLM-thinking
+    time`; `None for direct answers and runs that failed before any iteration`;
+    `becomes the next iteration's planning_ms`. Each describes behavior owned by
+    a consumer or a write site.
+  - Good (on the field): `Plan ready → continuation-prompt entrypoint.` The
+    derivation/interpretation lives at the code that computes or displays it.
+- **Don't describe the same behavior in more than one place.** Pick the single
+  site that implements it; from elsewhere, reference — don't restate. Duplicated
+  prose drifts out of sync. If you find yourself writing something already
+  documented at the implementing site, delete it rather than restating it.
+- **Comment on current behavior, not change history.** Describe what the code
+  does now, as if it were always this way — git records the diff, the comment
+  should not. Do not phrase a comment relative to the past: avoid "prior we did
+  XYZ, now we ABC", "(unchanged)", "legacy behavior", "now does X",
+  "previously…", "still works as before", "moved from…", "keep current
+  behavior". History-relative phrasing drifts out of sync as the code evolves
+  and is noise to anyone who didn't witness the change — rewrite it as a
+  present-tense statement of what the code does.
+- **Before finishing any code change, run the drift test on every comment you
+  added or touched that sits on a struct, field, enum, or variant.** For each,
+  ask "would this change if a different function changed?" — if yes, move (don't
+  copy) it onto the implementing code. Check the whole comment, not just its
+  first clause: the anti-pattern often hides as a trailing "; …when…" or "; …
+  becomes…" appended to an otherwise-correct definition.
+
 ## Commit and Contribution Rules
 
 - **No AI co-authorship**: Never add `Co-Authored-By` lines for Claude or any AI assistant. Claude cannot accept the CLA.

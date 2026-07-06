@@ -465,6 +465,15 @@ pub fn increment_orch_scrollback() {
     ORCH_SCROLLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Increment the orchestrator scrollback counter by the number of *visual*
+/// rows a line consumes, accounting for wrap. Pass the unstyled line text
+/// (no ANSI escapes) so the width math is correct — a long line that wraps
+/// must advance the counter by every physical row it occupies, or later
+/// cursor math clobbers the wrapped tail.
+pub fn increment_orch_scrollback_wrapped(line_text: &str) {
+    ORCH_SCROLLBACK_COUNTER.fetch_add(visual_row_count(line_text), Ordering::Relaxed);
+}
+
 /// Reset orchestrator tool tracking.
 pub fn reset_orch_tools() {
     if let Ok(mut guard) = ACTIVE_ORCH_TOOLS.lock() {
