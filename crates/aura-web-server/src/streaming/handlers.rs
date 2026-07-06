@@ -1161,11 +1161,15 @@ fn handle_orchestrator_event(
             will_replan,
             reasoning,
             gaps,
+            timings,
         } => {
             tracing::debug!(
-                "Orchestrator: iteration {} complete (will_replan={})",
+                "Orchestrator: iteration {} complete (will_replan={}, planning={}ms, execution={}ms, tool={}ms)",
                 iteration,
-                will_replan
+                will_replan,
+                timings.planning_ms,
+                timings.execution_ms,
+                timings.tool_ms,
             );
             OrchestrationStreamEvent::iteration_complete(
                 *iteration,
@@ -1176,6 +1180,7 @@ fn handle_orchestrator_event(
                     Some(reasoning.to_string())
                 },
                 gaps.clone(),
+                *timings,
                 event_context,
             )
         }

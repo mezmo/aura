@@ -175,6 +175,7 @@ mod tests {
                 })
                 .collect(),
             artifact_paths: vec!["artifacts/result.txt".to_string()],
+            phase_timings: None,
         }
     }
 

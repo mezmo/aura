@@ -148,6 +148,18 @@ pub enum OrchestrationStreamEvent {
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         gaps: Vec<String>,
+        /// Prompt → plan created (ms).
+        #[serde(default)]
+        planning_ms: u64,
+        /// Plan ready → continuation-prompt entrypoint (ms), wall-clock.
+        #[serde(default)]
+        execution_ms: u64,
+        /// Sum of per-task wall durations (ms) across the iteration.
+        #[serde(default)]
+        task_compute_ms: u64,
+        /// Sum of tool-call durations (ms) within the iteration.
+        #[serde(default)]
+        tool_ms: u64,
         #[serde(flatten)]
         context: EventContext,
     },
@@ -329,6 +341,10 @@ impl OrchestrationStreamEvent {
         evaluation_skipped: bool,
         reasoning: Option<String>,
         gaps: Vec<String>,
+        planning_ms: u64,
+        execution_ms: u64,
+        task_compute_ms: u64,
+        tool_ms: u64,
         context: EventContext,
     ) -> Self {
         Self::IterationComplete {
@@ -339,6 +355,10 @@ impl OrchestrationStreamEvent {
             evaluation_skipped,
             reasoning,
             gaps,
+            planning_ms,
+            execution_ms,
+            task_compute_ms,
+            tool_ms,
             context,
         }
     }

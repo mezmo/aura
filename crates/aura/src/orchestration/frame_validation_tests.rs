@@ -158,6 +158,7 @@ fn sample_manifest(
         response_summary: None,
         task_summaries: tasks,
         artifact_paths: vec![],
+        phase_timings: None,
     }
 }
 
@@ -551,6 +552,7 @@ fn test_session_history_direct_response_run() {
         response_summary: Some("The answer is 4".into()),
         task_summaries: vec![],
         artifact_paths: vec![],
+        phase_timings: None,
     };
 
     let history = build_session_context(&[manifest]);
@@ -582,6 +584,7 @@ fn test_session_history_multi_run_chronological() {
             vec![],
         )],
         artifact_paths: vec![],
+        phase_timings: None,
     };
     let m2 = RunManifest {
         run_id: "run_002".into(),
@@ -595,6 +598,7 @@ fn test_session_history_multi_run_chronological() {
         response_summary: None,
         task_summaries: vec![],
         artifact_paths: vec![],
+        phase_timings: None,
     };
     let m3 = RunManifest {
         run_id: "run_003".into(),
@@ -608,6 +612,7 @@ fn test_session_history_multi_run_chronological() {
         response_summary: Some("The result is X".into()),
         task_summaries: vec![],
         artifact_paths: vec![],
+        phase_timings: None,
     };
 
     // build_session_context expects most-recent-first (as returned by load_session_manifests)
@@ -971,6 +976,7 @@ fn test_session_history_routed_single_worker() {
             vec![],
         )],
         artifact_paths: vec![],
+        phase_timings: None,
     };
 
     let history = build_session_context(&[manifest]);

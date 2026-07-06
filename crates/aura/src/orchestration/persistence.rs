@@ -112,6 +112,9 @@ pub struct RunManifest {
     pub task_summaries: Vec<TaskSummary>,
     /// Relative paths to large artifact files.
     pub artifact_paths: Vec<String>,
+    /// Phase-level wall-clock timings for the final iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_timings: Option<super::types::IterationTimings>,
 }
 
 /// Summary of a single task for the run manifest.
@@ -1441,6 +1444,7 @@ mod tests {
                 },
             ],
             artifact_paths: vec!["task-0-research-iter-1-result.txt".to_string()],
+            phase_timings: None,
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();
@@ -1478,6 +1482,7 @@ mod tests {
             response_summary: None,
             task_summaries: vec![],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         let path = persistence.write_manifest(&manifest).await.unwrap();
@@ -1505,6 +1510,7 @@ mod tests {
             response_summary: None,
             task_summaries: vec![],
             artifact_paths: vec![],
+            phase_timings: None,
         };
         let path = persistence.write_manifest(&manifest).await.unwrap();
         assert_eq!(path, PathBuf::new());
@@ -1552,6 +1558,7 @@ mod tests {
                 artifacts: vec![],
             }],
             artifact_paths: vec![],
+            phase_timings: None,
         }
     }
 
@@ -1761,6 +1768,7 @@ mod tests {
                 artifacts: vec![],
             }],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         let result = build_session_context(&[manifest]);
@@ -1811,6 +1819,7 @@ mod tests {
                 artifacts: vec![],
             }],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         let result = build_session_context(&[manifest]);
@@ -1860,6 +1869,7 @@ mod tests {
                 ],
             }],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         let result = build_session_context(&[manifest]);
@@ -1918,6 +1928,7 @@ mod tests {
                 artifacts: vec![],
             }],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         let result = build_session_context(&[manifest]);
@@ -1943,6 +1954,7 @@ mod tests {
             response_summary: Some("The answer is 4.".to_string()),
             task_summaries: vec![],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         let result = build_session_context(&[manifest]);
@@ -2249,6 +2261,7 @@ mod tests {
                 },
             ],
             artifact_paths: vec!["task-0-sre-iter-1-result.txt".to_string()],
+            phase_timings: None,
         };
 
         let json = serde_json::to_string_pretty(&manifest).unwrap();

@@ -1082,6 +1082,20 @@ fn truncate_reasoning(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Phase-level wall-clock timings for one orchestration iteration, in
+/// milliseconds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct IterationTimings {
+    /// Prompt → plan created.
+    pub planning_ms: u64,
+    /// Plan ready → continuation-prompt entrypoint.
+    pub execution_ms: u64,
+    /// Sum of per-task wall durations across the iteration.
+    pub task_compute_ms: u64,
+    /// Sum of tool-call durations recorded for the iteration's tasks.
+    pub tool_ms: u64,
+}
+
 /// Outcome returned by `run_iteration` to drive the orchestration loop.
 ///
 /// Errors bubble via `Result` — this enum carries only the success variants.
@@ -1093,6 +1107,8 @@ pub(crate) enum IterationOutcome {
     Continue {
         new_plan: Plan,
         previous_context: Option<IterationContext>,
+        /// Wall-clock of the continuation-decision call that produced `new_plan`.
+        planning_ms: u64,
     },
 }
 

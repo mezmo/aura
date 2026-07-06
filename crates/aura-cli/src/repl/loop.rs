@@ -2832,9 +2832,28 @@ impl StreamHandler for ReplStreamHandler {
                 // disturb in-flight reasoning blocks.
                 event_names::ITERATION_COMPLETE => {
                     let iteration = get_u64(val, "iteration");
-                    let quality_score = get_str(val, "quality_score");
+                    // Phase timings. LLM-thinking time ≈ execution - tools.
+                    // Durations are humanized (1.5s, 34.0s) to match the rest
+                    // of the orchestrator timing display.
+                    use crate::ui::orchestrator::format_orch_duration_ms;
+                    let planning = format_orch_duration_ms(get_u64(val, "planning_ms"));
+                    let execution = format_orch_duration_ms(get_u64(val, "execution_ms"));
+                    let task_compute = format_orch_duration_ms(get_u64(val, "task_compute_ms"));
+                    let tool = format_orch_duration_ms(get_u64(val, "tool_ms"));
+                    let timing_line = format!(
+                        "planning {planning} · execution {execution} \
+                         (tools {tool}, compute {task_compute})"
+                    );
                     let expanded = is_expanded_output();
                     let has_fields = expanded && !fields.is_empty();
+                    // `will_replan == false` marks the terminal iteration — the one
+                    // immediately followed by the final-answer bullet, which is the
+                    // only transition where the frame-collapse clobber below bites.
+                    let will_replan = val
+                        .get("will_replan")
+                        .or_else(|| val.get("data").and_then(|d| d.get("will_replan")))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     crate::ui::prompt::clear_agent_reasoning();
                     println!(
                         "{} {}",
@@ -2844,17 +2863,25 @@ impl StreamHandler for ReplStreamHandler {
                         "Iteration complete".attribute(crossterm::style::Attribute::Bold),
                     );
                     crate::ui::prompt::increment_orch_scrollback();
+                    // Timing is printed before iteration so that, if the clobber
+                    // below over-reaches, the more valuable timing data is the last
+                    // thing to be lost.
+                    println!(
+                        "{} timing: {}",
+                        "├─".themed(AuraStyle::Connector),
+                        timing_line.as_str().themed(AuraStyle::Muted),
+                    );
+                    // The timing line can be long; count its wrapped rows so later
+                    // frame cursor math stays aligned (unstyled text drives the
+                    // width calc, no ANSI escapes).
+                    crate::ui::prompt::increment_orch_scrollback_wrapped(&format!(
+                        "├─ timing: {timing_line}"
+                    ));
+                    let iteration_connector = if has_fields { "├─" } else { "└─" };
                     println!(
                         "{} iteration: {}",
-                        "├─".themed(AuraStyle::Connector),
+                        iteration_connector.themed(AuraStyle::Connector),
                         iteration.to_string().as_str().themed(AuraStyle::Muted),
-                    );
-                    crate::ui::prompt::increment_orch_scrollback();
-                    let quality_connector = if has_fields { "├─" } else { "└─" };
-                    println!(
-                        "{} quality: {}",
-                        quality_connector.themed(AuraStyle::Connector),
-                        quality_score.as_str().themed(AuraStyle::Muted),
                     );
                     crate::ui::prompt::increment_orch_scrollback();
                     if has_fields {
@@ -2875,9 +2902,20 @@ impl StreamHandler for ReplStreamHandler {
                     }
                     println!();
                     crate::ui::prompt::increment_orch_scrollback();
+                    // On the terminal iteration the final-answer bullet is drawn by
+                    // the input-frame collapse, whose cursor math rebuilds the frame
+                    // ~2 rows too high in some terminals and paints over the last
+                    // scrollback rows (eating the iteration line + the blank above).
+                    // Emit a second sacrificial blank so the over-eat consumes only
+                    // blanks and both summary lines survive. Live-only; `/expand`
+                    // repaints from the display event with a single blank.
+                    if !will_replan {
+                        println!();
+                        crate::ui::prompt::increment_orch_scrollback();
+                    }
                     push_display_event(DisplayEvent::OrchestratorIterationComplete {
                         iteration,
-                        quality_score,
+                        timing_line,
                         fields,
                     });
                 }

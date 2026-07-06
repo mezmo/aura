@@ -63,8 +63,8 @@ use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
-    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
-    PlanningResponse, TaskState, TaskStatus,
+    FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
+    IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
 };
 
 // ============================================================================
@@ -2621,14 +2621,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// dependencies complete in subsequent iterations.
     ///
     /// Each worker receives the plan goal (not the raw query) to understand context.
+    ///
+    /// Returns the aggregate task-compute time (sum of per-task wall durations
+    /// across all waves), used for the iteration's phase-timing breakdown.
     async fn execute(
         &self,
         plan: &mut Plan,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-    ) -> Result<(), StreamError> {
+    ) -> Result<u64, StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
+        let mut task_compute_ms: u64 = 0;
         while !plan.is_finished() {
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
@@ -2701,6 +2705,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             while let Some((task_id, result, duration_ms, worker_name, task_desc)) =
                 futures.next().await
             {
+                task_compute_ms += duration_ms;
                 match result {
                     Ok(exec_result) => {
                         let final_result = self
@@ -2780,7 +2785,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         }
 
-        Ok(())
+        Ok(task_compute_ms)
     }
 
     /// Collect failed tasks from this iteration into failure records.
@@ -3470,6 +3475,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Set iteration for initial planning (journal reads this via AtomicUsize)
         self.current_iteration.store(1, Ordering::Relaxed);
+        // Planning latency: prompt → plan created (includes correction retries).
+        // Spans the whole planning call, so any planning-correction retries
+        // inside plan_with_routing are counted in planning_ms.
+        let planning_start = Instant::now();
         let (response, _prompt, _coordinator_text) = self
             .plan_with_routing(
                 query,
@@ -3479,6 +3488,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Some(&event_tx),
             )
             .await?;
+        let initial_planning_ms = planning_start.elapsed().as_millis() as u64;
 
         let result = match response {
             PlanningResponse::Direct {
@@ -3541,6 +3551,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     &mut coordinator_state,
                     event_tx,
                     orchestration_start,
+                    initial_planning_ms,
                 )
                 .await
             }
@@ -3562,6 +3573,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Budget enforcement: at each iteration boundary, checks whether remaining
     /// wall-clock time is less than `per_call_timeout_secs`. If so, returns the
     /// best available result instead of starting a new iteration.
+    #[allow(clippy::too_many_arguments)]
     async fn run_orchestration_loop(
         &self,
         query: &str,
@@ -3570,11 +3582,17 @@ Assign tasks to the worker whose tools best match the required operations."#,
         coordinator_state: &mut CoordinatorState,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
+        initial_planning_ms: u64,
     ) -> Result<String, StreamError> {
         let mut iteration = 0;
         let mut previous_context: Option<IterationContext> = None;
         let mut plan = initial_plan;
         let mut failure_history: Vec<FailedTaskRecord> = Vec::new();
+        // Planning latency for the next iteration. The first iteration uses the
+        // initial planning call; replanned iterations inherit the prior
+        // iteration's continuation-decision latency (that call produced the
+        // plan being executed).
+        let mut planning_ms = initial_planning_ms;
 
         let final_result = loop {
             iteration += 1;
@@ -3589,6 +3607,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     previous_context.as_ref(),
                     &event_tx,
                     orchestration_start,
+                    planning_ms,
                     &mut failure_history,
                 )
                 .await?
@@ -3597,9 +3616,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 IterationOutcome::Continue {
                     new_plan,
                     previous_context: pc,
+                    planning_ms: next_planning_ms,
                 } => {
                     plan = new_plan;
                     previous_context = pc;
+                    planning_ms = next_planning_ms;
                 }
             }
         };
@@ -3616,6 +3637,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
             orchestration.task_count = tracing::field::Empty,
             orchestration.post_execute_decision = tracing::field::Empty,
             orchestration.decision_latency_seconds = tracing::field::Empty,
+            orchestration.planning_ms = planning_ms,
+            orchestration.execution_ms = tracing::field::Empty,
+            orchestration.task_compute_ms = tracing::field::Empty,
+            orchestration.tool_ms = tracing::field::Empty,
         )
     )]
     async fn run_iteration(
@@ -3628,9 +3653,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         previous_context: Option<&IterationContext>,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
+        planning_ms: u64,
         failure_history: &mut Vec<FailedTaskRecord>,
     ) -> Result<IterationOutcome, StreamError> {
         let elapsed = orchestration_start.elapsed().as_secs_f64();
+        // Execution span: plan ready → continuation-prompt entrypoint. Covers
+        // worker waves, persistence drain, and result consolidation.
+        let execution_start = Instant::now();
 
         tracing::info!(
             "Starting iteration {}/{} (elapsed={:.1}s, per_call_timeout={}s)",
@@ -3660,10 +3689,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        if let Err(e) = self.execute(&mut plan, event_tx).await {
-            self.write_run_manifest(&plan, iteration).await;
-            return Err(e);
-        }
+        let task_compute_ms = match self.execute(&mut plan, event_tx).await {
+            Ok(ms) => ms,
+            Err(e) => {
+                self.write_run_manifest(&plan, iteration, None).await;
+                return Err(e);
+            }
+        };
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
@@ -3743,7 +3775,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     this_iteration_failures.len(),
                     summary
                 );
-                self.write_run_manifest(&plan, iteration).await;
+                self.write_run_manifest(&plan, iteration, None).await;
                 return Err(format!(
                     "Provider error: all tasks failed due to provider issues (not retryable via replan):\n{}",
                     summary
@@ -3779,6 +3811,27 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // paid for instead of an empty response.
         // ----------------------------------------------------------------
         let tool_traces = self.load_tool_traces_for_plan(&plan).await;
+
+        // Phase timings for this iteration. `execution_ms` is the wall-clock
+        // from plan-ready to here (the continuation-prompt entrypoint);
+        // `tool_ms` is the aggregate tool-execution time within it, so
+        // `execution_ms - tool_ms` approximates LLM-thinking time.
+        let tool_ms: u64 = tool_traces
+            .values()
+            .flat_map(|entries| entries.iter())
+            .map(|e| e.duration_ms)
+            .sum();
+        let timings = IterationTimings {
+            planning_ms,
+            execution_ms: execution_start.elapsed().as_millis() as u64,
+            task_compute_ms,
+            tool_ms,
+        };
+        let current_span = tracing::Span::current();
+        current_span.record("orchestration.execution_ms", timings.execution_ms);
+        current_span.record("orchestration.task_compute_ms", timings.task_compute_ms);
+        current_span.record("orchestration.tool_ms", timings.tool_ms);
+
         let post_execute_ctx = IterationContext::new(
             iteration,
             plan.clone(),
@@ -3798,7 +3851,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )
             .await;
 
-        let decision_latency = decision_start.elapsed().as_secs_f64();
+        let decision_elapsed = decision_start.elapsed();
+        let decision_latency = decision_elapsed.as_secs_f64();
+        // The continuation decision call doubles as the planning step for the
+        // next iteration when it returns a new plan, so carry its latency
+        // forward as that iteration's `planning_ms`.
+        let decision_latency_ms = decision_elapsed.as_millis() as u64;
         tracing::Span::current().record("orchestration.decision_latency_seconds", decision_latency);
 
         match routing {
@@ -3828,6 +3886,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         will_replan: false,
                         reasoning: String::new(),
                         gaps: vec![],
+                        timings,
                     },
                 )
                 .await;
@@ -3837,8 +3896,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest_with_summary(&plan, iteration, response_summary)
-                    .await;
+                self.write_run_manifest_with_summary(
+                    &plan,
+                    iteration,
+                    response_summary,
+                    Some(timings),
+                )
+                .await;
                 Ok(IterationOutcome::FinalResult(response))
             }
             Ok((
@@ -3870,6 +3934,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         will_replan: false,
                         reasoning: String::new(),
                         gaps: vec![],
+                        timings,
                     },
                 )
                 .await;
@@ -3879,7 +3944,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                self.write_run_manifest(&plan, iteration).await;
+                self.write_run_manifest(&plan, iteration, Some(timings))
+                    .await;
                 Ok(IterationOutcome::FinalResult(question))
             }
             Ok((resp @ PlanningResponse::StepsPlan { .. }, _, _)) => {
@@ -3904,10 +3970,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             will_replan: false,
                             reasoning: "Replan budget exhausted".to_string(),
                             gaps: vec![],
+                            timings,
                         },
                     )
                     .await;
-                    self.write_run_manifest(&plan, iteration).await;
+                    self.write_run_manifest(&plan, iteration, Some(timings))
+                        .await;
                     return Ok(IterationOutcome::FinalResult(raw));
                 }
 
@@ -3937,6 +4005,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         will_replan: true,
                         reasoning: String::new(),
                         gaps: vec![],
+                        timings,
                     },
                 )
                 .await;
@@ -3971,6 +4040,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 Ok(IterationOutcome::Continue {
                     new_plan,
                     previous_context: new_previous_context,
+                    planning_ms: decision_latency_ms,
                 })
             }
             // Post-execute coordinator call errored before routing (timeout,
@@ -4003,10 +4073,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         will_replan: false,
                         reasoning: note,
                         gaps: vec![],
+                        timings,
                     },
                 )
                 .await;
-                self.write_run_manifest(&plan, iteration).await;
+                self.write_run_manifest(&plan, iteration, Some(timings))
+                    .await;
                 Ok(IterationOutcome::FinalResult(raw))
             }
         }
@@ -4072,8 +4144,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
     /// Called at the end of `run_orchestration_loop()` on all exit paths.
     /// Errors are logged but not propagated — manifest is observability, not control flow.
-    async fn write_run_manifest(&self, plan: &Plan, iterations: usize) {
-        self.write_run_manifest_with_summary(plan, iterations, None)
+    ///
+    /// `timings` carries the final iteration's phase timings when available
+    /// (`None` for paths that failed before the timed consolidation step).
+    async fn write_run_manifest(
+        &self,
+        plan: &Plan,
+        iterations: usize,
+        timings: Option<IterationTimings>,
+    ) {
+        self.write_run_manifest_with_summary(plan, iterations, None, timings)
             .await;
     }
 
@@ -4082,6 +4162,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         plan: &Plan,
         iterations: usize,
         response_summary: Option<String>,
+        timings: Option<IterationTimings>,
     ) {
         use super::persistence::{
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
@@ -4195,6 +4276,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             response_summary,
             task_summaries,
             artifact_paths,
+            phase_timings: timings,
         };
 
         if let Err(e) = persistence.write_manifest(&manifest).await {
@@ -4231,6 +4313,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             response_summary,
             task_summaries: vec![],
             artifact_paths: vec![],
+            phase_timings: None,
         };
 
         if let Err(e) = persistence.write_manifest(&manifest).await {
