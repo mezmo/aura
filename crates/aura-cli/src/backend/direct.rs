@@ -139,13 +139,7 @@ impl DirectBackend {
             .configs
             .iter()
             .filter(|c| !c.agent.hidden)
-            .map(|c| {
-                c.agent
-                    .alias
-                    .as_deref()
-                    .unwrap_or(&c.agent.name)
-                    .to_string()
-            })
+            .map(|c| c.agent_id().to_string())
             .collect()
     }
 
@@ -160,12 +154,7 @@ impl DirectBackend {
     pub fn find_matching_model(&self, model_name: &str) -> Option<String> {
         let lower = model_name.to_lowercase();
         for config in self.app_state.configs.iter() {
-            let effective_id = config
-                .agent
-                .alias
-                .as_deref()
-                .unwrap_or(&config.agent.name)
-                .to_string();
+            let effective_id = config.agent_id().to_string();
 
             // Match against effective ID, name, or alias independently
             if effective_id.to_lowercase() == lower
@@ -186,15 +175,10 @@ impl DirectBackend {
     pub fn get_config_system_prompt(&self, model: Option<&str>) -> Option<String> {
         let config = if let Some(model_name) = model {
             let lower = model_name.to_lowercase();
-            self.app_state.configs.iter().find(|c| {
-                let effective = c
-                    .agent
-                    .alias
-                    .as_deref()
-                    .unwrap_or(&c.agent.name)
-                    .to_lowercase();
-                effective == lower
-            })
+            self.app_state
+                .configs
+                .iter()
+                .find(|c| c.agent_id().to_lowercase() == lower)
         } else {
             self.app_state.configs.first()
         };
@@ -207,15 +191,9 @@ impl DirectBackend {
         let mut configs: Vec<_> = (*self.app_state.configs).clone();
         let target = if let Some(model_name) = model {
             let lower = model_name.to_lowercase();
-            configs.iter_mut().find(|c| {
-                let effective = c
-                    .agent
-                    .alias
-                    .as_deref()
-                    .unwrap_or(&c.agent.name)
-                    .to_lowercase();
-                effective == lower
-            })
+            configs
+                .iter_mut()
+                .find(|c| c.agent_id().to_lowercase() == lower)
         } else {
             configs.first_mut()
         };
@@ -372,6 +350,32 @@ impl DirectBackend {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         Ok(self.model_ids())
     }
+
+    pub(crate) fn startup_agent_overview(&self) -> Option<aura_events::AgentInfo> {
+        let selected = get_selected_model();
+        self.agent_overview_for_model(selected.as_deref())
+    }
+
+    /// Project non-hidden configs into a `ServerInfo` and resolve the overview
+    /// agent with the shared selection policy (`backend::select_agent`).
+    /// Standalone has no default agent, so multi-config needs an explicit
+    /// selection.
+    fn agent_overview_for_model(&self, selected: Option<&str>) -> Option<aura_events::AgentInfo> {
+        let agents = self
+            .app_state
+            .configs
+            .iter()
+            .filter(|config| !config.agent.hidden)
+            .map(aura::agent_info)
+            .collect();
+        super::select_agent(
+            aura_events::ServerInfo {
+                default_agent: None,
+                agents,
+            },
+            selected,
+        )
+    }
 }
 
 /// Map the CLI-side `Message` (OpenAI-shaped, with role as a string) to the
@@ -458,6 +462,44 @@ mod tests {
         config.agent.alias = alias.map(|a| a.to_string());
         config.agent.system_prompt = system_prompt.to_string();
         config
+    }
+
+    fn make_orch_config(name: &str, alias: Option<&str>, worker: &str) -> aura_config::Config {
+        let alias = alias
+            .map(|alias| format!(r#"alias = "{alias}""#))
+            .unwrap_or_default();
+        aura_config::load_config_from_str(&format!(
+            r#"
+[agent]
+name = "{name}"
+{alias}
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.{worker}]
+description = "{worker} work"
+preamble = "p"
+"#
+        ))
+        .unwrap()
+    }
+
+    fn agent_worker_names(agent: Option<aura_events::AgentInfo>) -> Vec<String> {
+        agent
+            .map(|agent| {
+                agent
+                    .workers
+                    .into_iter()
+                    .map(|worker| worker.name)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -568,6 +610,36 @@ mod tests {
             backend.find_matching_model("Secret Agent"),
             Some("Secret Agent".to_string())
         );
+    }
+
+    #[test]
+    fn startup_agent_overview_uses_single_config_for_any_selected_model() {
+        let backend = make_backend(vec![make_orch_config("orch", None, "planner")]);
+
+        let agent = backend.agent_overview_for_model(Some("provider-model"));
+
+        assert_eq!(agent.as_ref().map(|agent| agent.id.as_str()), Some("orch"));
+        assert_eq!(
+            agent.as_ref().map(|agent| agent.model.as_str()),
+            Some("gpt-4o")
+        );
+        assert_eq!(agent_worker_names(agent), vec!["planner"]);
+    }
+
+    #[test]
+    fn startup_agent_overview_requires_selected_model_with_multiple_configs() {
+        let orch = make_orch_config("orch", None, "planner");
+        let solo = make_config("solo", None, "p");
+        let mut ghost = make_config("ghost", None, "p");
+        ghost.agent.hidden = true;
+        let backend = make_backend(vec![solo, orch, ghost]);
+
+        let agent = backend.agent_overview_for_model(Some("orch"));
+
+        assert_eq!(agent.as_ref().map(|agent| agent.id.as_str()), Some("orch"));
+        assert_eq!(agent_worker_names(agent), vec!["planner"]);
+        assert!(backend.agent_overview_for_model(None).is_none());
+        assert!(backend.agent_overview_for_model(Some("ghost")).is_none());
     }
 
     // -----------------------------------------------------------------------

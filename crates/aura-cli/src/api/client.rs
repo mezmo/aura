@@ -229,6 +229,22 @@ impl ChatClient {
         let body: serde_json::Value = response.json().await.ok()?;
         body.get("aura_version")?.as_str().map(str::to_string)
     }
+
+    /// Fetch `GET /aura/info` for the agent overview. Best-effort with a short
+    /// timeout so startup and `/model` never stall.
+    #[must_use]
+    pub async fn server_info(&self) -> Option<aura_events::ServerInfo> {
+        let response = self
+            .build_request(reqwest::Method::GET, &self.config.info_url(), None)
+            .timeout(std::time::Duration::from_millis(1500))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
+    }
 }
 
 #[cfg(test)]

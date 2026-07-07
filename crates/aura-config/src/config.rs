@@ -325,6 +325,11 @@ impl Config {
         self.orchestration.as_ref().is_some_and(|o| o.enabled)
     }
 
+    /// The agent's public identifier: its alias when set, otherwise its name.
+    pub fn agent_id(&self) -> &str {
+        self.agent.alias.as_deref().unwrap_or(&self.agent.name)
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         validate_llm_api_key(&self.agent.llm, "agent.llm")?;

@@ -18,6 +18,36 @@ pub fn truncate_with_ellipsis(text: &str, max: usize) -> String {
     format!("{prefix}...")
 }
 
+/// Greedy word-wrap of `text` into lines of at most `width` columns.
+///
+/// Counts `char`s, not grapheme clusters, so multi-scalar glyphs may be
+/// over-counted when measuring line width.
+pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            current.push_str(word);
+            current_len = word_len;
+        } else if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_len = word_len;
+        }
+    }
+
+    lines.push(current);
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +87,13 @@ mod tests {
         let out = truncate_with_ellipsis(&s, 6);
         // 3 kept clusters + ellipsis; all kept clusters are whole waves.
         assert_eq!(out, format!("{}...", wave.repeat(3)));
+    }
+
+    #[test]
+    fn wrap_words_preserves_words() {
+        let wrapped = wrap_words("one two three four five", 8);
+        assert!(wrapped.len() > 1);
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 8));
+        assert_eq!(wrapped.join(" "), "one two three four five");
     }
 }

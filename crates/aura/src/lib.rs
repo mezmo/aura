@@ -63,7 +63,7 @@ pub use orchestration::tools::{
 pub use orchestration::{
     ArtifactsConfig, EventContext, OrchestrationConfig, OrchestrationStreamEvent, Orchestrator,
     OrchestratorEvent, OrchestratorFactory, Plan, PlanningResponse, RoutingMode, RunId, Task,
-    TaskIdentity, TaskJson, TaskState, TaskStatus, TimeoutsConfig,
+    TaskIdentity, TaskJson, TaskState, TaskStatus, TimeoutsConfig, agent_info, worker_overview,
 };
 pub use passthrough_tool::{PASSTHROUGH_MARKER, PassthroughTool};
 pub use provider_agent::{

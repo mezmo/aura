@@ -641,6 +641,10 @@ pub fn run_repl(
     } else {
         crate::ui::prompt::print_welcome_state();
     }
+    let startup_agent = rt.block_on(backend.startup_agent_overview());
+    if let Some(agent) = startup_agent {
+        crate::ui::agent_overview::print_agent_overview(&agent);
+    }
     setup_terminal();
 
     // If telemetry is already Enabled at launch (a recorded preference),
@@ -784,6 +788,8 @@ pub fn run_repl(
                         conv_store: &mut conv_store,
                         input_reader: &mut input_reader,
                         telemetry,
+                        rt,
+                        backend,
                     };
                     match registry::dispatch(&input, &mut ctx) {
                         Some(CommandOutcome::Exit) => break,
@@ -1917,6 +1923,8 @@ pub fn run_repl(
                         conv_store: &mut conv_store,
                         input_reader: &mut input_reader,
                         telemetry,
+                        rt,
+                        backend,
                     };
                     match (pending.command.handler)(&mut ctx, &pending.args) {
                         CommandOutcome::Exit => break,
@@ -2497,7 +2505,7 @@ impl StreamHandler for ReplStreamHandler {
         // tool_start for).
         //
         // These transient events (progress, worker_phase,
-        // session_info, non-orchestrator-prefixed) update
+        // non-orchestrator-prefixed) update
         // the spinner sub-line or task header in-place —
         // they don't add to scrollback, so they must NOT
         // flush the live reasoning block. Flushing here

@@ -263,6 +263,11 @@ impl AppConfig {
     pub fn health_url(&self) -> String {
         format!("{}/health", self.api_url.trim_end_matches('/'))
     }
+
+    /// Build the aura-native info endpoint URL from the base URL.
+    pub fn info_url(&self) -> String {
+        format!("{}/aura/info", self.api_url.trim_end_matches('/'))
+    }
 }
 
 /// Persist the user's selected style to `~/.aura/cli.toml`. Updates the

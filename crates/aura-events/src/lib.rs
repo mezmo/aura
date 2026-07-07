@@ -1,6 +1,7 @@
-//! Shared SSE event types for the Aura ecosystem.
+//! Shared wire types for the aura HTTP surface: SSE event types and
+//! introspection response bodies.
 //!
-//! This crate defines the event types emitted by the aura web server and
+//! This crate defines the types produced by the aura web server and
 //! consumed by the aura CLI. It is intentionally lightweight — no agent,
 //! MCP, or provider dependencies — so both producer and consumer crates
 //! can depend on it without pulling in the full aura stack.
@@ -163,6 +164,34 @@ pub struct McpServerStatus {
     /// Failure reason when `status == "failed"`; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One orchestration worker row suitable for client display.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerOverview {
+    pub name: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// One agent entry in the `GET /aura/info` response.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInfo {
+    /// Agent identifier — matches the `id` field in `/v1/models` (alias or name).
+    pub id: String,
+    /// LLM model name (e.g., "gpt-4o").
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workers: Vec<WorkerOverview>,
+}
+
+/// Response body for `GET /aura/info`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+    pub agents: Vec<AgentInfo>,
 }
 
 /// Worker phase for multi-agent orchestration.

@@ -13,6 +13,7 @@ use super::commands;
 use super::conversations::ConversationStore;
 use super::history::ConversationHistory;
 use super::input_reader::AuraHelper;
+use crate::backend::Backend;
 use crate::ui::prompt::{is_expanded_output, with_event_log};
 use crate::ui::state::{MODEL_MATCHES, RESUME_MATCHES, STYLE_MATCHES, get_tab_select_index};
 
@@ -25,6 +26,8 @@ pub(crate) struct CommandContext<'a> {
     /// state and persist an opt-out. Inspection/disable only — dispatch
     /// happens before the consent gate, so a slash command never enables.
     pub telemetry: &'a aura_telemetry::TelemetryHandle,
+    pub rt: &'a tokio::runtime::Runtime,
+    pub backend: &'a Backend,
 }
 
 /// What the REPL loop should do after a command handler returns.
@@ -262,7 +265,7 @@ fn cmd_rename(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
 }
 
 fn cmd_model(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
-    commands::handle_model(args, ctx.conv_store);
+    commands::handle_model(args, ctx.conv_store, ctx.rt, ctx.backend);
     CommandOutcome::Handled
 }
 

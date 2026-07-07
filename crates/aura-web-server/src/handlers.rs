@@ -5,6 +5,7 @@ use aura::{
     approval_event_unsubscribe, request_progress_subscribe, tool_event_subscribe,
     tool_usage_subscribe,
 };
+use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -950,6 +951,22 @@ pub async fn health() -> Response {
     .into_response()
 }
 
+/// `GET /aura/info`: aura-native introspection. Off `/v1/` to keep the OpenAI surface clean.
+pub async fn info(State(state): State<Arc<AppState>>) -> Response {
+    let agents: Vec<AgentInfo> = state
+        .configs
+        .iter()
+        .filter(|config| !config.agent.hidden)
+        .map(aura::agent_info)
+        .collect();
+
+    Json(ServerInfo {
+        default_agent: state.default_agent.clone(),
+        agents,
+    })
+    .into_response()
+}
+
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
 /// Filters out `hidden` agents
@@ -1553,6 +1570,117 @@ model = "gpt-4o"
         assert_eq!(data[0]["id"], "visible-agent");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "openai");
+    }
+
+    // --- info endpoint tests ---
+
+    fn make_info_state(
+        configs: Vec<aura_config::Config>,
+        default_agent: Option<&str>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            configs: Arc::new(configs),
+            tool_result_mode: crate::streaming::ToolResultMode::None,
+            tool_result_max_length: 0,
+            streaming_buffer_size: 32,
+            aura_custom_events: false,
+            aura_emit_reasoning: false,
+            streaming_timeout_secs: 0,
+            first_chunk_timeout_secs: 0,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
+            active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
+            default_agent: default_agent.map(str::to_owned),
+            additional_tools: Arc::new(Vec::new),
+            pending_approvals: aura::hitl::PendingApprovals::new(),
+        })
+    }
+
+    async fn parse_info_response(resp: Response) -> ServerInfo {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn info_config(name: &str, agent_fields: &str, extra_tables: &str) -> aura_config::Config {
+        parse_config(&format!(
+            r#"
+[agent]
+name = "{name}"
+system_prompt = "p"
+{agent_fields}
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+
+{extra_tables}
+"#
+        ))
+    }
+
+    fn solo_info_config(name: &str) -> aura_config::Config {
+        info_config(name, "", "")
+    }
+
+    fn orch_info_config() -> aura_config::Config {
+        info_config(
+            "orch-agent",
+            r#"alias = "orch""#,
+            r#"
+[orchestration]
+enabled = true
+
+[orchestration.worker.planner]
+description = "Plans work"
+preamble = "p"
+
+[orchestration.worker.writer]
+description = "Writes summaries"
+preamble = "p"
+
+[orchestration.worker.writer.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o-mini"
+"#,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_info_returns_agents_with_workers() {
+        let state = make_info_state(vec![orch_info_config()], None);
+        let resp = info(State(state)).await;
+        let info = parse_info_response(resp).await;
+
+        assert_eq!(info.agents.len(), 1);
+        let agent = &info.agents[0];
+        assert_eq!(agent.id, "orch");
+        assert_eq!(agent.model, "gpt-4o");
+        assert_eq!(agent.workers.len(), 2);
+        assert_eq!(agent.workers[0].name, "planner");
+        assert_eq!(agent.workers[0].model, None);
+        assert_eq!(agent.workers[1].name, "writer");
+        assert_eq!(agent.workers[1].model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[tokio::test]
+    async fn test_info_filters_hidden_agents_and_reports_default() {
+        let state = make_info_state(
+            vec![
+                info_config("hidden-agent", "hidden = true", ""),
+                solo_info_config("visible-agent"),
+            ],
+            Some("visible-agent"),
+        );
+        let resp = info(State(state)).await;
+        let info = parse_info_response(resp).await;
+
+        let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, ["visible-agent"]);
+        assert_eq!(info.default_agent.as_deref(), Some("visible-agent"));
     }
 
     // --- streaming / response builder tests ---

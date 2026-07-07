@@ -10,7 +10,7 @@
 pub use super::state::{
     ACTIVE_ORCH_TOOLS, ORCH_SCROLLBACK_COUNTER, cache_anim_lines, capture_style_preview_original,
     check_resize, clear_display_events, clear_queued_input, clear_style_preview_original,
-    extend_display_events, frame_lines, get_model_matches, get_selected_model,
+    extend_display_events, frame_lines, get_model_cache, get_model_matches, get_selected_model,
     install_sigint_handler, is_expanded_output, is_pretty, is_processing, is_readline_active,
     last_mid_stream_history_entry, print_welcome_state, print_welcome_state_animated,
     push_display_event, push_mid_stream_history, random_bullet_color, reset_input_geometry,
