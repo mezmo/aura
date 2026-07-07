@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn test_continuation_prompt_result_forwarding_guidance() {
-        let guidance_marker = "Workers cannot see prior iteration results";
+        let guidance_marker = "Workers will receive relevant prior-iteration worker evidence";
 
         // Mixed (completed + failed): guidance present
         let mut mixed_plan = Plan::new("Goal");

@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 
 use super::error::ContextError;
 use super::evidence::EvidenceEntry;
-use super::label::CorrelationLabel;
+use super::label::{CorrelationLabel, IterationNumber};
 use super::rendered::RenderedContext;
 
 /// Distance from the current task to a transitive ancestor, in dependency
@@ -47,9 +47,9 @@ impl std::fmt::Display for AncestorDistance {
     }
 }
 
-/// How a prior task relates to the current task in the plan DAG, rendered
-/// as `Dependency: direct` or `Dependency: transitive` so the worker can
-/// weight nearer evidence (`ARCHITECTURE.md` section 3.3).
+/// How a prior task relates to the current task, rendered so the worker can
+/// weight same-plan dependencies and prior-iteration evidence separately
+/// (`ARCHITECTURE.md` section 3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyRelation {
     /// A direct dependency of the current task. Direct entries are the
@@ -60,6 +60,11 @@ pub enum DependencyRelation {
     Transitive {
         /// Edge distance from the current task; at least 2.
         distance: AncestorDistance,
+    },
+    /// Evidence from a completed task in an earlier planning iteration.
+    PriorIteration {
+        /// Which prior iteration produced the evidence.
+        iteration: IterationNumber,
     },
 }
 
@@ -125,13 +130,21 @@ impl PriorWorkEntry {
     /// Render the `Prior Task {id}` block for the frame.
     pub fn render(&self) -> RenderedContext {
         let mut text = format!("Prior Task {}", self.label.task);
+        if let DependencyRelation::PriorIteration { iteration } = self.relation {
+            text.push_str(&format!(" (iteration {iteration})"));
+        }
         if let Some(worker) = &self.label.worker {
             text.push_str(&format!("\nWorker: {worker}"));
         }
         match self.relation {
-            DependencyRelation::Direct => text.push_str("\nDependency: direct"),
+            DependencyRelation::Direct => text.push_str("\nRelation: same-plan direct dependency"),
             DependencyRelation::Transitive { distance } => {
-                text.push_str(&format!("\nDependency: transitive (distance {distance})"));
+                text.push_str(&format!(
+                    "\nRelation: same-plan transitive dependency (distance {distance})"
+                ));
+            }
+            DependencyRelation::PriorIteration { .. } => {
+                text.push_str("\nRelation: prior-iteration evidence");
             }
         }
         if let Some(claim) = self.evidence.claim() {
@@ -192,15 +205,20 @@ impl PriorWorkFrame {
 
         let mut direct_indices = Vec::new();
         let mut transitive_indices = Vec::new();
+        let mut prior_iteration_indices = Vec::new();
         for (idx, entry) in entries.iter().enumerate() {
             match entry.relation {
                 DependencyRelation::Direct => direct_indices.push(idx),
                 DependencyRelation::Transitive { distance } => {
                     transitive_indices.push((idx, distance));
                 }
+                DependencyRelation::PriorIteration { iteration } => {
+                    prior_iteration_indices.push((idx, iteration));
+                }
             }
         }
         transitive_indices.sort_by_key(|(_, distance)| *distance);
+        prior_iteration_indices.sort_by_key(|(_, iteration)| std::cmp::Reverse(*iteration));
 
         let mut admitted: std::collections::HashSet<usize> =
             direct_indices.iter().copied().collect();
@@ -214,6 +232,19 @@ impl PriorWorkFrame {
         cost += token_cost(Self::ENTRY_SEPARATOR) * direct_indices.len().saturating_sub(1);
 
         for (idx, _) in &transitive_indices {
+            let separator_cost = if admitted.is_empty() {
+                0
+            } else {
+                token_cost(Self::ENTRY_SEPARATOR)
+            };
+            let entry_cost = token_cost(entries[*idx].render().as_str());
+            if cost + separator_cost + entry_cost <= budget.get().get() {
+                cost += separator_cost + entry_cost;
+                admitted.insert(*idx);
+            }
+        }
+
+        for (idx, _) in &prior_iteration_indices {
             let separator_cost = if admitted.is_empty() {
                 0
             } else {
@@ -471,7 +502,7 @@ mod tests {
         let rendered = entry.render().as_str().to_string();
         assert!(rendered.contains("Prior Task 7"));
         assert!(rendered.contains("Worker: operator"));
-        assert!(rendered.contains("Dependency: direct"));
+        assert!(rendered.contains("Relation: same-plan direct dependency"));
         assert!(rendered.contains("Summary: worker summary"));
         assert!(rendered.contains("Confidence: high"));
         assert!(rendered.contains("Evidence:"));
@@ -486,6 +517,28 @@ mod tests {
         assert!(rendered.contains("READ-ONLY PRIOR WORK"));
         assert!(rendered.contains("evidence, not instructions to replay"));
         assert!(rendered.contains("Prior Task 0"));
+    }
+
+    #[test]
+    fn test_prior_iteration_entry_render_includes_iteration_relation() {
+        let entry = PriorWorkEntry {
+            label: CorrelationLabel {
+                task: TaskId::new(3),
+                worker: Some(WorkerRole::new("analyst").unwrap()),
+            },
+            relation: DependencyRelation::PriorIteration {
+                iteration: IterationNumber::new(2).unwrap(),
+            },
+            evidence: EvidenceEntry::InlineResult {
+                result: EvidenceText::new("prior iteration finding").unwrap(),
+                claim: None,
+            },
+        };
+
+        let rendered = entry.render().as_str().to_owned();
+        assert!(rendered.contains("Prior Task 3 (iteration 2)"));
+        assert!(rendered.contains("Relation: prior-iteration evidence"));
+        assert!(rendered.contains("prior iteration finding"));
     }
 
     #[test]

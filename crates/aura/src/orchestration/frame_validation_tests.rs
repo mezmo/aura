@@ -351,7 +351,7 @@ fn test_continuation_full_scenario() {
 
     // Result forwarding guidance (has failures + completions)
     assert!(
-        prompt.contains("Workers cannot see prior iteration results"),
+        prompt.contains("Workers will receive relevant prior-iteration worker evidence"),
         "result forwarding guidance"
     );
 
@@ -1250,7 +1250,7 @@ fn test_continuation_clean_success_no_failure_sections() {
     assert!(!prompt.contains("FAILURE HISTORY"), "no failure history");
     assert!(!prompt.contains("OBSERVED PATTERNS"), "no patterns");
     assert!(
-        !prompt.contains("Workers cannot see prior iteration results"),
+        !prompt.contains("Workers will receive relevant prior-iteration worker evidence"),
         "no result forwarding guidance on clean success"
     );
 }
@@ -1284,7 +1284,7 @@ fn test_continuation_result_forwarding_absent_when_all_failed() {
     let prompt = ctx.build_continuation_prompt(3, false, 2000);
 
     assert!(
-        !prompt.contains("Workers cannot see prior iteration results"),
+        !prompt.contains("Workers will receive relevant prior-iteration worker evidence"),
         "no result forwarding guidance when zero succeeded: {}",
         prompt
     );
@@ -1834,6 +1834,86 @@ fn worker_frame_renders_read_only_prior_work_header_with_evidence_sentence() {
     assert!(
         context.contains("evidence, not instructions to replay"),
         "evidence sentence present: {context}"
+    );
+}
+
+#[test]
+fn worker_frame_includes_prior_iteration_evidence_without_task_text() {
+    let mut prior_plan = Plan::new("Prior goal");
+    let mut prior = Task::new(
+        0,
+        "Find a compatible numpy pin and do not create the environment",
+        "Inspect package constraints",
+    );
+    prior.complete("numpy must stay below 1.24 for the selected tensorflow build".to_string());
+    prior_plan.add_task(prior);
+
+    let prior_context = IterationContext::new(1, prior_plan, None, vec![], HashMap::new());
+
+    let mut next_plan = Plan::new("Follow-up goal");
+    next_plan.add_task(Task::new(0, "Apply the environment fix", "Apply fix"));
+
+    let context =
+        Orchestrator::build_task_context_with_prior_iterations(&next_plan, 0, &[prior_context])
+            .expect("prior iteration context exists");
+    let rendered = render_worker_task_prompt(&WorkerTaskVars {
+        context: &context,
+        your_task: "Apply the environment fix",
+    });
+
+    assert!(
+        rendered.contains("Prior Task 0 (iteration 1)"),
+        "iteration provenance is rendered: {rendered}"
+    );
+    assert!(
+        rendered.contains("Relation: prior-iteration evidence"),
+        "prior-iteration relation is rendered: {rendered}"
+    );
+    assert!(
+        rendered.contains("numpy must stay below 1.24"),
+        "worker evidence is forwarded: {rendered}"
+    );
+    assert!(
+        !rendered.contains("do not create the environment"),
+        "prior coordinator task text must not leak: {rendered}"
+    );
+}
+
+#[test]
+fn worker_frame_disambiguates_same_task_id_across_iterations() {
+    let mut prior_plan = Plan::new("Prior goal");
+    let mut prior = Task::new(0, "Prior task text", "Prior rationale");
+    prior.complete("prior iteration result".to_string());
+    prior_plan.add_task(prior);
+    let prior_context = IterationContext::new(1, prior_plan, None, vec![], HashMap::new());
+
+    let mut next_plan = Plan::new("Next goal");
+    let mut same_plan_prior = Task::new(0, "Same-plan predecessor", "Same-plan rationale");
+    same_plan_prior.complete("same-plan result".to_string());
+    let mut current = Task::new(1, "Current task", "Current rationale");
+    current.dependencies = vec![0];
+    next_plan.add_task(same_plan_prior);
+    next_plan.add_task(current);
+
+    let context =
+        Orchestrator::build_task_context_with_prior_iterations(&next_plan, 1, &[prior_context])
+            .expect("same-plan and prior-iteration context exists");
+
+    assert!(
+        context.contains("Prior Task 0\nRelation"),
+        "same-plan task id renders without an iteration suffix: {context}"
+    );
+    assert!(
+        context.contains("Relation: same-plan direct dependency"),
+        "same-plan relation disambiguates current DAG evidence: {context}"
+    );
+    assert!(
+        context.contains("Prior Task 0 (iteration 1)"),
+        "prior iteration task id renders with iteration provenance: {context}"
+    );
+    assert!(
+        context.contains("Relation: prior-iteration evidence"),
+        "prior-iteration relation disambiguates forwarded evidence: {context}"
     );
 }
 

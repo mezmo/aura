@@ -61,7 +61,8 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 use super::config::OrchestrationConfig;
 use super::context::{
     AncestorDistance, CoordinatorTurn, CorrelationLabel, DependencyRelation, EvidenceEntry,
-    PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim, WorkerRole,
+    IterationNumber, PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim,
+    WorkerRole,
 };
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
@@ -2620,6 +2621,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn execute(
         &self,
         plan: &mut Plan,
+        prior_contexts: &[IterationContext],
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<(), StreamError> {
         use futures::StreamExt;
@@ -2632,7 +2634,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .ready_tasks()
                 .iter()
                 .map(|t| {
-                    let context = Self::build_task_context(plan, t.id);
+                    let context =
+                        Self::build_task_context_with_prior_iterations(plan, t.id, prior_contexts);
                     (t.id, t.description.clone(), context, t.worker.clone())
                 })
                 .collect();
@@ -2853,13 +2856,20 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns `None` when the task has no completed ancestors, so the
     /// `%%CONTEXT%%` slot is left empty.
+    #[cfg(test)]
     pub(crate) fn build_task_context(plan: &Plan, task_id: usize) -> Option<String> {
-        let ancestors = Self::completed_ancestors(plan, task_id);
-        if ancestors.is_empty() {
-            return None;
-        }
+        Self::build_task_context_with_prior_iterations(plan, task_id, &[])
+    }
 
-        let entries: Vec<PriorWorkEntry> = ancestors
+    /// Build worker task context from same-plan ancestors plus completed
+    /// worker evidence from earlier planning iterations.
+    pub(crate) fn build_task_context_with_prior_iterations(
+        plan: &Plan,
+        task_id: usize,
+        prior_contexts: &[IterationContext],
+    ) -> Option<String> {
+        let ancestors = Self::completed_ancestors(plan, task_id);
+        let mut entries: Vec<PriorWorkEntry> = ancestors
             .into_iter()
             .filter_map(|(ancestor_id, distance)| {
                 let ancestor = plan.tasks.iter().find(|t| t.id == ancestor_id)?;
@@ -2910,12 +2920,64 @@ Assign tasks to the worker whose tools best match the required operations."#,
             })
             .collect();
 
+        entries.extend(Self::prior_iteration_entries(prior_contexts));
+
         if entries.is_empty() {
             return None;
         }
 
         let frame = PriorWorkFrame::assemble(entries, TokenBudget::default()).ok()?;
         Some(String::from(frame.render()))
+    }
+
+    fn prior_iteration_entries(prior_contexts: &[IterationContext]) -> Vec<PriorWorkEntry> {
+        prior_contexts
+            .iter()
+            .flat_map(|ctx| {
+                let iteration = match IterationNumber::new(ctx.iteration) {
+                    Ok(iteration) => iteration,
+                    Err(_) => return Vec::new(),
+                };
+
+                ctx.previous_plan
+                    .tasks
+                    .iter()
+                    .filter_map(move |task| {
+                        let result = match &task.state {
+                            TaskState::Complete { result } => result,
+                            _ => return None,
+                        };
+                        let label = CorrelationLabel {
+                            task: TaskId::new(task.id),
+                            worker: task
+                                .worker
+                                .as_deref()
+                                .and_then(|w| WorkerRole::new(w).ok()),
+                        };
+                        let claim = task
+                            .structured_output
+                            .as_ref()
+                            .and_then(|so| WorkerClaim::try_from(so).ok());
+                        let evidence = match EvidenceEntry::from_completed_result(result, claim) {
+                            Ok(entry) => entry,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to build prior-iteration evidence entry for task {}: {}",
+                                    task.id,
+                                    e
+                                );
+                                return None;
+                            }
+                        };
+                        Some(PriorWorkEntry {
+                            label,
+                            relation: DependencyRelation::PriorIteration { iteration },
+                            evidence,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Find all completed ancestors of `task_id` with their shortest edge
@@ -3663,7 +3725,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         orchestration_start: Instant,
     ) -> Result<String, StreamError> {
         let mut iteration = 0;
-        let mut previous_context: Option<IterationContext> = None;
+        let mut prior_contexts: Vec<IterationContext> = Vec::new();
         let mut plan = initial_plan;
         let mut failure_history: Vec<FailedTaskRecord> = Vec::new();
 
@@ -3677,7 +3739,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan,
                     &chat_history,
                     coordinator_state,
-                    previous_context.as_ref(),
+                    &prior_contexts,
                     &event_tx,
                     orchestration_start,
                     &mut failure_history,
@@ -3690,7 +3752,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     previous_context: pc,
                 } => {
                     plan = new_plan;
-                    previous_context = pc;
+                    if let Some(context) = pc {
+                        prior_contexts.push(context);
+                    }
                 }
             }
         };
@@ -3716,7 +3780,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         mut plan: Plan,
         chat_history: &[rig::completion::Message],
         coordinator_state: &mut CoordinatorState,
-        previous_context: Option<&IterationContext>,
+        prior_contexts: &[IterationContext],
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
         failure_history: &mut Vec<FailedTaskRecord>,
@@ -3731,13 +3795,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             self.config.per_call_timeout_secs(),
         );
 
-        // `previous_context` is unused under the unified continuation design —
-        // the prior iteration's post-execute coordinator call already
-        // produced the plan we receive here (or we received an empty
-        // carry-over plan from the failure-replan path's `trigger_replan`).
-        // Kept in the signature for future artifact-reachability wiring.
-        let _ = previous_context;
-
         // On re-plan (iteration > 1), advance persistence so the new plan
         // and its execution share a single directory.
         if iteration > 1 {
@@ -3751,7 +3808,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        if let Err(e) = self.execute(&mut plan, event_tx).await {
+        if let Err(e) = self.execute(&mut plan, prior_contexts, event_tx).await {
             self.write_run_manifest(&plan, iteration).await;
             return Err(e);
         }
