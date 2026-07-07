@@ -141,8 +141,9 @@ helm install aura ./deployment/helm/aura \
   --set secrets.openaiApiKey="$OPENAI_API_KEY"
 ```
 
-> **Using a different LLM provider?** Edit `aura-values.yaml` and update the `[llm]`
-> section. See [`examples/reference.toml`](../reference.toml) for all provider options.
+> **Using a different LLM provider?** Edit `aura-values.yaml` and update the
+> `[agent.llm]` section. See [`examples/reference.toml`](../reference.toml) for all
+> provider options.
 
 Wait for AURA:
 
@@ -152,15 +153,12 @@ kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=aura --timeout=
 
 ### 5. Try it out
 
-Launch [AURA CLI](https://hub.docker.com/r/mezmo/aura) inside the cluster,
-pointed at the AURA service:
+The [AURA CLI](../../crates/aura-cli/README.md) ships **inside the same image**
+as the server, so there's no separate CLI container to deploy. Exec into the
+running AURA pod and launch the bundled CLI against the in-pod server:
 
 ```bash
-kubectl run -it --rm aura \
-  --image=mezmo/aura \
-  --restart=Never \
-  --command -- ./aura --api-url http://aura:80 \
-  --model "kubernetes-sre"
+kubectl exec -it deploy/aura -- ./aura --api-url http://localhost:8080 --model kubernetes-sre
 ```
 
 This drops you into an interactive REPL. Try these queries:
@@ -187,6 +185,10 @@ You can toggle the SSE event panel with `/stream` to watch the orchestration in
 real time.
 
 Type `/quit` to exit.
+
+> **Prefer a browser or a local CLI?** Port-forward the service with
+> `kubectl port-forward svc/aura 8080:80`, then point any OpenAI-compatible
+> client — or a locally built `aura --api-url http://localhost:8080` — at it.
 
 ## How the orchestration config works
 

@@ -25,7 +25,7 @@ services:
 
   # ── Aura Agent Server (Orchestration Mode) ──────────────────────────
   aura:
-    image: mezmo/aura:orchestration
+    image: mezmo/aura:latest
     container_name: aura
     command:
       - ./aura-web-server

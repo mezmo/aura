@@ -8,14 +8,16 @@ replicaCount: 1
 
 image:
   repository: mezmo/aura
-  tag: "orchestration"
+  tag: "latest"
   pullPolicy: IfNotPresent
 
+# The mezmo/aura image ships both binaries: the server (default CMD,
+# ./aura-web-server) and the CLI (./aura). The chart already runs the server by
+# default, so no command/args override is needed here — step 5 execs the bundled
+# CLI into this same pod.
 server:
   httpPort: 8080
   loglevel: info
-  command: ["./aura-web-server"]
-  args: ["--verbose"]
 
 streaming:
   toolResultMode: "aura"
@@ -36,10 +38,10 @@ resources:
 
 config:
   content: |
-    [llm]
-    provider = "openai"
-    api_key = "{{ env.OPENAI_API_KEY }}"
-    model = "gpt-5.4-mini"
+    # Root the orchestration run artifacts on disk. `memory_dir` is a top-level
+    # key; the older `[orchestration.artifacts].memory_dir` form still works as a
+    # fallback.
+    memory_dir = "/tmp/aura-orchestration"
 
     [mcp]
     sanitize_schemas = true
@@ -72,6 +74,13 @@ config:
     Prefer read-only operations unless the user explicitly requests changes.
     """
     turn_depth = 20
+
+    # LLM config lives under [agent.llm]. Workers inherit it unless they set
+    # their own [orchestration.worker.<name>.llm].
+    [agent.llm]
+    provider = "openai"
+    api_key = "{{ env.OPENAI_API_KEY }}"
+    model = "gpt-5.4-mini"
     max_tokens = 4096
 
     # ── Orchestration ────────────────────────────────────────────────
@@ -86,9 +95,6 @@ config:
 
     [orchestration.timeouts]
     per_call_timeout_secs = 120
-
-    [orchestration.artifacts]
-    memory_dir = "/tmp/aura-orchestration"
 
     # ── Workers ──────────────────────────────────────────────────────
     #
