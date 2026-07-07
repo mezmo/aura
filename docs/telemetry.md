@@ -1,6 +1,6 @@
 # Telemetry & Privacy
 
-`aura-cli` emits **anonymous** product telemetry to PostHog so maintainers
+The `aura` CLI emits **anonymous** product telemetry to PostHog so maintainers
 can answer one question: *are people using the CLI, in which modes, and do
 their chat turns succeed?* Telemetry is **CLI-only** (the server sends
 nothing), **opt-out**, and **notice-gated**: nothing is sent until you have
@@ -55,7 +55,7 @@ machine.
 
 ### One-shot mode never sends
 
-`aura -q "…"` (one-shot `--query`) is non-interactive: it cannot show the
+`aura --query "…"` (one-shot) is non-interactive: it cannot show the
 notice, stays **Unknown**, and only ever writes to the local inspection log.
 It never transmits.
 
