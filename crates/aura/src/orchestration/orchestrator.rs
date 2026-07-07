@@ -2026,6 +2026,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         preamble: &str,
         temperature: Option<f64>,
         additional_params: Option<serde_json::Value>,
+        max_tokens: Option<u64>,
         tools: CoordinatorTools,
     ) -> rig::agent::Agent<M> {
         let mut builder = rig::agent::AgentBuilder::new(completion_model);
@@ -2035,6 +2036,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
         if let Some(params) = additional_params {
             builder = builder.additional_params(params);
+        }
+        if let Some(max) = max_tokens {
+            builder = builder.max_tokens(max);
         }
         let mut state = BuilderState::Initial(builder);
         if let Some(list_tools) = tools.list_tools {
@@ -2208,6 +2212,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &preamble,
                 temperature,
                 self.agent_config.llm.additional_params(),
+                self.agent_config.llm.max_tokens(),
                 coordinator_tools,
             )
             .await?;
@@ -2247,6 +2252,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         preamble: &str,
         temperature: Option<f64>,
         additional_params: Option<serde_json::Value>,
+        max_tokens: Option<u64>,
         tools: CoordinatorTools,
     ) -> Result<ProviderAgent, Box<dyn std::error::Error + Send + Sync>> {
         match &self.agent_config.llm {
@@ -2271,6 +2277,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     preamble,
                     temperature,
                     additional_params,
+                    max_tokens,
                     tools,
                 )))
             }
@@ -2294,6 +2301,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     preamble,
                     temperature,
                     additional_params,
+                    max_tokens,
                     tools,
                 )))
             }
@@ -2325,6 +2333,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     preamble,
                     temperature,
                     additional_params,
+                    max_tokens,
                     tools,
                 )))
             }
@@ -2348,6 +2357,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     preamble,
                     temperature,
                     additional_params,
+                    max_tokens,
                     tools,
                 )))
             }
@@ -2366,6 +2376,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     preamble,
                     temperature,
                     additional_params,
+                    max_tokens,
                     tools,
                 )))
             }
@@ -2389,6 +2400,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     preamble,
                     temperature,
                     additional_params,
+                    max_tokens,
                     tools,
                 )))
             }
