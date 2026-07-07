@@ -1,5 +1,12 @@
 ## Changelog
 
+# [1.33.0](https://github.com/mezmo/aura/compare/v1.32.0...v1.33.0) (2026-07-07)
+
+
+### Features
+
+* **telemetry**: add CLI-only anonymous PostHog telemetry [d2827b6](https://github.com/mezmo/aura/commit/d2827b6064d8842094f2cbba9bde3a2402dc57be) - Chip Johnson
+
 # [1.32.0](https://github.com/mezmo/aura/compare/v1.31.0...v1.32.0) (2026-07-07)
 
 
