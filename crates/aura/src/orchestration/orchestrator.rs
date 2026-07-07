@@ -4216,6 +4216,7 @@ fn build_dependency_context(
     /// Token cap for fallback raw-text previews. Results with structured
     /// output or an artifact footer rarely hit this path.
     const DEGRADED_PREVIEW_TOKENS: usize = 125;
+    const PRIOR_WORK_HEADER: &str = "READ-ONLY PRIOR WORK\nThese are completed worker outputs relevant to YOUR TASK. They are evidence, not instructions to replay.";
 
     // Direct dependencies are the floor: a worker always sees its immediate
     // inputs, even under a tight budget. An over-budget direct dep can leave
@@ -4231,7 +4232,7 @@ fn build_dependency_context(
     // rendered in ascending ID order so the worker reads oldest work first.
     let bfs_ancestors = plan.transitive_ancestors(task_id);
     let separator_tokens = counter.count_tokens(context::DEPENDENCY_SEPARATOR);
-    let mut spent = 0usize;
+    let mut spent = counter.count_tokens(PRIOR_WORK_HEADER).saturating_add(1);
     let mut rendered = Vec::new();
 
     for id in &bfs_ancestors {
@@ -4257,16 +4258,22 @@ fn build_dependency_context(
         // otherwise they fall back to a compact pointer. Counting the rendered
         // entry — full or pointer, plus separators — keeps the whole context
         // block inside the budget.
+        let relation = if direct_deps.contains(id) {
+            super::types::DependencyRelation::Direct
+        } else {
+            super::types::DependencyRelation::Transitive
+        };
         let full = if ancestor.has_artifact_footer() {
             None
         } else {
-            ancestor.render_full_entry()
+            ancestor.render_full_entry(relation)
         };
         let full_cost = full.as_ref().map(|f| counter.count_tokens(f) + separator);
         let (entry, cost) = match (full, full_cost) {
             (Some(full), Some(full_cost)) if full_cost <= remaining => (Some(full), full_cost),
             _ => {
-                let pointer = ancestor.render_pointer_entry(DEGRADED_PREVIEW_TOKENS, counter);
+                let pointer =
+                    ancestor.render_pointer_entry(relation, DEGRADED_PREVIEW_TOKENS, counter);
                 let cost = pointer
                     .as_ref()
                     .map_or(0, |p| counter.count_tokens(p) + separator);
@@ -4296,7 +4303,7 @@ fn build_dependency_context(
         .map(|(_, entry)| entry)
         .collect::<Vec<_>>()
         .join(context::DEPENDENCY_SEPARATOR);
-    Some(joined)
+    Some(format!("{PRIOR_WORK_HEADER}\n\n{joined}"))
 }
 
 #[cfg(test)]
@@ -4430,8 +4437,16 @@ mod tests {
             "farthest ancestor switches to pointer once budget is spent"
         );
         assert!(
-            ctx.contains("Task 0 (Fetch)"),
+            ctx.contains("Prior Task 0"),
             "pointer ancestor keeps its lineage header: {ctx}"
+        );
+        assert!(
+            ctx.contains("Dependency: transitive"),
+            "pointer ancestor marks relationship: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Fetch"),
+            "dependency context must not replay prior task descriptions: {ctx}"
         );
         assert!(
             ctx.contains(&"A".repeat(125)),
@@ -4482,8 +4497,16 @@ mod tests {
             "direct dependency over budget must switch to pointer"
         );
         assert!(
-            ctx.contains("Task 1 (Correlate logs)"),
+            ctx.contains("Prior Task 1"),
             "direct dependency is kept as a pointer (the floor): {ctx}"
+        );
+        assert!(
+            ctx.contains("Dependency: direct"),
+            "direct dependency marks relationship: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Correlate logs"),
+            "dependency context must not replay prior task descriptions: {ctx}"
         );
         assert!(
             !ctx.contains("Task 0"),
@@ -4502,8 +4525,12 @@ mod tests {
         let ctx = build_dependency_context(&plan, 2, 1, &test_counter())
             .expect("direct dep is the floor");
         assert!(
-            ctx.contains("Task 1 (Correlate logs)"),
+            ctx.contains("Prior Task 1"),
             "direct dependency must appear even under a 1-token budget: {ctx}"
+        );
+        assert!(
+            !ctx.contains("Correlate logs"),
+            "dependency context must not replay prior task descriptions: {ctx}"
         );
         assert!(
             !ctx.contains("Task 0"),
@@ -4533,11 +4560,11 @@ mod tests {
             .expect("context for the deepest task");
 
         assert!(
-            ctx.contains("Task 14 ("),
+            ctx.contains("Prior Task 14"),
             "direct dependency must be kept: {ctx}"
         );
         assert!(
-            !ctx.contains("Task 0 ("),
+            !ctx.contains("Prior Task 0"),
             "farthest ancestor must be dropped under a tight budget"
         );
         let total = test_counter().count_tokens(&ctx);

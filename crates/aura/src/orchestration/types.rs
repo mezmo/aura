@@ -397,6 +397,23 @@ pub struct StructuredTaskOutput {
     pub confidence: super::tools::submit_result::Confidence,
 }
 
+/// Relationship between the current task and a completed prior task rendered
+/// into the worker's read-only dependency context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DependencyRelation {
+    Direct,
+    Transitive,
+}
+
+impl DependencyRelation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DependencyRelation::Direct => "direct",
+            DependencyRelation::Transitive => "transitive",
+        }
+    }
+}
+
 impl Task {
     /// Create a new pending task.
     pub fn new(id: usize, description: impl Into<String>, rationale: impl Into<String>) -> Self {
@@ -460,17 +477,9 @@ impl Task {
     /// Render the full result as a dependency-context entry.
     ///
     /// Returns `None` unless the task is `Complete`.
-    pub(crate) fn render_full_entry(&self) -> Option<String> {
-        use super::prompt_constants::sections;
-
+    pub(crate) fn render_full_entry(&self, relation: DependencyRelation) -> Option<String> {
         let result = self.state.completed_result()?;
-        Some(format!(
-            "{} — Task {} ({}):\n{}",
-            sections::PRIOR_WORK,
-            self.id,
-            self.description,
-            result
-        ))
+        Some(self.render_dependency_entry(relation, result))
     }
 
     /// Render a compact, budget-safe dependency-context entry.
@@ -483,20 +492,19 @@ impl Task {
     /// Returns `None` unless the task is `Complete`.
     pub(crate) fn render_pointer_entry(
         &self,
+        relation: DependencyRelation,
         max_preview_tokens: usize,
         counter: &dyn crate::scratchpad::TokenCounter,
     ) -> Option<String> {
-        use super::prompt_constants::sections;
-
         let result = self.state.completed_result()?;
         let footer = extract_artifact_footer(result);
 
-        let body = if let Some(ref so) = self.structured_output {
+        let evidence = if let Some(ref so) = self.structured_output {
             if !so.summary.is_empty() {
                 if let Some(footer) = footer {
-                    format!("{}\n{}", so.summary, footer)
+                    footer.to_string()
                 } else {
-                    so.summary.clone()
+                    "Structured summary only; full result omitted for prompt budget.".to_string()
                 }
             } else if let Some(footer) = footer {
                 // Empty summary but artifact exists: point at the artifact.
@@ -522,13 +530,27 @@ impl Task {
             counter.truncate_to_tokens(result, max_preview_tokens)
         };
 
-        Some(format!(
-            "{} — Task {} ({}):\n{}",
-            sections::PRIOR_WORK,
+        Some(self.render_dependency_entry(relation, &evidence))
+    }
+
+    fn render_dependency_entry(&self, relation: DependencyRelation, evidence: &str) -> String {
+        let worker = self.worker.as_deref().unwrap_or("unassigned");
+        let mut entry = format!(
+            "Prior Task {}\nWorker: {}\nDependency: {}",
             self.id,
-            self.description,
-            body
-        ))
+            worker,
+            relation.as_str()
+        );
+
+        if let Some(ref so) = self.structured_output {
+            if !so.summary.is_empty() {
+                entry.push_str(&format!("\nSummary: {}", so.summary));
+            }
+            entry.push_str(&format!("\nConfidence: {}", so.confidence));
+        }
+
+        entry.push_str(&format!("\nEvidence:\n{}", evidence));
+        entry
     }
 }
 
@@ -1389,11 +1411,20 @@ mod tests {
 
     #[test]
     fn test_render_full_entry() {
-        let mut task = Task::new(0, "Analyze", "r");
+        let mut task = Task::new(0, "Analyze", "r").with_worker("sre");
         task.complete("deploy X at 14:02");
-        let entry = task.render_full_entry().expect("complete task renders");
-        assert!(entry.contains("COMPLETED — Task 0 (Analyze):"));
+        let entry = task
+            .render_full_entry(DependencyRelation::Direct)
+            .expect("complete task renders");
+        assert!(entry.contains("Prior Task 0"));
+        assert!(entry.contains("Worker: sre"));
+        assert!(entry.contains("Dependency: direct"));
+        assert!(entry.contains("Evidence:"));
         assert!(entry.contains("deploy X at 14:02"));
+        assert!(
+            !entry.contains("Analyze"),
+            "prior task prompt must not be replayed in dependency context"
+        );
     }
 
     #[test]
@@ -1411,8 +1442,11 @@ mod tests {
         });
 
         let entry = task
-            .render_pointer_entry(100, &counter)
+            .render_pointer_entry(DependencyRelation::Transitive, 100, &counter)
             .expect("complete task renders");
+        assert!(entry.contains("Dependency: transitive"));
+        assert!(entry.contains("Summary: Found 47 error groups"));
+        assert!(entry.contains("Confidence: high"));
         assert!(entry.contains("Found 47 error groups"));
         assert!(entry.contains(footer));
         assert!(
@@ -1435,11 +1469,11 @@ mod tests {
         });
 
         let entry = task
-            .render_pointer_entry(100, &counter)
+            .render_pointer_entry(DependencyRelation::Direct, 100, &counter)
             .expect("complete task renders");
         assert_eq!(
             entry,
-            "COMPLETED — Task 0 (Analyze):\nFound 47 error groups"
+            "Prior Task 0\nWorker: unassigned\nDependency: direct\nSummary: Found 47 error groups\nConfidence: high\nEvidence:\nStructured summary only; full result omitted for prompt budget."
         );
     }
 
@@ -1462,9 +1496,10 @@ mod tests {
         });
 
         let entry = task
-            .render_pointer_entry(10, &counter)
+            .render_pointer_entry(DependencyRelation::Direct, 10, &counter)
             .expect("complete task renders");
-        assert!(entry.starts_with("COMPLETED — Task 0 (Analyze):"));
+        assert!(entry.starts_with("Prior Task 0"));
+        assert!(!entry.contains("Analyze"));
         assert!(
             entry.len() < body.len(),
             "empty summary must fall back to truncated result"
@@ -1486,7 +1521,7 @@ mod tests {
         task.complete(format!("{}\n\n{}", body, footer));
 
         let entry = task
-            .render_pointer_entry(20, &counter)
+            .render_pointer_entry(DependencyRelation::Direct, 20, &counter)
             .expect("complete task renders");
         assert!(entry.contains(footer));
         // Full body is far larger than the truncated entry.
@@ -1505,7 +1540,7 @@ mod tests {
         task.complete(format!("{}\n\n{}", body, footer));
 
         let entry = task
-            .render_pointer_entry(50, &counter)
+            .render_pointer_entry(DependencyRelation::Direct, 50, &counter)
             .expect("complete task renders");
         assert!(entry.contains(footer));
         assert!(entry.contains(body));
@@ -1530,9 +1565,10 @@ mod tests {
         task.complete(body.clone());
 
         let entry = task
-            .render_pointer_entry(10, &counter)
+            .render_pointer_entry(DependencyRelation::Direct, 10, &counter)
             .expect("complete task renders");
-        assert!(entry.starts_with("COMPLETED — Task 0 (Analyze):"));
+        assert!(entry.starts_with("Prior Task 0"));
+        assert!(!entry.contains("Analyze"));
         assert!(entry.len() < body.len(), "entry should be truncated");
     }
 
@@ -1542,9 +1578,15 @@ mod tests {
 
         let counter = TiktokenCounter::default_counter();
         let mut task = Task::new(0, "Analyze", "r");
-        assert!(task.render_pointer_entry(50, &counter).is_none());
+        assert!(
+            task.render_pointer_entry(DependencyRelation::Direct, 50, &counter)
+                .is_none()
+        );
         task.fail("boom", FailureCategory::AgentError);
-        assert!(task.render_pointer_entry(50, &counter).is_none());
+        assert!(
+            task.render_pointer_entry(DependencyRelation::Direct, 50, &counter)
+                .is_none()
+        );
     }
 
     #[test]
