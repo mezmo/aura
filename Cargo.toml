@@ -21,14 +21,14 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "1.33.0"
+version = "1.34.0"
 edition = "2024"
 authors = ["Mezmo <support@mezmo.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/mezmo/aura"
 
 [workspace.dependencies]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "890853065c8d46cd886b6f93bca5895a492d750c", features = ["rmcp"] }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "e6f008eaf555733d93368c9dd174d1d61d7d096d", features = ["rmcp"] }
 # Pinned to exact versions compatible with our rig-core 0.28.x fork.
 # Newer versions pull in rig-core 0.31+ which is semver-incompatible with the fork.
 rig-bedrock = "=0.3.10"
@@ -89,5 +89,5 @@ http = "1.0"
 
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
-rig-core = { git = "https://github.com/mezmo/rig.git", rev = "890853065c8d46cd886b6f93bca5895a492d750c" }
+rig-core = { git = "https://github.com/mezmo/rig.git", rev = "e6f008eaf555733d93368c9dd174d1d61d7d096d" }
 
