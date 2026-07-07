@@ -264,6 +264,7 @@ async fn run() -> std::io::Result<()> {
 
     let app = Router::new()
         .route("/health", get(handlers::health))
+        .route("/aura/info", get(handlers::info))
         .route("/v1/models", get(handlers::list_models))
         .route("/v1/chat/completions", post(handlers::chat_completions))
         .route(

@@ -437,6 +437,10 @@ pub fn get_model_matches() -> Vec<String> {
     MODEL_MATCHES.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
+pub fn get_model_cache() -> Vec<String> {
+    MODEL_CACHE.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 /// Get the cached style matches (populated while typing `/style`).
 pub fn get_style_matches() -> Vec<String> {
     STYLE_MATCHES.lock().map(|g| g.clone()).unwrap_or_default()

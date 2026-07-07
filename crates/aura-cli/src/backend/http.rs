@@ -55,4 +55,12 @@ impl HttpBackend {
     pub async fn connection_summary(&self) -> String {
         self.client.connection_summary().await
     }
+
+    /// Fetch the selected agent overview from `GET /aura/info`.
+    /// Returns `None` if the server is unreachable, doesn't support the
+    /// endpoint, or the selected model cannot be resolved.
+    pub async fn startup_agent_overview(&self) -> Option<aura_events::AgentInfo> {
+        let info = self.client.server_info().await?;
+        super::select_agent(info, crate::ui::prompt::get_selected_model().as_deref())
+    }
 }

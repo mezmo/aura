@@ -5,19 +5,52 @@ use std::io::{self, Write};
 use std::sync::atomic::Ordering;
 
 use crate::api::types::DisplayEvent;
+use crate::backend::Backend;
 use crate::repl::conversations::ConversationStore;
 use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{AuraHelper, HISTORY_COUNT, HISTORY_DEPTH};
 use crate::ui::prompt::{
     clear_display_events, clear_stream_events, clear_stream_panel_in_place, extend_display_events,
-    get_model_matches, is_expanded_output, list_conversations, load_and_restore_sse_events,
-    print_help, print_welcome_state, redraw_input_frame, replay_event_log_global,
-    reset_status_bar_tokens, seed_model_cache, seed_status_bar_tokens, set_expanded_output,
-    set_mid_stream_history, set_selected_model, set_stream_conv_dir, set_stream_show_all,
-    set_welcome_state, toggle_stream_panel, with_event_log,
+    get_model_cache, get_model_matches, is_expanded_output, list_conversations,
+    load_and_restore_sse_events, print_help, print_welcome_state, redraw_input_frame,
+    replay_event_log_global, reset_status_bar_tokens, seed_model_cache, seed_status_bar_tokens,
+    set_expanded_output, set_mid_stream_history, set_selected_model, set_stream_conv_dir,
+    set_stream_show_all, set_welcome_state, toggle_stream_panel, with_event_log,
 };
 use crate::ui::state::{RESUME_MATCHES, get_tab_select_index, set_tab_select_index};
 use crate::ui::welcome::WelcomeState;
+
+fn set_model_and_print_overview(
+    model_id: String,
+    conv_store: &Option<ConversationStore>,
+    rt: &tokio::runtime::Runtime,
+    backend: &Backend,
+) {
+    set_selected_model(Some(model_id.clone()));
+    if let Some(store) = conv_store {
+        store.save_model(&model_id);
+    }
+    println!("Model set to: {model_id}");
+    if let Some(agent) = rt.block_on(backend.startup_agent_overview()) {
+        crate::ui::agent_overview::print_agent_overview(&agent);
+    }
+}
+
+fn model_matches_for_command(filter: &str) -> Vec<String> {
+    let cached = get_model_cache();
+    if cached.is_empty() {
+        return get_model_matches();
+    }
+    if filter.is_empty() {
+        return cached;
+    }
+
+    let lower = filter.to_lowercase();
+    cached
+        .into_iter()
+        .filter(|model| model.to_lowercase().contains(&lower))
+        .collect()
+}
 
 /// Handle the `/clear` command: save/delete the current conversation, reset state,
 /// and redisplay the welcome screen.
@@ -358,42 +391,35 @@ pub(crate) fn handle_resume(
 }
 
 /// Handle the `/model` or `/model <filter>` command.
-pub(crate) fn handle_model(filter: &str, conv_store: &Option<ConversationStore>) {
+pub(crate) fn handle_model(
+    filter: &str,
+    conv_store: &Option<ConversationStore>,
+    rt: &tokio::runtime::Runtime,
+    backend: &Backend,
+) {
     // Check if a model was selected via Tab
     if let Some(tab_idx) = get_tab_select_index() {
-        let matches = get_model_matches();
+        let matches = model_matches_for_command(filter);
         if let Some(model_id) = matches.get(tab_idx) {
             let model_id = model_id.clone();
-            set_selected_model(Some(model_id.clone()));
-            if let Some(store) = conv_store {
-                store.save_model(&model_id);
-            }
-            println!("Model set to: {}", model_id);
+            set_model_and_print_overview(model_id, conv_store, rt, backend);
             set_tab_select_index(None);
             redraw_input_frame();
             return;
         }
         set_tab_select_index(None);
     }
-    let matches = get_model_matches();
+    let matches = model_matches_for_command(filter);
     if matches.len() == 1 {
         // Exact or unique match — use it directly
         let model_id = matches[0].clone();
-        set_selected_model(Some(model_id.clone()));
-        if let Some(store) = conv_store {
-            store.save_model(&model_id);
-        }
-        println!("Model set to: {}", model_id);
+        set_model_and_print_overview(model_id, conv_store, rt, backend);
     } else if !filter.is_empty() {
         // Check if filter exactly matches a listed model (case-insensitive)
         let exact = matches.iter().find(|m| m.eq_ignore_ascii_case(filter));
         if let Some(model_id) = exact {
             let model_id = model_id.clone();
-            set_selected_model(Some(model_id.clone()));
-            if let Some(store) = conv_store {
-                store.save_model(&model_id);
-            }
-            println!("Model set to: {}", model_id);
+            set_model_and_print_overview(model_id, conv_store, rt, backend);
         } else {
             // Unlisted model — ask for confirmation with immediate keypress
             use crossterm::event::{self, Event, KeyCode as CKC, KeyEventKind};
@@ -418,11 +444,7 @@ pub(crate) fn handle_model(filter: &str, conv_store: &Option<ConversationStore>)
             println!();
             if accepted {
                 let model_id = filter.to_string();
-                set_selected_model(Some(model_id.clone()));
-                if let Some(store) = conv_store {
-                    store.save_model(&model_id);
-                }
-                println!("Model set to: {}", model_id);
+                set_model_and_print_overview(model_id, conv_store, rt, backend);
             } else {
                 println!("Model selection cancelled.");
             }

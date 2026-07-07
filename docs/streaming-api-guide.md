@@ -49,6 +49,44 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 | `AURA_EMIT_REASONING` | `false` | Enable `aura.reasoning` events |
 | `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period (seconds) for in-flight streams on shutdown |
 
+## Server Info Endpoint
+
+`GET /aura/info` is an aura-native introspection endpoint. It returns the
+default agent and per-agent orchestration worker metadata. This endpoint is not
+OpenAI-compatible; it lives under `/aura/` to keep `/v1/models` clean.
+
+The CLI uses this at boot to display orchestration workers before the first
+prompt in HTTP mode.
+
+```bash
+curl http://localhost:8080/aura/info | jq
+```
+
+```json
+{
+  "default_agent": "orch",
+  "agents": [
+    {
+      "id": "orch",
+      "model": "gpt-4o",
+      "workers": [
+        { "name": "planner", "description": "Plans work" },
+        { "name": "writer", "description": "Writes summaries", "model": "gpt-4o-mini" }
+      ]
+    },
+    {
+      "id": "solo",
+      "model": "gpt-4o"
+    }
+  ]
+}
+```
+
+Each agent's `id` matches the `id` field in `/v1/models` (alias if set,
+otherwise agent name). The `workers` array is omitted for non-orchestration
+agents. Each worker's `model` is included only when it overrides the
+coordinator model.
+
 ## Custom AURA Events (Optional)
 
 Most custom AURA events are optional and require `AURA_CUSTOM_EVENTS=true`.

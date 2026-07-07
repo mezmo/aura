@@ -113,6 +113,14 @@ impl Backend {
         }
     }
 
+    pub async fn startup_agent_overview(&self) -> Option<aura_events::AgentInfo> {
+        match self {
+            Self::Http(http) => http.startup_agent_overview().await,
+            #[cfg(feature = "standalone-cli")]
+            Self::Direct(direct) => direct.startup_agent_overview(),
+        }
+    }
+
     /// Access the direct backend (standalone mode only). Panics if not Direct.
     #[cfg(feature = "standalone-cli")]
     pub fn as_direct(&self) -> &direct::DirectBackend {
@@ -149,5 +157,94 @@ impl Backend {
                 crate::ui::prompt::seed_model_cache(direct.model_ids());
             }
         }
+    }
+}
+
+/// Priority: single-agent passthrough > selected model > default_agent.
+/// Id matching is case-insensitive.
+pub(crate) fn select_agent(
+    info: aura_events::ServerInfo,
+    selected: Option<&str>,
+) -> Option<aura_events::AgentInfo> {
+    if info.agents.len() == 1 {
+        return info.agents.into_iter().next();
+    }
+    let target = selected.or(info.default_agent.as_deref())?;
+    info.agents
+        .into_iter()
+        .find(|agent| agent.id.eq_ignore_ascii_case(target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{agent, worker};
+    use aura_events::{AgentInfo, ServerInfo};
+
+    fn server_info(agents: Vec<AgentInfo>, default_agent: Option<&str>) -> ServerInfo {
+        ServerInfo {
+            default_agent: default_agent.map(str::to_owned),
+            agents,
+        }
+    }
+
+    #[test]
+    fn select_agent_resolves_expected_agent() {
+        let cases = [
+            (
+                "single-agent passthrough",
+                server_info(vec![agent("solo", vec![])], None),
+                None,
+                Some("solo"),
+            ),
+            (
+                "multi-agent selected match is case-insensitive",
+                server_info(vec![agent("solo", vec![]), agent("orch", vec![])], None),
+                Some("ORCH"),
+                Some("orch"),
+            ),
+            (
+                "multi-agent default agent fallback is case-insensitive",
+                server_info(
+                    vec![agent("solo", vec![]), agent("orch", vec![])],
+                    Some("Orch"),
+                ),
+                None,
+                Some("orch"),
+            ),
+            (
+                "selected miss does not fall back to default agent",
+                server_info(
+                    vec![agent("solo", vec![]), agent("orch", vec![])],
+                    Some("orch"),
+                ),
+                Some("nonexistent"),
+                None,
+            ),
+        ];
+
+        for (name, info, selected, expected_id) in cases {
+            let agent = select_agent(info, selected);
+            assert_eq!(
+                agent.as_ref().map(|agent| agent.id.as_str()),
+                expected_id,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_agent_passes_agent_info_through_whole() {
+        let info = server_info(
+            vec![
+                agent("solo", vec![]),
+                agent("orch", vec![worker("planner"), worker("writer")]),
+            ],
+            None,
+        );
+        let agent = select_agent(info, Some("orch")).expect("orch should be selected");
+        let names: Vec<_> = agent.workers.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["planner", "writer"]);
+        assert_eq!(agent.model, "gpt-4o");
     }
 }

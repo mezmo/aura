@@ -48,6 +48,7 @@ mod factory;
 mod frame_validation_tests;
 mod observer_wrapper;
 mod orchestrator;
+mod overview;
 mod persistence;
 mod persistence_wrapper;
 mod prompt_constants;
@@ -65,6 +66,7 @@ pub use events::{OrchestratorEvent, RoutingMode};
 pub use factory::OrchestratorFactory;
 pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
+pub use overview::{agent_info, worker_overview};
 pub use persistence::{
     ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
     build_session_context, load_session_manifests,

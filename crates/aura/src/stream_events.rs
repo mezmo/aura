@@ -7,7 +7,7 @@
 // Re-export everything from aura-events so existing consumers don't break
 pub use aura_events::{
     AgentContext, AuraStreamEvent, CorrelationContext, McpServerStatus, NumberOrString,
-    ProgressToken, WorkerPhase, format_named_sse,
+    ProgressToken, WorkerOverview, WorkerPhase, format_named_sse,
 };
 
 // Re-export orchestration event types
