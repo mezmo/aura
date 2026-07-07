@@ -1,5 +1,16 @@
 ## Changelog
 
+# [1.34.0](https://github.com/mezmo/aura/compare/v1.33.0...v1.34.0) (2026-07-07)
+
+
+### Bug Fixes
+
+* **orchestration**: propagate max_tokens to coordinator agent [a743295](https://github.com/mezmo/aura/commit/a743295d53debb75cc9286c91a198a64124baf0e) - Mike Shearer [#312](https://github.com/mezmo/aura/issues/312)
+
+### Features
+
+* **orchestration**: add per-iteration phase timing metrics [b05e50a](https://github.com/mezmo/aura/commit/b05e50ae5d71a33241da6e491f976fdb35380b6a) - Justin Gross [#217](https://github.com/mezmo/aura/issues/217)
+
 # [1.33.0](https://github.com/mezmo/aura/compare/v1.32.0...v1.33.0) (2026-07-07)
 
 
