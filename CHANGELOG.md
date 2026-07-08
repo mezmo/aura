@@ -1,5 +1,20 @@
 ## Changelog
 
+# [1.35.0](https://github.com/mezmo/aura/compare/v1.34.0...v1.35.0) (2026-07-08)
+
+
+### Bug Fixes
+
+* **cli**: word-wrap assistant summary headline [676b1cc](https://github.com/mezmo/aura/commit/676b1cce56b84d583be85d453079ecb61eb87bef) - Chip Johnson
+
+### Documentation
+
+* **cli**: tighten resize-watcher and summary doc comments [8f5f73d](https://github.com/mezmo/aura/commit/8f5f73dbf38eafafa731b031bdbb6c2ffc7a11a5) - Chip Johnson* **examples**: update quickstarts to current config layout and image [a996460](https://github.com/mezmo/aura/commit/a9964608914233dba831c474161399373db47d4a) - Justin Gross
+
+### Features
+
+* **cli**: redraw frame on terminal resize while idle [bdd6fb6](https://github.com/mezmo/aura/commit/bdd6fb6b02987864b168cac4844ca42741997c3d) - Chip Johnson* **cli**: show orchestration workers at boot via aura info endpoint [2f80e63](https://github.com/mezmo/aura/commit/2f80e6373fbcb9519e3d965a94b8ff50df447881) - Mike Shearer [#313](https://github.com/mezmo/aura/issues/313)
+
 # [1.34.0](https://github.com/mezmo/aura/compare/v1.33.0...v1.34.0) (2026-07-07)
 
 
