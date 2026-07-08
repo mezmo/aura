@@ -2,7 +2,7 @@
 
 One command to spin up AURA in **orchestration mode** with a math tool server:
 
-- **AURA** — the AI agent server running in orchestration mode (`mezmo/aura:orchestration`)
+- **AURA** — the AI agent server running in orchestration mode (`mezmo/aura:latest`)
 - **Math MCP** — an MCP server providing arithmetic, statistics, and trigonometry tools
 - **LibreChat** — a ChatGPT-style web UI connected to AURA
 - **Phoenix** — an LLM trace viewer for inspecting every tool call, prompt, and token
