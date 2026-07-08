@@ -649,6 +649,7 @@ mod tests {
             streaming_buffer_size: 0,
             aura_custom_events: false,
             aura_emit_reasoning: false,
+            debug_provider_errors: false,
             streaming_timeout_secs: 0,
             first_chunk_timeout_secs: 0,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
