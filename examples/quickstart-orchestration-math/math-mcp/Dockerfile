@@ -9,6 +9,7 @@ RUN npm install -g mcp-proxy
 RUN apk add --no-cache git curl \
     && git clone https://github.com/EthanHenrickson/math-mcp.git \
     && cd math-mcp \
+    && git checkout 6eed9eb \
     && npm install \
     && npm run build:stdio \
     && apk del git
