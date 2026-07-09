@@ -61,8 +61,7 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 use super::config::OrchestrationConfig;
 use super::context::{
     AncestorDistance, CoordinatorTurn, CorrelationLabel, DependencyRelation, EvidenceEntry,
-    IterationNumber, PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim,
-    WorkerRole,
+    PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim, WorkerRole,
 };
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
@@ -2621,7 +2620,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
     async fn execute(
         &self,
         plan: &mut Plan,
-        prior_contexts: &[IterationContext],
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<(), StreamError> {
         use futures::StreamExt;
@@ -2634,8 +2632,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .ready_tasks()
                 .iter()
                 .map(|t| {
-                    let context =
-                        Self::build_task_context_with_prior_iterations(plan, t.id, prior_contexts);
+                    let context = Self::build_task_context(plan, t.id);
                     (t.id, t.description.clone(), context, t.worker.clone())
                 })
                 .collect();
@@ -2856,20 +2853,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns `None` when the task has no completed ancestors, so the
     /// `%%CONTEXT%%` slot is left empty.
-    #[cfg(test)]
     pub(crate) fn build_task_context(plan: &Plan, task_id: usize) -> Option<String> {
-        Self::build_task_context_with_prior_iterations(plan, task_id, &[])
-    }
-
-    /// Build worker task context from same-plan ancestors plus completed
-    /// worker evidence from earlier planning iterations.
-    pub(crate) fn build_task_context_with_prior_iterations(
-        plan: &Plan,
-        task_id: usize,
-        prior_contexts: &[IterationContext],
-    ) -> Option<String> {
         let ancestors = Self::completed_ancestors(plan, task_id);
-        let mut entries: Vec<PriorWorkEntry> = ancestors
+        if ancestors.is_empty() {
+            return None;
+        }
+
+        let entries: Vec<PriorWorkEntry> = ancestors
             .into_iter()
             .filter_map(|(ancestor_id, distance)| {
                 let ancestor = plan.tasks.iter().find(|t| t.id == ancestor_id)?;
@@ -2920,64 +2910,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             })
             .collect();
 
-        entries.extend(Self::prior_iteration_entries(prior_contexts));
-
         if entries.is_empty() {
             return None;
         }
 
         let frame = PriorWorkFrame::assemble(entries, TokenBudget::default()).ok()?;
         Some(String::from(frame.render()))
-    }
-
-    fn prior_iteration_entries(prior_contexts: &[IterationContext]) -> Vec<PriorWorkEntry> {
-        prior_contexts
-            .iter()
-            .flat_map(|ctx| {
-                let iteration = match IterationNumber::new(ctx.iteration) {
-                    Ok(iteration) => iteration,
-                    Err(_) => return Vec::new(),
-                };
-
-                ctx.previous_plan
-                    .tasks
-                    .iter()
-                    .filter_map(move |task| {
-                        let result = match &task.state {
-                            TaskState::Complete { result } => result,
-                            _ => return None,
-                        };
-                        let label = CorrelationLabel {
-                            task: TaskId::new(task.id),
-                            worker: task
-                                .worker
-                                .as_deref()
-                                .and_then(|w| WorkerRole::new(w).ok()),
-                        };
-                        let claim = task
-                            .structured_output
-                            .as_ref()
-                            .and_then(|so| WorkerClaim::try_from(so).ok());
-                        let evidence = match EvidenceEntry::from_completed_result(result, claim) {
-                            Ok(entry) => entry,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "failed to build prior-iteration evidence entry for task {}: {}",
-                                    task.id,
-                                    e
-                                );
-                                return None;
-                            }
-                        };
-                        Some(PriorWorkEntry {
-                            label,
-                            relation: DependencyRelation::PriorIteration { iteration },
-                            evidence,
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
     }
 
     /// Find all completed ancestors of `task_id` with their shortest edge
@@ -3525,7 +3463,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await;
     }
 
-    /// Emit a ReplanStarted event and build the iteration context for the next cycle.
+    /// Emit a ReplanStarted event for the next cycle.
     ///
     /// Consolidates the common tail of the replan paths (coordinator-routed,
     /// failure-driven). Callers handle path-specific pre-work (e.g. IterationComplete
@@ -3534,10 +3472,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         iteration: usize,
         trigger: &str,
-        plan: Plan,
-        failure_summary: Option<FailureSummary>,
-        failure_history: &[FailedTaskRecord],
-    ) -> (Option<IterationContext>, Plan) {
+    ) {
         Self::emit_event(
             event_tx,
             OrchestratorEvent::ReplanStarted {
@@ -3546,18 +3481,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             },
         )
         .await;
-
-        // tool_traces intentionally empty — this context is only used for
-        // previous_plan carry-forward, not continuation prompt rendering
-        // (discarded in run_iteration via `let _ = previous_context`).
-        let context = IterationContext::new(
-            iteration,
-            plan,
-            failure_summary,
-            failure_history.to_vec(),
-            std::collections::HashMap::new(),
-        );
-        (Some(context), Plan::new(""))
     }
 
     /// Top-level orchestration entry point: route → loop.
@@ -3725,7 +3648,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         orchestration_start: Instant,
     ) -> Result<String, StreamError> {
         let mut iteration = 0;
-        let mut prior_contexts: Vec<IterationContext> = Vec::new();
         let mut plan = initial_plan;
         let mut failure_history: Vec<FailedTaskRecord> = Vec::new();
 
@@ -3739,7 +3661,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan,
                     &chat_history,
                     coordinator_state,
-                    &prior_contexts,
                     &event_tx,
                     orchestration_start,
                     &mut failure_history,
@@ -3747,14 +3668,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .await?
             {
                 IterationOutcome::FinalResult(s) => break s,
-                IterationOutcome::Continue {
-                    new_plan,
-                    previous_context: pc,
-                } => {
+                IterationOutcome::Continue { new_plan } => {
                     plan = new_plan;
-                    if let Some(context) = pc {
-                        prior_contexts.push(context);
-                    }
                 }
             }
         };
@@ -3780,7 +3695,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         mut plan: Plan,
         chat_history: &[rig::completion::Message],
         coordinator_state: &mut CoordinatorState,
-        prior_contexts: &[IterationContext],
         event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
         orchestration_start: Instant,
         failure_history: &mut Vec<FailedTaskRecord>,
@@ -3808,7 +3722,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        if let Err(e) = self.execute(&mut plan, prior_contexts, event_tx).await {
+        if let Err(e) = self.execute(&mut plan, event_tx).await {
             self.write_run_manifest(&plan, iteration).await;
             return Err(e);
         }
@@ -4106,29 +4020,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 }
 
-                let (new_previous_context, _) = Self::trigger_replan(
-                    event_tx,
-                    iteration,
-                    "post_execute_create_plan",
-                    plan,
-                    None,
-                    failure_history,
-                )
-                .await;
+                Self::trigger_replan(event_tx, iteration, "post_execute_create_plan").await;
                 tracing::info!(
                     "Iteration {} complete: elapsed={:.1}s (decision: create_plan, {:.1}s)",
                     iteration,
                     orchestration_start.elapsed().as_secs_f64(),
                     decision_latency,
                 );
-                // The coordinator already produced new_plan; we discard the
-                // empty plan returned by trigger_replan but keep its
-                // IterationContext so the next iteration can persist
-                // previous_plan cleanly.
-                Ok(IterationOutcome::Continue {
-                    new_plan,
-                    previous_context: new_previous_context,
-                })
+                // The coordinator already produced new_plan.
+                Ok(IterationOutcome::Continue { new_plan })
             }
             // Post-execute coordinator call errored before routing (timeout,
             // depth exhaustion, upstream provider error). Ship the worker

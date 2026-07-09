@@ -1058,10 +1058,7 @@ pub(crate) enum IterationOutcome {
     /// The iteration produced a final answer; the loop should break.
     FinalResult(String),
     /// The iteration requires another pass; swap in the new plan and continue.
-    Continue {
-        new_plan: Plan,
-        previous_context: Option<IterationContext>,
-    },
+    Continue { new_plan: Plan },
 }
 
 #[cfg(test)]
@@ -1623,7 +1620,7 @@ mod tests {
 
     #[test]
     fn test_continuation_prompt_result_forwarding_guidance() {
-        let guidance_marker = "Workers will receive relevant prior-iteration worker evidence";
+        let guidance_marker = "Workers cannot see prior iteration results";
 
         // Mixed (completed + failed): guidance present
         let mut mixed_plan = Plan::new("Goal");
