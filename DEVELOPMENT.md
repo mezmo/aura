@@ -77,7 +77,8 @@ Make targets are composed from modular includes under `.makefiles/` (rust, docke
 | `make fmt`             | Format code with rustfmt                       |
 | `make fmt-check`       | Check formatting (CI mode)                     |
 | `make lint`            | Run clippy with warnings as errors             |
-| `make ci`              | Run fmt-check and lint (the `test` hook is empty; run `cargo test --workspace` separately) |
+| `make test`            | Run workspace unit + doc tests                 |
+| `make ci`              | Run fmt-check, test, and lint                  |
 | `make coverage`        | Run the test suite with code coverage          |
 | `make lint-commits`    | Lint commits on the current branch against main |
 | `make clean`           | Clean build artifacts                          |
@@ -122,7 +123,7 @@ make test-integration-scratchpad-local
 
 # STDIO MCP tests (local only, no Compose/up/down variants; runs the
 # aura crate's integration-stdio feature)
-make test-integration-stdio-local
+make test-stdio-local
 ```
 
 Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate limits.

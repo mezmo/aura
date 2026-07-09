@@ -49,7 +49,7 @@ Environment setup, build instructions, project structure, and Make targets are d
    make lint
    ```
 
-   (`make ci` bundles the fmt-check and lint hooks, but its `test` hook is currently empty, so always run `cargo test --workspace` yourself.)
+   (`make ci` bundles all three: fmt-check, test, and lint.)
 
 4. Push your branch and open a pull request.
 

@@ -54,8 +54,8 @@ test-integration-local:: $(REPORT_DIR) ## Start local aura infra, run integratio
 
 # --- STDIO integration tests (no Docker infra needed; local child process) ---
 
-.PHONY:test-integration-stdio-local
-test-integration-stdio-local: $(REPORT_DIR) ## Run STDIO MCP integration tests locally
+.PHONY:test-stdio-local
+test-stdio-local: $(REPORT_DIR) ## Run STDIO MCP integration tests locally
 	@echo "Running STDIO MCP integration tests..."
 	@cargo test --package aura --features integration-stdio --no-fail-fast -- --test-threads=1
 

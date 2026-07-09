@@ -182,7 +182,7 @@ Confirmed sequential as of Rig 0.28: the streaming handler `.await`s each tool c
 
 ```bash
 make build                  # Build release binary
-cargo test --workspace      # Run all tests (the `make test` hook is empty)
+make test                   # Run workspace unit + doc tests
 make docker-build           # Build Docker image
 make lint                   # Run clippy + fmt check
 ```

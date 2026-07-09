@@ -17,6 +17,7 @@ default-members = [
     "crates/aura-telemetry-derive",
     "crates/aura-web-server",
     "crates/aura-test-utils",
+    "crates/aura-cli",
 ]
 resolver = "3"
 

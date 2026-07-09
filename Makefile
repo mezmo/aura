@@ -101,7 +101,7 @@ help:                 ## Show this help, includes list of all actions.
 build:: $(BUILD_ENV)  ## Build all workspace binaries
 
 .PHONY:test
-test::                ## Run all tests targets
+test::                ## Run workspace unit + doc tests (integration suites are separate)
 
 .PHONY:setup
 setup::              ## Setup local depencies for development
