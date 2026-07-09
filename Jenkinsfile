@@ -479,6 +479,7 @@ pipeline {
                 SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
                 SCCACHE_REGION = "${BUILD_CACHE_REGION}"
                 SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+                SIGNING_KEYCHAIN = "/tmp/aura-signing-release-${BUILD_SLUG}.keychain-db"
               }
 
               steps {
@@ -500,6 +501,40 @@ pipeline {
                       sh 'make build-binaries-darwin'
                     }
                   }
+
+                  withCredentials([
+                    certificate(
+                      credentialsId: 'apple-signing-certificate',
+                      keystoreVariable: 'APPLE_CERT_P12',
+                      passwordVariable: 'APPLE_CERT_PASSWORD'
+                    ),
+                    string(credentialsId: 'apple-notarytool-password', variable: 'NOTARY_PASSWORD')
+                  ]) {
+                    withEnv([
+                      'NOTARY_APPLE_ID=apps+dev@logdna.com',
+                      'NOTARY_TEAM_ID=TT7664HMU3'
+                    ]) {
+                      // Sign and notarize via a throwaway keychain; the stage post
+                      // step deletes it.
+                      sh '''
+                        set -eu
+                        KEYCHAIN_PW="aura-ci"
+                        security create-keychain -p "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+                        security set-keychain-settings "$SIGNING_KEYCHAIN"
+                        security unlock-keychain -p "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+                        security list-keychains -d user -s "$SIGNING_KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+                        security import "$APPLE_CERT_P12" -f pkcs12 -k "$SIGNING_KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+                        security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN" >/dev/null
+                        CODESIGN_IDENTITY=$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')
+                        if [ -z "$CODESIGN_IDENTITY" ]; then
+                          echo "no valid Developer ID Application identity in keychain" >&2
+                          security find-identity -p codesigning "$SIGNING_KEYCHAIN" >&2
+                          exit 1
+                        fi
+                        make sign-release-binaries-darwin CODESIGN_IDENTITY="$CODESIGN_IDENTITY"
+                      '''
+                    }
+                  }
                 }
 
                 stash(
@@ -511,6 +546,7 @@ pipeline {
 
               post {
                 always {
+                  sh 'security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true'
                   sh 'make clean'
                 }
               }
