@@ -16,7 +16,7 @@
 //! ## Sequential Execution Guarantee
 //!
 //! This design relies on Rig's streaming mode executing tools sequentially.
-//! See `docs/rig-tool-execution-order.md` for analysis.
+//! See `docs/rig-fork-changes.md` for analysis.
 //! The FIFO queue is safe because: hook fires → tool executes → hook fires → next tool.
 
 use crate::request_cancellation::RequestId;

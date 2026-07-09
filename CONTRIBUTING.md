@@ -1,174 +1,37 @@
 # Contributing to AURA
 
-Thank you for your interest in contributing to AURA! This guide will help you get started, whether you're fixing a bug, adding a feature, improving documentation, or proposing an idea.
+Thank you for contributing! Bug reports, features, documentation, example configurations, tests, reviews, and issue triage are all welcome.
 
-Contributions of all kinds are welcome and appreciated.
+Setup, build, test, and architecture documentation lives in [DEVELOPMENT.md](DEVELOPMENT.md). This guide covers the contribution process itself.
 
-## Table of Contents
+## The Short Version
 
-- [Contributing to AURA](#contributing-to-aura)
-  - [Table of Contents](#table-of-contents)
-  - [Code of Conduct](#code-of-conduct)
-  - [Contributor License Agreement](#contributor-license-agreement)
-  - [Getting Help](#getting-help)
-  - [Ways to Contribute](#ways-to-contribute)
-  - [Development Setup](#development-setup)
-    - [Prerequisites](#prerequisites)
-    - [Getting Started](#getting-started)
-  - [Project Structure](#project-structure)
-  - [Development Workflow](#development-workflow)
-    - [Branch Strategy](#branch-strategy)
-    - [Typical Workflow](#typical-workflow)
-    - [Useful Make Targets](#useful-make-targets)
-  - [Code Quality Standards](#code-quality-standards)
-    - [Formatting](#formatting)
-    - [Linting](#linting)
-    - [General Guidelines](#general-guidelines)
-  - [Testing](#testing)
-    - [Unit Tests (Required)](#unit-tests-required)
-    - [Integration Tests (Encouraged)](#integration-tests-encouraged)
-    - [Writing Tests](#writing-tests)
-  - [Commit Message Convention](#commit-message-convention)
-    - [Format](#format)
-    - [Types](#types)
-    - [Examples](#examples)
-    - [Breaking Changes](#breaking-changes)
-    - [Important Notes](#important-notes)
-  - [Submitting a Pull Request](#submitting-a-pull-request)
-    - [Before You Submit](#before-you-submit)
-    - [After You Submit](#after-you-submit)
-    - [PR Guidelines](#pr-guidelines)
-    - [PR Template](#pr-template)
-  - [Review Process](#review-process)
-  - [Documentation](#documentation)
-  - [Reporting Issues](#reporting-issues)
-  - [License](#license)
+1. Fork the repo (external contributors) or branch from `main` (maintainers).
+2. Make a focused change: one logical change per PR, with tests.
+3. Run `make fmt-check`, `cargo test --workspace`, and `make lint` before pushing.
+4. Write [Conventional Commits](#commit-messages); verify with `make lint-commits`.
+5. Open a PR explaining what and why. A maintainer reviews, then rebase-merges.
 
-## Code of Conduct
-
-This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report any concerns to the maintainers.
-
-## Contributor License Agreement
-
-All contributors — both individual and corporate — must agree to the [Mezmo Contributor License Agreement (CLA)](CLA.md) before their contributions can be accepted. The CLA ensures that you grant the necessary rights for your contributions to be included in the project while you retain ownership of your work.
-
-By submitting a pull request, commit, or other contribution to this repository after being presented with the CLA, you accept and agree to its terms. If you are contributing on behalf of your employer, please ensure you have authorization to accept the agreement on their behalf.
-
-Organizations with ten (10) or more contributors may contact [cla@mezmo.com](mailto:cla@mezmo.com) to execute a separate Corporate Contributor License Agreement covering all authorized contributors within the organization.
-
-For any questions about the CLA or licensing, please reach out to [cla@mezmo.com](mailto:cla@mezmo.com).
+Contributions require agreement to the [CLA](#contributor-license-agreement), and this project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Getting Help
 
-- **GitHub Discussions** — Ask questions, share ideas, or discuss approaches before opening a PR: [Discussions](https://github.com/mezmo/aura/discussions)
-- **GitHub Issues** — Report bugs or request features: [Issues](https://github.com/mezmo/aura/issues)
+- **[Community Slack](https://mezmo.com/r/slack-aura)**: ask questions, share ideas, or discuss approaches before opening a PR.
+- **[GitHub Issues](https://github.com/mezmo/aura/issues)**: report bugs or request features.
 
-## Ways to Contribute
+## Contributor License Agreement
 
-There are many ways to contribute beyond writing code:
+All contributors, both individual and corporate, must agree to the [Mezmo Contributor License Agreement (CLA)](CLA.md) before their contributions can be accepted. The CLA ensures that you grant the necessary rights for your contributions to be included in the project while you retain ownership of your work.
 
-- **Report bugs** — Found something broken? [Open an issue](#reporting-issues).
-- **Suggest features** — Have an idea? Start a [Discussion](https://github.com/mezmo/aura/discussions) or open an issue.
-- **Improve documentation** — Typo fixes, clarifications, new guides, and examples are always welcome.
-- **Add example configurations** — Share useful agent configurations in `examples/`.
-- **Write tests** — Help increase test coverage with unit or integration tests.
-- **Review pull requests** — Thoughtful reviews help maintain quality and are a great way to learn the codebase.
-- **Triage issues** — Help reproduce bugs, clarify reports, or identify duplicates.
+By submitting a pull request, commit, or other contribution to this repository after being presented with the CLA, you accept and agree to its terms. If you are contributing on behalf of your employer, please ensure you have authorization to accept the agreement on their behalf.
 
-## Development Setup
-
-### Prerequisites
-
-- **Rust (nightly)** — AURA requires the nightly toolchain. The repo includes a `rust-toolchain.toml` that handles this automatically.
-- **Docker and Docker Compose** — Required for integration tests and containerized builds.
-- **Git** — For version control and contributing via pull requests.
-- **Node.js (22+)** -- *Optional* Used in various CI processes (commit linting, release generation, etc)
-
-### Getting Started
-
-1. **Fork the repository** on GitHub (external contributors) or clone directly (maintainers).
-
-2. **Clone your fork:**
-
-   ```bash
-   git clone https://github.com/<your-username>/aura.git
-   cd aura
-   ```
-
-3. **Install Rust** (if you don't have it):
-
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-
-   The nightly toolchain will be installed automatically when you first build, thanks to `rust-toolchain.toml`.
-
-4. **Set up your configuration:**
-
-   ```bash
-   cp examples/reference.toml config.toml
-   cp .env.example .env
-   ```
-
-   Edit `.env` with your API keys. At minimum, you'll need an `OPENAI_API_KEY` if you plan to run the server or integration tests.
-
-5. **Build the project:**
-
-   ```bash
-   cargo build --workspace
-   ```
-
-6. **Verify everything works:**
-
-   ```bash
-   cargo test --workspace
-   ```
-
-   This runs unit tests across the workspace.
-
-## Project Structure
-
-Understanding the crate layout will help you navigate the codebase:
-
-```text
-aura/
-├── crates/
-│   ├── aura/                # Core agent builder library and orchestration
-│   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
-│   ├── aura-config/         # TOML parser and config loader
-│   ├── aura-events/         # Shared SSE event types (lightweight, no agent deps)
-│   ├── aura-web-server/     # OpenAI-compatible HTTP/SSE server
-│   └── aura-test-utils/     # Shared testing utilities
-├── compose/                 # Docker Compose files for testing
-├── configs/                 # Integration test and example configurations
-├── deployment/              # Helm charts and K8s manifests
-├── docs/                    # Architecture and protocol documentation
-├── examples/                # Example TOML configurations
-│   ├── reference.toml       # Complete annotated configuration
-│   ├── minimal/             # Bare minimum per-provider configs
-│   └── complete/            # Full agent composition examples
-└── scripts/                 # CI and utility scripts
-```
-
-**Key architectural docs** to read before diving into the code:
-
-- [docs/streaming-api-guide.md](docs/streaming-api-guide.md) — SSE protocol, event types, and client handling
-- [docs/request-lifecycle.md](docs/request-lifecycle.md) — Request flow, timeouts, and cancellation
-- [docs/rig-fork-changes.md](docs/rig-fork-changes.md) — Why we use a Rig.rs fork and what changed
-- [docs/rig-tool-execution-order.md](docs/rig-tool-execution-order.md) — Tool execution ordering (important for `tool_event_broker.rs`)
+Organizations with ten (10) or more contributors may contact [cla@mezmo.com](mailto:cla@mezmo.com) to execute a separate Corporate Contributor License Agreement covering all authorized contributors within the organization. For any questions about the CLA or licensing, reach out to [cla@mezmo.com](mailto:cla@mezmo.com).
 
 ## Development Workflow
 
-### Branch Strategy
+Environment setup, build instructions, project structure, and Make targets are documented in [DEVELOPMENT.md](DEVELOPMENT.md).
 
-- **External contributors**: Fork the repo and create a feature branch in your fork.
-- **Maintainers**: Create branches directly in the repository.
-
-All changes are merged to `main` via **rebase merging** to maintain a linear commit history.
-
-### Typical Workflow
-
-1. **Create a branch** from the latest `main`:
+1. Create a branch from the latest `main`:
 
    ```bash
    git checkout main
@@ -176,134 +39,39 @@ All changes are merged to `main` via **rebase merging** to maintain a linear com
    git checkout -b feat/your-feature-name
    ```
 
-2. **Make your changes**, keeping commits focused and atomic.
+2. Make your changes, keeping commits focused and atomic.
 
-3. **Run quality checks** before pushing:
+3. Run quality checks before pushing:
 
    ```bash
    make fmt-check
    cargo test --workspace
+   make lint
    ```
 
-4. **Push your branch** and open a pull request.
+   (`make ci` bundles the fmt-check and lint hooks, but its `test` hook is currently empty, so always run `cargo test --workspace` yourself.)
 
-### Useful Make Targets
+4. Push your branch and open a pull request.
 
-| Command              | Description                           |
-| -------------------- | ------------------------------------- |
-| `make build`         | Build all workspace crates            |
-| `make fmt`           | Format code with rustfmt              |
-| `make fmt-check`     | Check formatting (CI mode)            |
-| `make lint`          | Run clippy with warnings as errors    |
-| `make test`          | Run cargo tests + integration tests   |
-| `make ci`            | Run all checks: fmt-check, test, lint |
-| `make clean`         | Clean build artifacts                 |
+All changes are merged to `main` via **rebase merging** to maintain a linear commit history, so every commit must follow the [commit message convention](#commit-messages).
 
-## Code Quality Standards
+## Code Quality
 
-### Formatting
-
-All code must be formatted with `rustfmt`:
-
-```bash
-cargo fmt --all
-```
-
-CI will reject unformatted code. Run `make fmt` before committing.
-
-### Linting
-
-All code must pass `clippy` with warnings treated as errors:
-
-```bash
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-### General Guidelines
-
+- Format with rustfmt (`make fmt`); CI rejects unformatted code.
+- Pass clippy with warnings as errors (`make lint`).
 - Follow existing patterns and conventions in the codebase.
-- Keep changes focused — one logical change per PR.
-- Avoid unnecessary refactoring alongside feature work. If refactoring is needed, submit it as a separate PR.
-- Write clear, descriptive variable and function names. Prefer readability over cleverness.
-- Add comments where the "why" isn't obvious from the code. Don't comment on the "what" — the code should speak for itself.
-- Ensure your changes don't introduce compiler warnings.
+- Avoid refactoring alongside feature work; submit refactors as separate PRs.
+- Prefer clear, descriptive names over cleverness. Comment the "why", not the "what".
+- Don't introduce compiler warnings.
 
 ## Testing
 
-### Unit Tests (Required)
+- **Unit tests are required.** `cargo test --workspace` must pass before you submit; it needs no external services or API keys. Prefer unit tests for internal or algorithmic changes.
+- **Integration tests are encouraged** for user-facing changes. They call real LLM APIs and need an `OPENAI_API_KEY` plus Docker; see [DEVELOPMENT.md](DEVELOPMENT.md#testing) for suites, feature flags, and commands.
 
-All contributors must run tests before submitting a PR:
+## Commit Messages
 
-```bash
-cargo test --workspace
-```
-
-Unit tests don't require any external services or API keys.
-
-### Integration Tests (Encouraged)
-
-Integration tests verify end-to-end behavior through the web server, including LLM interaction and MCP tool execution. They **require a real `OPENAI_API_KEY`** because they make actual API calls to OpenAI. MCP tool execution is handled by mock servers — no external tool APIs are called.
-
-If you have an API key and want to run integration tests locally:
-
-```bash
-# Start local test infrastructure (mock MCP servers + AURA)
-make test-integration-local-up
-
-# Run the integration test suite
-cargo test --package aura-web-server --features integration --no-fail-fast -- --test-threads=1
-
-# Tear down when done
-make test-integration-local-down
-
-# Or do it all in one command:
-make test-integration-local
-
-# Orchestration integration tests
-make test-integration-orchestration-local
-
-# SRE orchestration integration tests
-make test-integration-sre-orchestration-local
-
-# Scratchpad integration tests
-make test-integration-scratchpad-local
-```
-
-Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate limits.
-
-**Feature flags** allow running specific test suites:
-
-| Flag                            | Suite                                         |
-| ------------------------------- | --------------------------------------------- |
-| `integration`                   | All integration tests                         |
-| `integration-streaming`         | Streaming functionality                       |
-| `integration-header-forwarding` | MCP header forwarding                         |
-| `integration-mcp`               | MCP tool execution                            |
-| `integration-events`            | Custom `aura.*` events                        |
-| `integration-cancellation`      | Request cancellation                          |
-| `integration-progress`          | MCP progress notifications                    |
-| `integration-vector`            | Vector store / RAG (requires external Qdrant) |
-
-Example — run only streaming tests:
-
-```bash
-cargo test --package aura-web-server --features integration-streaming --no-fail-fast -- --test-threads=1
-```
-
-### Writing Tests
-
-- **Unit tests**: Place `#[cfg(test)]` modules in the same file as the code they test.
-- **Integration tests**: Add to `crates/aura-web-server/tests/`. Use the `aura-test-utils` crate for shared test helpers.
-- If your change is user-facing, consider adding or updating integration tests.
-- If your change is internal/algorithmic, unit tests are preferred.
-
-## Commit Message Convention
-
-This project uses [Conventional Commits](https://www.conventionalcommits.org/) and enforces them via CI. **Every commit** on `main` must follow this format because we use rebase merging to maintain a linear history. 
-### Format
-
-The first line, which includes the type and description, must be entirely lowercase. The body
-and optional footer can use lower and upper casing.
+This project uses [Conventional Commits](https://www.conventionalcommits.org/), enforced by CI (`make lint-commits`):
 
 ```
 <type>(<optional scope>): <description>
@@ -313,7 +81,9 @@ and optional footer can use lower and upper casing.
 [optional footer(s)]
 ```
 
-### Types
+- The subject line must be entirely lowercase, under 72 characters, and not end with a period.
+- Use the body to explain **what** and **why**, not **how**.
+- If the change relates to a tracked ticket, include a `Ref: LOG-XXXXXX` footer; otherwise omit it (commitlint does not require it). Use `Fixes: #<issue number>` when the change closes a GitHub issue.
 
 | Type       | When to Use                                             |
 | ---------- | ------------------------------------------------------- |
@@ -327,7 +97,7 @@ and optional footer can use lower and upper casing.
 | `chore`    | Build process, tooling, or dependency updates           |
 | `ci`       | CI/CD configuration changes                             |
 
-### Examples
+Examples:
 
 ```
 feat(config): add support for gemini provider
@@ -335,13 +105,7 @@ feat(config): add support for gemini provider
 fix(streaming): correct sse event ordering on disconnect
 
 doc: add ollama troubleshooting guide
-
-test(mcp): add header forwarding integration tests
-
-refactor(provider-agent): simplify type-erased streaming dispatch
 ```
-
-### Breaking Changes
 
 For breaking changes, add `!` after the type/scope and include a `BREAKING CHANGE` footer:
 
@@ -352,59 +116,22 @@ BREAKING CHANGE: The [tools] config section has been renamed to [mcp.tools].
 Update your config.toml files accordingly.
 ```
 
-### Important Notes
+## Pull Requests
 
-- The commit message subject should be lowercase and not end with a period.
-- Keep the subject line under 72 characters.
-- Use the body to explain **what** and **why**, not **how**.
-- CI will reject commits that don't follow this convention.
+Before you submit:
 
-## Submitting a Pull Request
+1. Rebase on the latest `main` (`git fetch origin && git rebase origin/main`).
+2. Run the quality checks above, plus `make lint-commits`.
+3. Update documentation if your change affects user-facing behavior, configuration, or APIs (see [Updating Documentation](#updating-documentation)).
 
-### Before You Submit
+Guidelines:
 
-1. **Rebase on latest `main`** to ensure a clean history:
+- **Title**: clear and descriptive.
+- **Description**: explain what the PR does and why: context, approach, trade-offs considered, and testing performed.
+- **Size**: keep PRs focused and reasonably sized; break large changes into a series of smaller, reviewable PRs.
+- **Draft PRs**: open one if you want early feedback on work in progress.
 
-   ```bash
-   git fetch origin
-   git rebase origin/main
-   ```
-
-2. **Run tests locally:**
-
-   ```bash
-   cargo test --workspace
-   ```
-
-3. **Ensure all commits follow** the [Conventional Commits](#commit-message-convention) format.
-
-```bash
-> make lint-commits
-```
-
-4. **Update documentation** if your change affects user-facing behavior, configuration, or APIs.
-
-### After You Submit
-
-- Check the comments in the PR for:
-  - The status of automated checks
-  - Automated request to sign contributors agreement
-  - Feedback from other contributors
-
-### PR Guidelines
-
-- **Title**: Use a clear, descriptive title that summarizes the change.
-- **Description**: Explain what the PR does and why. Include:
-  - Context and motivation for the change
-  - Summary of the approach taken
-  - Any trade-offs or alternatives considered
-  - Testing performed (unit, integration, manual)
-- **Size**: Keep PRs focused and reasonably sized. Large changes should be broken into a series of smaller, reviewable PRs.
-- **Draft PRs**: If you want early feedback on a work-in-progress, open a draft PR.
-
-### PR Template
-
-When opening a PR, consider including:
+A suggested PR template:
 
 ```markdown
 ## What
@@ -422,46 +149,36 @@ Summary of the approach and any notable implementation details.
 ## Testing
 
 How this was tested (unit tests, integration tests, manual testing).
-
-## Checklist
-
-- [ ] Code follows existing patterns and conventions
-- [ ] `cargo test --workspace` passes locally
-- [ ] Commits follow Conventional Commits format
-- [ ] Documentation updated (if applicable)
-- [ ] Tests added or updated (if applicable)
 ```
+
+After you submit, watch the PR for automated check results, the CLA bot's request to sign the contributor agreement, and reviewer feedback.
 
 ## Review Process
 
 - All PRs require at least one maintainer review before merging.
-- Reviewers may request changes — this is normal and part of maintaining quality.
-- PRs are merged via **rebase merge** to maintain a linear commit history.
-- Be responsive to review feedback. If you disagree with a suggestion, explain your reasoning — constructive discussion improves outcomes.
-- After approval, a maintainer will merge your PR.
+- Reviewers may request changes; this is normal and part of maintaining quality. If you disagree with a suggestion, explain your reasoning.
+- After approval, a maintainer rebase-merges your PR.
 
-## Documentation
+## Updating Documentation
 
-Good documentation is as valuable as good code. If your change affects any of the following, please update the relevant docs:
+If your change affects any of the following, update the relevant docs (see the documentation map in [CLAUDE.md](CLAUDE.md)):
 
-- **Configuration options** — Update `examples/reference.toml` and the relevant `examples/` files.
-- **API behavior** — Update `docs/streaming-api-guide.md` or `docs/request-lifecycle.md`.
-- **New features** — Add usage examples to the README or create a new guide in `docs/`.
-- **Architecture changes** — Update the relevant doc in `docs/` and note any impacts in `CLAUDE.md`.
+- **Configuration options**: update `examples/reference.toml` and the relevant `examples/` files.
+- **API behavior**: update `docs/streaming-api-guide.md` or `docs/request-lifecycle.md`.
+- **New features**: add usage examples to the README or create a new guide in `docs/`.
+- **Build, testing, or architecture changes**: update `DEVELOPMENT.md` and the relevant doc in `docs/`, and note any impacts in `CLAUDE.md`.
 
 ## Reporting Issues
 
 When reporting a bug, please include:
 
-- **AURA version** (`cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="aura") | .version'` or check `Cargo.toml`)
-- **Rust toolchain version** (`rustc --version`)
+- **AURA version** (check `Cargo.toml`) and **Rust toolchain version** (`rustc --version`)
 - **Operating system and version**
-- **Steps to reproduce** the issue
-- **Expected behavior** vs. **actual behavior**
+- **Steps to reproduce**, plus **expected** vs. **actual** behavior
 - **Relevant logs** (set `RUST_LOG=debug` or `RUST_LOG=aura=trace` for verbose output)
-- **Configuration** (sanitized — remove API keys and secrets)
+- **Configuration** (sanitized: remove API keys and secrets)
 
-For feature requests, describe the use case and the problem you're trying to solve. Starting a [Discussion](https://github.com/mezmo/aura/discussions) first is a great way to refine ideas before opening a formal issue.
+For feature requests, describe the use case and the problem you're trying to solve. Raising the idea in the [community Slack](https://mezmo.com/r/slack-aura) first is a great way to refine it before opening a formal issue.
 
 ## License
 

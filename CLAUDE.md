@@ -130,7 +130,8 @@ aura/
 - **Diagnostic logs**: opt-in via `--log-file <path>` / `AURA_LOG_FILE` / `cli.toml` `log_file` (precedence: CLI > env > project > global > none). Events are appended to the file (no rotation — user-managed) in **both REPL and one-shot mode**, so stdout stays a clean pipe. Default filter is `warn,aura=info,aura_cli=info,aura_config=info,rig::agent::prompt_request=info`; override with `RUST_LOG`.
 - **OpenTelemetry (standalone only)**: when running in standalone mode, the CLI installs an OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Trace shape mirrors the web server — `agent.stream` root span via `direct.rs`, with `agent.turn` / `mcp.tool_call` / `orchestration.*` nesting under it. CLI omits the HTTP-infrastructure spans (`chat_completions`, `streaming_completion`) since it has no HTTP layer.
 - **Single shared tokio runtime**: `main` owns one `tokio::runtime::Runtime` and threads it into `Backend::from_config`, `run_oneshot`, and `run_repl`. `logging::init` runs inside `rt.enter()` so the OTLP gRPC exporter can call `Handle::current()` during `with_tonic()` construction; the `BatchSpanProcessor` worker lives on the same runtime that handles every subsequent request. `main` calls `aura::logging::shutdown_tracer()` via `rt.block_on(...)` before returning to flush buffered spans.
-- SSE event parsing uses shared types from `aura-events` crate (not in `default-members`, build explicitly with `cargo build -p aura-cli`)
+- SSE event parsing uses shared types from the `aura-events` crate
+- `aura-cli` is not in the workspace `default-members`, so a plain `cargo build` skips it; build it explicitly with `cargo build -p aura-cli`
 - See `crates/aura-cli/README.md` for full documentation
 
 ### Shared Event Types (`aura-events`)
@@ -173,17 +174,17 @@ The `tool_event_broker` uses a FIFO queue for correlating `tool_call_id` between
 - Look for `.await` between `on_tool_call` and `on_tool_result` (ensures sequential)
 - Check for `FuturesUnordered` or parallel execution patterns (would break FIFO)
 
-Confirmed sequential as of Rig 0.28: the streaming handler `.await`s each tool call inline. See `docs/rig-tool-execution-order.md`.
+Confirmed sequential as of Rig 0.28: the streaming handler `.await`s each tool call inline. See `docs/rig-fork-changes.md`.
 
 ## CI/CD
 
 **Status**: Jenkins/Makefile complete, Helm charts and K8s manifests in `deployment/`
 
 ```bash
-make build          # Build release binary
-make test           # Run all tests
-make docker-build   # Build Docker image
-make lint           # Run clippy + fmt check
+make build                  # Build release binary
+cargo test --workspace      # Run all tests (the `make test` hook is empty)
+make docker-build           # Build Docker image
+make lint                   # Run clippy + fmt check
 ```
 
 ## Code Comment Conventions
@@ -239,15 +240,22 @@ make lint           # Run clippy + fmt check
   Types: `feat`, `fix`, `doc`, `style`, `refactor`, `perf`, `test`, `chore`, `ci`
   Breaking changes: add `!` after type/scope and include a `BREAKING CHANGE:` footer.
   If fixing an issue, include `Fixes: #<issue number>` in the footer.
+  If the change relates to a tracked ticket, include `Ref: LOG-XXXXXX` in the footer; otherwise omit it (commitlint does not require it).
 
 ## Documentation
 
-- `README.md` - User-facing documentation
-- `crates/aura-cli/README.md` - CLI usage, backends, features, and build instructions
-- `CHANGELOG.md` - Auto-generated version history
+Which docs go where: put new documentation in the file that owns the topic.
+
+- `README.md` - User-facing only: what AURA is, quick start, usage (web server, A2A, client-side tools), and configuration reference. No table of contents (GitHub generates one). No build-from-source, testing, architecture, or contributor content; link to `DEVELOPMENT.md` / `CONTRIBUTING.md` instead.
+- `DEVELOPMENT.md` - Developer-facing: prerequisites, building from source, project structure, Make targets, testing (unit + integration suites and feature flags), and the architecture overview.
+- `CONTRIBUTING.md` - Contribution process only: CLA, workflow, code quality standards, commit conventions, PR and review process. Build/test details belong in `DEVELOPMENT.md`; link, don't duplicate.
+- `docs/` - Deep-dive guides for a single subsystem or protocol (streaming, request lifecycle, HITL, A2A, Ollama, telemetry, tracing, breaking changes). ADRs in `docs/adr/`, design docs in `docs/design/`.
+- `crates/*/README.md` - Crate-specific usage and build instructions (e.g. `crates/aura-cli/README.md`)
+- `CHANGELOG.md` - Auto-generated version history; never edit by hand
+
+Key deep-dive guides:
+
 - `docs/streaming-api-guide.md` - SSE streaming, custom events, and orchestration events
 - `docs/ollama-guide.md` - Ollama configuration, fallback tool parsing, and local model guidance
 - `docs/request-lifecycle.md` - Request flow, lifecycle, timeout, cancellation, and shutdown
-- `docs/rig-tool-execution-order.md` - Tool execution order analysis
-- `docs/rig-fork-changes.md` - Rig fork changes and rationale
-- `docs/orchestration-tickets.md` - Epic ticket table, dependency graph, research references, implementation plan
+- `docs/rig-fork-changes.md` - Rig fork changes, tool execution order, and rationale
