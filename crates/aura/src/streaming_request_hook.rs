@@ -14,7 +14,7 @@
 //! - `on_stream_completion_response_finish`: Captures usage, emits `aura.tool_usage` for pending tools
 //!
 //! This relies on Rig's streaming mode executing tools sequentially.
-//! See `docs/rig-tool-execution-order.md` for analysis.
+//! See `docs/rig-fork-changes.md` for analysis.
 //!
 //! # Usage
 //!

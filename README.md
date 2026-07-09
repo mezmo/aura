@@ -1,44 +1,25 @@
 # AURA
 
-[![Slack](https://img.shields.io/badge/Slack-Join%20the%20community-4A154B?logo=slack&logoColor=white)](https://mezmo.com/r/slack-aura)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org)
-[![MCP](https://img.shields.io/badge/MCP-compatible-green)](https://modelcontextprotocol.io)
+[![Join the AURA community on Slack](https://img.shields.io/badge/Slack-Join%20the%20community-4A154B?logo=slack&logoColor=white "Join the AURA community on Slack")](https://mezmo.com/r/slack-aura)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue "Apache License, Version 2.0")](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust "Built with Rust 1.85 or later")](https://www.rust-lang.org)
+[![MCP compatible](https://img.shields.io/badge/MCP-compatible-green "Model Context Protocol compatible")](https://modelcontextprotocol.io)
 
-AURA is an agentic harness that turns an LLM model into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
+AURA is an agentic harness that turns LLM models into a reliable, autonomous service capable of executing real SRE work. AURA provides the guardrails, API servers, state management, authentication, streaming, error handling, and tool integrations necessary to run AI SRE agents safely in production.
 
-Key capabilities:
+With AURA you can:
 
-- Declarative agent composition via TOML with multi-provider LLM support and multi-agent serving
-- Dynamic [MCP](https://modelcontextprotocol.io) tool discovery via HTTP streamable, SSE, and STDIO transports
-- Automatic schema sanitization for OpenAI function-calling compatibility
-- Vector search integration with Qdrant and AWS Bedrock Knowledge Base
-- Embeddable Rust core independent from configuration layer
-- Multi-agent orchestration with coordinator/worker architecture and DAG-based parallel execution
-- Dependency-aware multi-wave execution with plan/execute loops
-- [A2A protocol](https://github.com/a2a-protocol) support for agent-to-agent interoperability
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [Project Structure](#project-structure)
-- [Development Setup](#development-setup)
-- [Usage](#usage)
-  - [Web API Server](#web-api-server)
-  - [Client-Side Tools](#client-side-tools)
-- [Configuration](#configuration)
-  - [Multiple Agents](#multiple-agents)
-  - [Configuration Sections](#configuration-sections)
-  - [Orchestration](#orchestration)
-  - [Human-in-the-loop approval gates](#human-in-the-loop-approval-gates)
-  - [Scratchpad (Context Window Management)](#scratchpad-context-window-management)
-  - [Skills (On-Demand Instructions)](#skills-on-demand-instructions)
-  - [Ollama](#ollama)
-  - [Observability](#observability)
-- [Development and Testing](#development-and-testing)
-- [Testing](#testing)
-- [Documentation](#documentation)
-- [Architecture](#architecture)
+- Run entirely on your own infrastructure, including air-gapped and highly-regulated environments
+- Define orchestrated clusters of production agents in one simple, human-readable TOML file: models, per-agent prompts, tools, and guardrails
+- Run on the LLM backends you already use (OpenAI, Anthropic, Bedrock, Gemini, Ollama, OpenRouter), switch providers with a one-section edit, or mix models per worker
+- Give agents real tools: point a config at any MCP server (HTTP streamable, SSE, or STDIO) and its tools are discovered and callable at runtime
+- Require human approval (webhook or in-conversation) before sensitive tool calls execute
+- Survive huge tool outputs without context floods: oversized results are parked on disk and the agent pulls in only the slices it needs
+- Fan complex requests out to user-defined specialist workers: a coordinator plans a task DAG, runs independent tasks in parallel, and consolidates the results
+- Ground answers in your own data with vector search (Qdrant, AWS Bedrock Knowledge Base) and teach agents task-specific procedures with on-demand skills
+- Chat from the terminal with or without a server: the CLI runs agents in-process from a config, or connects to any OpenAI-compatible API
+- Interoperate with other agents over the A2A protocol, or embed the Rust core directly in your own application
+- Serve every agent as an OpenAI-compatible API, so existing clients and SDKs (LibreChat, OpenWebUI, …) work unchanged
 
 ## Quick Start
 
@@ -60,55 +41,11 @@ Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://
 - **[Kubernetes SRE](examples/quickstart-k8s-sre/README.md)** — AI-powered SRE agent on KIND with Kubernetes and Prometheus MCP servers
 - **[Example Configs](examples/README.md)** — Minimal per-provider configs and complete agent compositions
 
-## Project Structure
-
-```text
-aura/
-├── crates/
-│   ├── aura/                # Core library (agent builder + orchestration)
-│   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
-│   ├── aura-config/         # TOML parser and config loader
-│   ├── aura-events/         # Shared SSE event types
-│   ├── aura-test-utils/     # Shared testing utilities
-│   └── aura-web-server/     # OpenAI-compatible HTTP/SSE server
-├── compose/                 # Docker Compose (integration + orchestration overlays)
-├── configs/                 # E2E test and orchestration configurations
-├── deployment/              # Helm charts and K8s manifests
-├── docs/                    # Architecture and protocol documentation
-├── examples/                # Example and reference configurations
-├── scripts/                 # CI and utility scripts
-└── tests/                   # Integration test fixtures and helpers
-```
-
-## Development Setup
-
-For building AURA from source without Docker.
-
-1. Install Rust if needed:
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-2. Clone and configure:
-   ```bash
-   cd aura
-   cp examples/reference.toml config.toml
-   ```
-3. Set required environment variables:
-   ```bash
-   export OPENAI_API_KEY="your-api-key"
-   ```
-4. Build and run:
-   ```bash
-   cargo run --bin aura-web-server
-   ```
-
-Security: keep secrets in environment variables and reference them in TOML using `{{ env.VAR_NAME }}`.
-
 ## Usage
 
 ### Web API Server
 
-Run the web server:
+Run the web server (to build and run from source, see [DEVELOPMENT.md](DEVELOPMENT.md)):
 
 ```bash
 # Default: reads config.toml
@@ -145,7 +82,7 @@ Core server options:
 | `--port`                     | `PORT`                     | `8080`        | Bind port                           |
 | `--server-url`               | `AURA_SERVER_URL`          | host/port     | Canonical public origin published in the A2A agent card (see below) |
 | `--streaming-timeout-secs`   | `STREAMING_TIMEOUT_SECS`   | `900`         | Max SSE request duration            |
-| `--first-chunk-timeout-secs` | `FIRST_CHUNK_TIMEOUT_SECS` | `30`          | Max time to first provider chunk    |
+| `--first-chunk-timeout-secs` | `FIRST_CHUNK_TIMEOUT_SECS` | `90`          | Max time to first provider chunk    |
 | `--streaming-buffer-size`    | `STREAMING_BUFFER_SIZE`    | `400`         | SSE backpressure buffer             |
 | `--aura-custom-events`       | `AURA_CUSTOM_EVENTS`       | `false`       | Enable `aura.*` events              |
 | `--aura-emit-reasoning`      | `AURA_EMIT_REASONING`      | `false`       | Enable `aura.reasoning`             |
@@ -407,14 +344,6 @@ url = "http://localhost:8081/mcp"
 headers = { "Authorization" = "Bearer {{ env.MCP_TOKEN }}" }
 ```
 
-Validate built-in config examples and tests:
-
-```bash
-cargo test -p aura-config
-```
-
-This runs all config validation tests, including `test_all_shipped_configs_parse` which validates every `.toml` file in `configs/`, `examples/`, and `quickstart.toml`.
-
 To validate your own config file, start the web server or CLI — both validate the config immediately and exit with a clear error if parsing fails, before binding to any port or entering the REPL:
 
 ```bash
@@ -623,59 +552,10 @@ OpenTelemetry support is enabled by default via the `otel` feature in both `aura
 
 AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec) semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the `gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider libraries (Rig.rs) are automatically translated to OpenInference equivalents at export time. This makes AURA traces natively compatible with [Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware observability tools.
 
-## Development and Testing
+## Development and Contributing
 
-Quick commands:
-
-```bash
-# Full local quality checks
-make ci
-
-# Individual checks
-make fmt
-make fmt-check
-make test
-make lint
-
-# Build targets
-make build
-```
-
-## Testing
-
-Web server integration tests live under `crates/aura-web-server/tests/`.
-
-Run integration workflows:
-
-```bash
-# Standard integration suites
-make test-integration
-
-# Local integration run against locally started test infra
-make test-integration-local
-
-# Orchestration-specific integration suites
-make test-integration-orchestration
-
-# Local orchestration integration run
-make test-integration-orchestration-local
-
-# SRE orchestration integration suites
-make test-integration-sre-orchestration
-
-# Local SRE orchestration integration run
-make test-integration-sre-orchestration-local
-```
-
-Integration test feature flags (`crates/aura-web-server/Cargo.toml`):
-
-- Parent flag: `integration`
-- Suite flags: `integration-streaming`, `integration-header-forwarding`, `integration-mcp`, `integration-events`, `integration-cancellation`, `integration-progress`
-- Orchestration suite: `integration-orchestration` (separate from parent `integration`)
-- SRE orchestration suite: `integration-orchestration-sre` (requires k8s-sre-mcp server config)
-- Optional suite: `integration-vector` (requires external Qdrant setup)
-
-Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-server/README.md).
+- [DEVELOPMENT.md](DEVELOPMENT.md): building from source, project structure, Make targets, testing, and architecture.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to contribute, including the CLA, commit conventions, and the PR process.
 
 ## Documentation
 
@@ -691,45 +571,6 @@ Detailed test guidance: [crates/aura-web-server/README.md](crates/aura-web-serve
 - [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
 - [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
 - [docs/telemetry.md](docs/telemetry.md): anonymous, opt-out CLI telemetry — the three-state consent model, exactly what is and isn't collected, kill switches, and how to audit it.
-
-## Architecture
-
-AURA separates concerns across crates:
-
-- `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
-- `aura-config`: typed TOML parsing and validation.
-- `aura-events`: shared SSE event types (`AuraStreamEvent`, `OrchestrationStreamEvent`) — lightweight, no agent dependencies.
-- `aura-web-server`: OpenAI-compatible REST/SSE serving layer.
-- `aura-cli`: interactive terminal client with HTTP and standalone modes.
-
-This separation means:
-
-- Embeddable core: use `aura` directly in any Rust application without config file dependencies.
-- Shared event types: `aura-events` can be consumed by any Rust client without pulling in the full agent stack.
-- Testable boundaries: each crate has focused responsibilities and clear interfaces.
-
-Key architectural characteristics:
-
-- Dynamic MCP tool discovery at runtime.
-- Automatic schema sanitization (anyOf, missing types, optional parameters) driven by OpenAI function-calling requirements — MCP tool schemas are transformed at discovery time to conform to OpenAI's strict subset of JSON Schema.
-- Header forwarding support (`headers_from_request`) for per-request MCP auth delegation.  See [examples/reference.toml](examples/reference.toml) for a practical example.
-- Config-driven composition with embeddable Rust core.
-
-Prompt routing and execution model:
-
-- `build_streaming_agent()` routes requests based on `orchestration.enabled`.
-- Direct Mode (`orchestration.enabled = false`): single `Agent` handles the turn.
-- Orchestration Mode (`orchestration.enabled = true`): `Orchestrator` coordinates worker execution.
-- Both `Agent` and `Orchestrator` implement `StreamingAgent`, so they are interchangeable at the API boundary.
-
-Orchestrator components and loop:
-
-- Coordinator agent: plans task DAGs and consolidates worker outputs via continuation.
-- Worker agents: per-task instances with filtered MCP tools and vector stores.
-- Persistence/event layers: track plan state, task outcomes, and stream orchestration events.
-- Loop: Plan -> Execute (dependency waves) -> Continue (respond / plan again / clarify).
-
-Request execution and cancellation flow are documented in [docs/request-lifecycle.md](docs/request-lifecycle.md).
 
 ## License
 
