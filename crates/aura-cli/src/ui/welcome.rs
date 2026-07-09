@@ -51,7 +51,7 @@ impl WelcomeState {
     /// bright, high-contrast complement of the art's dominant hue.  Otherwise
     /// a random palette color is used.
     pub fn pick() -> Option<Self> {
-        let content = pick_welcome_file()?;
+        let content = resolve_welcome_content()?;
         let (text_color, art_color) = if content.contains('\x1b') {
             let complement = complementary_text_color(&content);
             let (_, fallback) = random_color_pair();
@@ -605,21 +605,21 @@ fn interpolate_tokens(content: String, status: &str) -> String {
 }
 
 /// Load the `.welcome` file from the current directory (preferred) or
-/// `~/.aura/` (fallback), and interpolate env vars.
-fn pick_welcome_file() -> Option<String> {
+/// `~/.aura/` (fallback), and interpolate env vars. For read-only filesystems,
+/// fall back to the color built-in welcome message.
+fn resolve_welcome_content() -> Option<String> {
     let aura_dir = aura_home_dir();
     seed_home_welcome(&aura_dir);
 
-    let cwd_welcome = Path::new(".welcome");
-    let home_welcome = aura_dir.join(".welcome");
+    let cwd_content = fs::read_to_string(Path::new(".welcome")).ok();
+    let home_content = fs::read_to_string(aura_dir.join(".welcome")).ok();
+    let non_empty = |c: String| Some(c).filter(|c| !c.trim().is_empty());
 
-    let content = if cwd_welcome.exists() {
-        fs::read_to_string(cwd_welcome).ok()
-    } else {
-        fs::read_to_string(&home_welcome).ok()
-    };
+    let content = cwd_content
+        .and_then(non_empty)
+        .or_else(|| home_content.and_then(non_empty))
+        .unwrap_or_else(|| BUILTIN_WELCOME_FILES[0].1.to_string());
 
-    let content = content.filter(|c| !c.trim().is_empty())?;
     Some(interpolate_tokens(content, &super::state::startup_status()))
 }
 
