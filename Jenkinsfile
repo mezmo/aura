@@ -111,6 +111,85 @@ pipeline {
       }
     } // end setup
 
+    // TEMPORARY: exercises the macOS signing + notarization credentials and
+    // keychain wiring against a throwaway binary so a broken setup fails here
+    // instead of at release time. Remove once confirmed working.
+    stage('Signing Smoke Test') {
+      agent {
+        node {
+          label 'ec2-fleet-oss-macos'
+          customWorkspace("/tmp/workspace/${BUILD_SLUG}-signtest")
+        }
+      }
+
+      environment {
+        ENABLE_DOCKER = 'false'
+        SIGNING_KEYCHAIN = "/tmp/aura-signing-smoke-${BUILD_SLUG}.keychain-db"
+      }
+
+      steps {
+        withCredentials([
+          certificate(
+            credentialsId: 'apple-signing-certificate',
+            keystoreVariable: 'APPLE_CERT_P12',
+            passwordVariable: 'APPLE_CERT_PASSWORD'
+          ),
+          string(credentialsId: 'apple-notarytool-password', variable: 'NOTARY_PASSWORD')
+        ]) {
+          withEnv([
+            'NOTARY_APPLE_ID=apps+dev@logdna.com',
+            'NOTARY_TEAM_ID=TT7664HMU3'
+          ]) {
+            sh '''
+              set -eu
+
+              KEYCHAIN_PW="aura-ci"
+              security create-keychain -p "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+              security set-keychain-settings "$SIGNING_KEYCHAIN"
+              security unlock-keychain -p "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+              security import "$APPLE_CERT_P12" -k "$SIGNING_KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+              # Let codesign use the imported key without an interactive prompt.
+              security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN" >/dev/null
+
+              CODESIGN_IDENTITY=$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')
+              echo "using signing identity: $CODESIGN_IDENTITY"
+
+              echo 'int main(void) { return 0; }' > smoke.c
+              clang -o smoke-darwin smoke.c
+
+              echo 'signing smoke-darwin'
+              codesign --force --timestamp --options runtime --keychain "$SIGNING_KEYCHAIN" --sign "$CODESIGN_IDENTITY" smoke-darwin
+              codesign --verify --strict --verbose=2 smoke-darwin
+
+              echo 'notarizing smoke-darwin'
+              ditto -c -k smoke-darwin smoke-darwin.zip
+              xcrun notarytool submit smoke-darwin.zip \
+                --apple-id "$NOTARY_APPLE_ID" \
+                --password "$NOTARY_PASSWORD" \
+                --team-id "$NOTARY_TEAM_ID" \
+                --wait 2>&1 | tee notary.log
+
+              SUBMISSION_ID=$(awk '/^ *id: /{print $2; exit}' notary.log)
+              if ! grep -q 'status: Accepted' notary.log; then
+                echo "notarization not accepted; fetching log for $SUBMISSION_ID"
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --apple-id "$NOTARY_APPLE_ID" \
+                  --password "$NOTARY_PASSWORD" \
+                  --team-id "$NOTARY_TEAM_ID" || true
+                exit 1
+              fi
+            '''
+          }
+        }
+      }
+
+      post {
+        always {
+          sh 'security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true; rm -f smoke.c smoke-darwin smoke-darwin.zip notary.log'
+        }
+      }
+    } // end signing smoke test
+
     stage('Build Images') {
       // Preloaded tags are consumed by the Test Suite stage.
       when {
@@ -479,6 +558,7 @@ pipeline {
                 SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
                 SCCACHE_REGION = "${BUILD_CACHE_REGION}"
                 SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+                SIGNING_KEYCHAIN = "/tmp/aura-signing-release-${BUILD_SLUG}.keychain-db"
               }
 
               steps {
@@ -500,6 +580,37 @@ pipeline {
                       sh 'make build-binaries-darwin'
                     }
                   }
+
+                  withCredentials([
+                    certificate(
+                      credentialsId: 'apple-signing-certificate',
+                      keystoreVariable: 'APPLE_CERT_P12',
+                      passwordVariable: 'APPLE_CERT_PASSWORD'
+                    ),
+                    string(credentialsId: 'apple-notarytool-password', variable: 'NOTARY_PASSWORD')
+                  ]) {
+                    withEnv([
+                      'NOTARY_APPLE_ID=apps+dev@logdna.com',
+                      'NOTARY_TEAM_ID=TT7664HMU3'
+                    ]) {
+                      // Sign and notarize in a throwaway keychain: create it,
+                      // import the Developer ID certificate, and add it to the
+                      // search list so the make target's codesign calls resolve
+                      // the identity. The stage post step deletes the keychain.
+                      sh '''
+                        set -eu
+                        KEYCHAIN_PW="aura-ci"
+                        security create-keychain -p "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+                        security set-keychain-settings "$SIGNING_KEYCHAIN"
+                        security unlock-keychain -p "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN"
+                        security list-keychains -d user -s "$SIGNING_KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+                        security import "$APPLE_CERT_P12" -k "$SIGNING_KEYCHAIN" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+                        security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PW" "$SIGNING_KEYCHAIN" >/dev/null
+                        CODESIGN_IDENTITY=$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')
+                        make sign-release-binaries-darwin CODESIGN_IDENTITY="$CODESIGN_IDENTITY"
+                      '''
+                    }
+                  }
                 }
 
                 stash(
@@ -511,6 +622,7 @@ pipeline {
 
               post {
                 always {
+                  sh 'security delete-keychain "$SIGNING_KEYCHAIN" 2>/dev/null || true'
                   sh 'make clean'
                 }
               }
