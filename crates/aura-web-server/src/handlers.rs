@@ -1594,6 +1594,7 @@ model = "gpt-4o"
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
             default_agent: default_agent.map(str::to_owned),
             additional_tools: Arc::new(Vec::new),
+            debug_provider_errors: false,
             pending_approvals: aura::hitl::PendingApprovals::new(),
         })
     }
