@@ -5,20 +5,32 @@
 #   curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 #
 # Options (via environment variables):
-#   AURA_VERSION   - Version to install (default: latest)
-#   AURA_INSTALL   - Install directory (default: ~/.local/bin)
-#   AURA_COMPONENT - Which binary: "all", "server", "cli" (default: all)
+#   AURA_VERSION          - Version to install (default: latest)
+#   AURA_INSTALL          - Install directory (default: ~/.local/bin)
+#   AURA_COMPONENT        - Which binary: "all", "server", "cli" (default: all)
+#   AURA_REQUIRE_CHECKSUM - Fail (1) instead of warn (0) when a checksum is missing (default: 0)
 
 set -euo pipefail
 
 REPO="mezmo/aura"
 VERSION="${AURA_VERSION:-latest}"
+VERSION="${VERSION#v}"
 INSTALL_DIR="${AURA_INSTALL:-${HOME}/.local/bin}"
 COMPONENT="${AURA_COMPONENT:-all}"
+REQUIRE_CHECKSUM="${AURA_REQUIRE_CHECKSUM:-0}"
 BASE_URL="https://github.com/${REPO}/releases"
+
+case "${COMPONENT}" in
+    all|server|cli) ;;
+    *)
+        echo "Error: invalid AURA_COMPONENT '${COMPONENT}'. Supported: all, server, cli."
+        exit 1
+        ;;
+esac
 
 main() {
     detect_platform
+    detect_downloader
     resolve_version
 
     echo "Installing AURA ${VERSION} (${OS}/${ARCH}) to ${INSTALL_DIR}"
@@ -31,7 +43,12 @@ main() {
         cp "${AURA_CHECKSUMS}" "${tmpdir}/checksums.txt"
     else
         local checksums_url="${BASE_URL}/download/v${VERSION}/checksums.txt"
-        curl -fsSL -o "${tmpdir}/checksums.txt" "${checksums_url}" 2>/dev/null || true
+        fetch "${tmpdir}/checksums.txt" "${checksums_url}" 2>/dev/null || true
+    fi
+
+    if [[ "${REQUIRE_CHECKSUM}" == 1 && ! -s "${tmpdir}/checksums.txt" ]]; then
+        echo "Error: AURA_REQUIRE_CHECKSUM is set but checksums.txt could not be fetched."
+        exit 1
     fi
 
     if [[ "${COMPONENT}" != "cli" ]]; then
@@ -54,8 +71,9 @@ detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
     case "${OS}" in
         linux) ;;
+        darwin) ;;
         *)
-            echo "Error: unsupported OS '${OS}'. Only linux is currently available."
+            echo "Error: unsupported OS '${OS}'. Supported: linux, darwin."
             exit 1
             ;;
     esac
@@ -72,12 +90,42 @@ detect_platform() {
     esac
 }
 
+detect_downloader() {
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOADER="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        DOWNLOADER="wget"
+    else
+        echo "Error: need curl or wget installed."
+        exit 1
+    fi
+}
+
+fetch() {
+    local dest="$1" url="$2"
+    case "${DOWNLOADER}" in
+        curl) curl -fsSL -o "${dest}" "${url}" ;;
+        wget) wget -q -O "${dest}" "${url}" ;;
+    esac
+}
+
+resolve_latest_url() {
+    case "${DOWNLOADER}" in
+        curl)
+            curl -fsSLI -o /dev/null -w '%{url_effective}' "${BASE_URL}/latest"
+            ;;
+        wget)
+            wget -S --spider "${BASE_URL}/latest" 2>&1 \
+                | awk 'tolower($1) == "location:" { print $2 }' | tail -1
+            ;;
+    esac
+}
+
 resolve_version() {
     if [[ "${VERSION}" == "latest" ]]; then
-        local location
-        location=$(curl -fsSI "${BASE_URL}/latest" 2>/dev/null \
-            | grep -i '^location:' | tail -1 | tr -d '\r')
-        VERSION="${location##*/}"
+        local url
+        url=$(resolve_latest_url 2>/dev/null | tr -d '\r')
+        VERSION="${url##*/}"
         VERSION="${VERSION#v}"
         if [[ -z "${VERSION}" ]]; then
             echo "Error: could not determine latest version."
@@ -89,7 +137,7 @@ resolve_version() {
 download() {
     local dest="$1" name="$2"
     local url="${BASE_URL}/download/v${VERSION}/${name}"
-    if ! curl -fsSL -o "${dest}" "${url}"; then
+    if ! fetch "${dest}" "${url}"; then
         echo "Error: failed to download ${url}"
         return 1
     fi
@@ -97,13 +145,21 @@ download() {
 
 verify_checksum() {
     local file="$1" asset_name="$2" checksums="$3"
-    if [[ ! -f "${checksums}" ]]; then
+    if [[ ! -s "${checksums}" ]]; then
+        if [[ "${REQUIRE_CHECKSUM}" == 1 ]]; then
+            echo "Error: no checksums file and AURA_REQUIRE_CHECKSUM is set."
+            exit 1
+        fi
         echo "  Warning: no checksums file, skipping verification"
         return 0
     fi
     local expected
     expected=$(grep "  ${asset_name}\$" "${checksums}" | cut -d' ' -f1 || true)
     if [[ -z "${expected}" ]]; then
+        if [[ "${REQUIRE_CHECKSUM}" == 1 ]]; then
+            echo "Error: no checksum for ${asset_name} and AURA_REQUIRE_CHECKSUM is set."
+            exit 1
+        fi
         echo "  Warning: no checksum for ${asset_name}, skipping verification"
         return 0
     fi
