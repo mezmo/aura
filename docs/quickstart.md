@@ -69,7 +69,7 @@ Install only the CLI to a custom directory:
 AURA_INSTALL=/usr/local/bin AURA_COMPONENT=cli curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-**Manual download:** Pre-built `aura` (the CLI) and `aura-web-server` binaries are published on the [GitHub Releases](https://github.com/mezmo/aura/releases) page. Builds are available for Linux (`linux-amd64` and `linux-arm64`) and macOS (`darwin-amd64` and `darwin-arm64`). Each binary has a SHA-256 checksum in `checksums.txt`.
+**Manual download:** Pre-built `aura` (the CLI) and `aura-web-server` binaries are published on the [GitHub Releases](https://github.com/mezmo/aura/releases) page. Builds are available for Linux (`linux-amd64` and `linux-arm64`) and macOS (`darwin-amd64` and `darwin-arm64`). Each asset name ends in a platform suffix. For example, the Apple Silicon CLI is `aura-darwin-arm64` and the server is `aura-web-server-darwin-arm64`. After downloading, make the file executable with `chmod +x`, and rename it if you want a shorter name such as `aura`. Each binary has a SHA-256 checksum in `checksums.txt`.
 
 ### Build the CLI from source
 
