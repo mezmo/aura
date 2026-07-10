@@ -36,6 +36,18 @@ const REASONING_FIELD: &str = "_aura_reasoning";
 /// `on_complete` can rendezvous on the same entry in `raw_outputs`.
 const CALL_ID_FIELD: &str = "_persistence_call_id";
 
+/// Start of the inline footer `transform_output` appends to promoted tool
+/// outputs (`"{marker}{filename}]"`).
+pub(crate) const ARTIFACT_FOOTER_MARKER: &str = "\n\n[Tool output saved to artifact: ";
+
+/// Strip a trailing artifact footer from `output`, if present.
+pub(crate) fn strip_artifact_footer(output: &str) -> &str {
+    match output.rfind(ARTIFACT_FOOTER_MARKER) {
+        Some(pos) => &output[..pos],
+        None => output,
+    }
+}
+
 /// RAII guard that decrements the in-flight counter and notifies drain waiters
 /// on drop. Guarantees the counter is decremented even on early returns or
 /// panics inside `on_complete`.
@@ -218,7 +230,7 @@ impl ToolWrapper for PersistenceWrapper {
             task_id, worker, self.iteration, tool, call_idx
         );
 
-        let footer = format!("\n\n[Tool output saved to artifact: {}]", filename);
+        let footer = format!("{ARTIFACT_FOOTER_MARKER}{filename}]");
         TransformOutputResult::new(format!("{}{}", output, footer))
     }
 
@@ -263,10 +275,7 @@ impl ToolWrapper for PersistenceWrapper {
         let output_text = output.as_deref().unwrap_or("");
         // Strip any artifact footer appended by transform_output so we write
         // clean output and compute thresholds on the original size.
-        let output_clean = output_text
-            .rfind("\n\n[Tool output saved to artifact: ")
-            .map(|pos| &output_text[..pos])
-            .unwrap_or(output_text);
+        let output_clean = strip_artifact_footer(output_text);
         let should_promote = match (
             output_clean.len(),
             self.size_threshold,
@@ -317,11 +326,7 @@ impl ToolWrapper for PersistenceWrapper {
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({})),
             reasoning,
-            output: output.map(|o| {
-                o.rfind("\n\n[Tool output saved to artifact: ")
-                    .map(|pos| o[..pos].to_string())
-                    .unwrap_or(o)
-            }),
+            output: output.map(|o| strip_artifact_footer(&o).to_string()),
             error,
             duration_ms,
             artifact_filename,

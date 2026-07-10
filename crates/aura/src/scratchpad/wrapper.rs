@@ -4,30 +4,13 @@
 use super::context_budget::ContextBudget;
 use super::storage::ScratchpadStorage;
 use crate::mcp_response::CallOutcome;
+use crate::orchestration::persistence_wrapper::strip_artifact_footer;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-
-/// Inline footer the persistence wrapper appends to promoted tool outputs
-/// (see `orchestration::persistence_wrapper`). Kept in sync with that marker.
-const ARTIFACT_FOOTER_MARKER: &str = "\n\n[Tool output saved to artifact: ";
-
-/// Strip a trailing persistence artifact footer from `output`, if present.
-///
-/// `ComposedWrapper` runs `transform_output` in reverse order, so the
-/// persistence wrapper appends its footer before this wrapper sees the output.
-/// Mirrors the strip in `persistence_wrapper` so the scratchpad never writes
-/// the footer into a file, where it would corrupt otherwise-valid JSON and
-/// break `get_in`/`schema`/`iterate_over`.
-fn strip_artifact_footer(output: &str) -> &str {
-    match output.rfind(ARTIFACT_FOOTER_MARKER) {
-        Some(pos) => &output[..pos],
-        None => output,
-    }
-}
 
 /// Build the primary "this lives in a file, explore it with these tools"
 /// pointer. Shared by [`ScratchpadWrapper`] (for intercepted MCP output) and
@@ -109,15 +92,13 @@ impl ToolWrapper for ScratchpadWrapper {
             None => return TransformOutputResult::new(output),
         };
 
-        // Persistence runs before this wrapper (ComposedWrapper applies
-        // transform_output in reverse order) and may have appended an artifact
-        // footer. Diverting to the scratchpad replaces the output with our own
-        // pointer, so that footer is redundant here — and writing it into the
-        // scratchpad file would append a non-JSON line that breaks get_in,
-        // schema, and iterate_over on otherwise-valid JSON. Strip it before
-        // counting, hashing, and writing. The passthrough returns below keep
-        // the original output so the footer still serves as the persistence
-        // read_artifact pointer when the scratchpad does not intercept.
+        // The output may arrive with a trailing artifact footer already
+        // appended. The pointer built below replaces the whole output, and
+        // the scratchpad file must hold only the raw tool output — a
+        // trailing non-JSON footer breaks get_in, schema, and iterate_over
+        // on otherwise-valid JSON. Strip it before counting, hashing, and
+        // writing. Passthrough returns hand back `output` untouched, footer
+        // and all.
         let content = strip_artifact_footer(&output);
 
         let output_tokens = self.budget.count_tokens(content);
@@ -401,12 +382,11 @@ mod tests {
         assert_eq!(strip_artifact_footer(body), body);
     }
 
-    /// A large JSON output that arrives carrying the persistence wrapper's
-    /// artifact footer (persistence runs first under `ComposedWrapper`) must be
-    /// written to the scratchpad file WITHOUT the footer, so the exploration
-    /// tools can still parse it as JSON. Regression test for the footer leaking
-    /// into the file and breaking get_in/schema/iterate_over with "not valid
-    /// JSON".
+    /// A large JSON output that arrives carrying a trailing artifact footer
+    /// must be written to the scratchpad file WITHOUT the footer, so the
+    /// exploration tools can still parse it as JSON. Regression test for the
+    /// footer leaking into the file and breaking get_in/schema/iterate_over
+    /// with "not valid JSON".
     #[tokio::test]
     async fn test_wrapper_strips_persistence_footer_before_write() {
         let tmp = TempDir::new().unwrap();
