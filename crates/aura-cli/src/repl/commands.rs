@@ -30,9 +30,12 @@ fn set_model_and_print_overview(
     if let Some(store) = conv_store {
         store.save_model(&model_id);
     }
-    println!("Model set to: {model_id}");
-    if let Some(agent) = rt.block_on(backend.startup_agent_overview()) {
-        crate::ui::agent_overview::print_agent_overview(&agent);
+    // The overview already names the agent and model, so print it alone;
+    // fall back to a plain confirmation when no overview is available
+    // (e.g. HTTP mode against a non-AURA server).
+    match rt.block_on(backend.startup_agent_overview()) {
+        Some(agent) => crate::ui::agent_overview::print_agent_overview(&agent),
+        None => println!("Model set to: {model_id}"),
     }
 }
 
