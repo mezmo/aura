@@ -1,5 +1,32 @@
 ## Changelog
 
+# [2.0.0](https://github.com/mezmo/aura/compare/v1.35.0...v2.0.0) (2026-07-10)
+
+
+### Bug Fixes
+
+* **cli**: show welcome banner when no .welcome file on disk [af23842](https://github.com/mezmo/aura/commit/af23842cba8ff4b7bc3905aeb7cb310f7716bca7) - Chip Johnson [#294](https://github.com/mezmo/aura/issues/294) [LOG-000000](https://mezmo.atlassian.net/browse/LOG-000000)* **web-server**: set debug_provider_errors in info endpoint test state [fa1ba1e](https://github.com/mezmo/aura/commit/fa1ba1efe2debdf62fe450f0cbe7f55b971d28fc) - Chip Johnson* **web-server**: set debug_provider_errors in test app state [7f8167e](https://github.com/mezmo/aura/commit/7f8167ed925bbfc0201de11a3ce4d23268f32701) - Chip Johnson
+
+### Code Refactoring
+
+* **streaming**: gate raw provider errors behind dev flag [cd450b6](https://github.com/mezmo/aura/commit/cd450b66709c9950e021cebac35b09be85b47fa0) - Chip Johnson
+
+### Documentation
+
+* split readme into development and contributing docs [06d79a2](https://github.com/mezmo/aura/commit/06d79a25637c2adaaa70481abd767002f1c28224) - Mike Shearer* **streaming**: trim redundant provider-error comments [748dca3](https://github.com/mezmo/aura/commit/748dca30828fe5298d210de61ce710e7f83fb745) - Chip Johnson
+
+### Features
+
+* **build**: add macos release binaries [5fe655b](https://github.com/mezmo/aura/commit/5fe655be7d12fae1e0b63107769fb2571fe5adb0) - Jacob Hull [#297](https://github.com/mezmo/aura/issues/297)* **streaming**: surface upstream provider error detail [ff39990](https://github.com/mezmo/aura/commit/ff39990af060200576e1201c44faf11088fb2f64) - Chip Johnson
+
+### **BREAKING CHANGES**
+
+* **web-server:** the lib test build with missing-field errors. Set the field
+to false in the two handler test helpers and the a2a executor test
+helper.
+
+Signed-off-by: Charles Johnson <chip.johnson@mezmo.com>
+
 # [1.35.0](https://github.com/mezmo/aura/compare/v1.34.0...v1.35.0) (2026-07-08)
 
 
