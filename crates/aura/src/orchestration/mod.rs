@@ -50,7 +50,7 @@ mod observer_wrapper;
 mod orchestrator;
 mod overview;
 mod persistence;
-mod persistence_wrapper;
+pub(crate) mod persistence_wrapper;
 mod prompt_constants;
 mod prompt_journal;
 mod stream_events;
