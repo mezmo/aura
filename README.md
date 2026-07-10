@@ -21,6 +21,23 @@ With AURA you can:
 - Interoperate with other agents over the A2A protocol, or embed the Rust core directly in your own application
 - Serve every agent as an OpenAI-compatible API, so existing clients and SDKs (LibreChat, OpenWebUI, …) work unchanged
 
+## Install
+
+Install the `aura` CLI and `aura-web-server` binaries (Linux/macOS, amd64/arm64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
+```
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AURA_VERSION` | `latest` | Release version to install |
+| `AURA_INSTALL` | `~/.local/bin` | Install directory |
+| `AURA_COMPONENT` | `all` | Which binary: `all`, `server`, or `cli` |
+| `AURA_REQUIRE_CHECKSUM` | `0` | `1` to fail when a release checksum is missing, `0` to warn and continue |
+
+Running a binary needs a config — see the [quickstart guide](docs/quickstart.md) and [Configuration](#configuration). To try AURA with no setup, use the Quick Start below.
+
 ## Quick Start
 
 ```bash
