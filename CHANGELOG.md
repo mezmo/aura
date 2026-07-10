@@ -1,5 +1,31 @@
 ## Changelog
 
+# [3.0.0](https://github.com/mezmo/aura/compare/v2.0.0...v3.0.0) (2026-07-10)
+
+
+### Bug Fixes
+
+* **cli**: stop double-printing agent details on /model selection [6825522](https://github.com/mezmo/aura/commit/682552273279fde64200cfb0d06431d2a6e7f867) - Mike Shearer [#336](https://github.com/mezmo/aura/issues/336)* **compose**: pin math-mcp to 6eed9eb before build:stdio removal [7b72cd3](https://github.com/mezmo/aura/commit/7b72cd313d8f069d6e6f8ba1f4e1b11fd2de5241) - Mike Shearer* **docs**: change docker exec command to docker compose exec [b23421f](https://github.com/mezmo/aura/commit/b23421f9fa6be17363d3b040a1d9b6a0a0e33ab7) - Mike Shearer* **scratchpad**: grep literal fallback and clearer non-JSON error [57c6e4c](https://github.com/mezmo/aura/commit/57c6e4c131e70ec80fa1073437d835a246d341b2) - Mike Shearer* **scratchpad**: strip persistence footer before writing scratchpad file [20713d1](https://github.com/mezmo/aura/commit/20713d115beb59eb08e116fd80a5da377088854e) - Mike Shearer
+
+### Chores
+
+* **docs**: Update telemetry docs for aura cli args [32eca0c](https://github.com/mezmo/aura/commit/32eca0c90f1cc182c80fc1aadd9ea68459e6d6d7) - Mike Shearer
+
+### Code Refactoring
+
+* **scratchpad**: single source for artifact footer marker [a65b134](https://github.com/mezmo/aura/commit/a65b134c4d0a81a9590ccf3ca619898766601925) - Mike Shearer
+
+### **BREAKING CHANGES**
+
+* **scratchpad:** get_in/schema/iterate_over with "Not JSON: file is not
+valid JSON".
+
+Strip the footer before counting, hashing, and writing. Passthrough
+returns keep the original output so the footer still serves as the
+read_artifact pointer when the scratchpad does not intercept.
+Stripping before hashing also fixes a dedup gap where identical raw
+outputs hashed differently due to call-specific footer text.
+
 # [2.0.0](https://github.com/mezmo/aura/compare/v1.35.0...v2.0.0) (2026-07-10)
 
 
