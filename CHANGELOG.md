@@ -1,5 +1,12 @@
 ## Changelog
 
+## [3.0.1](https://github.com/mezmo/aura/compare/v3.0.0...v3.0.1) (2026-07-11)
+
+
+### Chores
+
+* add darwin support to install script and update readme [bbfade3](https://github.com/mezmo/aura/commit/bbfade35a983070d98f65b92fb38df939c87e74c) - Jacob Hull [#297](https://github.com/mezmo/aura/issues/297)
+
 # [3.0.0](https://github.com/mezmo/aura/compare/v2.0.0...v3.0.0) (2026-07-10)
 
 
