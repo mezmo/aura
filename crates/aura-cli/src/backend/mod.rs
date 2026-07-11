@@ -19,7 +19,7 @@ use crate::config::AppConfig;
 /// `Direct` (behind `standalone-cli` feature) builds an agent in-process
 /// from TOML config and consumes the native stream directly.
 pub enum Backend {
-    Http(http::HttpBackend),
+    Http(Box<http::HttpBackend>),
     #[cfg(feature = "standalone-cli")]
     Direct(direct::DirectBackend),
 }
@@ -47,7 +47,7 @@ impl Backend {
             return Ok(Self::Direct(direct));
         }
 
-        Ok(Self::Http(http::HttpBackend::new(config.clone())))
+        Ok(Self::Http(Box::new(http::HttpBackend::new(config.clone()))))
     }
 
     /// Send a streaming chat completion and process the response, invoking
