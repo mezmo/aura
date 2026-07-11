@@ -1,5 +1,12 @@
 ## Changelog
 
+## [3.0.2](https://github.com/mezmo/aura/compare/v3.0.1...v3.0.2) (2026-07-11)
+
+
+### Chores
+
+* **deps**: drop native-tls for rustls and its arm64 build machinery [998e8d1](https://github.com/mezmo/aura/commit/998e8d1dce6c7b3fa30fc97f90af41d45a382f24) - Mike Shearer [#342](https://github.com/mezmo/aura/issues/342)
+
 ## [3.0.1](https://github.com/mezmo/aura/compare/v3.0.0...v3.0.1) (2026-07-11)
 
 
