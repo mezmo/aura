@@ -124,8 +124,6 @@ build-binary-linux-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/
 		export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
 		export CC_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-gcc; \
 		export CXX_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-g++; \
-		export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
-		export PKG_CONFIG_ALLOW_CROSS=1; \
 		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu --bin aura-web-server && \
 		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu -p aura-cli --bin aura"
 	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64

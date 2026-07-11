@@ -34,7 +34,7 @@ regex = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 dotenvy = { workspace = true }
 rpassword = "7"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
+reqwest = { workspace = true, features = ["blocking"] }
 aura-events = { path = "../aura-events" }
 aura-telemetry = { path = "../aura-telemetry" }
 eventsource-stream = "0.2"

@@ -21,7 +21,7 @@ rmcp = { workspace = true }
 base64 = "0.22"
 futures = "0.3"
 sse-stream = "0.2"
-reqwest = { version = "0.12", features = ["stream", "json"] }
+reqwest = { workspace = true }
 http = { workspace = true }
 url = "2"
 
