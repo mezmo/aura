@@ -1307,6 +1307,51 @@ impl Orchestrator {
         format!("Current time: {timestamp}\n\n{base}")
     }
 
+    /// Golden-frame seam (S2): expose the private continuation wrapper to
+    /// the `context_fixture` harness without widening production
+    /// visibility. Delegates; no test-only behavior.
+    #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "S2 seam accessor: consumed by the context_fixture envelope builder in the S2 implementation step"
+    )]
+    pub(crate) fn continuation_wrapper_for_golden(
+        ctx: &IterationContext,
+        max_iterations: usize,
+        show_tool_chain: bool,
+        content_max_length: usize,
+    ) -> String {
+        Self::build_continuation_wrapper(ctx, max_iterations, show_tool_chain, content_max_length)
+    }
+
+    /// Golden-frame seam (S2): expose the private worker prompt sections
+    /// (worker section, worker JSON field, worker guidelines) to the
+    /// `context_fixture` harness. Delegates; no test-only behavior.
+    #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "S2 seam accessor: consumed by the context_fixture envelope builder in the S2 implementation step"
+    )]
+    pub(crate) fn worker_prompt_sections_for_golden(&self) -> (String, String, String) {
+        self.build_worker_prompt_sections()
+    }
+
+    /// Golden-frame seam (S2): expose the private per-iteration failure
+    /// fold to the `context_fixture` harness, so the continuation prompt's
+    /// failure history is built by production code instead of a test-side
+    /// re-statement. Delegates; no test-only behavior.
+    #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "S2 seam accessor: consumed by the context_fixture envelope builder in the S2 implementation step"
+    )]
+    pub(crate) fn iteration_failures_for_golden(
+        plan: &Plan,
+        iteration: usize,
+    ) -> Vec<super::types::FailedTaskRecord> {
+        Self::collect_iteration_failures(plan, iteration)
+    }
+
     /// The assistant turn recorded after a routing decision: the compact
     /// decision text — variant, rationale, and plan shape for `create_plan`;
     /// the model's actual response or question text for the terminal

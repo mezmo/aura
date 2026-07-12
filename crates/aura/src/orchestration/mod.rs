@@ -42,6 +42,8 @@
 
 mod config;
 pub mod context;
+#[cfg(test)]
+mod context_fixture;
 mod duplicate_call_guard;
 mod events;
 mod factory;
