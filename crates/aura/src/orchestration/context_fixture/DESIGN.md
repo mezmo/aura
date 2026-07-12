@@ -126,7 +126,7 @@ verification section below.
   inseparable from MCP/vector/persistence wiring). GATE STATUS: the
   coordinator-side comparison LANDED and passes
   (`gate_r3_coordinator_preamble_matches_create_coordinator` in
-  `corpus.rs`): the composed preamble byte-equals real
+  `golden_tests.rs`): the composed preamble byte-equals real
   `create_coordinator` output over a tempdir-backed config with skills
   and session history enabled and vector stores disabled, through the
   `coordinator_preamble_for_golden` accessor. Residues: (a) the vector
@@ -145,8 +145,8 @@ verification section below.
   tool records per task id across the run via disk persistence; the
   builder reproduces the merge in memory - a false-pass path. GATE
   STATUS: LANDED and passing
-  (`gate_r5_trace_merge_matches_persistence_loader` in `corpus.rs`): the
-  `coordinator_call3_failures` trace data is written through a
+  (`gate_r5_trace_merge_matches_persistence_loader` in `golden_tests.rs`):
+  the `coordinator_call3_failures` trace data is written through a
   tempdir-backed `ExecutionPersistence` across two iterations and the
   harness merge is asserted equal to the production
   `load_tool_records_for_task` scan mapped through `ToolTraceEntry::from`.
@@ -207,8 +207,8 @@ git diff --stat 9df96382..HEAD -- \
 # 6 files changed, 3283 insertions(+), 892 deletions(-)
 ```
 
-Net +2,391 test `.rs` lines. Per file: facade +38, `corpus.rs` +1,369,
-`envelope.rs` +511, `normalize.rs` +405, `scenario.rs` +896,
+Net +2,391 test `.rs` lines. Per file: facade +38, `golden_tests.rs`
++1,369, `envelope.rs` +511, `normalize.rs` +405, `scenario.rs` +896,
 `frame_validation_tests.rs` +64/-892 (1,992 → 1,164 lines; the repair
 round added two owning tests for previously test-less ledger rows).
 Reported separately per the boundary rule: 4,490 committed `.snap`

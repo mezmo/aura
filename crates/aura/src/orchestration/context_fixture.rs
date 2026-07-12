@@ -18,12 +18,12 @@
 //!
 //! The coverage ledger is `context_fixture/MANIFEST.md`; the type design
 //! record is `context_fixture/DESIGN.md`. The snapshot corpus and the
-//! REQUIRED R3/R5 comparison gates live in [`corpus`]; the
+//! REQUIRED R3/R5 comparison gates live in [`golden_tests`]; the
 //! `frame_validation_tests.rs` cases the corpus subsumes were deleted in
 //! the S2 implementation step.
 
-mod corpus;
 mod envelope;
+mod golden_tests;
 mod normalize;
 mod scenario;
 

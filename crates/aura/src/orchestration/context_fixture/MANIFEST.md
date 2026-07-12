@@ -5,7 +5,7 @@ Baseline: aura `9df96382`. Anatomy references are to
 repo); defect letters are from
 `docs/redesign/evidence/2026-07-10-worker-delegation-contract-audit.md`.
 
-Status: IMPLEMENTED. The corpus below is landed in `corpus.rs`; every
+Status: IMPLEMENTED. The corpus below is landed in `golden_tests.rs`; every
 fixture's snapshot is committed under `snapshots/` and one test per row
 group renders the complete envelope triple. A row is either mapped to a
 fixture or explicitly excluded with a reason, and every exclusion row that
@@ -30,7 +30,7 @@ Two further claim qualifiers, marked where they apply:
   omissions. Every other fixture's triple is complete and reachable.
 - **Re-stated rules (R3/R5/R8).** Rows marked "re-stated" snapshot a shape
   the test builder reproduces rather than production emits end-to-end.
-  The REQUIRED comparison gates landed in `corpus.rs` close the
+  The REQUIRED comparison gates landed in `golden_tests.rs` close the
   cross-iteration trace merge (R5) and PARTIALLY close the coordinator
   preamble append order (R3, coordinator side; the vector-append
   position stays re-stated because the gate runs vector-disabled). The
@@ -41,7 +41,7 @@ Two further claim qualifiers, marked where they apply:
 ## Fixture corpus
 
 All coordinator fixtures share one source-built playbook constant
-(`SOURCE_PLAYBOOK`, defined once in the corpus and carried by
+(`SOURCE_PLAYBOOK`, defined once in `golden_tests.rs` and carried by
 `PreambleFixture::playbook`) preserving the 14 headed blocks of §1 rows
 5-18. Continuation fixtures run on the default 3-cycle budget except
 `coordinator_call3_failures` and `coordinator_call4_final_urgency`

@@ -38,7 +38,7 @@
 //!
 //! What the builder necessarily RE-STATES (each a named false-pass drift
 //! risk in `DESIGN.md` R3/R5/R8; the comparison gates landed in
-//! `corpus.rs` close item 4 and, vector position excepted, item 1 —
+//! `golden_tests.rs` close item 4 and, vector position excepted, item 1 —
 //! items 2, 3, 5, and 6 stay named residues):
 //!
 //! 1. the preamble append order of `create_coordinator`, INCLUDING the
@@ -125,7 +125,7 @@ fn assert_escape_hatch_unset() {
 /// `create_coordinator` order — skill catalog, vector-store context, then
 /// `'\n'` + session history. This append SEQUENCE is the R3 re-statement;
 /// the R3 comparison gate byte-checks it against real `create_coordinator`
-/// output (`corpus.rs`).
+/// output (`golden_tests.rs`).
 pub(super) fn compose_coordinator_preamble(fixture: &PreambleFixture) -> String {
     assert_escape_hatch_unset();
     let mut preamble = build_coordinator_preamble(
@@ -208,7 +208,7 @@ fn outcome_traces(outcome: &TaskOutcome) -> &[ToolTraceEntry] {
 /// order, skipping tasks with no records. Production merges through disk
 /// persistence (`load_tool_records_for_task` scans
 /// `iteration-*/task-{id}.attempt-*.tool-calls.json`); the R5 comparison
-/// gate in `corpus.rs` byte-checks this fold against that production
+/// gate in `golden_tests.rs` byte-checks this fold against that production
 /// loader over a tempdir. Fixtures pin one attempt per task per iteration:
 /// within one iteration directory the production scan order over multiple
 /// attempt files is filesystem-dependent.
