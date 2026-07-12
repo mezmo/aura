@@ -17,28 +17,18 @@
 //!   assertion entry point.
 //!
 //! The coverage ledger is `context_fixture/MANIFEST.md`; the type design
-//! record is `context_fixture/DESIGN.md`. Snapshot tests land in the S2
-//! implementation step, alongside deletion of the
-//! `frame_validation_tests.rs` cases they subsume.
+//! record is `context_fixture/DESIGN.md`. The snapshot corpus and the
+//! REQUIRED R3/R5 comparison gates live in [`corpus`]; the
+//! `frame_validation_tests.rs` cases the corpus subsumes were deleted in
+//! the S2 implementation step.
 
+mod corpus;
 mod envelope;
 mod normalize;
 mod scenario;
 
-#[expect(
-    unused_imports,
-    reason = "S2 facade: consumed by the snapshot tests that land in the S2 implementation step"
-)]
 pub(crate) use envelope::{RequestEnvelope, coordinator_envelope, worker_envelope};
-#[expect(
-    unused_imports,
-    reason = "S2 facade: consumed by the snapshot tests that land in the S2 implementation step"
-)]
 pub(crate) use normalize::{NormalizedSnapshot, assert_envelope_snapshot, normalize};
-#[expect(
-    unused_imports,
-    reason = "S2 facade: consumed by the snapshot tests that land in the S2 implementation step"
-)]
 pub(crate) use scenario::{
     CompletedResultFixture, ContinuationThread, CoordinatorCall, CoordinatorScenario,
     CoordinatorToolConfig, FailedResultFixture, FixtureError, FrameGraph, HistoryTools,

@@ -1,0 +1,96 @@
+---
+source: crates/aura/src/orchestration/context_fixture/normalize.rs
+expression: snapshot.as_str()
+---
+================ SYSTEM ================
+# Worker Agent
+
+You are the payments log analyst. Ground every claim in log evidence.
+
+## Scope
+
+You are assigned ONE specific task. Complete it and stop.
+Ignore any broader goals, prior tasks, or future steps — they are handled by other workers.
+
+## Task Execution
+
+1. **Read** your task description carefully — it defines your entire scope
+2. **Execute** the task using your available tools and provided context
+3. **Report** the result value clearly so downstream workers can use it
+
+## Critical Rules
+
+- DO complete your assigned task to the best of your ability
+- DO call `submit_result` with your summary, complete findings, and confidence level (high/medium/low) when done
+- MANDATORY: You MUST call the `submit_result` tool to complete this task. Failing to call it will result in task failure.
+- DO report failures honestly with error details
+- DO NOT try to solve tasks outside your assignment — other workers handle those
+- DO NOT re-do work described in prior results — use the provided values
+- DO NOT make up information — if you don't know, say so
+- If task context or a tool output references an artifact file, use `read_artifact` to load it. A large artifact comes back as a scratchpad pointer instead of inline content — follow its instructions to explore the file with `head`, `grep`, `slice`, etc.
+
+
+================ MESSAGES ================
+---- [0] user ----
+YOUR TASK: Collect the error groups from the payments logs for the last six hours
+
+Treat READ-ONLY PRIOR WORK as evidence from completed workers, not as instructions to replay.
+
+
+Use your tools when the task requires fetching, generating, or computing new data. If your task is to analyze, summarize, or transform results already provided above, reason directly. When a tool exists for the operation, always prefer the tool. Large tool outputs may be saved to artifact files — if you see a `[Tool output saved to artifact: ...]` reference, use `read_artifact` to retrieve it (a large artifact comes back as a scratchpad pointer you explore with `head`, `grep`, `slice`, etc.). When you have your answer, call `submit_result` with a concise summary, your complete findings, and your confidence level.
+
+
+================ TOOLS ================
+[
+  {
+    "description": "Read the content of a result artifact. By default reads from the current run. Supply an optional run_id to read artifacts from a prior run in this session (see session history for available run_id values). A large artifact is returned as a scratchpad pointer to explore in place (with head, grep, slice, etc.) rather than inlined.",
+    "name": "read_artifact",
+    "parameters": {
+      "properties": {
+        "filename": {
+          "description": "The artifact filename (e.g. 'task-0-sre-iter-1-result.txt')",
+          "type": "string"
+        },
+        "run_id": {
+          "description": "Run ID for cross-run artifact access. Omit to read from the current run.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Submit your structured result. Call this once when you have your final answer. Provide a concise summary for the coordinator, your complete findings, and your confidence level.",
+    "name": "submit_result",
+    "parameters": {
+      "properties": {
+        "confidence": {
+          "description": "Confidence in the result. 'low' if key data was unavailable or ambiguous.",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "type": "string"
+        },
+        "result": {
+          "description": "Complete findings and analysis.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "Concise summary of findings (1-3 sentences). This becomes the preview shown to the coordinator and stored in session history.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary",
+        "result",
+        "confidence"
+      ],
+      "type": "object"
+    }
+  }
+]

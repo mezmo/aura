@@ -1311,10 +1311,6 @@ impl Orchestrator {
     /// the `context_fixture` harness without widening production
     /// visibility. Delegates; no test-only behavior.
     #[cfg(test)]
-    #[expect(
-        dead_code,
-        reason = "S2 seam accessor: consumed by the context_fixture envelope builder in the S2 implementation step"
-    )]
     pub(crate) fn continuation_wrapper_for_golden(
         ctx: &IterationContext,
         max_iterations: usize,
@@ -1328,12 +1324,24 @@ impl Orchestrator {
     /// (worker section, worker JSON field, worker guidelines) to the
     /// `context_fixture` harness. Delegates; no test-only behavior.
     #[cfg(test)]
-    #[expect(
-        dead_code,
-        reason = "S2 seam accessor: consumed by the context_fixture envelope builder in the S2 implementation step"
-    )]
     pub(crate) fn worker_prompt_sections_for_golden(&self) -> (String, String, String) {
         self.build_worker_prompt_sections()
+    }
+
+    /// Golden-frame seam (S2): expose the preamble the real
+    /// `create_coordinator` assembles, for the REQUIRED R3 comparison gate
+    /// (`context_fixture/DESIGN.md`) that byte-checks the harness's
+    /// re-stated append order against production output. Delegates; no
+    /// test-only behavior.
+    #[cfg(test)]
+    pub(crate) async fn coordinator_preamble_for_golden(
+        &self,
+        allow_recon_tools: bool,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let AgentWithPreamble { preamble, .. } = self
+            .create_coordinator(RoutingToolSet::new(), allow_recon_tools)
+            .await?;
+        Ok(preamble)
     }
 
     /// Golden-frame seam (S2): expose the private per-iteration failure
@@ -1341,10 +1349,6 @@ impl Orchestrator {
     /// failure history is built by production code instead of a test-side
     /// re-statement. Delegates; no test-only behavior.
     #[cfg(test)]
-    #[expect(
-        dead_code,
-        reason = "S2 seam accessor: consumed by the context_fixture envelope builder in the S2 implementation step"
-    )]
     pub(crate) fn iteration_failures_for_golden(
         plan: &Plan,
         iteration: usize,

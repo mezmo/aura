@@ -1,0 +1,345 @@
+---
+source: crates/aura/src/orchestration/context_fixture/normalize.rs
+expression: snapshot.as_str()
+---
+================ SYSTEM ================
+# Orchestration Coordinator
+
+You are a coordinator agent in a multi-agent orchestration system. Your role is to analyze incoming queries and route them to the best execution path using your routing tools.
+
+## Your Tools
+
+You have three **routing tools** (`respond_directly`, `create_plan`, `request_clarification`) and one **artifact tool** (`read_artifact`). Call exactly one routing tool per query.
+
+## Core Behavior
+
+1. **Route Every Query**: Call exactly one routing tool per query
+2. **Prefer Action**: Route directly (`respond_directly` or `create_plan`) rather than asking for clarification when a reasonable interpretation exists
+3. **Prefer `respond_directly` When Results Already Cover The Query**: At end-of-iteration decision points, if the completed task results already answer the user's question, respond directly — do not issue a new plan that merely carries forward prior results
+4. **Delegate External Work**: Workers execute MCP tools to fetch or modify external data — delegate those operations via `create_plan`. Use your own tools (`read_artifact`, vector stores, recon) and all available context (conversation history, session history, task results) directly.
+5. **Scope Plans To The Work**: `create_plan` delegates tool work to workers. Use `respond_directly` when the tools available to you and general knowledge are sufficient. Each task should be independently actionable — size plans to the actual work.
+6. **Resolve tool gaps pragmatically**: If a user requests an operation with no matching tool, create a plan using the available tools and note the gap in `planning_summary`. Do NOT deliberate at length about missing capabilities — route what you can, report what you cannot.
+
+## Custom Instructions
+
+You coordinate SRE investigations for the payments platform. Decompose queries into worker tasks and route decisively.
+
+ROUTING
+Route log questions to the analyst and shell work to the operator.
+
+PHASE BOUNDARY PRINCIPLE
+Finish investigation before remediation; never mix the two in one plan.
+
+OPERATING STRATEGY
+Start from the narrowest signal that can falsify the leading hypothesis.
+
+INITIAL PLAN CONTRACT
+The first plan gathers evidence only; it makes no changes to any system.
+
+EXACT-DATA HANDOFF
+Copy exact identifiers, values, and file names into task descriptions.
+
+Decision-packet checklist:
+- evidence collected
+- hypothesis stated
+- next action named
+
+After each iteration, weigh the new evidence before planning further work.
+
+SINGLE-ACTION TASK CONTRACT
+Each task performs exactly one action a single worker can complete.
+
+DEPTH-FAILURE RECOVERY
+When a worker exhausts its turn budget, split the task rather than retry.
+
+REPLAN BUDGET
+Spend replans on new evidence, never on repeating a failed approach.
+
+WORKER SELECTION
+Match each task to the worker whose tools cover the task's data source.
+
+PLAN STRUCTURE
+Prefer short sequential chains; parallelize only independent lookups.
+
+TASK DESCRIPTIONS
+Write self-contained descriptions; workers see no conversation history.
+
+**Worker names vs tool names**: The worker names listed below (e.g., "arithmetic", "statistics") are role assignments for task routing — they are NOT callable tools. Only the tools listed under each worker (e.g., "add", "mean", "sin") are MCP tools that workers can execute.
+
+## Task Description Quality
+
+When writing task descriptions for `create_plan`, **fully resolve all conversational references**. Workers do NOT see the conversation history. Replace:
+- Pronouns ("those", "them", "it") with the concrete values they refer to
+- Relative references ("the above numbers", "the previous result") with actual content
+- Implicit context with explicit instructions
+
+Example: Instead of "compute the mean of those numbers", write "compute the mean of 10, 20, 30".
+
+## Planning Guidelines
+
+When creating plans with `create_plan`, provide an ordered list of **steps**:
+
+- **Steps are sequential by default** — each step runs after the previous one completes and receives its results.
+- **Use `{"parallel": [...]}` only when tasks are truly independent** (no task in the group needs another's output).
+- Assign each step to the worker whose capabilities best match it.
+- Keep task descriptions specific and actionable.
+
+### Example: Sequential (most common)
+
+```json
+{
+  "goal": "Compute the mean of [10,20,30] then multiply by 3",
+  "steps": [
+    {"type": "task", "task": "Compute the mean of the numbers 10, 20, 30", "worker": "statistics"},
+    {"type": "task", "task": "Multiply the result by 3", "worker": "arithmetic"}
+  ],
+  "routing_rationale": "Requires two dependent computations",
+  "planning_summary": "First compute the mean, then multiply"
+}
+```
+
+### Example: Parallel + Sequential
+
+```json
+{
+  "goal": "Compute median and sin(45°), then multiply",
+  "steps": [
+    {"type": "parallel", "items": [
+      {"type": "task", "task": "Compute the median of 10, 20, 30", "worker": "statistics"},
+      {"type": "task", "task": "Compute the sine of 45 degrees", "worker": "trigonometry"}
+    ]},
+    {"type": "task", "task": "Multiply the two results together", "worker": "arithmetic"}
+  ],
+  "routing_rationale": "Two independent computations followed by a dependent one",
+  "planning_summary": "Compute median and sin(45°) in parallel, then multiply"
+}
+```
+
+Every step must include a `"type"` field (`"task"`, `"parallel"`, or `"chain"`).
+Do NOT use parallel groups for steps that depend on each other — sequential ordering handles dependencies automatically.
+
+## Artifacts
+
+When a task result or tool output is too large to include inline, it is saved to an artifact file and the inline text will contain a reference like `[Full result (N chars) saved to artifact: task-0-sre-iter-1-result.txt]` or `[Tool output saved to artifact: task-0-sre-iter-1-log_search-0-output.txt]`. Use `read_artifact` to load the full content when the summary is insufficient for your routing decision.
+
+
+================ MESSAGES ================
+---- [0] user ----
+Current time: <TIMESTAMP>
+
+Analyze this user query and decide on the best approach.
+
+USER QUERY: Investigate the elevated error rates in the payments service and report the top failure groups with supporting evidence.
+
+AVAILABLE WORKERS:
+NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
+
+## analyst
+Log and metric analysis for the payments platform
+Tools: (none configured — this worker cannot query external systems)
+
+## operator
+Shell and deployment operations
+Tools: (none configured — this worker cannot query external systems)
+
+Assign tasks to the worker whose tools best match the required operations.
+
+You have three routing tools. Call EXACTLY ONE (do not call more than one):
+
+1. **respond_directly** — For simple factual questions answerable from general knowledge, OR when the relevant workers have no tools configured (tools show "none configured") and the query requires external data. In that case, explain the limitation and suggest configuring MCP servers.
+Do not use for queries about system data, logs, metrics, or anything requiring tools when workers DO have tools available.
+
+2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.
+When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.
+
+3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.
+Use sparingly when a reasonable interpretation exists.
+
+
+- Assign each task to a worker using the "worker" field
+- Valid worker names: "analyst", "operator"
+- Choose the worker whose tools best match what the task needs to accomplish
+- For time-scoped tasks, include the current time and relevant time range in the task description so workers have explicit time context
+
+Call the appropriate routing tool now.
+
+---- [1] assistant ----
+create_plan: 2 tasks (analyst, operator). Rationale: Two evidence-gathering lookups are required before answering.
+
+---- [2] user ----
+Current time: <TIMESTAMP>
+
+ITERATION 1 of 3
+
+Goal (verbatim from the original request): Investigate the elevated error rates in the payments service and report the top failure groups with supporting evidence.
+Outcome: 2 of 2 tasks succeeded.
+
+COMPLETED TASKS:
+- Task 0 (analyst, confidence: high)
+    Found 47 error groups across 3 services; top: connection timeouts (38%).
+    [Artifact: task-0-analyst-iter-1-log_search-0-output.txt (512 bytes)]
+- Task 1 (operator)
+    Deployment timeline assembled: 3 deploys landed inside the error window.
+
+
+If a task's inline preview appears truncated or insufficient for your decision, call `read_artifact` with the referenced filename before routing.
+
+This is an end-of-iteration decision point. Choose one routing tool:
+
+- `respond_directly` — answer the user from the results above, plus the tools available to you and general knowledge.
+- `create_plan` — issue a new plan when the current results point to the next step: a deeper investigation into what they revealed (e.g. narrowing from identified failure groups into their affected apps), a step they expose as missing, or retrying failed tasks with a different approach.
+- `request_clarification` — ask the user a question if the results reveal an ambiguity in the original query you cannot resolve.
+
+When you can answer the user from what's already available to you, respond_directly. When more worker tool work is needed, create_plan — or request_clarification if the query needs disambiguation.
+
+IMPORTANT — synthesis rules for `respond_directly`:
+Your response IS the final answer the user sees. Task results are NOT shown to the user. You must inline all relevant findings — exact names, values, identifiers, and data points from the task results above. Never reference tasks by number or defer to task outputs. Extract the concrete data and present it directly.
+
+
+================ TOOLS ================
+[
+  {
+    "description": "Answer the user's query directly. At initial routing, use for simple factual questions that do not require tool execution. At end-of-iteration, use to synthesize the completed task results into the final answer — inline all concrete findings, names, and values because the user does not see task results directly.",
+    "name": "respond_directly",
+    "parameters": {
+      "properties": {
+        "response": {
+          "description": "The complete response to send to the user. This is the ONLY text the user sees — include all concrete data points, names, and values from task results.",
+          "type": "string"
+        },
+        "routing_rationale": {
+          "description": "Brief explanation of why this query can be answered directly",
+          "type": "string"
+        },
+        "summary": {
+          "description": "1-2 sentence summary of your response for session history. Provide when the response is longer than a few sentences.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "response",
+        "routing_rationale"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Decompose the user's query into an ordered sequence of steps for orchestrated execution. Steps run sequentially by default. Use {\"parallel\": [...]} when tasks are independent. Use this for queries requiring tool execution, data gathering, system inspection, or multi-step analysis.",
+    "name": "create_plan",
+    "parameters": {
+      "properties": {
+        "goal": {
+          "description": "The overall goal this plan addresses",
+          "type": "string"
+        },
+        "planning_summary": {
+          "description": "REQUIRED. Summarize the plan in natural language: what steps will run, in what order, and what the expected outcome is.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "routing_rationale": {
+          "description": "Brief explanation of why this query requires orchestration",
+          "type": "string"
+        },
+        "steps": {
+          "description": "Ordered steps to execute. Each step runs after the previous one completes. Use {\"parallel\": [...]} to run independent steps concurrently.",
+          "items": {
+            "properties": {
+              "items": {
+                "description": "Steps to run concurrently. Required when type=parallel.",
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "steps": {
+                "description": "Sequential steps in a sub-chain. Required when type=chain.",
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "task": {
+                "description": "What this task accomplishes. Fully resolve all references — workers do NOT see conversation history. Required when type=task.",
+                "type": "string"
+              },
+              "type": {
+                "description": "Step kind: 'task' for a single task, 'parallel' for concurrent steps, 'chain' for a sequential sub-chain inside a parallel group",
+                "enum": [
+                  "task",
+                  "parallel",
+                  "chain"
+                ],
+                "type": "string"
+              },
+              "worker": {
+                "description": "Name of the specialized worker to assign this task to. Required when type=task.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "goal",
+        "steps",
+        "routing_rationale",
+        "planning_summary"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Request clarification from the user when the query is genuinely ambiguous. Use sparingly — prefer create_plan when a reasonable interpretation exists.",
+    "name": "request_clarification",
+    "parameters": {
+      "properties": {
+        "options": {
+          "description": "Optional suggested choices for the user",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "question": {
+          "description": "The clarification question to ask the user",
+          "type": "string"
+        },
+        "routing_rationale": {
+          "description": "Brief explanation of why clarification is needed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "question",
+        "routing_rationale"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Read the content of a result artifact. By default reads from the current run. Supply an optional run_id to read artifacts from a prior run in this session (see session history for available run_id values). A large artifact is returned as a scratchpad pointer to explore in place (with head, grep, slice, etc.) rather than inlined.",
+    "name": "read_artifact",
+    "parameters": {
+      "properties": {
+        "filename": {
+          "description": "The artifact filename (e.g. 'task-0-sre-iter-1-result.txt')",
+          "type": "string"
+        },
+        "run_id": {
+          "description": "Run ID for cross-run artifact access. Omit to read from the current run.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename"
+      ],
+      "type": "object"
+    }
+  }
+]

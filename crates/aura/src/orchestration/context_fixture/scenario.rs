@@ -12,15 +12,6 @@
 //! ([`Plan`], [`FailureSummary`], [`ToolTraceEntry`], [`RunManifest`],
 //! [`OrchestrationConfig`]); they never re-model what those already forbid.
 
-#![expect(
-    dead_code,
-    reason = "S2 type skeleton: fixture types land before the snapshot tests that consume them (S2 implementation step)"
-)]
-#![expect(
-    unused_variables,
-    reason = "S2 type skeleton: constructor bodies are todo!() until the S2 implementation step"
-)]
-
 use crate::orchestration::config::OrchestrationConfig;
 use crate::orchestration::context::{
     ContextError, EvidenceText, PinnedGoal, ResultPreview, SpilledArtifact, WorkerClaim,
@@ -134,12 +125,14 @@ impl PlanningBudget {
     ///
     /// Returns [`FixtureError::ZeroPlanningBudget`] for zero.
     pub(crate) fn new(max_planning_cycles: usize) -> Result<Self, FixtureError> {
-        todo!()
+        NonZeroUsize::new(max_planning_cycles)
+            .map(Self)
+            .ok_or(FixtureError::ZeroPlanningBudget)
     }
 
     /// The budget, as passed to `build_continuation_prompt`.
     pub(crate) fn get(&self) -> usize {
-        todo!()
+        self.0.get()
     }
 }
 
@@ -208,12 +201,23 @@ impl SessionHistoryFixture {
     /// [`FixtureError::SessionHistoryNotRecentFirst`] when any adjacent
     /// pair is ordered oldest-first.
     pub(crate) fn new(manifests: Vec<RunManifest>) -> Result<Self, FixtureError> {
-        todo!()
+        if manifests.is_empty() {
+            return Err(FixtureError::EmptySessionHistory);
+        }
+        // `load_session_manifests` sorts by the timestamp STRING descending;
+        // the same comparison decides recent-first here.
+        let recent_first = manifests
+            .windows(2)
+            .all(|pair| pair[0].timestamp >= pair[1].timestamp);
+        if !recent_first {
+            return Err(FixtureError::SessionHistoryNotRecentFirst);
+        }
+        Ok(Self(manifests))
     }
 
     /// The manifests, as handed to `build_session_context`.
     pub(crate) fn manifests(&self) -> &[RunManifest] {
-        todo!()
+        &self.0
     }
 }
 
@@ -257,22 +261,44 @@ pub(crate) struct PreambleFixture {
 /// (orchestrator.rs). Forbidden state: a roster and a valid-names list
 /// built from different worker sets.
 ///
+/// Implementation-step amendment (documented in `DESIGN.md`): the fixture
+/// also carries the agent-level `[[vector_stores]]` catalog, because the
+/// Full-visibility roster reads tool DESCRIPTIONS from
+/// `agent_config.vector_stores` (`get_all_tool_descriptions`), a second
+/// production input the skeleton conflated with the coordinator preamble
+/// append. The catalog feeds `AgentRuntimeConfig::vector_stores` on the
+/// section-building orchestrator; the preamble append stays on
+/// [`PreambleFixture::vector_stores`].
+///
 /// The wrapped config's `workers` map is HashMap-ordered; the snapshot
 /// normalizer (not the fixture) canonicalizes roster ordering. See
 /// `normalize.rs`.
 #[derive(Debug, Clone)]
-pub(crate) struct WorkerRosterFixture(OrchestrationConfig);
+pub(crate) struct WorkerRosterFixture {
+    config: OrchestrationConfig,
+    vector_catalog: Vec<VectorStoreConfig>,
+}
 
 impl WorkerRosterFixture {
     /// Wrap the orchestration config whose `workers` and
-    /// `tools_in_planning` shape the planning prompt.
-    pub(crate) fn new(config: OrchestrationConfig) -> Self {
-        todo!()
+    /// `tools_in_planning` shape the planning prompt, plus the agent-level
+    /// vector-store catalog that Full-visibility descriptions read.
+    pub(crate) fn new(config: OrchestrationConfig, vector_catalog: Vec<VectorStoreConfig>) -> Self {
+        Self {
+            config,
+            vector_catalog,
+        }
     }
 
     /// The wrapped config, as handed to `Orchestrator::new`.
     pub(crate) fn config(&self) -> &OrchestrationConfig {
-        todo!()
+        &self.config
+    }
+
+    /// The agent-level vector-store catalog, as handed to
+    /// `AgentRuntimeConfig::vector_stores`.
+    pub(crate) fn vector_catalog(&self) -> &[VectorStoreConfig] {
+        &self.vector_catalog
     }
 }
 
@@ -296,18 +322,30 @@ impl PlanDecision {
     /// variants and [`FixtureError::UnflattenablePlan`] when the steps do
     /// not flatten into an executable plan.
     pub(crate) fn new(decision: PlanningResponse) -> Result<Self, FixtureError> {
-        todo!()
+        match &decision {
+            PlanningResponse::Direct { .. } | PlanningResponse::Clarification { .. } => {
+                return Err(FixtureError::TerminalDecisionMidThread);
+            }
+            PlanningResponse::StepsPlan { .. } => {}
+        }
+        if decision.clone().into_plan().is_none() {
+            return Err(FixtureError::UnflattenablePlan);
+        }
+        Ok(Self(decision))
     }
 
     /// The decision, as handed to `compact_decision_turn`.
     pub(crate) fn as_response(&self) -> &PlanningResponse {
-        todo!()
+        &self.0
     }
 
     /// The flattened plan this decision creates (validated non-`None` at
     /// construction).
     pub(crate) fn plan(&self) -> Plan {
-        todo!()
+        self.0
+            .clone()
+            .into_plan()
+            .expect("flattenability was validated at construction")
     }
 }
 
@@ -360,14 +398,38 @@ pub(crate) enum CompletedResultFixture {
 impl CompletedResultFixture {
     /// The raw result string exactly as `TaskState::Complete { result }`
     /// stores it (inline text, or stand-in prefix plus rendered footer).
+    ///
+    /// Spill layout confirmed against `maybe_create_artifact`
+    /// (orchestrator.rs): `{preview}\n\n{footer}` — the bounded preview,
+    /// one blank line, then the `[Full result (N chars) saved to
+    /// artifact: FILE]` footer.
     pub(crate) fn raw_result(&self) -> String {
-        todo!()
+        match self {
+            Self::Inline { result, .. } => result.as_str().to_owned(),
+            Self::Spilled { stand_in, artifact } => {
+                let prefix = match stand_in {
+                    SpilledStandIn::ClaimEcho { claim } => claim.summary(),
+                    SpilledStandIn::RawPreview { preview, .. } => preview.as_str(),
+                    // Whitespace-only preview: the footer parser's prefix
+                    // trims to empty, so the render is pointer-only.
+                    SpilledStandIn::NoPreview => "   ",
+                };
+                format!("{prefix}\n\n{artifact}")
+            }
+        }
     }
 
     /// The worker's claim, when one exists, as `Task::structured_output`
     /// carries it.
     pub(crate) fn claim(&self) -> Option<&WorkerClaim> {
-        todo!()
+        match self {
+            Self::Inline { claim, .. } => claim.as_ref(),
+            Self::Spilled { stand_in, .. } => match stand_in {
+                SpilledStandIn::ClaimEcho { claim } => Some(claim),
+                SpilledStandIn::RawPreview { claim, .. } => claim.as_ref(),
+                SpilledStandIn::NoPreview => None,
+            },
+        }
     }
 }
 
@@ -450,23 +512,40 @@ impl IterationFixture {
         outcomes: Vec<TaskOutcome>,
         failure_summary: Option<FailureSummary>,
     ) -> Result<Self, FixtureError> {
-        todo!()
+        let tasks = decision.plan().tasks.len();
+        if outcomes.len() != tasks {
+            return Err(FixtureError::OutcomeCountMismatch {
+                tasks,
+                outcomes: outcomes.len(),
+            });
+        }
+        let has_failure = outcomes
+            .iter()
+            .any(|o| matches!(o, TaskOutcome::Failed { .. } | TaskOutcome::Blocked));
+        if failure_summary.is_some() && !has_failure {
+            return Err(FixtureError::FailureSummaryWithoutFailure);
+        }
+        Ok(Self {
+            decision,
+            outcomes,
+            failure_summary,
+        })
     }
 
     /// The decision that opened this iteration.
     pub(crate) fn decision(&self) -> &PlanDecision {
-        todo!()
+        &self.decision
     }
 
     /// The per-task outcomes, in plan-task order.
     pub(crate) fn outcomes(&self) -> &[TaskOutcome] {
-        todo!()
+        &self.outcomes
     }
 
     /// The iteration's failure summary, when the failure path populated
     /// one.
     pub(crate) fn failure_summary(&self) -> Option<&FailureSummary> {
-        todo!()
+        self.failure_summary.as_ref()
     }
 }
 
@@ -488,12 +567,15 @@ impl ContinuationThread {
     ///
     /// Returns [`FixtureError::EmptyContinuationThread`] for an empty list.
     pub(crate) fn new(iterations: Vec<IterationFixture>) -> Result<Self, FixtureError> {
-        todo!()
+        if iterations.is_empty() {
+            return Err(FixtureError::EmptyContinuationThread);
+        }
+        Ok(Self(iterations))
     }
 
     /// The completed iterations, oldest first.
     pub(crate) fn iterations(&self) -> &[IterationFixture] {
-        todo!()
+        &self.0
     }
 }
 
@@ -554,33 +636,74 @@ impl CoordinatorScenario {
         roster: WorkerRosterFixture,
         call: CoordinatorCall,
     ) -> Result<Self, FixtureError> {
-        todo!()
+        let budget = PlanningBudget::new(roster.config().max_planning_cycles)?;
+
+        if preamble.tools.recon == ReconTools::Included
+            && roster.config().tools_in_planning != crate::orchestration::ToolVisibility::None
+        {
+            return Err(FixtureError::ReconRequiresUninlinedTools);
+        }
+
+        if let CoordinatorCall::Continuation(thread) = &call {
+            let iterations = thread.iterations().len();
+            // The post-execute call after iteration N is planning call N+1;
+            // iterations themselves stop at the budget, so any envelope with
+            // more completed iterations than the budget is unreachable.
+            if iterations > budget.get() {
+                return Err(FixtureError::IterationsExhaustBudget {
+                    iterations,
+                    budget: budget.get(),
+                });
+            }
+            for iteration in thread.iterations() {
+                let plan = iteration.decision().plan();
+                for (task, outcome) in plan.tasks.iter().zip(iteration.outcomes()) {
+                    if matches!(outcome, TaskOutcome::Complete { .. })
+                        && let Some(worker) = task.worker.as_deref()
+                        && roster.config().get_worker(worker).is_none()
+                    {
+                        return Err(FixtureError::CompletedTaskUnknownWorker {
+                            task_id: task.id,
+                            worker: worker.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            preamble,
+            query,
+            roster,
+            budget,
+            call,
+        })
     }
 
     /// The preamble configuration.
     pub(crate) fn preamble(&self) -> &PreambleFixture {
-        todo!()
+        &self.preamble
     }
 
     /// The verbatim user query (also the pinned continuation goal).
     pub(crate) fn query(&self) -> &PinnedGoal {
-        todo!()
+        &self.query
     }
 
     /// The worker roster configuration.
     pub(crate) fn roster(&self) -> &WorkerRosterFixture {
-        todo!()
+        &self.roster
     }
 
     /// The planning budget, derived at construction from
     /// `roster.config().max_planning_cycles`.
     pub(crate) fn budget(&self) -> PlanningBudget {
-        todo!()
+        self.budget
     }
 
     /// Which planning call this scenario captures.
     pub(crate) fn call(&self) -> &CoordinatorCall {
-        todo!()
+        &self.call
     }
 }
 
@@ -682,17 +805,23 @@ impl FrameGraph {
     /// Returns [`FixtureError::FrameHasNoCompletedAncestor`] when the plan
     /// yields no completed ancestor for `task_id`.
     pub(crate) fn new(plan: Plan, task_id: usize) -> Result<Self, FixtureError> {
-        todo!()
+        // The real gate: `build_task_context` returns `None` exactly when
+        // the task yields no frame, so a "populated" fixture cannot
+        // silently degenerate to an empty `%%CONTEXT%%`.
+        if crate::orchestration::Orchestrator::build_task_context(&plan, task_id).is_none() {
+            return Err(FixtureError::FrameHasNoCompletedAncestor { task_id });
+        }
+        Ok(Self { plan, task_id })
     }
 
     /// The plan, as handed to `Orchestrator::build_task_context`.
     pub(crate) fn plan(&self) -> &Plan {
-        todo!()
+        &self.plan
     }
 
     /// The task whose frame is rendered.
     pub(crate) fn task_id(&self) -> usize {
-        todo!()
+        self.task_id
     }
 }
 
@@ -736,7 +865,16 @@ impl WorkerFrameFixture {
     /// The `%%YOUR_TASK%%` text: the carried string on the empty variants,
     /// the target task's description on the populated branch.
     pub(crate) fn task_text(&self) -> &str {
-        todo!()
+        match self {
+            Self::EmptyFirstTurn { task } | Self::EmptyReplanBoundary { task } => task,
+            Self::Populated(graph) => graph
+                .plan()
+                .tasks
+                .iter()
+                .find(|t| t.id == graph.task_id())
+                .map(|t| t.description.as_str())
+                .expect("frame graph target task exists: validated at construction"),
+        }
     }
 }
 
