@@ -5,6 +5,15 @@
 //! session history, worker task) contains the expected artifact-repair
 //! data: tool traces, artifact entries, failure categories, structured
 //! output, and cross-run references.
+//!
+//! S2 consolidation: the cases whose asserted substrings the golden-frame
+//! snapshot corpus subsumes were deleted (mapping recorded in
+//! `context_fixture/DESIGN.md`). Every test remaining here owns coverage
+//! the corpus deliberately excludes — gated completed-task tool chains,
+//! degenerate inputs the fixture types forbid by construction, the
+//! session-history catch-all task render, multi-pattern failure ordering
+//! (HashMap-ordered, so not snapshot-stable), and plan-state machinery
+//! (`fail_descendants_of`).
 
 use std::collections::HashMap;
 
@@ -17,7 +26,6 @@ use super::persistence::{
     ArtifactEntry, ArtifactKind, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolOutcome,
     ToolTraceEntry,
 };
-use super::templates::{WorkerTaskVars, render_worker_task_prompt};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, Plan, PlanningResponse,
     StepInput, StructuredTaskOutput, Task, TaskState, TaskStatus,
@@ -360,72 +368,6 @@ fn test_continuation_full_scenario() {
     assert!(prompt.contains("read_artifact"), "read_artifact directive");
 }
 
-#[test]
-fn test_continuation_final_attempt_urgency() {
-    let mut plan = Plan::new("Simple goal");
-    let mut t = Task::new(0, "task", "do something");
-    t.complete("done".to_string());
-    plan.add_task(t);
-
-    let ctx = IterationContext::new(3, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(
-        prompt.contains("(FINAL ATTEMPT)"),
-        "urgency marker: {}",
-        prompt
-    );
-}
-
-#[test]
-fn test_continuation_mixed_structured_and_raw() {
-    let mut plan = Plan::new("Mixed output test");
-
-    // Task 0: structured output via submit_result
-    let mut t0 = Task::new(0, "structured", "Task with structured output");
-    t0.complete("Full detailed result from structured output".to_string());
-    t0.structured_output = Some(StructuredTaskOutput {
-        summary: "Concise structured summary".into(),
-        confidence: super::tools::submit_result::Confidence::Medium,
-    });
-
-    // Task 1: raw output (no submit_result)
-    let mut t1 = Task::new(1, "raw", "Task without structured output");
-    t1.complete("Raw unstructured worker output text here".to_string());
-
-    plan.add_task(t0);
-    plan.add_task(t1);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    // Structured path with no artifact: inlines full result, not summary
-    assert!(
-        prompt.contains("Full detailed result from structured output"),
-        "full result inlined"
-    );
-    assert!(
-        prompt.contains("confidence: medium"),
-        "confidence from structured"
-    );
-    // Summary is NOT shown when result fits inline (no artifact)
-    assert!(
-        !prompt.contains("Concise structured summary"),
-        "summary not shown when no artifact"
-    );
-
-    // Raw path: shows full result directly
-    assert!(
-        prompt.contains("Raw unstructured worker output"),
-        "raw output"
-    );
-    // Raw path should NOT contain "confidence:"
-    let raw_section = prompt
-        .lines()
-        .any(|l| l.contains("Raw unstructured") && !l.contains("confidence:"));
-    assert!(raw_section, "no confidence on raw task");
-}
-
 // ========================================================================
 // Frame 5 — Session history
 // ========================================================================
@@ -559,223 +501,6 @@ fn test_session_history_full_scenario() {
     );
 }
 
-#[test]
-fn test_session_history_direct_response_run() {
-    let manifest = RunManifest {
-        run_id: "run_direct".into(),
-        session_id: Some("session_test".into()),
-        timestamp: "2026-04-30T15:00:00Z".into(),
-        goal: "What is 2+2?".into(),
-        status: RunStatus::Success,
-        iterations: 0,
-        routing_mode: Some(RoutingMode::DirectAnswer),
-        outcome: Some("Answered directly".into()),
-        response_summary: Some("The answer is 4".into()),
-        task_summaries: vec![],
-        artifact_paths: vec![],
-    };
-
-    let history = build_session_context(&[manifest]);
-
-    assert!(history.contains("What is 2+2?"), "goal");
-    assert!(history.contains("The answer is 4"), "response summary");
-    assert!(history.contains("Answered directly"), "outcome string");
-}
-
-#[test]
-fn test_session_history_multi_run_chronological() {
-    let m1 = RunManifest {
-        run_id: "run_001".into(),
-        session_id: Some("s".into()),
-        timestamp: "2026-04-30T10:00:00Z".into(),
-        goal: "First query".into(),
-        status: RunStatus::Success,
-        iterations: 1,
-        routing_mode: Some(RoutingMode::Orchestrated),
-        outcome: Some("1/1 tasks completed".into()),
-        response_summary: None,
-        task_summaries: vec![complete_task_summary(
-            0,
-            "task A",
-            "w",
-            "done A",
-            "high",
-            vec![],
-            vec![],
-        )],
-        artifact_paths: vec![],
-    };
-    let m2 = RunManifest {
-        run_id: "run_002".into(),
-        session_id: Some("s".into()),
-        timestamp: "2026-04-30T11:00:00Z".into(),
-        goal: "Second query".into(),
-        status: RunStatus::Failed,
-        iterations: 2,
-        routing_mode: Some(RoutingMode::Orchestrated),
-        outcome: Some("0/2 tasks completed".into()),
-        response_summary: None,
-        task_summaries: vec![],
-        artifact_paths: vec![],
-    };
-    let m3 = RunManifest {
-        run_id: "run_003".into(),
-        session_id: Some("s".into()),
-        timestamp: "2026-04-30T12:00:00Z".into(),
-        goal: "Third query".into(),
-        status: RunStatus::Success,
-        iterations: 1,
-        routing_mode: Some(RoutingMode::DirectAnswer),
-        outcome: Some("Answered directly".into()),
-        response_summary: Some("The result is X".into()),
-        task_summaries: vec![],
-        artifact_paths: vec![],
-    };
-
-    // build_session_context expects most-recent-first (as returned by load_session_manifests)
-    let history = build_session_context(&[m3, m2, m1]);
-
-    // All three runs present
-    assert!(history.contains("First query"), "run 1 goal");
-    assert!(history.contains("Second query"), "run 2 goal");
-    assert!(history.contains("Third query"), "run 3 goal");
-    assert!(history.contains("3 prior run(s)"), "turn count");
-
-    // Verify rendered in chronological order (earliest first) despite desc input
-    let first_pos = history.find("First query").unwrap();
-    let third_pos = history.find("Third query").unwrap();
-    assert!(
-        first_pos < third_pos,
-        "chronological order in rendered output"
-    );
-}
-
-// ========================================================================
-// Frame 1 — Coordinator preamble
-// ========================================================================
-
-#[test]
-fn test_preamble_dynamic_tool_sections_with_persistence() {
-    // With history tools (persistence + session_id configured)
-    let preamble_with = build_coordinator_preamble("You are an SRE assistant.", false, true);
-    assert!(
-        preamble_with.contains("read_artifact"),
-        "read_artifact in preamble with history"
-    );
-    assert!(
-        preamble_with.contains("list_prior_runs"),
-        "list_prior_runs in preamble with history"
-    );
-
-    // Without history tools
-    let preamble_without = build_coordinator_preamble("You are an SRE assistant.", false, false);
-    assert!(
-        preamble_without.contains("read_artifact"),
-        "read_artifact always present"
-    );
-    assert!(
-        !preamble_without.contains("list_prior_runs"),
-        "list_prior_runs absent without history"
-    );
-}
-
-// ========================================================================
-// Frame 3 — Worker task prompt
-// ========================================================================
-
-#[test]
-fn test_worker_task_context_with_dependency_results() {
-    let context = "Completed results from prior tasks:\n\
-        Task 0 result: Found 47 error groups. Top: timeouts 38%. \
-        [Full result (3200 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
-
-    let rendered = render_worker_task_prompt(&WorkerTaskVars {
-        context,
-        your_task: "Analyze connection pool metrics for the services identified in Task 0",
-    });
-
-    assert!(
-        rendered.contains("Analyze connection pool"),
-        "task description"
-    );
-    assert!(
-        rendered.contains("task-0-sre-iter-1-result.txt"),
-        "artifact ref preserved in context"
-    );
-    assert!(
-        rendered.contains("Found 47 error groups"),
-        "dependency result in context"
-    );
-    assert!(
-        rendered.contains("submit_result"),
-        "submit_result instruction"
-    );
-}
-
-// ========================================================================
-// Cross-frame scenario
-// ========================================================================
-
-#[test]
-fn test_session_history_and_continuation_independent_artifact_refs() {
-    // Session history from a prior run with artifacts
-    let prior_manifest = sample_manifest(
-        "run_prior",
-        "Earlier investigation",
-        RunStatus::Success,
-        vec![complete_task_summary(
-            0,
-            "Search logs",
-            "sre",
-            "Found errors in auth-service",
-            "high",
-            vec![trace_with_artifact(
-                "log_search",
-                "searching",
-                5000,
-                "task-0-sre-iter-1-log_search-0-output.txt",
-            )],
-            vec![
-                result_artifact("task-0-sre-iter-1-result.txt", 2500),
-                tool_artifact(
-                    "task-0-sre-iter-1-log_search-0-output.txt",
-                    35000,
-                    "log_search",
-                ),
-            ],
-        )],
-    );
-
-    let history = build_session_context(&[prior_manifest]);
-    assert!(
-        history.contains("run_prior"),
-        "prior run_id in session history"
-    );
-    assert!(
-        history.contains("task-0-sre-iter-1-result.txt"),
-        "prior artifact in history"
-    );
-
-    // Current iteration continuation — its own artifacts are independent
-    let mut plan = Plan::new("Follow-up investigation");
-    let mut t = Task::new(0, "Deeper analysis", "Analyze auth-service in detail");
-    let result = "Auth-service has 12 failing endpoints. [Full result (5000 chars) saved to artifact: task-0-sre-iter-1-result.txt]";
-    t.complete(result.to_string());
-    plan.add_task(t);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let continuation = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(
-        continuation.contains("task-0-sre-iter-1-result.txt"),
-        "current artifact in continuation"
-    );
-    assert!(
-        continuation.contains("Auth-service has 12 failing"),
-        "current result in continuation"
-    );
-}
-
 // ========================================================================
 // Tool output artifact refs in continuation prompt
 // ========================================================================
@@ -838,39 +563,6 @@ fn test_continuation_tool_output_artifacts_visible() {
     );
 }
 
-#[test]
-fn test_continuation_failed_task_no_artifact_refs() {
-    let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "Deploy check", "Check deployments");
-    t.fail("403 Forbidden".to_string(), FailureCategory::AgentError);
-    plan.add_task(t);
-
-    let mut traces = HashMap::new();
-    traces.insert(
-        0,
-        vec![
-            trace("get_deployments", "checking staging", 1200, None),
-            trace(
-                "get_deployments",
-                "querying prod",
-                30200,
-                Some("403 Forbidden"),
-            ),
-        ],
-    );
-
-    let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3, true, 2000);
-
-    // Failed tools don't produce artifacts
-    assert!(
-        !prompt.contains("[Tool output:"),
-        "no artifact refs for failed tools: {}",
-        prompt
-    );
-    assert!(prompt.contains("FAILED: 403 Forbidden"), "failure visible");
-}
-
 // ========================================================================
 // All FailureCategory variants in continuation prompt
 // ========================================================================
@@ -908,36 +600,6 @@ fn test_continuation_all_failure_categories() {
 }
 
 #[test]
-fn test_continuation_soft_failure_with_structured_output() {
-    let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "Inconclusive task", "Investigate ambiguous signal");
-    t.fail(
-        "Worker reported inconclusive findings".to_string(),
-        FailureCategory::SoftFailure,
-    );
-    t.structured_output = Some(StructuredTaskOutput {
-        summary: "Found some evidence but insufficient for conclusions".into(),
-        confidence: super::tools::submit_result::Confidence::Low,
-    });
-    plan.add_task(t);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    // SoftFailure with structured output uses the summary path
-    assert!(
-        prompt.contains("soft_failure"),
-        "soft_failure tag: {}",
-        prompt
-    );
-    assert!(prompt.contains("low confidence"), "confidence shown");
-    assert!(
-        prompt.contains("Found some evidence"),
-        "summary from structured output"
-    );
-}
-
-#[test]
 fn test_continuation_soft_failure_without_structured_output() {
     let mut plan = Plan::new("Test goal");
     let mut t = Task::new(0, "Inconclusive task", "Investigate ambiguous signal");
@@ -960,109 +622,6 @@ fn test_continuation_soft_failure_without_structured_output() {
         prompt.contains("Worker did not call submit_result"),
         "error text"
     );
-}
-
-// ========================================================================
-// Session history — RoutingMode::Routed variant
-// ========================================================================
-
-#[test]
-fn test_session_history_routed_single_worker() {
-    let manifest = RunManifest {
-        run_id: "run_routed".into(),
-        session_id: Some("s".into()),
-        timestamp: "2026-04-30T16:00:00Z".into(),
-        goal: "Check k8s pod status".into(),
-        status: RunStatus::Success,
-        iterations: 1,
-        routing_mode: Some(RoutingMode::Routed),
-        outcome: Some("1/1 tasks completed".into()),
-        response_summary: None,
-        task_summaries: vec![complete_task_summary(
-            0,
-            "Get pod status",
-            "sre",
-            "3 pods running, 0 pending",
-            "high",
-            vec![trace(
-                "kubectl_get_pods",
-                "listing pods in prod namespace",
-                2000,
-                None,
-            )],
-            vec![],
-        )],
-        artifact_paths: vec![],
-    };
-
-    let history = build_session_context(&[manifest]);
-
-    assert!(history.contains("Check k8s pod status"), "goal");
-    assert!(history.contains("Task 0 [sre] — Complete"), "task status");
-    assert!(history.contains("3 pods running"), "result preview");
-    assert!(history.contains("kubectl_get_pods"), "tool in chain");
-}
-
-// ========================================================================
-// Frame 2 — Planning / routing prompt (CRITICAL — was entirely missing)
-// ========================================================================
-
-#[test]
-fn test_planning_wrapper_basic_structure() {
-    let prompt = Orchestrator::build_planning_wrapper(
-        "What are the error rates in the payments service?",
-        "\n\nAVAILABLE WORKERS:\n## sre\nSRE tools for log and metric analysis\nTools: log_search, get_metrics",
-        "\n- Assign each task to a worker\n- Valid worker names: \"sre\"",
-    );
-
-    assert!(
-        prompt.contains("USER QUERY: What are the error rates"),
-        "query present"
-    );
-    assert!(
-        prompt.contains("AVAILABLE WORKERS"),
-        "worker section present"
-    );
-    assert!(
-        prompt.contains("log_search, get_metrics"),
-        "tool names present"
-    );
-    assert!(prompt.contains("respond_directly"), "routing tool 1");
-    assert!(prompt.contains("create_plan"), "routing tool 2");
-    assert!(prompt.contains("request_clarification"), "routing tool 3");
-    assert!(
-        prompt.contains("Call EXACTLY ONE"),
-        "exclusivity instruction"
-    );
-    assert!(
-        prompt.contains("Valid worker names: \"sre\""),
-        "worker guidelines"
-    );
-}
-
-#[test]
-fn test_planning_wrapper_no_workers() {
-    let prompt = Orchestrator::build_planning_wrapper("What is 2+2?", "", "");
-
-    assert!(prompt.contains("USER QUERY: What is 2+2?"), "query present");
-    assert!(!prompt.contains("AVAILABLE WORKERS"), "no worker section");
-    assert!(
-        prompt.contains("respond_directly"),
-        "routing tools still present"
-    );
-}
-
-#[test]
-fn test_planning_wrapper_multi_worker_guidelines() {
-    let prompt = Orchestrator::build_planning_wrapper(
-        "Investigate infrastructure issues",
-        "\n\nAVAILABLE WORKERS:\n## sre\nSRE tools\n\n## dev\nDev tools",
-        "\n- Assign each task to a worker\n- Valid worker names: \"sre\", \"dev\"\n- Choose the worker whose tools best match",
-    );
-
-    assert!(prompt.contains("\"sre\", \"dev\""), "multiple worker names");
-    assert!(prompt.contains("## sre"), "sre worker section");
-    assert!(prompt.contains("## dev"), "dev worker section");
 }
 
 // ========================================================================
@@ -1140,42 +699,6 @@ fn test_task_description_appears_at_most_once_across_conversation_and_continuati
 // ========================================================================
 
 #[test]
-fn test_preamble_recon_tools_enabled() {
-    let preamble = build_coordinator_preamble("Custom SRE instructions.", true, false);
-
-    assert!(
-        preamble.contains("list_tools"),
-        "list_tools present with recon"
-    );
-    assert!(
-        preamble.contains("inspect_tool_params"),
-        "inspect_tool_params present"
-    );
-    assert!(
-        preamble.contains("reconnaissance"),
-        "recon guidance section"
-    );
-    assert!(
-        preamble.contains("Custom SRE instructions"),
-        "agent system prompt injected"
-    );
-}
-
-#[test]
-fn test_preamble_recon_and_history_tools_combined() {
-    let preamble = build_coordinator_preamble("Domain prompt.", true, true);
-
-    assert!(preamble.contains("list_tools"), "recon tool");
-    assert!(preamble.contains("inspect_tool_params"), "recon tool");
-    assert!(preamble.contains("read_artifact"), "artifact tool");
-    assert!(preamble.contains("list_prior_runs"), "history tool");
-    assert!(
-        preamble.contains("two **artifact/history tools**"),
-        "combined tool count"
-    );
-}
-
-#[test]
 fn test_preamble_empty_system_prompt() {
     let preamble = build_coordinator_preamble("", false, false);
 
@@ -1190,132 +713,8 @@ fn test_preamble_empty_system_prompt() {
 }
 
 // ========================================================================
-// Frame 3 — Worker task prompt additional coverage
-// ========================================================================
-
-#[test]
-fn test_worker_task_empty_context() {
-    let rendered = render_worker_task_prompt(&WorkerTaskVars {
-        context: "",
-        your_task: "Search logs for error patterns",
-    });
-
-    assert!(rendered.contains("YOUR TASK: Search logs"), "task present");
-    assert!(
-        rendered.contains("submit_result"),
-        "submit_result instruction"
-    );
-}
-
-// ========================================================================
 // Frame 4 — Continuation prompt branch gaps
 // ========================================================================
-
-#[test]
-fn test_continuation_running_task_renders_as_blocked() {
-    let mut plan = Plan::new("Test goal");
-    let t0 = Task::new(0, "running task", "This task is still running");
-    plan.add_task(t0);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(
-        prompt.contains("blocked (dependency failed)"),
-        "Running renders as blocked: {}",
-        prompt
-    );
-}
-
-#[test]
-fn test_continuation_clean_success_no_failure_sections() {
-    let mut plan = Plan::new("Simple goal");
-    let mut t0 = Task::new(0, "task A", "First task");
-    t0.complete("Done A".to_string());
-    let mut t1 = Task::new(1, "task B", "Second task");
-    t1.complete("Done B".to_string());
-    plan.add_task(t0);
-    plan.add_task(t1);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(
-        prompt.contains("COMPLETED TASKS"),
-        "completed section present"
-    );
-    assert!(prompt.contains("2 of 2 tasks succeeded"), "all succeeded");
-    assert!(!prompt.contains("FAILED TASKS"), "no failed section");
-    assert!(!prompt.contains("FAILURE SUMMARY"), "no failure summary");
-    assert!(!prompt.contains("FAILURE HISTORY"), "no failure history");
-    assert!(!prompt.contains("OBSERVED PATTERNS"), "no patterns");
-    assert!(
-        !prompt.contains("Workers cannot see prior iteration results"),
-        "no result forwarding guidance on clean success"
-    );
-}
-
-#[test]
-fn test_continuation_short_result_no_artifact() {
-    let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "short result task", "Task with short result");
-    t.complete("Short result, no artifact needed".to_string());
-    plan.add_task(t);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(
-        prompt.contains("Short result, no artifact needed"),
-        "full result present"
-    );
-    assert!(!prompt.contains("..."), "no truncation marker");
-    assert!(!prompt.contains("[Full result"), "no artifact footer");
-}
-
-#[test]
-fn test_continuation_result_forwarding_absent_when_all_failed() {
-    let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "failing", "This fails");
-    t.fail("error".to_string(), FailureCategory::AgentError);
-    plan.add_task(t);
-
-    let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(
-        !prompt.contains("Workers cannot see prior iteration results"),
-        "no result forwarding guidance when zero succeeded: {}",
-        prompt
-    );
-}
-
-#[test]
-fn test_continuation_failure_history_worker_none() {
-    let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "task", "A task");
-    t.fail("oops".to_string(), FailureCategory::AgentError);
-    plan.add_task(t);
-
-    let history = vec![FailedTaskRecord {
-        description: "A task".into(),
-        error: "oops".into(),
-        iteration: 1,
-        worker: None,
-        category: FailureCategory::AgentError,
-    }];
-
-    let ctx = IterationContext::new(1, plan, None, history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    assert!(prompt.contains("FAILURE HISTORY"), "history present");
-    // Should NOT contain "(worker: )" with empty worker
-    assert!(
-        !prompt.contains("(worker: )"),
-        "no empty worker parens: {}",
-        prompt
-    );
-}
 
 #[test]
 fn test_continuation_multiple_repeated_failure_patterns() {
@@ -1376,36 +775,6 @@ fn test_continuation_multiple_repeated_failure_patterns() {
     );
 }
 
-#[test]
-fn test_continuation_empty_reasoning_in_tool_chain() {
-    let mut plan = Plan::new("Test goal");
-    let mut t = Task::new(0, "task", "A task");
-    t.complete("Done".to_string());
-    plan.add_task(t);
-
-    let mut traces = HashMap::new();
-    traces.insert(
-        0,
-        vec![
-            trace("tool_a", "", 1000, None),
-            trace("tool_b", "has reasoning", 2000, None),
-        ],
-    );
-
-    let ctx = IterationContext::new(1, plan, None, vec![], traces);
-    let prompt = ctx.build_continuation_prompt(3, true, 2000);
-
-    let chain_line = prompt.lines().find(|l| l.contains("Tool chain:")).unwrap();
-    assert!(
-        chain_line.contains("tool_a (1.0s)"),
-        "empty reasoning omits quotes"
-    );
-    assert!(
-        chain_line.contains("tool_b (2.0s, \"has reasoning\")"),
-        "non-empty reasoning has quotes"
-    );
-}
-
 // ========================================================================
 // Frame 5 — Session history branch gaps
 // ========================================================================
@@ -1414,35 +783,6 @@ fn test_continuation_empty_reasoning_in_tool_chain() {
 fn test_session_history_empty_manifests() {
     let history = build_session_context(&[]);
     assert!(history.is_empty(), "empty manifests returns empty string");
-}
-
-#[test]
-fn test_session_history_task_with_no_worker() {
-    let manifest = sample_manifest(
-        "run_1",
-        "Test goal",
-        RunStatus::Success,
-        vec![TaskSummary {
-            task_id: 0,
-            description: "Unassigned task".into(),
-            status: TaskStatus::Complete,
-            worker: None,
-            result_preview: Some("Task completed".into()),
-            confidence: None,
-            failure_category: None,
-            error: None,
-            error_context: None,
-            tool_trace: vec![],
-            artifacts: vec![],
-        }],
-    );
-
-    let history = build_session_context(&[manifest]);
-    assert!(
-        history.contains("unassigned"),
-        "None worker renders as 'unassigned'"
-    );
-    assert!(history.contains("Task completed"), "preview present");
 }
 
 #[test]
@@ -1507,31 +847,6 @@ fn test_session_history_failed_task_no_error_no_context() {
 }
 
 #[test]
-fn test_session_history_no_artifacts_no_crossrun_hint() {
-    let manifest = sample_manifest(
-        "run_no_artifacts",
-        "Simple query",
-        RunStatus::Success,
-        vec![complete_task_summary(
-            0,
-            "Simple task",
-            "sre",
-            "Done",
-            "high",
-            vec![],
-            vec![],
-        )],
-    );
-
-    let history = build_session_context(&[manifest]);
-    assert!(
-        !history.contains("use run_id="),
-        "no cross-run hint when no artifacts: {}",
-        prompt_excerpt(&history)
-    );
-}
-
-#[test]
 fn test_session_history_manifest_outcome_none() {
     let mut manifest = sample_manifest(
         "run_1",
@@ -1552,34 +867,6 @@ fn test_session_history_manifest_outcome_none() {
     let history = build_session_context(&[manifest]);
     assert!(history.contains("Test goal"), "goal present");
     assert!(!history.contains("Outcome:"), "no outcome line when None");
-}
-
-#[test]
-fn test_session_history_current_time_placeholder_replaced() {
-    let manifest = sample_manifest(
-        "run_1",
-        "Test",
-        RunStatus::Success,
-        vec![complete_task_summary(
-            0,
-            "t",
-            "w",
-            "d",
-            "high",
-            vec![],
-            vec![],
-        )],
-    );
-
-    let history = build_session_context(&[manifest]);
-    assert!(
-        !history.contains("%%CURRENT_TIME%%"),
-        "template placeholder must not appear"
-    );
-    assert!(
-        !history.contains("Current time:"),
-        "current time moved to user messages"
-    );
 }
 
 #[test]
@@ -1616,57 +903,6 @@ fn test_session_history_error_context_without_partial_result() {
     );
 }
 
-// ========================================================================
-// Section ordering and structural integrity
-// ========================================================================
-
-#[test]
-fn test_continuation_section_ordering() {
-    let mut plan = Plan::new("Order test");
-    let mut t0 = Task::new(0, "complete", "Completed task");
-    t0.complete("done".to_string());
-    let mut t1 = Task::new(1, "failed", "Failed task");
-    t1.fail("error".to_string(), FailureCategory::AgentError);
-    let t2 = Task::new(2, "blocked", "Blocked task");
-    plan.add_task(t0);
-    plan.add_task(t1);
-    plan.add_task(t2);
-
-    let fs = FailureSummary {
-        reasoning: "One failed".into(),
-        gaps: vec!["Gap".into()],
-    };
-    let history = vec![FailedTaskRecord {
-        description: "Failed task".into(),
-        error: "error".into(),
-        iteration: 1,
-        worker: None,
-        category: FailureCategory::AgentError,
-    }];
-
-    let ctx = IterationContext::new(1, plan, Some(fs), history, HashMap::new());
-    let prompt = ctx.build_continuation_prompt(3, false, 2000);
-
-    let completed_pos = prompt.find("COMPLETED TASKS").unwrap();
-    let blocked_pos = prompt.find("BLOCKED TASKS").unwrap();
-    let failed_pos = prompt.find("FAILED TASKS").unwrap();
-    let summary_pos = prompt.find("FAILURE SUMMARY").unwrap();
-    let history_pos = prompt.find("FAILURE HISTORY").unwrap();
-
-    assert!(completed_pos < blocked_pos, "COMPLETED before BLOCKED");
-    assert!(blocked_pos < failed_pos, "BLOCKED before FAILED");
-    assert!(failed_pos < summary_pos, "FAILED before SUMMARY");
-    assert!(summary_pos < history_pos, "SUMMARY before HISTORY");
-}
-
-// ========================================================================
-// Helper
-// ========================================================================
-
-// ========================================================================
-// Remaining edge cases from final review
-// ========================================================================
-
 #[test]
 fn test_session_history_running_task_status() {
     let manifest = sample_manifest(
@@ -1696,70 +932,6 @@ fn test_session_history_running_task_status() {
     );
 }
 
-#[test]
-fn test_session_history_multi_artifact_listing() {
-    let manifest = sample_manifest(
-        "run_1",
-        "Test",
-        RunStatus::Success,
-        vec![complete_task_summary(
-            0,
-            "Multi-artifact task",
-            "sre",
-            "Produced lots of data",
-            "high",
-            vec![
-                trace_with_artifact(
-                    "log_search",
-                    "searching",
-                    5000,
-                    "task-0-sre-iter-1-log_search-0-output.txt",
-                ),
-                trace_with_artifact(
-                    "get_metrics",
-                    "metrics",
-                    3000,
-                    "task-0-sre-iter-1-get_metrics-1-output.txt",
-                ),
-            ],
-            vec![
-                result_artifact("task-0-sre-iter-1-result.txt", 4200),
-                tool_artifact(
-                    "task-0-sre-iter-1-log_search-0-output.txt",
-                    48000,
-                    "log_search",
-                ),
-                tool_artifact(
-                    "task-0-sre-iter-1-get_metrics-1-output.txt",
-                    12000,
-                    "get_metrics",
-                ),
-            ],
-        )],
-    );
-
-    let history = build_session_context(&[manifest]);
-    let artifacts_line = history.lines().find(|l| l.contains("Artifacts:")).unwrap();
-
-    assert!(
-        artifacts_line.contains("task-0-sre-iter-1-result.txt"),
-        "result artifact"
-    );
-    assert!(
-        artifacts_line.contains("task-0-sre-iter-1-log_search-0-output.txt"),
-        "log_search artifact"
-    );
-    assert!(
-        artifacts_line.contains("task-0-sre-iter-1-get_metrics-1-output.txt"),
-        "get_metrics artifact"
-    );
-    assert_eq!(
-        artifacts_line.matches(", ").count(),
-        2,
-        "3 artifacts separated by 2 commas"
-    );
-}
-
 // ========================================================================
 // Helper
 // ========================================================================
@@ -1771,71 +943,6 @@ fn prompt_excerpt(s: &str) -> &str {
 // ========================================================================
 // Frame 3b — Worker prior-work frame (R3c acceptance)
 // ========================================================================
-
-#[test]
-fn worker_frame_omits_imperative_task_text() {
-    let mut plan = Plan::new("Analyze system state");
-
-    let mut t0 = Task::new(
-        0,
-        "Calculate the fibonacci sequence",
-        "Calculate fibonacci numbers",
-    );
-    t0.complete("Result: 1, 1, 2, 3, 5, 8".to_string());
-
-    let mut t1 = Task::new(1, "List all running processes", "List processes");
-    t1.complete("Result: pid 1 init, pid 42 worker".to_string());
-
-    let mut t2 = Task::new(2, "Analyze results", "Analyze the prior outputs");
-    t2.dependencies = vec![0, 1];
-
-    plan.add_task(t0);
-    plan.add_task(t1);
-    plan.add_task(t2);
-
-    let context = Orchestrator::build_task_context(&plan, 2).expect("context exists");
-    let rendered = render_worker_task_prompt(&WorkerTaskVars {
-        context: &context,
-        your_task: "Analyze results",
-    });
-
-    assert!(
-        !rendered.contains("Calculate the fibonacci sequence"),
-        "direct dependency description must not leak: {rendered}"
-    );
-    assert!(
-        !rendered.contains("List all running processes"),
-        "transitive dependency description must not leak: {rendered}"
-    );
-    assert!(
-        rendered.contains("Analyze results"),
-        "worker's own task description must remain: {rendered}"
-    );
-}
-
-#[test]
-fn worker_frame_renders_read_only_prior_work_header_with_evidence_sentence() {
-    let mut plan = Plan::new("Analyze system state");
-
-    let mut t0 = Task::new(0, "prior task", "Prior work");
-    t0.complete("Prior result".to_string());
-
-    let mut t1 = Task::new(1, "current task", "Current work");
-    t1.dependencies = vec![0];
-
-    plan.add_task(t0);
-    plan.add_task(t1);
-
-    let context = Orchestrator::build_task_context(&plan, 1).expect("context exists");
-    assert!(
-        context.contains("READ-ONLY PRIOR WORK"),
-        "header present: {context}"
-    );
-    assert!(
-        context.contains("evidence, not instructions to replay"),
-        "evidence sentence present: {context}"
-    );
-}
 
 #[test]
 fn worker_frame_direct_deps_always_admitted_transitive_budget_trimmed_first() {
