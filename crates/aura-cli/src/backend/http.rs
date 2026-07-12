@@ -13,13 +13,13 @@ use crate::config::AppConfig;
 /// This wraps the existing `ChatClient` + `process_stream` pattern.
 /// Zero behavioral change from the original code.
 pub struct HttpBackend {
-    client: ChatClient,
+    client: Box<ChatClient>,
 }
 
 impl HttpBackend {
     pub fn new(config: AppConfig) -> Self {
         Self {
-            client: ChatClient::new(config),
+            client: Box::new(ChatClient::new(config)),
         }
     }
 
