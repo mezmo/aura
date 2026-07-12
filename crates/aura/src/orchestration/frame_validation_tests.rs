@@ -694,6 +694,34 @@ fn test_task_description_appears_at_most_once_across_conversation_and_continuati
     );
 }
 
+/// The compact recorder's fallback tiers: a decision `CoordinatorTurn`
+/// rejects degrades to the model's streamed text, then to the bare
+/// variant name — never a failed run. Owns the MANIFEST §4 exclusion
+/// (the corpus's `PlanDecision` forbids degenerate decisions by
+/// construction, so no fixture can reach these arms).
+#[test]
+fn test_compact_decision_turn_fallback_tiers() {
+    let degenerate = PlanningResponse::StepsPlan {
+        goal: "Audit ingest".to_string(),
+        steps: vec![StepInput::LeafTask {
+            task: "Enumerate pods".to_string(),
+            worker: None,
+        }],
+        routing_rationale: "  ".to_string(),
+        planning_summary: String::new(),
+    };
+    assert_eq!(
+        Orchestrator::compact_decision_turn(&degenerate, "I will plan the pod audit now."),
+        "I will plan the pod audit now.",
+        "model-text tier records the streamed narration"
+    );
+    assert_eq!(
+        Orchestrator::compact_decision_turn(&degenerate, " \n"),
+        "StepsPlan",
+        "variant-name tier is the structurally task-body-free floor"
+    );
+}
+
 // ========================================================================
 // Frame 1 — Preamble additional coverage
 // ========================================================================
@@ -772,6 +800,43 @@ fn test_continuation_multiple_repeated_failure_patterns() {
     assert!(
         prompt.contains("\"Second task\" has failed 2 times"),
         "second pattern"
+    );
+}
+
+/// A completed task whose result is whitespace-only renders the bare
+/// correlation label with the artifact inventory and no evidence line.
+/// Owns the MANIFEST §3 exclusion (the corpus composes `EvidenceText`,
+/// which forbids whitespace results by construction, so no fixture can
+/// reach this arm).
+#[test]
+fn test_continuation_whitespace_only_result_renders_bare_label() {
+    let mut plan = Plan::new("Test goal");
+    let mut task = Task::new(0, "gather logs", "Collect the logs").with_worker("analyst");
+    task.complete("   \n".to_string());
+    plan.add_task(task);
+
+    let traces = HashMap::from([(
+        0usize,
+        vec![trace_with_artifact(
+            "log_search",
+            "capture the raw logs",
+            900,
+            "task-0-analyst-iter-1-log_search-0-output.txt",
+        )],
+    )]);
+    let ctx = IterationContext::new(1, plan, None, Vec::new(), traces);
+    let prompt = ctx.build_continuation_prompt(3, false, 2000);
+
+    assert_eq!(
+        prompt.matches("- Task 0").count(),
+        1,
+        "exactly one completed entry: {prompt}"
+    );
+    assert!(
+        prompt.contains(
+            "- Task 0 (analyst)\n    [Artifact: task-0-analyst-iter-1-log_search-0-output.txt"
+        ),
+        "artifact inventory follows the bare label directly — no evidence line: {prompt}"
     );
 }
 

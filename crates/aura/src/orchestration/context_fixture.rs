@@ -11,7 +11,7 @@
 //! - [`scenario`] — fixture types composing the existing `context` module
 //!   types and production state types; every type maps to one business
 //!   rule and names the invalid state it forbids.
-//! - [`envelope`] — [`RequestEnvelope`] plus builders that call the real
+//! - [`envelope`] — `RequestEnvelope` plus builders that call the real
 //!   production assembly functions.
 //! - [`normalize`] — the two-pass snapshot normalizer and the byte-identity
 //!   assertion entry point.
@@ -27,7 +27,7 @@ mod envelope;
 mod normalize;
 mod scenario;
 
-pub(crate) use envelope::{RequestEnvelope, coordinator_envelope, worker_envelope};
+pub(crate) use envelope::{coordinator_envelope, worker_envelope};
 pub(crate) use normalize::{NormalizedSnapshot, assert_envelope_snapshot, normalize};
 pub(crate) use scenario::{
     CompletedResultFixture, ContinuationThread, CoordinatorCall, CoordinatorScenario,

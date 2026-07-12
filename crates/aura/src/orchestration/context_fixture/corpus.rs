@@ -25,10 +25,9 @@ use super::{
     CompletedResultFixture, ContinuationThread, CoordinatorCall, CoordinatorScenario,
     CoordinatorToolConfig, FailedResultFixture, FixtureError, FrameGraph, HistoryTools,
     IterationFixture, NormalizedSnapshot, PlanDecision, PlanningBudget, PreambleFixture,
-    ReconTools, RequestEnvelope, ScratchpadWiring, SessionHistoryFixture, SpilledStandIn,
-    TaskOutcome, WorkerFrameFixture, WorkerPreambleAppends, WorkerPreambleFixture,
-    WorkerRosterFixture, WorkerScenario, assert_envelope_snapshot, coordinator_envelope, normalize,
-    worker_envelope,
+    ReconTools, ScratchpadWiring, SessionHistoryFixture, SpilledStandIn, TaskOutcome,
+    WorkerFrameFixture, WorkerPreambleAppends, WorkerPreambleFixture, WorkerRosterFixture,
+    WorkerScenario, assert_envelope_snapshot, coordinator_envelope, normalize, worker_envelope,
 };
 use crate::config::AgentRuntimeConfig;
 use crate::orchestration::config::{ArtifactsConfig, OrchestrationConfig, ToolVisibility};
@@ -1345,7 +1344,9 @@ fn fixture_constructors_reject_unreachable_states() {
 }
 
 /// The two empty-`%%CONTEXT%%` snapshots are byte-identical (pre-approved
-/// decision 4): the branches differ causally, not mechanically.
+/// decision 4): the branches differ causally, not mechanically. The
+/// normalized document embeds all three envelope surfaces (system,
+/// messages, tools JSON), so one equality covers the full triple.
 #[tokio::test]
 async fn empty_frame_branches_render_byte_identically() {
     let fresh = WorkerScenario {
@@ -1364,10 +1365,5 @@ async fn empty_frame_branches_render_byte_identically() {
         normalize(&worker_envelope(&fresh).await.expect("fresh envelope"));
     let replan_snapshot: NormalizedSnapshot =
         normalize(&worker_envelope(&replan).await.expect("replan envelope"));
-    let fresh_envelope: RequestEnvelope = worker_envelope(&fresh).await.expect("fresh envelope");
     assert_eq!(fresh_snapshot, replan_snapshot);
-    assert_eq!(fresh_envelope.tools_json(), {
-        let replan_envelope = worker_envelope(&replan).await.expect("replan envelope");
-        replan_envelope.tools_json()
-    });
 }

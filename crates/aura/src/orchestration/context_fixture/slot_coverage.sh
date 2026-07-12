@@ -39,7 +39,10 @@ check '{{recon_guidance}}/nonrecon' '**Worker names vs tool names**'
 check '{{worker_system_prompt}}/default' '(No custom instructions provided)'
 check '{{worker_system_prompt}}/custom'  'Prefer structured summaries over prose'
 check '%%YOUR_TASK%%'          'YOUR TASK: '
-check '%%CONTEXT%%/populated'  'READ-ONLY PRIOR WORK'
+# Witness must be frame-only: the task template's own line 3 mentions
+# READ-ONLY PRIOR WORK unconditionally (defect B), so the frame subtitle
+# is the discriminating string (same one check 3 proves absent when empty).
+check '%%CONTEXT%%/populated'  'These are completed worker outputs relevant to YOUR TASK'
 check '%%ITERATION%%/%%MAX_ITERATIONS%%' 'ITERATION 2 of 4'
 check '%%URGENCY%%'            '(FINAL ATTEMPT)'
 check '%%SUCCEEDED%%/%%TOTAL%%' 'Outcome: 1 of 4 tasks succeeded.'

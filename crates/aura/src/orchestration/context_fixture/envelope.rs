@@ -37,8 +37,9 @@
 //!   `load_skill`/`read_skill_file` when skills are configured)
 //!
 //! What the builder necessarily RE-STATES (each a named false-pass drift
-//! risk in `DESIGN.md` R3/R5/R8, with the comparison gates the
-//! implementation step must land):
+//! risk in `DESIGN.md` R3/R5/R8; the comparison gates landed in
+//! `corpus.rs` close item 4 and, vector position excepted, item 1 —
+//! items 2, 3, 5, and 6 stay named residues):
 //!
 //! 1. the preamble append order of `create_coordinator`, INCLUDING the
 //!    bare `push('\n')` before `build_session_context`;
@@ -52,9 +53,10 @@
 //! 5. the execute-path context glue between the frame render and the task
 //!    template: `format!("{}\n\n", context)`, byte-reproduced ahead of
 //!    `render_worker_task_prompt`;
-//! 6. the tool REGISTRATION ORDER of `create_coordinator_agent` and the
-//!    worker builder (the definitions themselves are production calls;
-//!    their sequence is re-stated).
+//! 6. the tool REGISTRATION ORDER of `build_agent_with_tools` (reached via
+//!    `create_coordinator`) and the worker builder's `add_all_tools` (the
+//!    definitions themselves are production calls; their sequence is
+//!    re-stated).
 
 use std::collections::HashMap;
 
