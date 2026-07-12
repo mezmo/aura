@@ -38,7 +38,7 @@ forbids. Types marked (reused) come from `orchestration::context` or
 | `FrameGraph` | `build_task_context` renders a frame only for a task with ≥1 completed ancestor | A "populated" fixture that silently renders an empty frame |
 | `WorkerFrameFixture` | Empty `%%CONTEXT%%` arises on two causally distinct paths (fresh plan vs replan boundary, pre-approved decision 4); production derives `%%YOUR_TASK%%` and the frame from the SAME plan task, so the populated branch derives its task text from the frame graph's target task | An empty-frame fixture with no stated cause; a populated fixture whose task text diverges from its own plan task (no field to diverge with) |
 | `WorkerScenario` | Worker envelope = preamble + ONE task-prompt user message + worker tools; the frame branch owns the task text | A worker envelope carrying conversation history (no field for it) |
-| `RequestEnvelope` | The S2 identity claim quantifies over exactly (system, messages, tools) | Identity claims over a partial surface |
+| `RequestEnvelope` | The S2 identity claim quantifies over exactly the (system, messages, tools) triple: every envelope is STRUCTURALLY complete (all three surfaces present and compared). Production-completeness of the tools surface is a separate per-fixture property: the MANIFEST §6a partial-tools fixtures carry a structurally complete triple whose tools JSON omits the named live-wiring definitions | An identity claim over fewer than the three surfaces (a structurally partial envelope) |
 | `NormalizedSnapshot` | Normalization applies exactly two named rewrite classes, LOCATION-ANCHORED (per message, offset-0 timestamp prefix; first-user-message roster spans) behind an occurrence audit that panics on marker drift | A generic "cleanup" pass, or a flattened-text rewrite that could absorb payload drift |
 | `PinnedGoal` (reused) | Goal line is the verbatim original query | Empty/paraphrased goal |
 | `EvidenceText`, `ResultPreview`, `SpilledArtifact`, `WorkerClaim` (reused) | Worker-evidence parsing rules (`context/evidence.rs`, `context/label.rs`) | Footered inline text; empty claims/previews/filenames |
@@ -164,9 +164,10 @@ verification section below.
 - **R8 - conversation-growth and tool-registration-order re-statement.**
   The `plan_with_routing` growth rule (user wrapper, compact assistant
   turn per prior call) executes inside the live model loop, and tool
-  REGISTRATION order lives in `create_coordinator_agent`/the worker
-  builder; both are re-stated by the envelope builder with no seam to
-  compare against. Coverage of those rows is SHAPE-ONLY: the snapshots
+  REGISTRATION order lives in `build_agent_with_tools` (reached via
+  `create_coordinator`) and the worker builder's `add_all_tools`; both
+  are re-stated by the envelope builder with no seam to compare
+  against. Coverage of those rows is SHAPE-ONLY: the snapshots
   lock today's shape and detect builder drift, but a production
   reordering moves the corpus only if the builder moves with it. Named
   here because no cheaper closure exists without product refactors that
@@ -177,12 +178,14 @@ verification section below.
 The card's net test-LOC reduction is reported against a fixed boundary so
 it cannot be selectively scoped:
 
-- **Boundary.** `.rs` lines under
-  `crates/aura/src/orchestration/frame_validation_tests.rs` plus
-  `crates/aura/src/orchestration/context_fixture/` (committed `.snap`
-  files and these two Markdown records are excluded from the LOC ledger
-  and reported separately). Delta = `git diff --stat` over exactly that
-  boundary between `9df96382` and the implementation commit.
+- **Boundary.** `.rs` lines in exactly three places:
+  `crates/aura/src/orchestration/frame_validation_tests.rs`, the
+  `crates/aura/src/orchestration/context_fixture.rs` facade, and
+  `crates/aura/src/orchestration/context_fixture/*.rs` (committed
+  `.snap` files, `slot_coverage.sh`, and these two Markdown records are
+  excluded from the LOC ledger and reported separately). Delta =
+  `git diff --stat` over exactly those pathspecs between `9df96382` and
+  the card head.
 - **Deletion candidates.** Only `frame_validation_tests.rs` cases whose
   asserted substrings are subsumed by a corpus fixture may be deleted;
   each deleted test is enumerated below against the fixture that
@@ -192,23 +195,45 @@ it cannot be selectively scoped:
   deleting one invalidates the exclusion's justification, and the
   manifest row must be re-dispositioned in the same change.
 
-### Measured outcome (S2 implementation)
+### Measured outcome (S2 implementation, re-measured after the repair round)
 
-Delta over the fixed boundary, `git diff --stat 9df96382..HEAD` on
-`frame_validation_tests.rs` + `context_fixture{,.rs}/*.rs`:
-3,230 insertions, 902 deletions, net +2,328 test `.rs` lines
-(`frame_validation_tests.rs` alone: 1,992 → 1,099 lines). Reported
-separately per the boundary rule: 4,490 committed `.snap` lines and the
-two Markdown records. The card's "net test-LOC reduction" did not
-materialize as a negative number over this boundary: the corpus
+Delta over the fixed boundary at the repaired card head:
+
+```
+git diff --stat 9df96382..HEAD -- \
+  crates/aura/src/orchestration/frame_validation_tests.rs \
+  crates/aura/src/orchestration/context_fixture.rs \
+  'crates/aura/src/orchestration/context_fixture/*.rs'
+# 6 files changed, 3283 insertions(+), 892 deletions(-)
+```
+
+Net +2,391 test `.rs` lines. Per file: facade +38, `corpus.rs` +1,369,
+`envelope.rs` +511, `normalize.rs` +405, `scenario.rs` +896,
+`frame_validation_tests.rs` +64/-892 (1,992 → 1,164 lines; the repair
+round added two owning tests for previously test-less ledger rows).
+Reported separately per the boundary rule: 4,490 committed `.snap`
+lines and the two Markdown records (561 lines).
+
+**Card-acceptance deviation (for Gate U).** The card's acceptance line
+"a net test-LOC reduction reported" is met only in its "reported"
+reading: the anticipated reduction did NOT materialize. The corpus
 infrastructure (typed fixtures, envelope seam, normalizer, gates) costs
-more lines than the 29 subsumed assertion suites saved, and the boundary
-deliberately includes that infrastructure so the number cannot be gamed.
-Tooling caveat for the epic's C8 arithmetic: `scripts/loc_measure.py`
-classifies the harness `.rs` files as PRODUCT lines because their
-`#[cfg(test)]` gate sits at the declaration site in
-`orchestration/mod.rs`, not inside each file; the program-side
-measurement needs a classification fix before C8 sums card deltas.
+more lines than the 29 subsumed assertion suites saved, and the
+boundary deliberately includes that infrastructure so the number cannot
+be gamed. Gate U must explicitly accept this deviation or reject the
+card; the number is not spinnable into a reduction.
+
+Tooling caveats for the epic's C8 arithmetic (both need a program-side
+`scripts/loc_measure.py` fix before C8 sums card deltas):
+
+1. The harness `.rs` files count as PRODUCT lines because their
+   `#[cfg(test)]` gate sits at the declaration site in
+   `orchestration/mod.rs`, not inside each file - the tool books the
+   ~3,200-line harness as product growth.
+2. The two Markdown records count as TEMPLATE lines because the tool
+   classifies every `.md` under the measured roots as a template. The
+   card range's entire template-bucket growth is these two design
+   records; no prompt template changed in S2.
 
 Deleted cases (29), each mapped to the subsuming fixture; negative
 assertions ("X must not render") are subsumed by byte-identity, since
@@ -282,30 +307,57 @@ excludes:
   `test_fail_descendants_of_is_idempotent`: plan-state machinery, not an
   envelope surface.
 
+Repair-round additions (2, so `frame_validation_tests.rs` now carries 20
+tests): `test_compact_decision_turn_fallback_tiers` (owns the
+compact-turn fallback tiers, MANIFEST §4 - the review panel found the
+arms had no owning test) and
+`test_continuation_whitespace_only_result_renders_bare_label` (owns the
+whitespace-only completed-result bare-label arm in `types.rs`,
+MANIFEST §3).
+
 ## Verification record (S2 implementation step)
 
 - **Corpus and gates.** `cargo test --package aura --lib context_fixture`:
   27 tests (18 snapshot fixtures, the R3 and R5 comparison gates, the
   constructor-validation and normalizer-audit tests), all passing; full
-  `cargo test --package aura --lib`: 840 passing. Snapshots are stable
-  across repeated runs under `INSTA_UPDATE=no`.
+  `cargo test --package aura --lib`: 842 passing (840 plus the two
+  repair-round owning tests). Snapshots are stable across repeated
+  `INSTA_UPDATE=no` runs (eight consecutive clean 842/842 runs in the
+  repair round).
 - **Slot coverage.** `slot_coverage.sh` (this directory, run from the
   worktree root) proves every envelope-surface `%%SLOT%%` and `{{slot}}`
   renders filled in at least one snapshot, the empty-able slots also
   render empty somewhere, and no snapshot carries a raw placeholder
-  token. The empty-`%%CONTEXT%%` witness is the frame subtitle, because
-  the task template's own line 3 mentions `READ-ONLY PRIOR WORK`
-  unconditionally (defect B).
-- **Byte-identity mode, positive proof.** No-op refactor applied to
-  `build_planning_wrapper` (extracted the `chrono::Utc::now()` call into
-  a local binding), then `INSTA_UPDATE=no cargo test --package aura --lib
-  context_fixture`: `27 passed; 0 failed`, zero pending `.snap.new`
-  files. The refactor was reverted; the committed tree carries no trace
-  of it.
-- **Byte-identity mode, negative control.** A one-byte change to the
-  planning wrapper text (trailing `.` → `!`) failed every coordinator
-  snapshot under `INSTA_UPDATE=no` ("snapshot assertion for
-  'coordinator_call1_recon' failed", and peers). Reverted.
+  token. BOTH `%%CONTEXT%%` checks (populated witness, empty
+  forbidden-string) use the frame subtitle "These are completed worker
+  outputs relevant to YOUR TASK": the task template's own line 3
+  mentions `READ-ONLY PRIOR WORK` unconditionally (defect B), so that
+  string cannot discriminate populated from empty - the review panel
+  caught the original populated check passing against an empty-frame
+  snapshot.
+- **Byte-identity mode, positive proof** (re-run in the repair round; a
+  reverted working-tree experiment by nature, so this transcript is
+  both the evidence and the recipe). No-op refactor applied to
+  `build_planning_wrapper` in `orchestrator.rs`:
+
+  ```diff
+  -        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+  +        let now = chrono::Utc::now();
+  +        let timestamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+  ```
+
+  then `INSTA_UPDATE=no cargo test --package aura --lib context_fixture`
+  printed `test result: ok. 27 passed; 0 failed` and
+  `find . -name '*.snap.new'` found zero pending snapshots. Reverted
+  with `git checkout --`; `git status` clean.
+- **Byte-identity mode, negative control** (same session). A one-byte
+  change to the planning wrapper tail (`Call the appropriate routing
+  tool now.` → `now!`) under the same command printed
+  `test result: FAILED. 17 passed; 10 failed` - all ten coordinator
+  fixtures ("snapshot assertion for 'coordinator_call1_recon' failed",
+  and peers); the eight worker fixtures and both gates stayed green, as
+  expected for a coordinator-only wrapper edit. Reverted; `git status`
+  clean.
 - **Spill byte layout.** Confirmed against `maybe_create_artifact`
   (orchestrator.rs): `{preview}\n\n[Full result (N chars) saved to
   artifact: FILE]`; `CompletedResultFixture::raw_result` reproduces it,

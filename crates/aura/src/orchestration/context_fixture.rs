@@ -5,7 +5,7 @@
 //! `orchestration/mod.rs`): the module lives INSIDE the crate so the
 //! `pub(crate)` production seams (`Orchestrator::build_planning_wrapper`,
 //! `Orchestrator::compact_decision_turn`, `Orchestrator::build_task_context`,
-//! and the three `#[cfg(test)]` accessors in `orchestrator.rs`) are reachable
+//! and the four `#[cfg(test)]` accessors in `orchestrator.rs`) are reachable
 //! without widening any production visibility.
 //!
 //! - [`scenario`] — fixture types composing the existing `context` module

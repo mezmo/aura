@@ -30,11 +30,13 @@ Two further claim qualifiers, marked where they apply:
   omissions. Every other fixture's triple is complete and reachable.
 - **Re-stated rules (R3/R5/R8).** Rows marked "re-stated" snapshot a shape
   the test builder reproduces rather than production emits end-to-end.
-  The REQUIRED comparison gates landed in `corpus.rs` close two of them:
-  the coordinator preamble append order (R3, coordinator side) and the
-  cross-iteration trace merge (R5). The worker-side append orders and the
-  R8 conversation-growth/tool-registration rows stay re-stated, with the
-  residue named in DESIGN.md.
+  The REQUIRED comparison gates landed in `corpus.rs` close the
+  cross-iteration trace merge (R5) and PARTIALLY close the coordinator
+  preamble append order (R3, coordinator side; the vector-append
+  position stays re-stated because the gate runs vector-disabled). The
+  worker-side append orders and the R8 conversation-growth and
+  tool-registration rows stay re-stated, with the residue named in
+  DESIGN.md.
 
 ## Fixture corpus
 
@@ -87,7 +89,7 @@ within-iteration file order is filesystem-dependent).
 | 23 | Session-history block (source-built; no trace-derived golden exists - pre-approved decision 5). Fixture input order: manifests MOST-RECENT-FIRST, exactly as `load_session_manifests` returns them (`build_session_context` re-reverses for chronological turn numbering); enforced by `SessionHistoryFixture::new` | `coordinator_preamble_full_appends` |
 | 23a | `session_history.md` slot `%%TURN_ENTRIES%%` (unconditionally filled whenever block 23 renders) | `coordinator_preamble_full_appends` |
 | 23b | `session_history.md` slot `%%TURN_COUNT%%` (unconditionally filled whenever block 23 renders) | `coordinator_preamble_full_appends` |
-| 23c | Turn-entry shapes inside `%%TURN_ENTRIES%%`. The source-built manifest list carries a routed run and a direct-response run (outcome plus response summary, no task list). The routed run has a Complete task summary (named worker, confidence tag, result preview), a Failed task summary (unassigned worker → `[unassigned]`, category tag, error, error-context last-tool/partial lines), a tool-chain line (success + FAILED outcomes), an artifacts line, and the cross-run `read_artifact` hint | `coordinator_preamble_full_appends`. EXCLUDED shapes, with reason: the Pending/Running catch-all task render (a prior-run manifest records finished runs); owning retained tests `test_session_history_running_task_status` and `test_session_history_full_scenario`, plus `persistence.rs` unit coverage |
+| 23c | Turn-entry shapes inside `%%TURN_ENTRIES%%`. The source-built manifest list carries a routed run and a direct-response run (outcome plus response summary, no task list). The routed run has a Complete task summary (named worker, confidence tag, result preview), a Failed task summary (unassigned worker → `[unassigned]`, category tag, error, error-context last-tool/partial lines), a tool-chain line (success + FAILED outcomes), an artifacts line, and the cross-run `read_artifact` hint | `coordinator_preamble_full_appends`. EXCLUDED shapes, with reason: the Pending/Running catch-all task render (a prior-run manifest records finished runs); owning retained tests `test_session_history_running_task_status` and `test_session_history_full_scenario` |
 | - | Skill catalog append | `coordinator_preamble_full_appends` |
 | - | Vector-store context append (`## Available Knowledge Bases`) | `coordinator_preamble_full_appends` |
 | - | Append order (catalog → vector stores → `'\n'` + session history) | `coordinator_preamble_full_appends`, COVERED by the landed R3 comparison gate (`gate_r3_coordinator_preamble_matches_create_coordinator`): the composed preamble byte-equals real `create_coordinator` output over a tempdir-backed skills + session-history config. Residue: the gate runs vector-disabled (live-manager construction), so the vector append POSITION between catalog and session stays re-stated (DESIGN.md R3) |
@@ -135,7 +137,7 @@ within-iteration file order is filesystem-dependent).
 | Failure history record render | `coordinator_call3_failures` | |
 | Repeated-failure detection (`OBSERVED PATTERNS`) | `coordinator_call3_failures` (same handle+category twice; exactly ONE repeated pair, because the patterns list iterates a `HashMap` and a multi-pattern fixture would snapshot nondeterministically). Multi-pattern rendering keeps its unit coverage in the retained `test_continuation_multiple_repeated_failure_patterns` | |
 | read_artifact hint line, decision menu, synthesis rules (fixed tail) | every continuation fixture; third tail occurrence: `coordinator_call4_final_urgency` | |
-| Whitespace-only completed result fallback (bare label line) | EXCLUDED from the corpus: the fixture composes `EvidenceText`, which forbids whitespace results by construction; the degenerate branch keeps its unit coverage in `context/evidence.rs` (the `EvidenceText`/footer-prefix rejections that drive the `Err(_)` arm in `types.rs`). Candidate for promotion via a fixture variant if S3-S6 touch it. | |
+| Whitespace-only completed result fallback (bare label line) | EXCLUDED from the corpus: the fixture composes `EvidenceText`, which forbids whitespace results by construction. Owning tests: `test_continuation_whitespace_only_result_renders_bare_label` (`frame_validation_tests.rs`, the bare-label render arm in `types.rs`; added by the S2 repair round - the arm had no owner before) and `empty_values_are_rejected` (`context/evidence.rs`, the `EvidenceText` rejection that drives that `Err(_)` arm). Candidate for promotion via a fixture variant if S3-S6 touch it. | |
 | COMPLETED-entry tool-chain lines (gated by `show_tool_reasoning_in_continuation = true`) | EXCLUDED: non-default observability knob, off in the accepted baseline config; no Track A card varies it. Owning retained tests: `test_continuation_full_scenario` and `test_continuation_tool_output_artifacts_visible`. Scope note: this exclusion covers ONLY the completed-task chain - failed-task trace lines are unconditional and covered above. | |
 
 ## 4. Conversation growth (anatomy §1b)
@@ -144,8 +146,8 @@ within-iteration file order is filesystem-dependent).
 |---|---|
 | User turn pushed verbatim (planning wrapper, then each continuation wrapper) | every continuation fixture - SHAPE covered; the growth rule itself is RE-STATED (residual risk R8, DESIGN.md): `plan_with_routing` grows the conversation inside the live model loop, which no seam runs; a production reordering moves the snapshots only if the builder moves with it |
 | Compact assistant turn (`compact_decision_turn` → `CoordinatorTurn::render`, `create_plan` variant, ~136-char shape) | every continuation fixture (turn TEXT is production code via `compact_decision_turn`; its position in the conversation is re-stated - R8) |
-| Terminal decision turns (`respond_directly` / `request_clarification` renders) | EXCLUDED: terminal decisions end the run, so they never precede a later planning call inside one envelope; renders keep their `context/turn.rs` unit coverage. `PlanDecision` makes them unrepresentable mid-thread. |
-| Compact-turn fallback tiers (model text / bare variant name) | EXCLUDED: degenerate-decision path (empty rationale/plan), unreachable from validated fixtures; keeps `orchestrator.rs` unit coverage. |
+| Terminal decision turns (`respond_directly` / `request_clarification` renders) | EXCLUDED: terminal decisions end the run, so they never precede a later planning call inside one envelope; owning test: `terminal_turns_record_the_model_text_verbatim` (`context/turn.rs`). `PlanDecision` makes them unrepresentable mid-thread. |
+| Compact-turn fallback tiers (model text / bare variant name) | EXCLUDED: degenerate-decision path (empty rationale/plan), unreachable from validated fixtures; owning test: `test_compact_decision_turn_fallback_tiers` (`frame_validation_tests.rs`, added by the S2 repair round - no prior test invoked the fallback arms). |
 | Correction retry message (`ROUTING_TOOL_REQUIRED` as attempt > 1 prompt) | EXCLUDED: parse-failure path only; constant pinned in `prompt_constants.rs`. |
 | External `chat_history` prefix | PINNED EMPTY in all fixtures: the benchmark adapter issues one POST per task with no prior chat. Multi-turn chat prefixes are out of the S2 claim. |
 
@@ -169,7 +171,7 @@ within-iteration file order is filesystem-dependent).
 | Frame spilled entry, claim echo (defect C byte-identical Summary/Evidence) | `worker_role_frame_spilled_claim_echo` |
 | Frame spilled entry, pointer-only (`(no inline preview)`) | `worker_frame_spilled_no_preview` |
 | Doubled "evidence, not instructions" line (defect A: template line 3 + frame header) | every populated-frame worker fixture |
-| Frame budget eviction (transitive dropped under `TokenBudget`) | EXCLUDED from the envelope corpus: `build_task_context` hard-codes the 8000-token default, so eviction needs ~32KB of entry bodies; the admission/eviction rules keep their `context/frame.rs` unit coverage. |
+| Frame budget eviction (transitive dropped under `TokenBudget`) | EXCLUDED from the envelope corpus: `build_task_context` hard-codes the 8000-token default, so eviction needs ~32KB of entry bodies. Owning tests: `worker_frame_direct_deps_always_admitted_transitive_budget_trimmed_first` (retained, `frame_validation_tests.rs`) plus `test_frame_assemble_over_budget_trims_transitive_nearest_last_direct_kept` and `test_frame_assemble_admits_direct_floor_then_transitive_nearest_first_under_budget` (`context/frame.rs`). |
 | W12 `PriorIteration` relation branch | EXCLUDED: channel removed at `9df96382` (frame.rs has only Direct and Transitive); trace-derived shapes must not resurrect it. |
 | Final-iteration urgency | coordinator surface - §3 `%%URGENCY%%` (the epic lists it under worker calls; it renders in the continuation prompt) |
 | Recon / non-recon | coordinator surface - §1 blocks 2 and 19 |
