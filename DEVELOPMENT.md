@@ -40,8 +40,6 @@ How to build, test, and navigate the AURA codebase. For the contribution process
    cargo run --bin aura-web-server
    ```
 
-Note: `aura-cli` is not in the workspace `default-members`, so a plain `cargo build` skips it. Build it explicitly with `cargo build -p aura-cli`.
-
 ## Project Structure
 
 ```text
