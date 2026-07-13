@@ -1,5 +1,16 @@
 ## Changelog
 
+## [3.0.3](https://github.com/mezmo/aura/compare/v3.0.2...v3.0.3) (2026-07-13)
+
+
+### Chores
+
+* **ci**: clean up cargo cache after every macos step [7ec5a9f](https://github.com/mezmo/aura/commit/7ec5a9f1e4b408175e7cbe4db172096177f9de03) - Jacob Hull [#297](https://github.com/mezmo/aura/issues/297)
+
+### Continuous Integration
+
+* **workspace**: include aura-cli in default workspace members [cc18127](https://github.com/mezmo/aura/commit/cc181272427d497f3e70551f49115f55fc99884e) - Mike Shearer [#340](https://github.com/mezmo/aura/issues/340) [#1](https://github.com/mezmo/aura/issues/1) [#4](https://github.com/mezmo/aura/issues/4) [#340](https://github.com/mezmo/aura/issues/340) [#321](https://github.com/mezmo/aura/issues/321) [#340](https://github.com/mezmo/aura/issues/340)
+
 ## [3.0.2](https://github.com/mezmo/aura/compare/v3.0.1...v3.0.2) (2026-07-11)
 
 
