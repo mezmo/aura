@@ -40,6 +40,7 @@
 //! let stream = agent.stream(query, history, cancel_token, "req_123").await?;
 //! ```
 
+mod bounding;
 mod config;
 pub mod context;
 #[cfg(test)]
