@@ -212,6 +212,11 @@ verify-binaries: build-checksums $(DOCKER_ENV) ## Verify every expected binary i
 		echo "skipping execution smoke: runner container disabled"; \
 	fi
 
+.PHONY: bump-homebrew-tap
+bump-homebrew-tap: ## Open a PR on the Homebrew tap bumping formulae to VERSION (reads dist/checksums.txt)
+	@[ -n "$(VERSION)" ] || { echo "error: VERSION is required, e.g. make bump-homebrew-tap VERSION=1.2.3" >&2; exit 1; }
+	CHECKSUMS_FILE=$(DIST_DIR)/checksums.txt ./scripts/bump-homebrew-tap.sh $(VERSION)
+
 clean:: clean-dist
 
 .PHONY: clean-dist
