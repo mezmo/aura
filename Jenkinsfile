@@ -267,6 +267,12 @@ pipeline {
                           allowEmpty: false
                         )
                       }
+
+                      post {
+                        always {
+                          sh 'make clean'
+                        }
+                      }
                     }
                   }
                 }
@@ -403,6 +409,12 @@ pipeline {
                   includes: 'dist/**',
                   allowEmpty: false
                 )
+              }
+
+              post {
+                always {
+                  sh 'make clean'
+                }
               }
             }
           }
