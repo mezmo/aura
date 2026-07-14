@@ -9,7 +9,7 @@
 //! This is the S3 bounding module: function bodies are implemented.  The
 //! call-site wiring to production code happens in the implementation phase.
 
-#![allow(dead_code, unused_variables)]
+#![allow(dead_code)]
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -69,9 +69,9 @@ impl BoundingConfig {
                 config.duplicate_call_block_threshold,
             ),
             session_history: SessionHistoryLimit::new(config.session_history_turns()),
-            failure_handle: FailureHandleWidth::new(FailureHandleWidth::DEFAULT),
-            error_preview: ErrorPreviewWidth::new(ErrorPreviewWidth::DEFAULT),
-            tool_reasoning: ToolReasoningWidth::new(ToolReasoningWidth::DEFAULT),
+            failure_handle: FailureHandleWidth::DEFAULT,
+            error_preview: ErrorPreviewWidth::DEFAULT,
+            tool_reasoning: ToolReasoningWidth::DEFAULT,
             log_previews: LogPreviewWidths::default_widths(),
             manifest_widths: ManifestWidths::default_widths(),
             plan_content: PlanContentWidths::default_widths(),
@@ -165,6 +165,37 @@ impl CharWidth {
 // Unit-aware decision boundaries
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncateMarker {
+    None,
+    EllipsisChar,
+    Dots,
+}
+
+fn truncate_bytes(text: &str, max: usize, marker: TruncateMarker) -> String {
+    let (truncated, was_cut) = safe_truncate(text, max);
+    match (marker, was_cut) {
+        (TruncateMarker::None, _) => truncated.to_string(),
+        (TruncateMarker::EllipsisChar, true) => format!("{truncated}…"),
+        (TruncateMarker::Dots, true) => format!("{truncated}..."),
+        (_, false) => truncated.to_string(),
+    }
+}
+
+fn truncate_chars(text: &str, max: usize, marker: TruncateMarker) -> String {
+    match text.char_indices().nth(max) {
+        None => text.to_string(),
+        Some((cut, _)) => {
+            let truncated = &text[..cut];
+            match marker {
+                TruncateMarker::None => truncated.to_string(),
+                TruncateMarker::EllipsisChar => format!("{truncated}…"),
+                TruncateMarker::Dots => format!("{truncated}..."),
+            }
+        }
+    }
+}
+
 /// A byte threshold that may be zero.
 ///
 /// Business rule: some byte-based bounds treat zero as a sentinel
@@ -249,8 +280,41 @@ impl ResultSummaryWidth {
     }
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.get());
-        truncated.to_string()
+        truncate_bytes(text, self.get(), TruncateMarker::None)
+    }
+}
+
+/// A truncated summary with a truncation flag.
+///
+/// Produced by [`ResultSpillBudget::truncate_to_summary`]. Implements
+/// [`std::fmt::Display`] so the truncated text is available via `.to_string()`
+/// and the truncation flag via [`was_truncated`](Self::was_truncated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncatedSummary {
+    text: String,
+    was_truncated: bool,
+}
+
+impl TruncatedSummary {
+    fn new(text: String, was_truncated: bool) -> Self {
+        Self {
+            text,
+            was_truncated,
+        }
+    }
+
+    pub fn was_truncated(&self) -> bool {
+        self.was_truncated
+    }
+
+    pub fn into_string(self) -> String {
+        self.text
+    }
+}
+
+impl std::fmt::Display for TruncatedSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
     }
 }
 
@@ -279,6 +343,11 @@ impl ResultSpillBudget {
         }
     }
 
+    #[cfg(test)]
+    fn test_budget(threshold: usize, summary: usize) -> Self {
+        Self::from_config(threshold, summary)
+    }
+
     pub fn threshold(&self) -> ByteThreshold {
         self.threshold
     }
@@ -291,18 +360,19 @@ impl ResultSpillBudget {
         if self.threshold.allows_inline(text) {
             ResultSpillDecision::Inline
         } else {
-            let (truncated, was_truncated) = safe_truncate(text, self.summary_width.get());
+            let summary = self.truncate_to_summary(text);
+            let was_truncated = summary.was_truncated();
             ResultSpillDecision::Spill {
-                summary: truncated.to_string(),
+                summary: summary.into_string(),
                 result_len: text.len(),
                 was_truncated,
             }
         }
     }
 
-    pub fn truncate_to_summary(&self, text: &str) -> (String, bool) {
+    pub fn truncate_to_summary(&self, text: &str) -> TruncatedSummary {
         let (truncated, was_truncated) = safe_truncate(text, self.summary_width.get());
-        (truncated.to_string(), was_truncated)
+        TruncatedSummary::new(truncated.to_string(), was_truncated)
     }
 }
 
@@ -359,7 +429,7 @@ impl SizePromotion {
 /// duration-based promotion.  A positive threshold promotes calls longer
 /// than that duration.
 ///
-/// Forbidden invalid state: none; any `u64` is representable.
+/// Forbidden invalid state: none; any `u64` millis is representable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurationPromotion {
     /// Duration-based promotion is disabled.
@@ -525,6 +595,11 @@ impl DuplicateCallPolicy {
         }
     }
 
+    #[cfg(test)]
+    fn test_policy(nudge: usize, block: usize) -> Self {
+        Self::new(nudge, block)
+    }
+
     pub fn nudge_threshold(&self) -> Option<usize> {
         match self {
             Self::BlockOnly { .. } => None,
@@ -593,18 +668,13 @@ pub struct FailureHandleWidth(CharWidth);
 
 impl FailureHandleWidth {
     /// Default cap matching the accepted baseline binary.
-    pub const DEFAULT: usize = 120;
-
-    fn new(chars: usize) -> Self {
-        Self(CharWidth::new(chars).expect("fixed failure-handle cap must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(120) {
+        Some(n) => CharWidth(n),
+        None => panic!("fixed failure-handle cap must be non-zero"),
+    });
 
     fn truncate(&self, text: &str) -> String {
-        let max = self.0.get();
-        match text.char_indices().nth(max) {
-            Some((cut, _)) => text[..cut].to_string(),
-            None => text.to_string(),
-        }
+        truncate_chars(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -618,45 +688,35 @@ impl FailureHandleWidth {
 pub struct ErrorPreviewWidth(CharWidth);
 
 impl ErrorPreviewWidth {
-    pub const DEFAULT: usize = 2000;
-
-    fn new(chars: usize) -> Self {
-        Self(CharWidth::new(chars).expect("fixed error-preview cap must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(2000) {
+        Some(n) => CharWidth(n),
+        None => panic!("fixed error-preview cap must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let max = self.0.get();
-        match text.char_indices().nth(max) {
-            Some((cut, _)) => text[..cut].to_string(),
-            None => text.to_string(),
-        }
+        truncate_chars(text, self.0.get(), TruncateMarker::None)
     }
 }
 
 /// Character cap for tool-reasoning previews in continuation prompts.
 ///
-/// Business rule: tool-reasoning lines in the continuation prompt are
-/// truncated to a bounded character width with an ellipsis marker.
+/// Business rule: the `_aura_reasoning` text string forwarded into
+/// continuation prompts is truncated to a bounded character width with an
+/// ellipsis marker.  This cap applies to the reasoning text, not to a
+/// reasoning-token budget.
 ///
 /// Forbidden invalid state: a zero cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolReasoningWidth(CharWidth);
 
 impl ToolReasoningWidth {
-    pub const DEFAULT: usize = 100;
-
-    fn new(chars: usize) -> Self {
-        Self(CharWidth::new(chars).expect("fixed tool-reasoning cap must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(100) {
+        Some(n) => CharWidth(n),
+        None => panic!("fixed tool-reasoning cap must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let max = self.0.get();
-        if text.chars().count() <= max {
-            text.to_string()
-        } else {
-            let truncated: String = text.chars().take(max).collect();
-            format!("{truncated}…")
-        }
+        truncate_chars(text, self.0.get(), TruncateMarker::EllipsisChar)
     }
 }
 
@@ -669,19 +729,13 @@ impl ToolReasoningWidth {
 pub struct RoutingRationaleWidth(ByteWidth);
 
 impl RoutingRationaleWidth {
-    pub const DEFAULT: usize = 80;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed routing-rationale width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(80) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed routing-rationale width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, was_truncated) = safe_truncate(text, self.0.get());
-        if was_truncated {
-            format!("{truncated}...")
-        } else {
-            truncated.to_string()
-        }
+        truncate_bytes(text, self.0.get(), TruncateMarker::Dots)
     }
 }
 
@@ -690,15 +744,13 @@ impl RoutingRationaleWidth {
 pub struct TaskDescriptionLogWidth(ByteWidth);
 
 impl TaskDescriptionLogWidth {
-    pub const DEFAULT: usize = 100;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed task-description log width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(100) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed task-description log width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -707,15 +759,13 @@ impl TaskDescriptionLogWidth {
 pub struct TaskDescriptionSpanWidth(ByteWidth);
 
 impl TaskDescriptionSpanWidth {
-    pub const DEFAULT: usize = 200;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed task-description span width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(200) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed task-description span width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -724,15 +774,13 @@ impl TaskDescriptionSpanWidth {
 pub struct GoalWidth(ByteWidth);
 
 impl GoalWidth {
-    pub const DEFAULT: usize = 200;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed goal width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(200) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed goal width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -741,36 +789,31 @@ impl GoalWidth {
 pub struct RoutingResponseWidth(ByteWidth);
 
 impl RoutingResponseWidth {
-    pub const DEFAULT: usize = 300;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed routing-response width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(300) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed routing-response width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
 /// Byte width for query-log previews.
 ///
-/// Business rule: the fallback-plan log preview at
-/// `orchestrator.rs:1639` truncates the original query for a tracing line,
-/// not for plan content.
+/// Business rule: the fallback-plan query log preview truncates the original
+/// query for a tracing line, not for plan content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLogWidth(ByteWidth);
 
 impl QueryLogWidth {
-    pub const DEFAULT: usize = 100;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed query-log width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(100) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed query-log width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -794,12 +837,12 @@ pub struct LogPreviewWidths {
 impl LogPreviewWidths {
     fn default_widths() -> Self {
         Self {
-            routing_rationale: RoutingRationaleWidth::new(RoutingRationaleWidth::DEFAULT),
-            task_description_log: TaskDescriptionLogWidth::new(TaskDescriptionLogWidth::DEFAULT),
-            task_description_span: TaskDescriptionSpanWidth::new(TaskDescriptionSpanWidth::DEFAULT),
-            goal: GoalWidth::new(GoalWidth::DEFAULT),
-            routing_response: RoutingResponseWidth::new(RoutingResponseWidth::DEFAULT),
-            query_log: QueryLogWidth::new(QueryLogWidth::DEFAULT),
+            routing_rationale: RoutingRationaleWidth::DEFAULT,
+            task_description_log: TaskDescriptionLogWidth::DEFAULT,
+            task_description_span: TaskDescriptionSpanWidth::DEFAULT,
+            goal: GoalWidth::DEFAULT,
+            routing_response: RoutingResponseWidth::DEFAULT,
+            query_log: QueryLogWidth::DEFAULT,
         }
     }
 
@@ -837,15 +880,13 @@ impl LogPreviewWidths {
 pub struct ResultPreviewWidth(ByteWidth);
 
 impl ResultPreviewWidth {
-    pub const DEFAULT: usize = 200;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed result-preview width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(200) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed result-preview width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -854,15 +895,13 @@ impl ResultPreviewWidth {
 pub struct ResponseSummaryWidth(ByteWidth);
 
 impl ResponseSummaryWidth {
-    pub const DEFAULT: usize = 200;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed response-summary width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(200) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed response-summary width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, _) = safe_truncate(text, self.0.get());
-        truncated.to_string()
+        truncate_bytes(text, self.0.get(), TruncateMarker::None)
     }
 }
 
@@ -882,8 +921,8 @@ pub struct ManifestWidths {
 impl ManifestWidths {
     fn default_widths() -> Self {
         Self {
-            result_preview: ResultPreviewWidth::new(ResultPreviewWidth::DEFAULT),
-            response_summary: ResponseSummaryWidth::new(ResponseSummaryWidth::DEFAULT),
+            result_preview: ResultPreviewWidth::DEFAULT,
+            response_summary: ResponseSummaryWidth::DEFAULT,
         }
     }
 
@@ -905,19 +944,13 @@ impl ManifestWidths {
 pub struct PlanTaskDescriptionWidth(ByteWidth);
 
 impl PlanTaskDescriptionWidth {
-    pub const DEFAULT: usize = 100;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed plan task-description width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(100) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed plan task-description width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, was_truncated) = safe_truncate(text, self.0.get());
-        if was_truncated {
-            format!("{truncated}...")
-        } else {
-            truncated.to_string()
-        }
+        truncate_bytes(text, self.0.get(), TruncateMarker::Dots)
     }
 }
 
@@ -926,19 +959,13 @@ impl PlanTaskDescriptionWidth {
 pub struct PlanDirectAnswerTaskWidth(ByteWidth);
 
 impl PlanDirectAnswerTaskWidth {
-    pub const DEFAULT: usize = 80;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed plan direct-answer task width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(80) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed plan direct-answer task width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, was_truncated) = safe_truncate(text, self.0.get());
-        if was_truncated {
-            format!("{truncated}...")
-        } else {
-            truncated.to_string()
-        }
+        truncate_bytes(text, self.0.get(), TruncateMarker::Dots)
     }
 }
 
@@ -947,22 +974,13 @@ impl PlanDirectAnswerTaskWidth {
 pub struct PlanDirectAnswerRationaleWidth(ByteWidth);
 
 impl PlanDirectAnswerRationaleWidth {
-    pub const DEFAULT: usize = 100;
-
-    fn new(bytes: usize) -> Self {
-        Self(
-            ByteWidth::new(bytes)
-                .expect("fixed plan direct-answer rationale width must be non-zero"),
-        )
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(100) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed plan direct-answer rationale width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, was_truncated) = safe_truncate(text, self.0.get());
-        if was_truncated {
-            format!("{truncated}...")
-        } else {
-            truncated.to_string()
-        }
+        truncate_bytes(text, self.0.get(), TruncateMarker::Dots)
     }
 }
 
@@ -971,19 +989,13 @@ impl PlanDirectAnswerRationaleWidth {
 pub struct PlanClarificationTaskWidth(ByteWidth);
 
 impl PlanClarificationTaskWidth {
-    pub const DEFAULT: usize = 80;
-
-    fn new(bytes: usize) -> Self {
-        Self(ByteWidth::new(bytes).expect("fixed plan clarification task width must be non-zero"))
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(80) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed plan clarification task width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, was_truncated) = safe_truncate(text, self.0.get());
-        if was_truncated {
-            format!("{truncated}...")
-        } else {
-            truncated.to_string()
-        }
+        truncate_bytes(text, self.0.get(), TruncateMarker::Dots)
     }
 }
 
@@ -992,22 +1004,13 @@ impl PlanClarificationTaskWidth {
 pub struct PlanClarificationQuestionWidth(ByteWidth);
 
 impl PlanClarificationQuestionWidth {
-    pub const DEFAULT: usize = 100;
-
-    fn new(bytes: usize) -> Self {
-        Self(
-            ByteWidth::new(bytes)
-                .expect("fixed plan clarification question width must be non-zero"),
-        )
-    }
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(100) {
+        Some(n) => ByteWidth(n),
+        None => panic!("fixed plan clarification question width must be non-zero"),
+    });
 
     pub fn truncate(&self, text: &str) -> String {
-        let (truncated, was_truncated) = safe_truncate(text, self.0.get());
-        if was_truncated {
-            format!("{truncated}...")
-        } else {
-            truncated.to_string()
-        }
+        truncate_bytes(text, self.0.get(), TruncateMarker::Dots)
     }
 }
 
@@ -1030,17 +1033,11 @@ pub struct PlanContentWidths {
 impl PlanContentWidths {
     fn default_widths() -> Self {
         Self {
-            task_description: PlanTaskDescriptionWidth::new(PlanTaskDescriptionWidth::DEFAULT),
-            direct_answer_task: PlanDirectAnswerTaskWidth::new(PlanDirectAnswerTaskWidth::DEFAULT),
-            direct_answer_rationale: PlanDirectAnswerRationaleWidth::new(
-                PlanDirectAnswerRationaleWidth::DEFAULT,
-            ),
-            clarification_task: PlanClarificationTaskWidth::new(
-                PlanClarificationTaskWidth::DEFAULT,
-            ),
-            clarification_question: PlanClarificationQuestionWidth::new(
-                PlanClarificationQuestionWidth::DEFAULT,
-            ),
+            task_description: PlanTaskDescriptionWidth::DEFAULT,
+            direct_answer_task: PlanDirectAnswerTaskWidth::DEFAULT,
+            direct_answer_rationale: PlanDirectAnswerRationaleWidth::DEFAULT,
+            clarification_task: PlanClarificationTaskWidth::DEFAULT,
+            clarification_question: PlanClarificationQuestionWidth::DEFAULT,
         }
     }
 
@@ -1087,5 +1084,140 @@ impl ScratchpadBudget {
 
     pub fn inner(&self) -> &crate::scratchpad::ContextBudget {
         &self.0
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_width_emoji_boundary() {
+        let width = RoutingRationaleWidth(ByteWidth::new(8).unwrap());
+        let got = width.truncate("Hello 🎉 World");
+        assert_eq!(got, "Hello ...");
+    }
+
+    #[test]
+    fn char_width_cjk_boundary() {
+        let width = FailureHandleWidth(CharWidth::new(2).unwrap());
+        assert_eq!(width.truncate("日本語テスト"), "日本");
+    }
+
+    #[test]
+    fn result_spill_decide_branches() {
+        let budget = ResultSpillBudget::test_budget(10, 5);
+        assert_eq!(budget.decide("short"), ResultSpillDecision::Inline);
+
+        let text = "this text is longer than ten bytes";
+        match budget.decide(text) {
+            ResultSpillDecision::Spill {
+                summary,
+                result_len,
+                was_truncated,
+            } => {
+                assert_eq!(result_len, text.len());
+                assert_eq!(summary, "this ");
+                assert!(was_truncated);
+            }
+            _ => panic!("expected Spill"),
+        }
+
+        let zero_threshold = ResultSpillBudget::test_budget(0, 0);
+        match zero_threshold.decide("x") {
+            ResultSpillDecision::Spill {
+                summary,
+                was_truncated,
+                ..
+            } => {
+                assert!(summary.is_empty());
+                assert!(was_truncated);
+            }
+            _ => panic!("expected Spill"),
+        }
+
+        let wide_summary = ResultSpillBudget::test_budget(5, 100);
+        assert_eq!(wide_summary.summary_width().get(), 100);
+        let long = "a".repeat(10);
+        match wide_summary.decide(long.as_str()) {
+            ResultSpillDecision::Spill {
+                summary,
+                was_truncated,
+                ..
+            } => {
+                assert_eq!(summary, long);
+                assert!(!was_truncated);
+            }
+            _ => panic!("expected Spill"),
+        }
+    }
+
+    #[test]
+    fn duplicate_call_policy_collapse() {
+        let eq = DuplicateCallPolicy::test_policy(5, 5);
+        assert!(matches!(eq, DuplicateCallPolicy::BlockOnly { .. }));
+        assert_eq!(eq.nudge_threshold(), None);
+        assert_eq!(eq.block_threshold(), 5);
+
+        let gt = DuplicateCallPolicy::test_policy(7, 3);
+        assert!(matches!(gt, DuplicateCallPolicy::BlockOnly { .. }));
+        assert_eq!(gt.nudge_threshold(), None);
+        assert_eq!(gt.block_threshold(), 3);
+
+        let nudge = DuplicateCallPolicy::test_policy(3, 5);
+        assert!(matches!(nudge, DuplicateCallPolicy::NudgeThenBlock { .. }));
+        assert_eq!(nudge.nudge_threshold(), Some(3));
+        assert_eq!(nudge.block_threshold(), 5);
+    }
+
+    #[test]
+    fn session_history_limit_states() {
+        let disabled = SessionHistoryLimit::new(0);
+        assert!(matches!(disabled, SessionHistoryLimit::Disabled));
+        assert!(!disabled.is_enabled());
+        assert_eq!(disabled.get(), 0);
+
+        let limited = SessionHistoryLimit::new(3);
+        assert!(matches!(limited, SessionHistoryLimit::Limited(n) if n.get() == 3));
+        assert!(limited.is_enabled());
+        assert_eq!(limited.get(), 3);
+    }
+
+    #[test]
+    fn truncate_marker_styles() {
+        let reasoning = ToolReasoningWidth::DEFAULT.truncate("a".repeat(101).as_str());
+        assert!(reasoning.ends_with('…'));
+        assert_eq!(reasoning.chars().count(), 101);
+
+        let rationale = RoutingRationaleWidth::DEFAULT.truncate("a".repeat(81).as_str());
+        assert!(rationale.ends_with("..."));
+        assert_eq!(rationale.len(), 83);
+
+        let goal = GoalWidth::DEFAULT.truncate("a".repeat(201).as_str());
+        assert!(!goal.ends_with("...") && !goal.ends_with('…'));
+        assert_eq!(goal.len(), 200);
+    }
+
+    #[test]
+    fn truncate_marker_suppressed_when_not_cut() {
+        assert_eq!(RoutingRationaleWidth::DEFAULT.truncate("short"), "short");
+        assert_eq!(ToolReasoningWidth::DEFAULT.truncate("short"), "short");
+    }
+
+    #[test]
+    fn truncated_summary_display() {
+        let budget = ResultSpillBudget::test_budget(100, 5);
+
+        let long = budget.truncate_to_summary("hello world");
+        assert_eq!(long.to_string(), "hello");
+        assert!(long.was_truncated());
+
+        let short = budget.truncate_to_summary("hi");
+        assert_eq!(short.to_string(), "hi");
+        assert!(!short.was_truncated());
     }
 }

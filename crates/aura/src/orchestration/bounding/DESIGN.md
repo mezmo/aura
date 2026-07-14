@@ -17,8 +17,8 @@ behavior change.
 
 Every public type maps to one business rule and names the invalid state it
 forbids. Types marked (reused) come from existing production modules and are
-composed, not re-modeled. Implementation-detail types (`ByteWidth`,
-`CharWidth`, `NudgeThreshold`, `BlockThreshold`) are private;
+composed, not re-modeled. Type-implementation-detail types (`ByteWidth`,
+`CharWidth`, `NudgeThreshold`, `BlockThreshold`, `TruncateMarker`) are private;
 `NonZeroByteThreshold` and `NonZeroDuration` are `pub(crate)` so that the
 public enum variants they appear in are well-formed.
 
@@ -29,6 +29,7 @@ public enum variants they appear in are well-formed.
 | `ResultSummaryWidth` | The same config value drives both the artifact stand-in prefix and replan execution-summary error truncation; production accepts zero (empty prefix + marker) and summary wider than threshold | None; any `usize` is representable |
 | `ResultSpillBudget` | A worker result either stays inline (byte length at or below threshold) or spills to an artifact with a bounded inline stand-in summary | None; production accepts threshold 0, summary 0, and summary larger than threshold |
 | `ResultSpillDecision` | `ResultSpillBudget::decide` returns either the original inline result or the spill stand-in; the caller never measures bytes itself. `truncate_to_summary` serves the replan error site, which truncates to `summary_width` regardless of the spill threshold. | A caller that bypasses `decide`/`truncate_to_summary` and re-measures with a mismatched unit |
+| `TruncatedSummary` | Carries the truncated summary text and cut flag produced by `ResultSpillBudget::truncate_to_summary`; implements `Display` for `.to_string()` and exposes `was_truncated()` plus a consuming `into_string()`. | None; any `String` + `bool` pair is representable |
 | `SizePromotion` | Tool-output size promotion: threshold 0 means promote all (including empty), a positive threshold means larger than that byte count | None; any `usize` is representable |
 | `DurationPromotion` | Tool-output duration promotion: threshold 0 means disabled, a positive threshold means longer than that `std::time::Duration` | None; any `u64` millis is representable |
 | `ToolOutputSpillBudget` | Tool outputs are promoted to artifacts when size or duration qualifies; the two zero semantics are asymmetric (size 0 = promote all, duration 0 = disabled) | None beyond non-negativity |
@@ -39,20 +40,20 @@ public enum variants they appear in are well-formed.
 | `ErrorPreviewWidth` | Failure entries render a bounded error preview with an explicit `[truncated]` marker, never an unbounded error body | A zero cap |
 | `ToolReasoningWidth` | Tool-reasoning lines in the continuation prompt are truncated to a bounded character width with an ellipsis marker | A zero cap |
 | `RoutingRationaleWidth` | Routing-rationale log previews are byte-bounded | A zero byte width |
-| `TaskDescriptionLogWidth` | Task-description previews in log lines (orchestrator.rs:2817) are byte-bounded | A zero byte width |
-| `TaskDescriptionSpanWidth` | Task-description previews in tracing spans (orchestrator.rs:3063) are byte-bounded | A zero byte width |
+| `TaskDescriptionLogWidth` | Task-description log previews are byte-bounded | A zero byte width |
+| `TaskDescriptionSpanWidth` | Task-description tracing-span previews are byte-bounded | A zero byte width |
 | `GoalWidth` | Goal/span previews are byte-bounded | A zero byte width |
 | `RoutingResponseWidth` | Raw routing-response log previews are byte-bounded | A zero byte width |
-| `QueryLogWidth` | Fallback-query log preview (orchestrator.rs:1639) is byte-bounded | A zero byte width |
+| `QueryLogWidth` | Fallback-query log preview is byte-bounded | A zero byte width |
 | `LogPreviewWidths` | All observability/tracing string previews draw their limits from one table | Any preview width equal to zero |
-| `ResultPreviewWidth` | `TaskSummary.result_preview` (orchestrator.rs:4261) is byte-bounded; persisted to the run manifest | A zero byte width |
-| `ResponseSummaryWidth` | Manifest `response_summary` (orchestrator.rs:4325) is byte-bounded; persisted to the run manifest | A zero byte width |
+| `ResultPreviewWidth` | `TaskSummary.result_preview` is byte-bounded; persisted to the run manifest | A zero byte width |
+| `ResponseSummaryWidth` | Manifest `response_summary` is byte-bounded; persisted to the run manifest | A zero byte width |
 | `ManifestWidths` | Persisted-manifest string previews (`result_preview`, `response_summary`) draw their limits from one table, separate from observability previews | Any preview width equal to zero |
-| `PlanTaskDescriptionWidth` | Fallback `Task.description` content (orchestrator.rs:1632) is byte-bounded | A zero byte width |
-| `PlanDirectAnswerTaskWidth` | Config-converted direct-answer plan task content (orchestrator.rs:1674) is byte-bounded | A zero byte width |
-| `PlanDirectAnswerRationaleWidth` | Config-converted direct-answer plan rationale content (orchestrator.rs:1680) is byte-bounded | A zero byte width |
-| `PlanClarificationTaskWidth` | Config-converted clarification plan task content (orchestrator.rs:1698) is byte-bounded | A zero byte width |
-| `PlanClarificationQuestionWidth` | Config-converted clarification plan question content (orchestrator.rs:1705) is byte-bounded | A zero byte width |
+| `PlanTaskDescriptionWidth` | Fallback `Task.description` content is byte-bounded | A zero byte width |
+| `PlanDirectAnswerTaskWidth` | Config-converted direct-answer plan task content is byte-bounded | A zero byte width |
+| `PlanDirectAnswerRationaleWidth` | Config-converted direct-answer plan rationale content is byte-bounded | A zero byte width |
+| `PlanClarificationTaskWidth` | Config-converted clarification plan task content is byte-bounded | A zero byte width |
+| `PlanClarificationQuestionWidth` | Config-converted clarification plan question content is byte-bounded | A zero byte width |
 | `PlanContentWidths` | All plan-content string truncations (persisted manifests and worker prompts) draw their limits from one table | Any truncation width equal to zero |
 | `ScratchpadBudget` | The token-based scratchpad budget exists only when scratchpad tools are wired for a worker and is scoped to that worker's effective LLM | n/a (infallible wrapper; a zero context window cannot be reliably detected) |
 | `TokenBudget` (reused from `context::frame`) | The prior-work frame assembles completed ancestor entries under a non-zero token budget; direct dependencies are the floor and transitive entries fill remaining budget nearest-first | A zero token budget (R2 type already forbids this via `NonZeroUsize`) |
@@ -153,3 +154,25 @@ type above, preserving byte-identical output on every S2 manifest surface.
   respective modules. Consolidation does not unify the two approximation
   methods (R4) nor relocate their ownership. This is a narrowed claim from the
   original skeleton, which overstated centralization.
+- **R8 - SessionHistoryLimit compaction future.** `SessionHistoryLimit` today
+  models only Disabled or a positive turn count (drop-old behavior). A future
+  behavior change could let it return a compaction-budget option instead of
+  dropping old history (relevant to emergency compaction even though the
+  program philosophically avoids compaction). That is a behavior change
+  requiring its own card; S3 models only the drop semantics production accepts
+  today.
+- **R9 - Truncation marker inconsistency.** The width types use three marker
+  styles: no marker (most byte log/manifest previews and the char
+  `FailureHandle`/`ErrorPreview` caps), ASCII dots `"..."` (routing rationale
+  and plan-content byte widths), and the single ellipsis character `"…"` (the
+  char `ToolReasoningWidth`). This is preserved byte-identically from
+  production; a future card that unifies markers would be a behavior change.
+- **R10 - `was_truncated` signal asymmetry.** `ResultSpillBudget::truncate_to_summary`
+  returns `TruncatedSummary` carrying `was_truncated()`, but the char-cap types
+  (`FailureHandleWidth`, `ErrorPreviewWidth`) return a bare `String` from their
+  `truncate` methods with no cut flag. The prior domain constructors
+  (`FailureHandle::from_description`, `ErrorPreview::new`) need that signal to
+  gate their display markers. Phase B wiring will either need a
+  `was_truncated`-returning variant on the char-cap types or must re-detect the
+  cut by string comparison. This is a Phase B design decision, not a Phase A
+  behavior break (call sites are unwired, manifest unchanged).
