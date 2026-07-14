@@ -17,6 +17,7 @@ use tracing::{error, info};
 
 use aura_web_server::a2a::{AuraAgentExecutor, AuraRequestHandler, SharedTaskStore};
 use aura_web_server::handlers;
+use aura_web_server::session_store::{InMemorySessionStore, SessionStore};
 use aura_web_server::streaming;
 use aura_web_server::types;
 
@@ -254,6 +255,15 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
+    let session_store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    // Fail fast at startup if the session-state backend is unreachable.
+    if let Err(e) = session_store.ping().await {
+        error!("Session store unreachable: {e}");
+        return Err(std::io::Error::other(format!(
+            "session store unreachable: {e}"
+        )));
+    }
+
     let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
@@ -269,7 +279,10 @@ async fn run() -> std::io::Result<()> {
         active_requests: active_requests.clone(),
         default_agent: args.default_agent.clone(),
         additional_tools: Arc::new(Vec::new),
-        pending_approvals: aura::hitl::PendingApprovals::new(),
+        pending_approvals: aura::hitl::PendingApprovals::with_backend(
+            session_store.approvals(),
+            session_store.bus(),
+        ),
     });
 
     info!(
@@ -299,8 +312,7 @@ async fn run() -> std::io::Result<()> {
     // REST at /a2a/v1/message:send, /a2a/v1/tasks/
     // Agent card at /.well-known/agent-card.json
     let app = if args.enable_a2a {
-        // forcing an in-memory store for now. TBD: a resilient location
-        let task_store = SharedTaskStore::new();
+        let task_store = SharedTaskStore::from_store(session_store.tasks());
         let executor = AuraAgentExecutor::new(app_state.clone(), task_store.clone());
         let base_url = advertised_base_url(args.server_url.as_deref(), &args.host, args.port);
         let agent_card = executor.build_agent_card(&base_url);

@@ -3141,8 +3141,8 @@ impl StreamHandler for ReplStreamHandler {
         };
 
         // Resolve the approval: in-process registry (standalone) or HTTP POST
-        // (web-server mode). The registry path is synchronous (mutex + oneshot
-        // send); the HTTP path is fire-and-forget async.
+        // (web-server mode). Both paths post the decision fire-and-forget from
+        // a spawned task.
         #[cfg(feature = "standalone-cli")]
         let resolved_locally = if let Some(ref registry) = self.pending_approvals {
             let decision = match &response {
@@ -3157,13 +3157,23 @@ impl StreamHandler for ReplStreamHandler {
             };
             match aura::hitl::DecisionId::parse(&decision_id) {
                 Ok(id) => {
-                    if let Err(aura::hitl::ResolveError::NotFound) = registry.resolve(&id, decision)
-                    {
-                        eprintln!(
-                            "warning: approval decision was not found \
-                             (it may have already expired or been cancelled)."
-                        );
-                    }
+                    let registry = registry.clone();
+                    // Instrument so the resolve's store/bus events stay
+                    // parented to the stream's trace.
+                    let resolve = tracing::Instrument::instrument(
+                        async move {
+                            if let Err(aura::hitl::ResolveError::NotFound) =
+                                registry.resolve(&id, decision).await
+                            {
+                                eprintln!(
+                                    "warning: approval decision was not found \
+                                     (it may have already expired or been cancelled)."
+                                );
+                            }
+                        },
+                        tracing::Span::current(),
+                    );
+                    tokio::spawn(resolve);
                 }
                 Err(e) => {
                     eprintln!("error: invalid decision id '{decision_id}': {e}");

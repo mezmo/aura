@@ -57,7 +57,7 @@ impl fmt::Display for DecisionId {
 }
 
 /// The terminal human (or webhook) decision on a gated call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecision {
     Approved,
     Denied { reason: Option<String> },

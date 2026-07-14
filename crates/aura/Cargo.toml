@@ -19,6 +19,7 @@ aws-sdk-bedrockagentruntime = { workspace = true }
 
 rmcp = { workspace = true }
 base64 = "0.22"
+bytes = "1"
 futures = "0.3"
 sse-stream = "0.2"
 reqwest = { workspace = true }

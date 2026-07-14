@@ -213,6 +213,7 @@ dependencies = [
  "aws-sdk-bedrockagentruntime",
  "aws-sdk-bedrockruntime",
  "base64",
+ "bytes",
  "chrono",
  "futures",
  "gemini-tokenizer",
