@@ -67,6 +67,8 @@ Session.vim
 # Build artifacts and caches
 .cache/
 .build/
+.cargo/
+.rustup/
 
 # Rig source (if present)
 /rig-source/

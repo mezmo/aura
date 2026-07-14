@@ -41,9 +41,14 @@ services:
       start_period: 15s
 
   aura-web-server:
+    # CI preloads this tag from the Build Images stage; without --build,
+    # compose uses it as-is. Local flows build it: the tag is created on
+    # first use and refreshed whenever --build is passed.
+    image: ${AURA_SERVER_IMAGE:-local/aura-server:dev}
     build:
       context: ../
       dockerfile: Dockerfile
+      target: server
     environment:
       # API keys (passed from host environment or .env file)
       OPENAI_API_KEY: ${OPENAI_API_KEY}

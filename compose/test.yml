@@ -23,6 +23,9 @@ services:
       AURA_SERVER_URL: http://aura-web-server:8080
 
   aura-integration-test:
+    # CI preloads this tag from the Build Images stage; without --build,
+    # compose uses it as-is.
+    image: ${AURA_TEST_IMAGE:-local/aura-test:dev}
     build:
       context: ../
       dockerfile: Dockerfile
@@ -34,6 +37,20 @@ services:
       CI: true
       ENABLE_DOCKER: false
       AURA_AUTO_DOWNLOAD: false
+      # Compiler cache for the in-container coverage compile. Opt-in: CI
+      # sets the AURA_ toggle plus the SCCACHE_/AWS_ values; the empty
+      # defaults leave cargo behavior unchanged (an empty wrapper var is
+      # treated as unset). The workspace wrapper, not RUSTC_WRAPPER, so
+      # the deps baked by cook-debug keep their fingerprints.
+      RUSTC_WORKSPACE_WRAPPER: ${AURA_RUSTC_WORKSPACE_WRAPPER:-}
+      SCCACHE_BUCKET: ${SCCACHE_BUCKET:-}
+      SCCACHE_REGION: ${SCCACHE_REGION:-}
+      SCCACHE_S3_KEY_PREFIX: ${SCCACHE_S3_KEY_PREFIX:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      # sccache refuses incremental compiles, and incremental state cannot
+      # survive the ephemeral container anyway.
+      CARGO_INCREMENTAL: "0"
     volumes:
       # Shared volume for marker files (written by slow_task, read by tests)
       # Uses /tmp since that's where slow_task writes marker files

@@ -60,7 +60,7 @@ fn find_tool_complete_events(events: &[SseEvent]) -> Vec<&SseEvent> {
 /// Test 1: Verify aura.tool_requested events are emitted when AURA_CUSTOM_EVENTS=true
 ///
 /// This test requires the server to be started with AURA_CUSTOM_EVENTS=true
-/// which is configured in run_tests.sh
+/// which is configured in compose/base.yml
 #[tokio::test]
 async fn test_aura_tool_requested_events_emitted() {
     let client = reqwest::Client::new();
