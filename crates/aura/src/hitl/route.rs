@@ -111,7 +111,7 @@ impl DecisionRoute {
                     + chrono::Duration::from_std(*timeout)
                         .expect("approval timeout fits in chrono");
                 let pending_event = events::pending(&request, &expires_at);
-                let handle = registry.register(request, *timeout);
+                let handle = registry.register(request, *timeout).await;
 
                 approval_event_broker::publish(
                     &request_id,
@@ -124,7 +124,7 @@ impl DecisionRoute {
                     outcome,
                     ApprovalOutcome::TimedOut { .. } | ApprovalOutcome::Cancelled(_)
                 ) {
-                    registry.remove(&decision_id);
+                    registry.remove(&decision_id).await;
                 }
 
                 let completed_event =
@@ -372,6 +372,7 @@ mod tests {
             tokio::task::yield_now().await;
             if registry
                 .resolve(&decision_id, ApprovalDecision::Approved)
+                .await
                 .is_ok()
             {
                 break;
@@ -423,6 +424,7 @@ mod tests {
                         reason: Some("too risky".into()),
                     },
                 )
+                .await
                 .is_ok()
             {
                 break;
@@ -471,7 +473,9 @@ mod tests {
             other => panic!("expected TimedOut, got {:?}", other),
         }
         assert_eq!(
-            registry.resolve(&decision_id, ApprovalDecision::Approved),
+            registry
+                .resolve(&decision_id, ApprovalDecision::Approved)
+                .await,
             Err(ResolveError::NotFound),
             "late decisions for timed-out approvals must be rejected as expired",
         );

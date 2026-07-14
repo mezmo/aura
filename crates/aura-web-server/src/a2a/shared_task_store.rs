@@ -4,16 +4,18 @@ use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Wrapper over the backing [`TaskStore`] adding AURA's artifact-merge fix to
+/// `update`.
 #[derive(Clone)]
-pub struct SharedTaskStore(Arc<InMemoryTaskStore>);
+pub struct SharedTaskStore(Arc<dyn TaskStore>);
 
 impl SharedTaskStore {
     pub fn new() -> Self {
-        Self(Arc::new(InMemoryTaskStore::new()))
+        Self::from_store(Arc::new(InMemoryTaskStore::new()))
     }
 
-    pub fn inner_store(&self) -> Arc<InMemoryTaskStore> {
-        self.0.clone()
+    pub fn from_store(store: Arc<dyn TaskStore>) -> Self {
+        Self(store)
     }
 }
 

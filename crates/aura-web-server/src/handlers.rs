@@ -45,18 +45,29 @@ impl Drop for RequestResourceGuard {
     fn drop(&mut self) {
         use aura::{request_progress_unsubscribe, tool_event_unsubscribe, tool_usage_unsubscribe};
 
-        self.pending_approvals.cancel_request(&self.request_id);
+        // Synchronous so parked awaits cancel even when the runtime is
+        // shutting down and the spawn below never polls.
+        self.pending_approvals
+            .cancel_request_local(&self.request_id);
 
         // Use try_current to avoid panic during runtime shutdown
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let id = self.request_id.clone();
-            handle.spawn(async move {
-                RequestCancellation::unregister(&id);
-                approval_event_unsubscribe(&id).await;
-                request_progress_unsubscribe(&id).await;
-                tool_event_unsubscribe(&id).await;
-                tool_usage_unsubscribe(&id).await;
-            });
+            let pending_approvals = self.pending_approvals.clone();
+            // Instrument with the span current at drop so cleanup events
+            // stay parented to the request's trace.
+            let cleanup = tracing::Instrument::instrument(
+                async move {
+                    pending_approvals.cancel_request(&id).await;
+                    RequestCancellation::unregister(&id);
+                    approval_event_unsubscribe(&id).await;
+                    request_progress_unsubscribe(&id).await;
+                    tool_event_unsubscribe(&id).await;
+                    tool_usage_unsubscribe(&id).await;
+                },
+                tracing::Span::current(),
+            );
+            handle.spawn(cleanup);
         }
         // If no runtime, cleanup is best-effort (server is shutting down anyway)
     }
@@ -1020,7 +1031,11 @@ pub async fn resolve_approval(
         }
     };
     let decision = aura::hitl::ApprovalDecision::from(body);
-    match state.pending_approvals.resolve(&decision_id, decision) {
+    match state
+        .pending_approvals
+        .resolve(&decision_id, decision)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(aura::hitl::ResolveError::NotFound) => error_response(
             StatusCode::NOT_FOUND,
@@ -1900,7 +1915,8 @@ model = "gpt-4o-mini"
             let decision_id = req.decision_id;
             let handle = state
                 .pending_approvals
-                .register(req, Duration::from_secs(60));
+                .register(req, Duration::from_secs(60))
+                .await;
 
             let response = app
                 .oneshot(

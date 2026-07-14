@@ -7,11 +7,18 @@ default, one shipped networked backend, store plus event bus as distinct
 capabilities). This note carries the trait method sets, the backend key/topic
 schema, the config and wire formats, the wiring changes, and the phased rollout.
 
-**Status:** living design note, current as of 2026-07-08. The ADR holds the
-durable decision. Nothing here is built yet — the Rust signatures, key schema, and
-diagrams below describe intended design, not code that exists. References to
-existing aura code (file:line, module paths) are where-to-look pointers and move as
-the code does.
+**Status:** living design note, current as of 2026-07-13. The ADR holds the
+durable decision. **Phase 1 of §11 (traits + in-memory refactor) is implemented:**
+`aura::session_store` defines `ApprovalStore` and `EventBus` with in-memory impls,
+`PendingApprovals` rides on them (wake handles stay local, decisions travel over the
+bus), and the web server's `SessionStore` factory
+(`crates/aura-web-server/src/session_store.rs`) composes them with the upstream A2A
+`TaskStore`. The factory lives in the web-server crate rather than `aura` because
+`a2a_server::TaskStore` is a web-server-only dependency; the capability traits stay
+in `aura` so CLI standalone needs no A2A dependency. The Redis/Valkey backend
+(phases 2–4), the `[session_store]` config surface (§8), `ParkedApproval` serde
+derives, and Helm wiring (§10) are not built yet. References to existing aura code
+(file:line, module paths) are where-to-look pointers and move as the code does.
 
 **Goal of iteration 1:** make the state AURA _already has_ work across pods, so a
 load-balanced multi-replica deployment (Helm prod runs 3–10 replicas, no session
@@ -135,7 +142,7 @@ with a code comment pointing at "durable parking".
 
 Two capabilities. A backend may provide one or both; Redis/Valkey provides both.
 
-```
+```text
     ┌─────────────────────────── SessionStore (factory) ───────────────────────────┐
     │                                                                              │
     │   approvals() ─────▶ ApprovalStore   (durable parked HITL approvals)         │
@@ -264,7 +271,7 @@ the human is watching `aura.approval_pending`), but the **decision can arrive on
 pod**. So we do _not_ need to move the stream — we need the decision to reach the parking
 pod. Store + bus does exactly that.
 
-```
+```text
  Pod A (parks)                          Redis/Valkey                    Pod B (resolves)
  ───────────────                        ─────────────                   ────────────────
  tool gated, decide()
@@ -438,10 +445,10 @@ behind `PendingApprovals` gains the store/bus handles.
 
 ## 11. Phased rollout
 
-1. **Traits + in-memory refactor (no behavior change).** Introduce `SessionStore`,
-   `ApprovalStore`, `EventBus`; move today's structures behind them; A2A already has
-   `TaskStore`. Ship with `backend = memory`. This is a pure refactor — existing tests are
-   the guard.
+1. **Traits + in-memory refactor (no behavior change).** ✅ **Implemented
+   (2026-07-13).** Introduce `SessionStore`, `ApprovalStore`, `EventBus`; move today's
+   structures behind them; A2A already has `TaskStore`. Ship with `backend = memory`.
+   This is a pure refactor — existing tests are the guard.
 2. **Redis/Valkey backend — A2A task store.** Smallest, highest-value cross-pod win
    (`message:send` + poll works across pods). No bus needed for the poll path.
 3. **Redis/Valkey backend — HITL approvals (store + wake bus).** Cross-pod conversational
@@ -481,6 +488,35 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
   decide per-subsystem.
 - **At-most-once resolve across pods** must be enforced in the store (Lua/`MULTI`), not in
   application code, since two `POST /v1/approvals/{id}` could race on different pods.
+- **Register faults: fail fast vs park-and-time-out.** `PendingApprovals::register` is
+  infallible: store/bus faults are warn-logged and the call parks anyway, failing closed at
+  its timeout. Safe, but when `subscribe` fails the park is _provably_ unwakeable at
+  registration time, and the user still sees a `Pending` event and waits out the full
+  timeout. With a networked backend (phase 3), consider short-circuiting to an immediate
+  terminal outcome (or failing the gate) instead of emitting `Pending` for a dead park.
+- **Resolve atomicity across store + bus.** `PendingApprovals::resolve` records the
+  decision in the store, then publishes the wake. In-memory, both futures complete on
+  their first poll, so the pair runs without a yield point and cannot be interrupted.
+  With a networked backend, the resolving request can be dropped between the two calls
+  (client disconnect mid-await) — decision consumed, wake never published, parked side
+  fails closed at its timeout. Phase 3: shield the store+publish pair in a spawned task,
+  or accept and document the window.
+- **Teardown latency behind store I/O.** The request `Drop` guard cancels wake handles
+  synchronously (`cancel_request_local`), but the spawned cleanup task awaits
+  `ApprovalStore::cancel_request` before `RequestCancellation::unregister` and the
+  event-broker unsubscribes run. A slow networked store stretches that tail cleanup —
+  bound store calls with client-side timeouts when picking the phase-3 driver config.
+- **Trace context across the bus.** Bus payloads carry no OTel trace context, so on a
+  cross-pod resolve the parking pod's wake cannot link to the resolving request's trace
+  (in-process, the wake task is instrumented with the registering request's span). Phase 3
+  should decide whether decision payloads carry W3C `traceparent` for span links, or the
+  two traces stay correlated only by `decision_id` attributes.
+- **Surfacing swallowed backend faults.** The warn-only paths (`register` store/bus faults,
+  `resolve` publish failure, `Drop`-guard cleanup failures) are unreachable with the
+  in-memory backend but become real operational signals in phase 3 — add metrics/counters
+  so operators detect a degraded backend without log-diving. Document the approvals API
+  contract alongside: `204` means the decision was persisted and consumed at-most-once;
+  delivery to the parked waiter is best-effort, backstopped by the fail-closed timeout.
 - **Serialization format** for `ParkedApproval` / `Task` — JSON (debuggable) vs MessagePack
   (compact). Start with JSON.
 - **Multi-tenant / multi-deployment** sharing one cluster — the `key_prefix` covers naming;
