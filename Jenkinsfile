@@ -54,11 +54,11 @@ pipeline {
     GITHUB_ACTION = 'yes'
   }
 
+
   post {
     always {
       script {
         jiraSendBuildInfo site: 'logdna.atlassian.net'
-        sh 'ls -alh -R report'
         archiveArtifacts allowEmptyArchive: true, artifacts: 'report/ci/**', caseSensitive: false, followSymlinks: false
         sh 'make clean'
         if (env.SANITY_BUILD == 'true') {
@@ -76,6 +76,25 @@ pipeline {
   }
 
   stages {
+    stage('Check CI run conditions') {
+      when {
+        beforeAgent true
+        not {
+          anyOf {
+            branch DEFAULT_BRANCH
+            changeRequest()
+            triggeredBy cause: "UserIdCause"
+          }
+        }
+      }
+
+      steps {
+        script {
+          currentBuild.result = 'ABORTED'
+          error("Aborting the build due to no open PR")
+        }
+      }
+    }
 
     stage('Setup') {
       steps{
