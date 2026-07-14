@@ -1,5 +1,16 @@
 ## Changelog
 
+## [3.0.4](https://github.com/mezmo/aura/compare/v3.0.3...v3.0.4) (2026-07-14)
+
+
+### Chores
+
+* **ci**: Only run CI for PRs, on main, or when manually triggered [5522296](https://github.com/mezmo/aura/commit/5522296b2c0d07176fc8b437b795efddb8f4fb04) - Jon Moses
+
+### Documentation
+
+* **adr**: add session-storage cross-pod state decision [729805e](https://github.com/mezmo/aura/commit/729805e713d2496d5eb423aba0db8f9d144f5a3c) - Justin Gross [#325](https://github.com/mezmo/aura/issues/325)
+
 ## [3.0.3](https://github.com/mezmo/aura/compare/v3.0.2...v3.0.3) (2026-07-13)
 
 
