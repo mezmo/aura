@@ -6,7 +6,7 @@ slugify = $(shell echo '$(1)' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]
 
 # Provide standard defaults - set overrides in .config.mk
 SHELL=/bin/bash -o pipefail
-TARGET_DIR = target
+TARGET_DIR = $(or $(CARGO_TARGET_DIR),target)
 COVERAGE_DIR := report
 REPORT_DIR = $(COVERAGE_DIR)/ci
 AURA_AUTO_DOWNLOAD ?= true
@@ -15,11 +15,11 @@ CI ?=
 BUILD_TAG ?= 1
 IS_CI := $(if $(filter true, $(CI)), true,)
 ALWAYS_TIMESTAMP_VERSION ?= false
-APP_NAME ?= $(shell git remote -v | awk '/origin/ && /fetch/ { sub(/\.git/, ""); n=split($$2, origin, "/"); print origin[n]}')
+APP_NAME ?= $(shell git remote -v 2>/dev/null | awk '/origin/ && /fetch/ { sub(/\.git/, ""); n=split($$2, origin, "/"); print origin[n]}')
 ## Define sources for rendering and templating
-GIT_SHA1 ?= $(shell git log --pretty=format:'%h' -n 1)
-GIT_BRANCH ?= $(shell git branch --show-current)
-GIT_URL ?= $(shell git remote get-url origin)
+GIT_SHA1 ?= $(shell git log --pretty=format:'%h' -n 1 2>/dev/null)
+GIT_BRANCH ?= $(shell git branch --show-current 2>/dev/null)
+GIT_URL ?= $(shell git remote get-url origin 2>/dev/null)
 GIT_INFO ?= $(TMP_DIR)/.git-info.$(GIT_SHA1)
 BUILD_URL ?= localbuild://${USER}@$(shell uname -n | sed "s/'//g")
 BUILD_DATESTAMP ?= $(shell date -u '+%Y%m%dT%H%M%SZ')
@@ -34,7 +34,14 @@ DOCKER ?= docker
 DOCKER_FILE := $(PROJECT_ROOT)/Dockerfile
 DOCKER_RUN := $(DOCKER) run --rm -i
 DOCKER_ENV = $(TARGET_DIR)/aura-env
-RUNNER_CMD = $(DOCKER_RUN) --env-file=$(DOCKER_ENV) $(if $(filter true, $(IS_CI)), ,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
+# The env-file CARGO_HOME/RUSTUP_HOME paths are host-side and invalid inside
+# the container, so pin them to the mounted workspace. -e overrides the
+# env-file values.
+RUNNER_TOOLCHAIN_ENV := -e CARGO_HOME=/home/aura/.cargo -e RUSTUP_HOME=/home/aura/.rustup
+# Compiler-cache passthrough, gated on the CI toggle so local $(RUN) is
+# unchanged. Bare -e copies AWS values from the host environment.
+SCCACHE_RUN_ENV = $(if $(AURA_RUSTC_WRAPPER),-e RUSTC_WRAPPER=$(AURA_RUSTC_WRAPPER) -e SCCACHE_BUCKET -e SCCACHE_REGION -e SCCACHE_S3_KEY_PREFIX -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY,)
+RUNNER_CMD = $(DOCKER_RUN) --env-file=$(DOCKER_ENV) $(RUNNER_TOOLCHAIN_ENV) $(SCCACHE_RUN_ENV) $(if $(filter true, $(IS_CI)), ,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 RUNNER_NO_ENV_CMD = $(DOCKER_RUN) $(if $(filter true, $(IS_CI)),,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 DOCKER_RUN_BUILD_ENV := $(RUNNER_CMD)
 BUILD_SLUG := $(call slugify, $(BUILD_TAG))
@@ -130,7 +137,7 @@ docker-build::        ## Build Docker image (full release)
 
 .PHONY:docker-test
 docker-test::         ## Run Docker build with test stage (base)
-	$(DOCKER) build --target release-lint-test -t $(APP_NAME):test .
+	$(DOCKER) build --target lint-test -t $(APP_NAME):test .
 
 .PHONY:docker-build-release
 docker-build-release:: ## Build Docker release stage only

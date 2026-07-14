@@ -22,7 +22,7 @@ pipeline {
   }
 
   parameters {
-    string(name: 'SANITY_BUILD', defaultValue: '', description: 'This a scheduled sanity build that skips releasing.')
+    string(name: 'SANITY_BUILD', defaultValue: '', description: 'This is a scheduled sanity build that skips releasing.')
   }
 
   tools {
@@ -33,7 +33,7 @@ pipeline {
     timeout time: 1, unit: 'HOURS'
     timestamps()
     ansiColor 'xterm'
-    disableConcurrentBuilds()
+    disableConcurrentBuilds(abortPrevious: true)
     buildDiscarder(
       logRotator(
         numToKeepStr: env.BRANCH_NAME == DEFAULT_BRANCH ? '30' : '5',
@@ -52,6 +52,12 @@ pipeline {
     GIT_COMMITTER_EMAIL = 'bot@mezmo.com'
     ENABLE_DOCKER = 'true'
     GITHUB_ACTION = 'yes'
+    // Image tags produced by Build Images and consumed by compose; derived
+    // once here so make and compose never re-derive the slug.
+    AURA_SERVER_IMAGE = "local/aura-server:${BUILD_SLUG}"
+    AURA_TEST_IMAGE = "local/aura-test:${BUILD_SLUG}"
+    BUILD_CACHE_BUCKET = 'ci-oss-build-cache-483535019806-us-east-1-an'
+    BUILD_CACHE_REGION = 'us-east-1'
   }
 
 
@@ -101,6 +107,52 @@ pipeline {
         sh 'make setup'
       }
     } // end setup
+
+    stage('Build Images') {
+      // Preloaded tags are consumed by the Test Suite stage.
+      when {
+        beforeAgent true
+        not {
+          changelog '\\[skip ci\\]'
+        }
+      }
+
+      options {
+        // Seed runs pay two cold dependency cooks plus S3 uploads.
+        timeout(time: 50, unit: 'MINUTES')
+      }
+
+      environment {
+        BUILD_CACHE_PREFIX = 'aura/buildkit/'
+        CACHE_BUILDER = "aura-s3-${BUILD_SLUG}"
+      }
+
+      steps {
+        script {
+          // Authenticated pulls avoid Docker Hub rate limits on shared fleet egress.
+          docker.withRegistry(
+              'https://index.docker.io/v1/',
+              'dockerhub-token-mezmo'
+          ) {
+            withCredentials([
+              aws(
+                credentialsId: 'oss-aws-build-cache',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+              )
+            ]) {
+              sh 'make build-images'
+            }
+          }
+        }
+      }
+
+      post {
+        always {
+          sh 'docker buildx rm "$CACHE_BUILDER" >/dev/null 2>&1 || true'
+        }
+      }
+    }
 
     stage('ChangeSet Validation') {
       parallel {
@@ -201,17 +253,36 @@ pipeline {
         }
       }
 
-      stages {
-        stage('Test Suite: Parallel') {
-          parallel {
-            stage('Integration Tests') {
-              environment {
-                MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
-              }
-              steps {
-                sh 'mkdir -p report'
+      parallel {
+        stage('Integration Tests') {
+          environment {
+            MOCK_MCP_IMAGE = 'mezmo/aura-mock-mcp:latest'
+            // The plain daemon cannot read the S3 layer cache, so a rebuild
+            // would be a silent ~30min uncached build. --no-build consumes
+            // the Build Images tags and fails fast if one is missing.
+            COMPOSE_BUILD = '--no-build'
+            // sccache for the in-container coverage compile; compose maps
+            // this AURA_ toggle onto the cargo wrapper.
+            AURA_RUSTC_WORKSPACE_WRAPPER = 'sccache'
+            SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+            SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+            SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+          }
+          steps {
+            sh 'mkdir -p report'
+            script {
+              // Authenticated pulls avoid Docker Hub rate limits on shared fleet egress.
+              docker.withRegistry(
+                  'https://index.docker.io/v1/',
+                  'dockerhub-token-mezmo'
+              ) {
                 withCredentials([
                   string(credentialsId: 'openai-api-key', variable: 'OPENAI_API_KEY'),
+                  aws(
+                    credentialsId: 'oss-aws-build-cache',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                  )
                 ]) {
                   withReport('coverage', 'make test-integration') {
                     junit testResults: 'report/ci/junit.xml', allowEmptyResults: true
@@ -229,121 +300,63 @@ pipeline {
                   }
                 }
               }
-              post {
-                always {
-                  publishHTML target: [
-                    allowMissing: false,
-                    alwaysLinkToLastBuild: false,
-                    keepAll: true,
-                    reportDir: 'report/ci/html',
-                    reportFiles: '*.html',
-                    reportName: "coverage-${BUILD_TAG}"
-                  ]
-                }
-              }
-            }
-
-            stage('Release Test') {
-              when {
-                not {
-                  expression { CURRENT_BRANCH == DEFAULT_BRANCH }
-                }
-              }
-
-              stages {
-                stage('Build Release Artifacts') {
-                  stages {
-                    stage('Build Linux Artifacts') {
-                      steps {
-                        sh 'make build-binaries-linux PROFILE=debug'
-
-                        stash(
-                          name: 'linux-release-artifacts',
-                          includes: 'dist/**',
-                          allowEmpty: false
-                        )
-                      }
-                    }
-
-                    stage('Build Darwin Artifacts') {
-                      agent {
-                        node {
-                          label 'ec2-fleet-oss-macos'
-                          customWorkspace("/tmp/workspace/${BUILD_SLUG}-darwin")
-                        }
-                      }
-
-                      environment {
-                        ENABLE_DOCKER = 'false'
-                      }
-
-                      steps {
-                        sh 'make build-binaries-darwin PROFILE=debug'
-
-                        stash(
-                          name: 'darwin-release-artifacts',
-                          includes: 'dist/**',
-                          allowEmpty: false
-                        )
-                      }
-
-                      post {
-                        always {
-                          sh 'make clean'
-                        }
-                      }
-                    }
-                  }
-                }
-
-                stage('Verify Release Artifacts') {
-                  steps {
-                    sh 'rm -rf dist'
-                    sh 'mkdir -p dist'
-
-                    unstash 'linux-release-artifacts'
-                    unstash 'darwin-release-artifacts'
-
-                    sh 'make verify-binaries'
-                  }
-                }
-
-                stage('Semantic Release Dry Run') {
-                  environment {
-                    GIT_BRANCH = "${CURRENT_BRANCH}"
-                    BRANCH_NAME = "${CURRENT_BRANCH}"
-                    CHANGE_ID = ''
-                  }
-
-                  steps {
-                    script {
-                      def releaseCmd = 'npm run release:dry'
-                      if (env.CHANGE_FORK) {
-                        sh "git checkout -B ${CURRENT_BRANCH}"
-                        releaseCmd = "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/release-notes-generator"
-                      }
-                      docker.withRegistry(
-                          'https://index.docker.io/v1/',
-                          'dockerhub-token-mezmo'
-                      ) {
-                        withCredentials(RELEASE_CREDENTIALS) {
-                          buildx {
-                            withReport('Release Test', releaseCmd)
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
             }
           }
-
           post {
             always {
-              sh 'make test-integration-down'
+              publishHTML target: [
+                allowMissing: false,
+                alwaysLinkToLastBuild: false,
+                keepAll: true,
+                reportDir: 'report/ci/html',
+                reportFiles: '*.html',
+                reportName: "coverage-${BUILD_TAG}"
+              ]
             }
           }
+        }
+
+        // Cheap release preview: confirms commits parse and a version
+        // computes, with no image build (that happens at main Release).
+        // The file:// repo and plugin list keep it credential-free.
+        stage('Release Dry Run') {
+          when {
+            beforeAgent true
+            not {
+              expression { CURRENT_BRANCH == DEFAULT_BRANCH }
+            }
+          }
+
+          agent {
+            node {
+              label 'ec2-fleet-oss'
+              customWorkspace("/tmp/workspace/${BUILD_SLUG}-dryrun")
+            }
+          }
+
+          tools {
+            nodejs 'NodeJS 24'
+          }
+
+          environment {
+            GIT_BRANCH = "${CURRENT_BRANCH}"
+            BRANCH_NAME = "${CURRENT_BRANCH}"
+            CHANGE_ID = ''
+            ENABLE_DOCKER = 'false'
+          }
+
+          steps {
+            // package-lock=false in .npmrc means npm ci cannot be used.
+            sh 'npm install'
+            sh "git checkout -B ${CURRENT_BRANCH}"
+            withReport('Release Test', "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer")
+          }
+        }
+      }
+
+      post {
+        always {
+          sh 'make test-integration-down'
         }
       }
     }
@@ -417,9 +430,25 @@ pipeline {
 
           parallel {
             stage('Build Linux Artifacts') {
+              environment {
+                AURA_RUSTC_WRAPPER = 'sccache'
+                SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+                SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+                SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+              }
               steps {
                 sh './scripts/set-version.sh "$NEXT_RELEASE_VERSION"'
-                sh 'make build-binaries-linux'
+                script {
+                  withCredentials([
+                    aws(
+                      credentialsId: 'oss-aws-build-cache',
+                      accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                      secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                  ]) {
+                    sh 'make build-binaries-linux'
+                  }
+                }
 
                 stash(
                   name: 'linux-release-artifacts',

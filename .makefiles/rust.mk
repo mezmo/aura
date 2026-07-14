@@ -4,6 +4,7 @@ build:: build-rust
 
 CARGO_BIN_DIR ?= .bin
 NEXTEST_BIN = $(CARGO_BIN_DIR)/cargo-nextest
+NEXTEST_VERSION ?= 0.9.133
 GRCOV_VERSION ?= v0.10.7
 GRCOV_BIN = $(CARGO_BIN_DIR)/grcov
 PATH := $(CARGO_BIN_DIR):$(PATH)
@@ -39,8 +40,13 @@ coverage: $(DOCKER_ENV) $(REPORT_DIR) $(GRCOV_BIN) ## Run the local test suite w
 		--llvm \
 		--branch \
 		--source-dir . \
-		|| touch $(TARGET_DIR)/.coverage-failed
+		|| touch $(TARGET_DIR)/.grcov-failed
 
+	@# Hit/miss/non-cacheable counters land in the lane log when the
+	@# coverage compile ran through sccache.
+	-@if [ -n "$(RUSTC_WORKSPACE_WRAPPER)" ] || [ -n "$(RUSTC_WRAPPER)" ]; then \
+		sccache --show-stats || true; \
+	fi
 	@if [ -f $(TARGET_DIR)/.nextest-failed ] || [ -f $(TARGET_DIR)/.grcov-failed ]; then \
 		rm -f $(TARGET_DIR)/.nextest-failed $(TARGET_DIR)/.grcov-failed; \
 		exit 1; \
@@ -66,6 +72,11 @@ update-lockfile: $(DOCKER_ENV) ## Regenerate Cargo.lock after version changes
 .PHONY:clean-rust
 clean-rust: ## Clean up rust build artifacts
 	$(RUN_NO_ENV) cargo clean
+
+clean:: clean-toolchain-cache
+.PHONY:clean-toolchain-cache
+clean-toolchain-cache: ## Remove the workspace-scoped cargo and rustup homes
+	$(RUN_NO_ENV) rm -rf .cargo .rustup
 
 .PHONY:clean-report
 clean-report:  ## Clear out the report directory
@@ -112,7 +123,10 @@ build-binary-linux-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/
 	$(RUN) bash -c "\
 		$(call require_host,Linux,x86_64) \
 		cargo build $(CARGO_PROFILE_FLAG) --bin aura-web-server && \
-		cargo build $(CARGO_PROFILE_FLAG) -p aura-cli --bin aura"
+		cargo build $(CARGO_PROFILE_FLAG) -p aura-cli --bin aura; \
+		rc=\$$?; \
+		if [ -n \"\$$RUSTC_WRAPPER\" ]; then sccache --show-stats || true; fi; \
+		exit \$$rc"
 	cp target/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
 	cp target/$(PROFILE)/aura $(DIST_DIR)/aura-linux-amd64
 
@@ -125,7 +139,10 @@ build-binary-linux-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/
 		export CC_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-gcc; \
 		export CXX_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-g++; \
 		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu --bin aura-web-server && \
-		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu -p aura-cli --bin aura"
+		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu -p aura-cli --bin aura; \
+		rc=\$$?; \
+		if [ -n \"\$$RUSTC_WRAPPER\" ]; then sccache --show-stats || true; fi; \
+		exit \$$rc"
 	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
 	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura $(DIST_DIR)/aura-linux-arm64
 
@@ -169,13 +186,23 @@ EXPECTED_BINARIES := \
 	aura-darwin-arm64 aura-web-server-darwin-arm64
 
 .PHONY: verify-binaries
-verify-binaries: build-checksums ## Verify every expected binary is present and checksummed correctly
+verify-binaries: build-checksums $(DOCKER_ENV) ## Verify every expected binary is present and checksummed correctly
 	@cd $(DIST_DIR) && \
 	for f in $(EXPECTED_BINARIES); do \
 		[ -f "$$f" ] || { echo "error: missing binary: $$f" >&2; exit 1; }; \
 		grep -q " $$f\$$" checksums.txt || { echo "error: $$f absent from checksums.txt" >&2; exit 1; }; \
 	done
 	cd $(DIST_DIR) && sha256sum -c checksums.txt
+	@# Execution smoke for the pair the runner container can actually run;
+	@# cross-arch artifacts are covered by presence + checksum only. The
+	@# chmod restores the executable bit, which stash/unstash can drop.
+	@if [ "$(ENABLE_DOCKER)" = "true" ]; then \
+		chmod +x $(DIST_DIR)/aura-linux-amd64 $(DIST_DIR)/aura-web-server-linux-amd64 && \
+		$(RUN) ./dist/aura-linux-amd64 --version && \
+		$(RUN) ./dist/aura-web-server-linux-amd64 --version; \
+	else \
+		echo "skipping execution smoke: runner container disabled"; \
+	fi
 
 clean:: clean-dist
 
@@ -198,7 +225,7 @@ $(NEXTEST_BIN): $(CARGO_BIN_DIR)
 		*) echo "Unsupported platform"; exit 1;; \
 	esac; \
 	echo "Downloading for $$plat"; \
-	curl -LsSf "https://get.nexte.st/latest/$$plat" | tar zxf - -C $(CARGO_BIN_DIR); \
+	curl -LsSf "https://get.nexte.st/$(NEXTEST_VERSION)/$$plat" | tar zxf - -C $(CARGO_BIN_DIR); \
 	chmod +x $@; \
 	touch $@
 
@@ -231,4 +258,3 @@ $(GRCOV_BIN): | $(CARGO_BIN_DIR)
 	curl -LsSf "https://github.com/mozilla/grcov/releases/download/$(GRCOV_VERSION)/grcov-$$target.tar.bz2" | tar xjf - -C $(CARGO_BIN_DIR); \
 	chmod +x "$@"; \
 	touch "$@"
-

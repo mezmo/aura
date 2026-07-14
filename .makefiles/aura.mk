@@ -6,9 +6,11 @@ start: ## Start the docker compose setup
 stop: ## Stop the docker compose setup
 	docker compose -p aura-$(BUILD_SLUG) -f compose/base.yml -f compose/dev.yml down
 
+COMPOSE_BUILD ?= --build
+
 .PHONY:test-integration
 test-integration: $(REPORT_DIR) ## run CI test suite via docker compose
-	docker compose -p aura-test-$(BUILD_SLUG) -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test --build
+	docker compose -p aura-test-$(BUILD_SLUG) -f compose/base.yml -f compose/test.yml up --remove-orphans --exit-code-from aura-integration-test $(COMPOSE_BUILD)
 
 .PHONY:test-integration-down
 test-integration-down:  ## Cleanup integration test containers
@@ -16,6 +18,20 @@ test-integration-down:  ## Cleanup integration test containers
 		-f compose/base.yml \
 		-f compose/test.yml \
 		down --remove-orphans --volumes --rmi=local 2>/dev/null || true
+	@$(MAKE) clean-preloaded-images
+
+# Hooked into clean:: because a build that fails before the integration lane
+# never reaches test-integration-down; the pipeline's post-build make clean is
+# the only step guaranteed to run.
+clean:: clean-preloaded-images
+.PHONY:clean-preloaded-images
+clean-preloaded-images: ## Remove the per-build preloaded image tags
+	@# down --rmi=local skips custom-tagged images; without this, per-build
+	@# tags accumulate multi-GB images on reused fleet agents. Empty vars
+	@# mean a local run, whose dev-tagged images stay.
+	-@if [ -n "$(AURA_TEST_IMAGE)" ] || [ -n "$(AURA_SERVER_IMAGE)" ]; then \
+		docker rmi -f $(AURA_TEST_IMAGE) $(AURA_SERVER_IMAGE) || true; \
+	fi
 
 .PHONY:test-integration-local-up
 test-integration-local-up:  ## Start local aura infra for testing
