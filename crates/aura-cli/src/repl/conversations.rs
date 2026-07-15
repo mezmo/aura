@@ -239,7 +239,7 @@ impl ConversationStore {
         }
 
         // Sort newest first
-        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.2));
         entries.into_iter().map(|(u, n, _)| (u, n)).collect()
     }
 
