@@ -431,7 +431,6 @@ pipeline {
           parallel {
             stage('Build Linux Artifacts') {
               environment {
-                AURA_RUSTC_WRAPPER = 'sccache'
                 SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
                 SCCACHE_REGION = "${BUILD_CACHE_REGION}"
                 SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
@@ -446,7 +445,14 @@ pipeline {
                       secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                     )
                   ]) {
-                    sh 'make build-binaries-linux'
+                    // sccache reaches its S3 cache with the credentials bound
+                    // above, so enable the wrapper only inside this block.
+                    // Stage-wide it would route the credential-free
+                    // set-version step through sccache and time out on the
+                    // IMDS credential fallback.
+                    withEnv(['AURA_RUSTC_WRAPPER=sccache']) {
+                      sh 'make build-binaries-linux'
+                    }
                   }
                 }
 

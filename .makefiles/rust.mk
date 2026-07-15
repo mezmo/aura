@@ -66,8 +66,11 @@ check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features)
 	$(RUN) cargo test -p aura-cli --no-default-features
 
 .PHONY: update-lockfile
+# cargo update only re-resolves Cargo.lock and never compiles, so strip any
+# sccache wrapper the CI env injects: the S3-backed cache would demand AWS
+# creds this step lacks and time out on the IMDS fallback.
 update-lockfile: $(DOCKER_ENV) ## Regenerate Cargo.lock after version changes
-	$(RUN) cargo update --quiet --workspace
+	$(RUN) env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER cargo update --quiet --workspace
 
 .PHONY:clean-rust
 clean-rust: ## Clean up rust build artifacts
