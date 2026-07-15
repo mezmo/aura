@@ -1,4 +1,51 @@
-use serde_json::Value;
+use serde_json::{Value, json};
+
+/// Replaces bare boolean JSON-Schema nodes (`true`/`false`) with an equivalent
+/// object-schema representation, wherever they appear in `properties`,
+/// `patternProperties`, `items`, `prefixItems`, `$defs`/`definitions`, or
+/// `anyOf`/`oneOf`/`allOf`.
+///
+/// Bare booleans are valid JSON Schema shorthand (`true` = matches anything,
+/// `false` = matches nothing), commonly emitted by Pydantic v2 for
+/// `Dict[str, Any]`-typed fields. Backends that build a constrained-decoding
+/// grammar directly from the schema (e.g. llama.cpp's `--jinja` automatic
+/// parser generation) don't support this shorthand and reject the whole
+/// request with "Unrecognized schema: true".
+pub fn normalize_bare_boolean_schemas(schema: &mut Value) -> &mut Value {
+    normalize_bare_boolean_schemas_recursive(schema);
+    schema
+}
+
+fn normalize_bare_boolean_schemas_recursive(schema: &mut Value) {
+    if let Value::Object(map) = schema {
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            if let Some(Value::Array(arr)) = map.get_mut(key) {
+                for item in arr.iter_mut() {
+                    replace_bare_bool(item);
+                    normalize_bare_boolean_schemas_recursive(item);
+                }
+            }
+        }
+        for key in ["$defs", "definitions", "properties", "patternProperties"] {
+            if let Some(Value::Object(obj)) = map.get_mut(key) {
+                for sub in obj.values_mut() {
+                    replace_bare_bool(sub);
+                    normalize_bare_boolean_schemas_recursive(sub);
+                }
+            }
+        }
+        if let Some(items) = map.get_mut("items") {
+            replace_bare_bool(items);
+            normalize_bare_boolean_schemas_recursive(items);
+        }
+    }
+}
+
+fn replace_bare_bool(node: &mut Value) {
+    if let Value::Bool(b) = node {
+        *node = if *b { json!({}) } else { json!({"not": {}}) };
+    }
+}
 
 /// Recursively sets `additionalProperties: false` on all object schemas in a JSON Schema.
 ///
@@ -434,6 +481,58 @@ fn make_nullable(schema: &mut Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_bare_boolean_schema_nodes_normalized() {
+        // Real-world shape: a Dict[str, Any]-typed field renders as a bare
+        // `true` schema (Pydantic v2), alongside a nested `additionalProperties:
+        // true` on a sibling object field. Both must survive as valid object
+        // schemas with no bare Value::Bool node anywhere in the tree.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "user_config": true,
+                "extra_fields": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            }
+        });
+
+        normalize_bare_boolean_schemas(&mut schema);
+
+        assert_eq!(schema["properties"]["user_config"], json!({}));
+        assert!(!schema["properties"]["user_config"].is_boolean());
+        assert_eq!(
+            schema["properties"]["extra_fields"]["additionalProperties"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn test_bare_boolean_in_prefix_items_and_pattern_properties() {
+        let mut schema = json!({
+            "type": "object",
+            "patternProperties": {
+                "^x-": true
+            },
+            "properties": {
+                "coords": {
+                    "type": "array",
+                    "prefixItems": [true, false]
+                }
+            }
+        });
+
+        normalize_bare_boolean_schemas(&mut schema);
+
+        assert_eq!(schema["patternProperties"]["^x-"], json!({}));
+        assert_eq!(schema["properties"]["coords"]["prefixItems"][0], json!({}));
+        assert_eq!(
+            schema["properties"]["coords"]["prefixItems"][1],
+            json!({"not": {}})
+        );
+    }
 
     #[test]
     fn test_simple_object_with_required() {
