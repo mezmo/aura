@@ -60,6 +60,11 @@ nextest: $(DOCKER_ENV) $(NEXTEST_BIN) $(REPORT_DIR)
 lint-rust: | $(DOCKER_ENV) $(REPORT_DIR)  ## lint rust code via clippy
 	$(RUN) cargo clippy $(if $(IS_CI),-q,) --all-targets --all-features $(if $(IS_CI),--message-format=json,) -- -D warnings $(if $(IS_CI),> $(REPORT_DIR)/clippy.json,)
 
+.PHONY:lint-rust-ci
+lint-rust-ci: | $(REPORT_DIR)  ## lint rust code via clippy against the prebuilt AURA_TEST_IMAGE (CI only; needs `make build-images` first)
+	$(if $(AURA_TEST_IMAGE),,$(error AURA_TEST_IMAGE is not set; run make build-images first))
+	$(DOCKER) run --rm $(AURA_TEST_IMAGE) cargo clippy -q --all-targets --all-features --message-format=json -- -D warnings > $(REPORT_DIR)/clippy.json
+
 .PHONY: check-cli-http-only
 check-cli-http-only: $(DOCKER_ENV) ## Verify the HTTP-only (no-default-features) aura-cli still builds
 	$(RUN) cargo clippy -p aura-cli --no-default-features --all-targets -- -D warnings

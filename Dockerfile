@@ -144,8 +144,10 @@ RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
 
 USER aura
 
-# grcov reads llvm-tools' profdata; lint + nightly rustfmt are runner-only.
-RUN rustup component add llvm-tools
+# grcov reads llvm-tools' profdata. clippy rides this image's cook-debug
+# deps for CI lint; rustfmt stays runner-only (fmt-check doesn't compile,
+# so it gains nothing from these cached deps).
+RUN rustup component add llvm-tools clippy
 
 WORKDIR /home/aura
 # No .git: worktree pointer files are invalid inside the image.

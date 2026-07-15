@@ -207,7 +207,7 @@ pipeline {
         stage("Rust Lint") {
           steps {
             withChecks('clippy') {
-              sh script: "make lint-rust", returnStatus: true
+              sh script: "make lint-rust-ci", returnStatus: true
               recordIssues( // needs to be in same block as withChecks
                 tool: cargo(pattern: 'report/ci/clippy.json'),
                 id: 'clippy',
