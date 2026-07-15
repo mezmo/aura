@@ -415,6 +415,13 @@ impl SizePromotion {
         }
     }
 
+    pub fn threshold_bytes(&self) -> usize {
+        match self {
+            Self::PromoteAll => 0,
+            Self::LargerThan(threshold) => threshold.0.get(),
+        }
+    }
+
     pub fn qualifies(&self, output: &str) -> bool {
         match self {
             Self::PromoteAll => true,
@@ -444,6 +451,13 @@ impl DurationPromotion {
             Self::Disabled
         } else {
             Self::LongerThan(NonZeroDuration(Duration::from_millis(ms)))
+        }
+    }
+
+    pub fn threshold_millis(&self) -> u64 {
+        match self {
+            Self::Disabled => 0,
+            Self::LongerThan(threshold) => threshold.0.as_millis() as u64,
         }
     }
 

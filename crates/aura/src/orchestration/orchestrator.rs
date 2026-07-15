@@ -52,7 +52,6 @@ use crate::config::{AgentRuntimeConfig, LlmConfig};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
-use crate::string_utils::safe_truncate;
 use crate::tool_call_observer::ToolCallObserver;
 
 use super::tools::RoutingToolSet;
@@ -565,16 +564,17 @@ impl Orchestrator {
                 worker_name: worker_name.map(String::from),
                 iteration,
                 persistence_enabled,
-                size_threshold: self.config.tool_output_artifact_threshold(),
-                duration_threshold_ms: self.config.tool_output_duration_threshold_ms(),
+                size_threshold: self.bounding.tool_output_spill().size().threshold_bytes(),
+                duration_threshold_ms: self.bounding.tool_output_spill().duration().threshold_millis(),
             },
         ));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
             self.tool_call_observer.clone(),
             task_id,
         ));
-        let nudge = self.config.duplicate_call_nudge_threshold;
-        let block = self.config.duplicate_call_block_threshold;
+        let policy = self.bounding.duplicate_call_policy();
+        let nudge = policy.nudge_threshold().unwrap_or(0);
+        let block = policy.block_threshold();
         let escalation_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let duplicate_guard = Arc::new(DuplicateCallGuard::new(
             nudge,
@@ -1427,7 +1427,7 @@ impl Orchestrator {
                 ctx,
                 self.config.max_planning_cycles,
                 self.config.show_tool_reasoning_in_continuation(),
-                self.config.result_summary_length(),
+                self.bounding.result_spill().summary_width().get(),
             ),
         };
 
@@ -1568,10 +1568,14 @@ impl Orchestrator {
                     attempt,
                     attempt_start.elapsed().as_secs_f64(),
                     planning_response.variant_name(),
-                    truncate_query(&routing_rationale, 80),
+                    self.bounding
+                        .log_preview_widths()
+                        .routing_rationale()
+                        .truncate(&routing_rationale),
                 );
 
                 let planning_response = Self::enforce_routing_config(
+                    &self.bounding,
                     planning_response,
                     query,
                     self.config.allow_direct_answers,
@@ -1606,7 +1610,11 @@ impl Orchestrator {
                 }
             }
 
-            let (response_preview, _) = safe_truncate(&response.content, 300);
+            let response_preview = self
+                .bounding
+                .log_preview_widths()
+                .routing_response()
+                .truncate(&response.content);
             tracing::warn!(
                 "No routing tool called (attempt {}/{}). Appending correction to conversation. Response: {}",
                 attempt,
@@ -1636,14 +1644,20 @@ impl Orchestrator {
         let fallback = PlanningResponse::StepsPlan {
             goal: query.to_string(),
             steps: vec![super::types::StepInput::LeafTask {
-                task: format!("Execute: {}", truncate_query(query, 100)),
+                task: format!(
+                    "Execute: {}",
+                    self.bounding
+                        .plan_content_widths()
+                        .task_description()
+                        .truncate(query)
+                ),
                 worker: None,
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
         };
 
-        let (query_preview, _) = safe_truncate(query, 100);
+        let query_preview = self.bounding.log_preview_widths().query_log().truncate(query);
         tracing::info!("Created fallback single-task plan for: {}", query_preview);
 
         Ok((
@@ -1658,9 +1672,11 @@ impl Orchestrator {
     /// When `allow_direct_answers` or `allow_clarification` is false,
     /// converts the response to a single-task `StepsPlan`.
     ///
-    /// Takes flags as arguments (rather than reading `self.config`) so the
-    /// transformation is unit-testable without an `Orchestrator` instance.
+    /// Takes flags and the bounding snapshot as arguments (rather than reading
+    /// `self.config`) so the transformation is unit-testable without an
+    /// `Orchestrator` instance.
     fn enforce_routing_config(
+        bounding: &BoundingConfig,
         response: PlanningResponse,
         query: &str,
         allow_direct_answers: bool,
@@ -1678,13 +1694,22 @@ impl Orchestrator {
                 PlanningResponse::StepsPlan {
                     goal: query.to_string(),
                     steps: vec![super::types::StepInput::LeafTask {
-                        task: format!("Answer the user's query: {}", truncate_query(query, 80)),
+                        task: format!(
+                            "Answer the user's query: {}",
+                            bounding
+                                .plan_content_widths()
+                                .direct_answer_task()
+                                .truncate(query)
+                        ),
                         worker: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
                         routing_rationale,
-                        truncate_query(answer, 100)
+                        bounding
+                            .plan_content_widths()
+                            .direct_answer_rationale()
+                            .truncate(answer)
                     ),
                     planning_summary: String::new(),
                 }
@@ -1702,14 +1727,20 @@ impl Orchestrator {
                     steps: vec![super::types::StepInput::LeafTask {
                         task: format!(
                             "Investigate and answer the user's query: {}",
-                            truncate_query(query, 80)
+                            bounding
+                                .plan_content_widths()
+                                .clarification_task()
+                                .truncate(query)
                         ),
                         worker: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
                         routing_rationale,
-                        truncate_query(question, 100)
+                        bounding
+                            .plan_content_widths()
+                            .clarification_question()
+                            .truncate(question)
                     ),
                     planning_summary: String::new(),
                 }
@@ -1774,7 +1805,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
     /// Build worker section with tool names (ToolVisibility::Summary).
     fn build_workers_section_with_tools(&self) -> String {
         let worker_tools = self.resolve_worker_tools();
-        let max_tools = self.config.max_tools_per_worker;
+        let max_tools = self.bounding.tool_list_limit().get();
         let mut sections = Vec::new();
 
         for (name, config) in &self.config.workers {
@@ -1809,7 +1840,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     fn build_workers_section_with_full_tools(&self) -> String {
         let worker_tools = self.resolve_worker_tools();
         let tool_descriptions = self.get_all_tool_descriptions();
-        let max_tools = self.config.max_tools_per_worker;
+        let max_tools = self.bounding.tool_list_limit().get();
         let mut sections = Vec::new();
 
         for (name, config) in &self.config.workers {
@@ -2204,7 +2235,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         // Load and inject session history from prior runs
-        if self.config.session_history_turns() > 0
+        if self.bounding.session_history_limit().is_enabled()
             && let Some(memory_dir) = self.agent_config.effective_memory_dir()
         {
             let persistence = self.persistence.lock().await;
@@ -2213,7 +2244,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     std::path::Path::new(memory_dir),
                     session_id,
                     persistence.run_id(),
-                    self.config.session_history_turns(),
+                    self.bounding.session_history_limit().get(),
                 )
                 .await
                 .unwrap_or_default();
@@ -2821,7 +2852,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             )))
                             .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
-                        let (task_preview, _) = safe_truncate(&task_desc, 100);
+                        let task_preview = self
+                            .bounding
+                            .log_preview_widths()
+                            .task_description_log()
+                            .truncate(&task_desc);
                         tracing::warn!(
                             "Worker '{}' failed task {} after {}ms ({}): {}. Task was: {}",
                             worker_label,
@@ -2867,12 +2902,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
         worker_name: Option<&str>,
         result: String,
     ) -> String {
-        let threshold = self.config.result_artifact_threshold();
-        if result.len() <= threshold {
+        let spill = self.bounding.result_spill();
+        if spill.threshold().allows_inline(&result) {
             return result;
         }
 
-        let summary_len = self.config.result_summary_length();
         let persistence = self.persistence.lock().await;
         let iteration = persistence.current_iteration();
 
@@ -2881,7 +2915,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .await
         {
             Ok(filename) => {
-                let (truncated, _) = safe_truncate(&result, summary_len);
+                let truncated = spill.truncate_to_summary(&result);
                 format!(
                     "{}\n\n[Full result ({} chars) saved to artifact: {}]",
                     truncated,
@@ -3067,7 +3101,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         {
             let span = tracing::Span::current();
-            let (task_preview, _) = safe_truncate(task_description, 200);
+            let task_preview = self
+                .bounding
+                .log_preview_widths()
+                .task_description_span()
+                .truncate(task_description);
             span.record("orchestration.task", task_preview);
             if let Some(name) = worker_name {
                 span.record("orchestration.worker", *name);
@@ -3403,10 +3441,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         format!("✓ complete ({} chars)", result.len())
                     }
                     TaskState::Failed { error, .. } => {
-                        let (truncated, was_truncated) =
-                            safe_truncate(error, self.config.result_summary_length());
-                        let suffix = if was_truncated { " [truncated]" } else { "" };
-                        format!("✗ failed: {}{}", truncated, suffix)
+                        let summary = self.bounding.result_spill().truncate_to_summary(error);
+                        let suffix = if summary.was_truncated() { " [truncated]" } else { "" };
+                        format!("✗ failed: {}{}", summary, suffix)
                     }
                     TaskState::Pending => {
                         let blocked_by = t.dependencies.iter().any(|dep_id| {
@@ -3565,7 +3602,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
     ) -> Result<String, StreamError> {
         let span = tracing::Span::current();
-        let (goal_preview, _) = safe_truncate(query, 200);
+        let goal_preview = self.bounding.log_preview_widths().goal().truncate(query);
         span.record("orchestration.goal", goal_preview);
 
         let orchestration_start = Instant::now();
@@ -4199,7 +4236,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         use super::persistence::{
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
         };
-        use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
 
@@ -4265,7 +4301,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map(|s| s.summary.clone())
                     .or_else(|| match &t.state {
                         TaskState::Complete { result } => {
-                            Some(safe_truncate(result, 200).0.to_string())
+                            Some(self.bounding.manifest_widths().result_preview().truncate(result))
                         }
                         _ => None,
                     }),
@@ -4322,14 +4358,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
         summary: Option<&str>,
     ) {
         use super::persistence::{RunManifest, RunStatus};
-        use crate::string_utils::safe_truncate;
 
         let persistence = self.persistence.lock().await;
 
         let response_summary = Some(
             summary
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| safe_truncate(response, 200).0.to_string()),
+                .unwrap_or_else(|| self.bounding.manifest_widths().response_summary().truncate(response)),
         );
 
         let manifest = RunManifest {
@@ -4390,16 +4425,6 @@ fn artifact_kind_from_filename(filename: &str) -> super::persistence::ArtifactKi
     }
 }
 
-/// Truncate a query string for logging.
-fn truncate_query(query: &str, max_len: usize) -> String {
-    let (truncated, was_truncated) = safe_truncate(query, max_len);
-    if was_truncated {
-        format!("{truncated}...")
-    } else {
-        truncated.to_string()
-    }
-}
-
 /// Check if an error indicates a MaxDepthError from rig's ReAct loop.
 fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     let msg = error.to_string();
@@ -4439,24 +4464,6 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_truncate_query_short() {
-        assert_eq!(truncate_query("short", 10), "short");
-    }
-
-    #[test]
-    fn test_truncate_query_long() {
-        assert_eq!(
-            truncate_query("this is a longer query", 10),
-            "this is a ..."
-        );
-    }
-
-    #[test]
-    fn test_truncate_query_exact_length() {
-        assert_eq!(truncate_query("exactly10!", 10), "exactly10!");
-    }
 
     #[test]
     fn test_is_context_overflow_error_openai_style() {
@@ -4848,7 +4855,8 @@ mod tests {
             routing_rationale: "trivial".to_string(),
             response_summary: None,
         };
-        let out = Orchestrator::enforce_routing_config(direct, "what is 6*7?", true, true);
+        let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
+        let out = Orchestrator::enforce_routing_config(&bounding, direct, "what is 6*7?", true, true);
         assert!(matches!(out, PlanningResponse::Direct { .. }));
 
         let clar = PlanningResponse::Clarification {
@@ -4856,7 +4864,7 @@ mod tests {
             options: None,
             routing_rationale: "ambiguous".to_string(),
         };
-        let out = Orchestrator::enforce_routing_config(clar, "do the thing", true, true);
+        let out = Orchestrator::enforce_routing_config(&bounding, clar, "do the thing", true, true);
         assert!(matches!(out, PlanningResponse::Clarification { .. }));
     }
 
@@ -4869,7 +4877,8 @@ mod tests {
             routing_rationale: "trivial answer".to_string(),
             response_summary: None,
         };
-        let out = Orchestrator::enforce_routing_config(direct, "what is the meaning?", false, true);
+        let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
+        let out = Orchestrator::enforce_routing_config(&bounding, direct, "what is the meaning?", false, true);
 
         match out {
             PlanningResponse::StepsPlan {
@@ -4906,7 +4915,8 @@ mod tests {
             options: Some(vec!["prod".to_string(), "stage".to_string()]),
             routing_rationale: "ambiguous env".to_string(),
         };
-        let out = Orchestrator::enforce_routing_config(clar, "check service health", true, false);
+        let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
+        let out = Orchestrator::enforce_routing_config(&bounding, clar, "check service health", true, false);
 
         match out {
             PlanningResponse::StepsPlan {
@@ -4948,7 +4958,8 @@ mod tests {
 
         // Both flags off — should still pass through, since the response is
         // already a StepsPlan and the override only converts Direct/Clarification.
-        let out = Orchestrator::enforce_routing_config(original, "compute mean", false, false);
+        let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
+        let out = Orchestrator::enforce_routing_config(&bounding, original, "compute mean", false, false);
         match out {
             PlanningResponse::StepsPlan {
                 goal,
