@@ -58,6 +58,7 @@ use crate::tool_call_observer::ToolCallObserver;
 use super::tools::RoutingToolSet;
 use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
+use super::bounding::BoundingConfig;
 use super::config::OrchestrationConfig;
 use super::context::{
     AncestorDistance, CoordinatorTurn, CorrelationLabel, DependencyRelation, EvidenceEntry,
@@ -373,6 +374,11 @@ pub struct Orchestrator {
     /// Orchestration configuration
     config: OrchestrationConfig,
 
+    /// Typed bounding snapshot built from `config` at construction time.
+    /// Every truncate/spill/display-limit/history-limit call site reads
+    /// from this instead of raw config fields.
+    bounding: BoundingConfig,
+
     /// The underlying agent configuration (for creating workers)
     agent_config: AgentRuntimeConfig,
 
@@ -497,7 +503,8 @@ impl Orchestrator {
 
         Ok(Self {
             orchestrator_id,
-            config: orchestration_config,
+            config: orchestration_config.clone(),
+            bounding: BoundingConfig::from_orchestration(&orchestration_config),
             agent_config,
             tool_call_observer,
             mcp_manager,
