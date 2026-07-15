@@ -1,7 +1,7 @@
 services:
   # ── Aura Agent Server ──────────────────────────────────────────────
   aura:
-    image: mezmo/aura:1-latest
+    image: mezmo/aura:latest
     pull_policy: always
     container_name: aura
     command:
