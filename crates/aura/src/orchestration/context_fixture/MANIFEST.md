@@ -144,8 +144,8 @@ within-iteration file order is filesystem-dependent).
 
 | Rule | Covered by |
 |---|---|
-| User turn pushed verbatim (planning wrapper, then each continuation wrapper) | every continuation fixture - COVERED by the S3 R3 comparison gate (`gate_r8_conversation_growth` in `golden_tests.rs`): production `push_user_turn` / `push_assistant_turn` helpers extracted from `plan_with_routing` are shared with the envelope builder, so the growth rule is production-emitted, not re-stated |
-| Compact assistant turn (`compact_decision_turn` → `CoordinatorTurn::render`, `create_plan` variant, ~136-char shape) | every continuation fixture (turn TEXT is production code via `compact_decision_turn`; its position in the conversation is now production-emitted via the shared `push_assistant_turn` helper - R8 closed) |
+| User turn pushed verbatim (planning wrapper, then each continuation wrapper) | every continuation fixture - COVERED by the S3 R8 comparison gate (`gate_r8_conversation_growth` in `golden_tests.rs`): production `push_user_turn` / `push_assistant_turn` helpers extracted from `plan_with_routing` are shared with the envelope builder, but the SEQUENCE (how many iterations, in what order) is still constructed test-side, so the growth rule is partially production-emitted, not re-stated |
+| Compact assistant turn (`compact_decision_turn` → `CoordinatorTurn::render`, `create_plan` variant, ~136-char shape) | every continuation fixture (turn TEXT is production code via `compact_decision_turn`; its position in the conversation is now partially production-emitted via the shared `push_assistant_turn` helper - the sequence is still test-side, so R8 is partially closed) |
 | Terminal decision turns (`respond_directly` / `request_clarification` renders) | EXCLUDED: terminal decisions end the run, so they never precede a later planning call inside one envelope; owning test: `terminal_turns_record_the_model_text_verbatim` (`context/turn.rs`). `PlanDecision` makes them unrepresentable mid-thread. |
 | Compact-turn fallback tiers (model text / bare variant name) | EXCLUDED: degenerate-decision path (empty rationale/plan), unreachable from validated fixtures; owning test: `test_compact_decision_turn_fallback_tiers` (`frame_validation_tests.rs`, added by the S2 repair round - no prior test invoked the fallback arms). |
 | Correction retry message (`ROUTING_TOOL_REQUIRED` as attempt > 1 prompt) | EXCLUDED: parse-failure path only; constant pinned in `prompt_constants.rs`. |
@@ -206,6 +206,13 @@ here carries a complete, reachable triple.
 | `coordinator_preamble_full_appends` | `vector_search_*` | live vector-store manager |
 | `worker_role_frame_direct` | `vector_search_*`, scratchpad exploration tools | live manager; live token-counter/storage |
 | `worker_generic_fallback` | scratchpad exploration tools | live token-counter/storage |
+
+### 6b. Tool registration order (R8 comparison gates)
+
+| Gate | Claim | Status |
+|---|---|---|
+| `gate_r8_coordinator_tool_order` | Coordinator tool registration order matches `build_agent_with_tools` | SHAPE-ASSERTED: the gate mirrors the production order via `coordinator_tool_order_for_golden`, but it does not call `build_agent_with_tools` directly; a production reordering could false-pass. The gate detects drift in the re-stated order, not in production. |
+| `gate_r8_worker_tool_order` | Worker tool definition order matches `Agent::add_all_tools` | SHAPE-ASSERTED: the gate asserts the order returned by `worker_tool_definitions` against a hard-coded vector; a production reordering could false-pass. |
 
 ## 7. Exclusions and pinned environment (claim boundary)
 

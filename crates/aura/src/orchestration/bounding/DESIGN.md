@@ -2,8 +2,8 @@
 
 Baseline: aura `3136fe19`, branch `card/S3`. Scope: the `bounding` module
 that consolidates every truncate/summarize/spill decision behind one typed
-budget config. The skeleton lands first with `todo!()` bodies; the
-implementation phase will rewire production call sites without changing any
+budget config. The skeleton landed first with `todo!()` bodies; the
+implementation phase has rewired production call sites without changing any
 S2 manifest surface.
 
 This is a pure-consolidation refactor: the repaired skeleton models the
@@ -27,7 +27,7 @@ public enum variants they appear in are well-formed.
 | `BoundingConfig` | Centralizes the byte/char bounding decisions, display limits, and session-history limit used by the coordinator and worker flows. Does NOT own the token budgets (see R7). | A partially-built bounding snapshot, or a fixed-baseline width that does not match the accepted baseline binary |
 | `ByteThreshold` | Byte-based bounds that treat zero as a sentinel ("promote all" / "spill all non-empty") keep that semantics explicit | Negative thresholds (unrepresentable via `usize`) |
 | `ResultSummaryWidth` | The same config value drives both the artifact stand-in prefix and replan execution-summary error truncation; production accepts zero (empty prefix + marker) and summary wider than threshold | None; any `usize` is representable |
-| `ResultSpillBudget` | A worker result either stays inline (byte length at or below threshold) or spills to an artifact with a bounded inline stand-in summary | None; production accepts threshold 0, summary 0, and summary larger than threshold |
+| `ResultSpillBudget` | A worker result either stays inline (byte length at or below threshold) or spills to an artifact with a bounded inline preview | None; production accepts threshold 0, summary 0, and summary larger than threshold |
 | `ResultSpillDecision` | `ResultSpillBudget::decide` returns either the original inline result or the spill stand-in; the caller never measures bytes itself. `truncate_to_summary` serves the replan error site, which truncates to `summary_width` regardless of the spill threshold. | A caller that bypasses `decide`/`truncate_to_summary` and re-measures with a mismatched unit |
 | `TruncatedSummary` | Carries the truncated summary text and cut flag produced by `ResultSpillBudget::truncate_to_summary`; implements `Display` for `.to_string()` and exposes `was_truncated()` plus a consuming `into_string()`. | None; any `String` + `bool` pair is representable |
 | `SizePromotion` | Tool-output size promotion: threshold 0 means promote all (including empty), a positive threshold means larger than that byte count | None; any `usize` is representable |
@@ -61,34 +61,34 @@ public enum variants they appear in are well-formed.
 
 ## Visibility/seam table
 
-The skeleton introduces the `bounding` module and adds a single module
-declaration in `orchestration/mod.rs`. No production call sites are rewired
-in this phase.
+The skeleton introduced the `bounding` module and added a single module
+declaration in `orchestration/mod.rs`. Phase B has wired the production call
+sites listed below; the table now records the wired seams.
 
-| Production item today | Visibility at 3136fe19 | S3 seam plan |
+| Production item today | Visibility at 3136fe19 | S3 seam plan (Phase B wired) |
 |---|---|---|
 | `OrchestrationConfig` pub fields (`max_tools_per_worker`, `duplicate_call_nudge_threshold`, `duplicate_call_block_threshold`) and accessors (`result_artifact_threshold`, `result_summary_length`, `tool_output_artifact_threshold`, `tool_output_duration_threshold_ms`, `session_history_turns`) | `pub` | Replaced by `BoundingConfig::from_orchestration` and typed accessors |
-| `maybe_create_artifact` (orchestrator.rs) | private | Will consume `BoundingConfig::result_spill()` |
-| `PersistenceWrapper` size/duration thresholds | `pub` constructor via `PersistenceWrapperParams` | Will consume `BoundingConfig::tool_output_spill()` |
-| `format_tool_list` / worker-section builders (orchestrator.rs) | private | Will consume `BoundingConfig::tool_list_limit()` |
-| `DuplicateCallGuard::new` | `pub` | Will consume `BoundingConfig::duplicate_call_policy()` |
-| `load_session_manifests` limit | `pub` | Will consume `BoundingConfig::session_history_limit()` |
-| `FailureHandle::from_description` (context/failure_history.rs) | `pub` | Will consume `BoundingConfig::failure_handle_width()` |
-| `ErrorPreview::new` (context/evidence.rs) | `pub` | Will consume `BoundingConfig::error_preview_width()` |
-| `truncate_reasoning` (types.rs) | private free function | Will consume `BoundingConfig::tool_reasoning_width()` |
-| `safe_truncate` / log-preview sites (orchestrator.rs) | `pub(crate)` / private | Will consume `BoundingConfig::log_preview_widths()` |
-| `truncate_query` plan-content sites (orchestrator.rs) | private | Will consume `BoundingConfig::plan_content_widths()` |
-| `Agent::scratchpad_budget` (builder.rs) | `pub(crate)` | Will receive a `ScratchpadBudget` wrapper from the S3+ seam |
+| `maybe_create_artifact` (orchestrator.rs) | private | Consumes `BoundingConfig::result_spill()` |
+| `PersistenceWrapper` size/duration thresholds | `pub` constructor via `PersistenceWrapperParams` | Consumes `BoundingConfig::tool_output_spill()` |
+| `format_tool_list` / worker-section builders (orchestrator.rs) | private | Consumes `BoundingConfig::tool_list_limit()` |
+| `DuplicateCallGuard::new` | `pub` | Consumes `BoundingConfig::duplicate_call_policy()` |
+| `load_session_manifests` limit | `pub` | Consumes `BoundingConfig::session_history_limit()` |
+| `FailureHandle::from_description` (context/failure_history.rs) | `pub` | Consumes `BoundingConfig::failure_handle_width()` |
+| `ErrorPreview::new` (context/evidence.rs) | `pub` | Consumes `BoundingConfig::error_preview_width()` |
+| `truncate_reasoning` (types.rs) | private free function | Consumes `BoundingConfig::tool_reasoning_width()` |
+| `safe_truncate` / log-preview sites (orchestrator.rs) | `pub(crate)` / private | Consumes `BoundingConfig::log_preview_widths()` |
+| `truncate_query` plan-content sites (orchestrator.rs) | private | Consumes `BoundingConfig::plan_content_widths()` |
+| `Agent::scratchpad_budget` (builder.rs) | `pub(crate)` | Receives a `ScratchpadBudget` wrapper from the S3+ seam (not yet wired) |
 | `PriorWorkFrame::assemble` (context/frame.rs) | `pub` | Continues to use the reused `TokenBudget` |
 
-No production visibility is widened by the skeleton. The only file touched
-outside the new module is `orchestration/mod.rs`, which adds the module
-declaration.
+No production visibility is widened by the skeleton. Phase B widened only the
+`#[cfg(test)]` golden-frame accessors needed for the S2 harness seams; all
+other product-file edits route existing calls through `BoundingConfig`.
 
 ## Consolidation inventory (what this module unifies)
 
 The following sites are the current source of truth for each bounding
-decision. The implementation phase will route each group through the typed
+decision. The implementation phase has routed each group through the typed
 type above, preserving byte-identical output on every S2 manifest surface.
 
 - **Byte-based artifact spill**: `maybe_create_artifact` result threshold

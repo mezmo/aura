@@ -615,8 +615,8 @@ impl Orchestrator {
             task_id,
         ));
         let policy = self.bounding.duplicate_call_policy();
-        let nudge = policy.nudge_threshold().unwrap_or(0);
         let block = policy.block_threshold();
+        let nudge = policy.nudge_threshold().unwrap_or(block);
         let escalation_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let duplicate_guard = Arc::new(DuplicateCallGuard::new(
             nudge,

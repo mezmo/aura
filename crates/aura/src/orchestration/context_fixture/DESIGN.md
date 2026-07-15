@@ -171,21 +171,26 @@ verification section below.
   descriptions, truncation) IS covered - see MANIFEST §2.
 - **R7 - escape hatch.** The corpus pins `AURA_ESCAPE_HATCH` unset (fail
   loud if set); the stripped-preamble branch is uncovered by snapshots.
-- **R8 - conversation-growth and tool-registration-order re-statement.**
+- **R8 - conversation-growth partially closed; tool-registration-order shape-asserted.**
   The `plan_with_routing` growth rule (user wrapper, compact assistant
-  turn per prior call) executes inside the live model loop, and tool
-  REGISTRATION order lives in `build_agent_with_tools` (reached via
-  `create_coordinator`) and the worker builder's `add_all_tools`; both
-  were re-stated by the envelope builder with no seam to compare
-  against. S3 GATE STATUS: all three seams LANDED and passing.
+  turn per prior call) executes inside the live model loop;
   `gate_r8_conversation_growth` extracts `push_user_turn` and
   `push_assistant_turn` from `plan_with_routing` and shares them with
-  the envelope builder, so the growth rule is production-emitted.
-  `gate_r8_coordinator_tool_order` mirrors `build_agent_with_tools`
-  registration order via `coordinator_tool_order_for_golden`.
-  `gate_r8_worker_tool_order` asserts the `worker_tool_definitions`
-  order. MANIFEST §4 conversation-growth rows flipped to
+  the envelope builder, so the per-turn push operations are production
+  code. The SEQUENCE (how many iterations, in what order) is still
+  constructed test-side, so the growth rule is partially
   production-emitted.
+  Tool REGISTRATION order lives in `build_agent_with_tools` (reached via
+  `create_coordinator`) and the worker builder's `add_all_tools`; the R8
+  tool-order gates are SHAPE ASSERTIONS, not production comparisons.
+  `gate_r8_coordinator_tool_order` mirrors `build_agent_with_tools`
+  registration order via `coordinator_tool_order_for_golden`, but it
+  does not call `build_agent_with_tools` directly, so a production
+  reordering could false-pass. `gate_r8_worker_tool_order` asserts the
+  `worker_tool_definitions` order against a hard-coded vector.
+  MANIFEST §4 conversation-growth rows flipped to partially
+  production-emitted; MANIFEST §6b tool-order rows flipped to
+  shape-asserted.
 
 ## Net-reduction measurement contract (card acceptance, falsifiable)
 

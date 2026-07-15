@@ -1147,10 +1147,11 @@ async fn gate_r3_coordinator_preamble_matches_create_coordinator() {
 }
 
 /// R3 (worker side): the harness-composed worker preamble byte-equals the
-/// preamble the REAL `create_worker` assembles for a named role worker with
-/// assigned vector stores and skills.  Scratchpad is enabled in config but the
-/// test environment has no MCP, so production cannot wire scratchpad tools and
-/// does not append the scratchpad preamble; the comparison fixture uses
+/// preamble the REAL `create_worker` assembles for both the named-role branch
+/// (with assigned vector stores and skills) and the generic branch (no custom
+/// prompt, no vector stores, skills only).  Scratchpad is enabled in config but
+/// the test environment has no MCP, so production cannot wire scratchpad tools
+/// and does not append the scratchpad preamble; the comparison fixtures use
 /// `NotWired` to match that production output.  The vector → skills order is
 /// the closed portion of the residue; the scratchpad append position stays a
 /// conditional residue (DESIGN.md).
@@ -1223,7 +1224,7 @@ async fn gate_r3_worker_preamble_matches_create_worker() {
             // scratchpad tools, so the scratchpad preamble is not appended.
             // Match that production output rather than the full fixture.
             scratchpad: ScratchpadWiring::NotWired,
-            skills,
+            skills: skills.clone(),
         },
     };
     let composed = compose_worker_preamble(&fixture);
@@ -1231,6 +1232,29 @@ async fn gate_r3_worker_preamble_matches_create_worker() {
     assert_eq!(
         composed, real,
         "R3: the harness-composed worker preamble must byte-equal \
+         create_worker output (append order drifted?)"
+    );
+
+    // Generic-worker branch: no custom prompt, no vector stores, skills only.
+    // Scratchpad tools cannot wire without accessible MCP tools, so the gate
+    // matches production output with `NotWired`.
+    let real_generic = orchestrator
+        .worker_preamble_for_golden(0, 1, None)
+        .await
+        .expect("create_worker assembles the real generic worker preamble");
+
+    let fixture_generic = WorkerPreambleFixture::Generic {
+        custom_prompt: None,
+        appends: WorkerPreambleAppends {
+            scratchpad: ScratchpadWiring::NotWired,
+            skills,
+        },
+    };
+    let composed_generic = compose_worker_preamble(&fixture_generic);
+
+    assert_eq!(
+        composed_generic, real_generic,
+        "R3: the harness-composed generic worker preamble must byte-equal \
          create_worker output (append order drifted?)"
     );
 }
