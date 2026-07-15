@@ -8,6 +8,9 @@
 # Release binaries
 /dist/
 
+# Written by the release config's verifyReleaseCmd
+/.next-release-version
+
 # IDE
 .vscode/
 .idea/
