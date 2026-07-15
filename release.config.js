@@ -2,6 +2,22 @@
 
 const config = require('@mezmoinc/release-config-docker')
 
+const releaseRules = config.releaseRules.map((rule) => {
+  switch (rule.release) {
+    case 'major':
+      return {...rule, release: 'minor'}
+    case 'minor':
+      return {...rule, release: 'patch'}
+    default:
+      return {...rule}
+  }
+})
+
+const dockerTags = [
+  ...config.dockerTags,
+  'latest',
+]
+
 const plugins = config.plugins.map((plugin) => {
   const [name, config = {}] = plugin
   // there is a config name clash with github + git
@@ -24,7 +40,9 @@ module.exports = {
   extends: '@mezmoinc/release-config-docker',
   npmPublish: false,
   branches: ['main'],
-
+  /* Override releaseRules when on a 0.x.x version */
+  releaseRules,
+  dockerTags,
   // https://github.com/semantic-release/exec
   prepareCmd: `./scripts/set-version.sh \${nextRelease.version}`,
   verifyReleaseCmd: `echo \${nextRelease.version} > .next-release-version`,
