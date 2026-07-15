@@ -33,7 +33,10 @@ pipeline {
     timeout time: 1, unit: 'HOURS'
     timestamps()
     ansiColor 'xterm'
-    disableConcurrentBuilds(abortPrevious: true)
+    // On main, don't abort: a release build pushes a [skip ci] version commit
+    // that spawns a follow-on build, and aborting would mark the still-publishing
+    // release build as superseded. Non-main branches still abort stale builds.
+    disableConcurrentBuilds(abortPrevious: env.BRANCH_NAME != DEFAULT_BRANCH)
     buildDiscarder(
       logRotator(
         numToKeepStr: env.BRANCH_NAME == DEFAULT_BRANCH ? '30' : '5',
