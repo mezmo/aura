@@ -22,6 +22,7 @@ use crate::repl::conversations::ConversationStore;
 use crate::repl::history::ConversationHistory;
 use crate::repl::input_reader::{self, HISTORY_COUNT, HISTORY_DEPTH, LAST_READLINE_INPUT};
 use crate::repl::registry::{self, CommandContext, CommandOutcome};
+use crate::repl::telemetry_notice::{FirstMessageConsent, consent_on_first_message};
 use crate::tools;
 use crate::ui::markdown::{render_markdown, render_summary};
 use crate::ui::prompt::{
@@ -647,15 +648,17 @@ pub fn run_repl(
     }
     setup_terminal();
 
-    // If telemetry is already Enabled at launch (a recorded preference),
-    // capture the session-start event now. When `needs_consent`, this is
-    // deferred to the first-input gate so no event is emitted during the
-    // held `Unknown` state.
-    if matches!(telemetry.state(), aura_telemetry::TelemetryState::Enabled) {
-        capture_cli_session_started(telemetry, &config, is_standalone);
-    }
-    // Tracks whether the first-input consent gate still needs to run.
-    let mut consent_pending = needs_consent;
+    // Coordinate session telemetry here: Enabled sessions start now;
+    // Unknown sessions defer until the first submitted chat message.
+    let mut telemetry_lifecycle = ReplTelemetryLifecycle::new(
+        telemetry,
+        aura_telemetry::events::CliSessionStarted {
+            interactive: true,
+            standalone_mode: is_standalone,
+            client_tools_enabled: config.enable_client_tools,
+        },
+        needs_consent,
+    );
 
     // If resuming, replay the event log so the user sees the conversation
     let has_events = with_event_log(|log| !log.is_empty());
@@ -700,6 +703,10 @@ pub fn run_repl(
         .and_then(|s| s.load_pending_input())
         .unwrap_or_default();
     let mut auto_submit = false;
+
+    // Every outer-loop exit assigns this before the post-loop read;
+    // leaving it uninitialized lets the compiler prove complete coverage.
+    let exit_reason: aura_telemetry::events::ExitReason;
 
     loop {
         // Frame is already drawn (by setup or previous iteration).
@@ -792,7 +799,10 @@ pub fn run_repl(
                         backend,
                     };
                     match registry::dispatch(&input, &mut ctx) {
-                        Some(CommandOutcome::Exit) => break,
+                        Some(CommandOutcome::Exit) => {
+                            exit_reason = aura_telemetry::events::ExitReason::Quit;
+                            break;
+                        }
                         Some(CommandOutcome::Reinject(new_input)) => {
                             initial_input = new_input;
                             continue;
@@ -823,26 +833,10 @@ pub fn run_repl(
                 // were dispatched above and never grant consent. The decision
                 // is derived from the telemetry state those commands left
                 // behind, so the gate can't drift from the command parser.
-                if consent_pending {
-                    consent_pending = false;
-                    use crate::repl::telemetry_notice::{
-                        FirstMessageConsent, consent_on_first_message,
-                    };
-                    match consent_on_first_message(&telemetry.state()) {
-                        FirstMessageConsent::EnableAndCapture => {
-                            telemetry.enable();
-                            if let Err(e) =
-                                crate::config::save_telemetry_enabled_to_global_cli_toml(true)
-                            {
-                                eprintln!("warning: could not persist telemetry preference: {e}");
-                            }
-                            capture_cli_session_started(telemetry, &config, is_standalone);
-                        }
-                        FirstMessageConsent::CaptureOnly => {
-                            capture_cli_session_started(telemetry, &config, is_standalone);
-                        }
-                        FirstMessageConsent::Skip => {}
-                    }
+                if telemetry_lifecycle.on_first_message()
+                    && let Err(e) = crate::config::save_telemetry_enabled_to_global_cli_toml(true)
+                {
+                    eprintln!("warning: could not persist telemetry preference: {e}");
                 }
 
                 // One chat turn begins. Paired 1:1 with the completed event
@@ -1927,7 +1921,10 @@ pub fn run_repl(
                         backend,
                     };
                     match (pending.command.handler)(&mut ctx, &pending.args) {
-                        CommandOutcome::Exit => break,
+                        CommandOutcome::Exit => {
+                            exit_reason = aura_telemetry::events::ExitReason::Quit;
+                            break;
+                        }
                         CommandOutcome::Reinject(new_input) => {
                             initial_input = new_input;
                             continue;
@@ -1942,12 +1939,14 @@ pub fn run_repl(
             Err(ReadlineError::Eof) => {
                 // Ctrl-D — exit immediately
                 let _ = execute!(io::stdout(), cursor::MoveUp(1));
+                exit_reason = aura_telemetry::events::ExitReason::Eof;
                 break;
             }
             Err(ReadlineError::Interrupted) => {
                 // Ctrl-C — require double-press within 5 s to quit
                 if handle_ctrlc() {
                     let _ = execute!(io::stdout(), cursor::MoveUp(1));
+                    exit_reason = aura_telemetry::events::ExitReason::Interrupt;
                     break;
                 }
                 // First press: erase old frame and redraw with hint visible.
@@ -1972,10 +1971,13 @@ pub fn run_repl(
                 let _ = execute!(io::stdout(), cursor::MoveUp(1));
                 erase_input_frame();
                 eprintln!("Input error: {}", err);
+                exit_reason = aura_telemetry::events::ExitReason::Error;
                 break;
             }
         }
     }
+
+    telemetry_lifecycle.finish(exit_reason);
 
     // Save conversation on exit, or delete if conversation was never started
     if let Some(ref store) = conv_store {
@@ -2020,20 +2022,63 @@ pub fn run_repl(
     Ok(())
 }
 
-/// Capture `cli_session_started` once the REPL session is Enabled. The
-/// `interactive` flag is always true here (this is the REPL, not the
-/// one-shot path). Never called while `Unknown`/`Disabled`, so no event
-/// is emitted before consent.
-fn capture_cli_session_started(
-    telemetry: &aura_telemetry::TelemetryHandle,
-    config: &AppConfig,
-    is_standalone: bool,
-) {
-    telemetry.capture(aura_telemetry::events::CliSessionStarted {
-        interactive: true,
-        standalone_mode: is_standalone,
-        client_tools_enabled: config.enable_client_tools,
-    });
+/// Coordinates REPL telemetry ordering while leaving input handling and
+/// exit-reason selection in `run_repl`.
+struct ReplTelemetryLifecycle<'a> {
+    telemetry: &'a aura_telemetry::TelemetryHandle,
+    started_event: aura_telemetry::events::CliSessionStarted,
+    consent_pending: bool,
+}
+
+impl<'a> ReplTelemetryLifecycle<'a> {
+    fn new(
+        telemetry: &'a aura_telemetry::TelemetryHandle,
+        started_event: aura_telemetry::events::CliSessionStarted,
+        consent_pending: bool,
+    ) -> Self {
+        if matches!(telemetry.state(), aura_telemetry::TelemetryState::Enabled) {
+            telemetry.capture(started_event.clone());
+        }
+        Self {
+            telemetry,
+            started_event,
+            consent_pending,
+        }
+    }
+
+    /// Process the first submitted chat message, returning whether the newly
+    /// enabled preference should be persisted by the caller.
+    fn on_first_message(&mut self) -> bool {
+        if !self.consent_pending {
+            return false;
+        }
+        self.consent_pending = false;
+
+        match consent_on_first_message(&self.telemetry.state()) {
+            FirstMessageConsent::EnableAndCapture => {
+                self.telemetry.enable();
+                self.telemetry.capture(self.started_event.clone());
+                true
+            }
+            FirstMessageConsent::CaptureOnly => {
+                self.telemetry.capture(self.started_event.clone());
+                false
+            }
+            FirstMessageConsent::Skip => false,
+        }
+    }
+
+    /// Attempt the concluding event only while consent remains Enabled.
+    /// Runtime opt-out therefore suppresses it even if start was captured.
+    fn finish(&self, exit_reason: aura_telemetry::events::ExitReason) {
+        if matches!(
+            self.telemetry.state(),
+            aura_telemetry::TelemetryState::Enabled
+        ) {
+            self.telemetry
+                .capture(aura_telemetry::events::CliSessionEnded { exit_reason });
+        }
+    }
 }
 
 /// Streaming event handler for the interactive REPL: drives the live
@@ -3290,8 +3335,125 @@ impl StreamHandler for ReplStreamHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMAND_ALIASES, command_hint};
+    use super::{COMMAND_ALIASES, ReplTelemetryLifecycle, command_hint};
     use crate::repl::registry;
+    use aura_telemetry::events::{CliSessionStarted, ExitReason};
+    use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+    use aura_telemetry::{DisableReason, TelemetryConfig, TelemetryState};
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    struct TelemetryFixture {
+        handle: aura_telemetry::TelemetryHandle,
+        log_path: PathBuf,
+        _dir: TempDir,
+    }
+
+    fn telemetry_fixture(state: TelemetryState) -> TelemetryFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let config = TelemetryConfig {
+            endpoint: "http://127.0.0.1:1/no-such-host".into(),
+            api_key: "phc_test".into(),
+            install_id: Uuid::new_v4(),
+            install_id_path: None,
+            session_id: Uuid::new_v4(),
+            source: Source::Cli,
+            os_family: OsFamily::Linux,
+            deployment_method: DeploymentMethod::Local,
+            aura_version: "9.9.9-test",
+            inspection_log_path: Some(log_path.clone()),
+            state,
+            channel_capacity: 16,
+            batch_size: 16,
+            flush_interval: Duration::from_secs(60),
+            post_timeout: Duration::from_millis(200),
+            http_client: None,
+        };
+        TelemetryFixture {
+            handle: aura_telemetry::init(config),
+            log_path,
+            _dir: dir,
+        }
+    }
+
+    fn session_started_event() -> CliSessionStarted {
+        CliSessionStarted {
+            interactive: true,
+            standalone_mode: false,
+            client_tools_enabled: false,
+        }
+    }
+
+    fn logged_event_names(path: &PathBuf) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .map(|row| row["event"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn telemetry_lifecycle_enabled_at_launch_emits_started_then_ended() {
+        let fixture = telemetry_fixture(TelemetryState::Enabled);
+        let lifecycle =
+            ReplTelemetryLifecycle::new(&fixture.handle, session_started_event(), false);
+
+        lifecycle.finish(ExitReason::Quit);
+        fixture.handle.shutdown(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            logged_event_names(&fixture.log_path),
+            ["cli_session_started", "cli_session_ended"]
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_lifecycle_first_message_enables_and_pairs_events() {
+        let fixture = telemetry_fixture(TelemetryState::Unknown);
+        let mut lifecycle =
+            ReplTelemetryLifecycle::new(&fixture.handle, session_started_event(), true);
+
+        assert!(lifecycle.on_first_message());
+        lifecycle.finish(ExitReason::Eof);
+        fixture.handle.shutdown(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            logged_event_names(&fixture.log_path),
+            ["cli_session_started", "cli_session_ended"]
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_lifecycle_unknown_quit_emits_nothing() {
+        let fixture = telemetry_fixture(TelemetryState::Unknown);
+        let lifecycle = ReplTelemetryLifecycle::new(&fixture.handle, session_started_event(), true);
+
+        lifecycle.finish(ExitReason::Quit);
+        fixture.handle.shutdown(Duration::from_secs(2)).await;
+
+        assert!(logged_event_names(&fixture.log_path).is_empty());
+    }
+
+    #[tokio::test]
+    async fn telemetry_lifecycle_disable_after_start_suppresses_ended() {
+        let fixture = telemetry_fixture(TelemetryState::Enabled);
+        let lifecycle =
+            ReplTelemetryLifecycle::new(&fixture.handle, session_started_event(), false);
+
+        fixture.handle.set_disabled(DisableReason::AuraDisabled);
+        lifecycle.finish(ExitReason::Interrupt);
+        fixture.handle.shutdown(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            logged_event_names(&fixture.log_path),
+            ["cli_session_started"]
+        );
+    }
 
     #[test]
     fn intercepts_every_registered_command() {

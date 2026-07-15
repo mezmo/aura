@@ -6,6 +6,7 @@ error[E0277]: the trait bound `u64: IntoTelemetryProperty` is not satisfied
   |
   = help: the following other types implement trait `IntoTelemetryProperty`:
             &'static str
+            aura_telemetry::events::ExitReason
             aura_telemetry::properties::DeploymentMethod
             aura_telemetry::properties::OsFamily
             aura_telemetry::properties::SessionUuid

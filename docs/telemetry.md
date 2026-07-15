@@ -79,9 +79,16 @@ server-side IP capture and geo-IP are explicitly suppressed (`$ip: ""`,
 | `cli_session_started` | `interactive`, `standalone_mode`, `client_tools_enabled` (all booleans) | Tells us which run modes to prioritise for UX/perf work, and how often the audit-sensitive client-tools path is used. |
 | `chat_request_started` | none beyond the envelope | Turn volume, the core adoption signal that justifies continued investment. |
 | `chat_request_completed` | `success` (boolean) | Turn success rate surfaces reliability regressions to fix. |
+| `cli_session_ended` | `exit_reason` (`quit` \| `eof` \| `interrupt` \| `error`) | When telemetry remains enabled through REPL exit, provides a best-effort counterpart to `cli_session_started`; their timestamps can yield session length, and the exit path distinguishes clean completion (`quit`/`eof`) from abnormal termination (`interrupt`/`error`). |
 
 The `chat_request_*` pair fires once per chat turn, the same way regardless
 of HTTP or standalone backend (no double-reporting).
+
+Session length and turn volume are **derived** in analysis from these
+events' timestamps and `session_id` — they are not carried as event
+properties. Session pairing is not guaranteed: `/telemetry disable` during a
+session suppresses its ending event, and best-effort delivery means transport
+failures or a full telemetry channel can drop events.
 
 ## What is **not** collected
 

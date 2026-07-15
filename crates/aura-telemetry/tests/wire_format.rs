@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aura_telemetry::events::ChatRequestCompleted;
+use aura_telemetry::events::CliSessionEnded;
+use aura_telemetry::properties::ExitReason;
 use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
 use aura_telemetry::{init, TelemetryConfig};
 use serde_json::Value;
@@ -372,4 +374,49 @@ async fn channel_full_drops_record_to_inspection_log() {
         assert_eq!(drop["sent"], false);
         assert_eq!(drop["event"], "chat_request_completed");
     }
+}
+
+#[tokio::test]
+async fn cli_session_ended_payload_shape_is_correct() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/batch/"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let cfg = TelemetryConfig {
+        endpoint: server.uri(),
+        api_key: "phc_test_key".into(),
+        install_id: Uuid::new_v4(),
+        install_id_path: None,
+        session_id: Uuid::new_v4(),
+        source: Source::Cli,
+        os_family: OsFamily::Linux,
+        deployment_method: DeploymentMethod::Local,
+        aura_version: "9.9.9-test",
+        inspection_log_path: Some(dir.path().join("events.jsonl")),
+        state: aura_telemetry::TelemetryState::Enabled,
+        channel_capacity: 16,
+        batch_size: 1,
+        flush_interval: Duration::from_millis(50),
+        post_timeout: Duration::from_millis(500),
+        http_client: None,
+    };
+    let handle = init(cfg);
+    handle.capture(CliSessionEnded {
+        exit_reason: ExitReason::Quit,
+    });
+    handle.shutdown(Duration::from_secs(2)).await;
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 1, "one batch should be sent");
+    let body: Value = serde_json::from_slice(&requests[0].body).expect("body is json");
+    let event = &body["batch"][0];
+    assert_eq!(event["event"], "cli_session_ended");
+    assert_eq!(event["properties"]["exit_reason"], "quit");
+    // Envelope still present.
+    assert_eq!(event["properties"]["aura_source"], "cli");
+    assert!(event["properties"]["session_id"].is_string());
 }
