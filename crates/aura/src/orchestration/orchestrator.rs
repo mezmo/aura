@@ -3940,6 +3940,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_summary,
             failure_history.clone(),
             tool_traces,
+        )
+        .with_bounding_widths(
+            self.bounding.failure_handle_width(),
+            self.bounding.error_preview_width(),
+            self.bounding.tool_reasoning_width(),
         );
         // Pin the continuation goal line to the verbatim original user
         // query (docs/redesign/ARCHITECTURE.md section 1.2). A query that

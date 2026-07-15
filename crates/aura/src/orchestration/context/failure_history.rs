@@ -36,7 +36,10 @@ impl FailureHandle {
     ///
     /// Returns [`ContextError::EmptyFailureDescription`] when the
     /// description is empty or whitespace-only.
-    pub fn from_description(description: &str) -> Result<Self, ContextError> {
+    pub fn from_description(
+        description: &str,
+        width: crate::orchestration::bounding::FailureHandleWidth,
+    ) -> Result<Self, ContextError> {
         let first_line = description
             .trim_start()
             .lines()
@@ -46,16 +49,11 @@ impl FailureHandle {
         if first_line.is_empty() {
             return Err(ContextError::EmptyFailureDescription);
         }
-        // R2 gate decision 4: the marker is appended after the cap, so a
-        // cut handle is MAX_CHARS plus the marker, identically in display
-        // and in the grouping key.
-        match first_line.char_indices().nth(Self::MAX_CHARS) {
-            Some((cut, _)) => Ok(Self(format!(
-                "{}{}",
-                &first_line[..cut],
-                Self::TRUNCATION_MARKER
-            ))),
-            None => Ok(Self(first_line.to_owned())),
+        let (text, was_truncated) = width.truncate_with_flag(first_line);
+        if was_truncated {
+            Ok(Self(format!("{}{}", text, Self::TRUNCATION_MARKER)))
+        } else {
+            Ok(Self(text))
         }
     }
 
@@ -114,6 +112,7 @@ impl FailureRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::bounding::FailureHandleWidth;
 
     // R2 gate decision 4: the `...` marker is appended after the
     // 120-character cut, so a cut handle is MAX_CHARS plus the marker,
@@ -121,7 +120,8 @@ mod tests {
     #[test]
     fn cut_handle_appends_marker_after_cap() {
         let description = "d".repeat(200);
-        let handle = FailureHandle::from_description(&description).expect("non-empty");
+        let handle =
+            FailureHandle::from_description(&description, FailureHandleWidth::DEFAULT).expect("non-empty");
         assert_eq!(
             handle.as_str().chars().count(),
             FailureHandle::MAX_CHARS + FailureHandle::TRUNCATION_MARKER.chars().count(),
@@ -137,12 +137,14 @@ mod tests {
 
         // Display identity and grouping identity come from one truncation:
         // a re-issued identical description produces an identical handle.
-        let reissued = FailureHandle::from_description(&description).expect("non-empty");
+        let reissued =
+            FailureHandle::from_description(&description, FailureHandleWidth::DEFAULT).expect("non-empty");
         assert_eq!(handle, reissued);
 
         // At or under the cap, nothing is cut and nothing is marked.
         let exact = "e".repeat(FailureHandle::MAX_CHARS);
-        let uncut = FailureHandle::from_description(&exact).expect("non-empty");
+        let uncut =
+            FailureHandle::from_description(&exact, FailureHandleWidth::DEFAULT).expect("non-empty");
         assert_eq!(uncut.as_str(), exact);
     }
 
@@ -150,6 +152,7 @@ mod tests {
     fn handle_is_first_line_of_description() {
         let handle = FailureHandle::from_description(
             "Install QEMU and launch Windows 3.11 with full configuration.\nRun these steps in order: (1) install qemu-system-i386",
+            FailureHandleWidth::DEFAULT,
         )
         .expect("non-empty");
         assert_eq!(
@@ -158,7 +161,7 @@ mod tests {
         );
 
         assert_eq!(
-            FailureHandle::from_description("  \n\t"),
+            FailureHandle::from_description("  \n\t", FailureHandleWidth::DEFAULT),
             Err(ContextError::EmptyFailureDescription)
         );
     }
@@ -167,10 +170,10 @@ mod tests {
     fn record_renders_handle_worker_category_and_preview() {
         let record = FailureRecord {
             iteration: IterationNumber::new(2).expect("valid iteration"),
-            handle: FailureHandle::from_description("Gather logs").expect("non-empty"),
+            handle: FailureHandle::from_description("Gather logs", FailureHandleWidth::DEFAULT).expect("non-empty"),
             worker: Some(WorkerRole::new("operations").expect("non-empty")),
             category: FailureCategory::AgentTimeout,
-            error: ErrorPreview::new("Timeout contacting service"),
+            error: ErrorPreview::new("Timeout contacting service", crate::orchestration::bounding::ErrorPreviewWidth::DEFAULT),
         };
         assert_eq!(
             record.render().as_str(),

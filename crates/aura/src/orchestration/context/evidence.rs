@@ -374,17 +374,12 @@ impl ErrorPreview {
 
     /// Truncate raw error text to at most [`Self::MAX_CHARS`] characters,
     /// recording whether anything was cut.
-    pub fn new(raw_error: &str) -> Self {
-        match raw_error.char_indices().nth(Self::MAX_CHARS) {
-            Some((cut, _)) => Self {
-                text: raw_error[..cut].to_owned(),
-                truncated: true,
-            },
-            None => Self {
-                text: raw_error.to_owned(),
-                truncated: false,
-            },
-        }
+    pub fn new(
+        raw_error: &str,
+        width: crate::orchestration::bounding::ErrorPreviewWidth,
+    ) -> Self {
+        let (text, truncated) = width.truncate_with_flag(raw_error);
+        Self { text, truncated }
     }
 
     /// The bounded error text.
@@ -532,6 +527,7 @@ impl BlockedEntry {
 mod tests {
     use super::super::label::TaskId;
     use super::*;
+    use crate::orchestration::bounding::ErrorPreviewWidth;
 
     const FOOTER: &str =
         "[Full result (5000 chars) saved to artifact: task-0-operator-iter-1-result.txt]";
@@ -599,14 +595,14 @@ mod tests {
 
         // Error previews truncate at most once and mark every cut.
         let long = "e".repeat(ErrorPreview::MAX_CHARS + 1000);
-        let preview = ErrorPreview::new(&long);
+        let preview = ErrorPreview::new(&long, ErrorPreviewWidth::DEFAULT);
         assert!(preview.was_truncated());
         assert_eq!(preview.as_str().chars().count(), ErrorPreview::MAX_CHARS);
         let shown = preview.to_string();
         assert!(shown.ends_with(ErrorPreview::TRUNCATION_MARKER));
         assert_eq!(shown.matches(ErrorPreview::TRUNCATION_MARKER).count(), 1);
 
-        let short = ErrorPreview::new("Connection refused");
+        let short = ErrorPreview::new("Connection refused", ErrorPreviewWidth::DEFAULT);
         assert!(!short.was_truncated());
         assert_eq!(short.to_string(), "Connection refused");
     }
@@ -694,7 +690,7 @@ mod tests {
             label: label(Some("verifier")),
             report: FailureReport::Hard {
                 category: FailureCategory::DepthExhausted,
-                error: ErrorPreview::new("MaxDepthError (reached limit: 16)"),
+                error: ErrorPreview::new("MaxDepthError (reached limit: 16)", ErrorPreviewWidth::DEFAULT),
             },
         };
         assert_eq!(

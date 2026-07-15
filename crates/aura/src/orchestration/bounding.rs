@@ -14,6 +14,8 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::orchestration::config::OrchestrationConfig;
 use crate::string_utils::safe_truncate;
 
@@ -148,7 +150,7 @@ impl ByteWidth {
 ///
 /// Private implementation detail.  Domain-specific public types below wrap
 /// this so that char-bounded widths are not interchangeable with byte widths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct CharWidth(NonZeroUsize);
 
 impl CharWidth {
@@ -677,7 +679,7 @@ impl SessionHistoryLimit {
 /// at a fixed width, plus a truncation marker when cut.
 ///
 /// Forbidden invalid state: a zero cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailureHandleWidth(CharWidth);
 
 impl FailureHandleWidth {
@@ -686,6 +688,15 @@ impl FailureHandleWidth {
         Some(n) => CharWidth(n),
         None => panic!("fixed failure-handle cap must be non-zero"),
     });
+
+    /// Truncate to the cap, returning the text without marker and whether
+    /// anything was cut.  The caller owns the marker decision.
+    pub fn truncate_with_flag(&self, text: &str) -> (String, bool) {
+        match text.char_indices().nth(self.0.get()) {
+            None => (text.to_string(), false),
+            Some((cut, _)) => (text[..cut].to_string(), true),
+        }
+    }
 
     fn truncate(&self, text: &str) -> String {
         truncate_chars(text, self.0.get(), TruncateMarker::None)
@@ -698,7 +709,7 @@ impl FailureHandleWidth {
 /// explicit `[truncated]` marker, never an unbounded error body.
 ///
 /// Forbidden invalid state: a zero cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorPreviewWidth(CharWidth);
 
 impl ErrorPreviewWidth {
@@ -706,6 +717,15 @@ impl ErrorPreviewWidth {
         Some(n) => CharWidth(n),
         None => panic!("fixed error-preview cap must be non-zero"),
     });
+
+    /// Truncate to the cap, returning the text without marker and whether
+    /// anything was cut.  The caller owns the marker decision.
+    pub fn truncate_with_flag(&self, text: &str) -> (String, bool) {
+        match text.char_indices().nth(self.0.get()) {
+            None => (text.to_string(), false),
+            Some((cut, _)) => (text[..cut].to_string(), true),
+        }
+    }
 
     pub fn truncate(&self, text: &str) -> String {
         truncate_chars(text, self.0.get(), TruncateMarker::None)
@@ -720,7 +740,7 @@ impl ErrorPreviewWidth {
 /// reasoning-token budget.
 ///
 /// Forbidden invalid state: a zero cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolReasoningWidth(CharWidth);
 
 impl ToolReasoningWidth {

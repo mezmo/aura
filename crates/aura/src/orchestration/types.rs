@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::bounding::{ErrorPreviewWidth, FailureHandleWidth, ToolReasoningWidth};
+
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
 /// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
@@ -690,6 +692,12 @@ pub struct IterationContext {
     /// empty HashMap otherwise.
     #[serde(default)]
     pub tool_traces: HashMap<usize, Vec<super::persistence::ToolTraceEntry>>,
+    /// Bounding widths for continuation-prompt rendering.  Defaults match
+    /// the accepted baseline binary; the orchestrator sets them from
+    /// `BoundingConfig` at construction time.
+    pub failure_handle_width: FailureHandleWidth,
+    pub error_preview_width: ErrorPreviewWidth,
+    pub tool_reasoning_width: ToolReasoningWidth,
 }
 
 impl IterationContext {
@@ -708,6 +716,9 @@ impl IterationContext {
             failure_summary,
             failure_history,
             tool_traces,
+            failure_handle_width: FailureHandleWidth::DEFAULT,
+            error_preview_width: ErrorPreviewWidth::DEFAULT,
+            tool_reasoning_width: ToolReasoningWidth::DEFAULT,
         }
     }
 
@@ -717,6 +728,20 @@ impl IterationContext {
     #[must_use]
     pub fn with_pinned_goal(mut self, goal: super::context::PinnedGoal) -> Self {
         self.pinned_goal = Some(goal);
+        self
+    }
+
+    /// Set the bounding widths from the orchestrator's `BoundingConfig`.
+    #[must_use]
+    pub fn with_bounding_widths(
+        mut self,
+        failure_handle: FailureHandleWidth,
+        error_preview: ErrorPreviewWidth,
+        tool_reasoning: ToolReasoningWidth,
+    ) -> Self {
+        self.failure_handle_width = failure_handle;
+        self.error_preview_width = error_preview;
+        self.tool_reasoning_width = tool_reasoning;
         self
     }
 
@@ -802,7 +827,10 @@ impl IterationContext {
                     };
                     completed_lines.push(entry);
                     if show_tool_chain {
-                        for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
+                        for line in render_tool_chain_lines(
+                            self.tool_traces.get(&t.id),
+                            self.tool_reasoning_width,
+                        ) {
                             completed_lines.push(format!("    {}", line));
                         }
                     }
@@ -819,7 +847,7 @@ impl IterationContext {
                         },
                         (category, _) => FailureReport::Hard {
                             category: *category,
-                            error: ErrorPreview::new(error),
+                            error: ErrorPreview::new(error, self.error_preview_width),
                         },
                     };
                     redesign_lines.push(String::from(
@@ -829,7 +857,10 @@ impl IterationContext {
                         }
                         .render(),
                     ));
-                    for line in render_tool_chain_lines(self.tool_traces.get(&t.id)) {
+                    for line in render_tool_chain_lines(
+                        self.tool_traces.get(&t.id),
+                        self.tool_reasoning_width,
+                    ) {
                         redesign_lines.push(format!("    {}", line));
                     }
                 }
@@ -890,13 +921,17 @@ impl IterationContext {
             .filter_map(|record| {
                 Some(FailureRecord {
                     iteration: IterationNumber::new(record.iteration).ok()?,
-                    handle: FailureHandle::from_description(&record.description).ok()?,
+                    handle: FailureHandle::from_description(
+                        &record.description,
+                        self.failure_handle_width,
+                    )
+                    .ok()?,
                     worker: record
                         .worker
                         .as_deref()
                         .and_then(|w| WorkerRole::new(w).ok()),
                     category: record.category,
-                    error: ErrorPreview::new(&record.error),
+                    error: ErrorPreview::new(&record.error, self.error_preview_width),
                 })
             })
             .collect();
@@ -1010,6 +1045,7 @@ fn artifact_refs(
 /// durations, reasoning snippets, and error details.
 fn render_tool_chain_lines(
     traces: Option<&Vec<super::persistence::ToolTraceEntry>>,
+    width: ToolReasoningWidth,
 ) -> Vec<String> {
     use super::persistence::ToolOutcome;
 
@@ -1027,7 +1063,7 @@ fn render_tool_chain_lines(
                     if t.reasoning.is_empty() {
                         format!("{} ({})", t.tool, duration)
                     } else {
-                        let r = truncate_reasoning(&t.reasoning, 100);
+                        let r = width.truncate(&t.reasoning);
                         format!("{} ({}, \"{}\")", t.tool, duration, r)
                     }
                 }
@@ -1039,15 +1075,6 @@ fn render_tool_chain_lines(
         .collect();
 
     vec![format!("Tool chain: {}", parts.join(" → "))]
-}
-
-fn truncate_reasoning(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{}…", truncated)
-    }
 }
 
 /// Outcome returned by `run_iteration` to drive the orchestration loop.
@@ -1063,6 +1090,7 @@ pub(crate) enum IterationOutcome {
 
 #[cfg(test)]
 mod tests {
+    use super::super::bounding::FailureHandleWidth;
     use super::super::context::{ErrorPreview, FailureHandle, PinnedGoal};
     use super::*;
 
@@ -1871,7 +1899,11 @@ mod tests {
         let ctx = IterationContext::new(2, plan, None, vec![record(1), record(2)], HashMap::new());
         let prompt = ctx.build_continuation_prompt(4, false, 2000);
 
-        let handle = FailureHandle::from_description(&long_description).expect("non-empty");
+        let handle = FailureHandle::from_description(
+            &long_description,
+            FailureHandleWidth::DEFAULT,
+        )
+        .expect("non-empty");
         assert_eq!(
             handle.as_str().chars().count(),
             FailureHandle::MAX_CHARS + FailureHandle::TRUNCATION_MARKER.chars().count(),
