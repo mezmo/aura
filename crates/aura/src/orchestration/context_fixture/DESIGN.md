@@ -136,8 +136,18 @@ verification section below.
   when the prompt journal is enabled (`AURA_PROMPT_JOURNAL`, an env
   mutation the corpus's env-pinning stance forbids in tests), so a pure
   delegating accessor returns an empty string and a capturing accessor
-  would change production code. The worker per-branch append orders stay
-  RE-STATED in MANIFEST §5; S3+ bounding-module work should add the seam.
+  would change production code. S3 GATE STATUS: the worker-side
+  comparison LANDED and passes
+  (`gate_r3_worker_preamble_matches_create_worker` in
+  `golden_tests.rs`): `create_worker` now always captures its assembled
+  preamble (the prompt-journal gate was removed), and the
+  `worker_preamble_for_golden` accessor returns it. The composed worker
+  preamble byte-equals real `create_worker` output over an MCP-less
+  Orchestrator. Residue: the scratchpad append requires accessible MCP
+  tools, so the gate runs scratchpad-disabled; the vector → skills
+  sub-order is production-emitted, the scratchpad position is a
+  conditional residue. MANIFEST §5 worker-append-order rows flipped to
+  production-emitted.
 - **R4 - event side effects.** Persistence writes, journal records,
   stream events, and artifact I/O ordering are outside the envelope and
   unverified here.
@@ -166,12 +176,16 @@ verification section below.
   turn per prior call) executes inside the live model loop, and tool
   REGISTRATION order lives in `build_agent_with_tools` (reached via
   `create_coordinator`) and the worker builder's `add_all_tools`; both
-  are re-stated by the envelope builder with no seam to compare
-  against. Coverage of those rows is SHAPE-ONLY: the snapshots
-  lock today's shape and detect builder drift, but a production
-  reordering moves the corpus only if the builder moves with it. Named
-  here because no cheaper closure exists without product refactors that
-  are out of S2 scope; S3+ bounding-module work should add the seam.
+  were re-stated by the envelope builder with no seam to compare
+  against. S3 GATE STATUS: all three seams LANDED and passing.
+  `gate_r8_conversation_growth` extracts `push_user_turn` and
+  `push_assistant_turn` from `plan_with_routing` and shares them with
+  the envelope builder, so the growth rule is production-emitted.
+  `gate_r8_coordinator_tool_order` mirrors `build_agent_with_tools`
+  registration order via `coordinator_tool_order_for_golden`.
+  `gate_r8_worker_tool_order` asserts the `worker_tool_definitions`
+  order. MANIFEST §4 conversation-growth rows flipped to
+  production-emitted.
 
 ## Net-reduction measurement contract (card acceptance, falsifiable)
 

@@ -167,12 +167,10 @@ type above, preserving byte-identical output on every S2 manifest surface.
   and plan-content byte widths), and the single ellipsis character `"…"` (the
   char `ToolReasoningWidth`). This is preserved byte-identically from
   production; a future card that unifies markers would be a behavior change.
-- **R10 - `was_truncated` signal asymmetry.** `ResultSpillBudget::truncate_to_summary`
-  returns `TruncatedSummary` carrying `was_truncated()`, but the char-cap types
-  (`FailureHandleWidth`, `ErrorPreviewWidth`) return a bare `String` from their
-  `truncate` methods with no cut flag. The prior domain constructors
-  (`FailureHandle::from_description`, `ErrorPreview::new`) need that signal to
-  gate their display markers. Phase B wiring will either need a
-  `was_truncated`-returning variant on the char-cap types or must re-detect the
-  cut by string comparison. This is a Phase B design decision, not a Phase A
-  behavior break (call sites are unwired, manifest unchanged).
+- **R10 - `was_truncated` signal asymmetry.** RESOLVED in Phase B: added
+  `truncate_with_flag` method to `FailureHandleWidth` and
+  `ErrorPreviewWidth` returning `(String, bool)`. The constructors
+  (`FailureHandle::from_description`, `ErrorPreview::new`) use the flag
+  to gate their own markers (`"..."` and `" [truncated]"` respectively),
+  which differ from the `TruncateMarker` enum. The original `truncate`
+  methods remain for other callers that don't need the flag.
