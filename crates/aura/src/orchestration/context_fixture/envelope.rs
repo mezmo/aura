@@ -151,7 +151,7 @@ pub(super) fn compose_coordinator_preamble(fixture: &PreambleFixture) -> String 
 /// `Task::complete` over the stored raw result, failures via `Task::fail`,
 /// blocked tasks left `Pending`, and `structured_output` carrying the
 /// worker claim when one exists.
-fn executed_plan(iteration: &IterationFixture) -> Plan {
+pub(crate) fn executed_plan(iteration: &IterationFixture) -> Plan {
     let mut plan = iteration.decision().plan();
     for (task, outcome) in plan.tasks.iter_mut().zip(iteration.outcomes()) {
         match outcome {
@@ -212,7 +212,7 @@ fn outcome_traces(outcome: &TaskOutcome) -> &[ToolTraceEntry] {
 /// loader over a tempdir. Fixtures pin one attempt per task per iteration:
 /// within one iteration directory the production scan order over multiple
 /// attempt files is filesystem-dependent.
-pub(super) fn merged_traces(
+pub(crate) fn merged_traces(
     iterations: &[IterationFixture],
     current_plan: &Plan,
 ) -> HashMap<usize, Vec<ToolTraceEntry>> {
@@ -289,18 +289,20 @@ pub(crate) async fn coordinator_envelope(
             )
             .with_pinned_goal(scenario.query().clone());
 
-            messages.push(Message::assistant(Orchestrator::compact_decision_turn(
+            Orchestrator::push_assistant_turn_for_golden(
+                &mut messages,
                 iteration.decision().as_response(),
                 "",
-            )));
-            messages.push(Message::user(
-                Orchestrator::continuation_wrapper_for_golden(
+            );
+            Orchestrator::push_user_turn_for_golden(
+                &mut messages,
+                &Orchestrator::continuation_wrapper_for_golden(
                     &context,
                     scenario.budget().get(),
                     config.show_tool_reasoning_in_continuation(),
                     config.result_summary_length(),
                 ),
-            ));
+            );
         }
     }
 
@@ -316,7 +318,7 @@ pub(crate) async fn coordinator_envelope(
 /// production `build_worker_prompt_sections` renders the scenario's worker
 /// sections. The roster's `OrchestrationConfig` and agent-level
 /// vector-store catalog are the only inputs those sections read.
-async fn section_orchestrator(scenario: &CoordinatorScenario) -> Orchestrator {
+pub(crate) async fn section_orchestrator(scenario: &CoordinatorScenario) -> Orchestrator {
     let agent_config = crate::config::AgentRuntimeConfig {
         vector_stores: scenario.roster().vector_catalog().to_vec(),
         orchestration: Some(scenario.roster().config().clone()),
@@ -373,7 +375,7 @@ pub(crate) async fn worker_envelope(
 /// re-stating `create_worker`'s per-branch append order (R3): role branch
 /// vector-store context, then scratchpad, then skills; generic branch
 /// scratchpad, then skills.
-pub(super) fn compose_worker_preamble(fixture: &WorkerPreambleFixture) -> String {
+pub(crate) fn compose_worker_preamble(fixture: &WorkerPreambleFixture) -> String {
     let (mut preamble, appends) = match fixture {
         WorkerPreambleFixture::Role {
             role_preamble,
@@ -485,7 +487,7 @@ async fn coordinator_tool_definitions(
 /// (the worker builder registers `SkillToolset` from the same config).
 /// MCP, vector-search, and scratchpad tool definitions are excluded with
 /// reasons in `MANIFEST.md` §6/§6a.
-async fn worker_tool_definitions(scenario: &WorkerScenario) -> Vec<ToolDefinition> {
+pub(crate) async fn worker_tool_definitions(scenario: &WorkerScenario) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
     tools.push(
         ReadArtifactTool::new(disabled_persistence())

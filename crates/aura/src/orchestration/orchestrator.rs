@@ -132,6 +132,7 @@ struct CoordinatorState {
     routing_decision: super::tools::routing_tools::RoutingDecision,
 }
 
+#[cfg(not(test))]
 /// Bundled coordinator tools for `build_agent_with_tools`.
 struct CoordinatorTools {
     list_tools: Option<ListToolsTool>,
@@ -141,6 +142,43 @@ struct CoordinatorTools {
     read_artifact: Option<ReadArtifactTool>,
     list_prior_runs: Option<super::tools::ListPriorRunsTool>,
     skill_tools: Option<crate::skill_tool::SkillToolset>,
+}
+
+#[cfg(test)]
+/// Bundled coordinator tools for `build_agent_with_tools`.
+pub(crate) struct CoordinatorTools {
+    list_tools: Option<ListToolsTool>,
+    inspect_tool_params: Option<InspectToolParamsTool>,
+    vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
+    routing_tools: RoutingToolSet,
+    read_artifact: Option<ReadArtifactTool>,
+    list_prior_runs: Option<super::tools::ListPriorRunsTool>,
+    skill_tools: Option<crate::skill_tool::SkillToolset>,
+}
+
+#[cfg(test)]
+impl CoordinatorTools {
+    /// Constructor for the R8 tool-order golden-frame gate.  Public only to
+    /// tests; production keeps the struct private.
+    pub(crate) fn new_for_golden_test(
+        list_tools: Option<ListToolsTool>,
+        inspect_tool_params: Option<InspectToolParamsTool>,
+        vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
+        routing_tools: RoutingToolSet,
+        read_artifact: Option<ReadArtifactTool>,
+        list_prior_runs: Option<super::tools::ListPriorRunsTool>,
+        skill_tools: Option<crate::skill_tool::SkillToolset>,
+    ) -> Self {
+        Self {
+            list_tools,
+            inspect_tool_params,
+            vector_tools,
+            routing_tools,
+            read_artifact,
+            list_prior_runs,
+            skill_tools,
+        }
+    }
 }
 
 // ============================================================================
@@ -827,16 +865,15 @@ impl Orchestrator {
             worker_config.mcp_filter
         );
 
-        // Capture preamble before config is consumed by builder
-        let preamble = if self.prompt_journal.is_some() {
-            worker_config
-                .preamble_override
-                .as_deref()
-                .unwrap_or("")
-                .to_string()
-        } else {
-            String::new()
-        };
+        // Capture preamble before config is consumed by builder.  Always
+        // captured so the golden-frame harness can compare the real worker
+        // append order (R3); the journal recording itself is still gated by
+        // `self.prompt_journal.is_some()` elsewhere.
+        let preamble = worker_config
+            .preamble_override
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
 
         // Build worker agent using shared MCP connections.
         // Client-side tools are not supported in orchestration mode and are
@@ -1351,6 +1388,52 @@ impl Orchestrator {
         Ok(preamble)
     }
 
+    /// Golden-frame seam (S3): expose the preamble the real `create_worker`
+    /// assembles, for the R3 worker-side comparison gate.  Delegates; no
+    /// test-only behavior.
+    #[cfg(test)]
+    pub(crate) async fn worker_preamble_for_golden(
+        &self,
+        task_id: usize,
+        attempt: usize,
+        worker_name: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let AgentWithPreamble { preamble, .. } =
+            self.create_worker(task_id, attempt, worker_name).await?;
+        Ok(preamble)
+    }
+
+    /// Golden-frame seam (S3): return the coordinator tool registration
+    /// order as tool-name strings, for the R8 comparison gate.  The order
+    /// mirrors `build_agent_with_tools` exactly.
+    #[cfg(test)]
+    pub(crate) fn coordinator_tool_order_for_golden(tools: &CoordinatorTools) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if tools.list_tools.is_some() {
+            names.push("list_tools");
+        }
+        if tools.inspect_tool_params.is_some() {
+            names.push("inspect_tool_params");
+        }
+        if !tools.vector_tools.is_empty() {
+            names.push("vector_search");
+        }
+        names.push("respond_directly");
+        names.push("create_plan");
+        names.push("request_clarification");
+        if tools.read_artifact.is_some() {
+            names.push("read_artifact");
+        }
+        if tools.list_prior_runs.is_some() {
+            names.push("list_prior_runs");
+        }
+        if tools.skill_tools.is_some() {
+            names.push("load_skill");
+            names.push("read_skill_file");
+        }
+        names
+    }
+
     /// Golden-frame seam (S2): expose the private per-iteration failure
     /// fold to the `context_fixture` harness, so the continuation prompt's
     /// failure history is built by production code instead of a test-side
@@ -1391,6 +1474,50 @@ impl Orchestrator {
                 }
             }
         }
+    }
+
+    /// Push the user planning prompt into the conversation.  Extracted so
+    /// both production `plan_with_routing` and the golden-frame harness share
+    /// the same growth rule (R8).
+    fn push_user_turn(conversation: &mut Vec<rig::completion::Message>, prompt: &str) {
+        conversation.push(rig::completion::Message::user(prompt));
+    }
+
+    /// Push the compact assistant decision turn into the conversation and
+    /// return the compact text so callers can reuse it.  Extracted so both
+    /// production `plan_with_routing` and the golden-frame harness share the
+    /// same growth rule (R8).
+    fn push_assistant_turn(
+        conversation: &mut Vec<rig::completion::Message>,
+        planning_response: &PlanningResponse,
+        model_text: &str,
+    ) -> String {
+        let response_text = Self::compact_decision_turn(planning_response, model_text);
+        conversation.push(rig::completion::Message::assistant(&response_text));
+        response_text
+    }
+
+    /// Golden-frame seam (S3): expose the private user-turn push to the
+    /// `context_fixture` harness for the R8 conversation-growth comparison
+    /// gate.  Delegates; no test-only behavior.
+    #[cfg(test)]
+    pub(crate) fn push_user_turn_for_golden(
+        conversation: &mut Vec<rig::completion::Message>,
+        prompt: &str,
+    ) {
+        Self::push_user_turn(conversation, prompt);
+    }
+
+    /// Golden-frame seam (S3): expose the private assistant-turn push to the
+    /// `context_fixture` harness for the R8 conversation-growth comparison
+    /// gate.  Delegates; no test-only behavior.
+    #[cfg(test)]
+    pub(crate) fn push_assistant_turn_for_golden(
+        conversation: &mut Vec<rig::completion::Message>,
+        planning_response: &PlanningResponse,
+        model_text: &str,
+    ) {
+        Self::push_assistant_turn(conversation, planning_response, model_text);
     }
 
     /// Plan with routing tool support via persistent conversation.
@@ -1535,22 +1662,18 @@ impl Orchestrator {
                 }
             };
 
-            // Grow conversation: user turn
-            coordinator_state
-                .conversation
-                .push(rig::completion::Message::user(&prompt));
+            // Grow conversation: user turn, then assistant compact decision.
+            Self::push_user_turn(&mut coordinator_state.conversation, &prompt);
 
             // Check if a routing tool was called
             let decision = coordinator_state.routing_decision.lock().await.take();
 
             if let Some(planning_response) = decision {
-                let response_text =
-                    Self::compact_decision_turn(&planning_response, &response.content);
-
-                // Grow conversation: assistant turn (compact routing decision)
-                coordinator_state
-                    .conversation
-                    .push(rig::completion::Message::assistant(&response_text));
+                let response_text = Self::push_assistant_turn(
+                    &mut coordinator_state.conversation,
+                    &planning_response,
+                    &response.content,
+                );
 
                 // Persist planning phase artifacts
                 {

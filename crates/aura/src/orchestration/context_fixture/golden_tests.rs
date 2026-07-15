@@ -29,23 +29,31 @@ use super::{
     WorkerFrameFixture, WorkerPreambleAppends, WorkerPreambleFixture, WorkerRosterFixture,
     WorkerScenario, assert_envelope_snapshot, coordinator_envelope, normalize, worker_envelope,
 };
+use super::envelope::{
+    compose_worker_preamble, executed_plan, merged_traces, section_orchestrator,
+    worker_tool_definitions,
+};
 use crate::config::AgentRuntimeConfig;
 use crate::orchestration::config::{ArtifactsConfig, OrchestrationConfig, ToolVisibility};
 use crate::orchestration::context::{
     ContextError, EvidenceText, PinnedGoal, ResultPreview, SpilledArtifact, WorkerClaim,
 };
 use crate::orchestration::events::RoutingMode;
+use crate::orchestration::orchestrator::CoordinatorTools;
 use crate::orchestration::persistence::{
     ArtifactEntry, ArtifactKind, ErrorContext, ExecutionPersistence, RunManifest, RunStatus,
     TaskSummary, ToolCallRecord, ToolOutcome, ToolTraceEntry,
 };
+use crate::orchestration::tools::{
+    InspectToolParamsTool, ListPriorRunsTool, ListToolsTool, ReadArtifactTool, RoutingToolSet,
+};
 use crate::orchestration::tools::submit_result::Confidence;
 use crate::orchestration::types::{
-    FailureCategory, FailureSummary, Plan, PlanningResponse, StepInput, StructuredTaskOutput, Task,
-    TaskStatus,
+    FailureCategory, FailureSummary, IterationContext, Plan, PlanningResponse, StepInput,
+    StructuredTaskOutput, Task, TaskStatus,
 };
 use crate::orchestration::{Orchestrator, WorkerConfig};
-use aura_config::{LlmConfig, SkillConfig, SkillName, VectorStoreConfig};
+use aura_config::{LlmConfig, SkillConfig, SkillName, VectorStoreConfig, ScratchpadConfig};
 
 /// The shared coordinator playbook (`[agent].system_prompt`), preserving
 /// the 14 headed blocks of MANIFEST §1 rows 5-18 so Gate A can see each
@@ -1138,6 +1146,95 @@ async fn gate_r3_coordinator_preamble_matches_create_coordinator() {
     );
 }
 
+/// R3 (worker side): the harness-composed worker preamble byte-equals the
+/// preamble the REAL `create_worker` assembles for a named role worker with
+/// assigned vector stores and skills.  Scratchpad is enabled in config but the
+/// test environment has no MCP, so production cannot wire scratchpad tools and
+/// does not append the scratchpad preamble; the comparison fixture uses
+/// `NotWired` to match that production output.  The vector → skills order is
+/// the closed portion of the residue; the scratchpad append position stays a
+/// conditional residue (DESIGN.md).
+#[tokio::test]
+async fn gate_r3_worker_preamble_matches_create_worker() {
+    let skills = fixture_skills();
+    let vector_stores = vec![
+        vector_store(
+            "runbooks",
+            Some("Operational runbooks for the payments platform"),
+        ),
+        vector_store("telemetry", None),
+    ];
+
+    let worker_config = WorkerConfig {
+        description: "Payments log analyst".to_owned(),
+        preamble: ROLE_PREAMBLE.to_owned(),
+        mcp_filter: Vec::new(),
+        vector_stores: vec!["runbooks".to_owned(), "telemetry".to_owned()],
+        turn_depth: None,
+        llm: None,
+        scratchpad: None,
+        skills: None,
+    };
+    let mut workers = HashMap::new();
+    workers.insert("role-worker".to_owned(), worker_config);
+
+    let orchestration = OrchestrationConfig {
+        enabled: true,
+        workers,
+        ..Default::default()
+    };
+    let agent_config = AgentRuntimeConfig {
+        llm: LlmConfig::Ollama {
+            model: "llama3".to_owned(),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            fallback_tool_parsing: false,
+            additional_params: None,
+        },
+        agent: aura_config::AgentSettings {
+            system_prompt: "unused".to_owned(),
+            skills: skills.clone(),
+            scratchpad: Some(ScratchpadConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        vector_stores: vector_stores.clone(),
+        orchestration: Some(orchestration),
+        ..Default::default()
+    };
+    let orchestrator = Orchestrator::new(agent_config)
+        .await
+        .expect("gate orchestrator constructs with mcp and persistence disabled");
+
+    let real = orchestrator
+        .worker_preamble_for_golden(0, 1, Some("role-worker"))
+        .await
+        .expect("create_worker assembles the real worker preamble");
+
+    let fixture = WorkerPreambleFixture::Role {
+        role_preamble: ROLE_PREAMBLE.to_owned(),
+        vector_stores,
+        appends: WorkerPreambleAppends {
+            // No MCP in the test environment means production cannot wire
+            // scratchpad tools, so the scratchpad preamble is not appended.
+            // Match that production output rather than the full fixture.
+            scratchpad: ScratchpadWiring::NotWired,
+            skills,
+        },
+    };
+    let composed = compose_worker_preamble(&fixture);
+
+    assert_eq!(
+        composed, real,
+        "R3: the harness-composed worker preamble must byte-equal \
+         create_worker output (append order drifted?)"
+    );
+}
+
 /// R5: the harness's in-memory trace merge equals the production
 /// disk-persistence merge (`load_tool_records_for_task` scanned per task
 /// across iterations, mapped through `ToolTraceEntry::from`) for the same
@@ -1366,4 +1463,149 @@ async fn empty_frame_branches_render_byte_identically() {
     let replan_snapshot: NormalizedSnapshot =
         normalize(&worker_envelope(&replan).await.expect("replan envelope"));
     assert_eq!(fresh_snapshot, replan_snapshot);
+}
+
+// ============================================================================
+// REQUIRED comparison gates (DESIGN.md R8)
+// ============================================================================
+
+fn disabled_persistence() -> std::sync::Arc<tokio::sync::Mutex<ExecutionPersistence>> {
+    std::sync::Arc::new(tokio::sync::Mutex::new(ExecutionPersistence::disabled()))
+}
+
+/// R8 (coordinator tool registration order): the tool names returned by the
+/// production seam mirror the order `build_agent_with_tools` uses when all
+/// optional tool groups are present.
+#[tokio::test]
+async fn gate_r8_coordinator_tool_order() {
+    let routing = RoutingToolSet::new();
+    let tools = CoordinatorTools::new_for_golden_test(
+        Some(ListToolsTool::new(Vec::new())),
+        Some(InspectToolParamsTool::new(HashMap::new())),
+        Vec::new(), // vector tools are live-manager-constructed (MANIFEST §6a)
+        routing,
+        Some(ReadArtifactTool::new(disabled_persistence())),
+        Some(ListPriorRunsTool::new(disabled_persistence(), std::path::PathBuf::new())),
+        crate::skill_tool::SkillToolset::new(&fixture_skills()),
+    );
+    let order = Orchestrator::coordinator_tool_order_for_golden(&tools);
+    assert_eq!(
+        order,
+        vec![
+            "list_tools",
+            "inspect_tool_params",
+            "respond_directly",
+            "create_plan",
+            "request_clarification",
+            "read_artifact",
+            "list_prior_runs",
+            "load_skill",
+            "read_skill_file",
+        ],
+        "R8: coordinator tool registration order must match build_agent_with_tools"
+    );
+}
+
+/// R8 (worker tool registration order): `worker_tool_definitions` returns the
+/// in-repo worker tools in the order `Agent::add_all_tools` registers them.
+#[tokio::test]
+async fn gate_r8_worker_tool_order() {
+    let scenario = WorkerScenario {
+        preamble: WorkerPreambleFixture::Generic {
+            custom_prompt: None,
+            appends: WorkerPreambleAppends {
+                scratchpad: ScratchpadWiring::NotWired,
+                skills: fixture_skills(),
+            },
+        },
+        frame: WorkerFrameFixture::EmptyFirstTurn {
+            task: EMPTY_FRAME_TASK.to_owned(),
+        },
+    };
+    let tools = worker_tool_definitions(&scenario).await;
+    let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "read_artifact".to_owned(),
+            "submit_result".to_owned(),
+            "load_skill".to_owned(),
+            "read_skill_file".to_owned(),
+        ],
+        "R8: worker tool definition order must match Agent::add_all_tools"
+    );
+}
+
+/// R8 (conversation growth): the envelope builder grows the coordinator
+/// conversation using the same production helpers that `plan_with_routing`
+/// uses.
+#[tokio::test]
+async fn gate_r8_conversation_growth() {
+    let config = OrchestrationConfig {
+        max_planning_cycles: 4,
+        ..roster_config(analyst_operator_workers(), ToolVisibility::Summary)
+    };
+    let scenario = scenario(
+        preamble(no_optional_tools()),
+        WorkerRosterFixture::new(config, Vec::new()),
+        CoordinatorCall::Continuation(
+            ContinuationThread::new(failure_thread_iterations()).expect("two iterations"),
+        ),
+    );
+    let envelope = coordinator_envelope(&scenario)
+        .await
+        .expect("corpus envelope assembles");
+
+    let orchestrator = section_orchestrator(&scenario).await;
+    let (worker_section, _worker_field, worker_guidelines) =
+        orchestrator.worker_prompt_sections_for_golden();
+    let planning_wrapper = Orchestrator::build_planning_wrapper(
+        scenario.query().as_str(),
+        &worker_section,
+        &worker_guidelines,
+    );
+
+    let mut expected = vec![rig::completion::Message::user(planning_wrapper)];
+    if let CoordinatorCall::Continuation(thread) = scenario.call() {
+        let iterations = thread.iterations();
+        let config = scenario.roster().config();
+        let mut failure_history = Vec::new();
+        for (idx, iteration) in iterations.iter().enumerate() {
+            let iteration_number = idx + 1;
+            let plan = executed_plan(iteration);
+            failure_history.extend(Orchestrator::iteration_failures_for_golden(
+                &plan,
+                iteration_number,
+            ));
+            let traces = merged_traces(&iterations[..=idx], &plan);
+            let context = IterationContext::new(
+                iteration_number,
+                plan,
+                iteration.failure_summary().cloned(),
+                failure_history.clone(),
+                traces,
+            )
+            .with_pinned_goal(scenario.query().clone());
+
+            Orchestrator::push_assistant_turn_for_golden(
+                &mut expected,
+                iteration.decision().as_response(),
+                "",
+            );
+            Orchestrator::push_user_turn_for_golden(
+                &mut expected,
+                &Orchestrator::continuation_wrapper_for_golden(
+                    &context,
+                    scenario.budget().get(),
+                    config.show_tool_reasoning_in_continuation(),
+                    config.result_summary_length(),
+                ),
+            );
+        }
+    }
+
+    assert_eq!(
+        envelope.messages, expected,
+        "R8: the envelope builder must grow the conversation exactly like plan_with_routing"
+    );
 }
