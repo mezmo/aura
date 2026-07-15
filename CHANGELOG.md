@@ -1,5 +1,20 @@
 ## Changelog
 
+# [3.1.0](https://github.com/mezmo/aura/compare/v3.0.4...v3.1.0) (2026-07-15)
+
+
+### Bug Fixes
+
+* **ci**: scope sccache wrapper to the credentialed build [48697d2](https://github.com/mezmo/aura/commit/48697d24a565b43c78002348f90e5d5e133c51ad) - Mike Shearer [#321](https://github.com/mezmo/aura/issues/321)
+
+### Continuous Integration
+
+* ensure version is set before building artifacts [dedda30](https://github.com/mezmo/aura/commit/dedda30899d2c93329618dcb2e50f01b9bda1494) - Mike Shearer [#352](https://github.com/mezmo/aura/issues/352)
+
+### Performance Improvements
+
+* **ci**: cache rust deps and compile with sccache via s3 [8b82d15](https://github.com/mezmo/aura/commit/8b82d15b31f2f1c5cda82100757e74bd6753a29d) - Mike Shearer [#321](https://github.com/mezmo/aura/issues/321) [#350](https://github.com/mezmo/aura/issues/350)
+
 ## [3.0.4](https://github.com/mezmo/aura/compare/v3.0.3...v3.0.4) (2026-07-14)
 
 
