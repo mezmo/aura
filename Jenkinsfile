@@ -394,10 +394,31 @@ pipeline {
       }
 
       stages {
+        stage('Compute Release Version') {
+          steps {
+            withCredentials(RELEASE_CREDENTIALS) {
+              script {
+                try {
+                  sh 'npm run release:dry -- --plugins @semantic-release/commit-analyzer @semantic-release/exec'
+                  env.NEXT_RELEASE_VERSION = fileExists('.next-release-version') ? readFile('.next-release-version').trim() : ''
+                } finally {
+                  sh 'rm -f .next-release-version'
+                }
+                echo env.NEXT_RELEASE_VERSION ? "Release version: ${env.NEXT_RELEASE_VERSION}" : 'No release version determined; skipping build'
+              }
+            }
+          }
+        }
+
         stage('Build Release Artifacts') {
+          when {
+            expression { env.NEXT_RELEASE_VERSION }
+          }
+
           parallel {
             stage('Build Linux Artifacts') {
               steps {
+                sh './scripts/set-version.sh "$NEXT_RELEASE_VERSION"'
                 sh 'make build-binaries-linux'
 
                 stash(
@@ -421,6 +442,7 @@ pipeline {
               }
 
               steps {
+                sh './scripts/set-version.sh "$NEXT_RELEASE_VERSION"'
                 sh 'make build-binaries-darwin'
 
                 stash(
@@ -440,6 +462,10 @@ pipeline {
         }
 
         stage('Semantic Release') {
+          when {
+            expression { env.NEXT_RELEASE_VERSION }
+          }
+
           steps {
             sh 'rm -rf dist'
             sh 'mkdir -p dist'
