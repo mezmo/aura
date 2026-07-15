@@ -21,6 +21,10 @@
 
 use std::collections::HashMap;
 
+use super::envelope::{
+    compose_worker_preamble, executed_plan, merged_traces, section_orchestrator,
+    worker_tool_definitions,
+};
 use super::{
     CompletedResultFixture, ContinuationThread, CoordinatorCall, CoordinatorScenario,
     CoordinatorToolConfig, FailedResultFixture, FixtureError, FrameGraph, HistoryTools,
@@ -28,10 +32,6 @@ use super::{
     ReconTools, ScratchpadWiring, SessionHistoryFixture, SpilledStandIn, TaskOutcome,
     WorkerFrameFixture, WorkerPreambleAppends, WorkerPreambleFixture, WorkerRosterFixture,
     WorkerScenario, assert_envelope_snapshot, coordinator_envelope, normalize, worker_envelope,
-};
-use super::envelope::{
-    compose_worker_preamble, executed_plan, merged_traces, section_orchestrator,
-    worker_tool_definitions,
 };
 use crate::config::AgentRuntimeConfig;
 use crate::orchestration::config::{ArtifactsConfig, OrchestrationConfig, ToolVisibility};
@@ -44,16 +44,16 @@ use crate::orchestration::persistence::{
     ArtifactEntry, ArtifactKind, ErrorContext, ExecutionPersistence, RunManifest, RunStatus,
     TaskSummary, ToolCallRecord, ToolOutcome, ToolTraceEntry,
 };
+use crate::orchestration::tools::submit_result::Confidence;
 use crate::orchestration::tools::{
     InspectToolParamsTool, ListPriorRunsTool, ListToolsTool, ReadArtifactTool, RoutingToolSet,
 };
-use crate::orchestration::tools::submit_result::Confidence;
 use crate::orchestration::types::{
     FailureCategory, FailureSummary, IterationContext, Plan, PlanningResponse, StepInput,
     StructuredTaskOutput, Task, TaskStatus,
 };
 use crate::orchestration::{Orchestrator, WorkerConfig};
-use aura_config::{LlmConfig, SkillConfig, SkillName, VectorStoreConfig, ScratchpadConfig};
+use aura_config::{LlmConfig, ScratchpadConfig, SkillConfig, SkillName, VectorStoreConfig};
 
 /// The shared coordinator playbook (`[agent].system_prompt`), preserving
 /// the 14 headed blocks of MANIFEST §1 rows 5-18 so Gate A can see each
@@ -1485,7 +1485,10 @@ async fn gate_r8_coordinator_tool_order() {
         Vec::new(), // vector tools are live-manager-constructed (MANIFEST §6a)
         routing,
         Some(ReadArtifactTool::new(disabled_persistence())),
-        Some(ListPriorRunsTool::new(disabled_persistence(), std::path::PathBuf::new())),
+        Some(ListPriorRunsTool::new(
+            disabled_persistence(),
+            std::path::PathBuf::new(),
+        )),
         crate::skill_tool::SkillToolset::new(&fixture_skills()),
     );
     let order = Orchestrator::coordinator_tool_order_for_golden(&tools);

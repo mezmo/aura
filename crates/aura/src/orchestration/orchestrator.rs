@@ -603,7 +603,11 @@ impl Orchestrator {
                 iteration,
                 persistence_enabled,
                 size_threshold: self.bounding.tool_output_spill().size().threshold_bytes(),
-                duration_threshold_ms: self.bounding.tool_output_spill().duration().threshold_millis(),
+                duration_threshold_ms: self
+                    .bounding
+                    .tool_output_spill()
+                    .duration()
+                    .threshold_millis(),
             },
         ));
         let observer_wrapper = Arc::new(ObserverWrapper::new(
@@ -1780,7 +1784,11 @@ impl Orchestrator {
             planning_summary: String::new(),
         };
 
-        let query_preview = self.bounding.log_preview_widths().query_log().truncate(query);
+        let query_preview = self
+            .bounding
+            .log_preview_widths()
+            .query_log()
+            .truncate(query);
         tracing::info!("Created fallback single-task plan for: {}", query_preview);
 
         Ok((
@@ -3565,7 +3573,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                     TaskState::Failed { error, .. } => {
                         let summary = self.bounding.result_spill().truncate_to_summary(error);
-                        let suffix = if summary.was_truncated() { " [truncated]" } else { "" };
+                        let suffix = if summary.was_truncated() {
+                            " [truncated]"
+                        } else {
+                            ""
+                        };
                         format!("✗ failed: {}{}", summary, suffix)
                     }
                     TaskState::Pending => {
@@ -4428,9 +4440,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .as_ref()
                     .map(|s| s.summary.clone())
                     .or_else(|| match &t.state {
-                        TaskState::Complete { result } => {
-                            Some(self.bounding.manifest_widths().result_preview().truncate(result))
-                        }
+                        TaskState::Complete { result } => Some(
+                            self.bounding
+                                .manifest_widths()
+                                .result_preview()
+                                .truncate(result),
+                        ),
                         _ => None,
                     }),
                 confidence: t
@@ -4489,11 +4504,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let persistence = self.persistence.lock().await;
 
-        let response_summary = Some(
-            summary
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| self.bounding.manifest_widths().response_summary().truncate(response)),
-        );
+        let response_summary = Some(summary.map(|s| s.to_string()).unwrap_or_else(|| {
+            self.bounding
+                .manifest_widths()
+                .response_summary()
+                .truncate(response)
+        }));
 
         let manifest = RunManifest {
             run_id: persistence.run_id().to_string(),
@@ -4984,7 +5000,8 @@ mod tests {
             response_summary: None,
         };
         let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
-        let out = Orchestrator::enforce_routing_config(&bounding, direct, "what is 6*7?", true, true);
+        let out =
+            Orchestrator::enforce_routing_config(&bounding, direct, "what is 6*7?", true, true);
         assert!(matches!(out, PlanningResponse::Direct { .. }));
 
         let clar = PlanningResponse::Clarification {
@@ -5006,7 +5023,13 @@ mod tests {
             response_summary: None,
         };
         let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
-        let out = Orchestrator::enforce_routing_config(&bounding, direct, "what is the meaning?", false, true);
+        let out = Orchestrator::enforce_routing_config(
+            &bounding,
+            direct,
+            "what is the meaning?",
+            false,
+            true,
+        );
 
         match out {
             PlanningResponse::StepsPlan {
@@ -5044,7 +5067,13 @@ mod tests {
             routing_rationale: "ambiguous env".to_string(),
         };
         let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
-        let out = Orchestrator::enforce_routing_config(&bounding, clar, "check service health", true, false);
+        let out = Orchestrator::enforce_routing_config(
+            &bounding,
+            clar,
+            "check service health",
+            true,
+            false,
+        );
 
         match out {
             PlanningResponse::StepsPlan {
@@ -5087,7 +5116,8 @@ mod tests {
         // Both flags off — should still pass through, since the response is
         // already a StepsPlan and the override only converts Direct/Clarification.
         let bounding = BoundingConfig::from_orchestration(&OrchestrationConfig::default());
-        let out = Orchestrator::enforce_routing_config(&bounding, original, "compute mean", false, false);
+        let out =
+            Orchestrator::enforce_routing_config(&bounding, original, "compute mean", false, false);
         match out {
             PlanningResponse::StepsPlan {
                 goal,

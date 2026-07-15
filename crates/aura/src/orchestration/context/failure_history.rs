@@ -120,8 +120,8 @@ mod tests {
     #[test]
     fn cut_handle_appends_marker_after_cap() {
         let description = "d".repeat(200);
-        let handle =
-            FailureHandle::from_description(&description, FailureHandleWidth::DEFAULT).expect("non-empty");
+        let handle = FailureHandle::from_description(&description, FailureHandleWidth::DEFAULT)
+            .expect("non-empty");
         assert_eq!(
             handle.as_str().chars().count(),
             FailureHandle::MAX_CHARS + FailureHandle::TRUNCATION_MARKER.chars().count(),
@@ -137,14 +137,14 @@ mod tests {
 
         // Display identity and grouping identity come from one truncation:
         // a re-issued identical description produces an identical handle.
-        let reissued =
-            FailureHandle::from_description(&description, FailureHandleWidth::DEFAULT).expect("non-empty");
+        let reissued = FailureHandle::from_description(&description, FailureHandleWidth::DEFAULT)
+            .expect("non-empty");
         assert_eq!(handle, reissued);
 
         // At or under the cap, nothing is cut and nothing is marked.
         let exact = "e".repeat(FailureHandle::MAX_CHARS);
-        let uncut =
-            FailureHandle::from_description(&exact, FailureHandleWidth::DEFAULT).expect("non-empty");
+        let uncut = FailureHandle::from_description(&exact, FailureHandleWidth::DEFAULT)
+            .expect("non-empty");
         assert_eq!(uncut.as_str(), exact);
     }
 
@@ -170,10 +170,14 @@ mod tests {
     fn record_renders_handle_worker_category_and_preview() {
         let record = FailureRecord {
             iteration: IterationNumber::new(2).expect("valid iteration"),
-            handle: FailureHandle::from_description("Gather logs", FailureHandleWidth::DEFAULT).expect("non-empty"),
+            handle: FailureHandle::from_description("Gather logs", FailureHandleWidth::DEFAULT)
+                .expect("non-empty"),
             worker: Some(WorkerRole::new("operations").expect("non-empty")),
             category: FailureCategory::AgentTimeout,
-            error: ErrorPreview::new("Timeout contacting service", crate::orchestration::bounding::ErrorPreviewWidth::DEFAULT),
+            error: ErrorPreview::new(
+                "Timeout contacting service",
+                crate::orchestration::bounding::ErrorPreviewWidth::DEFAULT,
+            ),
         };
         assert_eq!(
             record.render().as_str(),

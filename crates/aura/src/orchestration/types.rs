@@ -1899,11 +1899,9 @@ mod tests {
         let ctx = IterationContext::new(2, plan, None, vec![record(1), record(2)], HashMap::new());
         let prompt = ctx.build_continuation_prompt(4, false, 2000);
 
-        let handle = FailureHandle::from_description(
-            &long_description,
-            FailureHandleWidth::DEFAULT,
-        )
-        .expect("non-empty");
+        let handle =
+            FailureHandle::from_description(&long_description, FailureHandleWidth::DEFAULT)
+                .expect("non-empty");
         assert_eq!(
             handle.as_str().chars().count(),
             FailureHandle::MAX_CHARS + FailureHandle::TRUNCATION_MARKER.chars().count(),

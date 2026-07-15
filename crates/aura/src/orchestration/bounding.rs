@@ -9,7 +9,6 @@
 //! This is the S3 bounding module: function bodies are implemented.  The
 //! call-site wiring to production code happens in the implementation phase.
 
-
 use std::num::NonZeroUsize;
 use std::time::Duration;
 

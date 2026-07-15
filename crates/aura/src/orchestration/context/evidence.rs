@@ -374,10 +374,7 @@ impl ErrorPreview {
 
     /// Truncate raw error text to at most [`Self::MAX_CHARS`] characters,
     /// recording whether anything was cut.
-    pub fn new(
-        raw_error: &str,
-        width: crate::orchestration::bounding::ErrorPreviewWidth,
-    ) -> Self {
+    pub fn new(raw_error: &str, width: crate::orchestration::bounding::ErrorPreviewWidth) -> Self {
         let (text, truncated) = width.truncate_with_flag(raw_error);
         Self { text, truncated }
     }
@@ -690,7 +687,10 @@ mod tests {
             label: label(Some("verifier")),
             report: FailureReport::Hard {
                 category: FailureCategory::DepthExhausted,
-                error: ErrorPreview::new("MaxDepthError (reached limit: 16)", ErrorPreviewWidth::DEFAULT),
+                error: ErrorPreview::new(
+                    "MaxDepthError (reached limit: 16)",
+                    ErrorPreviewWidth::DEFAULT,
+                ),
             },
         };
         assert_eq!(
