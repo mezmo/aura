@@ -792,7 +792,8 @@ impl McpManager {
     /// Returns Ok(()) if successful, or Err(reason) if schema is invalid and should be rejected.
     fn sanitize_schema_for_openai(schema: &mut serde_json::Value) -> Result<(), String> {
         use crate::schema_sanitize::{
-            fix_empty_root_required, recursive_set_additional_properties_false,
+            fix_empty_root_required, normalize_bare_boolean_schemas,
+            recursive_set_additional_properties_false,
         };
 
         // VALIDATION: OpenAI requires tool schemas to have type: "object" at root level
@@ -806,6 +807,10 @@ impl McpManager {
                     This is an MCP server bug - the server is returning a type definition as a tool."
             ));
         }
+
+        // Step 0: Normalize bare boolean schema nodes before anything else touches
+        // the tree, so later passes only ever see object schemas.
+        normalize_bare_boolean_schemas(schema);
 
         // Step 1: Fix incomplete required arrays (makes optional fields nullable)
         fix_empty_root_required(schema);
