@@ -9,7 +9,6 @@
 //! This is the S3 bounding module: function bodies are implemented.  The
 //! call-site wiring to production code happens in the implementation phase.
 
-#![allow(dead_code)]
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -137,6 +136,8 @@ impl BoundingConfig {
 struct ByteWidth(NonZeroUsize);
 
 impl ByteWidth {
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     fn new(bytes: usize) -> Option<Self> {
         NonZeroUsize::new(bytes).map(Self)
     }
@@ -154,6 +155,8 @@ impl ByteWidth {
 struct CharWidth(NonZeroUsize);
 
 impl CharWidth {
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     fn new(chars: usize) -> Option<Self> {
         NonZeroUsize::new(chars).map(Self)
     }
@@ -214,6 +217,8 @@ impl ByteThreshold {
         Self(bytes)
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn get(&self) -> usize {
         self.0
     }
@@ -231,6 +236,8 @@ impl ByteThreshold {
 pub(crate) struct NonZeroByteThreshold(NonZeroUsize);
 
 impl NonZeroByteThreshold {
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     fn new(bytes: usize) -> Option<Self> {
         NonZeroUsize::new(bytes).map(Self)
     }
@@ -244,6 +251,8 @@ impl NonZeroByteThreshold {
 pub(crate) struct NonZeroDuration(Duration);
 
 impl NonZeroDuration {
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     fn from_millis(ms: u64) -> Option<Self> {
         if ms == 0 {
             None
@@ -281,6 +290,8 @@ impl ResultSummaryWidth {
         }
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn truncate(&self, text: &str) -> String {
         truncate_bytes(text, self.get(), TruncateMarker::None)
     }
@@ -309,6 +320,8 @@ impl TruncatedSummary {
         self.was_truncated
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn into_string(self) -> String {
         self.text
     }
@@ -358,6 +371,8 @@ impl ResultSpillBudget {
         self.summary_width
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn decide(&self, text: &str) -> ResultSpillDecision {
         if self.threshold.allows_inline(text) {
             ResultSpillDecision::Inline
@@ -379,6 +394,8 @@ impl ResultSpillBudget {
 }
 
 /// Decision produced by [`ResultSpillBudget::decide`].
+// Unused S3 API surface.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultSpillDecision {
     /// Text stays inline unchanged.
@@ -424,6 +441,8 @@ impl SizePromotion {
         }
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn qualifies(&self, output: &str) -> bool {
         match self {
             Self::PromoteAll => true,
@@ -463,6 +482,8 @@ impl DurationPromotion {
         }
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn qualifies(&self, duration: Duration) -> bool {
         match self {
             Self::Disabled => false,
@@ -501,10 +522,14 @@ impl ToolOutputSpillBudget {
         self.duration
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn size_qualifies(&self, output: &str) -> bool {
         self.size.qualifies(output)
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     pub fn duration_qualifies(&self, duration: Duration) -> bool {
         self.duration.qualifies(duration)
     }
@@ -698,6 +723,8 @@ impl FailureHandleWidth {
         }
     }
 
+    // Unused S3 API surface.
+    #[allow(dead_code)]
     fn truncate(&self, text: &str) -> String {
         truncate_chars(text, self.0.get(), TruncateMarker::None)
     }
@@ -1108,9 +1135,13 @@ impl PlanContentWidths {
 /// `ContextBudget.context_window` is private and `usable_budget() == 0` cannot
 /// distinguish a zero context window from a small window rounded to zero after
 /// the safety margin, so the wrapper is infallible.
+// Unused S3 API surface.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ScratchpadBudget(crate::scratchpad::ContextBudget);
 
+// Unused S3 API surface.
+#[allow(dead_code)]
 impl ScratchpadBudget {
     pub fn new(budget: crate::scratchpad::ContextBudget) -> Self {
         Self(budget)
