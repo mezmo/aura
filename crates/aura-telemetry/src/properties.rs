@@ -89,6 +89,27 @@ impl DeploymentMethod {
     }
 }
 
+/// How an interactive REPL session ended. Values are code-controlled
+/// (never user input), so it is safe on the sealed allow-list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    Quit,
+    Eof,
+    Interrupt,
+    Error,
+}
+
+impl ExitReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::Eof => "eof",
+            Self::Interrupt => "interrupt",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// The Phase-1 sealed allow-list of values that may appear in an event's
 /// **property map** (i.e. the per-event key/value bag that PostHog
 /// receives under `properties`).
@@ -114,6 +135,8 @@ pub enum PropertyValue {
     AuraVersion,
     /// Session UUID — random per-process; not linked to install identity.
     SessionUuid(uuid::Uuid),
+    /// How an interactive REPL session ended.
+    ExitReason(ExitReason),
 }
 
 impl PropertyValue {
@@ -128,6 +151,7 @@ impl PropertyValue {
             Self::Static(s) => Value::String((*s).into()),
             Self::AuraVersion => Value::String(env!("CARGO_PKG_VERSION").into()),
             Self::SessionUuid(u) => Value::String(u.to_string()),
+            Self::ExitReason(v) => Value::String(v.as_str().into()),
         }
     }
 }
@@ -194,6 +218,12 @@ pub struct SessionUuid(pub uuid::Uuid);
 impl IntoTelemetryProperty for SessionUuid {
     fn into_telemetry_property(self) -> PropertyValue {
         PropertyValue::SessionUuid(self.0)
+    }
+}
+
+impl IntoTelemetryProperty for ExitReason {
+    fn into_telemetry_property(self) -> PropertyValue {
+        PropertyValue::ExitReason(self)
     }
 }
 
@@ -286,5 +316,21 @@ mod tests {
         // the shape — it's a non-empty string.
         let s = v.as_str().expect("AuraVersion should serialize as string");
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn exit_reason_renders_lowercase() {
+        assert_eq!(ExitReason::Quit.as_str(), "quit");
+        assert_eq!(ExitReason::Eof.as_str(), "eof");
+        assert_eq!(ExitReason::Interrupt.as_str(), "interrupt");
+        assert_eq!(ExitReason::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn exit_reason_property_to_json_is_string() {
+        assert_eq!(
+            PropertyValue::ExitReason(ExitReason::Interrupt).to_json(),
+            json!("interrupt")
+        );
     }
 }

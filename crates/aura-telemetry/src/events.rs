@@ -13,6 +13,8 @@
 
 use aura_telemetry_derive::Event as DeriveEvent;
 
+pub use crate::properties::ExitReason;
+
 /// Emitted once per interactive CLI session, when the user grants consent
 /// by sending their first chat message (or immediately on launch if
 /// telemetry was already `Enabled`).
@@ -66,4 +68,14 @@ pub struct ChatRequestCompleted {
     /// `true` if the turn completed without an error surfacing to the
     /// user; `false` if it errored or was cancelled.
     pub success: bool,
+}
+
+/// Emitted on REPL exit while telemetry remains enabled.
+/// Tracks exit paths and enables derived session-length and turn-volume analysis.
+#[derive(DeriveEvent, Debug, Clone)]
+#[aura_event(name = "cli_session_ended")]
+pub struct CliSessionEnded {
+    /// How the session ended (`/quit`, Ctrl-D, double Ctrl-C, or an
+    /// input error).
+    pub exit_reason: ExitReason,
 }

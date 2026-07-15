@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use aura_telemetry::events::{ChatRequestStarted, CliSessionStarted};
-use aura_telemetry::properties::{DeploymentMethod, OsFamily, Source};
+use aura_telemetry::events::{ChatRequestStarted, CliSessionEnded, CliSessionStarted};
+use aura_telemetry::properties::{DeploymentMethod, ExitReason, OsFamily, Source};
 use aura_telemetry::{
     init, DisableReason, EnableOutcome, TelemetryConfig, TelemetryHandle, TelemetryState,
 };
@@ -265,5 +265,60 @@ async fn runtime_disable_then_enable_resumes_sending() {
     assert!(
         events.iter().any(|e| e["event"] == "cli_session_started"),
         "an event captured after re-enable must be sent; got {events:?}"
+    );
+}
+
+/// When `Enabled`, `cli_session_ended` reaches the wire, carrying its
+/// exit_reason and landing after `cli_session_started`.
+#[tokio::test]
+async fn session_ended_sent_after_started_when_enabled() {
+    let f = fixture(TelemetryState::Enabled).await;
+    f.handle.capture(session_event());
+    f.handle.capture(CliSessionEnded {
+        exit_reason: ExitReason::Quit,
+    });
+    f.handle.shutdown(Duration::from_secs(2)).await;
+
+    let reqs = f.server.received_requests().await.unwrap_or_default();
+    let events: Vec<Value> = reqs
+        .iter()
+        .flat_map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            body["batch"].as_array().cloned().unwrap_or_default()
+        })
+        .collect();
+    let names: Vec<&str> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    let started = names.iter().position(|n| *n == "cli_session_started");
+    let ended = names.iter().position(|n| *n == "cli_session_ended");
+    assert!(
+        started.is_some() && ended.is_some() && started < ended,
+        "ended must follow started; got {names:?}"
+    );
+    let ended_event = events
+        .iter()
+        .find(|e| e["event"] == "cli_session_ended")
+        .unwrap();
+    assert_eq!(ended_event["properties"]["exit_reason"], "quit");
+}
+
+/// While `Unknown` (no consent), `cli_session_ended` is held and never
+/// sent — mirrors the guard `run_repl` applies at the call site.
+#[tokio::test]
+async fn session_ended_held_while_unknown() {
+    let f = fixture(TelemetryState::Unknown).await;
+    f.handle.capture(CliSessionEnded {
+        exit_reason: ExitReason::Eof,
+    });
+    f.handle.shutdown(Duration::from_secs(2)).await;
+    assert!(
+        f.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "ended must not send while Unknown"
     );
 }
