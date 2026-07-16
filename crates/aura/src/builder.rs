@@ -146,6 +146,9 @@ pub struct Agent {
     /// stream with `finish_reason: "tool_calls"` so the caller can execute
     /// the tool and resume in a follow-up request.
     pub(crate) client_tool_names: HashSet<String>,
+    /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`
+    /// (see the `turn_nudge` module).
+    pub(crate) turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
 }
 
 impl Agent {
@@ -341,18 +344,50 @@ impl Agent {
             ));
         }
 
-        let config = &config_owned;
-
         // Scratchpad bonus only applies when scratchpad was actually wired up
         // (enabled + context_window + a matching MCP tool).
-        let base_depth = config.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
-        let scratchpad_bonus = config
+        let base_depth = config_owned.agent.turn_depth.unwrap_or(DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = config_owned
             .scratchpad_tools_config
             .as_ref()
-            .and(config.agent.scratchpad.as_ref())
+            .and(config_owned.agent.scratchpad.as_ref())
             .map(|sp| sp.turn_depth_bonus)
             .unwrap_or(0);
         let max_depth = base_depth + scratchpad_bonus;
+
+        // Turn-limit nudging for single-agent mode. Orchestration workers wire
+        // their own state in `create_worker` (with submit_result wording); the
+        // top-level orchestration agent doesn't run rig's multi-turn loop
+        // itself, so it gets no nudge state.
+        let turn_nudge = if config_owned.orchestration_enabled() {
+            None
+        } else {
+            crate::turn_nudge::TurnNudgeState::new(
+                config_owned.agent.nudge_last_turn,
+                config_owned.agent.nudge_turns_remaining,
+                max_depth,
+            )
+        };
+        if let Some(ref state) = turn_nudge {
+            // First in the vec → `transform_output` runs LAST, so the nudge
+            // lands on the text the LLM actually sees (after any scratchpad
+            // pointer rewrite) and is never persisted as raw tool output.
+            let nudge: Arc<dyn crate::tool_wrapper::ToolWrapper> =
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone()));
+            config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
+                Some(existing) => Arc::new(crate::tool_wrapper::ComposedWrapper::new(vec![
+                    nudge, existing,
+                ])),
+                None => nudge,
+            });
+            tracing::info!(
+                "  Turn-limit nudging: ENABLED (last_turn={}, wrap_up_threshold={:?})",
+                config_owned.agent.nudge_last_turn,
+                config_owned.agent.nudge_turns_remaining
+            );
+        }
+
+        let config = &config_owned;
         if scratchpad_bonus > 0 {
             tracing::info!(
                 "  Max turn depth: {} (base={}, scratchpad_bonus={})",
@@ -751,6 +786,7 @@ impl Agent {
             context_window: config.llm.context_window(),
             scratchpad_budget: agent_scratchpad_budget,
             client_tool_names,
+            turn_nudge,
         })
     }
 
@@ -1150,7 +1186,7 @@ impl Agent {
         query: &str,
     ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
         let stream = self.inner.stream_prompt(query, self.max_depth).await;
-        self.maybe_wrap_with_fallback(stream)
+        self.maybe_wrap_with_fallback(self.count_turns(stream))
     }
 
     /// Stream a chat query with conversation history - returns true streaming response with multi-turn tool support
@@ -1163,7 +1199,7 @@ impl Agent {
             .inner
             .stream_chat(query, chat_history, self.max_depth)
             .await;
-        self.maybe_wrap_with_fallback(stream)
+        self.maybe_wrap_with_fallback(self.count_turns(stream))
     }
 
     /// Stream a chat with explicit max_depth override.
@@ -1179,7 +1215,37 @@ impl Agent {
         max_depth: usize,
     ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
         let stream = self.inner.stream_chat(query, chat_history, max_depth).await;
-        self.maybe_wrap_with_fallback(stream)
+        self.maybe_wrap_with_fallback(self.count_turns(stream))
+    }
+
+    /// Feed per-turn completions into the turn-nudge state so its
+    /// `TurnNudgeWrapper` knows which turn is executing.
+    ///
+    /// Rig yields exactly one provider `Final` chunk per turn, which
+    /// `map_stream_item` converts to `StreamItem::TurnUsage` — counting those
+    /// tracks the turn number without touching the rig fork. Tool calls of
+    /// turn `N` execute before turn `N`'s `TurnUsage` arrives, so during tool
+    /// execution the current turn is `turns_completed + 1`. Counters are
+    /// reset here because an `Agent` can serve multiple sequential streams
+    /// (e.g. the CLI REPL). No-op passthrough when nudging is disabled.
+    fn count_turns(
+        &self,
+        stream: Pin<
+            Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>,
+        >,
+    ) -> Pin<Box<dyn futures::stream::Stream<Item = Result<StreamItem, StreamError>> + Send>> {
+        use futures::StreamExt;
+
+        let Some(state) = self.turn_nudge.clone() else {
+            return stream;
+        };
+        state.reset();
+        Box::pin(stream.map(move |item| {
+            if matches!(item, Ok(StreamItem::TurnUsage(_))) {
+                state.record_turn_completed();
+            }
+            item
+        }))
     }
 
     /// Append a final `StreamItem::ScratchpadUsage` if this agent has a
@@ -1283,7 +1349,7 @@ impl Agent {
             )
             .await;
         (
-            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(self.count_turns(stream))),
             cancel_tx,
             usage_state,
         )
@@ -1329,7 +1395,7 @@ impl Agent {
             )
             .await;
         (
-            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(stream)),
+            self.append_scratchpad_usage(self.maybe_wrap_with_fallback(self.count_turns(stream))),
             cancel_tx,
             usage_state,
         )

@@ -672,16 +672,65 @@ impl Orchestrator {
             }
         }
 
+        // Resolution order: worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH.
+        // Scratchpad bonus only applies when scratchpad was actually wired up.
+        let base_depth = worker_name
+            .and_then(|name| self.config.workers.get(name))
+            .and_then(|w| w.turn_depth)
+            .or(self.agent_config.agent.turn_depth)
+            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
+        let scratchpad_bonus = worker_config
+            .scratchpad_tools_config
+            .as_ref()
+            .and(effective_scratchpad.as_ref())
+            .map(|sp| sp.turn_depth_bonus)
+            .unwrap_or(0);
+        let resolved_depth = base_depth + scratchpad_bonus;
+        worker_config.agent.turn_depth = Some(resolved_depth);
+        if scratchpad_bonus > 0 {
+            tracing::info!(
+                "Worker {} turn_depth={} (base={}, scratchpad_bonus={})",
+                task_id,
+                resolved_depth,
+                base_depth,
+                scratchpad_bonus
+            );
+        } else {
+            tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
+        }
+
+        // Turn-limit nudging: workers get submit_result wording. The state is
+        // fed per-turn by `Agent::count_turns` on the worker's stream.
+        let turn_nudge = crate::turn_nudge::TurnNudgeState::new_with_submit_tool(
+            worker_config.agent.nudge_last_turn,
+            worker_config.agent.nudge_turns_remaining,
+            resolved_depth,
+        );
+
         // ComposedWrapper applies transform_output in reverse-list order, so
         // the LAST entry runs FIRST on the raw tool output. Persistence must
         // see raw output (for debugging/retry), so it goes last. Scratchpad
         // also needs raw output — persistence's transform_output is a
         // passthrough that just caches the raw — and rewrites to the pointer.
         // Duplicate-guard and observer then see the pointer, which is what
-        // should surface to the LLM/UI.
+        // should surface to the LLM/UI. The turn-limit nudge goes first so it
+        // runs after everything else and lands on the text the LLM sees
+        // without being persisted as raw output.
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
+        if let Some(ref state) = turn_nudge {
+            wrappers.insert(
+                0,
+                Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone())),
+            );
+            tracing::info!(
+                "Worker {} turn-limit nudging enabled (last_turn={}, wrap_up_threshold={:?})",
+                task_id,
+                worker_config.agent.nudge_last_turn,
+                worker_config.agent.nudge_turns_remaining
+            );
+        }
 
         // HITL config gate. When `[hitl]` is configured, gate matching worker
         // tool calls behind the decision route, and pre-build the agent-callable
@@ -804,33 +853,6 @@ impl Orchestrator {
         // Disable orchestration in worker config to avoid nested orchestration
         worker_config.orchestration = None;
 
-        // Resolution order: worker turn_depth → [agent].turn_depth → DEFAULT_MAX_DEPTH.
-        // Scratchpad bonus only applies when scratchpad was actually wired up.
-        let base_depth = worker_name
-            .and_then(|name| self.config.workers.get(name))
-            .and_then(|w| w.turn_depth)
-            .or(self.agent_config.agent.turn_depth)
-            .unwrap_or(crate::builder::DEFAULT_MAX_DEPTH);
-        let scratchpad_bonus = worker_config
-            .scratchpad_tools_config
-            .as_ref()
-            .and(effective_scratchpad.as_ref())
-            .map(|sp| sp.turn_depth_bonus)
-            .unwrap_or(0);
-        let resolved_depth = base_depth + scratchpad_bonus;
-        worker_config.agent.turn_depth = Some(resolved_depth);
-        if scratchpad_bonus > 0 {
-            tracing::info!(
-                "Worker {} turn_depth={} (base={}, scratchpad_bonus={})",
-                task_id,
-                resolved_depth,
-                base_depth,
-                scratchpad_bonus
-            );
-        } else {
-            tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
-        }
-
         if worker_config.scratchpad_tools_config.is_some()
             && let Some(ref mut preamble) = worker_config.preamble_override
         {
@@ -885,6 +907,7 @@ impl Orchestrator {
                 .as_ref()
                 .map(|sp| sp.budget.clone()),
             client_tool_names: Default::default(),
+            turn_nudge,
         };
 
         Ok(AgentWithPreamble {
@@ -2236,6 +2259,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 context_window: None,
                 scratchpad_budget: None,
                 client_tool_names: Default::default(),
+                turn_nudge: None,
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
