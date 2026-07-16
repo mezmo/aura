@@ -45,6 +45,7 @@ pub mod tool_error_detection;
 pub mod tool_event_broker;
 pub mod tool_wrapper;
 pub mod tools;
+pub mod turn_nudge;
 pub mod vector_dynamic;
 pub mod vector_store;
 

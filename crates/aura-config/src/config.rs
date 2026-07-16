@@ -757,6 +757,15 @@ pub struct AgentConfig {
     /// `[orchestration.worker.<name>.skills]`.
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Nudge the agent on its final turn to submit its results instead of
+    /// calling more tools (default: false).
+    #[serde(default, deserialize_with = "lenient_bool::deserialize_bool")]
+    pub nudge_last_turn: bool,
+    /// Nudge the agent to start wrapping up when this many turns remain
+    /// before the turn-depth limit. `None` disables wrap-up nudging.
+    #[serde(default)]
+    #[serde(deserialize_with = "lenient_int::deserialize_option_usize")]
+    pub nudge_turns_remaining: Option<usize>,
 }
 
 fn default_turn_depth() -> Option<usize> {
@@ -787,6 +796,8 @@ impl Default for AgentConfig {
             scratchpad: None,
             hidden: bool::default(),
             skills: SkillsConfig::default(),
+            nudge_last_turn: false,
+            nudge_turns_remaining: None,
         }
     }
 }
@@ -841,6 +852,14 @@ pub struct AgentSettings {
     /// On-demand skill definitions loaded via the load_skill tool
     #[serde(default)]
     pub skills: Vec<SkillConfig>,
+    /// Nudge the agent on its final turn to submit its results instead of
+    /// calling more tools.
+    #[serde(default)]
+    pub nudge_last_turn: bool,
+    /// Nudge the agent to start wrapping up when this many turns remain
+    /// before the turn-depth limit. `None` disables wrap-up nudging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudge_turns_remaining: Option<usize>,
 }
 
 impl Default for AgentSettings {
@@ -855,6 +874,8 @@ impl Default for AgentSettings {
             enable_client_tools: false,
             client_tool_filter: None,
             skills: Vec::new(),
+            nudge_last_turn: false,
+            nudge_turns_remaining: None,
         }
     }
 }
@@ -941,6 +962,29 @@ mod tests {
     fn test_glob_match_star_only() {
         assert!(glob_match("*", "anything"));
         assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn test_agent_nudge_flags_parse_and_default_off() {
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+            nudge_last_turn = true
+            nudge_turns_remaining = 3
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.agent.nudge_last_turn);
+        assert_eq!(config.agent.nudge_turns_remaining, Some(3));
+
+        let toml = r#"
+            [agent]
+            name = "test"
+            system_prompt = "test"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.agent.nudge_last_turn);
+        assert_eq!(config.agent.nudge_turns_remaining, None);
     }
 
     #[test]

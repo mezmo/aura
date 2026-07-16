@@ -55,6 +55,8 @@ impl RigBuilder {
             enable_client_tools: self.config.agent.enable_client_tools,
             client_tool_filter: self.config.agent.client_tool_filter.clone(),
             skills: Vec::new(),
+            nudge_last_turn: self.config.agent.nudge_last_turn,
+            nudge_turns_remaining: self.config.agent.nudge_turns_remaining,
         };
 
         AgentRuntimeConfig {
