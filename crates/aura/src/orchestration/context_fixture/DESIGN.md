@@ -59,10 +59,19 @@ text. Call inventory is in `envelope.rs` module docs. Visibility decisions:
 | `Orchestrator::create_coordinator` | private | `#[cfg(test)] pub(crate) async fn coordinator_preamble_for_golden` accessor, added in the implementation step so the REQUIRED R3 gate compares against real `create_coordinator` output; pure delegation returning only the assembled preamble |
 | `crate::skill_tool::SkillToolset::new` | `pub` | called directly; pure over `SkillConfig` (no filesystem discovery), so skill tool definitions are real production output |
 
-No production visibility was widened; the only product-file edits are the
-four `#[cfg(test)]`-gated delegating accessors (three from the skeleton,
-one added by the implementation step for the R3 gate). Test-only
-dependency added: `insta = "1"` in `[dev-dependencies]`.
+No production visibility was widened. S2's product-file edits were the
+four `#[cfg(test)]`-gated delegating accessors above (three from the
+skeleton, one added by the implementation step for the R3 gate). S3
+Phase B added four more `#[cfg(test)]` accessors for its seam gates
+(`worker_preamble_for_golden`, `coordinator_tool_order_for_golden`,
+`push_user_turn_for_golden`, `push_assistant_turn_for_golden`) plus the
+`#[cfg(test)]` constructor `CoordinatorTools::new_for_golden_test`, and
+made two behavior-preserving production edits outside `#[cfg(test)]`:
+`create_worker` now always captures its assembled preamble (the
+prompt-journal gate was removed), and the per-turn conversation pushes
+were extracted into `push_user_turn`/`push_assistant_turn` so the R8
+gate shares them with production (details in the R3/R8 sections below).
+Test-only dependency added: `insta = "1"` in `[dev-dependencies]`.
 
 ## Normalization design (pre-approved decision 2)
 
@@ -144,9 +153,10 @@ verification section below.
   `worker_preamble_for_golden` accessor returns it. The composed worker
   preamble byte-equals real `create_worker` output over an MCP-less
   Orchestrator. Residue: the scratchpad append requires accessible MCP
-  tools, so the gate runs scratchpad-disabled; the vector → skills
-  sub-order is production-emitted, the scratchpad position is a
-  conditional residue. MANIFEST §5 worker-append-order rows flipped to
+  tools; the gate's config enables scratchpad but the MCP-less test
+  environment leaves it unwired, so the vector → skills sub-order is
+  production-emitted and the scratchpad position is a conditional
+  residue. MANIFEST §5 worker-append-order rows flipped to
   production-emitted.
 - **R4 - event side effects.** Persistence writes, journal records,
   stream events, and artifact I/O ordering are outside the envelope and

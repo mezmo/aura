@@ -81,9 +81,13 @@ sites listed below; the table now records the wired seams.
 | `Agent::scratchpad_budget` (builder.rs) | `pub(crate)` | Receives a `ScratchpadBudget` wrapper from the S3+ seam (not yet wired) |
 | `PriorWorkFrame::assemble` (context/frame.rs) | `pub` | Continues to use the reused `TokenBudget` |
 
-No production visibility is widened by the skeleton. Phase B widened only the
-`#[cfg(test)]` golden-frame accessors needed for the S2 harness seams; all
-other product-file edits route existing calls through `BoundingConfig`.
+No production visibility is widened by the skeleton. Phase B widened the
+`#[cfg(test)]` golden-frame accessors needed for the S2 harness seams and
+made two behavior-preserving production edits for the R3/R8 gates
+(`create_worker` now always captures its assembled preamble;
+`push_user_turn`/`push_assistant_turn` extracted from `plan_with_routing`);
+every other product-file edit routes existing calls through
+`BoundingConfig`.
 
 ## Consolidation inventory (what this module unifies)
 
@@ -95,7 +99,7 @@ type above, preserving byte-identical output on every S2 manifest surface.
   (`result_artifact_threshold`, default 4000) and summary width
   (`result_summary_length`, default 2000).  Production uses `result.len()`
   (bytes) for both threshold and summary; the artifact stand-in prints
-  "Full result ({} chars)" while reporting `result.len()` bytes — a label
+  "Full result ({} chars)" while reporting `result.len()` bytes - a label
   lie the implementation must preserve byte-identically.
 - **Token-based scratchpad budget**: per-worker `ContextBudget` built in
   `create_worker` and attached to `Agent::scratchpad_budget`.

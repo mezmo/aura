@@ -31,12 +31,14 @@ Two further claim qualifiers, marked where they apply:
 - **Re-stated rules (R3/R5/R8).** Rows marked "re-stated" snapshot a shape
   the test builder reproduces rather than production emits end-to-end.
   The REQUIRED comparison gates landed in `golden_tests.rs` close the
-  cross-iteration trace merge (R5) and PARTIALLY close the coordinator
-  preamble append order (R3, coordinator side; the vector-append
-  position stays re-stated because the gate runs vector-disabled). The
-  worker-side append orders and the R8 conversation-growth and
-  tool-registration rows stay re-stated, with the residue named in
-  DESIGN.md.
+  cross-iteration trace merge (R5) and the coordinator and worker
+  preamble append orders (R3; the coordinator vector-append position
+  stays re-stated because that gate runs vector-disabled, and the
+  worker scratchpad position is a conditional residue). The R8
+  conversation-growth rows are partially production-emitted (the
+  per-turn pushes are shared with production; the sequence is
+  test-side), and the R8 tool-registration rows stay shape-asserted,
+  with each residue named in DESIGN.md.
 
 ## Fixture corpus
 
@@ -144,7 +146,7 @@ within-iteration file order is filesystem-dependent).
 
 | Rule | Covered by |
 |---|---|
-| User turn pushed verbatim (planning wrapper, then each continuation wrapper) | every continuation fixture - COVERED by the S3 R8 comparison gate (`gate_r8_conversation_growth` in `golden_tests.rs`): production `push_user_turn` / `push_assistant_turn` helpers extracted from `plan_with_routing` are shared with the envelope builder, but the SEQUENCE (how many iterations, in what order) is still constructed test-side, so the growth rule is partially production-emitted, not re-stated |
+| User turn pushed verbatim (planning wrapper, then each continuation wrapper) | every continuation fixture - COVERED by the S3 R8 comparison gate (`gate_r8_conversation_growth` in `golden_tests.rs`). Conversation growth goes through the production `push_user_turn` / `push_assistant_turn` helpers (formerly inline in `plan_with_routing`). The SEQUENCE (how many iterations and in what order) stays test-side, so the growth rule is partially production-emitted rather than re-stated |
 | Compact assistant turn (`compact_decision_turn` → `CoordinatorTurn::render`, `create_plan` variant, ~136-char shape) | every continuation fixture (turn TEXT is production code via `compact_decision_turn`; its position in the conversation is now partially production-emitted via the shared `push_assistant_turn` helper - the sequence is still test-side, so R8 is partially closed) |
 | Terminal decision turns (`respond_directly` / `request_clarification` renders) | EXCLUDED: terminal decisions end the run, so they never precede a later planning call inside one envelope; owning test: `terminal_turns_record_the_model_text_verbatim` (`context/turn.rs`). `PlanDecision` makes them unrepresentable mid-thread. |
 | Compact-turn fallback tiers (model text / bare variant name) | EXCLUDED: degenerate-decision path (empty rationale/plan), unreachable from validated fixtures; owning test: `test_compact_decision_turn_fallback_tiers` (`frame_validation_tests.rs`, added by the S2 repair round - no prior test invoked the fallback arms). |
@@ -161,7 +163,7 @@ within-iteration file order is filesystem-dependent).
 | Vector-store context append - NAMED-ROLE BRANCH ONLY (the append is inside `create_worker`'s `if let Some(name) = worker_name`; the generic branch never receives it), modeling the post-`retain` assigned-store list | `worker_role_frame_direct`. A generic-branch vector append is production-unreachable and unrepresentable (`WorkerPreambleFixture::Generic` has no vector field) |
 | Scratchpad preamble append (both branches) | `worker_generic_fallback`, `worker_role_frame_direct` |
 | Skill catalog append (both branches) | `worker_generic_fallback`, `worker_role_frame_direct` |
-| Role-branch append order (vector → scratchpad → skills) | `worker_role_frame_direct` (carries all three appends) - COVERED by the S3 R3 comparison gate (`gate_r3_worker_preamble_matches_create_worker` in `golden_tests.rs`): the composed worker preamble byte-equals real `create_worker` output over an MCP-less Orchestrator. Residue: the scratchpad append requires accessible MCP tools, so the gate runs scratchpad-disabled; the vector → skills sub-order is production-emitted, the scratchpad position is a conditional residue |
+| Role-branch append order (vector → scratchpad → skills) | `worker_role_frame_direct` (carries all three appends) - COVERED by the S3 R3 comparison gate (`gate_r3_worker_preamble_matches_create_worker` in `golden_tests.rs`): the composed worker preamble byte-equals real `create_worker` output over an MCP-less Orchestrator. Residue: the scratchpad append requires accessible MCP tools; the gate's config enables scratchpad but the MCP-less test environment leaves it unwired, so the vector → skills sub-order is production-emitted and the scratchpad position is a conditional residue |
 | Generic-branch append order (scratchpad → skills) | `worker_generic_fallback` (carries both appends) - COVERED by the S3 R3 gate, same residue (scratchpad conditional) |
 | `%%YOUR_TASK%%` | every worker fixture |
 | `%%CONTEXT%%` empty - fresh-plan first turn (defect B dangling reference) | `worker_first_turn_empty` |
