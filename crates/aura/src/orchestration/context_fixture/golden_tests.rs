@@ -57,7 +57,7 @@ use aura_config::{LlmConfig, ScratchpadConfig, SkillConfig, SkillName, VectorSto
 
 /// The shared coordinator playbook (`[agent].system_prompt`), preserving
 /// the 14 headed blocks of MANIFEST §1 rows 5-18 so Gate A can see each
-/// block render inside the single `{{orchestration_system_prompt}}` slot.
+/// block render inside the single `%%ORCHESTRATION_SYSTEM_PROMPT%%` slot.
 const SOURCE_PLAYBOOK: &str = "\
 You coordinate SRE investigations for the payments platform. Decompose \
 queries into worker tasks and route decisively.

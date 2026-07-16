@@ -668,7 +668,7 @@ impl Orchestrator {
                     .unwrap_or(0);
                 let initial_used = scratchpad::estimate_scratchpad_overhead(
                     &*token_counter,
-                    &[super::config::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
+                    &[super::templates::WORKER_PREAMBLE_TEMPLATE, worker_preamble],
                 ) + mcp_tool_tokens;
 
                 let (iter_dir, read_root) = {
@@ -716,8 +716,10 @@ impl Orchestrator {
                 )
             })?;
             tracing::info!("Creating worker '{}' for task {}", name, task_id);
-            let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
-                .replace("{{worker_system_prompt}}", &worker.preamble);
+            let full_preamble =
+                super::templates::render_worker_preamble(&super::templates::WorkerPreambleVars {
+                    worker_system_prompt: worker.preamble.as_str(),
+                });
             worker_config.preamble_override = Some(full_preamble);
             if !worker.mcp_filter.is_empty() {
                 worker_config.mcp_filter = Some(worker.mcp_filter.clone());
@@ -1286,25 +1288,12 @@ impl Orchestrator {
         worker_guidelines: &str,
     ) -> String {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        format!(
-            "Current time: {timestamp}\n\n\
-             Analyze this user query and decide on the best approach.\n\n\
-             USER QUERY: {query}{worker_section}\n\n\
-             You have three routing tools. Call EXACTLY ONE (do not call more than one):\n\n\
-             1. **respond_directly** — For simple factual questions answerable from general knowledge, \
-                OR when the relevant workers have no tools configured (tools show \"none configured\") \
-                and the query requires external data. In that case, explain the limitation and suggest \
-                configuring MCP servers.\n\
-                Do not use for queries about system data, logs, metrics, or anything requiring tools \
-                when workers DO have tools available.\n\n\
-             2. **create_plan** — For queries requiring tool execution, data gathering, or multi-step analysis.\n\
-                When uncertain, choose create_plan only if tool execution or multi-step work is genuinely required; otherwise choose respond_directly.\n\n\
-             3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
-                Use sparingly when a reasonable interpretation exists.\n\n\
-             {worker_guidelines}\n\
-             - For time-scoped tasks, include the current time and relevant time range in the task description so workers have explicit time context\n\n\
-             Call the appropriate routing tool now.",
-        )
+        super::templates::render_planning_prompt(&super::templates::PlanningVars {
+            timestamp: &timestamp,
+            query,
+            worker_section,
+            worker_guidelines,
+        })
     }
 
     /// Build the post-execute continuation wrapper (end-of-iteration decision
@@ -1321,7 +1310,10 @@ impl Orchestrator {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let base =
             ctx.build_continuation_prompt(max_iterations, show_tool_chain, content_max_length);
-        format!("Current time: {timestamp}\n\n{base}")
+        super::templates::render_continuation_wrapper(&super::templates::ContinuationWrapperVars {
+            timestamp: &timestamp,
+            continuation_body: &base,
+        })
     }
 
     /// Golden-frame seam (S2): expose the private continuation wrapper to
@@ -1855,24 +1847,21 @@ impl Orchestrator {
             let names_json: Vec<String> =
                 worker_names.iter().map(|n| format!("\"{}\"", n)).collect();
 
-            // Build worker section based on visibility setting
+            let field = r#",
+      "worker": "worker_name""#
+                .to_string();
+
+            let guidelines = super::templates::render_worker_guidelines(
+                &super::templates::WorkerGuidelinesVars {
+                    valid_worker_names: &names_json.join(", "),
+                },
+            );
+
             let section = match &self.config.tools_in_planning {
                 ToolVisibility::None => self.build_workers_section_no_tools(),
                 ToolVisibility::Summary => self.build_workers_section_with_tools(),
                 ToolVisibility::Full => self.build_workers_section_with_full_tools(),
             };
-
-            let field = r#",
-      "worker": "worker_name""#
-                .to_string();
-
-            let guidelines = format!(
-                r#"
-- Assign each task to a worker using the "worker" field
-- Valid worker names: {}
-- Choose the worker whose tools best match what the task needs to accomplish"#,
-                names_json.join(", ")
-            );
 
             (section, field, guidelines)
         } else {
@@ -1883,49 +1872,41 @@ impl Orchestrator {
     /// Build worker section without tool information (ToolVisibility::None).
     fn build_workers_section_no_tools(&self) -> String {
         let workers_list = self.config.format_workers_for_prompt();
-        format!(
-            r#"
-
-AVAILABLE WORKERS:
-{}
-
-Each worker has specialized capabilities. Assign tasks to the most appropriate worker."#,
-            workers_list
-        )
+        super::templates::render_worker_roster(&super::templates::WorkerRosterVars {
+            header_note: "",
+            roster_content: &workers_list,
+            closing_line: "Each worker has specialized capabilities. Assign tasks to the most appropriate worker.",
+        })
     }
 
     /// Build worker section with tool names (ToolVisibility::Summary).
     fn build_workers_section_with_tools(&self) -> String {
         let worker_tools = self.resolve_worker_tools();
         let max_tools = self.bounding.tool_list_limit().get();
-        let mut sections = Vec::new();
+        let sections: Vec<String> = self
+            .config
+            .workers
+            .iter()
+            .map(|(name, config)| {
+                let tools = worker_tools.get(name).cloned().unwrap_or_default();
+                let tool_list = self.format_tool_list(&tools, max_tools);
 
-        for (name, config) in &self.config.workers {
-            let tools = worker_tools.get(name).cloned().unwrap_or_default();
-            let tool_list = self.format_tool_list(&tools, max_tools);
+                if tool_list.is_empty() {
+                    format!(
+                        "## {}\n{}\nTools: (none configured — this worker cannot query external systems)",
+                        name, config.description
+                    )
+                } else {
+                    format!("## {}\n{}\nTools: {}", name, config.description, tool_list)
+                }
+            })
+            .collect();
 
-            let section = if tool_list.is_empty() {
-                format!(
-                    "## {}\n{}\nTools: (none configured — this worker cannot query external systems)",
-                    name, config.description
-                )
-            } else {
-                format!("## {}\n{}\nTools: {}", name, config.description, tool_list)
-            };
-            sections.push(section);
-        }
-
-        format!(
-            r#"
-
-AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
-
-{}
-
-Assign tasks to the worker whose tools best match the required operations."#,
-            sections.join("\n\n")
-        )
+        super::templates::render_worker_roster(&super::templates::WorkerRosterVars {
+            header_note: "NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.\n\n",
+            roster_content: &sections.join("\n\n"),
+            closing_line: "Assign tasks to the worker whose tools best match the required operations.",
+        })
     }
 
     /// Build worker section with full tool info (ToolVisibility::Full).
@@ -1933,54 +1914,50 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let worker_tools = self.resolve_worker_tools();
         let tool_descriptions = self.get_all_tool_descriptions();
         let max_tools = self.bounding.tool_list_limit().get();
-        let mut sections = Vec::new();
+        let sections: Vec<String> = self
+            .config
+            .workers
+            .iter()
+            .map(|(name, config)| {
+                let tools = worker_tools.get(name).cloned().unwrap_or_default();
 
-        for (name, config) in &self.config.workers {
-            let tools = worker_tools.get(name).cloned().unwrap_or_default();
+                let tool_details: Vec<String> = tools
+                    .iter()
+                    .take(max_tools)
+                    .map(|t| {
+                        if let Some(desc) = tool_descriptions.get(t) {
+                            format!("  - {}: {}", t, desc)
+                        } else {
+                            format!("  - {}", t)
+                        }
+                    })
+                    .collect();
 
-            let tool_details: Vec<String> = tools
-                .iter()
-                .take(max_tools)
-                .map(|t| {
-                    if let Some(desc) = tool_descriptions.get(t) {
-                        format!("  - {}: {}", t, desc)
-                    } else {
-                        format!("  - {}", t)
-                    }
-                })
-                .collect();
+                let remaining = tools.len().saturating_sub(max_tools);
+                let tool_section = if tool_details.is_empty() {
+                    String::new()
+                } else if remaining > 0 {
+                    format!("{}\n  (+{} more)", tool_details.join("\n"), remaining)
+                } else {
+                    tool_details.join("\n")
+                };
 
-            let remaining = tools.len().saturating_sub(max_tools);
-            let tool_section = if tool_details.is_empty() {
-                String::new()
-            } else if remaining > 0 {
-                format!("{}\n  (+{} more)", tool_details.join("\n"), remaining)
-            } else {
-                tool_details.join("\n")
-            };
+                if tool_section.is_empty() {
+                    format!("## {}\n{}", name, config.description)
+                } else {
+                    format!(
+                        "## {}\n{}\nTools:\n{}",
+                        name, config.description, tool_section
+                    )
+                }
+            })
+            .collect();
 
-            let section = if tool_section.is_empty() {
-                format!("## {}\n{}", name, config.description)
-            } else {
-                format!(
-                    "## {}\n{}\nTools:\n{}",
-                    name, config.description, tool_section
-                )
-            };
-            sections.push(section);
-        }
-
-        format!(
-            r#"
-
-AVAILABLE WORKERS:
-NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.
-
-{}
-
-Assign tasks to the worker whose tools best match the required operations."#,
-            sections.join("\n\n")
-        )
+        super::templates::render_worker_roster(&super::templates::WorkerRosterVars {
+            header_note: "NOTE: Worker names below are role assignments, not callable tool names. Only the tools listed under each worker are MCP tools that workers can execute.\n\n",
+            roster_content: &sections.join("\n\n"),
+            closing_line: "Assign tasks to the worker whose tools best match the required operations.",
+        })
     }
 
     /// Format a list of tool names with truncation.

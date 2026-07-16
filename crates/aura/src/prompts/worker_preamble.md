@@ -1,6 +1,6 @@
 # Worker Agent
 
-{{worker_system_prompt}}
+%%WORKER_SYSTEM_PROMPT%%
 
 ## Scope
 

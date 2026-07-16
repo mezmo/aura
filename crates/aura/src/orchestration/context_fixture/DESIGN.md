@@ -356,10 +356,10 @@ MANIFEST §3).
   `INSTA_UPDATE=no` runs (eight consecutive clean 842/842 runs in the
   repair round).
 - **Slot coverage.** `slot_coverage.sh` (this directory, run from the
-  worktree root) proves every envelope-surface `%%SLOT%%` and `{{slot}}`
-  renders filled in at least one snapshot, the empty-able slots also
-  render empty somewhere, and no snapshot carries a raw placeholder
-  token. BOTH `%%CONTEXT%%` checks (populated witness, empty
+  worktree root) proves every envelope-surface `%%SLOT%%` renders filled
+  in at least one snapshot, the empty-able slots also render empty
+  somewhere, and no snapshot carries a raw placeholder token. BOTH
+  `%%CONTEXT%%` checks (populated witness, empty
   forbidden-string) use the frame subtitle "These are completed worker
   outputs relevant to YOUR TASK": the task template's own line 3
   mentions `READ-ONLY PRIOR WORK` unconditionally (defect B), so that

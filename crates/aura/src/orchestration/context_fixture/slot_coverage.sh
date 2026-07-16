@@ -1,7 +1,7 @@
 #!/bin/bash
-# S2 slot-coverage proof: every envelope-surface %%SLOT%% / {{slot}} is
-# exercised by at least one fixture-rendered snapshot, and no snapshot
-# carries an unreplaced placeholder token.
+# S2 slot-coverage proof: every envelope-surface %%SLOT%% is exercised by at
+# least one fixture-rendered snapshot, and no snapshot carries an unreplaced
+# placeholder token.
 set -u
 # Run from the worktree root: bash crates/aura/src/orchestration/context_fixture/slot_coverage.sh
 SNAP=crates/aura/src/orchestration/context_fixture/snapshots
@@ -9,17 +9,19 @@ TPL=crates/aura/src/prompts
 fail=0
 
 echo "== template placeholder census (envelope-surface templates) =="
-grep -ohE '%%[A-Z_]+%%|\{\{[a-z_]+\}\}' \
+grep -ohE '%%[A-Z_]+%%' \
   $TPL/orchestrator_preamble.md $TPL/worker_preamble.md \
   $TPL/worker_task_prompt.md $TPL/continuation_prompt.md \
+  $TPL/continuation_wrapper.md $TPL/planning_prompt.md \
+  $TPL/worker_roster.md $TPL/worker_guidelines.md \
   $TPL/session_history.md | sort -u
 
 echo
 echo "== 1) no unreplaced placeholder token in any snapshot =="
-if grep -rnE '%%[A-Z_]+%%|\{\{[a-z_]+\}\}' $SNAP/; then
+if grep -rnE '%%[A-Z_]+%%' $SNAP/; then
   echo "FAIL: raw placeholder leaked into a snapshot"; fail=1
 else
-  echo "OK: no raw %%SLOT%% or {{slot}} token in any snapshot"
+  echo "OK: no raw %%SLOT%% token in any snapshot"
 fi
 
 echo
@@ -32,12 +34,12 @@ check() { # slot, witness (fixed string)
     printf 'FAIL %-36s witness %q not found\n' "$1" "$2"; fail=1
   fi
 }
-check '{{orchestration_system_prompt}}' 'PHASE BOUNDARY PRINCIPLE'
-check '{{tools_section}}'      'Call exactly one routing tool per query.'
-check '{{recon_guidance}}/recon'    '## Reconnaissance Guidance'
-check '{{recon_guidance}}/nonrecon' '**Worker names vs tool names**'
-check '{{worker_system_prompt}}/default' '(No custom instructions provided)'
-check '{{worker_system_prompt}}/custom'  'Prefer structured summaries over prose'
+check '%%ORCHESTRATION_SYSTEM_PROMPT%%' 'PHASE BOUNDARY PRINCIPLE'
+check '%%TOOLS_SECTION%%'      'Call exactly one routing tool per query.'
+check '%%RECON_GUIDANCE%%/recon'    '## Reconnaissance Guidance'
+check '%%RECON_GUIDANCE%%/nonrecon' '**Worker names vs tool names**'
+check '%%WORKER_SYSTEM_PROMPT%%/default' '(No custom instructions provided)'
+check '%%WORKER_SYSTEM_PROMPT%%/custom'  'Prefer structured summaries over prose'
 check '%%YOUR_TASK%%'          'YOUR TASK: '
 # Witness must be frame-only: the task template's own line 3 mentions
 # READ-ONLY PRIOR WORK unconditionally (defect B), so the frame subtitle
@@ -55,6 +57,15 @@ check '%%FAILURE_HISTORY%%'    'FAILURE HISTORY:'
 check '%%REUSE_GUIDANCE%%'     'Workers cannot see prior iteration results'
 check '%%TURN_ENTRIES%%'       '### Turn 1 ('
 check '%%TURN_COUNT%%'         '2 prior run(s) shown above'
+check '%%TIMESTAMP%%'          'Current time: <TIMESTAMP>'
+check '%%QUERY%%'              'USER QUERY: Investigate the elevated error rates'
+check '%%WORKER_SECTION%%'     'AVAILABLE WORKERS:'
+check '%%WORKER_GUIDELINES%%'  '- Assign each task to a worker using the "worker" field'
+check '%%VALID_WORKER_NAMES%%' '"analyst", "operator"'
+check '%%HEADER_NOTE%%'        'NOTE: Worker names below are role assignments'
+check '%%ROSTER_CONTENT%%'     '## analyst'
+check '%%CLOSING_LINE%%'       'Each worker has specialized capabilities'
+check '%%CONTINUATION_BODY%%'  'ITERATION 2 of 4'
 
 echo
 echo "== 3) empty-branch witnesses (slot exercised empty) =="

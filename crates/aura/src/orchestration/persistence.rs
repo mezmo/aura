@@ -1005,9 +1005,6 @@ pub async fn lock_persistence<'a>(
 // Session History — Cross-Run Manifest Loading
 // ============================================================================
 
-/// Session history template loaded at compile time.
-const SESSION_HISTORY_TEMPLATE: &str = include_str!("../prompts/session_history.md");
-
 /// Load run manifests from prior runs in a session directory.
 ///
 /// Reads `{base_path}/{session_id}/*/manifest.json`, sorts by timestamp
@@ -1126,9 +1123,10 @@ pub fn build_session_context(manifests: &[RunManifest]) -> String {
         turn_entries.push('\n');
     }
 
-    SESSION_HISTORY_TEMPLATE
-        .replace("%%TURN_COUNT%%", &manifests.len().to_string())
-        .replace("%%TURN_ENTRIES%%", turn_entries.trim_end())
+    super::templates::render_session_history(&super::templates::SessionHistoryVars {
+        turn_count: &manifests.len().to_string(),
+        turn_entries: turn_entries.trim_end(),
+    })
 }
 
 fn render_task_summary(task: &TaskSummary, out: &mut String) {

@@ -24,9 +24,6 @@ use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
 };
 
-const GUIDANCE_TEMPLATE: &str = include_str!("../prompts/duplicate_call_guidance.md");
-const ABORT_TEMPLATE: &str = include_str!("../prompts/duplicate_call_abort.md");
-
 /// Hash of `(tool_name, canonical_args)` identifying a unique invocation pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CallFingerprint(u64);
@@ -64,12 +61,6 @@ impl DuplicateCallGuard {
         tool_name.hash(&mut hasher);
         canonical.hash(&mut hasher);
         CallFingerprint(hasher.finish())
-    }
-
-    fn render_template(template: &str, tool_name: &str, count: usize) -> String {
-        template
-            .replace("%%TOOL_NAME%%", tool_name)
-            .replace("%%COUNT%%", &count.to_string())
     }
 }
 
@@ -153,7 +144,12 @@ impl ToolWrapper for DuplicateCallGuard {
                 count,
                 self.block_threshold
             );
-            let annotation = Self::render_template(ABORT_TEMPLATE, &tool_name, count);
+            let annotation = super::templates::render_duplicate_call_abort(
+                &super::templates::DuplicateCallVars {
+                    tool_name: &tool_name,
+                    count: &count.to_string(),
+                },
+            );
             return TransformOutputResult::new(format!("{output}\n\n{annotation}"));
         }
 
@@ -164,7 +160,12 @@ impl ToolWrapper for DuplicateCallGuard {
                 count,
                 self.nudge_threshold
             );
-            let annotation = Self::render_template(GUIDANCE_TEMPLATE, &tool_name, count);
+            let annotation = super::templates::render_duplicate_call_guidance(
+                &super::templates::DuplicateCallVars {
+                    tool_name: &tool_name,
+                    count: &count.to_string(),
+                },
+            );
             return TransformOutputResult::new(format!("{output}\n\n{annotation}"));
         }
 

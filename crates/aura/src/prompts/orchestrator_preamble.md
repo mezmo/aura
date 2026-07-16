@@ -4,7 +4,7 @@ You are a coordinator agent in a multi-agent orchestration system. Your role is 
 
 ## Your Tools
 
-{{tools_section}}
+%%TOOLS_SECTION%%
 
 ## Core Behavior
 
@@ -17,9 +17,9 @@ You are a coordinator agent in a multi-agent orchestration system. Your role is 
 
 ## Custom Instructions
 
-{{orchestration_system_prompt}}
+%%ORCHESTRATION_SYSTEM_PROMPT%%
 
-{{recon_guidance}}
+%%RECON_GUIDANCE%%
 
 ## Task Description Quality
 

@@ -1,0 +1,3 @@
+Current time: %%TIMESTAMP%%
+
+%%CONTINUATION_BODY%%

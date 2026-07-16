@@ -238,7 +238,7 @@ impl SessionHistoryFixture {
 #[derive(Debug, Clone)]
 pub(crate) struct PreambleFixture {
     /// The `[agent].system_prompt` playbook substituted into
-    /// `{{orchestration_system_prompt}}` (anatomy blocks 5-18 are content
+    /// `%%ORCHESTRATION_SYSTEM_PROMPT%%` (anatomy blocks 5-18 are content
     /// of this single slot).
     pub(crate) playbook: String,
     /// Drives the tools sentence, recon guidance, and the tool-definition

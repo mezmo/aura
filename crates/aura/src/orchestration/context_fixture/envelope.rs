@@ -80,7 +80,10 @@ use crate::orchestration::tools::{
     SubmitResultTool,
 };
 use crate::orchestration::types::{IterationContext, Plan};
-use crate::orchestration::{Orchestrator, config::WORKER_PREAMBLE_TEMPLATE};
+use crate::orchestration::{
+    Orchestrator,
+    templates::{WorkerPreambleVars, render_worker_preamble},
+};
 
 /// The complete aura-level request envelope for one model call.
 ///
@@ -382,8 +385,9 @@ pub(crate) fn compose_worker_preamble(fixture: &WorkerPreambleFixture) -> String
             vector_stores,
             appends,
         } => {
-            let mut preamble =
-                WORKER_PREAMBLE_TEMPLATE.replace("{{worker_system_prompt}}", role_preamble);
+            let mut preamble = render_worker_preamble(&WorkerPreambleVars {
+                worker_system_prompt: role_preamble,
+            });
             if !vector_stores.is_empty() {
                 preamble.push_str(&build_vector_store_context(vector_stores));
             }

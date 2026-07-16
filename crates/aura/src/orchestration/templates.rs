@@ -2,10 +2,13 @@
 //!
 //! This module provides a simple template system using `%%VAR%%` placeholders
 //! that avoids conflicts with JSON `{{`/`}}` literals and Rust format strings.
+//! Every prompt template in `crates/aura/src/prompts/` is loaded here and
+//! rendered through a typed `TemplateVars` impl, so the placeholder convention
+//! is uniform across the orchestration pipeline.
 //!
 //! # Type Safety
 //!
-//! Each template has an associated context type implementing `TemplateContext`.
+//! Each template has an associated context type implementing `TemplateVars`.
 //! Tests validate bi-directionally that:
 //! - All template placeholders are provided by the context
 //! - All context fields are used in the template
@@ -25,6 +28,17 @@ use std::collections::HashSet;
 // Template constants loaded at compile time
 pub const WORKER_TASK_PROMPT_TEMPLATE: &str = include_str!("../prompts/worker_task_prompt.md");
 pub const CONTINUATION_PROMPT_TEMPLATE: &str = include_str!("../prompts/continuation_prompt.md");
+pub const ORCHESTRATOR_PREAMBLE_TEMPLATE: &str =
+    include_str!("../prompts/orchestrator_preamble.md");
+pub const WORKER_PREAMBLE_TEMPLATE: &str = include_str!("../prompts/worker_preamble.md");
+pub const SESSION_HISTORY_TEMPLATE: &str = include_str!("../prompts/session_history.md");
+pub const DUPLICATE_CALL_GUIDANCE_TEMPLATE: &str =
+    include_str!("../prompts/duplicate_call_guidance.md");
+pub const DUPLICATE_CALL_ABORT_TEMPLATE: &str = include_str!("../prompts/duplicate_call_abort.md");
+pub const PLANNING_PROMPT_TEMPLATE: &str = include_str!("../prompts/planning_prompt.md");
+pub const WORKER_ROSTER_TEMPLATE: &str = include_str!("../prompts/worker_roster.md");
+pub const WORKER_GUIDELINES_TEMPLATE: &str = include_str!("../prompts/worker_guidelines.md");
+pub const CONTINUATION_WRAPPER_TEMPLATE: &str = include_str!("../prompts/continuation_wrapper.md");
 
 /// Trait for template variable providers.
 ///
@@ -111,6 +125,152 @@ impl TemplateVars for ContinuationVars<'_> {
     }
 }
 
+/// Variables for the coordinator system preamble.
+#[derive(Debug, Clone)]
+pub struct CoordinatorPreambleVars<'a> {
+    pub orchestration_system_prompt: &'a str,
+    pub tools_section: &'a str,
+    pub recon_guidance: &'a str,
+}
+
+impl TemplateVars for CoordinatorPreambleVars<'_> {
+    const VARS: &'static [&'static str] = &[
+        "ORCHESTRATION_SYSTEM_PROMPT",
+        "TOOLS_SECTION",
+        "RECON_GUIDANCE",
+    ];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace(
+                "%%ORCHESTRATION_SYSTEM_PROMPT%%",
+                self.orchestration_system_prompt,
+            )
+            .replace("%%TOOLS_SECTION%%", self.tools_section)
+            .replace("%%RECON_GUIDANCE%%", self.recon_guidance)
+    }
+}
+
+/// Variables for the worker preamble (generic-worker fallback).
+#[derive(Debug, Clone)]
+pub struct WorkerPreambleVars<'a> {
+    pub worker_system_prompt: &'a str,
+}
+
+impl TemplateVars for WorkerPreambleVars<'_> {
+    const VARS: &'static [&'static str] = &["WORKER_SYSTEM_PROMPT"];
+
+    fn render(&self, template: &str) -> String {
+        template.replace("%%WORKER_SYSTEM_PROMPT%%", self.worker_system_prompt)
+    }
+}
+
+/// Variables for the session-history block.
+#[derive(Debug, Clone)]
+pub struct SessionHistoryVars<'a> {
+    pub turn_count: &'a str,
+    pub turn_entries: &'a str,
+}
+
+impl TemplateVars for SessionHistoryVars<'_> {
+    const VARS: &'static [&'static str] = &["TURN_COUNT", "TURN_ENTRIES"];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%TURN_COUNT%%", self.turn_count)
+            .replace("%%TURN_ENTRIES%%", self.turn_entries)
+    }
+}
+
+/// Variables for the duplicate-call guard annotations.
+#[derive(Debug, Clone)]
+pub struct DuplicateCallVars<'a> {
+    pub tool_name: &'a str,
+    pub count: &'a str,
+}
+
+impl TemplateVars for DuplicateCallVars<'_> {
+    const VARS: &'static [&'static str] = &["TOOL_NAME", "COUNT"];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%TOOL_NAME%%", self.tool_name)
+            .replace("%%COUNT%%", self.count)
+    }
+}
+
+/// Variables for the initial planning wrapper.
+#[derive(Debug, Clone)]
+pub struct PlanningVars<'a> {
+    pub timestamp: &'a str,
+    pub query: &'a str,
+    pub worker_section: &'a str,
+    pub worker_guidelines: &'a str,
+}
+
+impl TemplateVars for PlanningVars<'_> {
+    const VARS: &'static [&'static str] =
+        &["TIMESTAMP", "QUERY", "WORKER_SECTION", "WORKER_GUIDELINES"];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%TIMESTAMP%%", self.timestamp)
+            .replace("%%QUERY%%", self.query)
+            .replace("%%WORKER_SECTION%%", self.worker_section)
+            .replace("%%WORKER_GUIDELINES%%", self.worker_guidelines)
+    }
+}
+
+/// Variables for the worker roster section in the planning wrapper.
+#[derive(Debug, Clone)]
+pub struct WorkerRosterVars<'a> {
+    pub header_note: &'a str,
+    pub roster_content: &'a str,
+    pub closing_line: &'a str,
+}
+
+impl TemplateVars for WorkerRosterVars<'_> {
+    const VARS: &'static [&'static str] = &["HEADER_NOTE", "ROSTER_CONTENT", "CLOSING_LINE"];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%HEADER_NOTE%%", self.header_note)
+            .replace("%%ROSTER_CONTENT%%", self.roster_content)
+            .replace("%%CLOSING_LINE%%", self.closing_line)
+    }
+}
+
+/// Variables for the worker-assignment guidelines in the planning wrapper.
+#[derive(Debug, Clone)]
+pub struct WorkerGuidelinesVars<'a> {
+    pub valid_worker_names: &'a str,
+}
+
+impl TemplateVars for WorkerGuidelinesVars<'_> {
+    const VARS: &'static [&'static str] = &["VALID_WORKER_NAMES"];
+
+    fn render(&self, template: &str) -> String {
+        template.replace("%%VALID_WORKER_NAMES%%", self.valid_worker_names)
+    }
+}
+
+/// Variables for the continuation timestamp wrapper.
+#[derive(Debug, Clone)]
+pub struct ContinuationWrapperVars<'a> {
+    pub timestamp: &'a str,
+    pub continuation_body: &'a str,
+}
+
+impl TemplateVars for ContinuationWrapperVars<'_> {
+    const VARS: &'static [&'static str] = &["TIMESTAMP", "CONTINUATION_BODY"];
+
+    fn render(&self, template: &str) -> String {
+        template
+            .replace("%%TIMESTAMP%%", self.timestamp)
+            .replace("%%CONTINUATION_BODY%%", self.continuation_body)
+    }
+}
+
 /// Render the worker task prompt with the given variables.
 pub fn render_worker_task_prompt(vars: &WorkerTaskVars<'_>) -> String {
     vars.render(WORKER_TASK_PROMPT_TEMPLATE)
@@ -119,6 +279,51 @@ pub fn render_worker_task_prompt(vars: &WorkerTaskVars<'_>) -> String {
 /// Render the continuation prompt with the given variables.
 pub fn render_continuation_prompt(vars: &ContinuationVars<'_>) -> String {
     vars.render(CONTINUATION_PROMPT_TEMPLATE)
+}
+
+/// Render the coordinator system preamble with the given variables.
+pub fn render_coordinator_preamble(vars: &CoordinatorPreambleVars<'_>) -> String {
+    vars.render(ORCHESTRATOR_PREAMBLE_TEMPLATE)
+}
+
+/// Render the worker preamble with the given variables.
+pub fn render_worker_preamble(vars: &WorkerPreambleVars<'_>) -> String {
+    vars.render(WORKER_PREAMBLE_TEMPLATE)
+}
+
+/// Render the session-history block with the given variables.
+pub fn render_session_history(vars: &SessionHistoryVars<'_>) -> String {
+    vars.render(SESSION_HISTORY_TEMPLATE)
+}
+
+/// Render the duplicate-call guidance annotation with the given variables.
+pub fn render_duplicate_call_guidance(vars: &DuplicateCallVars<'_>) -> String {
+    vars.render(DUPLICATE_CALL_GUIDANCE_TEMPLATE)
+}
+
+/// Render the duplicate-call abort annotation with the given variables.
+pub fn render_duplicate_call_abort(vars: &DuplicateCallVars<'_>) -> String {
+    vars.render(DUPLICATE_CALL_ABORT_TEMPLATE)
+}
+
+/// Render the initial planning wrapper with the given variables.
+pub fn render_planning_prompt(vars: &PlanningVars<'_>) -> String {
+    vars.render(PLANNING_PROMPT_TEMPLATE)
+}
+
+/// Render the worker roster section with the given variables.
+pub fn render_worker_roster(vars: &WorkerRosterVars<'_>) -> String {
+    vars.render(WORKER_ROSTER_TEMPLATE)
+}
+
+/// Render the worker-assignment guidelines with the given variables.
+pub fn render_worker_guidelines(vars: &WorkerGuidelinesVars<'_>) -> String {
+    vars.render(WORKER_GUIDELINES_TEMPLATE)
+}
+
+/// Render the continuation timestamp wrapper with the given variables.
+pub fn render_continuation_wrapper(vars: &ContinuationWrapperVars<'_>) -> String {
+    vars.render(CONTINUATION_WRAPPER_TEMPLATE)
 }
 
 /// Extract `%%VAR%%` placeholders from a template string.
@@ -274,6 +479,60 @@ mod tests {
             .expect("Continuation template should match ContinuationVars");
     }
 
+    #[test]
+    fn test_orchestrator_preamble_template_matches_context() {
+        validate_template::<CoordinatorPreambleVars>(ORCHESTRATOR_PREAMBLE_TEMPLATE)
+            .expect("Orchestrator preamble template should match CoordinatorPreambleVars");
+    }
+
+    #[test]
+    fn test_worker_preamble_template_matches_context() {
+        validate_template::<WorkerPreambleVars>(WORKER_PREAMBLE_TEMPLATE)
+            .expect("Worker preamble template should match WorkerPreambleVars");
+    }
+
+    #[test]
+    fn test_session_history_template_matches_context() {
+        validate_template::<SessionHistoryVars>(SESSION_HISTORY_TEMPLATE)
+            .expect("Session history template should match SessionHistoryVars");
+    }
+
+    #[test]
+    fn test_duplicate_call_guidance_template_matches_context() {
+        validate_template::<DuplicateCallVars>(DUPLICATE_CALL_GUIDANCE_TEMPLATE)
+            .expect("Duplicate-call guidance template should match DuplicateCallVars");
+    }
+
+    #[test]
+    fn test_duplicate_call_abort_template_matches_context() {
+        validate_template::<DuplicateCallVars>(DUPLICATE_CALL_ABORT_TEMPLATE)
+            .expect("Duplicate-call abort template should match DuplicateCallVars");
+    }
+
+    #[test]
+    fn test_planning_prompt_template_matches_context() {
+        validate_template::<PlanningVars>(PLANNING_PROMPT_TEMPLATE)
+            .expect("Planning prompt template should match PlanningVars");
+    }
+
+    #[test]
+    fn test_worker_roster_template_matches_context() {
+        validate_template::<WorkerRosterVars>(WORKER_ROSTER_TEMPLATE)
+            .expect("Worker roster template should match WorkerRosterVars");
+    }
+
+    #[test]
+    fn test_worker_guidelines_template_matches_context() {
+        validate_template::<WorkerGuidelinesVars>(WORKER_GUIDELINES_TEMPLATE)
+            .expect("Worker guidelines template should match WorkerGuidelinesVars");
+    }
+
+    #[test]
+    fn test_continuation_wrapper_template_matches_context() {
+        validate_template::<ContinuationWrapperVars>(CONTINUATION_WRAPPER_TEMPLATE)
+            .expect("Continuation wrapper template should match ContinuationWrapperVars");
+    }
+
     // =========================================================================
     // Validation function tests
     // =========================================================================
@@ -337,6 +596,118 @@ mod tests {
         assert!(
             CONTINUATION_PROMPT_TEMPLATE.contains("%%REDESIGN_SECTION%%"),
             "Continuation template should contain REDESIGN_SECTION placeholder"
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_preamble_template_loaded() {
+        assert!(
+            !ORCHESTRATOR_PREAMBLE_TEMPLATE.is_empty(),
+            "Orchestrator preamble template should be loaded"
+        );
+        assert!(
+            ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("%%ORCHESTRATION_SYSTEM_PROMPT%%"),
+            "Orchestrator preamble template should contain ORCHESTRATION_SYSTEM_PROMPT placeholder"
+        );
+    }
+
+    #[test]
+    fn test_worker_preamble_template_loaded() {
+        assert!(
+            !WORKER_PREAMBLE_TEMPLATE.is_empty(),
+            "Worker preamble template should be loaded"
+        );
+        assert!(
+            WORKER_PREAMBLE_TEMPLATE.contains("%%WORKER_SYSTEM_PROMPT%%"),
+            "Worker preamble template should contain WORKER_SYSTEM_PROMPT placeholder"
+        );
+    }
+
+    #[test]
+    fn test_session_history_template_loaded() {
+        assert!(
+            !SESSION_HISTORY_TEMPLATE.is_empty(),
+            "Session history template should be loaded"
+        );
+        assert!(
+            SESSION_HISTORY_TEMPLATE.contains("%%TURN_ENTRIES%%"),
+            "Session history template should contain TURN_ENTRIES placeholder"
+        );
+        assert!(
+            SESSION_HISTORY_TEMPLATE.contains("%%TURN_COUNT%%"),
+            "Session history template should contain TURN_COUNT placeholder"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_call_templates_loaded() {
+        assert!(
+            !DUPLICATE_CALL_GUIDANCE_TEMPLATE.is_empty(),
+            "Duplicate-call guidance template should be loaded"
+        );
+        assert!(
+            DUPLICATE_CALL_GUIDANCE_TEMPLATE.contains("%%TOOL_NAME%%"),
+            "Duplicate-call guidance template should contain TOOL_NAME placeholder"
+        );
+        assert!(
+            !DUPLICATE_CALL_ABORT_TEMPLATE.is_empty(),
+            "Duplicate-call abort template should be loaded"
+        );
+        assert!(
+            DUPLICATE_CALL_ABORT_TEMPLATE.contains("%%COUNT%%"),
+            "Duplicate-call abort template should contain COUNT placeholder"
+        );
+    }
+
+    #[test]
+    fn test_planning_prompt_template_loaded() {
+        assert!(
+            !PLANNING_PROMPT_TEMPLATE.is_empty(),
+            "Planning prompt template should be loaded"
+        );
+        assert!(
+            PLANNING_PROMPT_TEMPLATE.contains("%%TIMESTAMP%%"),
+            "Planning prompt template should contain TIMESTAMP placeholder"
+        );
+        assert!(
+            PLANNING_PROMPT_TEMPLATE.contains("%%WORKER_SECTION%%"),
+            "Planning prompt template should contain WORKER_SECTION placeholder"
+        );
+    }
+
+    #[test]
+    fn test_worker_roster_template_loaded() {
+        assert!(
+            !WORKER_ROSTER_TEMPLATE.is_empty(),
+            "Worker roster template should be loaded"
+        );
+        assert!(
+            WORKER_ROSTER_TEMPLATE.contains("%%ROSTER_CONTENT%%"),
+            "Worker roster template should contain ROSTER_CONTENT placeholder"
+        );
+    }
+
+    #[test]
+    fn test_worker_guidelines_template_loaded() {
+        assert!(
+            !WORKER_GUIDELINES_TEMPLATE.is_empty(),
+            "Worker guidelines template should be loaded"
+        );
+        assert!(
+            WORKER_GUIDELINES_TEMPLATE.contains("%%VALID_WORKER_NAMES%%"),
+            "Worker guidelines template should contain VALID_WORKER_NAMES placeholder"
+        );
+    }
+
+    #[test]
+    fn test_continuation_wrapper_template_loaded() {
+        assert!(
+            !CONTINUATION_WRAPPER_TEMPLATE.is_empty(),
+            "Continuation wrapper template should be loaded"
+        );
+        assert!(
+            CONTINUATION_WRAPPER_TEMPLATE.contains("%%TIMESTAMP%%"),
+            "Continuation wrapper template should contain TIMESTAMP placeholder"
         );
     }
 
@@ -505,6 +876,7 @@ Each worker has specialized capabilities. Assign tasks to the most appropriate w
              3. **request_clarification** — For genuinely ambiguous queries where intent is unclear.\n\
                 Use sparingly when a reasonable interpretation exists.\n\n\
              {worker_guidelines}\n\n\
+             - For time-scoped tasks, include the current time and relevant time range in the task description so workers have explicit time context\n\n\
              Call the appropriate routing tool now.",
         );
         let _ = writeln!(out, "{planning_prompt}");

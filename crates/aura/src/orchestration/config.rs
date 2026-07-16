@@ -54,24 +54,6 @@ pub fn build_vector_store_context(stores: &[VectorStoreConfig]) -> String {
 }
 
 // ============================================================================
-// Preamble Templates
-// ============================================================================
-
-/// Hardcoded orchestrator preamble template loaded at compile time.
-///
-/// Contains the core orchestrator behavior with a `{{orchestration_system_prompt}}`
-/// placeholder where `[agent].system_prompt` is injected. This creates the layered
-/// system prompt: framework instructions → user domain context → (worker details
-/// in user message).
-pub const ORCHESTRATOR_PREAMBLE_TEMPLATE: &str =
-    include_str!("../prompts/orchestrator_preamble.md");
-
-/// Hardcoded worker preamble template loaded at compile time.
-/// Contains the worker agent behavior with a `{{worker_system_prompt}}`
-/// placeholder for user customization.
-pub const WORKER_PREAMBLE_TEMPLATE: &str = include_str!("../prompts/worker_preamble.md");
-
-// ============================================================================
 // Preamble Builders
 // ============================================================================
 
@@ -128,10 +110,12 @@ pub fn build_coordinator_preamble(
          that workers can execute."
     };
 
-    let mut preamble = ORCHESTRATOR_PREAMBLE_TEMPLATE
-        .replace("{{orchestration_system_prompt}}", agent_system_prompt)
-        .replace("{{tools_section}}", &tools_section)
-        .replace("{{recon_guidance}}", recon_guidance);
+    let mut preamble =
+        super::templates::render_coordinator_preamble(&super::templates::CoordinatorPreambleVars {
+            orchestration_system_prompt: agent_system_prompt,
+            tools_section: &tools_section,
+            recon_guidance,
+        });
 
     // AURA_ESCAPE_HATCH=false strips the "Resolve tool gaps" directive for A/B testing
     if !crate::env_flags::bool_env("AURA_ESCAPE_HATCH", true) {
@@ -148,7 +132,7 @@ pub fn build_coordinator_preamble(
 /// Build the complete worker preamble by injecting the custom system prompt
 /// into the worker template.
 ///
-/// The template contains `{{worker_system_prompt}}` which is replaced with
+/// The template contains `%%WORKER_SYSTEM_PROMPT%%` which is replaced with
 /// the user's custom prompt, or a default message if none is provided.
 pub fn build_worker_preamble(config: &OrchestrationConfig) -> String {
     let custom_prompt = config
@@ -156,12 +140,17 @@ pub fn build_worker_preamble(config: &OrchestrationConfig) -> String {
         .as_deref()
         .unwrap_or("(No custom instructions provided)");
 
-    WORKER_PREAMBLE_TEMPLATE.replace("{{worker_system_prompt}}", custom_prompt)
+    super::templates::render_worker_preamble(&super::templates::WorkerPreambleVars {
+        worker_system_prompt: custom_prompt,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::templates::{
+        ORCHESTRATOR_PREAMBLE_TEMPLATE, WORKER_PREAMBLE_TEMPLATE,
+    };
     use aura_config::{EmbeddingConfig, VectorStoreConfig, VectorStoreType};
 
     #[test]
@@ -174,7 +163,7 @@ mod tests {
         let preamble = build_worker_preamble(&config);
         assert!(preamble.contains("Focus on data analysis."));
         assert!(preamble.contains("Worker Agent"));
-        assert!(!preamble.contains("{{worker_system_prompt}}"));
+        assert!(!preamble.contains("%%WORKER_SYSTEM_PROMPT%%"));
     }
 
     #[test]
@@ -184,13 +173,13 @@ mod tests {
 
         assert!(preamble.contains("(No custom instructions provided)"));
         assert!(preamble.contains("Worker Agent"));
-        assert!(!preamble.contains("{{worker_system_prompt}}"));
+        assert!(!preamble.contains("%%WORKER_SYSTEM_PROMPT%%"));
     }
 
     #[test]
     fn test_worker_preamble_template_loaded() {
         assert!(!WORKER_PREAMBLE_TEMPLATE.is_empty());
-        assert!(WORKER_PREAMBLE_TEMPLATE.contains("{{worker_system_prompt}}"));
+        assert!(WORKER_PREAMBLE_TEMPLATE.contains("%%WORKER_SYSTEM_PROMPT%%"));
         assert!(WORKER_PREAMBLE_TEMPLATE.contains("Worker Agent"));
     }
 
@@ -204,7 +193,7 @@ mod tests {
         // User's system prompt injected
         assert!(preamble.contains("Focus on thorough testing."));
         // Placeholder replaced
-        assert!(!preamble.contains("{{orchestration_system_prompt}}"));
+        assert!(!preamble.contains("%%ORCHESTRATION_SYSTEM_PROMPT%%"));
     }
 
     #[test]
@@ -214,15 +203,15 @@ mod tests {
         // Framework instructions still present
         assert!(preamble.contains("create_plan"));
         assert!(preamble.contains("Orchestration Coordinator"));
-        assert!(!preamble.contains("{{orchestration_system_prompt}}"));
+        assert!(!preamble.contains("%%ORCHESTRATION_SYSTEM_PROMPT%%"));
     }
 
     #[test]
     fn test_orchestrator_preamble_template_loaded() {
         assert!(!ORCHESTRATOR_PREAMBLE_TEMPLATE.is_empty());
-        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{orchestration_system_prompt}}"));
-        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{tools_section}}"));
-        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("{{recon_guidance}}"));
+        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("%%ORCHESTRATION_SYSTEM_PROMPT%%"));
+        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("%%TOOLS_SECTION%%"));
+        assert!(ORCHESTRATOR_PREAMBLE_TEMPLATE.contains("%%RECON_GUIDANCE%%"));
     }
 
     #[test]
