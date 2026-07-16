@@ -14,7 +14,7 @@
 //! # Production functions called (never re-implemented)
 //!
 //! - `config::build_coordinator_preamble`, `config::build_worker_preamble`,
-//!   `config::build_vector_store_context`, `config::WORKER_PREAMBLE_TEMPLATE`
+//!   `config::build_vector_store_context`, `templates::WORKER_PREAMBLE_TEMPLATE`
 //! - `crate::skill_tool::render_skill_catalog`,
 //!   `crate::skill_tool::SkillToolset::new` (pure over `SkillConfig`; no
 //!   filesystem discovery)
