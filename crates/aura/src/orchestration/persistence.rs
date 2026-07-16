@@ -465,7 +465,7 @@ impl ExecutionPersistence {
     /// Returns `true` if the counter reached zero before the deadline.
     #[tracing::instrument(
         name = "persistence.drain",
-        skip(self),
+        skip(self, timeout),
         fields(
             timeout_ms = timeout.as_millis() as u64,
             remaining = tracing::field::Empty,
@@ -626,7 +626,7 @@ impl ExecutionPersistence {
     /// `task-{id}-{worker}-iter-{n}-result.txt`
     #[tracing::instrument(
         name = "persistence.write_result_artifact",
-        skip(self, result),
+        skip(self, result, worker_name),
         fields(
             task_id,
             iteration,

@@ -4327,7 +4327,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
         };
 
-        let persistence = lock_persistence(&self.persistence, "write_run_manifest").await;
+        let persistence = lock_persistence(&self.persistence, "write_manifest").await;
 
         let all_complete = plan.completed_count() == plan.tasks.len();
         let status = if all_complete {
