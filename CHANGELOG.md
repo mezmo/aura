@@ -1,5 +1,12 @@
 ## Changelog
 
+## [0.0.2](https://github.com/mezmo/aura/compare/v0.0.1...v0.0.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* **mcp**: normalize bare boolean nodes in sanitized tool schemas [d9bfc76](https://github.com/mezmo/aura/commit/d9bfc76d1e60bfb4b3a6ce949969ee6ce0dbdb54) - Mike Shearer [#358](https://github.com/mezmo/aura/issues/358)
+
 ## [0.0.1](https://github.com/mezmo/aura/compare/v0.0.0...v0.0.1) (2026-07-16)
 
 
