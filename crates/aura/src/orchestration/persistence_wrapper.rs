@@ -23,7 +23,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
-use super::persistence::{ExecutionPersistence, ToolCallRecord};
+use super::persistence::{ExecutionPersistence, ToolCallRecord, lock_persistence};
 use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
     ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
@@ -222,6 +222,17 @@ impl ToolWrapper for PersistenceWrapper {
         TransformOutputResult::new(format!("{}{}", output, footer))
     }
 
+    #[tracing::instrument(
+        name = "persistence.on_complete",
+        skip(self, ctx, extracted, result),
+        fields(
+            tool = %ctx.tool_name,
+            task_id = ?ctx.task_id,
+            attempt = ?ctx.attempt,
+            duration_ms,
+            promoted = tracing::field::Empty,
+        )
+    )]
     async fn on_complete(
         &self,
         ctx: &ToolCallContext,
@@ -279,8 +290,10 @@ impl ToolWrapper for PersistenceWrapper {
             _ => false,
         };
 
+        tracing::Span::current().record("promoted", should_promote && result.is_ok());
+
         // Single lock acquisition for both artifact write and tool call append
-        let persistence_guard = self.persistence.lock().await;
+        let persistence_guard = lock_persistence(&self.persistence, "tool_output_write").await;
 
         // Write artifact file if promoted
         let artifact_filename = if should_promote && result.is_ok() {

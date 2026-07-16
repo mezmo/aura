@@ -416,16 +416,19 @@ where
                 let wrapper_clone = wrapper.clone();
                 let ctx_clone = ctx.clone();
                 let extracted_clone = extracted.clone();
-                tokio::spawn(async move {
-                    wrapper_clone
-                        .on_complete(
-                            &ctx_clone,
-                            extracted_clone.as_ref(),
-                            Err(&error_msg),
-                            duration_ms,
-                        )
-                        .await;
-                });
+                tokio::spawn(tracing::Instrument::instrument(
+                    async move {
+                        wrapper_clone
+                            .on_complete(
+                                &ctx_clone,
+                                extracted_clone.as_ref(),
+                                Err(&error_msg),
+                                duration_ms,
+                            )
+                            .await;
+                    },
+                    tracing::Span::current(),
+                ));
 
                 return Err(validation_error);
             }
@@ -463,16 +466,19 @@ where
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
                     let output_clone = transformed.output.clone();
-                    tokio::spawn(async move {
-                        wrapper_clone
-                            .on_complete(
-                                &ctx_clone,
-                                extracted_clone.as_ref(),
-                                Ok(&output_clone),
-                                duration_ms,
-                            )
-                            .await;
-                    });
+                    tokio::spawn(tracing::Instrument::instrument(
+                        async move {
+                            wrapper_clone
+                                .on_complete(
+                                    &ctx_clone,
+                                    extracted_clone.as_ref(),
+                                    Ok(&output_clone),
+                                    duration_ms,
+                                )
+                                .await;
+                        },
+                        tracing::Span::current(),
+                    ));
 
                     Ok(transformed.output)
                 }
@@ -484,16 +490,19 @@ where
                     let wrapper_clone = wrapper.clone();
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
-                    tokio::spawn(async move {
-                        wrapper_clone
-                            .on_complete(
-                                &ctx_clone,
-                                extracted_clone.as_ref(),
-                                Err(&error_msg),
-                                duration_ms,
-                            )
-                            .await;
-                    });
+                    tokio::spawn(tracing::Instrument::instrument(
+                        async move {
+                            wrapper_clone
+                                .on_complete(
+                                    &ctx_clone,
+                                    extracted_clone.as_ref(),
+                                    Err(&error_msg),
+                                    duration_ms,
+                                )
+                                .await;
+                        },
+                        tracing::Span::current(),
+                    ));
 
                     Err(transformed_error)
                 }

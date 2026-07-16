@@ -36,7 +36,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::fs;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, MutexGuard, Notify};
+use tracing::Instrument;
 
 use super::events::RoutingMode;
 use super::types::{Plan, TaskStatus};
@@ -462,6 +463,14 @@ impl ExecutionPersistence {
     /// Wait for all in-flight persistence writes to complete, bounded by `timeout`.
     ///
     /// Returns `true` if the counter reached zero before the deadline.
+    #[tracing::instrument(
+        name = "persistence.drain",
+        skip(self),
+        fields(
+            timeout_ms = timeout.as_millis() as u64,
+            remaining = tracing::field::Empty,
+        )
+    )]
     pub async fn drain(&self, timeout: Duration) -> bool {
         // Yield to let recently-spawned on_complete tasks poll their first
         // increment before we check the counter (closes TOCTOU window between
@@ -479,6 +488,7 @@ impl ExecutionPersistence {
             } => true,
             _ = tokio::time::sleep(timeout) => {
                 let remaining = self.in_flight.load(Ordering::Acquire);
+                tracing::Span::current().record("remaining", remaining as i64);
                 tracing::warn!(remaining, "Persistence drain timed out");
                 false
             }
@@ -497,6 +507,14 @@ impl ExecutionPersistence {
     }
 
     /// Write the plan created by coordinator.
+    #[tracing::instrument(
+        name = "persistence.write_plan",
+        skip(self, plan),
+        fields(
+            iteration = self.current_iteration,
+            task_count = plan.tasks.len(),
+        )
+    )]
     pub async fn write_plan(&self, plan: &Plan) -> io::Result<PathBuf> {
         if !self.enabled {
             return Ok(PathBuf::new());
@@ -515,6 +533,15 @@ impl ExecutionPersistence {
     }
 
     /// Write planning phase artifacts (coordinator prompt/response).
+    #[tracing::instrument(
+        name = "persistence.write_planning_phase",
+        skip(self, prompt, response),
+        fields(
+            iteration = self.current_iteration,
+            prompt_bytes = prompt.len(),
+            response_bytes = response.len(),
+        )
+    )]
     pub async fn write_planning_phase(&self, prompt: &str, response: &str) -> io::Result<PathBuf> {
         if !self.enabled {
             return Ok(PathBuf::new());
@@ -530,6 +557,17 @@ impl ExecutionPersistence {
     }
 
     /// Write worker task execution artifacts.
+    #[tracing::instrument(
+        name = "persistence.write_task_execution",
+        skip(self, prompt, response, record),
+        fields(
+            task_id,
+            attempt,
+            iteration = self.current_iteration,
+            prompt_bytes = prompt.len(),
+            response_bytes = response.len(),
+        )
+    )]
     pub async fn write_task_execution(
         &self,
         task_id: usize,
@@ -586,6 +624,16 @@ impl ExecutionPersistence {
     /// Returns the artifact filename (not the full path) for reference in summaries.
     /// Filenames are iteration-namespaced to avoid collisions across replans:
     /// `task-{id}-{worker}-iter-{n}-result.txt`
+    #[tracing::instrument(
+        name = "persistence.write_result_artifact",
+        skip(self, result),
+        fields(
+            task_id,
+            iteration,
+            worker = worker_name.unwrap_or("default"),
+            result_bytes = result.len(),
+        )
+    )]
     pub async fn write_result_artifact(
         &self,
         task_id: usize,
@@ -617,6 +665,18 @@ impl ExecutionPersistence {
     ///
     /// Returns the artifact filename for reference in footers and ToolCallRecord.
     /// Filename: `task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt`
+    #[tracing::instrument(
+        name = "persistence.write_tool_output_artifact",
+        skip(self, output),
+        fields(
+            task_id,
+            worker_name,
+            iteration,
+            tool_name,
+            call_idx,
+            output_bytes = output.len(),
+        )
+    )]
     pub async fn write_tool_output_artifact(
         &self,
         task_id: usize,
@@ -850,6 +910,14 @@ impl ExecutionPersistence {
     /// Called at the end of `run_orchestration_loop()` on both success and
     /// failure paths. The manifest serves as a structured index for Phase 2
     /// cross-turn context.
+    #[tracing::instrument(
+        name = "persistence.write_manifest",
+        skip(self, manifest),
+        fields(
+            task_count = manifest.task_summaries.len(),
+            artifact_count = manifest.artifact_paths.len(),
+        )
+    )]
     pub async fn write_manifest(&self, manifest: &RunManifest) -> io::Result<PathBuf> {
         if !self.enabled {
             return Ok(PathBuf::new());
@@ -868,6 +936,17 @@ impl ExecutionPersistence {
     ///
     /// This is called by PersistenceWrapper during tool execution.
     /// Tool calls are appended to a running list, not overwritten.
+    #[tracing::instrument(
+        name = "persistence.append_tool_call",
+        skip(self, record),
+        fields(
+            task_id,
+            attempt,
+            iteration = self.current_iteration,
+            tool = record.tool,
+            output_bytes = record.output.as_ref().map(|o| o.len()).unwrap_or(0),
+        )
+    )]
     pub async fn append_tool_call(
         &self,
         task_id: usize,
@@ -908,6 +987,18 @@ impl ExecutionPersistence {
 
         Ok(())
     }
+}
+
+/// Acquire the `ExecutionPersistence` lock with a tracing span around the wait.
+///
+/// Every consumer should use this for lock-acquisition visibility; the span is
+/// named `persistence_lock` and carries the logical operation being performed.
+pub async fn lock_persistence<'a>(
+    mutex: &'a Arc<Mutex<ExecutionPersistence>>,
+    operation: &'static str,
+) -> MutexGuard<'a, ExecutionPersistence> {
+    let span = tracing::info_span!("persistence_lock", operation);
+    async { mutex.lock().await }.instrument(span).await
 }
 
 // ============================================================================

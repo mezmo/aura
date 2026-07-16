@@ -1,3 +1,4 @@
+use crate::orchestration::lock_persistence;
 use crate::{
     config::{AgentRuntimeConfig, LlmConfig, McpServerConfig, VectorStoreType},
     error::{BuilderError, BuilderResult},
@@ -941,7 +942,10 @@ impl Agent {
                 crate::orchestration::ReadArtifactTool::new(persistence.clone());
             if let Some(ref scratchpad) = config.scratchpad_tools_config {
                 let read_root = scratchpad.storage.read_root().to_path_buf();
-                let run_path = persistence.lock().await.run_path().to_path_buf();
+                let run_path = lock_persistence(persistence, "read_run_path")
+                    .await
+                    .run_path()
+                    .to_path_buf();
                 if !run_path.starts_with(&read_root) {
                     tracing::warn!(
                         "read_artifact scratchpad read_root {} does not cover the artifacts \

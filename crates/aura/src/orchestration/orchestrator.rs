@@ -63,7 +63,7 @@ use super::context::{
     PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim, WorkerRole,
 };
 use super::events::OrchestratorEvent;
-use super::persistence::ExecutionPersistence;
+use super::persistence::{ExecutionPersistence, lock_persistence};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
     PlanningResponse, TaskState, TaskStatus,
@@ -503,7 +503,10 @@ impl Orchestrator {
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
-        let run_id_str = persistence.lock().await.run_id().to_string();
+        let run_id_str = lock_persistence(&persistence, "read_run_id")
+            .await
+            .run_id()
+            .to_string();
         let default_turn_depth = agent_config
             .agent
             .turn_depth
@@ -552,7 +555,7 @@ impl Orchestrator {
 
         // Build base tool wrappers: observer + duplicate guard + persistence
         let (in_flight, drain_notify, iteration, persistence_enabled) = {
-            let p = self.persistence.lock().await;
+            let p = lock_persistence(&self.persistence, "read_worker_metadata").await;
             (
                 p.in_flight_counter(),
                 p.drain_notify(),
@@ -669,7 +672,8 @@ impl Orchestrator {
                 ) + mcp_tool_tokens;
 
                 let (iter_dir, read_root) = {
-                    let persistence = self.persistence.lock().await;
+                    let persistence =
+                        lock_persistence(&self.persistence, "read_iteration_path").await;
                     let run_dir = persistence.run_path().to_path_buf();
                     let read_root = run_dir.parent().map(|p| p.to_path_buf()).unwrap_or(run_dir);
                     (persistence.iteration_path(), read_root)
@@ -1637,7 +1641,8 @@ impl Orchestrator {
 
                 // Persist planning phase artifacts
                 {
-                    let persistence = self.persistence.lock().await;
+                    let persistence =
+                        lock_persistence(&self.persistence, "write_planning_phase").await;
                     if let Err(e) = persistence
                         .write_planning_phase(&prompt, &response_text)
                         .await
@@ -1668,7 +1673,7 @@ impl Orchestrator {
                 if matches!(&planning_response, PlanningResponse::StepsPlan { .. })
                     && let Some(plan) = planning_response.clone().into_plan()
                 {
-                    let persistence = self.persistence.lock().await;
+                    let persistence = lock_persistence(&self.persistence, "write_plan").await;
                     if let Err(e) = persistence.write_plan(&plan).await {
                         tracing::warn!("Failed to persist plan: {}", e);
                     }
@@ -1684,7 +1689,7 @@ impl Orchestrator {
                 .push(rig::completion::Message::assistant(&response_text));
 
             {
-                let persistence = self.persistence.lock().await;
+                let persistence = lock_persistence(&self.persistence, "write_planning_phase").await;
                 if let Err(e) = persistence
                     .write_planning_phase(&prompt, &response_text)
                     .await
@@ -2272,7 +2277,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Build coordinator preamble: orchestration framework template + user system prompt
         let include_history_tools = self.config.memory_dir().is_some()
-            && self.persistence.lock().await.session_id().is_some();
+            && lock_persistence(&self.persistence, "read_session_id")
+                .await
+                .session_id()
+                .is_some();
         let mut preamble = super::config::build_coordinator_preamble(
             self.agent_config.effective_preamble(),
             include_recon_tools,
@@ -2325,7 +2333,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         if self.bounding.session_history_limit().is_enabled()
             && let Some(memory_dir) = self.agent_config.effective_memory_dir()
         {
-            let persistence = self.persistence.lock().await;
+            let persistence = lock_persistence(&self.persistence, "load_session_manifests").await;
             if let Some(session_id) = persistence.session_id() {
                 let manifests = super::persistence::load_session_manifests(
                     std::path::Path::new(memory_dir),
@@ -2994,7 +3002,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             return result;
         }
 
-        let persistence = self.persistence.lock().await;
+        let persistence = lock_persistence(&self.persistence, "write_result_artifact").await;
         let iteration = persistence.current_iteration();
 
         match persistence
@@ -3479,7 +3487,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
 
         {
-            let persistence = self.persistence.lock().await;
+            let persistence = lock_persistence(&self.persistence, "write_task_execution").await;
             if let Err(e) = persistence
                 .write_task_execution(
                     task_id,
@@ -3882,7 +3890,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // On re-plan (iteration > 1), advance persistence so the new plan
         // and its execution share a single directory.
         if iteration > 1 {
-            let mut persistence = self.persistence.lock().await;
+            let mut persistence = lock_persistence(&self.persistence, "start_new_iteration").await;
             persistence.start_new_iteration();
         }
 
@@ -3909,7 +3917,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         {
             let drain_timeout =
                 std::time::Duration::from_millis(self.config.persistence_drain_timeout_ms());
-            let persistence = self.persistence.lock().await.clone();
+            let persistence = lock_persistence(&self.persistence, "drain").await.clone();
             if !persistence.drain(drain_timeout).await {
                 tracing::warn!("Persistence drain timed out — tool output refs may be incomplete");
             }
@@ -3917,7 +3925,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         // Persistence fix: write plan after execute to capture task statuses
         {
-            let persistence = self.persistence.lock().await;
+            let persistence = lock_persistence(&self.persistence, "write_plan").await;
             if let Err(e) = persistence.write_plan(&plan).await {
                 tracing::warn!("Failed to persist plan after execution: {}", e);
             }
@@ -4189,7 +4197,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
                 // Persist plan state before replan
                 {
-                    let persistence = self.persistence.lock().await;
+                    let persistence = lock_persistence(&self.persistence, "write_plan").await;
                     if let Err(e) = persistence.write_plan(&plan).await {
                         tracing::warn!("Failed to persist plan before replan: {}", e);
                     }
@@ -4287,7 +4295,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) -> std::collections::HashMap<usize, Vec<super::persistence::ToolTraceEntry>> {
         use super::persistence::ToolTraceEntry;
 
-        let persistence = self.persistence.lock().await;
+        let persistence = lock_persistence(&self.persistence, "load_tool_records").await;
         let mut traces = std::collections::HashMap::new();
 
         for t in &plan.tasks {
@@ -4319,7 +4327,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
         };
 
-        let persistence = self.persistence.lock().await;
+        let persistence = lock_persistence(&self.persistence, "write_run_manifest").await;
 
         let all_complete = plan.completed_count() == plan.tasks.len();
         let status = if all_complete {
@@ -4444,7 +4452,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ) {
         use super::persistence::{RunManifest, RunStatus};
 
-        let persistence = self.persistence.lock().await;
+        let persistence =
+            lock_persistence(&self.persistence, "write_direct_response_manifest").await;
 
         let response_summary = Some(summary.map(|s| s.to_string()).unwrap_or_else(|| {
             self.bounding

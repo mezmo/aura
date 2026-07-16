@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::orchestration::persistence::ExecutionPersistence;
+use crate::orchestration::persistence::{ExecutionPersistence, lock_persistence};
 use crate::scratchpad::storage::ContentFormat;
 use crate::scratchpad::tools::check_and_record_budget;
 use crate::scratchpad::wrapper::build_file_pointer;
@@ -154,7 +154,7 @@ impl Tool for ReadArtifactTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let persistence = self.persistence.lock().await;
+        let persistence = lock_persistence(&self.persistence, "read_artifact").await;
 
         let (result, abs_path) = if let Some(ref run_id) = args.run_id {
             tracing::info!(

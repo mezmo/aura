@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::orchestration::persistence::{ExecutionPersistence, RunStatus, load_session_manifests};
+use crate::orchestration::persistence::{
+    ExecutionPersistence, RunStatus, load_session_manifests, lock_persistence,
+};
 
 const MAX_PRIOR_RUNS: usize = 50;
 
@@ -73,7 +75,7 @@ impl Tool for ListPriorRunsTool {
     }
 
     async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let persistence = self.persistence.lock().await;
+        let persistence = lock_persistence(&self.persistence, "list_prior_runs").await;
         let session_id = match persistence.session_id() {
             Some(sid) => sid.to_string(),
             None => {
