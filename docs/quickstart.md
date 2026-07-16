@@ -54,13 +54,18 @@ It renders the coordinator's plan and worker activity as the response streams.
 curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
 ```
 
-The script downloads pre-built binaries for your platform, verifies checksums when available, and installs them to `~/.local/bin`. It supports Linux and macOS on `amd64` and `arm64`, and works with whichever of `curl` or `wget` you have installed. You can customize the install with environment variables:
+The script downloads pre-built binaries for your platform, verifies checksums when available, and installs them to `~/.local/bin`. It supports Linux and macOS on `amd64` and `arm64`, and works with whichever of `curl` or `wget` you have installed.
+
+On macOS, the script installs through Homebrew when the `brew` command is available, running `brew install mezmo/tap/aura` from Mezmo's tap. If Homebrew isn't installed, or you set `AURA_NO_BREW=1`, the script downloads the release binaries directly instead. The Homebrew formula always installs the latest version of both binaries, so requesting a specific `AURA_VERSION` or a single `AURA_COMPONENT` also falls back to a direct download. When it does, the script prints a short note explaining why. Linux always uses the direct download.
+
+You can customize the install with environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AURA_VERSION` | `latest` | Version to install (e.g. `1.2.0`); a leading `v` is stripped, so `v1.2.0` and `1.2.0` both work |
 | `AURA_INSTALL` | `~/.local/bin` | Install directory |
 | `AURA_COMPONENT` | `all` | Which binaries: `all`, `server`, or `cli` |
+| `AURA_NO_BREW` | `0` | macOS only: `1` to skip Homebrew and download the release binaries directly |
 | `AURA_REQUIRE_CHECKSUM` | `0` | `1` to fail when a release checksum is missing, `0` to warn and continue |
 | `AURA_CHECKSUMS` | — | Path to a local checksums file for verification |
 
