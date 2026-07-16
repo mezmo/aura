@@ -82,7 +82,6 @@ build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 
 			--builder "$${CACHE_BUILDER}" \
 			--platform linux/amd64 \
 			--progress=plain \
-			--pull \
 			$$extra_args \
 			--target "$${target}" \
 			--cache-from "$${cache_spec}" \
