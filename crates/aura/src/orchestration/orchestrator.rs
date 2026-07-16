@@ -40,7 +40,6 @@
 //! - `Synthesizing` - when task results are being consolidated for the coordinator
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rig::client::CompletionClient;
@@ -65,7 +64,6 @@ use super::context::{
 };
 use super::events::OrchestratorEvent;
 use super::persistence::ExecutionPersistence;
-use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
     PlanningResponse, TaskState, TaskStatus,
@@ -106,8 +104,8 @@ struct TaskExecutionResult {
 
 /// Named return type for `create_*` coordinator/worker methods.
 ///
-/// Replaces bare `(Agent, String)` tuples where the `String` was the preamble
-/// used for journal recording.
+/// Replaces bare `(Agent, String)` tuples where the `String` is the preamble
+/// captured for the golden-frame comparison gate (R3).
 struct AgentWithPreamble {
     agent: Agent,
     preamble: String,
@@ -430,13 +428,6 @@ pub struct Orchestrator {
     /// Execution persistence for debugging and retry intelligence
     persistence: Arc<Mutex<ExecutionPersistence>>,
 
-    /// Optional prompt journal for dev diagnostics (gated by AURA_PROMPT_JOURNAL=1)
-    prompt_journal: Option<PromptJournal>,
-
-    /// Current orchestration iteration, set at the top of `run_orchestration_loop`.
-    /// Read by `journal_record` so that iteration doesn't pollute method signatures.
-    current_iteration: AtomicUsize,
-
     /// Accumulated token usage across all LLM calls in this orchestration run
     /// (planning, workers, continuation routing).
     ///
@@ -512,18 +503,6 @@ impl Orchestrator {
 
         let orchestrator_id = uuid::Uuid::new_v4().to_string();
 
-        // Initialize prompt journal (gated by AURA_PROMPT_JOURNAL env var, default off)
-        let journal_enabled = crate::env_flags::bool_env("AURA_PROMPT_JOURNAL", false);
-        let prompt_journal = if effective_memory_dir.is_some() {
-            let guard = persistence.lock().await;
-            let run_id = guard.run_id().to_string();
-            let run_path = guard.run_path().to_path_buf();
-            drop(guard);
-            PromptJournal::from_persistence(&run_path, &run_id, &orchestrator_id, journal_enabled)
-        } else {
-            None
-        };
-
         let run_id_str = persistence.lock().await.run_id().to_string();
         let default_turn_depth = agent_config
             .agent
@@ -546,21 +525,8 @@ impl Orchestrator {
             tool_call_observer,
             mcp_manager,
             persistence,
-            prompt_journal,
-            current_iteration: AtomicUsize::new(0),
             usage_state: crate::UsageState::new(),
         })
-    }
-
-    /// Record a prompt in the journal if enabled.
-    ///
-    /// Reads the current iteration from `self.current_iteration` so callers
-    /// don't need to pass it explicitly.
-    fn journal_record(&self, phase: JournalPhase, system_prompt: &str, user_prompt: &str) {
-        if let Some(ref journal) = self.prompt_journal {
-            let iteration = self.current_iteration.load(Ordering::Relaxed);
-            journal.record(phase, iteration, system_prompt, user_prompt);
-        }
     }
 
     /// Create a worker agent for task execution.
@@ -871,8 +837,7 @@ impl Orchestrator {
 
         // Capture preamble before config is consumed by builder.  Always
         // captured so the golden-frame harness can compare the real worker
-        // append order (R3); the journal recording itself is still gated by
-        // `self.prompt_journal.is_some()` elsewhere.
+        // append order (R3).
         let preamble = worker_config
             .preamble_override
             .as_deref()
@@ -1597,15 +1562,6 @@ impl Orchestrator {
                 &tracing::Span::current(),
                 &coordinator_state.preamble,
                 &full_history,
-                &prompt,
-            );
-
-            self.journal_record(
-                JournalPhase::Planning {
-                    attempt,
-                    max_attempts: max_correction_attempts,
-                },
-                &coordinator_state.preamble,
                 &prompt,
             );
 
@@ -3270,7 +3226,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
             let AgentWithPreamble {
                 agent: worker,
-                preamble: worker_preamble,
+                preamble: _worker_preamble,
                 escalation_flag,
                 submit_result_decision,
             } = self.create_worker(task_id, attempt, *worker_name).await?;
@@ -3300,17 +3256,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     task_prompt_tokens
                 );
             }
-
-            // Record in prompt journal
-            self.journal_record(
-                JournalPhase::Worker {
-                    task_id,
-                    worker_name: *worker_name,
-                    attempt,
-                },
-                &worker_preamble,
-                &prompt,
-            );
 
             // Execute the task
             let srd = submit_result_decision.clone();
@@ -3772,8 +3717,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_decision,
         };
 
-        // Set iteration for initial planning (journal reads this via AtomicUsize)
-        self.current_iteration.store(1, Ordering::Relaxed);
         let (response, _prompt, _coordinator_text) = self
             .plan_with_routing(
                 query,
@@ -3881,7 +3824,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
 
         let final_result = loop {
             iteration += 1;
-            self.current_iteration.store(iteration, Ordering::Relaxed);
             match self
                 .run_iteration(
                     iteration,

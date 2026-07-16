@@ -1,7 +1,7 @@
 //! Canonical parsing for boolean environment variables.
 //!
 //! Aura reads several boolean env vars (`AURA_CUSTOM_EVENTS`,
-//! `AURA_PROMPT_JOURNAL`, `OTEL_RECORD_CONTENT`, …) at startup or on the
+//! `OTEL_RECORD_CONTENT`, …) at startup or on the
 //! hot path. Historically each call site rolled its own truthy/falsy
 //! check, which led to incompatible vocabularies — `AURA_ENRICH_REPLAN`
 //! treated unknown values as truthy, while `OTEL_RECORD_CONTENT`

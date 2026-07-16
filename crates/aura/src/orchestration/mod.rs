@@ -55,7 +55,6 @@ mod orchestrator;
 mod persistence;
 mod persistence_wrapper;
 mod prompt_constants;
-mod prompt_journal;
 mod stream_events;
 mod templates;
 pub mod tools;

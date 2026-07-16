@@ -68,7 +68,8 @@ Phase B added four more `#[cfg(test)]` accessors for its seam gates
 `#[cfg(test)]` constructor `CoordinatorTools::new_for_golden_test`, and
 made two behavior-preserving production edits outside `#[cfg(test)]`:
 `create_worker` now always captures its assembled preamble (the
-prompt-journal gate was removed), and the per-turn conversation pushes
+prompt-journal gate was removed by S3; the journal module itself was
+removed by S24), and the per-turn conversation pushes
 were extracted into `push_user_turn`/`push_assistant_turn` so the R8
 gate shares them with production (details in the R3/R8 sections below).
 Test-only dependency added: `insta = "1"` in `[dev-dependencies]`.
@@ -142,14 +143,15 @@ verification section below.
   append position stays re-stated (live-manager construction); (b) the
   worker-side `create_worker` comparison proved INFEASIBLE without new
   production code - `create_worker` only captures its assembled preamble
-  when the prompt journal is enabled (`AURA_PROMPT_JOURNAL`, an env
-  mutation the corpus's env-pinning stance forbids in tests), so a pure
+  when the prompt journal is enabled (an env var the corpus's env-pinning
+  stance forbids in tests), so a pure
   delegating accessor returns an empty string and a capturing accessor
   would change production code. S3 GATE STATUS: the worker-side
   comparison LANDED and passes
   (`gate_r3_worker_preamble_matches_create_worker` in
   `golden_tests.rs`): `create_worker` now always captures its assembled
-  preamble (the prompt-journal gate was removed), and the
+  preamble (the prompt-journal gate was removed by S3; the journal
+  module itself was removed by S24), and the
   `worker_preamble_for_golden` accessor returns it. The composed worker
   preamble byte-equals real `create_worker` output over an MCP-less
   Orchestrator. Residue: the scratchpad append requires accessible MCP
