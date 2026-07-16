@@ -1,5 +1,12 @@
 ## Changelog
 
+## [0.0.3](https://github.com/mezmo/aura/compare/v0.0.2...v0.0.3) (2026-07-16)
+
+
+### Features
+
+* **session-store**: add storage traits with in-memory default [e80386a](https://github.com/mezmo/aura/commit/e80386a919dbd1050cba8f1112527a50f0d7250e) - Justin Gross [#327](https://github.com/mezmo/aura/issues/327)
+
 ## [0.0.2](https://github.com/mezmo/aura/compare/v0.0.1...v0.0.2) (2026-07-16)
 
 
