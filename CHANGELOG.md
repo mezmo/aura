@@ -1,5 +1,12 @@
 ## Changelog
 
+## [0.0.4](https://github.com/mezmo/aura/compare/v0.0.3...v0.0.4) (2026-07-16)
+
+
+### Performance Improvements
+
+* **ci**: run clippy against the warmed test-image deps [64ae4be](https://github.com/mezmo/aura/commit/64ae4bea471ab5a16ffe051d530828b0c63c0d89) - Mike Shearer
+
 ## [0.0.3](https://github.com/mezmo/aura/compare/v0.0.2...v0.0.3) (2026-07-16)
 
 
