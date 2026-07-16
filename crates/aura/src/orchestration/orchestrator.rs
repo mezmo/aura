@@ -4648,18 +4648,6 @@ mod tests {
         assert_eq!(expected_tool, "vector_search_mezmo_docs");
     }
 
-    #[test]
-    fn test_vector_store_tool_name_format() {
-        // Verify the tool naming convention matches DynamicVectorSearchTool
-        let store_names = vec!["docs", "kb", "mezmo_docs", "customer_runbooks"];
-
-        for name in store_names {
-            let tool_name = format!("vector_search_{}", name);
-            assert!(tool_name.starts_with("vector_search_"));
-            assert!(tool_name.ends_with(name));
-        }
-    }
-
     // ========================================================================
     // Vector Store Filtering Tests
     // ========================================================================
@@ -5279,24 +5267,6 @@ mod tests {
         assert!(output.found);
         assert_eq!(output.content.len(), 5000);
         assert_eq!(output.content, large_result);
-    }
-
-    #[tokio::test]
-    async fn test_artifact_threshold_below_does_not_create() {
-        use super::super::persistence::ExecutionPersistence;
-
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
-            .await
-            .unwrap();
-
-        // Result below default threshold (4000) should not create artifact
-        let small_result = "small result";
-        assert!(small_result.len() <= 4000);
-
-        // Verify list_artifacts returns empty
-        let artifacts = persistence.list_artifacts().await.unwrap();
-        assert!(artifacts.is_empty());
     }
 
     #[tokio::test]

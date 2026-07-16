@@ -5,13 +5,13 @@ Baseline: aura `9df96382`. Anatomy references are to
 repo); defect letters are from
 `docs/redesign/evidence/2026-07-10-worker-delegation-contract-audit.md`.
 
-Status: IMPLEMENTED. The corpus below is landed in `golden_tests.rs`; every
-fixture's snapshot is committed under `snapshots/` and one test per row
-group renders the complete envelope triple. A row is either mapped to a
-fixture or explicitly excluded with a reason, and every exclusion row that
-leans on legacy unit coverage names its owning tests (the retained-test
-ledger). Rows marked `excluded` are NOT covered by the S2
-envelope-identity claim.
+Status: IMPLEMENTED (S2) and extended by S17. The corpus below is landed in
+`golden_tests.rs`; every fixture's snapshot is committed under `snapshots/`
+and one test per row group renders the complete envelope triple. A row is
+either mapped to a fixture or explicitly excluded with a reason, and every
+exclusion row that leans on legacy unit coverage names its owning tests
+(the retained-test ledger). Rows marked `excluded` are NOT covered by the
+S2/S17 envelope-identity claim.
 
 Envelope claim (scope): every fixture snapshots the full aura-level
 request triple - system preamble string, ordered message list, serialized
@@ -61,10 +61,13 @@ within-iteration file order is filesystem-dependent).
 | `coordinator_call1_full_visibility` | Initial planning call; Full roster branch, populated config-only: a described tool (store present in `agent_config.vector_stores`, `context_prefix` description), an undescribed tool (assigned store name absent from agent config → bare `- name` line), an `(+N more)` remainder, and a no-tools worker |
 | `coordinator_call1_no_workers` | Initial planning call; `has_workers() == false` (empty worker sections) |
 | `coordinator_preamble_full_appends` | Initial call; skill catalog + vector-store context + source-built session history; history tools included; skill tool definitions (`load_skill`/`read_skill_file`) included - production registers them with the catalog. Partial-tools fixture (§6a): vector-search definitions omitted |
+| `session_history_catch_all` | Initial call; session-history block with Running and Pending task summaries, exercising the catch-all render for unfinished tasks |
 | `coordinator_call2_clean` | Continuation call 2; 1 iteration, all tasks complete (all failure slots empty) |
 | `coordinator_call2_all_failed` | Continuation call 2; all tasks failed (empty COMPLETED section; hard failure w/ >2000-char error; one failed task with empty traces → no trace lines) |
 | `coordinator_call3_failures` | Continuation call 3; mixed complete/failed/blocked; failure summary; accumulated + repeated failure history; cross-iteration artifact re-listing; failed task carrying tool traces (unconditional failed-entry trace lines) |
 | `coordinator_call4_final_urgency` | Continuation call 4; 3 iterations; budget 4 → `(FINAL ATTEMPT)`; template tail's third occurrence |
+| `coordinator_call_completed_task_tool_chain` | Continuation call 2; non-default `show_tool_reasoning_in_continuation = true`; completed tasks with traces render the gated tool-chain lines and `[Artifact: ...]` refs |
+| `coordinator_call_all_failure_categories` | Continuation call 2; 10 failed tasks, one per `FailureCategory` variant, exercise every bracket tag in the FAILED TASKS section |
 | `tools_coordinator_recon_history` | Initial planning call with recon + history tools BOTH included - a full (system, messages, tools) triple like every fixture: owns preamble block 2's recon+history tools-sentence branch AND the recon/history tool JSON |
 | `worker_role_frame_direct` | Named-role worker; populated frame, Direct-only; all three role-branch appends - assigned vector stores (post-`retain`), scratchpad, skill catalog - proving the vector → scratchpad → skills order; skill tool definitions included. Partial-tools fixture (§6a) |
 | `worker_role_frame_transitive` | Named-role worker; populated frame, Direct + Transitive (plan-order rendering, defect E visible) |
@@ -91,7 +94,7 @@ within-iteration file order is filesystem-dependent).
 | 23 | Session-history block (source-built; no trace-derived golden exists - pre-approved decision 5). Fixture input order: manifests MOST-RECENT-FIRST, exactly as `load_session_manifests` returns them (`build_session_context` re-reverses for chronological turn numbering); enforced by `SessionHistoryFixture::new` | `coordinator_preamble_full_appends` |
 | 23a | `session_history.md` slot `%%TURN_ENTRIES%%` (unconditionally filled whenever block 23 renders) | `coordinator_preamble_full_appends` |
 | 23b | `session_history.md` slot `%%TURN_COUNT%%` (unconditionally filled whenever block 23 renders) | `coordinator_preamble_full_appends` |
-| 23c | Turn-entry shapes inside `%%TURN_ENTRIES%%`. The source-built manifest list carries a routed run and a direct-response run (outcome plus response summary, no task list). The routed run has a Complete task summary (named worker, confidence tag, result preview), a Failed task summary (unassigned worker → `[unassigned]`, category tag, error, error-context last-tool/partial lines), a tool-chain line (success + FAILED outcomes), an artifacts line, and the cross-run `read_artifact` hint | `coordinator_preamble_full_appends`. EXCLUDED shapes, with reason: the Pending/Running catch-all task render (a prior-run manifest records finished runs); owning retained tests `test_session_history_running_task_status` and `test_session_history_full_scenario` |
+| 23c | Turn-entry shapes inside `%%TURN_ENTRIES%%`. The source-built manifest list carries a routed run and a direct-response run (outcome plus response summary, no task list). The routed run has a Complete task summary (named worker, confidence tag, result preview), a Failed task summary (unassigned worker → `[unassigned]`, category tag, error, error-context last-tool/partial lines), a tool-chain line (success + FAILED outcomes), an artifacts line, and the cross-run `read_artifact` hint | `coordinator_preamble_full_appends`. The catch-all Running/Pending task render is covered by `session_history_catch_all`; the unit-level edge cases (`test_session_history_*_no_preview_no_confidence`, `test_session_history_running_task_status`) remain in `frame_validation_tests.rs` |
 | - | Skill catalog append | `coordinator_preamble_full_appends` |
 | - | Vector-store context append (`## Available Knowledge Bases`) | `coordinator_preamble_full_appends` |
 | - | Append order (catalog → vector stores → `'\n'` + session history) | `coordinator_preamble_full_appends`, COVERED by the landed R3 comparison gate (`gate_r3_coordinator_preamble_matches_create_coordinator`): the composed preamble byte-equals real `create_coordinator` output over a tempdir-backed skills + session-history config. Residue: the gate runs vector-disabled (live-manager construction), so the vector append POSITION between catalog and session stays re-stated (DESIGN.md R3) |
@@ -140,7 +143,8 @@ within-iteration file order is filesystem-dependent).
 | Repeated-failure detection (`OBSERVED PATTERNS`) | `coordinator_call3_failures` (same handle+category twice; exactly ONE repeated pair, because the patterns list iterates a `HashMap` and a multi-pattern fixture would snapshot nondeterministically). Multi-pattern rendering keeps its unit coverage in the retained `test_continuation_multiple_repeated_failure_patterns` | |
 | read_artifact hint line, decision menu, synthesis rules (fixed tail) | every continuation fixture; third tail occurrence: `coordinator_call4_final_urgency` | |
 | Whitespace-only completed result fallback (bare label line) | EXCLUDED from the corpus: the fixture composes `EvidenceText`, which forbids whitespace results by construction. Owning tests: `test_continuation_whitespace_only_result_renders_bare_label` (`frame_validation_tests.rs`, the bare-label render arm in `types.rs`; added by the S2 repair round - the arm had no owner before) and `empty_values_are_rejected` (`context/evidence.rs`, the `EvidenceText` rejection that drives that `Err(_)` arm). Candidate for promotion via a fixture variant if S3-S6 touch it. | |
-| COMPLETED-entry tool-chain lines (gated by `show_tool_reasoning_in_continuation = true`) | EXCLUDED: non-default observability knob, off in the accepted baseline config; no Track A card varies it. Owning retained tests: `test_continuation_full_scenario` and `test_continuation_tool_output_artifacts_visible`. Scope note: this exclusion covers ONLY the completed-task chain - failed-task trace lines are unconditional and covered above. | |
+| COMPLETED-entry tool-chain lines (gated by `show_tool_reasoning_in_continuation = true`) | `coordinator_call_completed_task_tool_chain` (non-default knob enabled); the accompanying `[Artifact: ...]` refs are captured there. The unit-level `test_continuation_tool_output_artifacts_visible` was deleted and absorbed by this fixture. |
+| All `FailureCategory` bracket tags in the FAILED TASKS section | `coordinator_call_all_failure_categories` (one failed task per variant); the unit-level `test_continuation_all_failure_categories` was deleted and absorbed by this fixture. | |
 
 ## 4. Conversation growth (anatomy §1b)
 

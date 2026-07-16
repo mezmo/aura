@@ -351,6 +351,51 @@ fn direct_manifest() -> RunManifest {
     }
 }
 
+/// A prior run whose task summaries exercise the catch-all render for
+/// Running and Pending statuses (the MANIFEST §1 row 23c exclusion).
+fn catch_all_manifest() -> RunManifest {
+    RunManifest {
+        run_id: "run-catch-all-0001".to_owned(),
+        session_id: Some("s2-session".to_owned()),
+        timestamp: "2026-07-10T09:15:00Z".to_owned(),
+        goal: "Triage the payments error spike".to_owned(),
+        status: RunStatus::PartialSuccess,
+        iterations: 1,
+        routing_mode: Some(RoutingMode::Orchestrated),
+        outcome: Some("0/2 tasks completed".to_owned()),
+        response_summary: None,
+        task_summaries: vec![
+            TaskSummary {
+                task_id: 0,
+                description: "Search payments logs for error patterns".to_owned(),
+                status: TaskStatus::Running,
+                worker: Some("analyst".to_owned()),
+                result_preview: None,
+                confidence: None,
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![],
+            },
+            TaskSummary {
+                task_id: 1,
+                description: "Query deployment history for the error window".to_owned(),
+                status: TaskStatus::Pending,
+                worker: Some("analyst".to_owned()),
+                result_preview: None,
+                confidence: None,
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![],
+            },
+        ],
+        artifact_paths: vec![],
+    }
+}
+
 fn session_history() -> SessionHistoryFixture {
     // Most-recent-first, exactly as `load_session_manifests` returns them.
     SessionHistoryFixture::new(vec![direct_manifest(), routed_manifest()])
@@ -506,6 +551,29 @@ async fn coordinator_preamble_full_appends() {
     snapshot_coordinator("coordinator_preamble_full_appends", &scenario).await;
 }
 
+/// Session-history block with catch-all Running and Pending task summaries.
+#[tokio::test]
+async fn session_history_catch_all() {
+    let preamble = PreambleFixture {
+        playbook: SOURCE_PLAYBOOK.to_owned(),
+        tools: no_optional_tools(),
+        skills: Vec::new(),
+        vector_stores: Vec::new(),
+        session_history: Some(
+            SessionHistoryFixture::new(vec![catch_all_manifest()]).expect("one prior manifest"),
+        ),
+    };
+    let scenario = scenario(
+        preamble,
+        WorkerRosterFixture::new(
+            roster_config(analyst_operator_workers(), ToolVisibility::Summary),
+            Vec::new(),
+        ),
+        CoordinatorCall::Initial,
+    );
+    snapshot_coordinator("session_history_catch_all", &scenario).await;
+}
+
 #[tokio::test]
 async fn tools_coordinator_recon_history() {
     let preamble = preamble(CoordinatorToolConfig {
@@ -589,6 +657,22 @@ async fn coordinator_call2_clean() {
     snapshot_coordinator("coordinator_call2_clean", &scenario).await;
 }
 
+/// The non-default observability knob: completed tasks carry condensed
+/// tool-chain lines when `show_tool_reasoning_in_continuation` is enabled.
+#[tokio::test]
+async fn coordinator_call_completed_task_tool_chain() {
+    let mut config = roster_config(analyst_operator_workers(), ToolVisibility::Summary);
+    config.artifacts.show_tool_reasoning_in_continuation = true;
+    let scenario = scenario(
+        preamble(no_optional_tools()),
+        WorkerRosterFixture::new(config, Vec::new()),
+        CoordinatorCall::Continuation(
+            ContinuationThread::new(vec![clean_iteration()]).expect("one iteration"),
+        ),
+    );
+    snapshot_coordinator("coordinator_call_completed_task_tool_chain", &scenario).await;
+}
+
 #[tokio::test]
 async fn coordinator_call2_all_failed() {
     let decision = decision(
@@ -643,6 +727,57 @@ async fn coordinator_call2_all_failed() {
         CoordinatorCall::Continuation(ContinuationThread::new(vec![iteration]).expect("one")),
     );
     snapshot_coordinator("coordinator_call2_all_failed", &scenario).await;
+}
+
+/// Every `FailureCategory` variant renders in the FAILED TASKS section.
+#[tokio::test]
+async fn coordinator_call_all_failure_categories() {
+    let categories = vec![
+        (FailureCategory::AgentTimeout, "agent timeout"),
+        (FailureCategory::ContextOverflow, "context overflow"),
+        (FailureCategory::DepthExhausted, "depth exhausted"),
+        (FailureCategory::LoopDetected, "loop detected"),
+        (FailureCategory::ProviderOverloaded, "provider overloaded"),
+        (FailureCategory::ProviderAuthError, "provider auth error"),
+        (FailureCategory::ProviderNotFound, "provider not found"),
+        (FailureCategory::DependencyFailed, "dependency failed"),
+        (FailureCategory::SoftFailure, "soft failure"),
+        (FailureCategory::AgentError, "agent error"),
+    ];
+    let steps: Vec<StepInput> = categories
+        .iter()
+        .enumerate()
+        .map(|(i, (_, msg))| leaf(&format!("Task {i}: {msg}"), Some("analyst")))
+        .collect();
+    let decision = decision("Exercise every failure category in one iteration.", steps);
+    let outcomes: Vec<TaskOutcome> = categories
+        .iter()
+        .map(|(category, msg)| TaskOutcome::Failed {
+            report: FailedResultFixture::Hard {
+                error: format!("error: {msg}"),
+                category: *category,
+            },
+            traces: vec![],
+        })
+        .collect();
+    let iteration = IterationFixture::new(
+        decision,
+        outcomes,
+        Some(FailureSummary {
+            reasoning: "Execution failed: all tasks failed.".to_owned(),
+            gaps: vec!["All failure categories exercised".to_owned()],
+        }),
+    )
+    .expect("all-failure iteration validates");
+    let scenario = scenario(
+        preamble(no_optional_tools()),
+        WorkerRosterFixture::new(
+            roster_config(analyst_operator_workers(), ToolVisibility::Summary),
+            Vec::new(),
+        ),
+        CoordinatorCall::Continuation(ContinuationThread::new(vec![iteration]).expect("one")),
+    );
+    snapshot_coordinator("coordinator_call_all_failure_categories", &scenario).await;
 }
 
 /// Iterations 1-2 behind `coordinator_call3_failures` (also the R5 gate's
