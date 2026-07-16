@@ -352,7 +352,8 @@ fn direct_manifest() -> RunManifest {
 }
 
 /// A prior run whose task summaries exercise the catch-all render for
-/// Running and Pending statuses (the MANIFEST §1 row 23c exclusion).
+/// Running and Pending statuses (formerly excluded at MANIFEST §1 row
+/// 23c, now covered by the `session_history_catch_all` fixture).
 fn catch_all_manifest() -> RunManifest {
     RunManifest {
         run_id: "run-catch-all-0001".to_owned(),

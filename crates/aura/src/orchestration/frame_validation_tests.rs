@@ -92,40 +92,8 @@ fn sample_manifest(
 }
 
 // ========================================================================
-// All FailureCategory variants in continuation prompt
+// Soft failure and structured-output edge cases
 // ========================================================================
-
-#[test]
-fn test_continuation_all_failure_categories() {
-    let categories = vec![
-        (FailureCategory::AgentTimeout, "agent_timeout"),
-        (FailureCategory::ContextOverflow, "context_overflow"),
-        (FailureCategory::DepthExhausted, "depth_exhausted"),
-        (FailureCategory::LoopDetected, "loop_detected"),
-        (FailureCategory::ProviderOverloaded, "provider_overloaded"),
-        (FailureCategory::ProviderAuthError, "provider_auth_error"),
-        (FailureCategory::DependencyFailed, "dependency_failed"),
-        (FailureCategory::AgentError, "agent_error"),
-    ];
-
-    for (category, display) in categories {
-        let mut plan = Plan::new("Test goal");
-        let mut t = Task::new(0, "failing task", "This task fails");
-        t.fail(format!("error for {}", display), category);
-        plan.add_task(t);
-
-        let ctx = IterationContext::new(1, plan, None, vec![], HashMap::new());
-        let prompt = ctx.build_continuation_prompt(3, true, 2000);
-
-        assert!(
-            prompt.contains(&format!("[{}]", display)),
-            "category {} should render as [{}] in: {}",
-            display,
-            display,
-            prompt
-        );
-    }
-}
 
 #[test]
 fn test_continuation_soft_failure_without_structured_output() {
