@@ -1,5 +1,12 @@
 ## Changelog
 
+## [0.0.5](https://github.com/mezmo/aura/compare/v0.0.4...v0.0.5) (2026-07-17)
+
+
+### Features
+
+* **telemetry**: emit cli_session_ended on repl exit [468373e](https://github.com/mezmo/aura/commit/468373ec27776913403ffcbf2254444ba1de85ca) - Chip Johnson
+
 ## [0.0.4](https://github.com/mezmo/aura/compare/v0.0.3...v0.0.4) (2026-07-16)
 
 
