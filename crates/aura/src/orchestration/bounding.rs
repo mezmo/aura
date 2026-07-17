@@ -216,12 +216,6 @@ impl ByteThreshold {
         Self(bytes)
     }
 
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    pub fn get(&self) -> usize {
-        self.0
-    }
-
     pub fn allows_inline(&self, text: &str) -> bool {
         text.len() <= self.0
     }
@@ -234,32 +228,12 @@ impl ByteThreshold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NonZeroByteThreshold(NonZeroUsize);
 
-impl NonZeroByteThreshold {
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    fn new(bytes: usize) -> Option<Self> {
-        NonZeroUsize::new(bytes).map(Self)
-    }
-}
-
 /// A non-zero duration threshold for duration-based promotion.
 ///
 /// Implementation detail of [`DurationPromotion`]; crate-visible so the public
 /// enum variant is well-formed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NonZeroDuration(Duration);
-
-impl NonZeroDuration {
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    fn from_millis(ms: u64) -> Option<Self> {
-        if ms == 0 {
-            None
-        } else {
-            Some(Self(Duration::from_millis(ms)))
-        }
-    }
-}
 
 // ============================================================================
 // Spill budgets
@@ -287,12 +261,6 @@ impl ResultSummaryWidth {
             Self::Empty => 0,
             Self::Limited(n) => n.get(),
         }
-    }
-
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    pub fn truncate(&self, text: &str) -> String {
-        truncate_bytes(text, self.get(), TruncateMarker::None)
     }
 }
 
@@ -439,15 +407,6 @@ impl SizePromotion {
             Self::LargerThan(threshold) => threshold.0.get(),
         }
     }
-
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    pub fn qualifies(&self, output: &str) -> bool {
-        match self {
-            Self::PromoteAll => true,
-            Self::LargerThan(threshold) => output.len() > threshold.0.get(),
-        }
-    }
 }
 
 /// Policy for duration-based tool-output promotion.
@@ -480,15 +439,6 @@ impl DurationPromotion {
             Self::LongerThan(threshold) => threshold.0.as_millis() as u64,
         }
     }
-
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    pub fn qualifies(&self, duration: Duration) -> bool {
-        match self {
-            Self::Disabled => false,
-            Self::LongerThan(threshold) => duration > threshold.0,
-        }
-    }
 }
 
 /// Budget governing tool-output promotion to artifacts.
@@ -519,18 +469,6 @@ impl ToolOutputSpillBudget {
 
     pub fn duration(&self) -> DurationPromotion {
         self.duration
-    }
-
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    pub fn size_qualifies(&self, output: &str) -> bool {
-        self.size.qualifies(output)
-    }
-
-    // Unused S3 API surface.
-    #[allow(dead_code)]
-    pub fn duration_qualifies(&self, duration: Duration) -> bool {
-        self.duration.qualifies(duration)
     }
 }
 

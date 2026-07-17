@@ -878,47 +878,6 @@ impl Orchestrator {
         })
     }
 
-    /// Execute a blocking chat call with timeout — for **worker tasks only**.
-    ///
-    /// Workers need the full ReAct loop for sequential MCP tool chains.
-    /// Coordinator phases (planning, continuation routing) use `stream_and_collect()`
-    /// for early exit after one-shot tool decisions and reasoning forwarding.
-    ///
-    /// Returns `Err` with a timeout message if the call exceeds `per_call_timeout_secs`.
-    /// A value of 0 (the default) disables the per-call timeout.
-    #[allow(dead_code)]
-    async fn chat_with_timeout(
-        &self,
-        agent: &Agent,
-        prompt: &str,
-        history: Vec<rig::completion::Message>,
-        phase: &str,
-    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let timeout_secs = self.config.per_call_timeout_secs();
-        if timeout_secs == 0 {
-            return agent.chat(prompt, history).await;
-        }
-
-        let timeout = Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, agent.chat(prompt, history)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    "{} LLM call timed out after {}s (per_call_timeout_secs={})",
-                    phase,
-                    timeout_secs,
-                    timeout_secs,
-                );
-                Err(format!(
-                    "{} timed out after {}s — the LLM provider did not respond in time",
-                    phase, timeout_secs
-                )
-                .into())
-            }
-        }
-    }
-
     /// Stream a full ReAct chat, forwarding reasoning events and collecting the final response.
     ///
     /// Unlike `stream_and_collect` (which uses `max_depth=1` and early-exit for coordinator

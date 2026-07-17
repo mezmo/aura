@@ -1,4 +1,4 @@
-//! Prompt section headers and field names as constants for type safety.
+//! Prompt section headers as constants for type safety.
 //!
 //! This module centralizes all string constants used in orchestration prompts,
 //! ensuring consistency across the codebase and enabling easy updates.
@@ -9,29 +9,6 @@
 //! - LangChain's Write-Select-Compress-Isolate framework
 //! - LlamaIndex's Context Store with typed state
 //! - Anthropic's context engineering principles
-
-/// Section headers for worker prompts.
-pub mod sections {
-    #[allow(dead_code)]
-    pub const PRIOR_WORK: &str = "COMPLETED";
-}
-
-/// JSON field names for plan parsing.
-pub mod fields {
-    pub const GOAL: &str = "goal";
-    pub const TASKS: &str = "tasks";
-    pub const ID: &str = "id";
-    pub const DESCRIPTION: &str = "description";
-    pub const DEPENDENCIES: &str = "dependencies";
-    pub const RATIONALE: &str = "rationale";
-    pub const WORKER: &str = "worker";
-}
-
-/// Context formatting constants.
-pub mod context {
-    #[allow(dead_code)]
-    pub const DEPENDENCY_SEPARATOR: &str = "\n\n---\n\n";
-}
 
 /// Section headers for the continuation prompt (post-execute decision point).
 pub mod continuation {
@@ -65,24 +42,4 @@ pub(crate) mod context_overflow {
     pub const WORKER: &str =
         "Task context too large. The plan may need smaller, more focused tasks.";
     pub const DEFAULT: &str = "Request exceeded context limits. Reduce query complexity.";
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_section_headers_are_uppercase() {
-        assert!(
-            sections::PRIOR_WORK
-                .chars()
-                .all(|c| c.is_uppercase() || c.is_whitespace())
-        );
-    }
-
-    #[test]
-    fn test_field_names_are_lowercase() {
-        assert!(fields::GOAL.chars().all(|c| c.is_lowercase()));
-        assert!(fields::RATIONALE.chars().all(|c| c.is_lowercase()));
-    }
 }
