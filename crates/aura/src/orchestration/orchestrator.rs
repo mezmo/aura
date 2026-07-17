@@ -63,7 +63,7 @@ use super::context::{
     PinnedGoal, PriorWorkEntry, PriorWorkFrame, TaskId, TokenBudget, WorkerClaim, WorkerRole,
 };
 use super::events::OrchestratorEvent;
-use super::persistence::{ExecutionPersistence, lock_persistence};
+use super::persistence::{ExecutionPersistence, lock_persistence, maybe_spill_result};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome, Plan,
     PlanningResponse, TaskState, TaskStatus,
@@ -2974,36 +2974,17 @@ impl Orchestrator {
         worker_name: Option<&str>,
         result: String,
     ) -> String {
-        let spill = self.bounding.result_spill();
-        if spill.threshold().allows_inline(&result) {
-            return result;
-        }
-
         let persistence = lock_persistence(&self.persistence, "write_result_artifact").await;
-        let iteration = persistence.current_iteration();
-
-        match persistence
-            .write_result_artifact(task_id, worker_name, iteration, &result)
-            .await
-        {
-            Ok(filename) => {
-                let truncated = spill.truncate_to_summary(&result);
-                format!(
-                    "{}\n\n[Full result ({} chars) saved to artifact: {}]",
-                    truncated,
-                    result.len(),
-                    filename,
-                )
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to write result artifact for task {}: {}",
-                    task_id,
-                    e
-                );
-                result
-            }
-        }
+        let spilled = maybe_spill_result(
+            &persistence,
+            self.bounding.result_spill(),
+            task_id,
+            worker_name,
+            result,
+        )
+        .await;
+        drop(persistence);
+        spilled
     }
 
     /// Build the read-only prior-work context for a worker task.
@@ -4302,6 +4283,7 @@ impl Orchestrator {
     ) {
         use super::persistence::{
             ArtifactEntry, ErrorContext, RunManifest, RunStatus, TaskSummary, ToolTraceEntry,
+            artifact_kind_from_filename,
         };
 
         let persistence = lock_persistence(&self.persistence, "write_manifest").await;
@@ -4463,40 +4445,6 @@ impl Orchestrator {
 // which creates an Orchestrator lazily inside stream() to avoid duplicate
 // MCP connections and persistence directories.
 
-/// Determine artifact kind from the filename convention.
-///
-/// Filenames ending in `-result.txt` are worker result artifacts.
-/// Filenames ending in `-output.txt` are promoted tool output artifacts;
-/// the tool name is extracted from the filename structure.
-fn artifact_kind_from_filename(filename: &str) -> super::persistence::ArtifactKind {
-    use super::persistence::ArtifactKind;
-    if filename.ends_with("-result.txt") {
-        ArtifactKind::Result
-    } else if filename.ends_with("-output.txt") {
-        // Format: task-{id}-{worker}-iter-{n}-{tool_name}-{call_idx}-output.txt
-        // Extract tool_name: split by '-', skip known prefix segments, take up to call_idx
-        let without_suffix = filename.trim_end_matches("-output.txt");
-        let parts: Vec<&str> = without_suffix.split('-').collect();
-        // Find "iter" marker position, tool_name segments follow iter-{n}
-        let tool_name = parts
-            .iter()
-            .position(|&p| p == "iter")
-            .and_then(|iter_pos| {
-                // Skip iter-{n}, take segments up to the last one (call_idx)
-                let after_iter = &parts[iter_pos + 2..];
-                if after_iter.len() > 1 {
-                    Some(after_iter[..after_iter.len() - 1].join("-"))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        ArtifactKind::ToolOutput { tool_name }
-    } else {
-        ArtifactKind::Result
-    }
-}
-
 /// Check if an error indicates a MaxDepthError from rig's ReAct loop.
 fn is_max_depth_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     let msg = error.to_string();
@@ -4536,6 +4484,7 @@ fn context_overflow_suggestion(phase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::persistence::artifact_kind_from_filename;
 
     #[test]
     fn test_is_context_overflow_error_openai_style() {

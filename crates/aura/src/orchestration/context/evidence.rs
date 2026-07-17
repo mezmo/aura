@@ -10,35 +10,9 @@
 use super::error::ContextError;
 use super::label::{CorrelationLabel, WorkerClaim, WorkerRole};
 use super::rendered::RenderedContext;
+pub use crate::orchestration::persistence::{ArtifactRef, SpilledArtifact};
 use crate::orchestration::tools::submit_result::Confidence;
 use crate::orchestration::types::FailureCategory;
-
-/// A well-formed trailing spill footer found in worker-reported text: where
-/// it starts and the artifact it points at.
-///
-/// This is the single classification point between inline and spilled
-/// evidence: [`EvidenceText::new`] rejects exactly what this parser accepts,
-/// so a result renders by one path only (R2 gate decision 5).
-struct TrailingFooter {
-    start: usize,
-    artifact: SpilledArtifact,
-}
-
-/// Parse the trailing `[Full result (N chars) saved to artifact: FILE]`
-/// footer appended by the spill path. Returns `None` unless the text ends
-/// with a well-formed footer; text that merely mentions the prefix stays
-/// classified as inline evidence.
-fn parse_trailing_footer(text: &str) -> Option<TrailingFooter> {
-    const PREFIX: &str = "[Full result (";
-    const INFIX: &str = " chars) saved to artifact: ";
-    let start = text.rfind(PREFIX)?;
-    let after_prefix = &text[start + PREFIX.len()..];
-    let (digits, rest) = after_prefix.split_once(INFIX)?;
-    let full_chars: usize = digits.parse().ok()?;
-    let filename = rest.trim_end().strip_suffix(']')?;
-    let artifact = SpilledArtifact::new(filename, full_chars).ok()?;
-    Some(TrailingFooter { start, artifact })
-}
 
 /// Format the parenthesized suffix of a per-task entry line: worker role
 /// and, for completed entries, the worker's stated confidence. Renders
@@ -82,7 +56,7 @@ impl EvidenceText {
         if text.trim().is_empty() {
             return Err(ContextError::EmptyEvidenceText);
         }
-        if parse_trailing_footer(text).is_some() {
+        if SpilledArtifact::parse_trailing(text).is_some() {
             return Err(ContextError::InlineEvidenceCarriesSpillFooter);
         }
         Ok(Self(text.to_owned()))
@@ -119,99 +93,6 @@ impl ResultPreview {
     /// The preview text.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-/// Pointer to a worker result spilled to an artifact file.
-///
-/// `Display` renders today's footer format verbatim —
-/// `[Full result (N chars) saved to artifact: FILE]` — which the
-/// architecture keeps unchanged (`ARCHITECTURE.md` sections 1.3 and 6) and
-/// which `extract_artifact_footer` keys on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpilledArtifact {
-    filename: String,
-    full_chars: usize,
-}
-
-impl SpilledArtifact {
-    /// Parse a spilled-result pointer from its artifact filename and the
-    /// full result length in characters.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::EmptyArtifactFilename`] when the filename is
-    /// empty or whitespace-only.
-    pub fn new(filename: &str, full_chars: usize) -> Result<Self, ContextError> {
-        if filename.trim().is_empty() {
-            return Err(ContextError::EmptyArtifactFilename);
-        }
-        Ok(Self {
-            filename: filename.to_owned(),
-            full_chars,
-        })
-    }
-
-    /// Parse the trailing spill footer out of worker-reported result or
-    /// error text, when a well-formed one is present. This is how render
-    /// call sites recover the pointer today's spill path appended.
-    pub fn parse_trailing(text: &str) -> Option<Self> {
-        parse_trailing_footer(text).map(|footer| footer.artifact)
-    }
-
-    /// The artifact filename, readable via `read_artifact`.
-    pub fn filename(&self) -> &str {
-        &self.filename
-    }
-}
-
-impl std::fmt::Display for SpilledArtifact {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[Full result ({} chars) saved to artifact: {}]",
-            self.full_chars, self.filename
-        )
-    }
-}
-
-/// One artifact inventory line for a completed task.
-///
-/// `Display` renders today's inventory format verbatim —
-/// `[Artifact: FILE (N bytes)]` — preserved unchanged as the coordinator's
-/// index of `read_artifact` targets (`ARCHITECTURE.md` section 1.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtifactRef {
-    filename: String,
-    bytes: u64,
-}
-
-impl ArtifactRef {
-    /// Parse an artifact inventory reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::EmptyArtifactFilename`] when the filename is
-    /// empty or whitespace-only.
-    pub fn new(filename: &str, bytes: u64) -> Result<Self, ContextError> {
-        if filename.trim().is_empty() {
-            return Err(ContextError::EmptyArtifactFilename);
-        }
-        Ok(Self {
-            filename: filename.to_owned(),
-            bytes,
-        })
-    }
-
-    /// The artifact filename, readable via `read_artifact`.
-    pub fn filename(&self) -> &str {
-        &self.filename
-    }
-}
-
-impl std::fmt::Display for ArtifactRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[Artifact: {} ({} bytes)]", self.filename, self.bytes)
     }
 }
 
@@ -288,11 +169,11 @@ impl EvidenceEntry {
         result_text: &str,
         claim: Option<WorkerClaim>,
     ) -> Result<Self, ContextError> {
-        match parse_trailing_footer(result_text) {
-            Some(footer) => {
-                let prefix = result_text[..footer.start].trim_end();
+        match SpilledArtifact::parse_trailing_with_offset(result_text) {
+            Some((start, artifact)) => {
+                let prefix = result_text[..start].trim_end();
                 if prefix.is_empty() {
-                    return Ok(Self::spilled_no_preview(footer.artifact));
+                    return Ok(Self::spilled_no_preview(artifact));
                 }
                 let stand_in = match claim {
                     Some(claim) => ArtifactStandIn::Claim(claim),
@@ -301,10 +182,7 @@ impl EvidenceEntry {
                     // exists.
                     None => ArtifactStandIn::Preview(ResultPreview::new(prefix)?),
                 };
-                Ok(Self::ArtifactPointer {
-                    stand_in,
-                    artifact: footer.artifact,
-                })
+                Ok(Self::ArtifactPointer { stand_in, artifact })
             }
             None => Ok(Self::InlineResult {
                 result: EvidenceText::new(result_text)?,
