@@ -9,15 +9,18 @@
 #   AURA_INSTALL          - Install directory (default: ~/.local/bin)
 #   AURA_COMPONENT        - Which binary: "all", "server", "cli" (default: all)
 #   AURA_REQUIRE_CHECKSUM - Fail (1) instead of warn (0) when a checksum is missing (default: 0)
+#   AURA_NO_BREW          - Skip Homebrew and download directly on macOS (default: 0)
 
 set -euo pipefail
 
 REPO="mezmo/aura"
+BREW_TAP="mezmo/tap/aura"
 VERSION="${AURA_VERSION:-latest}"
 VERSION="${VERSION#v}"
 INSTALL_DIR="${AURA_INSTALL:-${HOME}/.local/bin}"
 COMPONENT="${AURA_COMPONENT:-all}"
 REQUIRE_CHECKSUM="${AURA_REQUIRE_CHECKSUM:-0}"
+NO_BREW="${AURA_NO_BREW:-0}"
 BASE_URL="https://github.com/${REPO}/releases"
 
 case "${COMPONENT}" in
@@ -30,6 +33,12 @@ esac
 
 main() {
     detect_platform
+
+    if [[ "${OS}" == "darwin" ]] && should_use_homebrew; then
+        install_via_homebrew
+        return
+    fi
+
     detect_downloader
     resolve_version
 
@@ -65,6 +74,27 @@ main() {
         echo "Add to your PATH:"
         echo "  export PATH=\"${INSTALL_DIR}:\${PATH}\""
     fi
+}
+
+# On macOS, prefer the Homebrew tap when `brew` is available.
+should_use_homebrew() {
+    [[ "${NO_BREW}" != 1 ]] || return 1
+    command -v brew >/dev/null 2>&1 || return 1
+
+    if [[ "${VERSION}" != "latest" ]]; then
+        echo "Note: AURA_VERSION is set; Homebrew can't pin versions, downloading directly."
+        return 1
+    fi
+    if [[ "${COMPONENT}" != "all" ]]; then
+        echo "Note: AURA_COMPONENT is '${COMPONENT}'; Homebrew installs both binaries, downloading directly."
+        return 1
+    fi
+    return 0
+}
+
+install_via_homebrew() {
+    echo "Installing AURA via Homebrew (${BREW_TAP})"
+    brew install "${BREW_TAP}"
 }
 
 detect_platform() {

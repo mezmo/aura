@@ -46,6 +46,8 @@ module.exports = {
   // https://github.com/semantic-release/exec
   prepareCmd: `./scripts/set-version.sh \${nextRelease.version}`,
   verifyReleaseCmd: `echo \${nextRelease.version} > .next-release-version`,
+  // Open a PR on the Homebrew tap bumping the formulae to the released version.
+  successCmd: `make bump-homebrew-tap VERSION=\${nextRelease.version}`,
   // https://github.com/esatterwhite/semantic-release-docker
   dockerProject: 'mezmo',
   dockerImage: 'aura',

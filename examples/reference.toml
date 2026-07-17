@@ -110,6 +110,7 @@ Authorization = "Bearer {{ env.MCP_TOKEN }}"
 # provider = "openai"
 # model = "text-embedding-3-small"
 # api_key = "{{ env.OPENAI_API_KEY }}"
+# base_url = "http://localhost:8000/v1"  # optional: any OpenAI-compatible endpoint
 #
 # AWS Bedrock embeddings (uses AWS credentials, no API key needed):
 # [vector_stores.embedding_model]

@@ -70,8 +70,16 @@ impl VectorStoreManager {
     fn create_openai_embedding_model(
         api_key: &str,
         model: &str,
+        base_url: Option<&str>,
     ) -> Result<OpenAIEmbeddingModel, BuilderError> {
-        let client = Client::new(api_key).map_err(|e| {
+        let mut client_builder = Client::<reqwest::Client>::builder().api_key(api_key);
+
+        if let Some(url) = base_url {
+            info!("Using custom embedding base URL: {}", url);
+            client_builder = client_builder.base_url(url);
+        }
+
+        let client = client_builder.build().map_err(|e| {
             BuilderError::VectorStoreError(format!("Failed to create OpenAI client: {e}"))
         })?;
         Ok(client.embedding_model(model))
@@ -140,8 +148,12 @@ impl VectorStoreManager {
 
         // Validate the embedding provider can be initialized
         match embedding {
-            EmbeddingConfig::OpenAI { api_key, model, .. } => {
-                Self::create_openai_embedding_model(api_key, model)?;
+            EmbeddingConfig::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => {
+                Self::create_openai_embedding_model(api_key, model, base_url.as_deref())?;
             }
             EmbeddingConfig::Bedrock {
                 model,
@@ -214,8 +226,13 @@ impl VectorStoreManager {
 
         // Create embedding model and Qdrant store based on provider
         let qdrant_store = match embedding {
-            EmbeddingConfig::OpenAI { api_key, model, .. } => {
-                let embedding_model = Self::create_openai_embedding_model(api_key, model)?;
+            EmbeddingConfig::OpenAI {
+                api_key,
+                model,
+                base_url,
+            } => {
+                let embedding_model =
+                    Self::create_openai_embedding_model(api_key, model, base_url.as_deref())?;
                 let store = QdrantVectorStore::new(qdrant_client, embedding_model, query_params);
                 QdrantStoreKind::OpenAI(store)
             }
