@@ -645,6 +645,7 @@ pub fn run_repl(
     let startup_agent = rt.block_on(backend.startup_agent_overview());
     if let Some(agent) = startup_agent {
         crate::ui::agent_overview::print_agent_overview(&agent);
+        crate::ui::agent_overview::print_startup_cta(&agent);
     }
     setup_terminal();
 

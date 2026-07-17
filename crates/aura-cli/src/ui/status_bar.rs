@@ -233,7 +233,7 @@ pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
         let remaining_pct = ((ceiling - total) as f64 / ceiling as f64 * 100.0).round() as u64;
         format!("Context left: {remaining_pct}%")
     } else {
-        "Aura, by Mezmo!".to_string()
+        "AURA, by Mezmo!".to_string()
     };
     set_status_bar(set_status_with_right_text(&left, &right));
 }
@@ -262,7 +262,7 @@ fn refresh_status_bar_from_counters() {
         let remaining_pct = ((ceiling - total) as f64 / ceiling as f64 * 100.0).round() as u64;
         format!("Context left: {remaining_pct}%")
     } else {
-        "Aura, by Mezmo!".to_string()
+        "AURA, by Mezmo!".to_string()
     };
     set_status_bar(set_status_with_right_text(&left, &right));
 }
@@ -284,7 +284,7 @@ pub(crate) fn rebuild_status_bar() {
         .map(|g| *g)
         .unwrap_or(0);
     if prompt == 0 && completion == 0 && intercepted == 0 {
-        set_status_bar(set_status_with_right_text("", "Aura, by Mezmo!"));
+        set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
     } else {
         refresh_status_bar_from_counters();
     }
@@ -352,7 +352,7 @@ pub fn seed_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
     }
     let total = prompt_tokens + completion_tokens;
     let left = build_status_left(prompt_tokens, completion_tokens, total);
-    set_status_bar(set_status_with_right_text(&left, "Aura, by Mezmo!"));
+    set_status_bar(set_status_with_right_text(&left, "AURA, by Mezmo!"));
 }
 
 /// Reset cumulative token counters to zero.
@@ -369,7 +369,7 @@ pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_EXTRACTED.lock() {
         *g = 0;
     }
-    set_status_bar(set_status_with_right_text("", "Aura, by Mezmo!"));
+    set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
 }
 
 // ---------------------------------------------------------------------------

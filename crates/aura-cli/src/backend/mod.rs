@@ -179,7 +179,8 @@ pub(crate) fn select_agent(
 mod tests {
     use super::*;
     use crate::test_fixtures::{agent, worker};
-    use aura_events::{AgentInfo, ServerInfo};
+    use aura_events::{AgentInfo, McpServerOverview, ServerInfo};
+    use std::collections::BTreeMap;
 
     fn server_info(agents: Vec<AgentInfo>, default_agent: Option<&str>) -> ServerInfo {
         ServerInfo {
@@ -235,16 +236,37 @@ mod tests {
 
     #[test]
     fn select_agent_passes_agent_info_through_whole() {
-        let info = server_info(
-            vec![
-                agent("solo", vec![]),
-                agent("orch", vec![worker("planner"), worker("writer")]),
-            ],
-            None,
+        let mut orch = agent("orch", vec![worker("planner"), worker("writer")]);
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "logs".to_string(),
+            McpServerOverview::Sse {
+                url: "https://logs.example.com/sse".to_string(),
+                description: None,
+            },
         );
+        orch.mcp_servers = Some(servers.clone());
+        let info = server_info(vec![agent("solo", vec![]), orch], None);
         let agent = select_agent(info, Some("orch")).expect("orch should be selected");
         let names: Vec<_> = agent.workers.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(names, ["planner", "writer"]);
         assert_eq!(agent.model, "gpt-4o");
+        assert_eq!(agent.mcp_servers, Some(servers));
+    }
+
+    #[test]
+    fn select_agent_accepts_old_server_payload_without_mcp_presence() {
+        let info: ServerInfo = serde_json::from_value(serde_json::json!({
+            "default_agent": "orch",
+            "agents": [{
+                "id": "orch",
+                "model": "gpt-4o",
+                "workers": []
+            }]
+        }))
+        .unwrap();
+        let agent = select_agent(info, None).expect("old server agent should remain selectable");
+
+        assert_eq!(agent.mcp_servers, None);
     }
 }

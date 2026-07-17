@@ -52,8 +52,9 @@ TOOL_RESULT_MODE=aura AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
 ## Server Info Endpoint
 
 `GET /aura/info` is an aura-native introspection endpoint. It returns the
-default agent and per-agent orchestration worker metadata. This endpoint is not
-OpenAI-compatible; it lives under `/aura/` to keep `/v1/models` clean.
+default agent and, per agent, its orchestration workers and configured MCP
+servers. This endpoint is not OpenAI-compatible; it lives under `/aura/` to keep
+`/v1/models` clean.
 
 The CLI uses this at boot to display orchestration workers before the first
 prompt in HTTP mode.
@@ -72,11 +73,20 @@ curl http://localhost:8080/aura/info | jq
       "workers": [
         { "name": "planner", "description": "Plans work" },
         { "name": "writer", "description": "Writes summaries", "model": "gpt-4o-mini" }
-      ]
+      ],
+      "mcp_servers": {
+        "logs": {
+          "transport": "http_streamable",
+          "url": "https://logs.example.com",
+          "description": "Search logs."
+        },
+        "fs": { "transport": "stdio", "command": "fs-server" }
+      }
     },
     {
       "id": "solo",
-      "model": "gpt-4o"
+      "model": "gpt-4o",
+      "mcp_servers": {}
     }
   ]
 }
@@ -86,6 +96,18 @@ Each agent's `id` matches the `id` field in `/v1/models` (alias if set,
 otherwise agent name). The `workers` array is omitted for non-orchestration
 agents. Each worker's `model` is included only when it overrides the
 coordinator model.
+
+`mcp_servers` is a credential-free view of the agent's configured MCP servers,
+keyed by name and tagged by `transport` (`stdio`, `http_streamable`, or `sse`).
+URLs are reduced to their origin (`scheme://host:port`) — path, query,
+fragment, and userinfo are all dropped, since any of them can carry a token. A
+stdio server shows only the executable basename as `command`; its arguments
+and environment are never included, and neither are `headers` or
+`headers_from_request`. A URL that cannot be reduced to an origin appears as
+the sentinel `<invalid url>`, and a command with no extractable file name as
+`<unknown>`. An empty object means no configured MCP servers, while
+a populated one lists them. Older servers omit the field entirely, and the CLI
+then uses its generic startup call-to-action.
 
 ## Custom AURA Events (Optional)
 
