@@ -209,6 +209,9 @@ impl ExecutionPersistence {
         )
     )]
     pub async fn drain(&self, timeout: Duration) -> bool {
+        // Yield once so any task that was just spawned has a chance to run and
+        // increment the in-flight counter before we check it. This closes the
+        // TOCTOU window between `tokio::spawn` and `fetch_add`.
         tokio::task::yield_now().await;
 
         if self.in_flight.load(Ordering::Acquire) == 0 {
@@ -676,4 +679,67 @@ pub async fn lock_persistence<'a>(
 ) -> MutexGuard<'a, ExecutionPersistence> {
     let span = tracing::info_span!("persistence_lock", operation);
     async { mutex.lock().await }.instrument(span).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration::events::RoutingMode;
+    use crate::orchestration::persistence::{RunStatus, TaskStatus, TaskSummary};
+    use tempfile::TempDir;
+
+    fn make_test_manifest(run_id: &str, timestamp: &str, goal: &str) -> RunManifest {
+        RunManifest {
+            run_id: run_id.to_string(),
+            session_id: Some("cs_test".to_string()),
+            timestamp: timestamp.to_string(),
+            goal: goal.to_string(),
+            status: RunStatus::Success,
+            iterations: 1,
+            routing_mode: Some(RoutingMode::Routed),
+            outcome: None,
+            response_summary: None,
+            task_summaries: vec![TaskSummary {
+                task_id: 0,
+                description: "Compute mean".to_string(),
+                status: TaskStatus::Complete,
+                worker: Some("statistics".to_string()),
+                result_preview: Some("Result: 20".to_string()),
+                confidence: None,
+                failure_category: None,
+                error: None,
+                error_context: None,
+                tool_trace: vec![],
+                artifacts: vec![],
+            }],
+            artifact_paths: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let manifest = make_test_manifest("run-1", "2026-03-20T01:00:00Z", "Test goal");
+        let path = persistence.write_manifest(&manifest).await.unwrap();
+
+        assert_eq!(path, persistence.run_path().join("manifest.json"));
+        assert!(path.exists());
+
+        let content = fs::read_to_string(&path).await.unwrap();
+        let deserialized: RunManifest = serde_json::from_str(&content).unwrap();
+        assert_eq!(deserialized.run_id, "run-1");
+        assert_eq!(deserialized.goal, "Test goal");
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest_disabled() {
+        let persistence = ExecutionPersistence::disabled();
+        let manifest = make_test_manifest("run-1", "2026-03-20T01:00:00Z", "Test goal");
+        let path = persistence.write_manifest(&manifest).await.unwrap();
+        assert!(path.as_os_str().is_empty());
+    }
 }

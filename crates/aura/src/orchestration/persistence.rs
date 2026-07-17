@@ -1463,6 +1463,31 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_serde_roundtrip() {
+        let manifest = make_test_manifest("run-1", "2026-03-20T01:00:00Z", "Roundtrip goal");
+        let json = serde_json::to_string(&manifest).unwrap();
+        let deserialized: RunManifest = serde_json::from_str(&json).unwrap();
+        let roundtrip_json = serde_json::to_string(&deserialized).unwrap();
+        assert_eq!(json, roundtrip_json);
+    }
+
+    #[test]
+    fn test_run_status_serde() {
+        assert_eq!(
+            serde_json::to_string(&RunStatus::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RunStatus::PartialSuccess).unwrap(),
+            "\"partial_success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RunStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
+
+    #[test]
     fn test_tool_outcome_serde() {
         let success = ToolOutcome::Success { output_bytes: 1234 };
         let json = serde_json::to_string(&success).unwrap();

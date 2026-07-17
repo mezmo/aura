@@ -16,6 +16,7 @@ fn parse_trailing_footer(text: &str) -> Option<TrailingFooter> {
     Some(TrailingFooter { start, artifact })
 }
 
+/// The single classification point between inline and spilled evidence.
 struct TrailingFooter {
     start: usize,
     artifact: SpilledArtifact,
@@ -31,6 +32,11 @@ pub struct SpilledArtifact {
 impl SpilledArtifact {
     /// Parse a spilled-result pointer from its artifact filename and the
     /// full result length in characters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EmptyArtifactFilename`] when `filename` is
+    /// empty or only whitespace.
     pub fn new(filename: &str, full_chars: usize) -> Result<Self, ContextError> {
         if filename.trim().is_empty() {
             return Err(ContextError::EmptyArtifactFilename);
@@ -84,6 +90,11 @@ pub struct ArtifactRef {
 
 impl ArtifactRef {
     /// Parse an artifact inventory reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EmptyArtifactFilename`] when `filename` is
+    /// empty or only whitespace.
     pub fn new(filename: &str, bytes: u64) -> Result<Self, ContextError> {
         if filename.trim().is_empty() {
             return Err(ContextError::EmptyArtifactFilename);
@@ -126,10 +137,9 @@ pub async fn maybe_spill_result(
     {
         Ok(filename) => {
             let truncated = spill.truncate_to_summary(&result);
-            match SpilledArtifact::new(&filename, result.len()) {
-                Ok(pointer) => pointer.render_with_prefix(&truncated.to_string()),
-                Err(_) => result,
-            }
+            SpilledArtifact::new(&filename, result.len())
+                .expect("filename guaranteed non-empty by write_result_artifact")
+                .render_with_prefix(&truncated.to_string())
         }
         Err(e) => {
             tracing::warn!(

@@ -2974,15 +2974,13 @@ impl Orchestrator {
         worker_name: Option<&str>,
         result: String,
     ) -> String {
+        let spill = self.bounding.result_spill();
+        if spill.threshold().allows_inline(&result) {
+            return result;
+        }
+
         let persistence = lock_persistence(&self.persistence, "write_result_artifact").await;
-        let spilled = maybe_spill_result(
-            &persistence,
-            self.bounding.result_spill(),
-            task_id,
-            worker_name,
-            result,
-        )
-        .await;
+        let spilled = maybe_spill_result(&persistence, spill, task_id, worker_name, result).await;
         drop(persistence);
         spilled
     }

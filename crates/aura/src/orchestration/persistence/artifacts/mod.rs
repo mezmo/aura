@@ -1,9 +1,8 @@
-//! Artifact owner module: storage, spill trigger, pointer render, and read tool.
+//! Artifact storage, spill trigger, pointer render, and the read tool for the
+//! orchestration coordinator.
 //!
-//! This module consolidates the four artifact concerns that were previously split
-//! across `persistence.rs`, `orchestrator.rs`, `context/evidence.rs`, and
-//! `tools/read_artifact.rs`. The public facade is re-exported from the parent
-//! `persistence` module so existing import paths remain unchanged.
+//! The public facade is re-exported from the parent `persistence` module so
+//! existing import paths remain unchanged.
 
 pub mod read_tool;
 mod spill;
