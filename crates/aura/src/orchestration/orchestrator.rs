@@ -1066,7 +1066,7 @@ impl Orchestrator {
 
     /// Stream a coordinator call with early exit and optional reasoning forwarding.
     ///
-    /// Replaces `chat_with_timeout` for one-shot tool phases (planning, continuation routing).
+    /// For one-shot tool phases (planning, continuation routing).
     /// Workers MUST NOT use this — they need the full ReAct loop for MCP tool chains.
     ///
     /// Key behaviors:
@@ -1220,7 +1220,7 @@ impl Orchestrator {
             Ok(CompletionResponse { content, usage })
         };
 
-        // Timeout wrapping (preserves chat_with_timeout behavior)
+        // Timeout wrapping
         if timeout_secs == 0 {
             stream_future.await
         } else {
