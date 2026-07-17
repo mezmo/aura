@@ -151,7 +151,7 @@ fn adjust_frame_for_line_change(old_lines: u16, new_lines: u16, old_cursor_row: 
 
 /// Set up the terminal.
 pub fn setup_terminal() {
-    set_status_bar(set_status_with_right_text("", "Aura, by Mezmo!"));
+    set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
     let (w, _) = term_size();
     LAST_TERM_WIDTH.store(w, Ordering::Relaxed);
     println!();

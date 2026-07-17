@@ -18,6 +18,7 @@ pub mod event_names;
 pub mod orchestration;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // When the `rmcp-types` feature is enabled, use rmcp's ProgressToken directly
 // for zero-cost interop with the aura crate. Otherwise, define a compatible
@@ -175,6 +176,30 @@ pub struct WorkerOverview {
     pub model: Option<String>,
 }
 
+/// Credential-free view of one configured MCP server for `GET /aura/info`,
+/// tagged by `transport` to mirror the `[mcp.servers.<name>]` config.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum McpServerOverview {
+    Stdio {
+        /// Executable basename only — never the full command line.
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    HttpStreamable {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    Sse {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+}
+
 /// One agent entry in the `GET /aura/info` response.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentInfo {
@@ -184,6 +209,9 @@ pub struct AgentInfo {
     pub model: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workers: Vec<WorkerOverview>,
+    /// Configured MCP servers keyed by name — the config view, no connection state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<BTreeMap<String, McpServerOverview>>,
 }
 
 /// Response body for `GET /aura/info`.
@@ -574,6 +602,73 @@ impl AuraStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_info_mcp_servers_backward_compatible() {
+        // An older server omits the field entirely → None, and None serializes
+        // back to an absent field (never `"mcp_servers": null`).
+        let old: ServerInfo = serde_json::from_value(serde_json::json!({
+            "default_agent": "orch",
+            "agents": [{
+                "id": "orch",
+                "model": "gpt-4o"
+            }]
+        }))
+        .unwrap();
+        let unknown = &old.agents[0];
+        assert_eq!(unknown.mcp_servers, None);
+        assert!(serde_json::to_value(unknown)
+            .unwrap()
+            .get("mcp_servers")
+            .is_none());
+
+        // A populated config view round-trips through the standard keyed-map
+        // shape; `description` is omitted when absent.
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "logs".to_string(),
+            McpServerOverview::HttpStreamable {
+                url: "https://logs.example.com/mcp".to_string(),
+                description: Some("Search logs.".to_string()),
+            },
+        );
+        servers.insert(
+            "fs".to_string(),
+            McpServerOverview::Stdio {
+                command: "fs-server".to_string(),
+                description: None,
+            },
+        );
+        let mut known = unknown.clone();
+        known.mcp_servers = Some(servers);
+
+        let json = serde_json::to_value(&known).unwrap();
+        assert_eq!(
+            json["mcp_servers"]["logs"],
+            serde_json::json!({
+                "transport": "http_streamable",
+                "url": "https://logs.example.com/mcp",
+                "description": "Search logs."
+            })
+        );
+        assert_eq!(
+            json["mcp_servers"]["fs"],
+            serde_json::json!({
+                "transport": "stdio",
+                "command": "fs-server"
+            })
+        );
+        assert_eq!(serde_json::from_value::<AgentInfo>(json).unwrap(), known);
+
+        // An empty map is distinct from omission on the wire: it serializes as
+        // `{}` (known-zero), not an absent field (unknown).
+        let mut empty = unknown.clone();
+        empty.mcp_servers = Some(BTreeMap::new());
+        assert_eq!(
+            serde_json::to_value(&empty).unwrap()["mcp_servers"],
+            serde_json::json!({})
+        );
+    }
 
     #[test]
     fn tool_complete_roundtrip() {

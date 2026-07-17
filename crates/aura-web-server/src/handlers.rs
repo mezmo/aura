@@ -1682,6 +1682,64 @@ model = "gpt-4o-mini"
         assert_eq!(agent.workers[0].model, None);
         assert_eq!(agent.workers[1].name, "writer");
         assert_eq!(agent.workers[1].model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(agent.mcp_servers, Some(std::collections::BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn test_info_reports_configured_mcp_servers() {
+        let state = make_info_state(
+            vec![
+                solo_info_config("no-mcp"),
+                info_config(
+                    "empty-mcp",
+                    "",
+                    r#"
+[mcp]
+servers = {}
+"#,
+                ),
+                info_config(
+                    "dead-mcp",
+                    "",
+                    r#"
+[mcp.servers.dead]
+transport = "http_streamable"
+url = "http://127.0.0.1:9"
+"#,
+                ),
+            ],
+            None,
+        );
+        let info = parse_info_response(info(State(state)).await).await;
+        let servers_of = |id: &str| {
+            info.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .unwrap_or_else(|| panic!("agent {id} present"))
+                .mcp_servers
+                .clone()
+        };
+
+        // Absent `[mcp]` and an empty server map both project to a known-empty
+        // map (`Some`), never `None`.
+        assert_eq!(
+            servers_of("no-mcp"),
+            Some(std::collections::BTreeMap::new())
+        );
+        assert_eq!(
+            servers_of("empty-mcp"),
+            Some(std::collections::BTreeMap::new())
+        );
+
+        // A configured server appears in the keyed config view, credential-free.
+        let dead = servers_of("dead-mcp").expect("a current server projects Some");
+        assert_eq!(
+            dead["dead"],
+            aura_events::McpServerOverview::HttpStreamable {
+                url: "http://127.0.0.1:9".to_string(),
+                description: None,
+            }
+        );
     }
 
     #[tokio::test]

@@ -626,6 +626,10 @@ preamble = "p"
             agent.as_ref().map(|agent| agent.model.as_str()),
             Some("gpt-4o")
         );
+        assert_eq!(
+            agent.as_ref().and_then(|agent| agent.mcp_servers.as_ref()),
+            Some(&std::collections::BTreeMap::new())
+        );
         assert_eq!(agent_worker_names(agent), vec!["planner"]);
     }
 
