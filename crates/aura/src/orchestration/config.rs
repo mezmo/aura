@@ -282,6 +282,7 @@ mod tests {
                 embedding_model: EmbeddingConfig::OpenAI {
                     api_key: "test".to_string(),
                     model: "text-embedding-3-small".to_string(),
+                    base_url: None,
                 },
                 url: "http://localhost:6334".to_string(),
                 collection_name: "mezmo_docs".to_string(),
@@ -304,6 +305,7 @@ mod tests {
                 embedding_model: EmbeddingConfig::OpenAI {
                     api_key: "test".to_string(),
                     model: "test".to_string(),
+                    base_url: None,
                 },
                 url: "http://localhost:6334".to_string(),
                 collection_name: "test_kb".to_string(),

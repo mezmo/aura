@@ -115,9 +115,14 @@ budget_tokens = 8000
         let vector_store = &config.vector_stores[0];
         match &vector_store.store {
             crate::config::VectorStoreType::InMemory { embedding_model } => match embedding_model {
-                crate::config::EmbeddingConfig::OpenAI { api_key, model } => {
+                crate::config::EmbeddingConfig::OpenAI {
+                    api_key,
+                    model,
+                    base_url,
+                } => {
                     assert_eq!(model, "text-embedding-3-small");
                     assert_eq!(api_key, "test_embedding_key");
+                    assert_eq!(base_url, &None);
                 }
                 _ => panic!("Expected OpenAI embedding config"),
             },
@@ -442,6 +447,41 @@ model = "gpt-4"
         unsafe {
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("TEST_API_KEY");
+        }
+    }
+
+    #[test]
+    fn test_embedding_config_custom_base_url() {
+        let config_str = r#"
+[[vector_stores]]
+name = "default"
+type = "in_memory"
+
+[vector_stores.embedding_model]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key = "test_embedding_key"
+base_url = "http://localhost:8000/v1"
+
+[agent]
+name = "Test Assistant"
+system_prompt = "You are a test assistant."
+
+[agent.llm]
+provider = "openai"
+api_key = "test_openai_key"
+model = "gpt-4o-mini"
+"#;
+
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        match &config.vector_stores[0].store {
+            crate::config::VectorStoreType::InMemory { embedding_model } => match embedding_model {
+                crate::config::EmbeddingConfig::OpenAI { base_url, .. } => {
+                    assert_eq!(base_url, &Some("http://localhost:8000/v1".to_string()));
+                }
+                _ => panic!("Expected OpenAI embedding config"),
+            },
+            _ => panic!("Expected InMemory vector store"),
         }
     }
 

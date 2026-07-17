@@ -625,6 +625,9 @@ pub enum EmbeddingConfig {
     OpenAI {
         api_key: String,
         model: String,
+        /// Custom API endpoint for OpenAI-compatible embedding servers
+        #[serde(default)]
+        base_url: Option<String>,
     },
     Bedrock {
         model: String,
@@ -640,6 +643,7 @@ impl Default for EmbeddingConfig {
         EmbeddingConfig::OpenAI {
             api_key: String::new(),
             model: "text-embedding-3-small".to_string(),
+            base_url: None,
         }
     }
 }
