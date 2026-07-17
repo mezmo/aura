@@ -58,6 +58,8 @@ The script downloads pre-built binaries for your platform, verifies checksums wh
 
 On macOS, the script installs through Homebrew when the `brew` command is available, running `brew install mezmo/tap/aura` from Mezmo's tap. If Homebrew isn't installed, or you set `AURA_NO_BREW=1`, the script downloads the release binaries directly instead. The Homebrew formula always installs the latest version of both binaries, so requesting a specific `AURA_VERSION` or a single `AURA_COMPONENT` also falls back to a direct download. When it does, the script prints a short note explaining why. Linux always uses the direct download.
 
+Because the Homebrew path hands off to `brew`, it installs to Homebrew's own prefix and doesn't honor `AURA_INSTALL` or the checksum options. Set `AURA_NO_BREW=1` if you need those on macOS.
+
 You can customize the install with environment variables:
 
 | Variable | Default | Description |
