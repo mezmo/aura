@@ -374,6 +374,34 @@ cargo run -p aura-web-server -- --config your-config.toml
 cargo run -p aura-cli -- --config your-config.toml
 ```
 
+### Session Store (Durable and Multi-Pod Deployments)
+
+By default, cross-request session state (A2A tasks, parked HITL approvals) lives in
+process memory — correct for a single pod, the CLI, and local dev. Behind a load
+balancer with multiple replicas, configure a shared Redis/Valkey backend so A2A
+`message:send` → poll → `list` → history-by-context work no matter which pod serves
+each request.
+
+The session store is deployment infrastructure — one instance per server, not
+per-agent — so it is configured **only via environment variables**, never in agent
+TOML files:
+
+```bash
+export AURA_SESSION_STORE=redis                          # memory (default) | redis
+export AURA_SESSION_STORE_URL=redis://valkey:6379        # redis:// or rediss:// (Valkey compatible)
+export AURA_SESSION_STORE_PREFIX=aura:prod               # optional namespace (default "aura")
+export AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS=5         # optional
+export AURA_SESSION_STORE_TASK_TTL_SECS=86400            # optional; 0 = no expiry
+```
+
+The server pings the backend at startup and fails fast if it is unreachable;
+`/health` reports the backend and its ping latency.
+
+The Redis backend requires building with the `session-store-redis` cargo feature
+(`cargo build --release --features aura-web-server/session-store-redis`). The in-memory
+backend is always available. Conversational HITL approvals and A2A streaming/cancel are
+not yet cross-pod (see `docs/design/session-storage.md` for the roadmap).
+
 ### Orchestration
 
 Enable orchestration mode in config:

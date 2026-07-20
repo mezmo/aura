@@ -11,6 +11,7 @@
 mod memory;
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,13 +21,25 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
 
-/// A fault in the backing session-store/bus backend (connection, protocol,
-/// serialization at the backend boundary).
+/// A fault in the backing session-store/bus backend.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionStoreError {
-    #[error("session store backend error: {0}")]
-    Backend(String),
+    /// The configured backend is not compiled into this binary.
+    #[error("session store backend '{backend}' requires the '{feature}' cargo feature")]
+    BackendUnavailable { backend: String, feature: String },
+    /// The backend connection URL failed to parse.
+    #[error("invalid session store url: {reason}")]
+    InvalidUrl { reason: String },
+    /// Establishing the backend connection failed.
+    #[error("session store connection failed: {reason}")]
+    Connect { reason: String },
+    /// The backend connection was not established in time.
+    #[error("timed out connecting to the session store after {}s", .timeout.as_secs())]
+    ConnectTimeout { timeout: Duration },
+    /// A request to an established backend failed.
+    #[error("session store request failed: {reason}")]
+    Request { reason: String },
 }
 
 /// Durable storage for parked conversational HITL approvals, over the

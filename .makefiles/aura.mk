@@ -239,3 +239,26 @@ test-integration-scratchpad-local: $(REPORT_DIR) ## Start local scratchpad infra
 	test_exit=$$?; \
 	$(MAKE) test-integration-scratchpad-local-down; \
 	exit $$test_exit
+
+# --- Session-store integration tests (needs only a Redis/Valkey; no aura infra) ---
+
+VALKEY_TEST_IMAGE ?= valkey/valkey:8
+VALKEY_TEST_PORT ?= 16379
+VALKEY_TEST_NAME ?= aura-session-store-test-valkey
+
+.PHONY:test-integration-session-store-local
+test-integration-session-store-local: $(REPORT_DIR) ## Start an ephemeral Valkey, run session-store integration tests, then cleanup
+	@echo "Starting ephemeral Valkey for session-store testing..."
+	docker run --rm -d --name $(VALKEY_TEST_NAME) -p $(VALKEY_TEST_PORT):6379 $(VALKEY_TEST_IMAGE)
+	@timeout=30; until docker exec $(VALKEY_TEST_NAME) valkey-cli ping >/dev/null 2>&1; do \
+		timeout=$$((timeout - 1)); \
+		if [ $$timeout -le 0 ]; then echo "❌ Timeout waiting for Valkey"; docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1; exit 1; fi; \
+		sleep 1; \
+	done
+	@echo "✅ Valkey is ready; running session-store integration tests..."
+	@trap 'docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1; exit 130' INT TERM; \
+	AURA_TEST_REDIS_URL=redis://127.0.0.1:$(VALKEY_TEST_PORT) \
+	cargo test --package aura-web-server --features integration-session-store --test redis_session_store_test --no-fail-fast; \
+	test_exit=$$?; \
+	docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1 || true; \
+	exit $$test_exit

@@ -7,18 +7,26 @@ default, one shipped networked backend, store plus event bus as distinct
 capabilities). This note carries the trait method sets, the backend key/topic
 schema, the config and wire formats, the wiring changes, and the phased rollout.
 
-**Status:** living design note, current as of 2026-07-13. The ADR holds the
+**Status:** living design note, current as of 2026-07-14. The ADR holds the
 durable decision. **Phase 1 of §11 (traits + in-memory refactor) is implemented:**
 `aura::session_store` defines `ApprovalStore` and `EventBus` with in-memory impls,
 `PendingApprovals` rides on them (wake handles stay local, decisions travel over the
 bus), and the web server's `SessionStore` factory
-(`crates/aura-web-server/src/session_store.rs`) composes them with the upstream A2A
+(`crates/aura-web-server/src/session_store/`) composes them with the upstream A2A
 `TaskStore`. The factory lives in the web-server crate rather than `aura` because
 `a2a_server::TaskStore` is a web-server-only dependency; the capability traits stay
-in `aura` so CLI standalone needs no A2A dependency. The Redis/Valkey backend
-(phases 2–4), the `[session_store]` config surface (§8), `ParkedApproval` serde
-derives, and Helm wiring (§10) are not built yet. References to existing aura code
-(file:line, module paths) are where-to-look pointers and move as the code does.
+in `aura` so CLI standalone needs no A2A dependency. **Phase 2 (Redis/Valkey A2A
+task store) is implemented:** the env-only config surface (§8, `AURA_SESSION_STORE*`
+variables — agent TOML has no session-store table), the `session-store-redis` cargo
+feature, and
+`RedisSessionStore`/`RedisTaskStore`
+(`crates/aura-web-server/src/session_store/redis.rs`) over the §7 key schema, with
+`/health` reporting the backend and its ping. With `backend = "redis"`, A2A
+send/poll/list/history are cross-pod; HITL approvals and the event bus stay
+process-local until phase 3, and A2A streaming/cancel stay pod-anchored until
+phase 4. `ParkedApproval` serde derives (phase 3) and Helm wiring (§10, phase 5)
+are not built yet. References to existing aura code (file:line, module paths) are
+where-to-look pointers and move as the code does.
 
 **Goal of iteration 1:** make the state AURA _already has_ work across pods, so a
 load-balanced multi-replica deployment (Helm prod runs 3–10 replicas, no session
@@ -337,24 +345,31 @@ both the store and the bus.
 
 ### Key schema (iteration 1)
 
-| Key / channel                    | Type                           | Purpose                                | TTL                      |
-| -------------------------------- | ------------------------------ | -------------------------------------- | ------------------------ |
-| `aura:approval:{decision_id}`    | string (JSON `ParkedApproval`) | parked approval record                 | `expires_at`             |
-| `aura:approval:req:{request_id}` | set of `decision_id`           | `cancel_request` fan-out               | slightly > route timeout |
-| `approval:{decision_id}`         | pub/sub channel                | wake the parking pod with the decision | —                        |
-| `aura:a2a:task:{task_id}`        | string (JSON `Task`)           | A2A task record                        | configurable (e.g. 24h)  |
-| `aura:a2a:ctx:{context_id}`      | list/zset of `task_id`         | history + `list` by context            | same as task             |
-| `a2a:task:{task_id}`             | pub/sub channel                | streaming fan-out to subscribers       | —                        |
-| `a2a:cancel:{task_id}`           | pub/sub channel                | route `cancel` to the pod running it   | —                        |
+| Key / channel                    | Type                             | Purpose                                     | TTL                      |
+| -------------------------------- | -------------------------------- | ------------------------------------------- | ------------------------ |
+| `aura:approval:{decision_id}`    | string (JSON `ParkedApproval`)   | parked approval record                      | `expires_at`             |
+| `aura:approval:req:{request_id}` | set of `decision_id`             | `cancel_request` fan-out                    | slightly > route timeout |
+| `approval:{decision_id}`         | pub/sub channel                  | wake the parking pod with the decision      | —                        |
+| `aura:a2a:task:{task_id}`        | hash (`version`, `task` as JSON) | A2A task record + version counter           | configurable (e.g. 24h)  |
+| `aura:a2a:ctx:{context_id}`      | set of `task_id`                 | history + `list` by context                 | same as task             |
+| `aura:a2a:tasks`                 | set of `task_id`                 | `list` without a `context_id` filter        | same as task             |
+| `a2a:task:{task_id}`             | pub/sub channel                  | streaming fan-out to subscribers            | —                        |
+| `a2a:cancel:{task_id}`           | pub/sub channel                  | route `cancel` to the pod running it        | —                        |
 
 Notes:
 
 - `resolve` is a Lua script / `MULTI` so "read-and-delete + record decision" is atomic and
   at-most-once, matching today's `remove`-on-resolve.
+- Task create/update atomicity (exists-check + `version` bump + record write) is a Lua
+  script over the single task hash. The index sets are refreshed after the task write —
+  not atomically with it — and every write refreshes both indexes, so a missed index
+  entry self-heals on the next update; `list` lazily prunes indexed ids whose task hash
+  expired first. Scripts touch one key, so the layout is single-instance/sentinel
+  friendly; Redis Cluster would need hash-tagged keys and is out of scope.
 - All keys are namespaced under `aura:` and should carry a deployment/tenant prefix
   (config, §8) so multiple AURA deployments can share a cluster.
-- Use `SET ... EX` for TTL; no background sweeper needed. The parking pod's `await` remains
-  the authoritative timeout.
+- Records carry a plain `EXPIRE`-style TTL; no background sweeper needed. The parking
+  pod's `await` remains the authoritative timeout.
 
 ### In-memory default impl
 
@@ -371,35 +386,29 @@ regression guard for the refactor.
 
 ## 8. Configuration surface
 
-Default is in-memory (no new infra). Enable a shared backend explicitly.
+Default is in-memory (no new infra). Enable a shared backend explicitly — **via
+environment variables only**. There is deliberately no TOML surface: TOML configs are
+per-agent (the server loads N of them), while the session store is deployment
+infrastructure with exactly one instance per server, so a TOML surface would
+ambiguously imply one store per agent config.
 
-```toml
-# Optional. Absent → in-memory (single-pod behavior, today's default).
-[session_store]
-backend = "redis"                     # "memory" (default) | "redis"
-url = "{{ env.AURA_SESSION_STORE_URL }}"   # redis:// or rediss:// (Valkey compatible)
-key_prefix = "aura:prod"              # namespace; lets deployments share a cluster
-connect_timeout_secs = 5
-# TTLs
-approval_ttl_secs = 0                 # 0 → derive from each approval's expires_at
-task_ttl_secs = 86400
-```
+| Env var                                   | Meaning                                                          |
+| ----------------------------------------- | ---------------------------------------------------------------- |
+| `AURA_SESSION_STORE`                      | `memory` (default) or `redis`                                    |
+| `AURA_SESSION_STORE_URL`                  | `redis://…` / `rediss://…` (Valkey ok)                           |
+| `AURA_SESSION_STORE_PREFIX`               | key namespace; lets deployments share a cluster (default `aura`) |
+| `AURA_SESSION_STORE_CONNECT_TIMEOUT_SECS` | backend connection timeout (default 5)                           |
+| `AURA_SESSION_STORE_TASK_TTL_SECS`        | A2A task record TTL, `0` → no expiry (default 86400)             |
 
-Env-var equivalents for the 12-factor / Helm path (mirrors existing AURA env conventions):
-
-| Env var                     | Meaning                                |
-| --------------------------- | -------------------------------------- |
-| `AURA_SESSION_STORE`        | `memory` (default) or `redis`          |
-| `AURA_SESSION_STORE_URL`    | `redis://…` / `rediss://…` (Valkey ok) |
-| `AURA_SESSION_STORE_PREFIX` | key namespace                          |
+An approval-TTL env var lands with phase 3 (`0` → derive from each approval's
+`expires_at`).
 
 Cargo feature flags keep the default build free of the Redis client:
 
 ```toml
-# aura-web-server / aura
+# aura-web-server
 [features]
-default = []
-session-store-redis = ["dep:fred"]    # or redis-rs
+session-store-redis = ["dep:redis"]   # redis-rs; talks to Redis and Valkey
 ```
 
 Build with `--features session-store-redis` for the shipped image; the trait and the
@@ -449,8 +458,9 @@ behind `PendingApprovals` gains the store/bus handles.
    (2026-07-13).** Introduce `SessionStore`, `ApprovalStore`, `EventBus`; move today's
    structures behind them; A2A already has `TaskStore`. Ship with `backend = memory`.
    This is a pure refactor — existing tests are the guard.
-2. **Redis/Valkey backend — A2A task store.** Smallest, highest-value cross-pod win
-   (`message:send` + poll works across pods). No bus needed for the poll path.
+2. **Redis/Valkey backend — A2A task store.** ✅ **Implemented (2026-07-14).**
+   Smallest, highest-value cross-pod win (`message:send` + poll works across pods).
+   No bus needed for the poll path.
 3. **Redis/Valkey backend — HITL approvals (store + wake bus).** Cross-pod conversational
    approvals via `approval:{id}` pub/sub. Fail-closed preserved.
 4. **A2A streaming/cancel over the bus.** Cross-pod `message:stream` / `subscribe` /
@@ -466,11 +476,16 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
 ## 12. Testing
 
 - **Trait conformance suite:** one async test battery run against _both_ the in-memory and
-  Redis backends (Redis via `testcontainers` / an ephemeral Valkey) — register/resolve,
-  at-most-once resolve, expiry, `cancel_request`, task create/get/list/history-by-context.
+  Redis backends — register/resolve, at-most-once resolve, expiry, `cancel_request`, task
+  create/get/list/history-by-context. The Redis side ships as
+  `crates/aura-web-server/tests/redis_session_store_test.rs` behind the
+  `integration-session-store` feature, pointed at an ephemeral Valkey via
+  `AURA_TEST_REDIS_URL` (`make test-integration-session-store-local`).
 - **Cross-pod simulation:** two `AppState` instances sharing one backend; park an approval
   via instance A, resolve via instance B, assert instance A's await wakes. Same for A2A:
-  `message:send` on A, `GET /tasks/{id}` on B.
+  `message:send` on A, `GET /tasks/{id}` on B. (The A2A store half is covered at the
+  `TaskStore` layer in the suite above: create/update on one handle, get/list/history on
+  another.)
 - **Degradation:** `backend = redis` with the store down → startup fails fast; store lost
   mid-flight → HITL fails closed, A2A surfaces a clean error, single-pod in-memory path
   unaffected.
@@ -538,7 +553,7 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
 | Server wiring (construct backend)                 | `crates/aura-web-server/src/main.rs:257,287`          |
 | `AppState`                                        | `crates/aura-web-server/src/types.rs:77`              |
 | CLI standalone wiring (stays in-memory)           | `crates/aura-cli/src/backend/direct.rs:104`           |
-| Config (`[session_store]`)                        | `crates/aura-config/src/config.rs`                    |
+| Config (`AURA_SESSION_STORE*` env vars)           | `crates/aura-config/src/session_store.rs`             |
 | Helm values / Deployment env                      | `deployment/helm/aura/`                               |
 
 ## 15. Related docs

@@ -950,14 +950,28 @@ fn convert_tool_message(msg: &ChatMessage, client_tools_enabled: bool) -> Option
     None
 }
 
-/// Health check endpoint
-pub async fn health() -> Response {
+/// Health check endpoint. Reports overall status plus a `session_store`
+/// block (backend name, ping result, ping latency); a failing backend ping
+/// degrades the status but keeps the endpoint at 200, since the in-flight
+/// HTTP surface still works.
+pub async fn health(State(state): State<Arc<AppState>>) -> Response {
+    let ping_started = std::time::Instant::now();
+    let ping = state.session_store.ping().await;
+    let ping_ms = ping_started.elapsed().as_millis() as u64;
+
     Json(serde_json::json!({
-        "status": "healthy",
+        "status": if ping.is_ok() { "healthy" } else { "degraded" },
         "timestamp": Utc::now().to_rfc3339(),
         "aura_version": env!("CARGO_PKG_VERSION"),
         "a2a_server": {
             "version": VERSION,
+        },
+        "session_store": {
+            "backend": state.session_store.backend().to_string(),
+            "ping": match &ping {
+                Ok(()) => serde_json::json!({ "ok": true, "latency_ms": ping_ms }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+            },
         },
     }))
     .into_response()
@@ -1539,6 +1553,7 @@ mod tests {
             default_agent: None,
             additional_tools: Arc::new(Vec::new),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
         })
     }
 
@@ -1611,6 +1626,7 @@ model = "gpt-4o"
             additional_tools: Arc::new(Vec::new),
             debug_provider_errors: false,
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
         })
     }
 
@@ -1943,6 +1959,7 @@ url = "http://127.0.0.1:9"
                 default_agent: None,
                 additional_tools: Arc::new(Vec::new),
                 pending_approvals: aura::hitl::PendingApprovals::new(),
+                session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
             })
         }
 
