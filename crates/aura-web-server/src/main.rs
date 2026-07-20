@@ -24,7 +24,7 @@ use aura_web_server::streaming;
 use aura_web_server::types;
 
 use streaming::ToolResultMode;
-use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
+use types::{ActiveRequestTracker, AppState, ConfigRegistry, ErrorDetail, ErrorResponse};
 
 /// CLI arguments for the web server
 #[derive(Parser, Debug)]
@@ -348,7 +348,7 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
-    let configs_arc = Arc::new(configs);
+    let configs_arc = Arc::new(ConfigRegistry::new(configs));
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
@@ -393,7 +393,7 @@ async fn run() -> std::io::Result<()> {
     })?;
     // With a secret configured, a plaintext webhook URL fails at boot rather
     // than on the first approval request.
-    for config in configs_arc.iter() {
+    for config in configs_arc.snapshot().iter() {
         if let Some(hitl) = &config.hitl {
             aura::hitl::validate_webhook_signing_config(hitl, ingress_hmac.as_ref()).map_err(
                 |e| {
