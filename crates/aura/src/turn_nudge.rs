@@ -1,38 +1,11 @@
-//! Turn-limit nudging — warns an agent that it is approaching its turn-depth
-//! limit so it wraps up and submits results instead of losing all work to a
+//! Turn-limit nudging — warns an agent nearing its turn-depth limit so it
+//! wraps up and submits results instead of losing all work to a
 //! `MaxDepthError`.
 //!
-//! # How it works
-//!
-//! Rig's multi-turn loop lives inside the rig fork, so aura cannot inject a
-//! message between turns directly. Instead the nudge rides on two aura-owned
-//! seams:
-//!
-//! 1. **Turn counting** — every rig turn ends with a provider `Final` chunk,
-//!    which `map_stream_item` converts to `StreamItem::TurnUsage`. The
-//!    `Agent::stream_*` methods count those into [`TurnNudgeState`]
-//!    (see `Agent::count_turns`).
-//! 2. **Injection** — [`TurnNudgeWrapper`] appends a notice to MCP tool
-//!    output when few turns remain. Rig feeds tool results back as the next
-//!    turn's prompt, so the model reads the nudge at the start of its next
-//!    turn.
-//!
-//! Enabled per agent via `[agent].nudge_last_turn` (final-turn "submit now"
-//! notice) and `[agent].nudge_turns_remaining` (start "wrap up" notices when
-//! that many turns remain). Wired for orchestration workers (in
-//! `create_worker`) and single-agent mode (in `Agent::new`); the coordinator
-//! is excluded.
-//!
-//! # Prototype limitations
-//!
-//! - Only MCP tool outputs carry the nudge (`tool_wrapper` doesn't wrap
-//!   native tools like scratchpad reads or `submit_result`). A turn that
-//!   calls no MCP tool gets no nudge — but a turn with no tool calls at all
-//!   ends the loop successfully anyway.
-//! - The state is per-`Agent`; concurrent streams on one `Agent` would share
-//!   a counter. All current callers build agents per request/task.
-//! - Ollama fallback tool parsing executes tools outside rig's loop and is
-//!   not nudged.
+//! `Agent::count_turns` tracks the turn number (one `StreamItem::TurnUsage`
+//! per rig turn); [`TurnNudgeWrapper`] appends a notice to MCP tool output,
+//! which rig feeds back as the next turn's prompt. Enabled via
+//! `[agent].nudge_last_turn` and `[agent].nudge_turns_remaining`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,14 +17,8 @@ use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformOutputResult};
 
 /// Shared turn-limit tracking for one agent stream.
-///
-/// Turn math: rig's streaming loop (`rig-core` `prompt_request/streaming.rs`)
-/// breaks only when its pre-increment turn counter exceeds `max_depth + 1`,
-/// so it executes up to `max_depth + 2` turns before yielding
-/// `MaxDepthError`. A nudge appended to turn `T`'s tool output is read by
-/// the model at the start of turn `T + 1`.
 pub struct TurnNudgeState {
-    /// Total turns rig will execute for this agent before `MaxDepthError`.
+    /// Total turns rig will execute before `MaxDepthError`.
     max_turns: usize,
     nudge_last_turn: bool,
     /// Emit wrap-up notices once this many turns (or fewer) remain.
@@ -64,8 +31,7 @@ pub struct TurnNudgeState {
 }
 
 impl TurnNudgeState {
-    /// Build nudge state from the `[agent]` flags and the agent's resolved
-    /// turn depth. Returns `None` when both flags are off (nudging disabled).
+    /// Returns `None` when both flags are off (nudging disabled).
     pub fn new(
         nudge_last_turn: bool,
         nudge_turns_remaining: Option<usize>,
@@ -74,9 +40,7 @@ impl TurnNudgeState {
         Self::build(nudge_last_turn, nudge_turns_remaining, max_depth, false)
     }
 
-    /// Like [`Self::new`] but for agents that carry the orchestration
-    /// `submit_result` tool — the final-turn nudge tells the agent to call
-    /// it instead of answering in text.
+    /// Like [`Self::new`] but with `submit_result` wording for workers.
     pub fn new_with_submit_tool(
         nudge_last_turn: bool,
         nudge_turns_remaining: Option<usize>,
@@ -95,6 +59,8 @@ impl TurnNudgeState {
             return None;
         }
         Some(Arc::new(Self {
+            // Rig's streaming loop breaks when its pre-increment counter
+            // exceeds max_depth + 1, i.e. it runs max_depth + 2 turns.
             max_turns: max_depth + 2,
             nudge_last_turn,
             wrap_up_threshold: nudge_turns_remaining,
@@ -104,30 +70,26 @@ impl TurnNudgeState {
         }))
     }
 
-    /// Reset counters at stream start (an `Agent` can serve multiple
-    /// sequential streams, e.g. the CLI REPL).
+    /// Reset counters at stream start.
     pub fn reset(&self) {
         self.turns_completed.store(0, Ordering::Release);
         self.last_nudged_turn.store(0, Ordering::Release);
     }
 
-    /// Record one completed rig turn (one `StreamItem::TurnUsage` observed).
+    /// Record one completed rig turn.
     pub fn record_turn_completed(&self) {
         self.turns_completed.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Nudge text for the turn currently executing, or `None` when no nudge
     /// applies (or one was already issued this turn).
-    ///
-    /// Called from tool-output transformation, i.e. mid-turn: the current
-    /// turn number is `turns_completed + 1`, and `remaining` counts the
-    /// turns left *after* this one — the turns in which the model can still
-    /// act on the nudge.
     pub fn nudge_message(&self) -> Option<String> {
+        // Called mid-turn, so the current turn is turns_completed + 1.
+        // `remaining` counts turns left after this one — the nudge is read
+        // at the start of the next turn.
         let current_turn = self.turns_completed.load(Ordering::Acquire) + 1;
         let remaining = self.max_turns.saturating_sub(current_turn);
         if remaining == 0 {
-            // The loop is out of turns; a nudge could no longer be acted on.
             return None;
         }
 
@@ -145,8 +107,7 @@ impl TurnNudgeState {
             None
         }?;
 
-        // At most one nudge per turn: swap is safe because turn numbers are
-        // monotonically increasing within a stream.
+        // At most one nudge per turn.
         let previously_nudged = self.last_nudged_turn.swap(current_turn, Ordering::AcqRel);
         if previously_nudged == current_turn {
             return None;
@@ -189,10 +150,6 @@ impl TurnNudgeState {
 }
 
 /// ToolWrapper that appends turn-limit nudges to tool output.
-///
-/// Composed so its `transform_output` runs last (first in the wrapper list),
-/// after scratchpad interception — the nudge must land on the text the LLM
-/// actually sees, and must not be persisted as raw tool output.
 pub struct TurnNudgeWrapper {
     state: Arc<TurnNudgeState>,
 }

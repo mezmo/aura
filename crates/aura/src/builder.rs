@@ -146,8 +146,7 @@ pub struct Agent {
     /// stream with `finish_reason: "tool_calls"` so the caller can execute
     /// the tool and resume in a follow-up request.
     pub(crate) client_tool_names: HashSet<String>,
-    /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`
-    /// (see the `turn_nudge` module).
+    /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`.
     pub(crate) turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
 }
 
@@ -355,10 +354,8 @@ impl Agent {
             .unwrap_or(0);
         let max_depth = base_depth + scratchpad_bonus;
 
-        // Turn-limit nudging for single-agent mode. Orchestration workers wire
-        // their own state in `create_worker` (with submit_result wording); the
-        // top-level orchestration agent doesn't run rig's multi-turn loop
-        // itself, so it gets no nudge state.
+        // Turn-limit nudging for single-agent mode; orchestration workers
+        // wire their own state in `create_worker`.
         let turn_nudge = if config_owned.orchestration_enabled() {
             None
         } else {
@@ -369,9 +366,8 @@ impl Agent {
             )
         };
         if let Some(ref state) = turn_nudge {
-            // First in the vec → `transform_output` runs LAST, so the nudge
-            // lands on the text the LLM actually sees (after any scratchpad
-            // pointer rewrite) and is never persisted as raw tool output.
+            // First in the vec → transform_output runs last, on the text the
+            // LLM actually sees (after any scratchpad pointer rewrite).
             let nudge: Arc<dyn crate::tool_wrapper::ToolWrapper> =
                 Arc::new(crate::turn_nudge::TurnNudgeWrapper::new(state.clone()));
             config_owned.tool_wrapper = Some(match config_owned.tool_wrapper.take() {
@@ -1218,16 +1214,10 @@ impl Agent {
         self.maybe_wrap_with_fallback(self.count_turns(stream))
     }
 
-    /// Feed per-turn completions into the turn-nudge state so its
-    /// `TurnNudgeWrapper` knows which turn is executing.
-    ///
-    /// Rig yields exactly one provider `Final` chunk per turn, which
-    /// `map_stream_item` converts to `StreamItem::TurnUsage` — counting those
-    /// tracks the turn number without touching the rig fork. Tool calls of
-    /// turn `N` execute before turn `N`'s `TurnUsage` arrives, so during tool
-    /// execution the current turn is `turns_completed + 1`. Counters are
-    /// reset here because an `Agent` can serve multiple sequential streams
-    /// (e.g. the CLI REPL). No-op passthrough when nudging is disabled.
+    /// Count completed turns into the turn-nudge state. Rig yields exactly
+    /// one `StreamItem::TurnUsage` per turn, and a turn's tool calls execute
+    /// before its `TurnUsage` arrives, so mid-turn the current turn is
+    /// `turns_completed + 1`. No-op when nudging is disabled.
     fn count_turns(
         &self,
         stream: Pin<
