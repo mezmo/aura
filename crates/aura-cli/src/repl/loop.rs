@@ -646,6 +646,21 @@ pub fn run_repl(
     if let Some(agent) = startup_agent {
         crate::ui::agent_overview::print_agent_overview(&agent);
     }
+
+    if config
+        .model
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case("aura-bootstrap"))
+    {
+        use crate::theme::Themed;
+        println!(
+            "\n  {} You're connected to the bootstrap configuration agent.\n  \
+             Describe what you want this AURA instance to do and it will\n  \
+             build a configuration for you.\n",
+            "aura-bootstrap".themed_with(crate::theme::theme().heading),
+        );
+    }
+
     setup_terminal();
 
     // Coordinate session telemetry here: Enabled sessions start now;
