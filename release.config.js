@@ -45,9 +45,8 @@ module.exports = {
   dockerTags,
   // https://github.com/semantic-release/exec
   prepareCmd: `./scripts/set-version.sh \${nextRelease.version}`,
-  verifyReleaseCmd: `echo \${nextRelease.version} > .next-release-version`,
-  // Open a PR on the Homebrew tap bumping the formulae to the released version.
-  successCmd: `make bump-homebrew-tap VERSION=\${nextRelease.version}`,
+  verifyReleaseCmd: `echo \${nextRelease.version} > .next-release-version && ./scripts/bump-homebrew-tap.sh --dry-run \${nextRelease.version}`,
+  successCmd: `./scripts/bump-homebrew-tap.sh \${nextRelease.version}`,
   // https://github.com/esatterwhite/semantic-release-docker
   dockerProject: 'mezmo',
   dockerImage: 'aura',

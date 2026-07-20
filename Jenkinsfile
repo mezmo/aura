@@ -13,6 +13,13 @@ def RELEASE_CREDENTIALS = [
    )
 ]
 
+def TAP_CREDENTIALS = [
+   string(
+     credentialsId: 'github-api-token',
+     variable: 'GITHUB_TOKEN'
+   )
+]
+
 pipeline {
   agent {
     node {
@@ -415,7 +422,9 @@ pipeline {
             withCredentials(RELEASE_CREDENTIALS) {
               script {
                 try {
-                  sh 'npm run release:dry -- --plugins @semantic-release/commit-analyzer @semantic-release/exec'
+                  withCredentials(TAP_CREDENTIALS) {
+                    sh 'npm run release:dry -- --plugins @semantic-release/commit-analyzer @semantic-release/exec'
+                  }
                   env.NEXT_RELEASE_VERSION = fileExists('.next-release-version') ? readFile('.next-release-version').trim() : ''
                 } finally {
                   sh 'rm -f .next-release-version'
@@ -524,7 +533,9 @@ pipeline {
                     project: PROJECT_NAME,
                     versionFn: { -> npm.semver().version }
                   ) {
-                    withReport('Release', 'npm run release')
+                    withCredentials(TAP_CREDENTIALS) {
+                      withReport('Release', 'npm run release')
+                    }
                   }
                 }
               }
