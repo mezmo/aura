@@ -192,7 +192,7 @@ impl Tool for CreatePlanTool {
                 },
                 "task": {
                     "type": "string",
-                    "description": "What this task accomplishes. Fully resolve all references — workers do NOT see conversation history. Required when type=task."
+                    "description": "What this task accomplishes. Fully resolve all references — workers do NOT see conversation history. Reference bulk data by path or artifact rather than inlining it; state only evidence a worker has verified, and mark anything unverified as needing verification, not as settled fact. Required when type=task."
                 },
                 "worker": {
                     "type": "string",
