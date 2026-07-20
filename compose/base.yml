@@ -16,7 +16,7 @@ services:
   mock-mcp:
     # Use Docker Hub image
     image: ${MOCK_MCP_IMAGE:-mezmo/aura-mock-mcp:latest}
- 
+
     volumes:
       # Shared volume for marker files (written by slow_task, read by tests)
       # Uses /tmp since that's where slow_task writes marker files

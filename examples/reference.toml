@@ -216,4 +216,3 @@ model = "gpt-5.2"
 # api_key = "{{ env.OPENROUTER_API_KEY }}"
 # model = "anthropic/claude-sonnet-4"
 # base_url = "https://custom-endpoint/v1"  # optional: OpenRouter-compatible proxies only
-

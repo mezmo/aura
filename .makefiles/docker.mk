@@ -111,4 +111,3 @@ build-images: | $(REPORT_DIR) ## Build server+test images via buildx with an S3 
 	build_target server server-amd64 "$${AURA_SERVER_IMAGE}"; \
 	docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}' \
 		| grep -F -e "$${AURA_SERVER_IMAGE}" -e "$${AURA_TEST_IMAGE}" || true
-

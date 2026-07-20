@@ -91,4 +91,3 @@ http = "1.0"
 # Patch rig-core to use the fork with streaming hook + span propagation fix
 [patch.crates-io]
 rig-core = { git = "https://github.com/mezmo/rig.git", rev = "e6f008eaf555733d93368c9dd174d1d61d7d096d" }
-

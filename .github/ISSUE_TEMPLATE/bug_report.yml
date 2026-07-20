@@ -28,7 +28,7 @@ body:
 
         **Steps**
         1. Start`aura-web-server` with config file
-        2. Connect to server with AURA CLI 
+        2. Connect to server with AURA CLI
         3. Enter the /model command
         4. [BUG]  Expect to see a list of models but no models are listed
     validations:
