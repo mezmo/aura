@@ -8,6 +8,7 @@
 pub mod approval_event_broker;
 pub mod approver_headers;
 pub mod bedrock_embedding;
+pub mod bootstrap;
 pub mod builder;
 pub mod config;
 pub mod env_flags;
