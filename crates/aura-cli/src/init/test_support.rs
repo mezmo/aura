@@ -21,6 +21,7 @@ pub(crate) fn args() -> InitArgs {
         region: None,
         base_url: None,
         name: "assistant".to_string(),
+        bootstrap: false,
         offline: true,
         non_interactive: true,
         force: false,
