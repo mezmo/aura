@@ -35,9 +35,17 @@ const CONFIG_TEMPLATE: &str = include_str!("config_template.toml");
 /// two commented-out workers (ops-engineer, runbook-engineer), and MCP
 /// server placeholders.
 pub(crate) fn render_config(spec: &ConfigSpec) -> String {
-    CONFIG_TEMPLATE
+    let mut rendered = CONFIG_TEMPLATE
         .replace("{{name}}", &toml_escape(&spec.name))
-        .replace("{{llm}}", &render_llm_block(spec))
+        .replace("{{llm}}", &render_llm_block(spec));
+    if spec.bootstrap {
+        rendered.push_str(
+            "\n# The aura-bootstrap configuration agent: edit this config by \
+             chatting with it.\n# Token-gated — the server prints the token \
+             at startup (or set AURA_BOOTSTRAP_TOKEN).\n[bootstrap]\nenabled = true\n",
+        );
+    }
+    rendered
 }
 
 /// Render a `.env` file for a user-provided API key. Only called when the
@@ -90,7 +98,7 @@ pub(crate) fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()>
 }
 
 /// Human-readable next-steps shown after writing the files.
-pub(crate) fn next_steps(config_path: &Path, wrote_env: bool) -> String {
+pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, bootstrap: bool) -> String {
     let dir = config_path.parent().filter(|p| !p.as_os_str().is_empty());
     let (run_prefix, config_for_run) = match dir {
         Some(d) => {
@@ -109,12 +117,20 @@ pub(crate) fn next_steps(config_path: &Path, wrote_env: bool) -> String {
     } else {
         ""
     };
+    let bootstrap_note = if bootstrap {
+        "\nThe aura-bootstrap agent is enabled: run `aura` in this directory \
+         and switch to it\nwith `/model aura-bootstrap` to build out this \
+         config conversationally. Over HTTP\nthe server prints its token at \
+         startup; pass it via --api-key."
+    } else {
+        ""
+    };
     format!(
         "\nNext steps:\n  \
            1. Add MCP servers to {config_for_run} to connect your observability stack\n  \
            2. {run_prefix}CONFIG_PATH={config_for_run} aura-web-server\n  \
            3. aura --api-url http://localhost:8080\n\
-         {env_note}",
+         {env_note}{bootstrap_note}",
     )
 }
 
@@ -129,6 +145,19 @@ mod tests {
         let spec1 = resolve(&args()).unwrap();
         let spec2 = resolve(&args()).unwrap();
         assert_eq!(render_config(&spec1), render_config(&spec2));
+    }
+
+    #[test]
+    fn bootstrap_table_rendered_only_when_enabled() {
+        let spec = resolve(&args()).unwrap();
+        assert!(!render_config(&spec).contains("[bootstrap]"));
+
+        let mut flagged = args();
+        flagged.bootstrap = true;
+        let spec = resolve(&flagged).unwrap();
+        let rendered = render_config(&spec);
+        assert!(rendered.contains("[bootstrap]\nenabled = true"), "got: {rendered}");
+        toml::from_str::<toml::Value>(&rendered).unwrap();
     }
 
     #[test]
@@ -205,19 +234,19 @@ mod tests {
 
     #[test]
     fn next_steps_mentions_config() {
-        let s = next_steps(Path::new("config.toml"), false);
+        let s = next_steps(Path::new("config.toml"), false, false);
         assert!(s.contains("config.toml"), "got: {s}");
     }
 
     #[test]
     fn next_steps_mentions_env_when_written() {
-        let s = next_steps(Path::new("config.toml"), true);
+        let s = next_steps(Path::new("config.toml"), true, false);
         assert!(s.contains(".env"), "got: {s}");
     }
 
     #[test]
     fn next_steps_cds_into_config_dir() {
-        let s = next_steps(Path::new("proj/config.toml"), false);
+        let s = next_steps(Path::new("proj/config.toml"), false, false);
         assert!(s.contains("cd proj"), "got: {s}");
         assert!(s.contains("CONFIG_PATH=config.toml"), "got: {s}");
     }
