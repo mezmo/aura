@@ -716,10 +716,7 @@ impl WriteConfigTool {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
-        let tmp = target_file.with_extension(format!(
-            "toml.tmp.{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let tmp = target_file.with_extension(format!("toml.tmp.{}", uuid::Uuid::new_v4().simple()));
         fs::write(&tmp, &args.content)
             .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
         if let Err(e) = fs::rename(&tmp, &target_file) {
@@ -764,9 +761,17 @@ fn check_secret_literals(value: &toml::Value) -> Result<(), String> {
     }
     fn credential_key(key: &str) -> bool {
         let k = key.to_ascii_lowercase().replace('-', "_");
-        ["api_key", "apikey", "token", "secret", "password", "authorization", "credential"]
-            .iter()
-            .any(|marker| k.contains(marker))
+        [
+            "api_key",
+            "apikey",
+            "token",
+            "secret",
+            "password",
+            "authorization",
+            "credential",
+        ]
+        .iter()
+        .any(|marker| k.contains(marker))
     }
     fn walk(value: &toml::Value, path: &str, violations: &mut Vec<String>) {
         match value {
@@ -1208,7 +1213,10 @@ model = "gpt-5.1"
 
         let result = write_tool(target).call(write_args(&content)).await.unwrap();
 
-        assert!(result.contains("literal API key(s)/secret(s)"), "got: {result}");
+        assert!(
+            result.contains("literal API key(s)/secret(s)"),
+            "got: {result}"
+        );
         assert!(
             result.contains("mcp.servers.k8s.headers.Authorization"),
             "got: {result}"
@@ -1402,8 +1410,16 @@ model = "gpt-5.1"
     fn signal_merge_keeps_mutating_across_servers() {
         // Server A says mutating, server B says read-only: mutating wins
         // regardless of discovery order.
-        assert!(MUTATING.merge_most_restrictive(READ_ONLY_LIST).declared_mutating());
-        assert!(READ_ONLY_LIST.merge_most_restrictive(MUTATING).declared_mutating());
+        assert!(
+            MUTATING
+                .merge_most_restrictive(READ_ONLY_LIST)
+                .declared_mutating()
+        );
+        assert!(
+            READ_ONLY_LIST
+                .merge_most_restrictive(MUTATING)
+                .declared_mutating()
+        );
         // Agreement on read-only survives the merge.
         assert!(
             !READ_ONLY_LIST
