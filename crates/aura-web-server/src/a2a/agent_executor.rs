@@ -643,6 +643,7 @@ mod tests {
     ) -> AuraAgentExecutor {
         let app_state = Arc::new(AppState {
             configs: Arc::new(crate::types::ConfigRegistry::new(configs)),
+            bootstrap: None,
             default_agent: default_agent.map(str::to_owned),
             tool_result_mode: ToolResultMode::default(),
             tool_result_max_length: 0,

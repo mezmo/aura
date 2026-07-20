@@ -104,9 +104,22 @@ impl ConfigRegistry {
     }
 }
 
+/// Runtime state for the built-in `aura-bootstrap` agent, held outside the
+/// [`ConfigRegistry`].
+pub struct BootstrapState {
+    /// The served agent (assembled by `aura::bootstrap::bootstrap_agent_config`).
+    pub agent_config: aura_config::Config,
+    /// The admin token accepted on requests addressed to the bootstrap agent.
+    pub token: String,
+    /// Factory for the agent's configuration tools (read / inspect / write).
+    pub tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
+}
+
 /// Application state
 pub struct AppState {
     pub configs: Arc<ConfigRegistry>,
+    /// Token-gated bootstrap agent.
+    pub bootstrap: Option<BootstrapState>,
     pub tool_result_mode: ToolResultMode,
     /// Maximum length for tool results (0 = no truncation)
     pub tool_result_max_length: usize,
