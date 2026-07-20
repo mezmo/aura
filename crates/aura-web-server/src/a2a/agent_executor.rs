@@ -47,7 +47,7 @@ impl AuraAgentExecutor {
     }
 
     fn resolve_config(&self, requested_model: Option<&str>) -> Option<aura_config::Config> {
-        let configs = &self.app_state.configs;
+        let configs = self.app_state.configs.snapshot();
         // Single-config: always use it, ignore any requested_model (mirrors chat completions passthrough).
         if configs.len() == 1 {
             return configs.first().cloned();
@@ -642,7 +642,7 @@ mod tests {
         default_agent: Option<&str>,
     ) -> AuraAgentExecutor {
         let app_state = Arc::new(AppState {
-            configs: Arc::new(configs),
+            configs: Arc::new(crate::types::ConfigRegistry::new(configs)),
             default_agent: default_agent.map(str::to_owned),
             tool_result_mode: ToolResultMode::default(),
             tool_result_max_length: 0,

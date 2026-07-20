@@ -258,13 +258,17 @@ pub async fn prepare_request(
     // assistant `tool_calls` and `role: "tool"` follow-up results).
     let (query, chat_history) = convert_chat_messages(&req.messages, has_client_tools)?;
 
+    // One roster snapshot per request: this request (including any stream it
+    // spawns) works against an immutable view, unaffected by hot reloads.
+    let configs = data.configs.snapshot();
+
     // Find the matching config: single-config passthrough > explicit model > DEFAULT_AGENT
     // Single-config servers accept any model field value (clients like LibreChat always send one).
     // Multi-config servers require the model field to match an alias or agent name.
-    let config = if data.configs.len() == 1 {
-        data.configs[0].clone()
+    let config = if configs.len() == 1 {
+        configs[0].clone()
     } else if let Some(model_name) = req.model.as_deref().or(data.default_agent.as_deref()) {
-        data.configs
+        configs
             .iter()
             .find(|c| c.agent.alias.as_deref().unwrap_or(&c.agent.name) == model_name)
             .cloned()
@@ -967,6 +971,7 @@ pub async fn health() -> Response {
 pub async fn info(State(state): State<Arc<AppState>>) -> Response {
     let agents: Vec<AgentInfo> = state
         .configs
+        .snapshot()
         .iter()
         .filter(|config| !config.agent.hidden)
         .map(aura::agent_info)
@@ -985,6 +990,7 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Response {
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let models: Vec<serde_json::Value> = state
         .configs
+        .snapshot()
         .iter()
         .filter(|config| !config.agent.hidden)
         .map(|config| {
@@ -1525,7 +1531,7 @@ mod tests {
 
     fn make_state(configs: Vec<aura_config::Config>) -> Arc<AppState> {
         Arc::new(AppState {
-            configs: Arc::new(configs),
+            configs: Arc::new(crate::types::ConfigRegistry::new(configs)),
             tool_result_mode: crate::streaming::ToolResultMode::None,
             tool_result_max_length: 0,
             streaming_buffer_size: 32,
@@ -1597,7 +1603,7 @@ model = "gpt-4o"
         default_agent: Option<&str>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
-            configs: Arc::new(configs),
+            configs: Arc::new(crate::types::ConfigRegistry::new(configs)),
             tool_result_mode: crate::streaming::ToolResultMode::None,
             tool_result_max_length: 0,
             streaming_buffer_size: 32,
@@ -1871,7 +1877,7 @@ model = "gpt-4o-mini"
 
         fn test_app_state() -> Arc<AppState> {
             Arc::new(AppState {
-                configs: Arc::new(vec![]),
+                configs: Arc::new(crate::types::ConfigRegistry::new(vec![])),
                 tool_result_mode: ToolResultMode::default(),
                 tool_result_max_length: 0,
                 streaming_buffer_size: 0,
