@@ -699,8 +699,6 @@ impl Orchestrator {
             tracing::info!("Worker {} turn_depth={}", task_id, resolved_depth);
         }
 
-        // Turn-limit nudging: workers get submit_result wording. The state is
-        // fed per-turn by `Agent::count_turns` on the worker's stream.
         let turn_nudge = crate::turn_nudge::TurnNudgeState::new_with_submit_tool(
             worker_config.agent.nudge_last_turn,
             worker_config.agent.nudge_turns_remaining,
@@ -713,9 +711,8 @@ impl Orchestrator {
         // also needs raw output — persistence's transform_output is a
         // passthrough that just caches the raw — and rewrites to the pointer.
         // Duplicate-guard and observer then see the pointer, which is what
-        // should surface to the LLM/UI. The turn-limit nudge goes first so it
-        // runs after everything else and lands on the text the LLM sees
-        // without being persisted as raw output.
+        // should surface to the LLM/UI. The turn-limit nudge goes first so
+        // it runs after everything else, on the text the LLM sees.
         let mut wrappers: Vec<Arc<dyn ToolWrapper>> = vec![observer_wrapper, duplicate_guard];
         wrappers.extend(scratchpad_tools);
         wrappers.push(persistence_wrapper);
