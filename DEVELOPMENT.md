@@ -121,6 +121,11 @@ make test-integration-scratchpad-local
 # STDIO MCP tests (local only, no Compose/up/down variants; runs the
 # aura crate's integration-stdio feature)
 make test-integration-stdio-local
+
+# Session-store tests (local only; needs Docker for an ephemeral Valkey,
+# no other infra and no LLM key). To use an existing Redis/Valkey instead,
+# set AURA_TEST_REDIS_URL and run the cargo command directly.
+make test-integration-session-store-local
 ```
 
 Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate limits.
@@ -140,6 +145,7 @@ Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate l
 | `integration-orchestration`     | Orchestration (separate from parent `integration`)       |
 | `integration-orchestration-sre` | SRE orchestration (requires k8s-sre-mcp server config)   |
 | `integration-scratchpad`        | Scratchpad (separate from parent `integration`; requires scratchpad-test-mcp server config) |
+| `integration-session-store`     | Redis/Valkey session store (separate from parent `integration`; requires a live Redis/Valkey via `AURA_TEST_REDIS_URL`) |
 | `integration-vector`            | Vector store / RAG (requires external Qdrant)            |
 
 Example, run only the streaming tests:

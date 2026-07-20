@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::session_store::SessionStore;
 use crate::streaming::ToolResultMode;
 
 /// Tracks in-flight request count for graceful shutdown.
@@ -103,6 +104,8 @@ pub struct AppState {
     /// Called once per request to produce fresh tool instances. Returns empty vec for the web server.
     pub additional_tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
     pub pending_approvals: aura::hitl::PendingApprovals,
+    /// The session-state backend.
+    pub session_store: Arc<dyn SessionStore>,
 }
 
 /// OpenAI-compatible message role

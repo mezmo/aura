@@ -17,7 +17,7 @@ use tracing::{error, info};
 
 use aura_web_server::a2a::{AuraAgentExecutor, AuraRequestHandler, SharedTaskStore};
 use aura_web_server::handlers;
-use aura_web_server::session_store::{InMemorySessionStore, SessionStore};
+use aura_web_server::session_store::{SessionStore, build_session_store};
 use aura_web_server::streaming;
 use aura_web_server::types;
 
@@ -255,7 +255,20 @@ async fn run() -> std::io::Result<()> {
 
     let shutdown_timeout_secs = args.shutdown_timeout_secs;
 
-    let session_store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    // Deployment-scoped, env-only configuration (AURA_SESSION_STORE*).
+    let session_store_config = aura_config::SessionStoreConfig::from_env().map_err(|e| {
+        error!("Invalid session store configuration: {e}");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("session store configuration error: {e}"),
+        )
+    })?;
+    let session_store: Arc<dyn SessionStore> = build_session_store(&session_store_config)
+        .await
+        .map_err(|e| {
+            error!("Failed to build session store: {e}");
+            std::io::Error::other(format!("session store error: {e}"))
+        })?;
     // Fail fast at startup if the session-state backend is unreachable.
     if let Err(e) = session_store.ping().await {
         error!("Session store unreachable: {e}");
@@ -263,6 +276,7 @@ async fn run() -> std::io::Result<()> {
             "session store unreachable: {e}"
         )));
     }
+    info!("Session store backend: {}", session_store.backend());
 
     let app_state = Arc::new(AppState {
         configs: configs_arc,
@@ -283,6 +297,7 @@ async fn run() -> std::io::Result<()> {
             session_store.approvals(),
             session_store.bus(),
         ),
+        session_store: session_store.clone(),
     });
 
     info!(

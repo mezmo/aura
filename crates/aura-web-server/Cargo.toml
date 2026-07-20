@@ -33,9 +33,15 @@ async-trait = "0.1.89"
 a2a = { package = "a2a-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
 a2a-server = { package = "a2a-server-lf", git = "https://github.com/a2aproject/a2a-rs.git", tag = "a2a-server-lf-v0.3.1" }
 
+redis = { version = "0.32", default-features = false, features = ["tokio-comp", "connection-manager", "script", "keep-alive"], optional = true }
+
 [features]
 default = ["otel"]
 otel = ["aura/otel", "dep:tracing-opentelemetry", "dep:opentelemetry"]
+
+# Redis/Valkey session-store backend (`AURA_SESSION_STORE=redis`).
+# The in-memory backend is always compiled; this only gates the Redis client.
+session-store-redis = ["dep:redis"]
 
 # Integration test feature flags
 # Parent flag - enables all integration tests
@@ -69,6 +75,10 @@ integration-orchestration-sre = []  # sre_orchestration_test
 
 # Scratchpad integration tests (separate - needs scratchpad-test-mcp server config)
 integration-scratchpad = []  # scratchpad_test
+
+# Session-store integration tests (needs a live Redis/Valkey; see
+# `AURA_TEST_REDIS_URL` in tests/redis_session_store_test.rs)
+integration-session-store = ["session-store-redis"]  # redis_session_store_test
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use aura_web_server::handlers::{self, CollectedResult, DeliveryMode};
+use aura_web_server::session_store::InMemorySessionStore;
 use aura_web_server::streaming::ToolResultMode;
 use aura_web_server::types::{
     ActiveRequestTracker, AppState, ChatCompletionRequest, ChatMessage, ChatMessageFunctionCall,
@@ -103,6 +104,7 @@ impl DirectBackend {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            session_store: Arc::new(InMemorySessionStore::new()),
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -219,6 +221,7 @@ impl DirectBackend {
             default_agent: old.default_agent.clone(),
             additional_tools: additional_tools_factory(),
             pending_approvals: old.pending_approvals.clone(),
+            session_store: old.session_store.clone(),
         });
     }
 
@@ -451,6 +454,7 @@ mod tests {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            session_store: Arc::new(InMemorySessionStore::new()),
         });
         DirectBackend {
             app_state,

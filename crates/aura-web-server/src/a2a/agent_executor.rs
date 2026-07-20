@@ -657,6 +657,7 @@ mod tests {
             active_requests: Arc::new(ActiveRequestTracker::default()),
             additional_tools: Arc::new(Vec::new),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())
     }
