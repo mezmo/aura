@@ -71,6 +71,6 @@ pub use super::mid_stream::{drain_stdin, poll_input, prepare_input_line, styled_
 
 // Re-export from input_hint.rs
 pub use super::input_hint::{
-    clear_input_hint, seed_model_cache, set_model_cache, set_model_error, set_model_fetch_config,
-    trigger_model_fetch, update_input_hint, validate_command_input,
+    clear_input_hint, refresh_model_cache, seed_model_cache, set_model_cache, set_model_error,
+    set_model_fetch_config, trigger_model_fetch, update_input_hint, validate_command_input,
 };
