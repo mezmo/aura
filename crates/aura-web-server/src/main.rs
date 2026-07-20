@@ -267,10 +267,7 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
-    let roster_names: Vec<String> = configs
-        .iter()
-        .map(|c| c.agent_id().to_string())
-        .collect();
+    let roster_names: Vec<String> = configs.iter().map(|c| c.agent_id().to_string()).collect();
     let configs_arc = Arc::new(ConfigRegistry::new(configs));
 
     // Token-gated aura-bootstrap agent, when exactly one config enabled it.

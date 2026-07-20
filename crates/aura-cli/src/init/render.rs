@@ -156,7 +156,10 @@ mod tests {
         flagged.bootstrap = true;
         let spec = resolve(&flagged).unwrap();
         let rendered = render_config(&spec);
-        assert!(rendered.contains("[bootstrap]\nenabled = true"), "got: {rendered}");
+        assert!(
+            rendered.contains("[bootstrap]\nenabled = true"),
+            "got: {rendered}"
+        );
         toml::from_str::<toml::Value>(&rendered).unwrap();
     }
 

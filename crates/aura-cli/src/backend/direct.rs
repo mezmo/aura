@@ -140,8 +140,7 @@ impl DirectBackend {
             anyhow::bail!("No agent config found in {}", config_path);
         }
 
-        aura::bootstrap::validate_roster(&config_pairs)
-            .map_err(|msg| anyhow::anyhow!("{msg}"))?;
+        aura::bootstrap::validate_roster(&config_pairs).map_err(|msg| anyhow::anyhow!("{msg}"))?;
         let bootstrap_declaration = config_pairs
             .iter()
             .find(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
