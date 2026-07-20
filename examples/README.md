@@ -38,6 +38,7 @@ CONFIG_PATH=examples/minimal/openai.toml cargo run --bin aura-web-server
 | [`bedrock.toml`](minimal/bedrock.toml) | AWS Bedrock | AWS credentials |
 | [`gemini.toml`](minimal/gemini.toml) | Google Gemini | Yes |
 | [`ollama.toml`](minimal/ollama.toml) | Ollama (local) | No |
+| [`bootstrap.toml`](minimal/bootstrap.toml) | OpenAI + the token-gated `aura-bootstrap` config agent | Yes |
 
 ## Complete Agent Configs
 
