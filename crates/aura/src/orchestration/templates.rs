@@ -386,6 +386,7 @@ Always verify your calculations before reporting results."
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
         workers.insert(
@@ -412,6 +413,7 @@ TOOL USAGE:
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
 
