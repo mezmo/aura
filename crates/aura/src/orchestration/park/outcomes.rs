@@ -4,6 +4,8 @@
 use crate::hitl::DecisionId;
 use crate::orchestration::types::{FailureCategory, TaskIdentity};
 
+use super::non_empty::NonEmpty;
+
 /// The parked approval a blocked task is waiting on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRef {
@@ -47,6 +49,7 @@ pub enum WaveOutcome {
     /// The plan is finished.
     Finished,
     /// The ready frontier is empty, nothing is running, and these tasks are
-    /// blocked: the quiescence park point.
-    Quiesced { blocked: Vec<ApprovalRef> },
+    /// blocked: the quiescence park point. Non-empty by construction - a
+    /// quiescent wave with no blocked task is not a park point.
+    Quiesced { blocked: NonEmpty<ApprovalRef> },
 }
