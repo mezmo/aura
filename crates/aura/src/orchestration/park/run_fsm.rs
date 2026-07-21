@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::hitl::{DecisionId, Timestamp};
+use crate::orchestration::types::RunId;
+
+use super::non_empty::NonEmpty;
 
 /// Durable run state, persisted in the session store. Terminals stay at
 /// three: expiry is a failure cause ([`RunFailureCause::ParkExpired`]), not a
@@ -30,7 +33,7 @@ pub enum RunState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ParkReason {
     /// The ready frontier drained with these approvals still outstanding.
-    ApprovalsBlocked { decisions: Vec<DecisionId> },
+    ApprovalsBlocked { decisions: NonEmpty<DecisionId> },
 }
 
 /// The boundary a parked run resumes from. A run may only durably exist
@@ -59,28 +62,31 @@ pub enum WakeReason {
 #[serde(tag = "cause", rename_all = "snake_case")]
 pub enum RunFailureCause {
     /// The park outlived `expires_at`.
-    ParkExpired,
+    ParkExpired {
+        summary: String,
+    },
     ExecutionFailed {
         summary: String,
     },
 }
 
-/// Events the run FSM accepts.
+/// Events the run FSM accepts. Parking is not an event: it is the
+/// checkpoint-carrying [`super::SessionRecord::park`] operation, so a
+/// `Running -> Parked` transition cannot exist without its checkpoint.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunEvent {
-    Start,
-    Park {
-        reason: ParkReason,
-        resume_point: ResumePoint,
-        parked_at: Timestamp,
-        expires_at: Timestamp,
+    Start {
+        run_id: RunId,
     },
     Reify(WakeReason),
     Complete,
     Fail(RunFailureCause),
     Cancel,
-    /// Reaper-issued expiry of a parked run.
-    Expire,
+    /// Reaper-issued expiry of a parked run; the summary lands in
+    /// [`RunFailureCause::ParkExpired`].
+    Expire {
+        summary: String,
+    },
 }
 
 /// A rejected transition: `event` is not legal from `from`.
@@ -93,11 +99,13 @@ pub struct IllegalTransition {
 impl RunState {
     /// Apply one event, consuming the current state.
     ///
-    /// Legality (ADR decision 3): `Created` only starts; `Running` parks,
-    /// completes, fails, or cancels; `Parked` reifies back to `Running` on a
-    /// wake reason, and every non-human exit (`Expire`, `Fail`, `Cancel`)
-    /// denies - `Parked` never reaches `Completed` directly. Terminals absorb
-    /// nothing.
+    /// Legality (ADR decision 3): `Created` only starts; `Running`
+    /// completes, fails, or cancels (it parks via
+    /// [`super::SessionRecord::park`]); `Parked` reifies back to `Running`
+    /// only on a wake reason whose decision id is one of the parked
+    /// reason's decisions - an unknown decision id is rejected, and every
+    /// non-human exit (`Expire`, `Fail`, `Cancel`) denies. `Parked` never
+    /// reaches `Completed` directly. Terminals accept no event.
     pub fn apply(self, event: RunEvent) -> Result<RunState, IllegalTransition> {
         let _ = event;
         todo!("staged for #271 P-cards: run FSM transition")
@@ -117,79 +125,90 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    fn parked_fields() -> (ParkReason, ResumePoint, Timestamp, Timestamp) {
-        (
-            ParkReason::ApprovalsBlocked {
-                decisions: vec![DecisionId::generate()],
-            },
-            ResumePoint::WaveBoundary { iteration: 1 },
-            Utc::now(),
-            Utc::now() + chrono::Duration::seconds(300),
-        )
+    fn run_id() -> RunId {
+        "018f9d2e-7c3a-7000-8000-000000000271".parse().unwrap()
     }
 
-    fn parked() -> RunState {
-        let (reason, resume_point, parked_at, expires_at) = parked_fields();
+    fn parked_on(decision_id: DecisionId) -> RunState {
         RunState::Parked {
-            reason,
-            resume_point,
-            parked_at,
-            expires_at,
+            reason: ParkReason::ApprovalsBlocked {
+                decisions: NonEmpty::new(vec![decision_id]).unwrap(),
+            },
+            resume_point: ResumePoint::WaveBoundary { iteration: 1 },
+            parked_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(300),
         }
     }
 
-    fn park_event() -> RunEvent {
-        let (reason, resume_point, parked_at, expires_at) = parked_fields();
-        RunEvent::Park {
-            reason,
-            resume_point,
-            parked_at,
-            expires_at,
-        }
-    }
-
-    fn wake() -> WakeReason {
+    fn wake(decision_id: DecisionId) -> WakeReason {
         WakeReason::DecisionResolved {
-            decision_id: DecisionId::generate(),
+            decision_id,
             resolved_at: Utc::now(),
         }
+    }
+
+    fn all_events() -> Vec<RunEvent> {
+        vec![
+            RunEvent::Start { run_id: run_id() },
+            RunEvent::Reify(wake(DecisionId::generate())),
+            RunEvent::Complete,
+            RunEvent::Fail(RunFailureCause::ExecutionFailed {
+                summary: "boom".to_string(),
+            }),
+            RunEvent::Cancel,
+            RunEvent::Expire {
+                summary: "expired".to_string(),
+            },
+        ]
     }
 
     #[test]
     fn created_starts_running() {
         assert_eq!(
-            RunState::Created.apply(RunEvent::Start),
+            RunState::Created.apply(RunEvent::Start { run_id: run_id() }),
             Ok(RunState::Running)
         );
     }
 
     #[test]
-    fn running_parks_at_boundary() {
-        let next = RunState::Running.apply(park_event()).expect("legal");
-        assert!(matches!(next, RunState::Parked { .. }));
+    fn parked_reifies_on_a_parked_decision() {
+        let decision = DecisionId::generate();
+        assert_eq!(
+            parked_on(decision).apply(RunEvent::Reify(wake(decision))),
+            Ok(RunState::Running)
+        );
     }
 
     #[test]
-    fn parked_reifies_to_running() {
+    fn reify_with_unknown_decision_rejected() {
+        let parked = parked_on(DecisionId::generate());
+        let stranger = RunEvent::Reify(wake(DecisionId::generate()));
         assert_eq!(
-            parked().apply(RunEvent::Reify(wake())),
-            Ok(RunState::Running)
+            parked.clone().apply(stranger.clone()),
+            Err(IllegalTransition {
+                from: parked,
+                event: stranger
+            })
         );
     }
 
     #[test]
     fn parked_expiry_fails_closed() {
         assert_eq!(
-            parked().apply(RunEvent::Expire),
+            parked_on(DecisionId::generate()).apply(RunEvent::Expire {
+                summary: "2 approvals denied by expiry".to_string()
+            }),
             Ok(RunState::Failed {
-                cause: RunFailureCause::ParkExpired
+                cause: RunFailureCause::ParkExpired {
+                    summary: "2 approvals denied by expiry".to_string()
+                }
             })
         );
     }
 
     #[test]
     fn parked_never_completes_directly() {
-        let from = parked();
+        let from = parked_on(DecisionId::generate());
         assert_eq!(
             from.clone().apply(RunEvent::Complete),
             Err(IllegalTransition {
@@ -200,23 +219,33 @@ mod tests {
     }
 
     #[test]
-    fn created_cannot_park() {
-        assert!(RunState::Created.apply(park_event()).is_err());
-    }
-
-    #[test]
-    fn terminal_states_are_absorbing() {
+    fn terminal_states_absorb_no_event() {
         let terminals = [
             RunState::Completed,
             RunState::Failed {
-                cause: RunFailureCause::ParkExpired,
+                cause: RunFailureCause::ParkExpired {
+                    summary: "expired".to_string(),
+                },
             },
             RunState::Cancelled,
         ];
         for terminal in terminals {
-            assert!(terminal.clone().apply(RunEvent::Start).is_err());
-            assert!(terminal.clone().apply(RunEvent::Reify(wake())).is_err());
-            assert!(terminal.clone().apply(RunEvent::Cancel).is_err());
+            for event in all_events() {
+                assert!(
+                    terminal.clone().apply(event.clone()).is_err(),
+                    "{terminal:?} must reject {event:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn running_accepts_no_start_or_reify() {
+        for event in [
+            RunEvent::Start { run_id: run_id() },
+            RunEvent::Reify(wake(DecisionId::generate())),
+        ] {
+            assert!(RunState::Running.apply(event).is_err());
         }
     }
 }
