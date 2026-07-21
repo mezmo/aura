@@ -17,7 +17,7 @@ pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
 /// The single blob a park commits: everything a fresh process needs to
 /// reify the run, minus pod-local artifacts (carried as explicit refs).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCheckpoint {
     pub run_id: RunId,
     pub session_id: SessionId,
@@ -83,7 +83,7 @@ pub struct PodLocalRef {
 
 /// Version envelope around the checkpoint blob: the storage codec
 /// surface.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointEnvelope {
     pub schema_version: u32,
     pub checkpoint: RunCheckpoint,

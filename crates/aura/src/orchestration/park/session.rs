@@ -36,7 +36,7 @@ pub struct AgentInstance {
 
 /// Everything a park commits besides the state transition itself. Bundled
 /// so the checkpoint cannot be omitted from the commit.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParkCommit {
     pub checkpoint: CheckpointEnvelope,
     pub reason: ParkReason,
@@ -44,16 +44,15 @@ pub struct ParkCommit {
     pub expires_at: Timestamp,
 }
 
-/// The session-store record the CAS protocol operates on: run FSM state,
-/// checkpoint, lease, and fencing generation for one session. Invariants:
-/// at most one non-terminal run per session; `run_id` is `Some` for every
-/// state but `Created`; `checkpoint` is `Some` exactly while `Parked`.
-#[derive(Debug, Serialize, Deserialize)]
+/// The session-store record the CAS protocol operates on: run FSM state
+/// (which carries the checkpoint while `Parked`), lease, and fencing
+/// generation for one session. Invariants: at most one non-terminal run
+/// per session; `run_id` is `Some` for every state but `Created`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session: Session,
     pub run_id: Option<RunId>,
     pub state: RunState,
-    pub checkpoint: Option<CheckpointEnvelope>,
     pub lease: Option<Lease>,
     pub generation: FencingGeneration,
 }
@@ -64,10 +63,9 @@ impl SessionRecord {
     /// `presented` must equal `self.generation` exactly - older or newer is
     /// [`CasError::GenerationMismatch`] - before the FSM is consulted. A
     /// legal event advances the generation, rewrites `lease.generation` to
-    /// match when a lease is held, binds `run_id` on `Start`, and clears
-    /// `checkpoint` when leaving `Parked`. Backends execute this inside
-    /// their atomic primitive - the semantics live here so every backend
-    /// enforces the same rules.
+    /// match when a lease is held, and binds `run_id` on `Start`. Backends
+    /// execute this inside their atomic primitive - the semantics live here
+    /// so every backend enforces the same rules.
     pub fn apply(
         self,
         presented: FencingGeneration,
@@ -78,12 +76,16 @@ impl SessionRecord {
     }
 
     /// Park the running run, committing the checkpoint and the
-    /// `Running -> Parked` transition as one record write (ADR decision 7).
+    /// `Running -> Parked` transition as one record write (ADR decision 7):
+    /// the resulting state is `Parked` embedding `commit.checkpoint`, with
+    /// `commit.reason`, `commit.parked_at`, and `commit.expires_at` carried
+    /// verbatim.
     ///
-    /// Parking is deliberately not a [`RunEvent`]: this is the only path to
-    /// `Parked`, so a parked record without its checkpoint is
-    /// unconstructable through the FSM surface. Fencing rules match
-    /// [`Self::apply`]; a non-`Running` state is [`CasError::StateMismatch`].
+    /// Parking is deliberately not a [`RunEvent`], and `RunState::Parked`
+    /// carries its checkpoint, so a parked record without one is
+    /// unrepresentable. Fencing rules match [`Self::apply`], including
+    /// lease-generation rewrite; a non-`Running` state is
+    /// [`CasError::StateMismatch`].
     pub fn park(
         self,
         presented: FencingGeneration,
@@ -111,7 +113,6 @@ mod tests {
             },
             run_id,
             state,
-            checkpoint: None,
             lease: Some(Lease {
                 holder: AgentInstanceId::generate(),
                 acquired_at: Utc::now(),
@@ -202,16 +203,37 @@ mod tests {
     }
 
     #[test]
-    fn park_commits_checkpoint_with_the_transition() {
+    fn park_commits_exactly_what_was_supplied() {
         let rec = record_in(RunState::Running, Some(run_id()));
         let presented = rec.generation;
-        let next = rec.park(presented, park_commit()).expect("legal");
-        assert!(matches!(next.state, RunState::Parked { .. }));
-        assert!(
-            next.checkpoint.is_some(),
-            "a parked record always carries its checkpoint"
+        let commit = park_commit();
+        let next = rec.park(presented, commit.clone()).expect("legal");
+        assert_eq!(
+            next.state,
+            RunState::Parked {
+                reason: commit.reason,
+                parked_at: commit.parked_at,
+                expires_at: commit.expires_at,
+                checkpoint: Box::new(commit.checkpoint),
+            },
+            "the parked state carries the supplied checkpoint and metadata verbatim"
         );
         assert_eq!(next.generation, presented.next());
+        assert_eq!(
+            next.lease.expect("lease retained").generation,
+            next.generation,
+            "park rewrites a held lease's fencing token like apply does"
+        );
+    }
+
+    #[test]
+    fn park_with_future_generation_rejected() {
+        let rec = record_in(RunState::Running, Some(run_id()));
+        let future = rec.generation.next();
+        assert!(matches!(
+            rec.park(future, park_commit()),
+            Err(CasError::GenerationMismatch { .. })
+        ));
     }
 
     #[test]
