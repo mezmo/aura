@@ -378,10 +378,12 @@ cargo run -p aura-cli -- --config your-config.toml
 
 By default, cross-request session state (A2A tasks, parked HITL approvals) lives in
 process memory — correct for a single pod, the CLI, and local dev. Behind a load
-balancer with multiple replicas, configure a shared Redis/Valkey backend so A2A
-`message:send` → poll → `list` → history-by-context work no matter which pod serves
-each request, and a conversational HITL approval parked on one pod can be resolved
-by a `POST /v1/approvals/{id}` that lands on any other.
+balancer with multiple replicas, configure a shared Redis/Valkey backend and every
+cross-request flow works no matter which pod serves each request: A2A
+`message:send` → poll → `list` → history-by-context, A2A `subscribe`/`cancel`
+against a task executing on another pod, and conversational HITL approvals
+resolved by a `POST /v1/approvals/{id}` that lands away from the pod that parked
+them.
 
 The session store is deployment infrastructure — one instance per server, not
 per-agent — so it is configured **only via environment variables**, never in agent
@@ -399,9 +401,9 @@ The server pings the backend at startup and fails fast if it is unreachable;
 `/health` reports the backend and its ping latency.
 
 The Redis backend requires building with the `session-store-redis` cargo feature
-(`cargo build --release --features aura-web-server/session-store-redis`). The in-memory
-backend is always available. A2A streaming/cancel are not yet cross-pod (see
-`docs/design/session-storage.md` for the roadmap).
+(`cargo build --release --features aura-web-server/session-store-redis`). The
+in-memory backend is always available. See `docs/design/session-storage.md` for
+the design and Helm packaging roadmap.
 
 ### Orchestration
 

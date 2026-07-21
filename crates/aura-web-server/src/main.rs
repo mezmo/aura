@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
-use aura_web_server::a2a::{AuraAgentExecutor, AuraRequestHandler, SharedTaskStore};
+use aura_web_server::a2a::{
+    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore,
+};
 use aura_web_server::handlers;
 use aura_web_server::session_store::{SessionStore, build_session_store};
 use aura_web_server::streaming;
@@ -331,7 +333,14 @@ async fn run() -> std::io::Result<()> {
         let executor = AuraAgentExecutor::new(app_state.clone(), task_store.clone());
         let base_url = advertised_base_url(args.server_url.as_deref(), &args.host, args.port);
         let agent_card = executor.build_agent_card(&base_url);
-        let a2a_handler = Arc::new(AuraRequestHandler::new(executor, task_store));
+        // Bridge execution events and cancels over the session-store bus so
+        // subscribe/cancel work across instances.
+        let executor = BusBridgedExecutor::new(executor, session_store.bus());
+        let a2a_handler = Arc::new(AuraRequestHandler::new(
+            executor,
+            task_store,
+            session_store.bus(),
+        ));
         let card_producer = Arc::new(StaticAgentCard::new(agent_card));
         let a2a_router = Router::new()
             .nest(

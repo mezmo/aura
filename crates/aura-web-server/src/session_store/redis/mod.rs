@@ -1,11 +1,11 @@
 //! Redis/Valkey session-store backend.
 //!
-//! Phases 2 and 3 of `docs/design/session-storage.md` §11: the A2A task store
-//! ([`task_store`]), the HITL approval store ([`approval_store`]), and the
-//! event bus ([`event_bus`]) are all Redis-backed, so A2A send/poll/list and
-//! conversational approvals work across instances. A2A streaming/cancel stay
-//! instance-anchored until phase 4. Each submodule documents its own key schema
-//! under the configured `key_prefix`.
+//! The A2A task store ([`task_store`]), the HITL approval store
+//! ([`approval_store`]), and the event bus ([`event_bus`]) are all
+//! Redis-backed, so A2A send/poll/list, conversational approvals, and —
+//! through `crate::a2a`'s bus bridge — A2A streaming/subscribe/cancel all
+//! work across instances. Each submodule documents its own key schema under
+//! the configured `key_prefix`. See `docs/design/session-storage.md`.
 
 mod approval_store;
 mod event_bus;

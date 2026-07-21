@@ -24,11 +24,15 @@ feature, and `RedisSessionStore`/`RedisTaskStore`
 event bus) is implemented:** `RedisApprovalStore` persists approvals as
 `ParkedApprovalRecord` (`aura::session_store::record`, the round-trippable storage
 projection — the domain types stay deliberately unserializable), and
-`RedisEventBus` carries decision wakes over pub/sub (§6.1). With
-`backend = "redis"`, A2A send/poll/list/history and conversational HITL approvals
-are cross-pod; A2A streaming/cancel stay pod-anchored until phase 4. Helm wiring
-(§10, phase 5) is not built yet. References to existing aura code (file:line,
-module paths) are where-to-look pointers and move as the code does.
+`RedisEventBus` carries decision wakes over pub/sub (§6.1). **Phase 4 (A2A
+streaming/cancel over the bus) is implemented:** `BusBridgedExecutor` and the
+`subscribe_to_task` bus relay (`crates/aura-web-server/src/a2a/bus_bridge.rs`,
+§6.2) fan execution events out over `a2a:task:{id}` and route cancels over
+`a2a:cancel:{id}`. With `backend = "redis"`, every A2A flow — send, poll, list,
+history, stream, subscribe, cancel — and conversational HITL approvals are
+cross-pod. Helm wiring (§10, phase 5) is not built yet. References to existing
+aura code (file:line, module paths) are where-to-look pointers and move as the
+code does.
 
 **Goal of iteration 1:** make the state AURA _already has_ work across pods, so a
 load-balanced multi-replica deployment (Helm prod runs 3–10 replicas, no session
@@ -346,6 +350,22 @@ TTL as a backstop so an abandoned parking pod's entry self-cleans.
   With the shared `TaskStore` and these two topics, **every** A2A flow — send, poll, list,
   history, stream, subscribe, cancel — is cross-pod. No session affinity is needed.
 
+  Implementation (phase 4, `crates/aura-web-server/src/a2a/bus_bridge.rs`): the
+  upstream handler's execution registry is process-local and not pluggable, so the
+  bridge composes around it — `BusBridgedExecutor` wraps the agent executor
+  (publishing every event to `a2a:task:{id}` and hosting the per-execution
+  routed-cancel listener), and `AuraRequestHandler::subscribe_to_task` falls back
+  to a relay (store snapshot frame, then live bus frames, terminal-event ends the
+  stream — the same shape as the upstream local subscription) when the upstream
+  handler reports no local execution. The relay periodically re-checks the store
+  so a subscriber of a task whose owning pod died still converges on the terminal
+  state. A cancel always publishes the routed copy and then runs the local cancel:
+  the pod that received the cancel writes the terminal status to the shared store,
+  the owning pod's listener only stops the execution. Missing/terminal tasks stay
+  `task_not_found` on subscribe, matching upstream single-pod behavior. Accepted
+  race, bounded by bus latency: an execution that completes while a routed cancel
+  is in flight can record `Completed` over `Canceled`.
+
 ---
 
 ## 7. Reference implementation — Redis / Valkey
@@ -367,8 +387,8 @@ default `aura`), so multiple AURA deployments can share a cluster.
 | `{p}:a2a:task:{task_id}`          | hash (`version`, `task` as JSON)      | A2A task record + version counter      | configurable (e.g. 24h)  |
 | `{p}:a2a:ctx:{context_id}`        | set of `task_id`                      | history + `list` by context            | same as task             |
 | `{p}:a2a:tasks`                   | set of `task_id`                      | `list` without a `context_id` filter   | same as task             |
-| `{p}:bus:a2a:task:{task_id}`      | pub/sub channel (phase 4)             | streaming fan-out to subscribers       | —                        |
-| `{p}:bus:a2a:cancel:{task_id}`    | pub/sub channel (phase 4)             | route `cancel` to the pod running it   | —                        |
+| `{p}:bus:a2a:task:{task_id}`      | pub/sub channel                       | streaming fan-out to subscribers       | —                        |
+| `{p}:bus:a2a:cancel:{task_id}`    | pub/sub channel                       | route `cancel` to the pod running it   | —                        |
 
 Notes:
 
@@ -486,9 +506,13 @@ behind `PendingApprovals` gains the store/bus handles.
    `ParkedApprovalRecord` with `GETDEL` at-most-once resolve, `RedisEventBus`
    (single pub/sub connection per pod, dispatcher with refcounted topic registry)
    carrying decision wakes. Fail-closed preserved.
-4. **A2A streaming/cancel over the bus.** Cross-pod `message:stream` / `subscribe` /
-   `cancel` via the `a2a:task:{id}` (fan-out) and `a2a:cancel:{id}` (routed cancel) topics.
-   Depends on the shared task store (phase 2) and the `EventBus` impl (phase 3).
+4. **A2A streaming/cancel over the bus.** ✅ **Implemented (2026-07-21).** Cross-pod
+   `message:stream` / `subscribe` / `cancel` via the `a2a:task:{id}` (fan-out) and
+   `a2a:cancel:{id}` (routed cancel) topics: `BusBridgedExecutor` wraps the agent
+   executor to publish every execution event and host the routed-cancel listener,
+   and `subscribe_to_task` falls back to a store-snapshot + bus relay when the
+   execution lives on another pod. Depends on the shared task store (phase 2) and
+   the `EventBus` impl (phase 3).
 5. **Helm/Valkey packaging + docs.** Values, Secret wiring, `/health`, runbook.
 
 Each phase is a self-contained issue/PR. Phase 1 is the prerequisite for everything else;
