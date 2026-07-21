@@ -49,6 +49,7 @@ mod frame_validation_tests;
 mod observer_wrapper;
 mod orchestrator;
 mod overview;
+pub mod park;
 mod persistence;
 pub(crate) mod persistence_wrapper;
 mod prompt_constants;
@@ -81,6 +82,6 @@ pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub use prompt_constants::{context, fields, sections};
 pub use types::{
-    Plan, PlanningResponse, RunId, StepInput, StructuredTaskOutput, Task, TaskIdentity, TaskJson,
-    TaskState, TaskStatus,
+    FailureCategory, IterationTimings, Plan, PlanningResponse, RunId, StepInput,
+    StructuredTaskOutput, Task, TaskIdentity, TaskJson, TaskState, TaskStatus,
 };
