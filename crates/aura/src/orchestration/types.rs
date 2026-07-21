@@ -177,7 +177,7 @@ fn flatten_one(
 ///
 /// The coordinator creates a plan by analyzing the user's query and
 /// breaking it down into discrete, actionable tasks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     /// The original goal/query being addressed.
     pub goal: String,
@@ -309,7 +309,7 @@ impl Plan {
 }
 
 /// A discrete task within a plan.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Task {
     /// Unique identifier for this task.
     pub id: usize,
@@ -405,7 +405,7 @@ impl<'de> Deserialize<'de> for Task {
 
 /// Structured metadata from `submit_result`, collapsed into a single optional
 /// to eliminate invalid states (e.g., confidence without summary).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuredTaskOutput {
     pub summary: String,
     pub confidence: super::tools::submit_result::Confidence,
@@ -513,7 +513,7 @@ pub enum FailureCategory {
 /// Rich state of a task, making invalid states unrepresentable.
 ///
 /// Use pattern matching or `matches!()` for boolean checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TaskState {
     Pending,
     Running,
@@ -1084,7 +1084,7 @@ fn truncate_reasoning(s: &str, max_chars: usize) -> String {
 
 /// Phase-level wall-clock timings for one orchestration iteration, in
 /// milliseconds.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct IterationTimings {
     /// Prompt → plan created.
     pub planning_ms: u64,
