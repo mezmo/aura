@@ -1,14 +1,15 @@
-//! Pluggable cross-pod session-state capabilities: a durable store for parked
+//! Pluggable cross-instance session-state capabilities: a durable store for parked
 //! HITL approvals and a pub/sub event bus.
 //!
 //! The in-memory implementations are the default; a networked backend (e.g.
-//! Redis/Valkey) implements the same traits to make a load-balanced multi-pod
+//! Redis/Valkey) implements the same traits to make a load-balanced multi-instance
 //! deployment behave like one process.
 //!
 //! See `docs/design/session-storage.md` and
 //! `docs/adr/2026-07-08-session-storage.md`.
 
 mod memory;
+mod record;
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use futures::Stream;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
+pub use record::{InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 
 /// A fault in the backing session-store/bus backend.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -40,6 +42,9 @@ pub enum SessionStoreError {
     /// A request to an established backend failed.
     #[error("session store request failed: {reason}")]
     Request { reason: String },
+    /// A stored record failed to decode.
+    #[error("session store record failed to decode: {reason}")]
+    Decode { reason: String },
 }
 
 /// Durable storage for parked conversational HITL approvals, over the
@@ -72,7 +77,7 @@ pub trait ApprovalStore: Send + Sync {
 /// The payload stream returned by [`EventBus::subscribe`].
 pub type Subscription = Pin<Box<dyn Stream<Item = Bytes> + Send>>;
 
-/// Cross-pod pub/sub.
+/// Cross-instance pub/sub.
 ///
 /// Payloads are opaque bytes; topic naming and payload encoding belong to the
 /// publishing subsystem.

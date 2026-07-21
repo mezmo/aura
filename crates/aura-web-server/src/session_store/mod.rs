@@ -1,5 +1,5 @@
 //! The session-store factory: one backend handing out the capability handles
-//! for cross-pod session state ([`ApprovalStore`] and [`EventBus`] from
+//! for cross-instance session state ([`ApprovalStore`] and [`EventBus`] from
 //! `aura::session_store`, plus the upstream `a2a_server::TaskStore`).
 //!
 //! See `docs/design/session-storage.md` and
@@ -20,7 +20,7 @@ use aura_config::{SessionStoreBackend, SessionStoreConfig};
 #[cfg(feature = "session-store-redis")]
 pub use redis::RedisSessionStore;
 
-/// A pluggable backend for cross-pod session state, handing out one handle
+/// A pluggable backend for cross-instance session state, handing out one handle
 /// per capability.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
@@ -33,7 +33,7 @@ pub trait SessionStore: Send + Sync {
     /// Durable A2A tasks (the upstream `a2a_server::TaskStore` trait).
     fn tasks(&self) -> Arc<dyn TaskStore>;
 
-    /// Allows for cross-pod pub/sub (in-memory SessionStore would be single-pod only).
+    /// Allows for cross-instance pub/sub (in-memory SessionStore would be single-instance only).
     fn bus(&self) -> Arc<dyn EventBus>;
 
     /// Cheap liveness check.
@@ -60,7 +60,7 @@ pub async fn build_session_store(
 }
 
 /// The default backend: every capability is process-local, so state is scoped
-/// to one pod.
+/// to one process.
 pub struct InMemorySessionStore {
     approvals: Arc<InMemoryApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,

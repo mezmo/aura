@@ -511,25 +511,25 @@ mod tests {
         assert!(parked.registered_at <= after);
     }
 
-    /// The cross-pod seam: two registries (as two pods) sharing one store and
+    /// The cross-instance seam: two registries (as two instances) sharing one store and
     /// bus. An approval parked on one is resolved through the other, and the
     /// parking side's await wakes.
     #[tokio::test(start_paused = true)]
     async fn resolve_on_shared_backend_wakes_other_registry() {
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
-        let pod_a = PendingApprovals::with_backend(store.clone(), bus.clone());
-        let pod_b = PendingApprovals::with_backend(store, bus);
+        let instance_a = PendingApprovals::with_backend(store.clone(), bus.clone());
+        let instance_b = PendingApprovals::with_backend(store, bus);
         let cancel = RequestCancelToken::unbound();
 
         let req = test_request("req-cross");
         let id = req.decision_id;
-        let handle = pod_a.register(req, Duration::from_secs(60)).await;
+        let handle = instance_a.register(req, Duration::from_secs(60)).await;
 
-        pod_b
+        instance_b
             .resolve(&id, ApprovalDecision::Approved)
             .await
-            .expect("resolve on the other pod succeeds");
+            .expect("resolve on the other instance succeeds");
 
         assert_eq!(
             handle.outcome(&cancel).await,

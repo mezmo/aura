@@ -1,4 +1,4 @@
-//! Session-store configuration: which cross-pod session-state backend the
+//! Session-store configuration: which cross-instance session-state backend the
 //! server uses and how to reach it (when not in-memory).
 //!
 //! Configured **only via environment variables** — never in agent TOML files.
@@ -25,7 +25,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SessionStoreBackend {
-    /// Process-local state (single-pod behavior).
+    /// Process-local state (single-instance behavior).
     #[default]
     Memory,
     /// Redis/Valkey-backed shared state.
@@ -59,7 +59,7 @@ impl std::str::FromStr for SessionStoreBackend {
 /// The effective session-store configuration for one server deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SessionStoreConfig {
-    /// Process-local state (single-pod behavior).
+    /// Process-local state (single-instance behavior).
     #[default]
     Memory,
     /// Redis/Valkey-backed shared state.

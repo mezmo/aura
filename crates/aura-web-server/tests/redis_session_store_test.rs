@@ -14,9 +14,19 @@
 //! Each test namespaces its keys under a unique prefix with a short TTL, so
 //! tests neither collide nor leave state behind.
 
+use std::time::Duration;
+
 use a2a::{ListTasksRequest, Message, Part, Role, Task, TaskState, TaskStatus};
+use aura::hitl::{
+    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalOutcome, ApprovalRequest,
+    DecisionId, PROTOCOL_VERSION, ParkedApproval, PendingApprovals, ResolveError,
+};
+use aura::request_cancellation::RequestCancelToken;
+use aura::session_store::ParkedApprovalRecord;
 use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
 use aura_web_server::session_store::{RedisSessionStore, SessionStore};
+use bytes::Bytes;
+use futures_util::StreamExt;
 
 fn redis_url() -> String {
     std::env::var("AURA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
@@ -263,24 +273,28 @@ async fn list_truncates_history_to_newest() {
     assert_eq!(resp.tasks[0].history.as_ref().unwrap().len(), 1);
 }
 
-/// Cross-pod simulation (§12): two independent backend handles sharing one
-/// Redis — a task created through "pod A" is visible to "pod B" by get, list,
+/// Cross-instance simulation (§12): two independent backend handles sharing one
+/// Redis — a task created through "instance A" is visible to "instance B" by get, list,
 /// and history-by-context, and B can update it.
 #[tokio::test]
-async fn task_created_on_one_pod_is_visible_and_updatable_on_another() {
+async fn task_created_on_one_instance_is_visible_and_updatable_on_another() {
     let config = test_config(60);
-    let pod_a = connect(&config).await.tasks();
-    let pod_b = connect(&config).await.tasks();
+    let instance_a = connect(&config).await.tasks();
+    let instance_b = connect(&config).await.tasks();
 
     let mut task = make_task("t1", "ctx-shared", TaskState::Working);
     task.history = Some(vec![Message::new(Role::User, vec![Part::text("q")])]);
-    pod_a.create(task).await.unwrap();
+    instance_a.create(task).await.unwrap();
 
-    let got = pod_b.get("t1").await.unwrap().expect("pod B cannot see t1");
+    let got = instance_b
+        .get("t1")
+        .await
+        .unwrap()
+        .expect("instance B cannot see t1");
     assert_eq!(got.status.state, TaskState::Working);
     assert_eq!(got.history.as_ref().unwrap().len(), 1);
 
-    let by_ctx = pod_b
+    let by_ctx = instance_b
         .list(&ListTasksRequest {
             context_id: Some("ctx-shared".to_string()),
             ..list_req()
@@ -289,12 +303,12 @@ async fn task_created_on_one_pod_is_visible_and_updatable_on_another() {
         .unwrap();
     assert_eq!(by_ctx.total_size, 1);
 
-    let v2 = pod_b
+    let v2 = instance_b
         .update(make_task("t1", "ctx-shared", TaskState::Completed))
         .await
         .unwrap();
     assert_eq!(v2, 2);
-    let got = pod_a.get("t1").await.unwrap().unwrap();
+    let got = instance_a.get("t1").await.unwrap().unwrap();
     assert_eq!(got.status.state, TaskState::Completed);
 }
 
@@ -313,4 +327,275 @@ async fn expired_task_is_gone_and_pruned_from_list() {
     assert!(tasks.get("t1").await.unwrap().is_none());
     let resp = tasks.list(&list_req()).await.unwrap();
     assert_eq!(resp.total_size, 0);
+}
+
+// ---------------------------------------------------------------------------
+// HITL approval store
+// ---------------------------------------------------------------------------
+
+fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
+    let now = chrono::Utc::now();
+    ParkedApproval {
+        request: ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: request_id.to_string(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "kubectl_*".to_string(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "kubectl_delete".to_string(),
+                arguments: serde_json::json!({"pod": "web-1"}),
+            }],
+        },
+        registered_at: now,
+        expires_at: now + chrono::Duration::from_std(ttl).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn approval_register_get_roundtrip_preserves_record() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+
+    let parked = make_parked("req-1", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    let expected = ParkedApprovalRecord::from(&parked);
+    instance_a.register(parked).await.unwrap();
+
+    let restored = instance_b
+        .get(&id)
+        .await
+        .unwrap()
+        .expect("instance B sees approval");
+    assert_eq!(ParkedApprovalRecord::from(&restored), expected);
+}
+
+#[tokio::test]
+async fn approval_resolve_is_at_most_once_across_instances() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+
+    let parked = make_parked("req-2", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    instance_a.register(parked).await.unwrap();
+
+    instance_b
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .expect("first resolve wins");
+    assert_eq!(
+        instance_a.resolve(&id, ApprovalDecision::Approved).await,
+        Err(ResolveError::NotFound)
+    );
+    assert!(instance_a.get(&id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn approval_concurrent_resolves_have_exactly_one_winner() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+
+    let parked = make_parked("req-3", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    instance_a.register(parked).await.unwrap();
+
+    let (a, b) = tokio::join!(
+        instance_a.resolve(&id, ApprovalDecision::Approved),
+        instance_b.resolve(&id, ApprovalDecision::Approved),
+    );
+    assert_eq!(
+        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one resolver must win: {a:?} / {b:?}"
+    );
+}
+
+#[tokio::test]
+async fn approval_remove_makes_resolve_not_found() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-4", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+
+    approvals.remove(&id).await.unwrap();
+
+    assert_eq!(
+        approvals.resolve(&id, ApprovalDecision::Approved).await,
+        Err(ResolveError::NotFound)
+    );
+}
+
+#[tokio::test]
+async fn approval_cancel_request_removes_only_matching() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let cancel = make_parked("req-cancel", Duration::from_secs(60));
+    let keep = make_parked("req-keep", Duration::from_secs(60));
+    let cancel_id = cancel.request.decision_id;
+    let keep_id = keep.request.decision_id;
+    approvals.register(cancel).await.unwrap();
+    approvals.register(keep).await.unwrap();
+
+    approvals.cancel_request("req-cancel").await.unwrap();
+
+    assert!(approvals.get(&cancel_id).await.unwrap().is_none());
+    assert!(approvals.get(&keep_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn approval_expires_with_its_record_ttl() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-ttl", Duration::from_secs(1));
+    let id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+
+    assert!(approvals.get(&id).await.unwrap().is_none());
+    assert_eq!(
+        approvals.resolve(&id, ApprovalDecision::Approved).await,
+        Err(ResolveError::NotFound)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Event bus (phase 3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bus_delivers_across_instances() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.bus();
+    let instance_b = connect(&config).await.bus();
+
+    let mut sub = instance_a.subscribe("topic-x").await.unwrap();
+    instance_b
+        .publish("topic-x", Bytes::from_static(b"hello"))
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("delivery within 5s")
+        .expect("stream open");
+    assert_eq!(payload, Bytes::from_static(b"hello"));
+}
+
+#[tokio::test]
+async fn bus_fans_out_to_all_subscribers() {
+    let config = test_config(60);
+    let bus = connect(&config).await.bus();
+
+    let mut sub_a = bus.subscribe("topic-fan").await.unwrap();
+    let mut sub_b = bus.subscribe("topic-fan").await.unwrap();
+    bus.publish("topic-fan", Bytes::from_static(b"payload"))
+        .await
+        .unwrap();
+
+    for sub in [&mut sub_a, &mut sub_b] {
+        let payload = tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("delivery within 5s")
+            .expect("stream open");
+        assert_eq!(payload, Bytes::from_static(b"payload"));
+    }
+}
+
+#[tokio::test]
+async fn bus_topics_are_independent() {
+    let config = test_config(60);
+    let bus = connect(&config).await.bus();
+
+    let mut sub_a = bus.subscribe("topic-a").await.unwrap();
+    let mut sub_b = bus.subscribe("topic-b").await.unwrap();
+    bus.publish("topic-a", Bytes::from_static(b"for-a"))
+        .await
+        .unwrap();
+    bus.publish("topic-b", Bytes::from_static(b"for-b"))
+        .await
+        .unwrap();
+
+    let a = tokio::time::timeout(Duration::from_secs(5), sub_a.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let b = tokio::time::timeout(Duration::from_secs(5), sub_b.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(a, Bytes::from_static(b"for-a"));
+    assert_eq!(b, Bytes::from_static(b"for-b"));
+}
+
+#[tokio::test]
+async fn bus_publish_without_subscribers_is_ok() {
+    let bus = connect(&test_config(60)).await.bus();
+    bus.publish("nobody-home", Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+}
+
+/// Deployments with different key prefixes sharing one Redis must not hear
+/// each other's topics.
+#[tokio::test]
+async fn bus_prefixes_isolate_deployments() {
+    let config_a = test_config(60);
+    let config_b = test_config(60);
+    let instance_a = connect(&config_a).await.bus();
+    let instance_b = connect(&config_b).await.bus();
+
+    let mut sub = instance_a.subscribe("topic-shared").await.unwrap();
+    instance_b
+        .publish("topic-shared", Bytes::from_static(b"other-deployment"))
+        .await
+        .unwrap();
+    instance_a
+        .publish("topic-shared", Bytes::from_static(b"same-deployment"))
+        .await
+        .unwrap();
+
+    let payload = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("delivery within 5s")
+        .expect("stream open");
+    assert_eq!(payload, Bytes::from_static(b"same-deployment"));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-instance approval wake (phase 3, full stack: §6.1)
+// ---------------------------------------------------------------------------
+
+/// The §6.1 flow over live Redis: an approval parked through one instance's
+/// registry is resolved through another instance's registry, and the parking instance's
+/// suspended await wakes with the decision.
+#[tokio::test]
+async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
+    let config = test_config(60);
+    let store_a = connect(&config).await;
+    let store_b = connect(&config).await;
+    let instance_a = PendingApprovals::with_backend(store_a.approvals(), store_a.bus());
+    let instance_b = PendingApprovals::with_backend(store_b.approvals(), store_b.bus());
+    let cancel = RequestCancelToken::unbound();
+
+    let parked = make_parked("req-cross", Duration::from_secs(30));
+    let request = parked.request;
+    let id = request.decision_id;
+    let handle = instance_a.register(request, Duration::from_secs(30)).await;
+
+    instance_b
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .expect("resolve through the other instance succeeds");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.outcome(&cancel))
+        .await
+        .expect("wake must arrive well before the approval timeout");
+    assert_eq!(
+        outcome,
+        ApprovalOutcome::Decided(ApprovalDecision::Approved)
+    );
 }
