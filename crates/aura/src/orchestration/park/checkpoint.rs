@@ -124,17 +124,17 @@ impl CheckpointEnvelope {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) const TEST_RUN_ID: &str = "018f9d2e-7c3a-7000-8000-000000000271";
+#[cfg(test)]
+pub(crate) const TEST_SESSION_ID: &str = "018f9d2e-7c3a-7000-8000-0000000000aa";
 
-    const GOLDEN_V1: &str = include_str!("testdata/checkpoint-v1.json");
-    const GOLDEN_RUN_ID: &str = "018f9d2e-7c3a-7000-8000-000000000271";
-    const GOLDEN_SESSION_ID: &str = "018f9d2e-7c3a-7000-8000-0000000000aa";
-
-    fn minimal_checkpoint() -> RunCheckpoint {
+#[cfg(test)]
+impl RunCheckpoint {
+    /// Minimal fixture matching `testdata/checkpoint-v1.json`.
+    pub(crate) fn test_minimal() -> Self {
         RunCheckpoint {
-            run_id: GOLDEN_RUN_ID.parse().expect("valid uuid"),
-            session_id: SessionId::parse(GOLDEN_SESSION_ID).expect("valid uuid"),
+            run_id: TEST_RUN_ID.parse().expect("valid uuid"),
+            session_id: SessionId::parse(TEST_SESSION_ID).expect("valid uuid"),
             chat_session_id: Some(ChatSessionId::new("cs_golden")),
             config_fingerprint: ConfigFingerprint::new("cfg-digest"),
             original_query: "original query".to_string(),
@@ -158,10 +158,17 @@ mod tests {
             timings: IterationTimings::default(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GOLDEN_V1: &str = include_str!("testdata/checkpoint-v1.json");
 
     #[test]
     fn checkpoint_envelope_round_trips() {
-        let envelope = CheckpointEnvelope::new(minimal_checkpoint());
+        let envelope = CheckpointEnvelope::new(RunCheckpoint::test_minimal());
         let encoded = envelope.to_json().expect("encodes");
         let decoded = CheckpointEnvelope::from_json(&encoded).expect("decodes");
         assert_eq!(decoded.schema_version, CHECKPOINT_SCHEMA_VERSION);
@@ -175,11 +182,8 @@ mod tests {
     fn golden_v1_fixture_parses() {
         let envelope = CheckpointEnvelope::from_json(GOLDEN_V1).expect("v1 stays readable");
         assert_eq!(envelope.schema_version, 1);
-        assert_eq!(envelope.checkpoint.run_id.to_string(), GOLDEN_RUN_ID);
-        assert_eq!(
-            envelope.checkpoint.session_id.to_string(),
-            GOLDEN_SESSION_ID
-        );
+        assert_eq!(envelope.checkpoint.run_id.to_string(), TEST_RUN_ID);
+        assert_eq!(envelope.checkpoint.session_id.to_string(), TEST_SESSION_ID);
         assert_eq!(envelope.checkpoint.original_query, "original query");
         assert_eq!(envelope.checkpoint.plan.goal, "golden goal");
         assert_eq!(
@@ -189,11 +193,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_future_schema_version_rejected() {
-        let future = GOLDEN_V1.replacen("\"schema_version\": 1", "\"schema_version\": 999", 1);
-        assert_ne!(future, GOLDEN_V1, "fixture must contain the version field");
+    fn unknown_future_schema_version_rejected_before_body_decode() {
+        // The body is deliberately not a valid checkpoint of any known
+        // shape: the version gate must fire before body decoding, so the
+        // error is UnknownSchemaVersion, never a serde failure.
+        let future = r#"{"schema_version": 999, "checkpoint": {"shape": "from the future"}}"#;
         assert!(matches!(
-            CheckpointEnvelope::from_json(&future),
+            CheckpointEnvelope::from_json(future),
             Err(CheckpointCodecError::UnknownSchemaVersion {
                 found: 999,
                 supported: CHECKPOINT_SCHEMA_VERSION,

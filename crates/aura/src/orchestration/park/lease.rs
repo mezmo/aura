@@ -25,6 +25,10 @@ impl FencingGeneration {
 }
 
 /// Exclusive session ownership held by one [`super::AgentInstance`].
+///
+/// `generation` is the fencing token issued to the holder; while the lease
+/// is held it always equals the record's current generation (fenced
+/// mutations rewrite both in the same commit).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lease {
     pub holder: AgentInstanceId,
@@ -37,12 +41,16 @@ pub struct Lease {
 /// A rejected session mutation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CasError {
-    /// The presented generation is older than the record's current one: a
-    /// newer owner exists and the caller must not mutate.
-    StaleGeneration {
+    /// The presented generation is not exactly the record's current one.
+    /// Older means a newer owner exists; newer means a token the record
+    /// never issued. Both must be rejected.
+    GenerationMismatch {
         presented: FencingGeneration,
         current: FencingGeneration,
     },
     /// The generation was current but the run FSM rejected the event.
     Illegal(IllegalTransition),
+    /// The record's state does not admit the operation (for example,
+    /// parking a session whose run is not `Running`).
+    StateMismatch { actual: &'static str },
 }
