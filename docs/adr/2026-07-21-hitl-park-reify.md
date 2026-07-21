@@ -101,11 +101,15 @@ out of scope until evidence shows re-execution cost matters.
 The durable run FSM lives in the session store, schema-versioned:
 
 ```text
-Created -> Running -> Parked { reason, resume_point, parked_at, expires_at }
+Created -> Running -> Parked { reason, parked_at, expires_at, checkpoint }
 Parked  -> Running            (reify, on a durable wake reason)
 Running -> Completed | Failed { cause } | Cancelled
 Parked  -> Failed { cause }   (every non-human exit; fail-closed)
 ```
+
+The `Parked` state carries its checkpoint (the resume point lives inside
+it), so a parked record without a checkpoint is unrepresentable rather
+than merely forbidden.
 
 Terminals stay at three. **Expiry is a failure cause, not a fourth terminal**:
 the reaper terminalizes an expired park as `Failed { cause: ParkExpired }`.
@@ -167,8 +171,9 @@ protocol, and #325's backend needs one contract to implement.
 ### 7. Atomic checkpoint
 
 Park commits one versioned `RunCheckpoint` blob in a single CAS transition
-`Running -> Parked`. No scattered writes; a reader sees the old state or the
-complete checkpoint. The checkpoint embeds the completed-task outputs future
+`Running -> Parked`; the checkpoint is embedded in the `Parked` state, so
+the transition and the blob are one value and one write. No scattered
+writes; a reader sees the old state or the complete checkpoint. The checkpoint embeds the completed-task outputs future
 DAG waves need. Pod-local references (artifact paths, scratchpad pointers)
 are carried explicitly; reify on a pod that cannot resolve them refuses
 rather than resuming with silent gaps.

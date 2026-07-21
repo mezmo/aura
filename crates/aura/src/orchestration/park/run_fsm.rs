@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::hitl::{DecisionId, Timestamp};
 use crate::orchestration::types::RunId;
 
+use super::checkpoint::CheckpointEnvelope;
 use super::non_empty::NonEmpty;
 
 /// Durable run state, persisted in the session store. Terminals stay at
@@ -15,11 +16,14 @@ use super::non_empty::NonEmpty;
 pub enum RunState {
     Created,
     Running,
+    /// Carries its checkpoint: a parked state without one is not
+    /// representable, in the FSM or in storage (ADR decision 7). The
+    /// resume point lives inside the checkpoint.
     Parked {
         reason: ParkReason,
-        resume_point: ResumePoint,
         parked_at: Timestamp,
         expires_at: Timestamp,
+        checkpoint: Box<CheckpointEnvelope>,
     },
     Completed,
     Failed {
@@ -134,9 +138,11 @@ mod tests {
             reason: ParkReason::ApprovalsBlocked {
                 decisions: NonEmpty::new(vec![decision_id]).unwrap(),
             },
-            resume_point: ResumePoint::WaveBoundary { iteration: 1 },
             parked_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::seconds(300),
+            checkpoint: Box::new(CheckpointEnvelope::new(
+                crate::orchestration::park::checkpoint::RunCheckpoint::test_minimal(),
+            )),
         }
     }
 
