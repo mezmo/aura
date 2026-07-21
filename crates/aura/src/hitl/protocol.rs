@@ -42,7 +42,7 @@ pub struct ApprovalRequest {
 /// Per the design note the spike's per-item `matched_pattern` and `task` are
 /// gone: that information lives on [`ApprovalRequest::origin`] and
 /// [`ApprovalRequest::scope`] respectively.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalItem {
     pub tool_name: String,
     pub arguments: Value,

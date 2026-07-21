@@ -7,7 +7,7 @@ default, one shipped networked backend, store plus event bus as distinct
 capabilities). This note carries the trait method sets, the backend key/topic
 schema, the config and wire formats, the wiring changes, and the phased rollout.
 
-**Status:** living design note, current as of 2026-07-14. The ADR holds the
+**Status:** living design note, current as of 2026-07-20. The ADR holds the
 durable decision. **Phase 1 of §11 (traits + in-memory refactor) is implemented:**
 `aura::session_store` defines `ApprovalStore` and `EventBus` with in-memory impls,
 `PendingApprovals` rides on them (wake handles stay local, decisions travel over the
@@ -18,15 +18,17 @@ bus), and the web server's `SessionStore` factory
 in `aura` so CLI standalone needs no A2A dependency. **Phase 2 (Redis/Valkey A2A
 task store) is implemented:** the env-only config surface (§8, `AURA_SESSION_STORE*`
 variables — agent TOML has no session-store table), the `session-store-redis` cargo
-feature, and
-`RedisSessionStore`/`RedisTaskStore`
-(`crates/aura-web-server/src/session_store/redis.rs`) over the §7 key schema, with
-`/health` reporting the backend and its ping. With `backend = "redis"`, A2A
-send/poll/list/history are cross-pod; HITL approvals and the event bus stay
-process-local until phase 3, and A2A streaming/cancel stay pod-anchored until
-phase 4. `ParkedApproval` serde derives (phase 3) and Helm wiring (§10, phase 5)
-are not built yet. References to existing aura code (file:line, module paths) are
-where-to-look pointers and move as the code does.
+feature, and `RedisSessionStore`/`RedisTaskStore`
+(`crates/aura-web-server/src/session_store/redis/`) over the §7 key schema, with
+`/health` reporting the backend and its ping. **Phase 3 (Redis HITL approvals +
+event bus) is implemented:** `RedisApprovalStore` persists approvals as
+`ParkedApprovalRecord` (`aura::session_store::record`, the round-trippable storage
+projection — the domain types stay deliberately unserializable), and
+`RedisEventBus` carries decision wakes over pub/sub (§6.1). With
+`backend = "redis"`, A2A send/poll/list/history and conversational HITL approvals
+are cross-pod; A2A streaming/cancel stay pod-anchored until phase 4. Helm wiring
+(§10, phase 5) is not built yet. References to existing aura code (file:line,
+module paths) are where-to-look pointers and move as the code does.
 
 **Goal of iteration 1:** make the state AURA _already has_ work across pods, so a
 load-balanced multi-replica deployment (Helm prod runs 3–10 replicas, no session
@@ -268,6 +270,15 @@ Topics (iteration 1):
 - `a2a:cancel:{task_id}` — a `cancel` on any pod publishes here; the pod running the task
   is subscribed and fires its local `CancellationToken`.
 
+Redis bus shape (phase 3): one pub/sub connection per pod, owned by a dispatcher
+task with a refcounted topic registry — Redis multiplexes any number of
+`SUBSCRIBE`s on one connection, and reconnect/re-`SUBSCRIBE` logic then exists
+exactly once (the dispatcher replays its registry after a drop). Channels are
+namespaced `{prefix}:bus:{topic}` so deployments sharing a cluster stay isolated.
+Publishing rides the ordinary command connection. Pub/sub is fire-and-forget:
+payloads published while a pod is reconnecting are lost, and the parking pod's
+fail-closed timeout is the backstop.
+
 ---
 
 ## 6. How each subsystem changes
@@ -345,29 +356,38 @@ both the store and the bus.
 
 ### Key schema (iteration 1)
 
-| Key / channel                    | Type                             | Purpose                                     | TTL                      |
-| -------------------------------- | -------------------------------- | ------------------------------------------- | ------------------------ |
-| `aura:approval:{decision_id}`    | string (JSON `ParkedApproval`)   | parked approval record                      | `expires_at`             |
-| `aura:approval:req:{request_id}` | set of `decision_id`             | `cancel_request` fan-out                    | slightly > route timeout |
-| `approval:{decision_id}`         | pub/sub channel                  | wake the parking pod with the decision      | —                        |
-| `aura:a2a:task:{task_id}`        | hash (`version`, `task` as JSON) | A2A task record + version counter           | configurable (e.g. 24h)  |
-| `aura:a2a:ctx:{context_id}`      | set of `task_id`                 | history + `list` by context                 | same as task             |
-| `aura:a2a:tasks`                 | set of `task_id`                 | `list` without a `context_id` filter        | same as task             |
-| `a2a:task:{task_id}`             | pub/sub channel                  | streaming fan-out to subscribers            | —                        |
-| `a2a:cancel:{task_id}`           | pub/sub channel                  | route `cancel` to the pod running it        | —                        |
+All keys and channels below live under the configured deployment prefix (§8,
+default `aura`), so multiple AURA deployments can share a cluster.
+
+| Key / channel                     | Type                                  | Purpose                                | TTL                      |
+| --------------------------------- | ------------------------------------- | -------------------------------------- | ------------------------ |
+| `{p}:approval:{decision_id}`      | string (JSON `ParkedApprovalRecord`)  | parked approval record                 | `expires_at`             |
+| `{p}:approval:req:{request_id}`   | set of `decision_id`                  | `cancel_request` fan-out               | record TTL + margin      |
+| `{p}:bus:approval:{decision_id}`  | pub/sub channel                       | wake the parking pod with the decision | —                        |
+| `{p}:a2a:task:{task_id}`          | hash (`version`, `task` as JSON)      | A2A task record + version counter      | configurable (e.g. 24h)  |
+| `{p}:a2a:ctx:{context_id}`        | set of `task_id`                      | history + `list` by context            | same as task             |
+| `{p}:a2a:tasks`                   | set of `task_id`                      | `list` without a `context_id` filter   | same as task             |
+| `{p}:bus:a2a:task:{task_id}`      | pub/sub channel (phase 4)             | streaming fan-out to subscribers       | —                        |
+| `{p}:bus:a2a:cancel:{task_id}`    | pub/sub channel (phase 4)             | route `cancel` to the pod running it   | —                        |
 
 Notes:
 
-- `resolve` is a Lua script / `MULTI` so "read-and-delete + record decision" is atomic and
-  at-most-once, matching today's `remove`-on-resolve.
+- Approval records are stored as `ParkedApprovalRecord`
+  (`aura::session_store::record`) — the round-trippable storage projection with
+  stable field/tag names. The domain types stay unserializable so no wire can
+  leak Rust variant names; the SSE/webhook DTOs (`hitl::events`) and the storage
+  record are separately-owned projections.
+- `resolve` is a single atomic `GETDEL`: exactly one resolver takes the record and
+  every later attempt sees `NotFound`, matching today's `remove`-on-resolve
+  at-most-once semantics. (Simpler than the Lua/`MULTI` originally sketched — the
+  decision itself is not persisted, mirroring the in-memory store; it travels
+  over the bus.)
 - Task create/update atomicity (exists-check + `version` bump + record write) is a Lua
   script over the single task hash. The index sets are refreshed after the task write —
   not atomically with it — and every write refreshes both indexes, so a missed index
   entry self-heals on the next update; `list` lazily prunes indexed ids whose task hash
   expired first. Scripts touch one key, so the layout is single-instance/sentinel
   friendly; Redis Cluster would need hash-tagged keys and is out of scope.
-- All keys are namespaced under `aura:` and should carry a deployment/tenant prefix
-  (config, §8) so multiple AURA deployments can share a cluster.
 - Records carry a plain `EXPIRE`-style TTL; no background sweeper needed. The parking
   pod's `await` remains the authoritative timeout.
 
@@ -461,8 +481,11 @@ behind `PendingApprovals` gains the store/bus handles.
 2. **Redis/Valkey backend — A2A task store.** ✅ **Implemented (2026-07-14).**
    Smallest, highest-value cross-pod win (`message:send` + poll works across pods).
    No bus needed for the poll path.
-3. **Redis/Valkey backend — HITL approvals (store + wake bus).** Cross-pod conversational
-   approvals via `approval:{id}` pub/sub. Fail-closed preserved.
+3. **Redis/Valkey backend — HITL approvals (store + wake bus).** ✅ **Implemented
+   (2026-07-20).** Cross-pod conversational approvals: `RedisApprovalStore` over
+   `ParkedApprovalRecord` with `GETDEL` at-most-once resolve, `RedisEventBus`
+   (single pub/sub connection per pod, dispatcher with refcounted topic registry)
+   carrying decision wakes. Fail-closed preserved.
 4. **A2A streaming/cancel over the bus.** Cross-pod `message:stream` / `subscribe` /
    `cancel` via the `a2a:task:{id}` (fan-out) and `a2a:cancel:{id}` (routed cancel) topics.
    Depends on the shared task store (phase 2) and the `EventBus` impl (phase 3).
@@ -501,8 +524,9 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
   fail-closed (safe) but a missed wake wastes the timeout window. Redis **Streams**
   (consumer read-after-write) would make the wake reliable at some complexity cost —
   decide per-subsystem.
-- **At-most-once resolve across pods** must be enforced in the store (Lua/`MULTI`), not in
-  application code, since two `POST /v1/approvals/{id}` could race on different pods.
+- **At-most-once resolve across pods** must be enforced in the store (the atomic
+  `GETDEL`), not in application code, since two `POST /v1/approvals/{id}` could race on
+  different pods.
 - **Register faults: fail fast vs park-and-time-out.** `PendingApprovals::register` is
   infallible: store/bus faults are warn-logged and the call parks anyway, failing closed at
   its timeout. Safe, but when `subscribe` fails the park is _provably_ unwakeable at
@@ -514,18 +538,21 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
   their first poll, so the pair runs without a yield point and cannot be interrupted.
   With a networked backend, the resolving request can be dropped between the two calls
   (client disconnect mid-await) — decision consumed, wake never published, parked side
-  fails closed at its timeout. Phase 3: shield the store+publish pair in a spawned task,
-  or accept and document the window.
+  fails closed at its timeout. Phase 3 accepts and documents this window (the Redis bus
+  module doc): pub/sub is fire-and-forget end to end, and the fail-closed timeout is the
+  single backstop for every lost-wake path.
 - **Teardown latency behind store I/O.** The request `Drop` guard cancels wake handles
   synchronously (`cancel_request_local`), but the spawned cleanup task awaits
   `ApprovalStore::cancel_request` before `RequestCancellation::unregister` and the
   event-broker unsubscribes run. A slow networked store stretches that tail cleanup —
-  bound store calls with client-side timeouts when picking the phase-3 driver config.
+  bounded in phase 3 by the `ConnectionManager`'s response timeout (set from the
+  configured connect timeout), which caps every store command client-side.
 - **Trace context across the bus.** Bus payloads carry no OTel trace context, so on a
   cross-pod resolve the parking pod's wake cannot link to the resolving request's trace
   (in-process, the wake task is instrumented with the registering request's span). Phase 3
-  should decide whether decision payloads carry W3C `traceparent` for span links, or the
-  two traces stay correlated only by `decision_id` attributes.
+  decision: payloads stay plain `ApprovalDecision` JSON; the two traces correlate by
+  `decision_id` attributes only. Carrying W3C `traceparent` for span links remains a
+  possible later extension of the payload format.
 - **Surfacing swallowed backend faults.** The warn-only paths (`register` store/bus faults,
   `resolve` publish failure, `Drop`-guard cleanup failures) are unreachable with the
   in-memory backend but become real operational signals in phase 3 — add metrics/counters

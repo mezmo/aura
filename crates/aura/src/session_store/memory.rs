@@ -69,7 +69,7 @@ impl ApprovalStore for InMemoryApprovalStore {
     }
 }
 
-/// A local `tokio::broadcast` registry keyed by topic. Single-pod pub/sub:
+/// A local `tokio::broadcast` registry keyed by topic. Single-instance pub/sub:
 /// publish and subscribe never leave the process.
 #[derive(Default)]
 pub struct InMemoryEventBus {

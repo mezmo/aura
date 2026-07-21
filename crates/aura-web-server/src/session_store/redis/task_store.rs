@@ -1,10 +1,5 @@
-//! Redis/Valkey session-store backend.
-//!
-//! Phase 2 of `docs/design/session-storage.md` §11: the A2A task store is
-//! Redis-backed, so `message:send` → poll → `list` → history-by-`context_id`
-//! work across pods. HITL approvals and the event bus remain the process-local
-//! in-memory implementations until phase 3, so with this backend a
-//! conversational approval still resolves only on the pod that parked it.
+//! Redis-backed A2A task store: `message:send` → poll → `list` →
+//! history-by-`context_id` work across instances.
 //!
 //! Key schema (all under the configured `key_prefix`, default `aura`):
 //!
@@ -21,20 +16,13 @@
 //! hash-tagged keys and is out of scope.
 
 use std::num::NonZeroU64;
-use std::sync::Arc;
 
 use a2a::{A2AError, ListTasksRequest, ListTasksResponse, Task};
 use a2a_server::TaskStore;
 use a2a_server::task_store::TaskVersion;
 use async_trait::async_trait;
-use aura::session_store::{
-    ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
-};
-use aura_config::{RedisSessionStoreConfig, SessionStoreBackend};
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
-use redis::{AsyncCommands, Client, Script};
-
-use super::SessionStore;
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, Script};
 
 /// Insert the task hash only if absent (at-most-once create).
 /// KEYS[1] = task key; ARGV[1] = task JSON; ARGV[2] = TTL secs (0 = none).
@@ -63,81 +51,6 @@ if tonumber(ARGV[2]) > 0 then
 end
 return v
 ";
-
-pub struct RedisSessionStore {
-    conn: ConnectionManager,
-    tasks: Arc<RedisTaskStore>,
-    approvals: Arc<InMemoryApprovalStore>,
-    bus: Arc<InMemoryEventBus>,
-}
-
-impl RedisSessionStore {
-    /// Connect and eagerly verify reachability (bounded by the configured
-    /// connect timeout) so a misconfigured backend fails at startup, not on
-    /// the first request.
-    pub async fn connect(config: &RedisSessionStoreConfig) -> Result<Self, SessionStoreError> {
-        let client =
-            Client::open(config.url.as_str()).map_err(|e| SessionStoreError::InvalidUrl {
-                reason: e.to_string(),
-            })?;
-
-        let timeout = config.connect_timeout;
-        let manager_config = ConnectionManagerConfig::new()
-            .set_connection_timeout(timeout)
-            .set_response_timeout(timeout);
-        let conn = tokio::time::timeout(
-            timeout,
-            ConnectionManager::new_with_config(client, manager_config),
-        )
-        .await
-        .map_err(|_| SessionStoreError::ConnectTimeout { timeout })?
-        .map_err(|e| SessionStoreError::Connect {
-            reason: e.to_string(),
-        })?;
-
-        let tasks = Arc::new(RedisTaskStore::new(
-            conn.clone(),
-            &config.key_prefix,
-            config.task_ttl_secs,
-        ));
-
-        Ok(Self {
-            conn,
-            tasks,
-            approvals: Arc::new(InMemoryApprovalStore::new()),
-            bus: Arc::new(InMemoryEventBus::new()),
-        })
-    }
-}
-
-#[async_trait]
-impl SessionStore for RedisSessionStore {
-    fn backend(&self) -> SessionStoreBackend {
-        SessionStoreBackend::Redis
-    }
-
-    fn approvals(&self) -> Arc<dyn ApprovalStore> {
-        self.approvals.clone()
-    }
-
-    fn tasks(&self) -> Arc<dyn TaskStore> {
-        self.tasks.clone()
-    }
-
-    fn bus(&self) -> Arc<dyn EventBus> {
-        self.bus.clone()
-    }
-
-    async fn ping(&self) -> Result<(), SessionStoreError> {
-        let mut conn = self.conn.clone();
-        redis::cmd("PING")
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(|e| SessionStoreError::Request {
-                reason: format!("ping failed: {e}"),
-            })
-    }
-}
 
 /// Redis-backed impl of the upstream `a2a_server::TaskStore`.
 pub struct RedisTaskStore {
