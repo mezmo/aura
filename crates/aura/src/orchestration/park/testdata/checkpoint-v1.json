@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "checkpoint": {
+    "run_id": "018f9d2e-7c3a-7000-8000-000000000271",
+    "session_id": "018f9d2e-7c3a-7000-8000-0000000000aa",
+    "chat_session_id": "cs_golden",
+    "config_fingerprint": "cfg-digest",
+    "original_query": "original query",
+    "external_history": [],
+    "coordinator_conversation": [],
+    "plan": {
+      "goal": "golden goal",
+      "tasks": []
+    },
+    "blocked": [],
+    "approvals": [],
+    "wake_reasons": [],
+    "resume_point": {
+      "boundary": "wave_boundary",
+      "iteration": 1
+    },
+    "identity_headers": [
+      {
+        "name": "x-user-id",
+        "value": "user-1"
+      }
+    ],
+    "pod_local_refs": [],
+    "iteration": 1,
+    "timings": {
+      "planning_ms": 0,
+      "execution_ms": 0,
+      "task_compute_ms": 0,
+      "tool_ms": 0
+    }
+  }
+}
