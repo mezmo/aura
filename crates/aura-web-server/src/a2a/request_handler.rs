@@ -1,9 +1,13 @@
 use a2a::*;
 use a2a_server::middleware::ServiceParams;
-use a2a_server::{AgentExecutor, DefaultRequestHandler, RequestHandler, TaskStore};
+use a2a_server::{AgentExecutor, DefaultRequestHandler, RequestHandler};
 use async_trait::async_trait;
+use aura::session_store::EventBus;
 use futures_util::stream::BoxStream;
 use std::sync::Arc;
+
+use super::bus_bridge::relay_subscription;
+use super::shared_task_store::SharedTaskStore;
 
 /// Wraps [`DefaultRequestHandler`] and forces `return_immediately = true` on every
 /// `message:send` request so the HTTP response returns as soon as the task is
@@ -11,14 +15,25 @@ use std::sync::Arc;
 ///
 /// Callers can poll `tasks/{id}` or subscribe via `message:stream` to check
 /// the status of the task and view completion events.
+///
+/// `subscribe_to_task` additionally falls back to a bus relay when the task
+/// is executing on another instance (see `bus_bridge`).
 pub struct AuraRequestHandler {
     inner: Arc<DefaultRequestHandler>,
+    task_store: SharedTaskStore,
+    bus: Arc<dyn EventBus>,
 }
 
 impl AuraRequestHandler {
-    pub fn new(executor: impl AgentExecutor, task_store: impl TaskStore) -> Self {
+    pub fn new(
+        executor: impl AgentExecutor,
+        task_store: SharedTaskStore,
+        bus: Arc<dyn EventBus>,
+    ) -> Self {
         Self {
-            inner: Arc::new(DefaultRequestHandler::new(executor, task_store)),
+            inner: Arc::new(DefaultRequestHandler::new(executor, task_store.clone())),
+            task_store,
+            bus,
         }
     }
 }
@@ -82,7 +97,13 @@ impl RequestHandler for AuraRequestHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        self.inner.subscribe_to_task(params, req).await
+        let task_id = req.id.clone();
+        match self.inner.subscribe_to_task(params, req).await {
+            Ok(stream) => Ok(stream),
+            // Not executing on this instance — relay the fan-out topic if the
+            // task is live somewhere else (`task_not_found` again otherwise).
+            Err(_) => relay_subscription(self.bus.clone(), self.task_store.clone(), &task_id).await,
+        }
     }
 
     async fn create_push_config(

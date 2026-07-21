@@ -463,7 +463,7 @@ async fn approval_expires_with_its_record_ttl() {
 }
 
 // ---------------------------------------------------------------------------
-// Event bus (phase 3)
+// Event bus
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -566,7 +566,7 @@ async fn bus_prefixes_isolate_deployments() {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-instance approval wake (phase 3, full stack: §6.1)
+// Cross-instance approval wake (full stack: §6.1)
 // ---------------------------------------------------------------------------
 
 /// The §6.1 flow over live Redis: an approval parked through one instance's
@@ -598,4 +598,240 @@ async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
         outcome,
         ApprovalOutcome::Decided(ApprovalDecision::Approved)
     );
+}
+
+// ---------------------------------------------------------------------------
+// A2A streaming/cancel over the bus (full stack: §6.2)
+// ---------------------------------------------------------------------------
+
+mod a2a_bridge {
+    use std::sync::{Arc, Mutex};
+
+    use a2a::{
+        A2AError, Artifact, CancelTaskRequest, Message, Part, Role, SendMessageRequest,
+        StreamResponse, SubscribeToTaskRequest, TaskArtifactUpdateEvent, TaskState, TaskStatus,
+        TaskStatusUpdateEvent,
+    };
+    use a2a_server::middleware::ServiceParams;
+    use a2a_server::{AgentExecutor, ExecutorContext, RequestHandler};
+    use aura_web_server::a2a::{AuraRequestHandler, BusBridgedExecutor, SharedTaskStore};
+    use futures_util::StreamExt;
+    use futures_util::stream::BoxStream;
+    use tokio::sync::Notify;
+
+    use super::{Duration, connect, test_config};
+
+    /// Scripted stand-in for one instance's executor: `execute` emits
+    /// `Working`, waits for `release` (or ends silently on `stop`, the
+    /// routed-cancel shape), then emits an artifact and `Completed`.
+    struct FakeExecutor {
+        release: Arc<Notify>,
+        stop: Arc<Notify>,
+        cancelled: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct Handles {
+        release: Arc<Notify>,
+        cancelled: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn status(task_id: &str, context_id: &str, state: TaskState) -> StreamResponse {
+        StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: task_id.to_string(),
+            context_id: context_id.to_string(),
+            status: TaskStatus {
+                state,
+                message: None,
+                timestamp: Some(chrono::Utc::now()),
+            },
+            metadata: None,
+        })
+    }
+
+    impl AgentExecutor for FakeExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let release = self.release.clone();
+            let stop = self.stop.clone();
+            Box::pin(async_stream::stream! {
+                yield Ok(status(&ctx.task_id, &ctx.context_id, TaskState::Working));
+                tokio::select! {
+                    _ = stop.notified() => return,
+                    _ = release.notified() => {}
+                }
+                yield Ok(StreamResponse::ArtifactUpdate(TaskArtifactUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    artifact: Artifact {
+                        artifact_id: "response".to_string(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("out")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    append: Some(false),
+                    last_chunk: Some(true),
+                    metadata: None,
+                }));
+                yield Ok(status(&ctx.task_id, &ctx.context_id, TaskState::Completed));
+            })
+        }
+
+        fn cancel(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            self.cancelled.lock().unwrap().push(ctx.task_id.clone());
+            self.stop.notify_one();
+            Box::pin(futures_util::stream::once(async move {
+                Ok(status(&ctx.task_id, &ctx.context_id, TaskState::Canceled))
+            }))
+        }
+    }
+
+    /// One simulated instance: its own Redis connection, wrapped executor,
+    /// and request handler.
+    async fn instance(
+        config: &aura_config::RedisSessionStoreConfig,
+    ) -> (AuraRequestHandler, Handles) {
+        let session_store = connect(config).await;
+        let release = Arc::new(Notify::new());
+        let stop = Arc::new(Notify::new());
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor {
+            release: release.clone(),
+            stop,
+            cancelled: cancelled.clone(),
+        };
+        use aura_web_server::session_store::SessionStore;
+        let task_store = SharedTaskStore::from_store(session_store.tasks());
+        let handler = AuraRequestHandler::new(
+            BusBridgedExecutor::new(executor, session_store.bus()),
+            task_store,
+            session_store.bus(),
+        );
+        (handler, Handles { release, cancelled })
+    }
+
+    fn send_request(task_id: &str, context_id: &str) -> SendMessageRequest {
+        let mut message = Message::new(Role::User, vec![Part::text("hi")]);
+        message.task_id = Some(task_id.to_string());
+        message.context_id = Some(context_id.to_string());
+        SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_on_other_instance_relays_execution_events() {
+        let config = test_config(60);
+        let (instance_a, handles_a) = instance(&config).await;
+        let (instance_b, _handles_b) = instance(&config).await;
+        let params = ServiceParams::new();
+
+        instance_a
+            .send_message(&params, send_request("t1", "c1"))
+            .await
+            .expect("send succeeds");
+
+        let mut relay = instance_b
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: "t1".to_string(),
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("subscribe on the non-executing instance succeeds");
+
+        let first = tokio::time::timeout(Duration::from_secs(5), relay.next())
+            .await
+            .expect("snapshot within 5s")
+            .expect("stream open")
+            .expect("frame ok");
+        match first {
+            StreamResponse::Task(task) => assert!(!task.status.state.is_terminal()),
+            other => panic!("expected snapshot Task frame, got {other:?}"),
+        }
+
+        handles_a.release.notify_one();
+
+        let mut saw_artifact = false;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), relay.next())
+                .await
+                .expect("frame within 5s")
+                .expect("stream open")
+                .expect("frame ok");
+            match frame {
+                StreamResponse::ArtifactUpdate(_) => saw_artifact = true,
+                StreamResponse::StatusUpdate(update)
+                    if update.status.state == TaskState::Completed =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_artifact, "artifact frame must reach the relay");
+    }
+
+    #[tokio::test]
+    async fn cancel_on_other_instance_stops_the_executing_instance() {
+        let config = test_config(60);
+        let (instance_a, handles_a) = instance(&config).await;
+        let (instance_b, _handles_b) = instance(&config).await;
+        let params = ServiceParams::new();
+
+        instance_a
+            .send_message(&params, send_request("t2", "c2"))
+            .await
+            .expect("send succeeds");
+
+        let task = instance_b
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t2".to_string(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("cancel on the non-executing instance succeeds");
+        assert_eq!(task.status.state, TaskState::Canceled);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handles_a
+                    .cancelled
+                    .lock()
+                    .unwrap()
+                    .contains(&"t2".to_string())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("routed cancel reaches the executing instance");
+
+        use aura_web_server::session_store::SessionStore as _;
+        let stored = super::connect(&config)
+            .await
+            .tasks()
+            .get("t2")
+            .await
+            .unwrap()
+            .expect("task in store");
+        assert_eq!(stored.status.state, TaskState::Canceled);
+    }
 }
