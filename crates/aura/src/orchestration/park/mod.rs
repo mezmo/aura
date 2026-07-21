@@ -16,6 +16,7 @@ mod dispatch;
 mod headers;
 mod ids;
 mod lease;
+mod non_empty;
 mod outcomes;
 mod run_fsm;
 mod session;
@@ -28,8 +29,9 @@ pub use dispatch::{ArgsDigest, DecisionDispatchState, DispatchError, DispatchEve
 pub use headers::{CredentialSource, HeaderClass, IdentityHeader, UnparkableCredential};
 pub use ids::{AgentInstanceId, ChatSessionId, ConfigFingerprint, SessionId};
 pub use lease::{CasError, FencingGeneration, Lease};
+pub use non_empty::{EmptyNonEmpty, NonEmpty};
 pub use outcomes::{ApprovalRef, TaskExecutionOutcome, ToolAttemptOutcome, WaveOutcome};
 pub use run_fsm::{
     IllegalTransition, ParkReason, ResumePoint, RunEvent, RunFailureCause, RunState, WakeReason,
 };
-pub use session::{AgentInstance, Session, SessionRecord};
+pub use session::{AgentInstance, ParkCommit, Session, SessionRecord};
