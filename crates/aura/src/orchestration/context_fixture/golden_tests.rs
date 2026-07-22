@@ -741,6 +741,53 @@ async fn coordinator_call_declared_check() {
     snapshot_coordinator("coordinator_call_declared_check", &scenario).await;
 }
 
+/// S46 Gate A finding A3 (packet section 8 View 2): a task declared a check,
+/// its worker carried the decisive result, and the bulk result spilled to an
+/// artifact. The `[Check: ...]` line must render above the `[Full result ...]`
+/// footer, so the deciding datum stays in front of the coordinator ahead of
+/// the artifact pointer rather than below it.
+#[tokio::test]
+async fn coordinator_call_declared_check_spilled() {
+    let decision = decision(
+        "Verify the install reached the desktop.",
+        vec![leaf_with_check(
+            "Verify the Windows 3.11 VM reached its desktop",
+            Some("analyst"),
+            "desktop framebuffer read",
+        )],
+    );
+    let performed = NamedCheck::parse(
+        "desktop framebuffer read",
+        Some("18/288000 non-black; desktop NOT reached"),
+        None,
+    )
+    .expect("valid performed check");
+    let outcomes = vec![TaskOutcome::Complete {
+        result: CompletedResultFixture::Spilled {
+            stand_in: SpilledStandIn::ClaimEcho {
+                claim: claim_with_check(
+                    "QEMU alive (PID 928), VNC :5901, QMP input OK; screen 18/288000 non-black",
+                    Confidence::High,
+                    performed,
+                ),
+            },
+            artifact: spilled("task-0-analyst-iter-1-result.txt", 2466),
+        },
+        traces: vec![],
+    }];
+    let iteration = IterationFixture::new(decision, outcomes, None)
+        .expect("spilled declared-check iteration validates");
+    let scenario = scenario(
+        preamble(no_optional_tools()),
+        WorkerRosterFixture::new(
+            roster_config(analyst_operator_workers(), ToolVisibility::Summary),
+            Vec::new(),
+        ),
+        CoordinatorCall::Continuation(ContinuationThread::new(vec![iteration]).expect("one")),
+    );
+    snapshot_coordinator("coordinator_call_declared_check_spilled", &scenario).await;
+}
+
 /// The non-default observability knob: completed tasks carry condensed
 /// tool-chain lines when `show_tool_reasoning_in_continuation` is enabled.
 #[tokio::test]

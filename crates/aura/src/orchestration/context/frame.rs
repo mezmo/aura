@@ -148,18 +148,25 @@ impl PriorWorkEntry {
             text.push_str(&format!("\nConfidence: {}", claim.confidence()));
         }
         text.push_str("\nEvidence:");
-        let body = self.evidence.render_body();
-        if body.trim().is_empty() {
+        let (body_text, spill_footer) = self.evidence.body_parts();
+        if body_text.trim().is_empty() {
             text.push('\n');
         } else {
             text.push('\n');
-            text.push_str(&super::evidence::indent(&body));
+            text.push_str(&super::evidence::indent(&body_text));
         }
+        // The declared check renders below the evidence text and above the
+        // spill footer, so a downstream worker sees it ahead of the
+        // `[Full result ...]` pointer when the prior result spilled (S46
+        // packet section 8 View 2/4).
         if let Some(named_check) = &self.named_check {
             text.push_str(&format!(
                 "\n{}",
                 super::evidence::indent(&named_check.render_line())
             ));
+        }
+        if let Some(footer) = spill_footer {
+            text.push_str(&format!("\n{}", super::evidence::indent(&footer)));
         }
         RenderedContext::new(text)
     }
@@ -533,6 +540,42 @@ mod tests {
             rendered
                 .contains("    [Check: per-directory entry count (max 30, recursive) -> NOT RUN]"),
             "downstream worker sees the declared check went unrun: {rendered}"
+        );
+    }
+
+    // S46 Gate A finding A3: on a spilled prior entry the declared check
+    // renders above the `[Full result ...]` footer, so a downstream worker
+    // sees the deciding datum ahead of the artifact pointer (packet section 8
+    // View 2/4).
+    #[test]
+    fn test_prior_work_entry_declared_check_renders_above_spill_footer() {
+        let not_run = NamedCheck::not_run("per-directory entry count (max 30, recursive)")
+            .expect("valid check");
+        let artifact = SpilledArtifact::parse_trailing(&format!("stand-in summary\n\n{FOOTER}"))
+            .expect("footer parses");
+        let entry = PriorWorkEntry {
+            label: CorrelationLabel {
+                task: TaskId::new(0),
+                worker: Some(WorkerRole::new("analyst").unwrap()),
+            },
+            relation: DependencyRelation::Direct,
+            evidence: EvidenceEntry::ArtifactPointer {
+                stand_in: super::super::evidence::ArtifactStandIn::Preview(
+                    super::super::evidence::ResultPreview::new("stand-in summary")
+                        .expect("non-empty preview"),
+                ),
+                artifact,
+            },
+            named_check: Some(not_run),
+        };
+        let rendered = entry.render().as_str().to_string();
+        let check_at = rendered.find("[Check:").expect("check line present");
+        let footer_at = rendered
+            .find("[Full result (")
+            .expect("spill footer present");
+        assert!(
+            check_at < footer_at,
+            "declared check must precede the [Full result ...] footer: {rendered}"
         );
     }
 

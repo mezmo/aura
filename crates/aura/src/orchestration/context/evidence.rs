@@ -210,20 +210,27 @@ impl EvidenceEntry {
         }
     }
 
-    /// Render the worker-reported body of this entry as unindented text.
-    pub(crate) fn render_body(&self) -> String {
+    /// Split the worker-reported body into its inline evidence text and the
+    /// optional spill footer.
+    ///
+    /// The two parts render with the decisive `[Check: ...]` line between
+    /// them, so a declared check sits above the `[Full result ...]` footer on
+    /// a spilled entry (S46 packet section 8 View 2) while still following the
+    /// evidence text on an inline entry. `None` on the second element marks an
+    /// inline entry with no spill footer.
+    pub(crate) fn body_parts(&self) -> (String, Option<String>) {
         match self {
-            Self::InlineResult { result, .. } => result.as_str().to_owned(),
+            Self::InlineResult { result, .. } => (result.as_str().to_owned(), None),
             Self::ArtifactPointer { stand_in, artifact } => {
                 let stand_in_text = match stand_in {
                     ArtifactStandIn::Claim(claim) => claim.summary(),
                     ArtifactStandIn::Preview(preview) => preview.as_str(),
                 };
-                format!("{stand_in_text}\n{artifact}")
+                (stand_in_text.to_owned(), Some(artifact.to_string()))
             }
-            Self::SummaryOnly { claim } => claim.summary().to_owned(),
+            Self::SummaryOnly { claim } => (claim.summary().to_owned(), None),
             Self::ArtifactPointerOnly { artifact } => {
-                format!("(no inline preview)\n{artifact}")
+                ("(no inline preview)".to_owned(), Some(artifact.to_string()))
             }
         }
     }
@@ -317,10 +324,19 @@ impl CompletedEntry {
             self.label.task,
             label_suffix(self.label.worker.as_ref(), confidence)
         );
+        let (body_text, spill_footer) = self.evidence.body_parts();
         text.push('\n');
-        text.push_str(&indent(&self.evidence.render_body()));
+        text.push_str(&indent(&body_text));
+        // The decisive check line sits directly below the evidence text and
+        // above the spill footer, so a declared check stays visible ahead of
+        // the `[Full result ...]` pointer on a spilled entry (S46 packet
+        // section 8 View 2); on an inline entry there is no footer, so it
+        // simply follows the evidence text.
         if let Some(named_check) = &self.named_check {
             text.push_str(&format!("\n    {}", named_check.render_line()));
+        }
+        if let Some(footer) = spill_footer {
+            text.push_str(&format!("\n    {footer}"));
         }
         for artifact in &self.artifacts {
             text.push_str(&format!("\n    {artifact}"));
@@ -668,6 +684,52 @@ mod tests {
             rendered.contains("[Check: per-directory entry count (max 30) -> NOT RUN]"),
             "check survives the spill: {rendered}"
         );
+        // The check line renders above the spill footer, not below it (S46
+        // Gate A finding A3, packet section 8 View 2).
+        let check_at = rendered
+            .find("[Check:")
+            .expect("check line present in spilled render");
+        let footer_at = rendered
+            .find("[Full result (")
+            .expect("spill footer present in spilled render");
+        assert!(
+            check_at < footer_at,
+            "check line must precede the [Full result ...] footer: {rendered}"
+        );
+    }
+
+    // S46 Gate A finding A3: a carried decisive check on a spilled entry
+    // renders its result on the `[Check: ...]` line, above the `[Full result
+    // ...]` footer, with the stand-in summary above the check (packet section
+    // 8 View 2). The stand-in, check, and footer appear in that exact order.
+    #[test]
+    fn completed_entry_renders_carried_check_above_spill_footer() {
+        let performed = NamedCheck::parse(
+            "desktop framebuffer read",
+            Some("18/288000 non-black; desktop NOT reached"),
+            None,
+        )
+        .expect("valid check");
+        let spilled = format!("QEMU alive; screen 18/288000 non-black.\n\n{FOOTER}");
+        let entry = CompletedEntry {
+            label: label(Some("verifier")),
+            evidence: EvidenceEntry::from_completed_result(&spilled, Some(claim()))
+                .expect("spilled result parses"),
+            artifacts: vec![],
+            named_check: Some(performed),
+        };
+        let rendered = entry.render().as_str().to_string();
+        let stand_in_at = rendered
+            .find("Found 47 error groups")
+            .expect("stand-in summary present");
+        let check_at = rendered.find("[Check:").expect("check line present");
+        let footer_at = rendered
+            .find("[Full result (")
+            .expect("spill footer present");
+        assert!(
+            stand_in_at < check_at && check_at < footer_at,
+            "order must be stand-in, then check, then footer: {rendered}"
+        );
     }
 
     #[test]
@@ -679,7 +741,13 @@ mod tests {
             matches!(entry, EvidenceEntry::ArtifactPointerOnly { .. }),
             "expected ArtifactPointerOnly, got {entry:?}"
         );
-        assert!(entry.render_body().contains(FOOTER));
+        let (body_text, footer) = entry.body_parts();
+        assert_eq!(body_text, "(no inline preview)");
+        assert!(
+            footer
+                .expect("spilled entry carries a footer")
+                .contains(FOOTER)
+        );
     }
 
     #[test]
