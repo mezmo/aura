@@ -160,7 +160,10 @@ build-binary-darwin-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for darwi
 		$(call require_host,Darwin,) \
 		rustup target add x86_64-apple-darwin 2>/dev/null; \
 		cargo build $(CARGO_PROFILE_FLAG) --target x86_64-apple-darwin --bin aura-web-server && \
-		cargo build $(CARGO_PROFILE_FLAG) --target x86_64-apple-darwin -p aura-cli --bin aura"
+		cargo build $(CARGO_PROFILE_FLAG) --target x86_64-apple-darwin -p aura-cli --bin aura; \
+		rc=\$$?; \
+		if [ -n \"\$$RUSTC_WRAPPER\" ]; then sccache --show-stats || true; fi; \
+		exit \$$rc"
 	cp target/x86_64-apple-darwin/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-darwin-amd64
 	cp target/x86_64-apple-darwin/$(PROFILE)/aura $(DIST_DIR)/aura-darwin-amd64
 
@@ -170,7 +173,10 @@ build-binary-darwin-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for darwi
 		$(call require_host,Darwin,) \
 		rustup target add aarch64-apple-darwin 2>/dev/null; \
 		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-apple-darwin --bin aura-web-server && \
-		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-apple-darwin -p aura-cli --bin aura"
+		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-apple-darwin -p aura-cli --bin aura; \
+		rc=\$$?; \
+		if [ -n \"\$$RUSTC_WRAPPER\" ]; then sccache --show-stats || true; fi; \
+		exit \$$rc"
 	cp target/aarch64-apple-darwin/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-darwin-arm64
 	cp target/aarch64-apple-darwin/$(PROFILE)/aura $(DIST_DIR)/aura-darwin-arm64
 

@@ -41,6 +41,15 @@ RUNNER_TOOLCHAIN_ENV := -e CARGO_HOME=/home/aura/.cargo -e RUSTUP_HOME=/home/aur
 # Compiler-cache passthrough, gated on the CI toggle so local $(RUN) is
 # unchanged. Bare -e copies AWS values from the host environment.
 SCCACHE_RUN_ENV = $(if $(AURA_RUSTC_WRAPPER),-e RUSTC_WRAPPER=$(AURA_RUSTC_WRAPPER) -e SCCACHE_BUCKET -e SCCACHE_REGION -e SCCACHE_S3_KEY_PREFIX -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY,)
+# Native (non-Docker) builds run cargo directly in this process's environment,
+# so translate the AURA_RUSTC_WRAPPER toggle into the RUSTC_WRAPPER cargo reads.
+# The SCCACHE_* and AWS values are inherited from the host env alongside it.
+# Docker builds inject the wrapper into the container via SCCACHE_RUN_ENV.
+ifneq ($(filter true, $(ENABLE_DOCKER)),true)
+ifneq ($(AURA_RUSTC_WRAPPER),)
+RUSTC_WRAPPER := $(AURA_RUSTC_WRAPPER)
+endif
+endif
 RUNNER_CMD = $(DOCKER_RUN) --env-file=$(DOCKER_ENV) $(RUNNER_TOOLCHAIN_ENV) $(SCCACHE_RUN_ENV) $(if $(filter true, $(IS_CI)), ,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 RUNNER_NO_ENV_CMD = $(DOCKER_RUN) $(if $(filter true, $(IS_CI)),,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 DOCKER_RUN_BUILD_ENV := $(RUNNER_CMD)
