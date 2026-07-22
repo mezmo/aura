@@ -134,12 +134,16 @@ mod tests {
         ArgsDigest::test_value("digest-bound")
     }
 
-    fn claim(presented: ArgsDigest) -> DispatchEvent {
+    fn claim_at(generation: FencingGeneration, presented: ArgsDigest) -> DispatchEvent {
         DispatchEvent::Claim {
-            generation: FencingGeneration::INITIAL.next(),
+            generation,
             presented,
             at: Utc::now(),
         }
+    }
+
+    fn claim(presented: ArgsDigest) -> DispatchEvent {
+        claim_at(FencingGeneration::INITIAL.next(), presented)
     }
 
     fn all_events() -> Vec<DispatchEvent> {
@@ -211,11 +215,15 @@ mod tests {
         let claimed = DispatchState::Unclaimed
             .apply(claim(bound()), &bound())
             .expect("legal");
-        // A second dispatcher must not consume the same binding.
-        assert!(matches!(
-            claimed.apply(claim(bound()), &bound()),
-            Err(DispatchError::Illegal { .. })
-        ));
+        // A second dispatcher must not consume the same binding - not at the
+        // same generation, and not at a later one after a lease rotation.
+        let later = FencingGeneration::INITIAL.next().next();
+        for second in [claim(bound()), claim_at(later, bound())] {
+            assert!(matches!(
+                claimed.apply(second, &bound()),
+                Err(DispatchError::Illegal { .. })
+            ));
+        }
     }
 
     #[test]
