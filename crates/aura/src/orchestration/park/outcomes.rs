@@ -48,8 +48,8 @@ pub enum WaveOutcome {
     Continue,
     /// The plan is finished.
     Finished,
-    /// The ready frontier is empty, nothing is running, and these tasks are
-    /// blocked: the quiescence park point. Non-empty by construction - a
-    /// quiescent wave with no blocked task is not a park point.
-    Quiesced { blocked: NonEmpty<ApprovalRef> },
+    /// The ready frontier is empty, nothing is running, and the run is
+    /// blocked on these approvals: the quiescence park point. Non-empty by
+    /// construction - a drained wave with no blocked task is not one.
+    Blocked { on: NonEmpty<ApprovalRef> },
 }
