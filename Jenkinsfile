@@ -7,16 +7,9 @@ def BUILD_SLUG = slugify(env.BUILD_TAG)
 
 def RELEASE_CREDENTIALS = [
    usernamePassword(
-     credentialsId: 'github-app-key-mezmo',
+     credentialsId: 'github-app-key-mezmo-aura',
      passwordVariable: 'GITHUB_TOKEN',
      usernameVariable: 'GITHUB_APP'
-   )
-]
-
-def TAP_CREDENTIALS = [
-   string(
-     credentialsId: 'github-api-token',
-     variable: 'GITHUB_TOKEN'
    )
 ]
 
@@ -328,7 +321,6 @@ pipeline {
 
         // Cheap release preview: confirms commits parse and a version
         // computes, with no image build (that happens at main Release).
-        // The file:// repo and plugin list keep it credential-free.
         stage('Release Dry Run') {
           when {
             beforeAgent true
@@ -422,9 +414,7 @@ pipeline {
             withCredentials(RELEASE_CREDENTIALS) {
               script {
                 try {
-                  withCredentials(TAP_CREDENTIALS) {
-                    sh 'npm run release:dry -- --plugins @semantic-release/commit-analyzer @semantic-release/exec'
-                  }
+                  sh 'npm run release:dry -- --plugins @semantic-release/commit-analyzer @semantic-release/exec'
                   env.NEXT_RELEASE_VERSION = fileExists('.next-release-version') ? readFile('.next-release-version').trim() : ''
                 } finally {
                   sh 'rm -f .next-release-version'
@@ -533,9 +523,7 @@ pipeline {
                     project: PROJECT_NAME,
                     versionFn: { -> npm.semver().version }
                   ) {
-                    withCredentials(TAP_CREDENTIALS) {
-                      withReport('Release', 'npm run release')
-                    }
+                    withReport('Release', 'npm run release')
                   }
                 }
               }
