@@ -337,6 +337,8 @@ Tool names are not namespaced by server. If two servers register a tool with the
 
 `turn_depth` controls how many tool-calling rounds can happen in a single turn. Higher values allow multi-step tool workflows before final response generation. This acts as a failsafe to prevent models from spinning out in unbounded tool-call loops.
 
+`nudge_last_turn` and `nudge_turns_remaining` enable turn-limit nudging: as the agent approaches the `turn_depth` limit, a warning is appended to tool output telling it to wrap up and deliver its answer (orchestration workers are told to call `submit_result`) rather than lose all gathered work when the limit terminates the run. `nudge_last_turn = true` warns on the final turn; `nudge_turns_remaining = N` starts wrap-up warnings when N or fewer turns remain. Both default to off and can be enabled independently.
+
 `context_window` sets the context window size (in tokens) for the agent, used for usage percentage reporting in `aura.session_info` streaming events.
 
 The complete starter configuration is in [examples/reference.toml](examples/reference.toml). Minimal per-provider configs are in `examples/minimal/` and complete agent examples are in `examples/complete/`.
