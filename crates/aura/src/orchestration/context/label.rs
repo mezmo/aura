@@ -110,9 +110,11 @@ impl std::fmt::Display for IterationNumber {
 /// The summary/confidence pair travels together. Confidence without a summary
 /// is unrepresentable, mirroring the collapse already encoded by
 /// `StructuredTaskOutput` in `orchestration::types`. The claim is the stand-in
-/// that survives result spill (`ArtifactStandIn::Claim`), so it is the carrier
-/// that keeps a task's decisive [`NamedCheck`] in the coordinator's view when
-/// the bulk result spills to an artifact (S46 packet section 7).
+/// that survives result spill (`ArtifactStandIn::Claim`), and the worker's
+/// decisive [`NamedCheck`] rides on it as the worker-attested source (design A,
+/// S46 packet section 7). The claim field is what fixtures read; the production
+/// render path draws the check line from the reconciled per-entry value
+/// (`CompletedEntry` / `PriorWorkEntry` `named_check`), not from this field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerClaim {
     summary: String,

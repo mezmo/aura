@@ -413,6 +413,47 @@ mod tests {
         assert_eq!(named_check.outcome(), &CheckOutcome::NotRun);
     }
 
+    // P5: the observed-only incapacity path through the tool's own `call`. A
+    // submission whose named_check carries a check and an `observed` datum but
+    // no `result` must store `Present` with `CheckOutcome::Incapable` carrying
+    // the observation — never `NotRun` (which would alias reconciled-absent).
+    #[tokio::test]
+    async fn observed_only_stores_incapable_carrying_the_observation() {
+        use crate::orchestration::context::CheckOutcome;
+
+        let decision: SubmitResultDecision = Arc::new(Mutex::new(None));
+        let tool = SubmitResultTool::new(decision.clone());
+
+        tool.call(SubmitResultArgs {
+            summary: "could not run the check".to_string(),
+            result: "full findings".to_string(),
+            confidence: "low".to_string(),
+            named_check: Some(NamedCheckArgs {
+                check: "per-directory entry count (max 30)".to_string(),
+                result: None,
+                observed: Some("sandbox denied directory listing".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+
+        let stored = decision.lock().await;
+        let named_check = match &stored.as_ref().unwrap().named_check {
+            SubmittedCheck::Present(nc) => nc,
+            other => panic!("observed-only stores Present, got {other:?}"),
+        };
+        assert_eq!(
+            named_check.identity().as_str(),
+            "per-directory entry count (max 30)"
+        );
+        match named_check.outcome() {
+            CheckOutcome::Incapable(observed) => {
+                assert_eq!(observed.as_str(), "sandbox denied directory listing");
+            }
+            other => panic!("observed-only outcome must be Incapable, got {other:?}"),
+        }
+    }
+
     // RV1: when the submitted check identity itself is over-bound, no bounded
     // NamedCheck exists to preserve — but the submission must not alias "no
     // check named". It records UnrepresentableIdentity, distinct from Absent.
