@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::hitl::{DecisionId, Timestamp};
 use crate::orchestration::types::{IterationTimings, Plan, RunId, TaskIdentity};
 
-use super::dispatch::{ArgsDigest, DispatchState};
+use super::dispatch::{ArgsDigest, DecisionConsumption};
 use super::headers::IdentityHeader;
 use super::ids::{ChatSessionId, ConfigFingerprint, SessionId};
 use super::run_fsm::{ResumePoint, WakeReason};
@@ -63,9 +63,7 @@ pub struct ParkedApprovalSnapshot {
     pub origin: ApprovalOriginSnapshot,
     pub registered_at: Timestamp,
     pub expires_at: Timestamp,
-    /// The consumption record for this approval's decision, once a granted
-    /// decision has one.
-    pub dispatch: Option<DispatchState>,
+    pub decision: DecisionConsumption,
 }
 
 /// Storage mirror of `hitl::ApprovalOrigin`.
