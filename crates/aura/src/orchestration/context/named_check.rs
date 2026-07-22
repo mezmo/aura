@@ -195,6 +195,13 @@ impl NamedCheck {
     /// - neither → [`CheckOutcome::NotRun`], the worker named the check but
     ///   carried nothing for it.
     ///
+    /// When both `result` and `observed` are supplied — an ambiguous dual
+    /// payload — the decisive `result` wins by defined precedence: a performed
+    /// check settles pass or fail, so its result is the outcome. The precedence
+    /// is spelled out here rather than falling out of match order, and the
+    /// ambiguity is diagnosed at the wire boundary (`submit_result`) so the
+    /// dropped observation never vanishes without a trace (design-panel RV2).
+    ///
     /// # Errors
     ///
     /// Propagates [`CheckIdentity::new`] and [`CheckResult::new`] errors.
@@ -205,7 +212,12 @@ impl NamedCheck {
     ) -> Result<Self, ContextError> {
         let identity = CheckIdentity::new(check)?;
         let outcome = match (result, observed) {
-            (Some(result), _) => CheckOutcome::Performed(CheckResult::new(result)?),
+            // Dual-payload precedence (RV2): a decisive result wins over a
+            // co-submitted observation. The `observed` slot is intentionally
+            // ignored on this arm; the drop is diagnosed at the wire boundary.
+            (Some(result), Some(_)) | (Some(result), None) => {
+                CheckOutcome::Performed(CheckResult::new(result)?)
+            }
             (None, Some(observed)) => CheckOutcome::Incapable(CheckResult::new(observed)?),
             (None, None) => CheckOutcome::NotRun,
         };
@@ -295,6 +307,26 @@ mod tests {
         let absent = NamedCheck::parse("per-directory entry count (max 30)", None, None)
             .expect("valid check");
         assert_eq!(absent.outcome(), &CheckOutcome::NotRun);
+    }
+
+    // RV2: a dual payload (both a decisive result and an observation) resolves
+    // by defined precedence to the decisive result — never silently to
+    // Incapable, and never dropping the result. The dropped observation is
+    // diagnosed at the wire boundary, not here.
+    #[test]
+    fn parse_prefers_result_over_observed_on_dual_payload() {
+        let both = NamedCheck::parse(
+            "per-directory entry count (max 30)",
+            Some("VIOLATION: g00000 has 53"),
+            Some("also could not read g00001"),
+        )
+        .expect("valid check");
+        match both.outcome() {
+            CheckOutcome::Performed(result) => {
+                assert_eq!(result.as_str(), "VIOLATION: g00000 has 53");
+            }
+            other => panic!("expected Performed with the decisive result, got {other:?}"),
+        }
     }
 
     #[test]

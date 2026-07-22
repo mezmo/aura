@@ -35,7 +35,8 @@ bounded domain types downstream.
 | `NamedCheckWidth` (`bounding.rs`) | The named-check field is bounded to one decisive line that survives spill. The module's other char widths truncate; this one **rejects**, because a decisive datum silently cut is worse than absent | A zero cap; (by consumers) silent truncation of a decisive result |
 | `NamedCheckArgs` (`submit_result.rs`, wire) | Raw worker submission: the check performed (`result`), or what the worker `observed` when it could not; both absent records the worker named the check but carried nothing. The `observed` slot keeps an incapacity note structured rather than in free-form self-report (design-panel P5); worker-facing instruction to fill it is phase-2, unadvertised in the tool schema like `named_check` | n/a (wire; validated on parse into `NamedCheck`) |
 | `SubmitResultArgs.named_check` (extended, wire) | The worker declares the decisive check's evidence in the structured tool call, not only inside free-form `result` (OPTION-IN) | n/a (wire) |
-| `SubmitResultOutput.named_check: Option<NamedCheck>` (extended) | The stored worker result carries the bounded decisive check, the acceptance gate's data source - separate from the free-form `result` that spills | The gate reading a self-report `summary` in place of the check (the field is a distinct, bounded slot) |
+| `SubmitResultOutput.named_check: SubmittedCheck` (extended) | The stored worker result carries what the submission held for the decisive check, the acceptance gate's data source - separate from the free-form `result` that spills. `SubmittedCheck` is a three-state enum (`Absent`, `Present(NamedCheck)`, `UnrepresentableIdentity`) so a rejected submission never aliases "no check named" (design-panel RV1) | The gate reading a self-report `summary` in place of the check; a submission whose identity was unrepresentable collapsing into `Absent` |
+| `SubmittedCheck` (`submit_result.rs`) | What a worker's submission carried for the decisive check: absent, a bounded `Present(NamedCheck)`, or a check submitted with an unrepresentable identity | An unrepresentable-identity submission dropped to "no check named" (the two are distinct variants, not one `None`) |
 | `WorkerClaim.named_check: Option<NamedCheck>` (extended) | The claim is the stand-in that survives result spill (`ArtifactStandIn::Claim`), so it is the render carrier that keeps the decisive check in the coordinator's view when the bulk result spills to an artifact (packet §7) | (render-time) a spilled decisive check lost behind the artifact pointer - the check rides on the claim, which renders inline on both the inline and spill paths |
 | `StepInput::LeafTask.named_check: Option<String>` (extended, wire) | A task MAY name the check that decides its success at plan creation (the task-side leg of the mechanism, gate round 5) | n/a (wire; `Option`; most tasks name none) |
 | `Task.named_check_declaration: Option<CheckIdentity>` (extended) | The task's declared check travels from plan creation to the evidence frame as a bounded domain value (parsed in `flatten_one`, not raw wire text), where absence in the worker's result is reconciled to `NOT RUN` (design-panel P1: the wire-to-domain bound is not bypassed on the task leg) | A declared check that cannot reach the acceptance/render site; an empty or over-bound declaration reaching reconciliation as an unrepresentable string (rejected at flatten instead) |
@@ -80,20 +81,24 @@ at the wire boundary and leaves as bounded values.
 
 ## Residual risks (named)
 
-- **R1 - the render carrier choice, and the claimless gap.** The decisive
-  check rides on `WorkerClaim` (design A) rather than on a new field of
-  `CompletedEntry` / `PriorWorkEntry` (design B). Design A carries the check
-  through both the inline (`InlineResult.claim`) and spill
+- **R1 - the render carrier choice, resolved by the design panel (ledger
+  P4).** The decisive check rides on `WorkerClaim` (design A) rather than on a
+  new field of `CompletedEntry` / `PriorWorkEntry` (design B). Design A carries
+  the check through both the inline (`InlineResult.claim`) and spill
   (`ArtifactStandIn::Claim`) paths for free and matches packet §7's
   "next to the stand-in" argument, at far lower blast radius. Its gap: an
   entry with no `WorkerClaim` (a claimless `InlineResult`, a `Preview`
   stand-in, or `ArtifactPointerOnly`) has no carrier, so a declared check on a
   claimless result cannot render `NOT RUN`. This is a legibility gap, not an
   enforcement hole: the deterministic gate reads `SubmitResultOutput.named_check`
-  plus the task declaration, which do not depend on a claim. **Open question
-  for the design panel:** accept design A with this gap, or pay design B's
-  blast radius for a per-entry reconciled `Option<NamedCheck>` that renders
-  `NOT RUN` on every entry.
+  plus the task declaration, which do not depend on a claim. **Panel ruling:**
+  design A stands for the committed phase-1 skeleton - the worker-attested
+  value rides the claim. The per-entry gap is not left open: the panel bound a
+  phase-2 requirement that the *reconciled* check render on every entry shape,
+  landing the reconciled value per-entry at reconciliation time. That delivers
+  design B's per-entry legibility at the layer that owns rendering while
+  keeping the claim as the worker-attested carrier, so packet §8 View 4's
+  prior-work legibility is preserved.
 - **R2 - the worker-to-render bridge is unwired.** `SubmitResultOutput` carries
   the worker's `named_check`, but the path onto `Task`/`WorkerClaim` at the
   render site is phase 2. It may require a `named_check` field on
@@ -111,12 +116,17 @@ at the wire boundary and leaves as bounded values.
   so the two provenances never alias. The wire carries it in
   `NamedCheckArgs.observed`; the worker-facing instruction to fill it is phase-2
   (the slot is unadvertised in the tool schema, like `named_check` itself).
-- **R5 - resolved (design-panel P3): rejected evidence is preserved, not
-  dropped.** `submit_result`'s `call` still has `type Error = Infallible`, but an
-  over-bound or malformed `named_check` is no longer dropped to `None` (which
-  would alias "no check named"). The declared identity is preserved as
-  `CheckOutcome::NotRun` so the deciding datum's absence stays visible. The
-  harder phase-2 target - hard-reject the submission without consuming
+- **R5 - resolved (design-panel P3, extended by RV1): rejected evidence is
+  preserved, never aliased to absent.** `submit_result`'s `call` still has
+  `type Error = Infallible`, and the stored `named_check` is a three-state
+  `SubmittedCheck`. When the worker's carried *result* fails the field bound but
+  the *identity* holds, the identity is preserved as
+  `SubmittedCheck::Present(NamedCheck)` with `CheckOutcome::NotRun`, so the
+  deciding datum's absence stays visible. When the *identity itself* is empty or
+  over-bound - so no bounded `NamedCheck` can be built at all - the submission
+  is recorded as `SubmittedCheck::UnrepresentableIdentity`, still distinct from
+  `Absent`: a rejected submission never masquerades as "no check named" (RV1).
+  The harder phase-2 target - hard-reject the submission without consuming
   first-write state so the worker can retry with bounded evidence - is recorded
   in the ledger and not built here; it would change the tool's error type.
 - **R6 - no type encodes semantic decisiveness (design-panel P8).** The bound

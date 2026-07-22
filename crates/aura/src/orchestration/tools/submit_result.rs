@@ -37,13 +37,38 @@ pub struct SubmitResultOutput {
     pub summary: String,
     pub result: String,
     pub confidence: Confidence,
-    /// The decisive verification whose result determines pass or fail, when
-    /// the task named one: the check performed and the result it produced.
-    /// Absent when the task named no such check. This is the acceptance
-    /// gate's data source — the coordinator does not treat the task as done on
-    /// the summary alone when a check was named.
+    /// What the worker's submission carried for the decisive named check: the
+    /// acceptance gate's data source. The coordinator does not treat the task
+    /// as done on the summary alone when a check was named. See
+    /// [`SubmittedCheck`] for the three non-aliasing states.
     #[serde(default)]
-    pub named_check: Option<NamedCheck>,
+    pub named_check: SubmittedCheck,
+}
+
+/// What a worker's `submit_result` call carried for the decisive named check.
+///
+/// Three mutually exclusive states, none aliasing another. In particular, a
+/// submission whose check identity was itself unrepresentable stays distinct
+/// from "no check named": a rejected submission never masquerades as an absent
+/// one (design-panel RV1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum SubmittedCheck {
+    /// The task named no decisive check, or the worker carried nothing for it.
+    /// The acceptance gate has no check to read.
+    #[default]
+    Absent,
+    /// A bounded named check. Its outcome is `NotRun` when the worker's carried
+    /// result was rejected at the field bound but the identity itself held
+    /// (design-panel P3): present-but-rejected evidence stays visible.
+    Present(NamedCheck),
+    /// A check was submitted, but its identity itself was empty or over the
+    /// field bound, so no bounded [`NamedCheck`] could be built. Distinct from
+    /// [`Absent`](Self::Absent): a check *was* named — it just could not be
+    /// represented, and that unrepresentability stays visible instead of
+    /// collapsing to "no check named" (design-panel RV1). The harder phase-2
+    /// target — hard-reject the submission so the worker retries with a
+    /// bounded identity — is recorded in the ledger, not built here.
+    UnrepresentableIdentity,
 }
 
 /// Shared state for capturing a worker's structured result.
@@ -174,13 +199,29 @@ impl Tool for SubmitResultTool {
 
         // Present-but-rejected evidence must never alias "no check named": when
         // the worker's carried result fails the field bound, preserve the
-        // declared identity as NotRun rather than dropping the whole check to
-        // None (design-panel P3). A hard-reject-and-retry path is phase-2; here
-        // the deciding datum's absence stays visible instead of vanishing.
+        // declared identity as NotRun rather than dropping the whole check
+        // (design-panel P3). When the identity itself is unrepresentable, the
+        // submission still leaves a typed trace (UnrepresentableIdentity, RV1),
+        // never collapsing to Absent. A hard-reject-and-retry path is phase-2.
         let named_check = match &args.named_check {
+            None => SubmittedCheck::Absent,
             Some(nc) => {
+                // RV2: a worker that carried both a decisive result and an
+                // incapacity observation supplies an ambiguous dual payload.
+                // The decisive result takes precedence (a performed check
+                // settles pass/fail); the drop of the observation is diagnosed
+                // here rather than vanishing silently inside `parse`. The
+                // error-channel alternative would need a new `ContextError`
+                // variant, outside this repair's file scope.
+                if nc.result.is_some() && nc.observed.is_some() {
+                    tracing::warn!(
+                        "submit_result named_check carried both a decisive result and an \
+                         incapacity observation; the decisive result takes precedence and \
+                         the observation is not retained"
+                    );
+                }
                 match NamedCheck::parse(&nc.check, nc.result.as_deref(), nc.observed.as_deref()) {
-                    Ok(parsed) => Some(parsed),
+                    Ok(parsed) => SubmittedCheck::Present(parsed),
                     Err(error) => match NamedCheck::not_run(&nc.check) {
                         Ok(preserved) => {
                             tracing::warn!(
@@ -188,20 +229,23 @@ impl Tool for SubmitResultTool {
                                 "submit_result named_check evidence rejected at the field bound; \
                                  preserving the declared identity as NOT RUN"
                             );
-                            Some(preserved)
+                            SubmittedCheck::Present(preserved)
                         }
                         Err(identity_error) => {
+                            // RV1: identity itself empty or over-bound, so no
+                            // bounded NamedCheck exists. Record the submission
+                            // as unrepresentable rather than dropping to Absent.
                             tracing::warn!(
                                 %error,
                                 %identity_error,
-                                "submit_result named_check identity itself is unbounded; dropping"
+                                "submit_result named_check identity itself is unrepresentable; \
+                                 recording an unrepresentable-identity trace, not aliasing absent"
                             );
-                            None
+                            SubmittedCheck::UnrepresentableIdentity
                         }
                     },
                 }
             }
-            None => None,
         };
 
         *guard = Some(SubmitResultOutput {
@@ -302,7 +346,7 @@ mod tests {
     fn submit_result_output_deserializes_legacy_payload() {
         let json = r#"{"summary":"s","result":"r","confidence":"medium"}"#;
         let output: SubmitResultOutput = serde_json::from_str(json).unwrap();
-        assert!(output.named_check.is_none());
+        assert!(matches!(output.named_check, SubmittedCheck::Absent));
     }
 
     // P3: an over-bound decisive result is rejected at the field bound, but the
@@ -329,16 +373,73 @@ mod tests {
         .unwrap();
 
         let stored = decision.lock().await;
-        let named_check = stored
-            .as_ref()
-            .unwrap()
-            .named_check
-            .as_ref()
-            .expect("identity preserved, not dropped to None");
+        let named_check = match &stored.as_ref().unwrap().named_check {
+            SubmittedCheck::Present(nc) => nc,
+            other => panic!("identity preserved as Present, not dropped, got {other:?}"),
+        };
         assert_eq!(
             named_check.identity().as_str(),
             "per-directory entry count (max 30)"
         );
         assert_eq!(named_check.outcome(), &CheckOutcome::NotRun);
+    }
+
+    // RV1: when the submitted check identity itself is over-bound, no bounded
+    // NamedCheck exists to preserve — but the submission must not alias "no
+    // check named". It records UnrepresentableIdentity, distinct from Absent.
+    #[tokio::test]
+    async fn over_bound_identity_records_unrepresentable_not_absent() {
+        let decision: SubmitResultDecision = Arc::new(Mutex::new(None));
+        let tool = SubmitResultTool::new(decision.clone());
+
+        tool.call(SubmitResultArgs {
+            summary: "checked".to_string(),
+            result: "full findings".to_string(),
+            confidence: "high".to_string(),
+            named_check: Some(NamedCheckArgs {
+                check: "x".repeat(10_000),
+                result: Some("30 entries".to_string()),
+                observed: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let stored = decision.lock().await;
+        let submitted = &stored.as_ref().unwrap().named_check;
+        assert!(
+            matches!(submitted, SubmittedCheck::UnrepresentableIdentity),
+            "over-bound identity must record an unrepresentable trace, not alias absent, \
+             got {submitted:?}"
+        );
+    }
+
+    // RV1: the empty-identity submission path is the other unrepresentable
+    // identity — it too records a trace rather than aliasing absent.
+    #[tokio::test]
+    async fn empty_identity_records_unrepresentable_not_absent() {
+        let decision: SubmitResultDecision = Arc::new(Mutex::new(None));
+        let tool = SubmitResultTool::new(decision.clone());
+
+        tool.call(SubmitResultArgs {
+            summary: "checked".to_string(),
+            result: "full findings".to_string(),
+            confidence: "high".to_string(),
+            named_check: Some(NamedCheckArgs {
+                check: "   ".to_string(),
+                result: Some("30 entries".to_string()),
+                observed: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let stored = decision.lock().await;
+        let submitted = &stored.as_ref().unwrap().named_check;
+        assert!(
+            matches!(submitted, SubmittedCheck::UnrepresentableIdentity),
+            "empty identity must record an unrepresentable trace, not alias absent, \
+             got {submitted:?}"
+        );
     }
 }
