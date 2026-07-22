@@ -188,10 +188,14 @@ wake reason is durable and survives until claimed.
 
 ### 9. Approval dispatch FSM
 
-Consumption of a resolved decision is its own FSM:
+Consuming a *granted* decision is its own FSM, distinct from resolving the
+approval (decision 8). A dispatch record exists only once an approval is
+granted, so a denial has no state here and cannot reach execution by
+construction: the fail-closed guarantee is the shape of the type, not a
+guard.
 
 ```text
-Pending -> Resolved -> DispatchClaimed -> Executed | ExecutionUnknown
+Unclaimed -> Claimed -> Executed | ExecutionUnknown
 ```
 
 A crash after claim leaves `ExecutionUnknown`, never a silent retry, because
