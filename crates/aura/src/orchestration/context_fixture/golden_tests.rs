@@ -36,7 +36,8 @@ use super::{
 use crate::config::AgentRuntimeConfig;
 use crate::orchestration::config::{ArtifactsConfig, OrchestrationConfig, ToolVisibility};
 use crate::orchestration::context::{
-    ContextError, EvidenceText, PinnedGoal, ResultPreview, SpilledArtifact, WorkerClaim,
+    CheckIdentity, ContextError, EvidenceText, NamedCheck, PinnedGoal, ResultPreview,
+    SpilledArtifact, WorkerClaim,
 };
 use crate::orchestration::events::RoutingMode;
 use crate::orchestration::orchestrator::CoordinatorTools;
@@ -44,7 +45,7 @@ use crate::orchestration::persistence::{
     ArtifactEntry, ArtifactKind, ErrorContext, ExecutionPersistence, RunManifest, RunStatus,
     TaskSummary, ToolCallRecord, ToolOutcome, ToolTraceEntry,
 };
-use crate::orchestration::tools::submit_result::Confidence;
+use crate::orchestration::tools::submit_result::{Confidence, SubmittedCheck};
 use crate::orchestration::tools::{
     InspectToolParamsTool, ListPriorRunsTool, ListToolsTool, ReadArtifactTool, RoutingToolSet,
 };
@@ -218,6 +219,22 @@ fn leaf(task: &str, worker: Option<&str>) -> StepInput {
         worker: worker.map(str::to_owned),
         named_check: None,
     }
+}
+
+/// A leaf task that declares the check deciding its success (S46), carried as
+/// raw wire text and parsed into `Task::named_check_declaration` on flatten.
+fn leaf_with_check(task: &str, worker: Option<&str>, check: &str) -> StepInput {
+    StepInput::LeafTask {
+        task: task.to_owned(),
+        worker: worker.map(str::to_owned),
+        named_check: Some(check.to_owned()),
+    }
+}
+
+/// A worker claim carrying the decisive named check it performed, mirroring an
+/// OPTION-IN `submit_result` that filled `named_check`.
+fn claim_with_check(summary: &str, confidence: Confidence, check: NamedCheck) -> WorkerClaim {
+    claim(summary, confidence).with_named_check(check)
 }
 
 fn decision(rationale: &str, steps: Vec<StepInput>) -> PlanDecision {
@@ -659,6 +676,71 @@ async fn coordinator_call2_clean() {
     snapshot_coordinator("coordinator_call2_clean", &scenario).await;
 }
 
+/// S46 declared-check acceptance moment (packet section 8 Views 1-3): two
+/// tasks each declared a check. Task 0's worker performed it, so its decisive
+/// result renders on the `[Check: ...]` line; task 1's worker carried nothing
+/// for its declared check, so it reconciles to `NOT RUN` at the render site —
+/// a self-report that can no longer read as a clean pass.
+#[tokio::test]
+async fn coordinator_call_declared_check() {
+    let decision = decision(
+        "Reshard, then verify the per-directory bound and the round-trip.",
+        vec![
+            leaf_with_check(
+                "Reshard c4_sample so each directory holds at most 30 entries",
+                Some("analyst"),
+                "per-directory entry count (max 30, recursive)",
+            ),
+            leaf_with_check(
+                "Verify the reshard reconstructs with zero diff failures",
+                Some("operator"),
+                "round-trip diff (zero failures)",
+            ),
+        ],
+    );
+    let performed = NamedCheck::parse(
+        "per-directory entry count (max 30, recursive)",
+        Some("VIOLATION: /app/c4_resharded/g00000 has 53 entries"),
+        None,
+    )
+    .expect("valid performed check");
+    let outcomes = vec![
+        TaskOutcome::Complete {
+            result: CompletedResultFixture::Inline {
+                result: evidence(
+                    "Resharding complete. Root entries in /app/c4_resharded/: 2; all 53 shards under g00000/.",
+                ),
+                claim: Some(claim_with_check(
+                    "Resharding complete; the per-directory sweep found a violation",
+                    Confidence::High,
+                    performed,
+                )),
+            },
+            traces: vec![],
+        },
+        TaskOutcome::Complete {
+            result: CompletedResultFixture::Inline {
+                result: evidence("Round-trip reconstructed 9,898 files from the shards."),
+                // No named check carried: the declared round-trip check
+                // reconciles to NOT RUN rather than riding the self-report.
+                claim: Some(claim("Round-trip reconstructed cleanly", Confidence::High)),
+            },
+            traces: vec![],
+        },
+    ];
+    let iteration = IterationFixture::new(decision, outcomes, None)
+        .expect("declared-check iteration validates");
+    let scenario = scenario(
+        preamble(no_optional_tools()),
+        WorkerRosterFixture::new(
+            roster_config(analyst_operator_workers(), ToolVisibility::Summary),
+            Vec::new(),
+        ),
+        CoordinatorCall::Continuation(ContinuationThread::new(vec![iteration]).expect("one")),
+    );
+    snapshot_coordinator("coordinator_call_declared_check", &scenario).await;
+}
+
 /// The non-default observability knob: completed tasks carry condensed
 /// tool-chain lines when `show_tool_reasoning_in_continuation` is enabled.
 #[tokio::test]
@@ -1008,6 +1090,10 @@ fn completed_task(id: usize, description: &str, result: &CompletedResultFixture)
     task.structured_output = result.claim().map(|claim| StructuredTaskOutput {
         summary: claim.summary().to_owned(),
         confidence: claim.confidence(),
+        named_check: claim
+            .named_check()
+            .cloned()
+            .map_or(SubmittedCheck::Absent, SubmittedCheck::Present),
     });
     task
 }
@@ -1057,6 +1143,49 @@ async fn worker_role_frame_direct() {
         )),
     };
     snapshot_worker("worker_role_frame_direct", &scenario).await;
+}
+
+/// S46 packet section 8 View 4: a prior task declared a check its worker did
+/// not carry, so the downstream worker inherits a visible `NOT RUN` line under
+/// `Evidence:` rather than a clean-looking summary.
+#[tokio::test]
+async fn worker_role_frame_declared_check() {
+    let mut plan = Plan::new(QUERY);
+    let mut ancestor = completed_task(
+        0,
+        "Reshard c4_sample so each directory holds at most 30 entries",
+        &CompletedResultFixture::Inline {
+            result: evidence(
+                "Root entries in /app/c4_resharded/: 2; all 53 shards in g00000/; reconstruction PASS on 3 sampled files.",
+            ),
+            claim: Some(claim(
+                "Resharding complete under a 2-entry root",
+                Confidence::High,
+            )),
+        },
+    );
+    ancestor.worker = Some("analyst".to_owned());
+    ancestor.named_check_declaration =
+        Some(CheckIdentity::new("per-directory entry count (max 30, recursive)").expect("valid"));
+    plan.add_task(ancestor);
+    plan.add_task(
+        Task::new(
+            1,
+            "Correlate the reshard output with the source manifest",
+            "fixture target",
+        )
+        .with_dependency(0),
+    );
+    let frame = FrameGraph::new(plan, 1).expect("declared-check frame renders");
+    let scenario = WorkerScenario {
+        preamble: WorkerPreambleFixture::Role {
+            role_preamble: ROLE_PREAMBLE.to_owned(),
+            vector_stores: vec![],
+            appends: no_appends(),
+        },
+        frame: WorkerFrameFixture::Populated(frame),
+    };
+    snapshot_worker("worker_role_frame_declared_check", &scenario).await;
 }
 
 #[tokio::test]

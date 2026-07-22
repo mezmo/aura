@@ -528,6 +528,7 @@ fn worker_frame_direct_deps_always_admitted_transitive_budget_trimmed_first() {
                 result: EvidenceText::new(body).unwrap(),
                 claim: None,
             },
+            named_check: None,
         }
     }
 

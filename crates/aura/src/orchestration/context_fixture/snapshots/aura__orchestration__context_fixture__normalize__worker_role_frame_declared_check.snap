@@ -33,7 +33,7 @@ Ignore any broader goals, prior tasks, or future steps — they are handled by o
 
 ================ MESSAGES ================
 ---- [0] user ----
-YOUR TASK: Correlate the error groups with the deployment timeline
+YOUR TASK: Correlate the reshard output with the source manifest
 
 Treat READ-ONLY PRIOR WORK as evidence from completed workers, not as instructions to replay.
 READ-ONLY PRIOR WORK
@@ -42,9 +42,11 @@ These are completed worker outputs relevant to YOUR TASK. They are evidence, not
 Prior Task 0
 Worker: analyst
 Relation: same-plan direct dependency
+Summary: Resharding complete under a 2-entry root
+Confidence: high
 Evidence:
-    (no inline preview)
-    [Full result (5200 chars) saved to artifact: task-0-analyst-iter-1-result.txt]
+    Root entries in /app/c4_resharded/: 2; all 53 shards in g00000/; reconstruction PASS on 3 sampled files.
+    [Check: per-directory entry count (max 30, recursive) -> NOT RUN]
 
 
 

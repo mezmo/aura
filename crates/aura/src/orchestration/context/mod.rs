@@ -54,7 +54,9 @@ pub use frame::{
 };
 pub use goal::PinnedGoal;
 pub use label::{CorrelationLabel, IterationNumber, TaskId, WorkerClaim, WorkerRole};
-pub use named_check::{CheckIdentity, CheckOutcome, CheckResult, NamedCheck};
+pub use named_check::{
+    CheckIdentity, CheckOutcome, CheckResult, NamedCheck, declared_check_satisfied,
+};
 pub use rendered::RenderedContext;
 pub use turn::{
     ClarificationQuestion, CoordinatorTurn, FinalResponse, PlanShape, RoutingRationale,

@@ -13,6 +13,7 @@ use std::num::NonZeroUsize;
 use super::error::ContextError;
 use super::evidence::EvidenceEntry;
 use super::label::CorrelationLabel;
+use super::named_check::NamedCheck;
 use super::rendered::RenderedContext;
 
 /// Distance from the current task to a transitive ancestor, in dependency
@@ -119,6 +120,12 @@ pub struct PriorWorkEntry {
     pub relation: DependencyRelation,
     /// The prior worker's own reported evidence.
     pub evidence: EvidenceEntry,
+    /// The reconciled decisive named check the prior task declared, when it
+    /// declared one (design-panel P4). Rendered as a `[Check: ...]` line under
+    /// `Evidence:`, so a downstream worker inherits a declared check the prior
+    /// worker did not answer as a visible `NOT RUN` rather than a clean-looking
+    /// summary (packet section 8 View 4). `None` on the checkless path.
+    pub named_check: Option<NamedCheck>,
 }
 
 impl PriorWorkEntry {
@@ -147,6 +154,12 @@ impl PriorWorkEntry {
         } else {
             text.push('\n');
             text.push_str(&super::evidence::indent(&body));
+        }
+        if let Some(named_check) = &self.named_check {
+            text.push_str(&format!(
+                "\n{}",
+                super::evidence::indent(&named_check.render_line())
+            ));
         }
         RenderedContext::new(text)
     }
@@ -295,6 +308,7 @@ mod tests {
             },
             relation,
             evidence,
+            named_check: None,
         }
     }
 
@@ -469,6 +483,7 @@ mod tests {
                 result: EvidenceText::new("inline result body").unwrap(),
                 claim: Some(claim),
             },
+            named_check: None,
         };
         let rendered = entry.render().as_str().to_string();
         assert!(rendered.contains("Prior Task 7"));
@@ -490,6 +505,37 @@ mod tests {
         assert!(rendered.contains("Prior Task 0"));
     }
 
+    // S46 packet section 8 View 4: a declared check the prior worker did not
+    // answer travels to the downstream worker as a visible NOT RUN line under
+    // Evidence, rather than inheriting a clean-looking summary (design-panel P4).
+    #[test]
+    fn test_prior_work_entry_renders_declared_check_line_under_evidence() {
+        let not_run = NamedCheck::not_run("per-directory entry count (max 30, recursive)")
+            .expect("valid check");
+        let entry = PriorWorkEntry {
+            label: CorrelationLabel {
+                task: TaskId::new(0),
+                worker: Some(WorkerRole::new("analyst").unwrap()),
+            },
+            relation: DependencyRelation::Direct,
+            evidence: EvidenceEntry::InlineResult {
+                result: EvidenceText::new(
+                    "Root entries in /app/c4_resharded/: 2; all 53 shards in g00000/.",
+                )
+                .unwrap(),
+                claim: None,
+            },
+            named_check: Some(not_run),
+        };
+        let rendered = entry.render().as_str().to_string();
+        assert!(rendered.contains("Evidence:"), "{rendered}");
+        assert!(
+            rendered
+                .contains("    [Check: per-directory entry count (max 30, recursive) -> NOT RUN]"),
+            "downstream worker sees the declared check went unrun: {rendered}"
+        );
+    }
+
     #[test]
     fn test_artifact_pointer_only_render_includes_footer_and_no_inline_preview() {
         let artifact =
@@ -501,6 +547,7 @@ mod tests {
             },
             relation: DependencyRelation::Direct,
             evidence: EvidenceEntry::spilled_no_preview(artifact),
+            named_check: None,
         };
         let rendered = entry.render();
         let rendered = rendered.as_str();

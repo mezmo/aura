@@ -149,6 +149,19 @@ pub(super) fn compose_coordinator_preamble(fixture: &PreambleFixture) -> String 
     preamble
 }
 
+/// The `SubmittedCheck` a fixture claim carries, mirroring how the tool stores
+/// a worker's decisive named check: a claim that rides a [`NamedCheck`] stores
+/// it as `Present`, and a claim without one stores `Absent`.
+fn claim_submitted_check(
+    claim: &crate::orchestration::context::WorkerClaim,
+) -> crate::orchestration::tools::submit_result::SubmittedCheck {
+    use crate::orchestration::tools::submit_result::SubmittedCheck;
+    claim
+        .named_check()
+        .cloned()
+        .map_or(SubmittedCheck::Absent, SubmittedCheck::Present)
+}
+
 /// Apply an iteration's outcomes to its decision's flattened plan, exactly
 /// as the execute loop records them: completed results via
 /// `Task::complete` over the stored raw result, failures via `Task::fail`,
@@ -166,6 +179,7 @@ pub(crate) fn executed_plan(iteration: &IterationFixture) -> Plan {
                         .map(|claim| crate::orchestration::types::StructuredTaskOutput {
                             summary: claim.summary().to_owned(),
                             confidence: claim.confidence(),
+                            named_check: claim_submitted_check(claim),
                         });
             }
             TaskOutcome::Failed { report, .. } => match report {
@@ -188,6 +202,7 @@ pub(crate) fn executed_plan(iteration: &IterationFixture) -> Plan {
                         Some(crate::orchestration::types::StructuredTaskOutput {
                             summary: claim.summary().to_owned(),
                             confidence: claim.confidence(),
+                            named_check: claim_submitted_check(claim),
                         });
                 }
             },

@@ -22,6 +22,7 @@ Ignore any broader goals, prior tasks, or future steps — they are handled by o
 
 - DO complete your assigned task to the best of your ability
 - DO call `submit_result` with your summary, complete findings, and confidence level (high/medium/low) when done
+- If your task named a check that decides success — a specific verification whose result determines pass or fail — your result is not complete until it contains that check and the result it actually produced. When a check is named, obtain its result by performing the check, not by reasoning about what it would produce; the evidence must come from that named check and address its stated criterion, not from a different check that happens to succeed. If you cannot perform the named check with the tools you have, say so explicitly, report what you did observe, and do not claim the check passed. Most tasks name no such check; when none is named, a complete result is exactly what the task describes.
 - MANDATORY: You MUST call the `submit_result` tool to complete this task. Failing to call it will result in task failure.
 - DO report failures honestly with error details
 - DO NOT try to solve tasks outside your assignment — other workers handle those
@@ -94,6 +95,27 @@ Use your tools when the task requires fetching, generating, or computing new dat
             "low"
           ],
           "type": "string"
+        },
+        "named_check": {
+          "description": "The specific verification whose result decides this task's success, when the task named one. Omit entirely when the task named no such check. Fill it by performing the check, not by reasoning about what it would produce.",
+          "properties": {
+            "check": {
+              "description": "The check that decides success: a specific verification whose result determines pass or fail, e.g. 'per-directory entry count (max 30, recursive)'. Keep it to one decisive line.",
+              "type": "string"
+            },
+            "observed": {
+              "description": "What you observed when you could NOT perform the check. Provide this instead of `result` on the incapacity path, and never claim the check passed.",
+              "type": "string"
+            },
+            "result": {
+              "description": "The decisive result the check actually produced — a count, a delta, a pass/fail line. Provide this when you performed the check; keep bulk output in `result` and reference it here by its decisive datum only.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "check"
+          ],
+          "type": "object"
         },
         "result": {
           "description": "Complete findings and analysis.",

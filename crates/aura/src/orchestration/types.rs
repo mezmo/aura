@@ -393,6 +393,17 @@ impl<'de> Deserialize<'de> for Task {
 pub struct StructuredTaskOutput {
     pub summary: String,
     pub confidence: super::tools::submit_result::Confidence,
+    /// What the worker's submission carried for the task's decisive named
+    /// check: the single owned source threaded from `submit_result` to the
+    /// evidence frame (design-panel P7), where it reconciles against
+    /// [`Task::named_check_declaration`]. Absent on the common checkless path,
+    /// and skipped on serialization there so legacy stored output stays
+    /// byte-identical.
+    #[serde(
+        default,
+        skip_serializing_if = "super::tools::submit_result::SubmittedCheck::is_absent"
+    )]
+    pub named_check: super::tools::submit_result::SubmittedCheck,
 }
 
 impl Task {
@@ -811,8 +822,8 @@ impl IterationContext {
     ) -> String {
         use super::context::{
             BlockedEntry, CompletedEntry, CorrelationLabel, ErrorPreview, EvidenceEntry,
-            FailedEntry, FailureHandle, FailureRecord, FailureReport, IterationNumber, PinnedGoal,
-            SpilledArtifact, TaskId, WorkerClaim, WorkerRole,
+            FailedEntry, FailureHandle, FailureRecord, FailureReport, IterationNumber, NamedCheck,
+            PinnedGoal, SpilledArtifact, TaskId, WorkerClaim, WorkerRole,
         };
         use super::templates::{ContinuationVars, render_continuation_prompt};
 
@@ -838,22 +849,35 @@ impl IterationContext {
             match &t.state {
                 TaskState::Complete { result } => {
                     let artifacts = artifact_refs(self.tool_traces.get(&t.id));
+                    // Reconcile the task's declared check against what the
+                    // worker's submission carried, at the render site, so a
+                    // declared check the worker did not answer surfaces as
+                    // `NOT RUN` (design-panel P4).
+                    let named_check = NamedCheck::reconcile(
+                        t.named_check_declaration.as_ref(),
+                        t.structured_output.as_ref().map(|so| &so.named_check),
+                    );
                     let entry = match EvidenceEntry::from_completed_result(result, claim) {
                         Ok(evidence) => String::from(
                             CompletedEntry {
                                 label: correlation_label(t),
                                 evidence,
                                 artifacts,
+                                named_check,
                             }
                             .render(),
                         ),
                         // A whitespace-only result has no evidence to show;
-                        // the label still records that the task ran, and the
+                        // the label still records that the task ran, the
+                        // declared check's outcome stays visible, and the
                         // artifact inventory stays visible.
                         Err(_) => {
                             let mut line = format!("- Task {}", t.id);
                             if let Some(worker) = correlation_label(t).worker {
                                 line.push_str(&format!(" ({worker})"));
+                            }
+                            if let Some(named_check) = &named_check {
+                                line.push_str(&format!("\n    {}", named_check.render_line()));
                             }
                             for artifact in &artifacts {
                                 line.push_str(&format!("\n    {artifact}"));
@@ -1713,6 +1737,7 @@ mod tests {
         task.structured_output = Some(StructuredTaskOutput {
             summary: "Found 47 error groups across 3 services".to_string(),
             confidence: Confidence::High,
+            named_check: super::super::tools::submit_result::SubmittedCheck::Absent,
         });
         plan.add_task(task);
 
@@ -1904,6 +1929,7 @@ mod tests {
         completed.structured_output = Some(StructuredTaskOutput {
             summary: "QEMU running with VNC".into(),
             confidence: super::super::tools::submit_result::Confidence::High,
+            named_check: super::super::tools::submit_result::SubmittedCheck::Absent,
         });
         plan.add_task(completed);
         let mut failed =
@@ -1951,6 +1977,7 @@ mod tests {
         task.structured_output = Some(StructuredTaskOutput {
             summary: "worker summary of the spilled result".into(),
             confidence: super::super::tools::submit_result::Confidence::High,
+            named_check: super::super::tools::submit_result::SubmittedCheck::Absent,
         });
         plan.add_task(task);
 
@@ -2683,6 +2710,7 @@ mod tests {
         task.structured_output = Some(StructuredTaskOutput {
             summary: "Found partial matches but could not correlate across services".into(),
             confidence: super::super::tools::submit_result::Confidence::Low,
+            named_check: super::super::tools::submit_result::SubmittedCheck::Absent,
         });
         plan.add_task(task);
 
@@ -2718,6 +2746,7 @@ mod tests {
         task.structured_output = Some(StructuredTaskOutput {
             summary: "".into(),
             confidence: super::super::tools::submit_result::Confidence::High,
+            named_check: super::super::tools::submit_result::SubmittedCheck::Absent,
         });
         plan.add_task(task);
 

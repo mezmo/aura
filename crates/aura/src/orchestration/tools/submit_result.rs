@@ -71,6 +71,16 @@ pub enum SubmittedCheck {
     UnrepresentableIdentity,
 }
 
+impl SubmittedCheck {
+    /// Whether the submission named no representable check. Lets the stored
+    /// output skip serializing the field on the common (checkless) path, so
+    /// legacy JSON stays byte-identical.
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
 /// Shared state for capturing a worker's structured result.
 /// First-write-wins: subsequent calls are rejected.
 pub type SubmitResultDecision = Arc<Mutex<Option<SubmitResultOutput>>>;
@@ -164,6 +174,25 @@ impl Tool for SubmitResultTool {
                         "type": "string",
                         "enum": ["high", "medium", "low"],
                         "description": "Confidence in the result. 'low' if key data was unavailable or ambiguous."
+                    },
+                    "named_check": {
+                        "type": "object",
+                        "description": "The specific verification whose result decides this task's success, when the task named one. Omit entirely when the task named no such check. Fill it by performing the check, not by reasoning about what it would produce.",
+                        "properties": {
+                            "check": {
+                                "type": "string",
+                                "description": "The check that decides success: a specific verification whose result determines pass or fail, e.g. 'per-directory entry count (max 30, recursive)'. Keep it to one decisive line."
+                            },
+                            "result": {
+                                "type": "string",
+                                "description": "The decisive result the check actually produced — a count, a delta, a pass/fail line. Provide this when you performed the check; keep bulk output in `result` and reference it here by its decisive datum only."
+                            },
+                            "observed": {
+                                "type": "string",
+                                "description": "What you observed when you could NOT perform the check. Provide this instead of `result` on the incapacity path, and never claim the check passed."
+                            }
+                        },
+                        "required": ["check"]
                     }
                 },
                 "required": ["summary", "result", "confidence"]

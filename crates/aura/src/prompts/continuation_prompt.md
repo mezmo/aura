@@ -8,11 +8,11 @@ If a task's inline preview appears truncated or insufficient for your decision, 
 
 This is an end-of-iteration decision point. Choose one routing tool:
 
-- `respond_directly` — answer the user from the results above, plus the tools available to you and general knowledge.
+- `respond_directly` — answer the user from the results above, plus the tools available to you and general knowledge. If a task above named a check that decides its success, answer from it only when that check and its actual result are in the results. If they are absent, obtain the result with a new plan when doing so is appropriate and safe — mind actions that are not idempotent, and do not issue plan after plan to chase evidence that cannot be obtained. When the result stays unavailable, answer while reporting that outcome as unverified rather than claiming success; never silently accept a success assertion in its place.
 - `create_plan` — issue a new plan when the current results point to the next step: a deeper investigation into what they revealed (e.g. narrowing from identified failure groups into their affected apps), a step they expose as missing, or retrying failed tasks with a different approach.
 - `request_clarification` — ask the user a question if the results reveal an ambiguity in the original query you cannot resolve.
 
 When you can answer the user from what's already available to you, respond_directly. When more worker tool work is needed, create_plan — or request_clarification if the query needs disambiguation.
 
 IMPORTANT — synthesis rules for `respond_directly`:
-Your response IS the final answer the user sees. Task results are NOT shown to the user. You must inline all relevant findings — exact names, values, identifiers, and data points from the task results above. Never reference tasks by number or defer to task outputs. Extract the concrete data and present it directly.
+Your response IS the final answer the user sees. Task results are NOT shown to the user. You must inline all relevant findings — exact names, values, identifiers, and data points from the task results above. Never reference tasks by number or defer to task outputs. Extract the concrete data and present it directly. If the task declared success on a named check, that check's actual result is one of the findings you must have in hand before you answer; a worker's assertion that it passed is not a substitute.

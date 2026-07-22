@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 
 use super::error::ContextError;
 use super::named_check::NamedCheck;
-use crate::orchestration::tools::submit_result::Confidence;
+use crate::orchestration::tools::submit_result::{Confidence, SubmittedCheck};
 use crate::orchestration::types::StructuredTaskOutput;
 
 /// Identity of a task within a plan, used to correlate an evidence entry
@@ -162,14 +162,20 @@ impl WorkerClaim {
 }
 
 /// Parse a claim from a worker's structured `submit_result` output, the
-/// canonical source of summary-plus-confidence pairs. Fails with
+/// canonical source of summary-plus-confidence pairs. The worker's carried
+/// named check rides onto the claim (design A, packet section 7), so it is the
+/// stand-in that survives result spill. Fails with
 /// [`ContextError::EmptyWorkerClaimSummary`] when the summary is empty or
 /// whitespace-only.
 impl TryFrom<&StructuredTaskOutput> for WorkerClaim {
     type Error = ContextError;
 
     fn try_from(output: &StructuredTaskOutput) -> Result<Self, Self::Error> {
-        Self::new(&output.summary, output.confidence)
+        let claim = Self::new(&output.summary, output.confidence)?;
+        Ok(match &output.named_check {
+            SubmittedCheck::Present(named_check) => claim.with_named_check(named_check.clone()),
+            SubmittedCheck::Absent | SubmittedCheck::UnrepresentableIdentity => claim,
+        })
     }
 }
 
@@ -207,6 +213,7 @@ mod tests {
         let empty_output = StructuredTaskOutput {
             summary: "  ".into(),
             confidence: Confidence::Low,
+            named_check: SubmittedCheck::Absent,
         };
         assert_eq!(
             WorkerClaim::try_from(&empty_output),
@@ -216,6 +223,7 @@ mod tests {
         let output = StructuredTaskOutput {
             summary: "Found 47 error groups".into(),
             confidence: Confidence::High,
+            named_check: SubmittedCheck::Absent,
         };
         let claim = WorkerClaim::try_from(&output).expect("summary present");
         assert_eq!(claim.summary(), "Found 47 error groups");

@@ -1,8 +1,9 @@
 # S46 named-check type design record
 
-Baseline: aura `7a0f0651`, branch `card/S46`. Scope: the type skeleton for
-the named-check mechanism (phase 1 of the S46 type discipline). Bodies where
-behavior is nontrivial are `todo!()`; plain field additions are complete. The
+Baseline: aura `7a0f0651`, branch `card/S46`. Scope: the named-check mechanism.
+Phase 1 landed the type skeleton; phase 2 landed the bodies — render,
+render-site reconciliation, the acceptance predicate, the worker-to-render
+bridge, the template wording, and the OPTION-IN tool-schema advertisement. The
 design of record is the U(mockup) packet v3
 (`docs/redesign/2026-07-21-s46-enforcement-mockups.md`), sections 2, 7, and 8;
 the gate decisions this record implements are OPTION-IN (round 4) and the
@@ -54,30 +55,46 @@ at the wire boundary and leaves as bounded values.
 | `NamedCheckWidth` (`bounding.rs`) | `pub` in the private `bounding` module | Reachable from `context` (a descendant of `orchestration`); co-located with every other bound per the module's "one source of truth" charter |
 | `CheckIdentity::new`, `CheckResult::new`, `NamedCheck::parse`, `NamedCheck::not_run` | `pub`, return `Result<_, ContextError>` | Parse-don't-validate; consumers obtain a bounded value through these constructors |
 | `serde(try_from = "String")` on `CheckIdentity` / `CheckResult` | - | Deserialization runs the bounded constructor, so a persisted or wire value cannot bypass the bound |
-| `NamedCheck::render_line` | `pub`, `todo!()` | Phase-2 render body; the `[Check: {identity} -> {outcome}]` line. Unused in phase 1 (no caller), so existing renders and golden snapshots are unchanged |
+| `NamedCheck::render_line`, `NamedCheck::reconcile`, `declared_check_satisfied` | `pub` | Phase-2 render, render-site reconciliation, and the acceptance predicate. `reconcile` reads `SubmittedCheck` from `tools`, closing the same `context -> tools` loop `Confidence` already uses |
 | `WorkerClaim::with_named_check` | `pub`, additive builder | Existing `WorkerClaim::new` callers are untouched; the field defaults to `None` |
 | `submit_result` (tools) → `context::NamedCheck` | - | Adds a `tools -> context` reference closing the loop `context -> tools` already opened for `Confidence`; intra-crate module cycles are permitted and carry no type cycle |
 
-## Phase boundary (what phase 1 does NOT do)
+## Phase 2 (landed)
 
-- **Reconciliation.** Turning a declared-but-absent check into
-  `CheckOutcome::NotRun` at the render/acceptance site is a `todo!()`-class
-  body deferred to phase 2. Phase 1 provides the types
-  (`NamedCheck::not_run`, `CheckOutcome::NotRun`) and the carriers.
-- **Render.** `NamedCheck::render_line` and the wiring that appends the
-  `[Check: ...]` line into `CompletedEntry::render` / `PriorWorkEntry::render`
-  are phase 2. Existing render bodies are unchanged, so no golden snapshot
-  moves.
-- **The worker → render bridge.** `SubmitResultOutput.named_check` reaches the
-  continuation-prompt render only once the orchestrator threads it onto the
-  task's stored output and builds the reconciled `WorkerClaim`. Phase 1 stops
-  at the field additions; the threading (and any consequent field on
-  `StructuredTaskOutput`) is phase-2 wiring, flagged in R2 below.
-- **Enforcement gate and schema advertisement.** The deterministic
-  "reject a `submit_result` that omits `named_check` when the task declared a
-  check" gate, and advertising `named_check` in the tool's JSON parameter
-  schema, are phase-2 behavior. The `submit_result` JSON schema is left
-  byte-identical so tool-definition snapshots do not move.
+- **Reconciliation.** `NamedCheck::reconcile(declaration, submitted)` turns a
+  declared-but-uncarried check into `CheckOutcome::NotRun` at the render site,
+  keyed off `Task.named_check_declaration` (design-panel P4). It is
+  declaration-driven: no declared check renders no line (the negative-space
+  clause), except an unrepresentable submission, which is surfaced not dropped
+  (RV1).
+- **Render.** `NamedCheck::render_line` emits `[Check: {identity} -> {outcome}]`
+  (`Performed` result, `COULD NOT PERFORM: {observed}`, or `NOT RUN`).
+  `CompletedEntry` and `PriorWorkEntry` each carry the reconciled
+  `Option<NamedCheck>` and append the line after the evidence, on every entry
+  shape — so a declared check stays visible through result spill and into the
+  worker-to-worker frame (packet section 8 Views 1-4).
+- **The worker → render bridge (R2 resolved).** `SubmittedCheck` threads as one
+  owned source (design-panel P7): `SubmitResultOutput.named_check` ->
+  `StructuredTaskOutput.named_check` -> `WorkerClaim` (via `TryFrom`, design A
+  carrier) and, at the render site, into the reconciled entry value. No third
+  parallel optional was added; `StructuredTaskOutput` gained the one field,
+  `skip_serializing_if` on the checkless path so legacy JSON stays identical.
+- **Acceptance obligation (P2).** `declared_check_satisfied(declaration,
+  submitted)` requires identity equality AND `CheckOutcome::Performed`;
+  everything else (incapable, not-run, mismatch, unrepresentable, absent) is
+  unverified and surfaces as the reconciled `NOT RUN` / `COULD NOT PERFORM`
+  render line in the coordinator's view. The control model is unchanged: no
+  runtime hard-reject gate was added (bounded router stays).
+- **Schema advertisement.** `submit_result` now advertises `named_check`
+  (`check` / `result` / `observed`) in its JSON parameter schema (OPTION-IN,
+  round 4). Tool-definition snapshots move with the schema (intended).
+
+## Still deferred (phase-2 out of scope)
+
+- **Deterministic enforcement gate.** The harder target — reject a
+  `submit_result` that omits `named_check` when the task declared a check,
+  without consuming first-write state so the worker retries — stays recorded in
+  the ledger (R5) and unbuilt; it would change the tool's error type.
 
 ## Residual risks (named)
 
@@ -99,12 +116,12 @@ at the wire boundary and leaves as bounded values.
   design B's per-entry legibility at the layer that owns rendering while
   keeping the claim as the worker-attested carrier, so packet §8 View 4's
   prior-work legibility is preserved.
-- **R2 - the worker-to-render bridge is unwired.** `SubmitResultOutput` carries
-  the worker's `named_check`, but the path onto `Task`/`WorkerClaim` at the
-  render site is phase 2. It may require a `named_check` field on
-  `StructuredTaskOutput` (~12 construction sites, mostly tests) - deferred so
-  phase 1 stays a minimal type surface. Flagged so the panel weighs the
-  eventual ripple.
+- **R2 - resolved (phase 2): the worker-to-render bridge is wired.**
+  `SubmittedCheck` threads `SubmitResultOutput.named_check` ->
+  `StructuredTaskOutput.named_check` -> `WorkerClaim` and the reconciled entry
+  value, one owned source (P7). `StructuredTaskOutput` gained the single field
+  (the anticipated ~12 construction sites, mostly tests), with
+  `skip_serializing_if` keeping checkless stored output byte-identical.
 - **R3 - the field bound value.** `NamedCheckWidth::DEFAULT` is 200 characters -
   a placeholder honoring the "one decisive line" intent; identity and result
   share one cap. The exact value (and whether identity should be capped tighter

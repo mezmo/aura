@@ -122,30 +122,6 @@ Do NOT use parallel groups for steps that depend on each other — sequential or
 
 When a task result or tool output is too large to include inline, it is saved to an artifact file and the inline text will contain a reference like `[Full result (N chars) saved to artifact: task-0-sre-iter-1-result.txt]` or `[Tool output saved to artifact: task-0-sre-iter-1-log_search-0-output.txt]`. Use `read_artifact` to load the full content when the summary is insufficient for your routing decision.
 
-## Session History
-
-You have context from previous orchestration run(s) in this session.
-
-**CRITICAL: Workers have NO access to session history. Every value a worker needs from a prior turn MUST appear as a concrete value in its task description.**
-
-**How to use this context:**
-- **Avoid redundant work**: Do not re-plan or re-call tools for tasks that already succeeded — reference their results directly in new task descriptions
-- **Embed concrete values for workers**: When a task depends on a prior turn's result, include the actual value (e.g., "The RCA identified 3 failure groups: auth-timeout, db-connection, and oom-kill — investigate the auth-timeout group" — NOT "investigate the failures from the previous result")
-- **Learn from failures**: If a prior task failed, check its tool chain and failure category to understand what went wrong. Avoid repeating the same approach — try a different decomposition, different tools, or break the task into smaller steps
-- **Use artifacts from prior runs**: If a prior run produced artifacts you need, use `read_artifact` with the `run_id` shown in that turn's entry to access them
-- **Do not assume stale data is current**: Prior results may be outdated if the user's follow-up implies changed conditions — check timestamps
-
-### Turn 1 (2026-07-10T09:15:00Z) — PartialSuccess
-Goal: "Triage the payments error spike"
-Outcome: 0/2 tasks completed
-Tasks:
-  Task 0 [analyst] — running
-    "Search payments logs for error patterns"
-  Task 1 [analyst] — pending
-    "Query deployment history for the error window"
-
-(1 prior run(s) shown above)
-
 
 ================ MESSAGES ================
 ---- [0] user ----
@@ -186,6 +162,40 @@ Use sparingly when a reasonable interpretation exists.
 - For time-scoped tasks, include the current time and relevant time range in the task description so workers have explicit time context
 
 Call the appropriate routing tool now.
+
+---- [1] assistant ----
+create_plan: 2 tasks (analyst, operator). Rationale: Reshard, then verify the per-directory bound and the round-trip.
+
+---- [2] user ----
+Current time: <TIMESTAMP>
+
+ITERATION 1 of 3
+
+Goal (verbatim from the original request): Investigate the elevated error rates in the payments service and report the top failure groups with supporting evidence.
+Outcome: 2 of 2 tasks succeeded.
+
+COMPLETED TASKS:
+- Task 0 (analyst, confidence: high)
+    Resharding complete. Root entries in /app/c4_resharded/: 2; all 53 shards under g00000/.
+    [Check: per-directory entry count (max 30, recursive) -> VIOLATION: /app/c4_resharded/g00000 has 53 entries]
+- Task 1 (operator, confidence: high)
+    Round-trip reconstructed 9,898 files from the shards.
+    [Check: round-trip diff (zero failures) -> NOT RUN]
+
+
+If a task's inline preview appears truncated or insufficient for your decision, call `read_artifact` with the referenced filename before routing.
+
+This is an end-of-iteration decision point. Choose one routing tool:
+
+- `respond_directly` — answer the user from the results above, plus the tools available to you and general knowledge. If a task above named a check that decides its success, answer from it only when that check and its actual result are in the results. If they are absent, obtain the result with a new plan when doing so is appropriate and safe — mind actions that are not idempotent, and do not issue plan after plan to chase evidence that cannot be obtained. When the result stays unavailable, answer while reporting that outcome as unverified rather than claiming success; never silently accept a success assertion in its place.
+- `create_plan` — issue a new plan when the current results point to the next step: a deeper investigation into what they revealed (e.g. narrowing from identified failure groups into their affected apps), a step they expose as missing, or retrying failed tasks with a different approach.
+- `request_clarification` — ask the user a question if the results reveal an ambiguity in the original query you cannot resolve.
+
+When you can answer the user from what's already available to you, respond_directly. When more worker tool work is needed, create_plan — or request_clarification if the query needs disambiguation.
+
+IMPORTANT — synthesis rules for `respond_directly`:
+Your response IS the final answer the user sees. Task results are NOT shown to the user. You must inline all relevant findings — exact names, values, identifiers, and data points from the task results above. Never reference tasks by number or defer to task outputs. Extract the concrete data and present it directly. If the task declared success on a named check, that check's actual result is one of the findings you must have in hand before you answer; a worker's assertion that it passed is not a substitute.
+
 
 ================ TOOLS ================
 [

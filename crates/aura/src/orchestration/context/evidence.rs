@@ -9,6 +9,7 @@
 
 use super::error::ContextError;
 use super::label::{CorrelationLabel, WorkerClaim, WorkerRole};
+use super::named_check::NamedCheck;
 use super::rendered::RenderedContext;
 pub use crate::orchestration::persistence::{ArtifactRef, SpilledArtifact};
 use crate::orchestration::tools::submit_result::Confidence;
@@ -295,12 +296,20 @@ pub struct CompletedEntry {
     /// Artifact inventory lines for this task; empty when the task produced
     /// no artifacts.
     pub artifacts: Vec<ArtifactRef>,
+    /// The reconciled decisive named check, when the task declared one
+    /// (design-panel P4): the worker's carried result when the identities
+    /// match, `NOT RUN` otherwise. Rendered as a `[Check: ...]` line after the
+    /// evidence on every entry shape, so a declared check the worker did not
+    /// answer stays visible even when the bulk result spilled. `None` on the
+    /// common checkless path.
+    pub named_check: Option<NamedCheck>,
 }
 
 impl CompletedEntry {
     /// Render the entry for the `COMPLETED TASKS:` section: the correlation
-    /// label line, the indented worker evidence, and the artifact inventory
-    /// lines (`ARCHITECTURE.md` sections 1.3 and 1.4).
+    /// label line, the indented worker evidence, the decisive check line when
+    /// the task declared one, and the artifact inventory lines
+    /// (`ARCHITECTURE.md` sections 1.3 and 1.4; S46 packet section 8).
     pub fn render(&self) -> RenderedContext {
         let confidence = self.evidence.claim().map(WorkerClaim::confidence);
         let mut text = format!(
@@ -310,6 +319,9 @@ impl CompletedEntry {
         );
         text.push('\n');
         text.push_str(&indent(&self.evidence.render_body()));
+        if let Some(named_check) = &self.named_check {
+            text.push_str(&format!("\n    {}", named_check.render_line()));
+        }
         for artifact in &self.artifacts {
             text.push_str(&format!("\n    {artifact}"));
         }
@@ -445,6 +457,7 @@ mod tests {
             label: label(Some("operator")),
             evidence: entry,
             artifacts: vec![],
+            named_check: None,
         }
         .render();
         let rendered = rendered.as_str();
@@ -463,6 +476,7 @@ mod tests {
             label: label(Some("operator")),
             evidence: inline,
             artifacts: vec![],
+            named_check: None,
         }
         .render();
         assert!(rendered.as_str().contains("    all checks passed"));
@@ -552,6 +566,7 @@ mod tests {
             artifacts: vec![
                 ArtifactRef::new("task-0-operator-iter-1-result.txt", 2143).expect("valid ref"),
             ],
+            named_check: None,
         };
         assert_eq!(
             entry.render().as_str(),
@@ -606,6 +621,55 @@ mod tests {
         );
     }
 
+    // S46 packet section 8: a declared check renders a `[Check: ...]` line
+    // after the evidence, and it survives result spill — the deciding datum
+    // stays in front of the coordinator even when the bulk spilled to an
+    // artifact (design-panel P4, packet section 7).
+    #[test]
+    fn completed_entry_renders_declared_check_inline_and_through_spill() {
+        let performed = NamedCheck::parse(
+            "per-directory entry count (max 30)",
+            Some("VIOLATION: g00000 has 53"),
+            None,
+        )
+        .expect("valid check");
+        let inline = CompletedEntry {
+            label: label(Some("analyst")),
+            evidence: EvidenceEntry::from_completed_result("Resharding complete.", Some(claim()))
+                .expect("parses inline"),
+            artifacts: vec![],
+            named_check: Some(performed),
+        };
+        assert!(
+            inline.render().as_str().contains(
+                "\n    [Check: per-directory entry count (max 30) -> VIOLATION: g00000 has 53]"
+            ),
+            "inline check line: {}",
+            inline.render().as_str()
+        );
+
+        // A declared check the worker did not carry renders NOT RUN, and the
+        // line rides alongside the spilled stand-in.
+        let not_run = NamedCheck::not_run("per-directory entry count (max 30)").expect("valid");
+        let spilled = format!("attested summary prefix\n\n{FOOTER}");
+        let entry = CompletedEntry {
+            label: label(Some("analyst")),
+            evidence: EvidenceEntry::from_completed_result(&spilled, Some(claim()))
+                .expect("spilled result parses"),
+            artifacts: vec![],
+            named_check: Some(not_run),
+        };
+        let rendered = entry.render().as_str().to_string();
+        assert!(
+            rendered.contains("[Full result ("),
+            "spill footer present: {rendered}"
+        );
+        assert!(
+            rendered.contains("[Check: per-directory entry count (max 30) -> NOT RUN]"),
+            "check survives the spill: {rendered}"
+        );
+    }
+
     #[test]
     fn from_completed_result_whitespace_only_prefix_returns_artifact_pointer_only() {
         let text = format!("   \n\n{FOOTER}");
@@ -626,6 +690,7 @@ mod tests {
             label: label(Some("operator")),
             evidence: entry,
             artifacts: vec![],
+            named_check: None,
         }
         .render();
         let rendered = rendered.as_str();

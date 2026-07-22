@@ -11,19 +11,26 @@
 //! (packet section 7) rather than growing into the bulk transcript. The
 //! task-side declaration lives on `Task` (`named_check_declaration`), and
 //! reconciling the two ends — a declared check the worker did not carry renders
-//! `NOT RUN` — is the phase-2 render body.
+//! `NOT RUN` — happens at the render site via [`NamedCheck::reconcile`].
 //!
 //! # Design status
 //!
-//! S46 phase 1 landed this module as a type skeleton. The parsing
-//! constructors ([`CheckIdentity::new`], [`CheckResult::new`], [`NamedCheck::parse`])
-//! are implemented; the render leg ([`NamedCheck::render_line`]) is a
-//! `todo!()` body for phase 2, along with the reconciliation that turns a
-//! declared-but-absent check into [`CheckOutcome::NotRun`] at the render site.
-//! See the co-located `DESIGN.md`.
+//! S46 phase 2 landed the bodies over the phase-1 skeleton. The parsing
+//! constructors ([`CheckIdentity::new`], [`CheckResult::new`],
+//! [`NamedCheck::parse`]), the render leg ([`NamedCheck::render_line`]), the
+//! render-site reconciliation ([`NamedCheck::reconcile`]), and the coordinator's
+//! acceptance predicate ([`declared_check_satisfied`]) are all implemented. See
+//! the co-located `DESIGN.md`.
 
 use super::error::ContextError;
 use crate::orchestration::bounding::NamedCheckWidth;
+use crate::orchestration::tools::submit_result::SubmittedCheck;
+
+/// Stand-in identity rendered when a worker's submission carried a check whose
+/// identity was itself unrepresentable and no task declaration is available to
+/// render against: the malformed submission is surfaced, never silently absent
+/// (design-panel RV1).
+const UNREPRESENTABLE_SUBMISSION_IDENTITY: &str = "submitted check (unrepresentable identity)";
 
 /// The identity of the verification a task's success depends on: what is
 /// checked and the criterion it must meet, for example
@@ -248,11 +255,83 @@ impl NamedCheck {
     }
 
     /// Render the decisive check line for an evidence entry:
-    /// `[Check: {identity} -> {result}]`, or `[Check: {identity} -> NOT RUN]`
-    /// when the check was not run (packet section 8).
+    /// `[Check: {identity} -> {outcome}]` (packet section 8). The outcome is the
+    /// decisive result when the check was performed, the worker's observation
+    /// prefixed `COULD NOT PERFORM:` when it could not, and `NOT RUN` when a
+    /// declared check carried nothing.
     #[must_use]
     pub fn render_line(&self) -> String {
-        todo!("S46 phase 2: render the [Check: ...] line; see named_check/DESIGN.md")
+        let outcome = match &self.outcome {
+            CheckOutcome::Performed(result) => result.as_str().to_owned(),
+            CheckOutcome::Incapable(observed) => format!("COULD NOT PERFORM: {observed}"),
+            CheckOutcome::NotRun => "NOT RUN".to_owned(),
+        };
+        format!("[Check: {} -> {}]", self.identity, outcome)
+    }
+
+    /// Reconcile a task's declared check identity against what the worker's
+    /// submission carried, yielding the check to render for one evidence entry
+    /// (design-panel P4). Reconciliation happens at the render site, so a
+    /// declared check the worker did not carry renders `NOT RUN` on every entry
+    /// shape — inline, spilled, or claimless.
+    ///
+    /// It is declaration-driven (packet section 8): a task that declared a check
+    /// always renders an outcome — the worker's carried result when the
+    /// identities match, `NOT RUN` otherwise (mismatched identity, absent, or an
+    /// unrepresentable submission) — so a declared check the worker did not
+    /// answer can never render as a clean success. A task that declared no check
+    /// renders no line, with one exception: a submission whose identity was
+    /// itself unrepresentable is surfaced rather than dropped (design-panel
+    /// RV1), so a malformed submission never vanishes silently.
+    #[must_use]
+    pub fn reconcile(
+        declaration: Option<&CheckIdentity>,
+        submitted: Option<&SubmittedCheck>,
+    ) -> Option<Self> {
+        match declaration {
+            Some(identity) => Some(match submitted {
+                Some(SubmittedCheck::Present(carried)) if carried.identity() == identity => {
+                    carried.clone()
+                }
+                _ => Self {
+                    identity: identity.clone(),
+                    outcome: CheckOutcome::NotRun,
+                },
+            }),
+            None => match submitted {
+                Some(SubmittedCheck::UnrepresentableIdentity) => {
+                    Self::not_run(UNREPRESENTABLE_SUBMISSION_IDENTITY).ok()
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Whether a task's declared check is satisfied by the worker's submission
+/// (design-panel P2): identity equality with the declaration AND a performed
+/// outcome. Incapable, `NotRun`, a mismatched identity, an unrepresentable
+/// submission, and an absent one are all unverified. A task that declared no
+/// check is trivially satisfied.
+///
+/// This is the coordinator's acceptance obligation: a declared-check task is
+/// accepted only on the named check's own performed result, never on the
+/// worker's self-report (packet section 2, Rule 2). Anything else surfaces as
+/// unverified in the coordinator's view (the reconciled `NOT RUN` /
+/// `COULD NOT PERFORM` render line).
+#[must_use]
+pub fn declared_check_satisfied(
+    declaration: Option<&CheckIdentity>,
+    submitted: Option<&SubmittedCheck>,
+) -> bool {
+    match declaration {
+        None => true,
+        Some(identity) => matches!(
+            submitted,
+            Some(SubmittedCheck::Present(carried))
+                if carried.identity() == identity
+                    && matches!(carried.outcome(), CheckOutcome::Performed(_))
+        ),
     }
 }
 
@@ -376,5 +455,173 @@ mod tests {
             let back: NamedCheck = serde_json::from_str(&json).unwrap();
             assert_eq!(check, back);
         }
+    }
+
+    // Phase-2 render: the `[Check: {identity} -> {outcome}]` line renders each
+    // outcome distinctly — the decisive result, a `COULD NOT PERFORM:` prefix,
+    // and the explicit `NOT RUN` (packet section 8).
+    #[test]
+    fn render_line_distinguishes_every_outcome() {
+        let performed = NamedCheck::parse(
+            "per-directory entry count (max 30)",
+            Some("VIOLATION: g00000 has 53"),
+            None,
+        )
+        .expect("valid");
+        assert_eq!(
+            performed.render_line(),
+            "[Check: per-directory entry count (max 30) -> VIOLATION: g00000 has 53]"
+        );
+
+        let incapable = NamedCheck::parse(
+            "desktop framebuffer read",
+            None,
+            Some("sandbox denied the monitor socket"),
+        )
+        .expect("valid");
+        assert_eq!(
+            incapable.render_line(),
+            "[Check: desktop framebuffer read -> COULD NOT PERFORM: sandbox denied the monitor socket]"
+        );
+
+        let not_run = NamedCheck::not_run("per-directory entry count (max 30)").expect("valid");
+        assert_eq!(
+            not_run.render_line(),
+            "[Check: per-directory entry count (max 30) -> NOT RUN]"
+        );
+    }
+
+    // P4: a task that declared no check reconciles to no line, so checkless
+    // tasks stay clean (the negative-space clause).
+    #[test]
+    fn reconcile_no_declaration_yields_no_line() {
+        assert_eq!(NamedCheck::reconcile(None, None), None);
+        assert_eq!(
+            NamedCheck::reconcile(None, Some(&SubmittedCheck::Absent)),
+            None
+        );
+        let present =
+            SubmittedCheck::Present(NamedCheck::parse("count", Some("30"), None).expect("valid"));
+        assert_eq!(NamedCheck::reconcile(None, Some(&present)), None);
+    }
+
+    // P4: a declared check whose identity matches the worker's carried check
+    // renders the worker's outcome; the deciding result is preserved.
+    #[test]
+    fn reconcile_matching_identity_carries_worker_outcome() {
+        let declaration = CheckIdentity::new("per-directory entry count (max 30)").expect("valid");
+        let submitted = SubmittedCheck::Present(
+            NamedCheck::parse(
+                "per-directory entry count (max 30)",
+                Some("VIOLATION: g00000 has 53"),
+                None,
+            )
+            .expect("valid"),
+        );
+        let reconciled =
+            NamedCheck::reconcile(Some(&declaration), Some(&submitted)).expect("declared");
+        assert_eq!(
+            reconciled.render_line(),
+            "[Check: per-directory entry count (max 30) -> VIOLATION: g00000 has 53]"
+        );
+    }
+
+    // P4/P2: a declared check the worker did not carry — absent, a mismatched
+    // identity, or an unrepresentable submission — reconciles to NOT RUN against
+    // the declared identity, so it can never render as a clean success.
+    #[test]
+    fn reconcile_uncarried_declaration_renders_not_run() {
+        let declaration = CheckIdentity::new("per-directory entry count (max 30)").expect("valid");
+
+        let absent = NamedCheck::reconcile(Some(&declaration), Some(&SubmittedCheck::Absent))
+            .expect("declared");
+        assert_eq!(absent.outcome(), &CheckOutcome::NotRun);
+
+        let none = NamedCheck::reconcile(Some(&declaration), None).expect("declared");
+        assert_eq!(none.outcome(), &CheckOutcome::NotRun);
+
+        let mismatch = SubmittedCheck::Present(
+            NamedCheck::parse("a different check", Some("passed"), None).expect("valid"),
+        );
+        let reconciled =
+            NamedCheck::reconcile(Some(&declaration), Some(&mismatch)).expect("declared");
+        assert_eq!(reconciled.outcome(), &CheckOutcome::NotRun);
+        assert_eq!(
+            reconciled.identity().as_str(),
+            "per-directory entry count (max 30)"
+        );
+
+        let unrepresentable = NamedCheck::reconcile(
+            Some(&declaration),
+            Some(&SubmittedCheck::UnrepresentableIdentity),
+        )
+        .expect("declared");
+        assert_eq!(unrepresentable.outcome(), &CheckOutcome::NotRun);
+    }
+
+    // RV1: an unrepresentable submission on a task that declared no check is
+    // still surfaced, never silently absent.
+    #[test]
+    fn reconcile_surfaces_unrepresentable_submission_without_declaration() {
+        let reconciled =
+            NamedCheck::reconcile(None, Some(&SubmittedCheck::UnrepresentableIdentity))
+                .expect("surfaced, not dropped");
+        assert_eq!(reconciled.outcome(), &CheckOutcome::NotRun);
+        assert!(
+            reconciled.render_line().contains("NOT RUN"),
+            "unrepresentable submission renders visibly: {}",
+            reconciled.render_line()
+        );
+    }
+
+    // P2: acceptance requires identity equality AND a performed outcome. Every
+    // other shape — incapable, not-run, mismatched, unrepresentable, absent — is
+    // unverified. A checkless task is trivially satisfied.
+    #[test]
+    fn declared_check_satisfied_requires_identity_equality_and_performed() {
+        let declaration = CheckIdentity::new("per-directory entry count (max 30)").expect("valid");
+
+        let performed = SubmittedCheck::Present(
+            NamedCheck::parse("per-directory entry count (max 30)", Some("clean"), None)
+                .expect("valid"),
+        );
+        assert!(declared_check_satisfied(
+            Some(&declaration),
+            Some(&performed)
+        ));
+
+        let incapable = SubmittedCheck::Present(
+            NamedCheck::parse("per-directory entry count (max 30)", None, Some("denied"))
+                .expect("valid"),
+        );
+        assert!(!declared_check_satisfied(
+            Some(&declaration),
+            Some(&incapable)
+        ));
+
+        let mismatch = SubmittedCheck::Present(
+            NamedCheck::parse("a different check", Some("clean"), None).expect("valid"),
+        );
+        assert!(!declared_check_satisfied(
+            Some(&declaration),
+            Some(&mismatch)
+        ));
+
+        assert!(!declared_check_satisfied(
+            Some(&declaration),
+            Some(&SubmittedCheck::Absent)
+        ));
+        assert!(!declared_check_satisfied(
+            Some(&declaration),
+            Some(&SubmittedCheck::UnrepresentableIdentity)
+        ));
+        assert!(!declared_check_satisfied(Some(&declaration), None));
+
+        // No declared check: nothing to verify, trivially satisfied.
+        assert!(declared_check_satisfied(
+            None,
+            Some(&SubmittedCheck::Absent)
+        ));
+        assert!(declared_check_satisfied(None, None));
     }
 }

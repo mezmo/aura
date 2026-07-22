@@ -2984,6 +2984,18 @@ impl Orchestrator {
                     .as_ref()
                     .and_then(|so| WorkerClaim::try_from(so).ok());
 
+                // Reconcile the prior task's declared check against what its
+                // worker carried, so a declared check the prior worker did not
+                // answer travels to the downstream worker as a visible
+                // `NOT RUN` (design-panel P4; packet section 8 View 4).
+                let named_check = crate::orchestration::context::NamedCheck::reconcile(
+                    ancestor.named_check_declaration.as_ref(),
+                    ancestor
+                        .structured_output
+                        .as_ref()
+                        .map(|so| &so.named_check),
+                );
+
                 let evidence = match EvidenceEntry::from_completed_result(result, claim) {
                     Ok(entry) => entry,
                     Err(e) => {
@@ -3009,6 +3021,7 @@ impl Orchestrator {
                     label,
                     relation,
                     evidence,
+                    named_check,
                 })
             })
             .collect();
@@ -3268,6 +3281,7 @@ impl Orchestrator {
                                 Some(&super::types::StructuredTaskOutput {
                                     summary: output.summary.clone(),
                                     confidence: output.confidence,
+                                    named_check: output.named_check.clone(),
                                 }),
                                 &prompt,
                             )
@@ -3277,6 +3291,7 @@ impl Orchestrator {
                                 structured_output: Some(super::types::StructuredTaskOutput {
                                     summary: output.summary,
                                     confidence: output.confidence,
+                                    named_check: output.named_check,
                                 }),
                             });
                         }
