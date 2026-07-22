@@ -1,8 +1,14 @@
 //! Approval dispatch consumption FSM (ADR 2026-07-21, decision 9).
+//!
+//! This is the consumption phase of an *approved* decision, not the approval
+//! lifecycle. Resolution (pending -> approved/denied) belongs to the HITL
+//! layer and to the durable wake reason (decision 8). A dispatch record
+//! exists only once an approval is granted, so a denial has no state here at
+//! all and cannot reach execution by construction.
 
 use serde::{Deserialize, Serialize};
 
-use crate::hitl::{ApprovalDecision, Timestamp};
+use crate::hitl::Timestamp;
 
 use super::lease::FencingGeneration;
 
@@ -29,21 +35,18 @@ impl ArgsDigest {
     }
 }
 
-/// Where a decision stands on its way to consumption.
+/// Consumption of a granted approval. The enum carries no `pending` or
+/// `denied` state: a dispatch record is minted only for an `Approved`
+/// decision (at the call site's `match`, the `Denied` arm mints none), so
+/// "a denial never reaches execution" holds because no value of this type
+/// can stand for one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "dispatch", rename_all = "snake_case")]
-pub enum DecisionDispatchState {
-    /// Parked; no human decision yet.
-    Pending,
-    /// A human decided; not yet dispatched.
-    Resolved {
-        decision: ApprovalDecision,
-        resolved_at: Timestamp,
-    },
-    /// One dispatcher claimed the decision for execution under its fencing
-    /// generation. Only an approval is claimable, so a claimed state always
-    /// stands for an approved call.
-    DispatchClaimed {
+pub enum DispatchState {
+    /// The approval is granted; no dispatcher has claimed it.
+    Unclaimed,
+    /// One dispatcher claimed it for execution under its fencing generation.
+    Claimed {
         generation: FencingGeneration,
         claimed_at: Timestamp,
     },
@@ -53,16 +56,13 @@ pub enum DecisionDispatchState {
     ExecutionUnknown { claimed_at: Timestamp },
 }
 
-/// Events the dispatch FSM accepts.
+/// Events the dispatch FSM accepts. Resolution is not among them: it is the
+/// approval's concern, upstream of any dispatch record.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchEvent {
-    Resolve {
-        decision: ApprovalDecision,
-        at: Timestamp,
-    },
     /// Claim the decision for execution, presenting the digest of the
     /// arguments about to run.
-    ClaimDispatch {
+    Claim {
         generation: FencingGeneration,
         presented: ArgsDigest,
         at: Timestamp,
@@ -80,7 +80,7 @@ pub enum DispatchEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchError {
     Illegal {
-        from: DecisionDispatchState,
+        from: DispatchState,
         event: DispatchEvent,
     },
     /// The presented arguments differ from the ones the human approved.
@@ -90,18 +90,16 @@ pub enum DispatchError {
     },
 }
 
-impl DecisionDispatchState {
+impl DispatchState {
     /// Apply one event, returning the next state and leaving `self`
     /// untouched - a rejected event provably consumes nothing, which is
     /// what "a digest mismatch leaves the decision unconsumed" means at the
     /// type level. `bound` is the digest recorded when the approval parked.
     ///
-    /// Legality: `Pending` only resolves; `Resolved { Approved }` is
-    /// claimed by exactly one dispatcher, and only with a digest equal to
-    /// `bound`; `Resolved { Denied }` is never claimable - a denial cannot
-    /// reach execution; `DispatchClaimed` confirms `Executed` or degrades
-    /// to `ExecutionUnknown`; `Executed` and `ExecutionUnknown` accept no
-    /// event.
+    /// Legality: `Unclaimed` is claimed by exactly one dispatcher, and only
+    /// with a digest equal to `bound`; `Claimed` confirms `Executed` or
+    /// degrades to `ExecutionUnknown`; `Executed` and `ExecutionUnknown`
+    /// accept no event.
     pub fn apply(&self, event: DispatchEvent, bound: &ArgsDigest) -> Result<Self, DispatchError> {
         let _ = (event, bound);
         todo!("staged for #271 P-cards: dispatch consumption FSM")
@@ -118,15 +116,8 @@ mod tests {
         ArgsDigest::test_value("digest-bound")
     }
 
-    fn resolved(decision: ApprovalDecision) -> DecisionDispatchState {
-        DecisionDispatchState::Resolved {
-            decision,
-            resolved_at: Utc::now(),
-        }
-    }
-
     fn claim(presented: ArgsDigest) -> DispatchEvent {
-        DispatchEvent::ClaimDispatch {
+        DispatchEvent::Claim {
             generation: FencingGeneration::INITIAL.next(),
             presented,
             at: Utc::now(),
@@ -135,10 +126,6 @@ mod tests {
 
     fn all_events() -> Vec<DispatchEvent> {
         vec![
-            DispatchEvent::Resolve {
-                decision: ApprovalDecision::Approved,
-                at: Utc::now(),
-            },
             claim(bound()),
             DispatchEvent::ConfirmExecuted { at: Utc::now() },
             DispatchEvent::LoseDispatcher { at: Utc::now() },
@@ -164,52 +151,16 @@ mod tests {
     }
 
     #[test]
-    fn pending_resolves() {
-        let next = DecisionDispatchState::Pending
-            .apply(
-                DispatchEvent::Resolve {
-                    decision: ApprovalDecision::Approved,
-                    at: Utc::now(),
-                },
-                &bound(),
-            )
-            .expect("legal");
-        assert!(matches!(next, DecisionDispatchState::Resolved { .. }));
-    }
-
-    #[test]
-    fn pending_cannot_be_claimed() {
-        assert!(matches!(
-            DecisionDispatchState::Pending.apply(claim(bound()), &bound()),
-            Err(DispatchError::Illegal { .. })
-        ));
-    }
-
-    #[test]
-    fn approved_claims_with_matching_digest() {
-        let next = resolved(ApprovalDecision::Approved)
+    fn unclaimed_claims_with_matching_digest() {
+        let next = DispatchState::Unclaimed
             .apply(claim(bound()), &bound())
             .expect("legal");
-        assert!(matches!(
-            next,
-            DecisionDispatchState::DispatchClaimed { .. }
-        ));
+        assert!(matches!(next, DispatchState::Claimed { .. }));
     }
 
     #[test]
-    fn denied_decision_cannot_be_claimed() {
-        let denied = resolved(ApprovalDecision::Denied {
-            reason: Some("no".to_string()),
-        });
-        assert!(matches!(
-            denied.apply(claim(bound()), &bound()),
-            Err(DispatchError::Illegal { .. })
-        ));
-    }
-
-    #[test]
-    fn digest_mismatch_denies_and_preserves_the_decision() {
-        let state = resolved(ApprovalDecision::Approved);
+    fn digest_mismatch_rejected_and_record_preserved() {
+        let state = DispatchState::Unclaimed;
         let presented = ArgsDigest::test_value("digest-tampered");
         assert_eq!(
             state.apply(claim(presented.clone()), &bound()),
@@ -218,36 +169,54 @@ mod tests {
                 presented,
             })
         );
-        // The rejected claim consumed nothing: the same decision still
+        // The rejected claim consumed nothing: the same record still
         // dispatches for the arguments the human actually approved.
         let next = state.apply(claim(bound()), &bound()).expect("legal");
-        assert!(matches!(
-            next,
-            DecisionDispatchState::DispatchClaimed { .. }
-        ));
+        assert!(matches!(next, DispatchState::Claimed { .. }));
+    }
+
+    #[test]
+    fn unclaimed_rejects_premature_events() {
+        for event in [
+            DispatchEvent::ConfirmExecuted { at: Utc::now() },
+            DispatchEvent::LoseDispatcher { at: Utc::now() },
+        ] {
+            assert!(matches!(
+                DispatchState::Unclaimed.apply(event, &bound()),
+                Err(DispatchError::Illegal { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn claimed_confirms_executed() {
+        let claimed = DispatchState::Unclaimed
+            .apply(claim(bound()), &bound())
+            .expect("legal");
+        let next = claimed
+            .apply(DispatchEvent::ConfirmExecuted { at: Utc::now() }, &bound())
+            .expect("legal");
+        assert!(matches!(next, DispatchState::Executed { .. }));
     }
 
     #[test]
     fn claimed_dispatcher_loss_is_execution_unknown() {
-        let claimed = resolved(ApprovalDecision::Approved)
+        let claimed = DispatchState::Unclaimed
             .apply(claim(bound()), &bound())
             .expect("legal");
         let next = claimed
             .apply(DispatchEvent::LoseDispatcher { at: Utc::now() }, &bound())
             .expect("legal");
-        assert!(matches!(
-            next,
-            DecisionDispatchState::ExecutionUnknown { .. }
-        ));
+        assert!(matches!(next, DispatchState::ExecutionUnknown { .. }));
     }
 
     #[test]
-    fn terminal_dispatch_states_absorb_no_event() {
+    fn terminal_states_absorb_no_event() {
         let terminals = [
-            DecisionDispatchState::Executed {
+            DispatchState::Executed {
                 executed_at: Utc::now(),
             },
-            DecisionDispatchState::ExecutionUnknown {
+            DispatchState::ExecutionUnknown {
                 claimed_at: Utc::now(),
             },
         ];
@@ -259,19 +228,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn resolved_cannot_resolve_twice() {
-        assert!(matches!(
-            resolved(ApprovalDecision::Approved).apply(
-                DispatchEvent::Resolve {
-                    decision: ApprovalDecision::Approved,
-                    at: Utc::now(),
-                },
-                &bound(),
-            ),
-            Err(DispatchError::Illegal { .. })
-        ));
     }
 }
