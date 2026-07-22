@@ -9,11 +9,11 @@
 //! | `{p}:a2a:ctx:{context_id}` | set  | task ids in a context (history + `list`)   |
 //! | `{p}:a2a:tasks`            | set  | all task ids (`list` without `context_id`) |
 //!
-//! Task hashes carry the configured TTL; index sets have their TTL refreshed
-//! on every write and stale members (whose task hash expired first) are pruned
-//! lazily during `list`. Create/update atomicity is per task key via Lua, so
-//! the layout is single-instance/sentinel friendly; Redis Cluster would need
-//! hash-tagged keys and is out of scope.
+//! Task hashes and both index sets carry the configured TTL, refreshed on
+//! every write; stale index members (whose task hash expired first) are
+//! pruned lazily during `list`. Each write is one Lua script covering the
+//! task hash and its indexes, so the layout is single-instance/sentinel
+//! friendly; Redis Cluster would need hash-tagged keys and is out of scope.
 
 use std::num::NonZeroU64;
 
@@ -23,33 +23,46 @@ use a2a_server::task_store::TaskVersion;
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
+use tracing::warn;
 
-/// Insert the task hash only if absent (at-most-once create).
-/// KEYS[1] = task key; ARGV[1] = task JSON; ARGV[2] = TTL secs (0 = none).
-const CREATE_SCRIPT: &str = r"
+/// Script contract, shared by create and update:
+/// KEYS[1] = task key; KEYS[2] = context index; KEYS[3] = global index;
+/// ARGV[1] = task JSON; ARGV[2] = TTL secs (0 = none); ARGV[3] = task id;
+/// ARGV[4] = 1 when the written task is in a terminal state.
+const WRITE_TAIL: &str = r"
+redis.call('SADD', KEYS[2], ARGV[3])
+redis.call('SADD', KEYS[3], ARGV[3])
+if tonumber(ARGV[2]) > 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+  redis.call('EXPIRE', KEYS[2], ARGV[2])
+  redis.call('EXPIRE', KEYS[3], ARGV[2])
+end
+";
+
+/// Insert the task hash and index it, only if absent (at-most-once create).
+/// Returns 1, or 0 if the task already exists.
+const CREATE_HEAD: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 1 then
   return 0
 end
-redis.call('HSET', KEYS[1], 'version', 1, 'task', ARGV[1])
-if tonumber(ARGV[2]) > 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-end
-return 1
+redis.call('HSET', KEYS[1], 'version', 1, 'task', ARGV[1], 'terminal', ARGV[4])
 ";
 
-/// Bump the version and replace the task JSON, atomically, only if present.
-/// KEYS[1] = task key; ARGV[1] = task JSON; ARGV[2] = TTL secs (0 = none).
-/// Returns the new version, or 0 if the task does not exist.
-const UPDATE_SCRIPT: &str = r"
+/// Bump the version, replace the task JSON, and refresh the indexes,
+/// atomically, only if present and not yet terminal. Terminal states are
+/// immutable: a finished task never transitions again, so a racing writer
+/// (e.g. an execution completing after a routed cancel recorded `Canceled`)
+/// cannot overwrite the terminal record. Returns the new version, 0 if the
+/// task does not exist, or -1 if it is already terminal.
+const UPDATE_HEAD: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then
   return 0
 end
-local v = redis.call('HINCRBY', KEYS[1], 'version', 1)
-redis.call('HSET', KEYS[1], 'task', ARGV[1])
-if tonumber(ARGV[2]) > 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
+if redis.call('HGET', KEYS[1], 'terminal') == '1' then
+  return -1
 end
-return v
+local v = redis.call('HINCRBY', KEYS[1], 'version', 1)
+redis.call('HSET', KEYS[1], 'task', ARGV[1], 'terminal', ARGV[4])
 ";
 
 /// Redis-backed impl of the upstream `a2a_server::TaskStore`.
@@ -72,8 +85,8 @@ impl RedisTaskStore {
             conn,
             key_prefix: key_prefix.to_string(),
             task_ttl_secs,
-            create_script: Script::new(CREATE_SCRIPT),
-            update_script: Script::new(UPDATE_SCRIPT),
+            create_script: Script::new(&format!("{CREATE_HEAD}{WRITE_TAIL}return 1")),
+            update_script: Script::new(&format!("{UPDATE_HEAD}{WRITE_TAIL}return v")),
         }
     }
 
@@ -89,40 +102,33 @@ impl RedisTaskStore {
         format!("{}:a2a:tasks", self.key_prefix)
     }
 
-    /// Write the task hash via `script` (create or update), then refresh the
-    /// context and global index sets. The index write is not atomic with the
-    /// task write, but every write refreshes both indexes, so a missed index
-    /// entry self-heals on the task's next update; `list` tolerates and prunes
-    /// the inverse case (indexed id whose task hash expired).
+    /// Write the task hash and refresh both index sets in one atomic script
+    /// (create or update); `list` tolerates and prunes an indexed id whose
+    /// task hash expired first.
     async fn write_task(&self, script: &Script, task: &Task) -> Result<Option<u64>, A2AError> {
         let task_json = serde_json::to_string(task)
             .map_err(|e| A2AError::internal(format!("task serialization failed: {e}")))?;
 
         let mut conn = self.conn.clone();
-        let version: u64 = script
+        let version: i64 = script
             .key(self.task_key(&task.id))
+            .key(self.ctx_key(&task.context_id))
+            .key(self.all_tasks_key())
             .arg(&task_json)
             .arg(self.task_ttl_secs.map_or(0, NonZeroU64::get))
+            .arg(&task.id)
+            .arg(i32::from(task.status.state.is_terminal()))
             .invoke_async(&mut conn)
             .await
             .map_err(store_err)?;
-        if version == 0 {
-            return Ok(None);
+        match version {
+            -1 => Err(A2AError::invalid_request(format!(
+                "task {} is terminal and cannot be updated",
+                task.id
+            ))),
+            0 => Ok(None),
+            v => Ok(Some(v as u64)),
         }
-
-        let ctx_key = self.ctx_key(&task.context_id);
-        let all_key = self.all_tasks_key();
-        let mut pipe = redis::pipe();
-        pipe.sadd(&ctx_key, &task.id).ignore();
-        pipe.sadd(&all_key, &task.id).ignore();
-        if let Some(ttl_secs) = self.task_ttl_secs {
-            let ttl = ttl_secs.get() as i64;
-            pipe.expire(&ctx_key, ttl).ignore();
-            pipe.expire(&all_key, ttl).ignore();
-        }
-        pipe.query_async::<()>(&mut conn).await.map_err(store_err)?;
-
-        Ok(Some(version))
     }
 
     /// Fetch every task listed in `index_key`, pruning ids whose task hash
@@ -144,7 +150,15 @@ impl RedisTaskStore {
         let mut stale: Vec<&String> = Vec::new();
         for (id, payload) in ids.iter().zip(payloads) {
             match payload {
-                Some(json) => tasks.push(parse_task(&json)?),
+                Some(json) => match parse_task(&json) {
+                    Ok(task) => tasks.push(task),
+                    // One undecodable record (e.g. schema skew during a
+                    // rolling deploy) must not fail the whole list; it stays
+                    // indexed for instances that can read it.
+                    Err(err) => {
+                        warn!(task_id = %id, error = %err, "undecodable task record skipped from list");
+                    }
+                },
                 None => stale.push(id),
             }
         }
@@ -200,29 +214,25 @@ fn parse_task(json: &str) -> Result<Task, A2AError> {
 }
 
 /// Filter, order, paginate, and history-truncate `tasks` with the same
-/// semantics as the upstream `InMemoryTaskStore::list`: filter by
-/// `context_id`/`status`, sort by task id, offset-token pagination with a
-/// default page size of 50, then truncate each task's history to
-/// `history_length` newest entries.
+/// semantics as the upstream `InMemoryTaskStore::list`: filter by `status`
+/// (context scoping is owned by `list`'s index selection), sort by task id,
+/// offset-token pagination with a default page size of 50, then truncate
+/// each task's history to `history_length` newest entries.
 fn shape_list_response(tasks: Vec<Task>, req: &ListTasksRequest) -> ListTasksResponse {
     let mut tasks: Vec<Task> = tasks
         .into_iter()
         .filter(|task| {
-            req.context_id
+            req.status
                 .as_ref()
-                .is_none_or(|ctx_id| task.context_id == *ctx_id)
-                && req
-                    .status
-                    .as_ref()
-                    .is_none_or(|status| task.status.state == *status)
+                .is_none_or(|status| task.status.state == *status)
         })
         .collect();
     tasks.sort_by(|a, b| a.id.cmp(&b.id));
 
-    let page_size = match req.page_size {
-        Some(size) if size > 0 => size as usize,
-        _ => 50,
-    };
+    let page_size = req
+        .page_size
+        .filter(|size| *size > 0)
+        .map_or(50, |size| size as usize);
     let start = req
         .page_token
         .as_ref()
@@ -296,21 +306,22 @@ mod tests {
     }
 
     #[test]
-    fn shape_filters_by_context_and_status() {
+    fn shape_filters_by_status() {
         let tasks = vec![
             make_task("t1", "c1", TaskState::Submitted),
-            make_task("t2", "c2", TaskState::Working),
+            make_task("t2", "c1", TaskState::Working),
             make_task("t3", "c1", TaskState::Working),
         ];
         let req = ListTasksRequest {
-            context_id: Some("c1".to_string()),
             status: Some(TaskState::Working),
             ..list_req()
         };
         let resp = shape_list_response(tasks, &req);
-        assert_eq!(resp.tasks.len(), 1);
-        assert_eq!(resp.tasks[0].id, "t3");
-        assert_eq!(resp.total_size, 1);
+        assert_eq!(
+            resp.tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["t2", "t3"]
+        );
+        assert_eq!(resp.total_size, 2);
     }
 
     #[test]

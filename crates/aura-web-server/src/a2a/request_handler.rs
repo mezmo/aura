@@ -102,7 +102,11 @@ impl RequestHandler for AuraRequestHandler {
             Ok(stream) => Ok(stream),
             // Not executing on this instance — relay the fan-out topic if the
             // task is live somewhere else (`task_not_found` again otherwise).
-            Err(_) => relay_subscription(self.bus.clone(), self.task_store.clone(), &task_id).await,
+            // Every other error kind is the caller's answer as-is.
+            Err(err) if err.code == error_code::TASK_NOT_FOUND => {
+                relay_subscription(self.bus.clone(), self.task_store.clone(), &task_id).await
+            }
+            Err(err) => Err(err),
         }
     }
 

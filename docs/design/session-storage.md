@@ -353,18 +353,27 @@ TTL as a backstop so an abandoned parking pod's entry self-cleans.
   Implementation (phase 4, `crates/aura-web-server/src/a2a/bus_bridge.rs`): the
   upstream handler's execution registry is process-local and not pluggable, so the
   bridge composes around it — `BusBridgedExecutor` wraps the agent executor
-  (publishing every event to `a2a:task:{id}` and hosting the per-execution
-  routed-cancel listener), and `AuraRequestHandler::subscribe_to_task` falls back
-  to a relay (store snapshot frame, then live bus frames, terminal-event ends the
-  stream — the same shape as the upstream local subscription) when the upstream
-  handler reports no local execution. The relay periodically re-checks the store
-  so a subscriber of a task whose owning pod died still converges on the terminal
-  state. A cancel always publishes the routed copy and then runs the local cancel:
-  the pod that received the cancel writes the terminal status to the shared store,
-  the owning pod's listener only stops the execution. Missing/terminal tasks stay
-  `task_not_found` on subscribe, matching upstream single-pod behavior. Accepted
-  race, bounded by bus latency: an execution that completes while a routed cancel
-  is in flight can record `Completed` over `Canceled`.
+  (publishing every event to `a2a:task:{id}` in a sequence-numbered envelope and
+  hosting the per-execution routed-cancel listener), and
+  `AuraRequestHandler::subscribe_to_task` falls back to a relay (store snapshot
+  frame, then live bus frames, terminal-event ends the stream — the same shape as
+  the upstream local subscription) when — and only when — the upstream handler
+  reports `task_not_found`. Executor error items, which the upstream handler
+  delivers only to local subscribers and never persists, are published as a
+  synthetic terminal `Failed` status so cross-instance relays terminate too. The
+  relay surfaces a fell-behind error on a sequence gap (the lossy bus dropped
+  frames for a slow subscriber — upstream-local-subscription parity, instead of
+  silently delivering partial content), periodically re-checks the store so a
+  subscriber of a task whose owning pod died still converges on the terminal
+  state, and is lifetime-bounded so a dead owner cannot hang it indefinitely
+  (clients resubscribe). A cancel always publishes the routed copy and then runs
+  the local cancel: the pod that received the cancel writes the terminal status
+  to the shared store, the owning pod's listener only stops the execution.
+  Missing/terminal tasks stay `task_not_found` on subscribe, matching upstream
+  single-pod behavior. Terminal states are immutable in the Redis store (the
+  update script rejects writes to a terminal task), so an execution that misses
+  a routed cancel keeps running until it finishes but cannot record `Completed`
+  over the `Canceled` the cancelling pod wrote.
 
 ---
 
@@ -402,12 +411,13 @@ Notes:
   at-most-once semantics. (Simpler than the Lua/`MULTI` originally sketched — the
   decision itself is not persisted, mirroring the in-memory store; it travels
   over the bus.)
-- Task create/update atomicity (exists-check + `version` bump + record write) is a Lua
-  script over the single task hash. The index sets are refreshed after the task write —
-  not atomically with it — and every write refreshes both indexes, so a missed index
-  entry self-heals on the next update; `list` lazily prunes indexed ids whose task hash
-  expired first. Scripts touch one key, so the layout is single-instance/sentinel
-  friendly; Redis Cluster would need hash-tagged keys and is out of scope.
+- Each task create/update is one Lua script covering the exists-check, `version`
+  bump, terminal-state gate (updates to a terminal task are rejected), record
+  write, and both index-set refreshes — atomically. `list` lazily prunes indexed
+  ids whose task hash expired first and skips (without failing) records it cannot
+  deserialize. The scripts touch the task key and its two index keys, so the
+  layout is single-instance/sentinel friendly; Redis Cluster would need
+  hash-tagged keys and is out of scope.
 - Records carry a plain `EXPIRE`-style TTL; no background sweeper needed. The parking
   pod's `await` remains the authoritative timeout.
 

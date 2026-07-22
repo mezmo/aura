@@ -13,11 +13,15 @@
 //!   subscribed and drives its local cancel machinery.
 //!
 //! Bus delivery is fire-and-forget end to end, and the store stays the source
-//! of truth: a relay that misses frames converges through its periodic store
-//! poll, and the instance that received the cancel writes the terminal status
-//! itself, whether or not the routed cancel arrives. The residual race — an
-//! execution completing while a routed cancel is in flight can still record
-//! `Completed` over `Canceled` — is bounded by bus delivery latency.
+//! of truth: fan-out frames are sequence-numbered so a relay that misses one
+//! surfaces a fell-behind error rather than silently delivering partial
+//! content, a relay converges through its periodic store poll (and is
+//! lifetime-bounded, so a dead executing instance cannot hang it forever),
+//! and the instance that received the cancel writes the terminal status
+//! itself, whether or not the routed cancel arrives. The Redis store rejects
+//! updates to terminal tasks, so an execution that misses a routed cancel
+//! can burn work until it finishes, but cannot overwrite the recorded
+//! `Canceled`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,15 +32,24 @@ use aura::session_store::EventBus;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use serde::{Deserialize, Serialize};
 use tokio::task::AbortHandle;
 use tracing::warn;
 
 use super::SharedTaskStore;
+use super::agent_executor::fail_status;
 
 /// How often a bus relay double-checks the store, so a subscriber attached to
 /// a task whose executing instance died still observes the terminal state (or
 /// the record's expiry) instead of waiting forever.
 const RELAY_STORE_POLL: Duration = Duration::from_secs(15);
+
+/// Upper bound on one relay stream's lifetime. A subscriber to a task whose
+/// executing instance died (store stuck non-terminal, no frames ever again)
+/// gets a terminal error at this bound instead of an unbounded hang; a task
+/// legitimately running longer stays subscribable — the client resubscribes
+/// and gets a fresh relay.
+const RELAY_MAX_LIFETIME: Duration = Duration::from_secs(900);
 
 /// Fan-out topic carrying one task's execution events.
 pub fn task_topic(task_id: &str) -> String {
@@ -74,18 +87,16 @@ impl<E: AgentExecutor> AgentExecutor for BusBridgedExecutor<E> {
     ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         let bus = self.bus.clone();
         let inner = self.inner.clone();
-        let topic = task_topic(&ctx.task_id);
         let listener_ctx = cancel_context(&ctx);
-        let mut events = self.inner.execute(ctx);
+        let task_id = ctx.task_id.clone();
+        let context_id = ctx.context_id.clone();
+        let events = self.inner.execute(ctx);
 
         Box::pin(async_stream::stream! {
             let listener = spawn_cancel_listener(bus.clone(), inner, listener_ctx).await;
             let _stop_listener_on_drop = AbortOnDrop(listener);
+            let mut events = publish_and_forward(bus, task_id, context_id, events);
             while let Some(item) = events.next().await {
-                // Publish before yielding: the request handler stops polling
-                // after a terminal event, so a post-yield publish would never
-                // run for the frame remote subscribers need most.
-                publish_frame(bus.as_ref(), &topic, &item).await;
                 yield item;
             }
         })
@@ -95,6 +106,7 @@ impl<E: AgentExecutor> AgentExecutor for BusBridgedExecutor<E> {
         let bus = self.bus.clone();
         let inner = self.inner.clone();
         let task_id = ctx.task_id.clone();
+        let context_id = ctx.context_id.clone();
 
         Box::pin(async_stream::stream! {
             // Route the cancel to wherever the execution lives. When it is
@@ -113,14 +125,58 @@ impl<E: AgentExecutor> AgentExecutor for BusBridgedExecutor<E> {
             // The terminal status this yields is applied to the shared store
             // by the request handler on this instance; publishing it also
             // ends any cross-instance relays.
-            let topic = task_topic(&task_id);
-            let mut events = inner.cancel(ctx);
+            let events = inner.cancel(ctx);
+            let mut events = publish_and_forward(bus, task_id, context_id, events);
             while let Some(item) = events.next().await {
-                publish_frame(bus.as_ref(), &topic, &item).await;
                 yield item;
             }
         })
     }
+}
+
+/// One frame on the task fan-out topic. `seq` restarts at 1 for each
+/// publishing stream and increases by 1 per frame, letting a relay detect
+/// frames the lossy bus dropped for it.
+#[derive(Serialize)]
+struct TaskFrameRef<'a> {
+    seq: u64,
+    event: &'a StreamResponse,
+}
+
+/// Owned deserialization counterpart of [`TaskFrameRef`].
+#[derive(Deserialize)]
+struct TaskFrame {
+    seq: u64,
+    event: StreamResponse,
+}
+
+/// Forward `events`, publishing each to the task's fan-out topic before
+/// yielding it — the request handler stops polling after a terminal event,
+/// so a post-yield publish would never run for the frame remote subscribers
+/// need most. An `Err` item (which the handler delivers only to local
+/// subscribers and never persists) is published as a synthetic terminal
+/// `Failed` status so cross-instance relays terminate too.
+fn publish_and_forward(
+    bus: Arc<dyn EventBus>,
+    task_id: String,
+    context_id: String,
+    mut events: BoxStream<'static, Result<StreamResponse, A2AError>>,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    let topic = task_topic(&task_id);
+    Box::pin(async_stream::stream! {
+        let mut seq: u64 = 0;
+        while let Some(item) = events.next().await {
+            seq += 1;
+            match &item {
+                Ok(event) => publish_frame(bus.as_ref(), &topic, seq, event).await,
+                Err(err) => {
+                    let failed = fail_status(&task_id, &context_id, &err.to_string());
+                    publish_frame(bus.as_ref(), &topic, seq, &failed).await;
+                }
+            }
+            yield item;
+        }
+    })
 }
 
 /// Serve `tasks/{id}:subscribe` for a task this instance is not executing:
@@ -152,16 +208,32 @@ pub async fn relay_subscription(
     Ok(Box::pin(async_stream::stream! {
         yield Ok(StreamResponse::Task(snapshot));
 
+        let deadline = tokio::time::Instant::now() + RELAY_MAX_LIFETIME;
         let mut poll = tokio::time::interval(RELAY_STORE_POLL);
         poll.reset();
+        let mut last_seq: Option<u64> = None;
         loop {
             tokio::select! {
                 frame = frames.next() => {
                     let Some(payload) = frame else { break };
-                    match serde_json::from_slice::<StreamResponse>(&payload) {
-                        Ok(event) => {
-                            let terminal = is_terminal_event(&event);
-                            yield Ok(event);
+                    match serde_json::from_slice::<TaskFrame>(&payload) {
+                        Ok(frame) => {
+                            // A sequence gap means the lossy bus dropped
+                            // frames for this slow subscriber: surface it,
+                            // mirroring the upstream local subscription's
+                            // fell-behind error, instead of silently
+                            // delivering partial content. A seq at or below
+                            // the last seen one is a new publishing stream
+                            // (e.g. the cancel path) and resets the baseline.
+                            if last_seq.is_some_and(|last| frame.seq > last + 1) {
+                                yield Err(A2AError::internal(
+                                    "subscription fell behind the task's event stream; resubscribe",
+                                ));
+                                break;
+                            }
+                            last_seq = Some(frame.seq);
+                            let terminal = is_terminal_event(&frame.event);
+                            yield Ok(frame.event);
                             if terminal {
                                 break;
                             }
@@ -185,6 +257,12 @@ pub async fn relay_subscription(
                         }
                     }
                 }
+                _ = tokio::time::sleep_until(deadline) => {
+                    yield Err(A2AError::internal(
+                        "subscription ended without a terminal event; resubscribe",
+                    ));
+                    break;
+                }
             }
         }
     }))
@@ -199,13 +277,11 @@ fn is_terminal_event(event: &StreamResponse) -> bool {
     }
 }
 
-/// Publish one execution event to the fan-out topic. Failures (including
-/// error frames, which have no stable wire form) are logged and skipped —
-/// the store write is the durable record; relays converge via their store
-/// poll.
-async fn publish_frame(bus: &dyn EventBus, topic: &str, item: &Result<StreamResponse, A2AError>) {
-    let Ok(event) = item else { return };
-    match serde_json::to_vec(event) {
+/// Publish one execution event to the fan-out topic. Failures are logged and
+/// skipped — the store write is the durable record; relays converge via
+/// their store poll and sequence-gap detection.
+async fn publish_frame(bus: &dyn EventBus, topic: &str, seq: u64, event: &StreamResponse) {
+    match serde_json::to_vec(&TaskFrameRef { seq, event }) {
         Ok(payload) => {
             if let Err(err) = bus.publish(topic, Bytes::from(payload)).await {
                 warn!(topic, error = %err, "a2a event publish failed; cross-instance subscribers may miss this frame");
@@ -273,7 +349,6 @@ impl Drop for AbortOnDrop {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -541,7 +616,7 @@ mod tests {
     async fn relay_subscription_terminal_task_is_not_found() {
         let store = SharedTaskStore::from_store(Arc::new(InMemoryTaskStore::new()));
         let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
-        let mut task = a2a::Task {
+        let task = a2a::Task {
             id: "t3".to_string(),
             context_id: "c3".to_string(),
             status: TaskStatus {
@@ -553,7 +628,6 @@ mod tests {
             history: None,
             metadata: None,
         };
-        task.status.state = TaskState::Completed;
         store.create(task).await.unwrap();
 
         assert!(relay_subscription(bus, store, "t3").await.is_err());
@@ -603,8 +677,167 @@ mod tests {
         assert!(relay.next().await.is_none());
     }
 
-    #[allow(dead_code)]
-    fn service_params_type_is_a_map(params: ServiceParams) -> HashMap<String, Vec<String>> {
-        params
+    /// Executor whose execution fails mid-flight: `Working`, then (once
+    /// released) an `Err` item — the shape upstream never persists.
+    struct FailingExecutor {
+        release: Arc<Notify>,
+    }
+
+    impl AgentExecutor for FailingExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let release = self.release.clone();
+            Box::pin(async_stream::stream! {
+                yield Ok(working_status(&ctx.task_id, &ctx.context_id, TaskState::Working));
+                release.notified().await;
+                yield Err(A2AError::internal("provider exploded"));
+            })
+        }
+
+        fn cancel(
+            &self,
+            _ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    #[tokio::test]
+    async fn failing_execution_terminates_cross_instance_relays() {
+        let store = SharedTaskStore::from_store(Arc::new(InMemoryTaskStore::new()));
+        let bus = Arc::new(InMemoryEventBus::new());
+        let release = Arc::new(Notify::new());
+        let bus_dyn: Arc<dyn EventBus> = bus.clone();
+        let instance_a = AuraRequestHandler::new(
+            BusBridgedExecutor::new(
+                FailingExecutor {
+                    release: release.clone(),
+                },
+                bus_dyn.clone(),
+            ),
+            store.clone(),
+            bus_dyn,
+        );
+        let (instance_b, _handles_b) = instance(&store, &bus);
+        let params = ServiceParams::new();
+
+        instance_a
+            .send_message(&params, send_request("t5", "c5"))
+            .await
+            .expect("send succeeds");
+
+        let mut relay = instance_b
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: "t5".to_string(),
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("subscribe succeeds");
+        match next_frame(&mut relay).await {
+            StreamResponse::Task(task) => assert!(!task.status.state.is_terminal()),
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        release.notify_one();
+
+        // The executor's Err is published as a synthetic terminal Failed
+        // status, so the relay ends instead of hanging.
+        match next_frame(&mut relay).await {
+            StreamResponse::StatusUpdate(update) => {
+                assert_eq!(update.status.state, TaskState::Failed);
+            }
+            other => panic!("expected Failed status, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), relay.next())
+                .await
+                .expect("stream ends after terminal frame")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_errors_on_sequence_gap() {
+        let store = SharedTaskStore::from_store(Arc::new(InMemoryTaskStore::new()));
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        store
+            .create(a2a::Task {
+                id: "t6".to_string(),
+                context_id: "c6".to_string(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let mut relay = relay_subscription(bus.clone(), store, "t6").await.unwrap();
+        next_frame(&mut relay).await; // snapshot
+
+        let publish = |seq: u64| {
+            let payload = serde_json::to_vec(&TaskFrameRef {
+                seq,
+                event: &working_status("t6", "c6", TaskState::Working),
+            })
+            .unwrap();
+            let bus = bus.clone();
+            async move { bus.publish(&task_topic("t6"), Bytes::from(payload)).await }
+        };
+        publish(1).await.unwrap();
+        next_frame(&mut relay).await; // seq 1 delivered
+
+        publish(3).await.unwrap(); // seq 2 lost
+        let item = tokio::time::timeout(Duration::from_secs(5), relay.next())
+            .await
+            .expect("gap surfaces within 5s")
+            .expect("stream open");
+        let err = item.expect_err("a sequence gap must surface as an error");
+        assert!(err.to_string().contains("fell behind"), "{err}");
+        assert!(relay.next().await.is_none());
+    }
+
+    /// A dead executing instance never writes a terminal state; the relay
+    /// must end with an error at its lifetime bound instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn relay_errors_at_max_lifetime_without_terminal() {
+        let store = SharedTaskStore::from_store(Arc::new(InMemoryTaskStore::new()));
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        store
+            .create(a2a::Task {
+                id: "t7".to_string(),
+                context_id: "c7".to_string(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let mut relay = relay_subscription(bus, store, "t7").await.unwrap();
+        next_frame(&mut relay).await; // snapshot
+
+        let item = tokio::time::timeout(RELAY_MAX_LIFETIME * 2, relay.next())
+            .await
+            .expect("lifetime bound fires")
+            .expect("stream open");
+        let err = item.expect_err("the lifetime bound must surface as an error");
+        assert!(
+            err.to_string().contains("without a terminal event"),
+            "{err}"
+        );
+        assert!(relay.next().await.is_none());
     }
 }
