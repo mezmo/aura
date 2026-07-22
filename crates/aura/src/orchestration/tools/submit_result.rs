@@ -85,10 +85,18 @@ pub struct NamedCheckArgs {
     /// The check that decides success: a specific verification whose result
     /// determines pass or fail.
     pub check: String,
-    /// The result the check actually produced. Absent when the worker named
-    /// the check but could not perform it.
+    /// The decisive result the check actually produced. Absent when the worker
+    /// could not perform it.
     #[serde(default)]
     pub result: Option<String>,
+    /// What the worker observed when it could not perform the check (packet
+    /// section 5c). Present only on the incapacity path, when `result` is
+    /// absent; it keeps the incapacity note in a bounded structured slot rather
+    /// than the free-form self-report channel. The worker-facing instruction to
+    /// fill it is phase-2 (this field is unadvertised in the tool schema, like
+    /// `named_check` itself).
+    #[serde(default)]
+    pub observed: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,14 +172,35 @@ impl Tool for SubmitResultTool {
             _ => Confidence::Medium, // default for unexpected values
         };
 
+        // Present-but-rejected evidence must never alias "no check named": when
+        // the worker's carried result fails the field bound, preserve the
+        // declared identity as NotRun rather than dropping the whole check to
+        // None (design-panel P3). A hard-reject-and-retry path is phase-2; here
+        // the deciding datum's absence stays visible instead of vanishing.
         let named_check = match &args.named_check {
-            Some(nc) => match NamedCheck::parse(&nc.check, nc.result.as_deref()) {
-                Ok(parsed) => Some(parsed),
-                Err(error) => {
-                    tracing::warn!(%error, "submit_result named_check failed to parse; dropping");
-                    None
+            Some(nc) => {
+                match NamedCheck::parse(&nc.check, nc.result.as_deref(), nc.observed.as_deref()) {
+                    Ok(parsed) => Some(parsed),
+                    Err(error) => match NamedCheck::not_run(&nc.check) {
+                        Ok(preserved) => {
+                            tracing::warn!(
+                                %error,
+                                "submit_result named_check evidence rejected at the field bound; \
+                                 preserving the declared identity as NOT RUN"
+                            );
+                            Some(preserved)
+                        }
+                        Err(identity_error) => {
+                            tracing::warn!(
+                                %error,
+                                %identity_error,
+                                "submit_result named_check identity itself is unbounded; dropping"
+                            );
+                            None
+                        }
+                    },
                 }
-            },
+            }
             None => None,
         };
 
@@ -245,5 +274,71 @@ mod tests {
         let stored = decision.lock().await;
         let output = stored.as_ref().unwrap();
         assert_eq!(output.summary, "First");
+    }
+
+    // P10: a pre-S46 worker payload carries no `named_check` field. It must
+    // still deserialize, defaulting the check to absent.
+    #[test]
+    fn submit_result_args_deserializes_legacy_payload_without_named_check() {
+        let json = r#"{"summary":"done","result":"full findings","confidence":"high"}"#;
+        let args: SubmitResultArgs = serde_json::from_str(json).unwrap();
+        assert!(args.named_check.is_none());
+    }
+
+    // P10: a named_check without the newer `observed` field (result-only, the
+    // shape a first-generation OPTION-IN worker sends) still deserializes.
+    #[test]
+    fn named_check_args_deserializes_without_observed_field() {
+        let json = r#"{"check":"entry count","result":"30 entries"}"#;
+        let args: NamedCheckArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.check, "entry count");
+        assert_eq!(args.result.as_deref(), Some("30 entries"));
+        assert!(args.observed.is_none());
+    }
+
+    // P10: the stored output round-trips, and a legacy stored output without
+    // `named_check` deserializes to absent.
+    #[test]
+    fn submit_result_output_deserializes_legacy_payload() {
+        let json = r#"{"summary":"s","result":"r","confidence":"medium"}"#;
+        let output: SubmitResultOutput = serde_json::from_str(json).unwrap();
+        assert!(output.named_check.is_none());
+    }
+
+    // P3: an over-bound decisive result is rejected at the field bound, but the
+    // declared identity is preserved as NOT RUN — present-but-rejected must
+    // never alias "no check named".
+    #[tokio::test]
+    async fn over_bound_result_is_preserved_as_not_run_not_dropped() {
+        use crate::orchestration::context::CheckOutcome;
+
+        let decision: SubmitResultDecision = Arc::new(Mutex::new(None));
+        let tool = SubmitResultTool::new(decision.clone());
+
+        tool.call(SubmitResultArgs {
+            summary: "checked".to_string(),
+            result: "full findings".to_string(),
+            confidence: "high".to_string(),
+            named_check: Some(NamedCheckArgs {
+                check: "per-directory entry count (max 30)".to_string(),
+                result: Some("x".repeat(10_000)),
+                observed: None,
+            }),
+        })
+        .await
+        .unwrap();
+
+        let stored = decision.lock().await;
+        let named_check = stored
+            .as_ref()
+            .unwrap()
+            .named_check
+            .as_ref()
+            .expect("identity preserved, not dropped to None");
+        assert_eq!(
+            named_check.identity().as_str(),
+            "per-directory entry count (max 30)"
+        );
+        assert_eq!(named_check.outcome(), &CheckOutcome::NotRun);
     }
 }

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::bounding::{ErrorPreviewWidth, FailureHandleWidth, ToolReasoningWidth};
+use super::context::CheckIdentity;
 
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
@@ -33,9 +34,9 @@ pub enum StepInput {
         worker: Option<String>,
         /// The check that decides this task's success, when the task names
         /// one: a specific verification whose result determines pass or fail.
-        /// Absent when the task names no such check. Carried as raw text here;
-        /// parsed into a bounded check identity downstream at the evidence
-        /// frame.
+        /// Absent when the task names no such check. Carried as raw wire text
+        /// here; parsed into a bounded [`CheckIdentity`](super::context::CheckIdentity)
+        /// when the plan is flattened into tasks.
         #[serde(default)]
         named_check: Option<String>,
     },
@@ -95,7 +96,15 @@ fn flatten_one(
             let mut t = Task::new(id, task.clone(), String::new());
             t.dependencies = frontier.to_vec();
             t.worker = worker.clone();
-            t.named_check_declaration = named_check.clone();
+            // Parse the wire declaration into a bounded domain value here, at
+            // plan creation, so reconciliation downstream is never stringly and
+            // fallible in the hot path (design-panel P1). The wire stays raw on
+            // `StepInput`; `Task` carries the bounded `CheckIdentity`.
+            t.named_check_declaration = named_check
+                .as_deref()
+                .map(CheckIdentity::new)
+                .transpose()
+                .map_err(|e| e.to_string())?;
             tasks.push(t);
             Ok(vec![id])
         }
@@ -291,10 +300,12 @@ pub struct Task {
     pub structured_output: Option<StructuredTaskOutput>,
     /// The check that decides this task's success, when the coordinator named
     /// one at plan creation: a specific verification whose result determines
-    /// pass or fail. Raw text as declared; parsed into a bounded check
-    /// identity at the evidence frame, where it is reconciled with the
-    /// worker's carried result (present, or `NOT RUN` when absent).
-    pub named_check_declaration: Option<String>,
+    /// pass or fail. A bounded [`CheckIdentity`](super::context::CheckIdentity),
+    /// parsed from the wire when the plan is flattened, so it can no longer be
+    /// an empty or over-bound string that reaches reconciliation unrepresentable
+    /// (design-panel P1). Reconciled downstream with the worker's carried result
+    /// (present, or `NOT RUN` when absent).
+    pub named_check_declaration: Option<CheckIdentity>,
 }
 
 impl Serialize for Task {
@@ -349,7 +360,7 @@ impl<'de> Deserialize<'de> for Task {
             #[serde(default)]
             structured_output: Option<StructuredTaskOutput>,
             #[serde(default)]
-            named_check_declaration: Option<String>,
+            named_check_declaration: Option<CheckIdentity>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
         let state = match h.status {
@@ -1394,6 +1405,83 @@ mod tests {
         };
         assert_eq!(error, "boom");
         assert_eq!(category, FailureCategory::AgentError);
+    }
+
+    // ========================================================================
+    // named_check_declaration serde + bound tests (design-panel P1, P10)
+    // ========================================================================
+
+    // P10: a pre-S46 task payload carries no `named_check_declaration`. It must
+    // still deserialize, defaulting the declaration to absent.
+    #[test]
+    fn test_task_deserialize_legacy_without_named_check_declaration() {
+        let json = r#"{"id":0,"description":"Test","dependencies":[],"status":"pending","rationale":"test"}"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert!(task.named_check_declaration.is_none());
+    }
+
+    // P1: the bounded declaration serializes as a bare string and round-trips
+    // back through the wire bound into a `CheckIdentity`.
+    #[test]
+    fn test_task_named_check_declaration_roundtrips_as_bare_string() {
+        let mut task = Task::new(0, "Test", "rationale");
+        task.named_check_declaration =
+            Some(CheckIdentity::new("per-directory entry count (max 30)").unwrap());
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(json.contains(r#""named_check_declaration":"per-directory entry count (max 30)""#));
+
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.named_check_declaration
+                .as_ref()
+                .map(CheckIdentity::as_str),
+            Some("per-directory entry count (max 30)")
+        );
+    }
+
+    // P1/P10: an over-bound declaration string is rejected on deserialization,
+    // not truncated — the bound runs through `TryFrom<String>`.
+    #[test]
+    fn test_task_deserialize_rejects_over_bound_named_check_declaration() {
+        let long = "x".repeat(10_000);
+        let json = format!(
+            r#"{{"id":0,"description":"Test","dependencies":[],"status":"pending","rationale":"test","named_check_declaration":"{long}"}}"#
+        );
+        let task: Result<Task, _> = serde_json::from_str(&json);
+        assert!(
+            task.is_err(),
+            "over-bound declaration must be rejected, not truncated"
+        );
+    }
+
+    // P1: flattening parses the wire declaration into a bounded identity, and an
+    // over-bound declaration fails plan flattening rather than reaching a task
+    // as an unrepresentable string.
+    #[test]
+    fn test_flatten_parses_and_bounds_named_check_declaration() {
+        let steps = vec![StepInput::LeafTask {
+            task: "count entries".to_string(),
+            worker: None,
+            named_check: Some("per-directory entry count (max 30)".to_string()),
+        }];
+        let tasks = flatten_steps(&steps).unwrap();
+        assert_eq!(
+            tasks[0]
+                .named_check_declaration
+                .as_ref()
+                .map(CheckIdentity::as_str),
+            Some("per-directory entry count (max 30)")
+        );
+
+        let over_bound = vec![StepInput::LeafTask {
+            task: "count entries".to_string(),
+            worker: None,
+            named_check: Some("x".repeat(10_000)),
+        }];
+        assert!(
+            flatten_steps(&over_bound).is_err(),
+            "over-bound declaration must fail flattening"
+        );
     }
 
     // ========================================================================

@@ -722,8 +722,8 @@ impl ToolReasoningWidth {
 /// decisive result).
 ///
 /// Business rule: the named-check field carries one decisive line — a count, a
-/// delta, an exit line — that must stay in view through result spill, so it is
-/// bounded to a short, fixed character width.
+/// delta, a pass/fail line — that must stay in view through result spill, so it
+/// is bounded to a short, fixed character width.
 ///
 /// Unlike the other char widths in this module, this cap **rejects** rather
 /// than truncates: a decisive result is worthless if its deciding datum is

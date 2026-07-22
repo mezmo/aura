@@ -1,7 +1,7 @@
 # S46 named-check type design record
 
 Baseline: aura `7a0f0651`, branch `card/S46`. Scope: the type skeleton for
-the two-ended named check (phase 1 of the S46 type discipline). Bodies where
+the named-check mechanism (phase 1 of the S46 type discipline). Bodies where
 behavior is nontrivial are `todo!()`; plain field additions are complete. The
 design of record is the U(mockup) packet v3
 (`docs/redesign/2026-07-21-s46-enforcement-mockups.md`), sections 2, 7, and 8;
@@ -13,7 +13,11 @@ success at plan creation, and the worker's result carries that check's
 decisive outcome at `submit_result`. The evidence frame reconciles the two
 (a declared check the worker did not carry renders `NOT RUN`), so completion
 can no longer be accepted on a self-report while the deciding check sits
-unasked.
+unasked. The two ends are modeled by two types on two sides: the bounded
+`CheckIdentity` on `Task.named_check_declaration` (the task side), and the
+`NamedCheck` worker-side evidence (the worker side). `NamedCheck` itself is
+single-ended - it carries only the worker's evidence, not the declaration -
+so this record does not call the type "two-ended".
 
 ## Type inventory
 
@@ -25,16 +29,16 @@ bounded domain types downstream.
 | Type | Business rule | Forbidden invalid state |
 |---|---|---|
 | `CheckIdentity` (`named_check.rs`) | The identity of the verification a task's success depends on - what is checked and its criterion. Parse-don't-validate: bounded and non-empty at construction | An empty identity; an identity over `NamedCheckWidth::DEFAULT` (a decisive check line cannot swell into a paragraph) |
-| `CheckResult` (`named_check.rs`) | The decisive result a check produced (a count, a delta, an exit line) that settles pass or fail | An empty result; a result over `NamedCheckWidth::DEFAULT` (bulk transcript is unrepresentable here - it must reference the spilled artifact, packet §7) |
-| `CheckOutcome` (`named_check.rs`) | A named check either produced a decisive result (`Performed`) or was not run (`NotRun`); `NOT RUN` is explicit | `NOT RUN` encoded as an empty/blank `CheckResult` string (it is a variant, not a sentinel value; packet §8) |
-| `NamedCheck` (`named_check.rs`) | The two-ended evidence: the check identity paired with its outcome. Identity is non-optional, so a decisive result never travels divorced from the check it belongs to | A decisive result with no identity; a declared check silently absent from a result (absence is `CheckOutcome::NotRun`, never "no line") |
+| `CheckResult` (`named_check.rs`) | The decisive result a check produced (a count, a delta, a pass/fail line) that settles pass or fail | An empty result; a result over `NamedCheckWidth::DEFAULT` (bulk transcript is unrepresentable here - it must reference the spilled artifact, packet §7) |
+| `CheckOutcome` (`named_check.rs`) | A named check produced a decisive result (`Performed`), the worker engaged it but could not complete it and carried an observation (`Incapable`), or it was not run (`NotRun`); `NOT RUN` is explicit. `Incapable` and `NotRun` are split so worker-reported incapacity-with-observation never aliases reconciled-absent (design-panel P5) | `NOT RUN` encoded as an empty/blank `CheckResult` string (it is a variant, not a sentinel value; packet §8); a worker incapacity observation collapsed into `NotRun` and lost |
+| `NamedCheck` (`named_check.rs`) | The worker-side evidence: the check identity paired with its outcome (one end of the two-ended mechanism; the task-side declaration is `Task.named_check_declaration`). Identity is non-optional, so a decisive result never travels divorced from the check it belongs to | A decisive result with no identity; a declared check silently absent from a result (absence is `CheckOutcome::NotRun`, never "no line") |
 | `NamedCheckWidth` (`bounding.rs`) | The named-check field is bounded to one decisive line that survives spill. The module's other char widths truncate; this one **rejects**, because a decisive datum silently cut is worse than absent | A zero cap; (by consumers) silent truncation of a decisive result |
-| `NamedCheckArgs` (`submit_result.rs`, wire) | Raw worker submission: the check performed and the result it produced; `result` absent records the worker named the check but could not perform it | n/a (wire; validated on parse into `NamedCheck`) |
+| `NamedCheckArgs` (`submit_result.rs`, wire) | Raw worker submission: the check performed (`result`), or what the worker `observed` when it could not; both absent records the worker named the check but carried nothing. The `observed` slot keeps an incapacity note structured rather than in free-form self-report (design-panel P5); worker-facing instruction to fill it is phase-2, unadvertised in the tool schema like `named_check` | n/a (wire; validated on parse into `NamedCheck`) |
 | `SubmitResultArgs.named_check` (extended, wire) | The worker declares the decisive check's evidence in the structured tool call, not only inside free-form `result` (OPTION-IN) | n/a (wire) |
 | `SubmitResultOutput.named_check: Option<NamedCheck>` (extended) | The stored worker result carries the bounded decisive check, the acceptance gate's data source - separate from the free-form `result` that spills | The gate reading a self-report `summary` in place of the check (the field is a distinct, bounded slot) |
 | `WorkerClaim.named_check: Option<NamedCheck>` (extended) | The claim is the stand-in that survives result spill (`ArtifactStandIn::Claim`), so it is the render carrier that keeps the decisive check in the coordinator's view when the bulk result spills to an artifact (packet §7) | (render-time) a spilled decisive check lost behind the artifact pointer - the check rides on the claim, which renders inline on both the inline and spill paths |
 | `StepInput::LeafTask.named_check: Option<String>` (extended, wire) | A task MAY name the check that decides its success at plan creation (the task-side leg of the mechanism, gate round 5) | n/a (wire; `Option`; most tasks name none) |
-| `Task.named_check_declaration: Option<String>` (extended) | The task's declared check travels from plan creation to the evidence frame, where absence in the worker's result is reconciled to `NOT RUN` | A declared check that cannot reach the acceptance/render site (it is carried on the task, beside `structured_output`) |
+| `Task.named_check_declaration: Option<CheckIdentity>` (extended) | The task's declared check travels from plan creation to the evidence frame as a bounded domain value (parsed in `flatten_one`, not raw wire text), where absence in the worker's result is reconciled to `NOT RUN` (design-panel P1: the wire-to-domain bound is not bypassed on the task leg) | A declared check that cannot reach the acceptance/render site; an empty or over-bound declaration reaching reconciliation as an unrepresentable string (rejected at flatten instead) |
 
 ## Visibility / seam table
 
@@ -100,15 +104,26 @@ at the wire boundary and leaves as bounded values.
   a placeholder honoring the "one decisive line" intent; identity and result
   share one cap. The exact value (and whether identity should be capped tighter
   than result) is a design-panel tunable, not evidence-derived.
-- **R4 - `NotRun` carries no observation.** Packet §5c's incapacity clause asks
-  a worker that cannot perform a check to "report what you did observe."
-  `CheckOutcome::NotRun` is payload-free in phase 1; a future
-  `NotRun { observed: ... }` could carry the incapacity note. Left minimal;
-  flagged.
-- **R5 - over-bound named_check is dropped, not rejected.** `submit_result`'s
-  `call` has `type Error = Infallible`, so an over-bound or malformed
-  `named_check` is logged (`warn`) and dropped to `None`, mirroring the
-  existing confidence fallback. Making it a hard tool error would change the
-  tool's error type - out of scope for a type skeleton. **Open question:**
-  should an over-bound decisive check fail the tool call rather than degrade to
-  absent?
+- **R4 - resolved (design-panel P5): incapacity observation is structured.**
+  Packet §5c's incapacity clause asks a worker that cannot perform a check to
+  "report what you did observe." That observation now rides on
+  `CheckOutcome::Incapable(CheckResult)`, split from `NotRun` (reconciled-absent)
+  so the two provenances never alias. The wire carries it in
+  `NamedCheckArgs.observed`; the worker-facing instruction to fill it is phase-2
+  (the slot is unadvertised in the tool schema, like `named_check` itself).
+- **R5 - resolved (design-panel P3): rejected evidence is preserved, not
+  dropped.** `submit_result`'s `call` still has `type Error = Infallible`, but an
+  over-bound or malformed `named_check` is no longer dropped to `None` (which
+  would alias "no check named"). The declared identity is preserved as
+  `CheckOutcome::NotRun` so the deciding datum's absence stays visible. The
+  harder phase-2 target - hard-reject the submission without consuming
+  first-write state so the worker can retry with bounded evidence - is recorded
+  in the ledger and not built here; it would change the tool's error type.
+- **R6 - no type encodes semantic decisiveness (design-panel P8).** The bound
+  keeps a `CheckResult` to one line and forbids blank sentinels, but nothing at
+  the type level distinguishes a decisive datum (`VIOLATION: g00000
+  has 53`) from a plausible-looking summary sentence that type-checks as a
+  `Performed` result. The guarantee that the carried result is the *actual*
+  deciding output rests partly on model compliance, plus the S45 grounding
+  dimension applied at measurement time - not on this type. Recorded as honest
+  residual risk; no phase-2 type is proposed to close it.
