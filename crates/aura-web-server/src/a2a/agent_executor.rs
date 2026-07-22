@@ -527,7 +527,7 @@ fn extract_text(parts: Vec<Part>) -> Result<String, A2AError> {
     Ok(strings.join("\n"))
 }
 
-fn fail_status(task_id: &str, context_id: &str, error_msg: &str) -> StreamResponse {
+pub(super) fn fail_status(task_id: &str, context_id: &str, error_msg: &str) -> StreamResponse {
     StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
         task_id: task_id.to_string(),
         context_id: context_id.to_string(),

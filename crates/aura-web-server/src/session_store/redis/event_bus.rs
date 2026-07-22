@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::future::Future;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,8 +39,7 @@ pub struct RedisEventBus {
     conn: ConnectionManager,
     key_prefix: String,
     commands: mpsc::UnboundedSender<BusCommand>,
-    /// Bound on how long `subscribe` waits for its `SUBSCRIBE` to become
-    /// active while the dispatcher is reconnecting.
+    /// Upper bound on one subscription handshake.
     subscribe_timeout: Duration,
 }
 
@@ -51,7 +51,7 @@ impl RedisEventBus {
         subscribe_timeout: Duration,
     ) -> Self {
         let (commands, command_rx) = mpsc::unbounded_channel();
-        tokio::spawn(dispatch(client, command_rx));
+        tokio::spawn(dispatch(client, command_rx, subscribe_timeout));
         Self {
             conn,
             key_prefix: key_prefix.to_string(),
@@ -88,7 +88,9 @@ impl EventBus for RedisEventBus {
             })
             .map_err(|_| dispatcher_stopped())?;
         // The dispatcher acks only after the redis SUBSCRIBE is active, so
-        // every payload published after this returns is received.
+        // every payload published after this returns is received. The timeout
+        // bounds the wait when the dispatcher is mid-reconnect (queued
+        // commands are served once the connection is back).
         let mut rx = tokio::time::timeout(self.subscribe_timeout, ready)
             .await
             .map_err(|_| SessionStoreError::Request {
@@ -122,8 +124,7 @@ fn dispatcher_stopped() -> SessionStoreError {
     }
 }
 
-/// Notifies the dispatcher when the handed-out subscription is dropped, so
-/// the last subscriber of a channel triggers a redis `UNSUBSCRIBE`.
+/// Notifies the dispatcher when the handed-out subscription is dropped.
 struct SubscriptionGuard {
     channel: String,
     commands: mpsc::UnboundedSender<BusCommand>,
@@ -147,12 +148,10 @@ enum BusCommand {
     },
 }
 
-/// One local fan-out per subscribed channel. `subscribers` is the dispatcher's
-/// own count (decremented by `Unsubscribe` messages) rather than
-/// `Sender::receiver_count`, so unsubscribe accounting does not race receiver
-/// drop timing.
+/// One local fan-out per subscribed channel.
 struct TopicEntry {
     tx: broadcast::Sender<Bytes>,
+    /// Live subscriptions handed out for this channel.
     subscribers: usize,
 }
 
@@ -161,9 +160,31 @@ enum AfterCommand {
     Reconnect,
 }
 
+/// Bound every sink command with this timeout: the raw pub/sub connection has
+/// no response timeout or TCP keepalive of its own, so an await on a
+/// silently-dead socket would otherwise block the dispatcher — with the
+/// stream unpolled, nothing else would ever trigger the reconnect.
+async fn sink_call(
+    op: impl Future<Output = redis::RedisResult<()>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match tokio::time::timeout(timeout, op).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "timed out after {}s (connection presumed dead)",
+            timeout.as_secs()
+        )),
+    }
+}
+
 /// The dispatcher: owns the pub/sub connection, the topic registry, and the
 /// reconnect loop. Ends when the bus and every subscription guard are gone.
-async fn dispatch(client: Client, mut commands: mpsc::UnboundedReceiver<BusCommand>) {
+async fn dispatch(
+    client: Client,
+    mut commands: mpsc::UnboundedReceiver<BusCommand>,
+    sink_timeout: Duration,
+) {
     let mut topics: HashMap<String, TopicEntry> = HashMap::new();
     loop {
         let pubsub = match client.get_async_pubsub().await {
@@ -181,7 +202,7 @@ async fn dispatch(client: Client, mut commands: mpsc::UnboundedReceiver<BusComma
         // lost (fire-and-forget, see module doc).
         let mut replayed = true;
         for channel in topics.keys() {
-            if let Err(err) = sink.subscribe(channel).await {
+            if let Err(err) = sink_call(sink.subscribe(channel), sink_timeout).await {
                 warn!(error = %err, channel, "event bus resubscribe failed; reconnecting");
                 replayed = false;
                 break;
@@ -197,7 +218,7 @@ async fn dispatch(client: Client, mut commands: mpsc::UnboundedReceiver<BusComma
                 command = commands.recv() => match command {
                     None => return,
                     Some(command) => {
-                        match handle_command(command, &mut topics, &mut sink).await {
+                        match handle_command(command, &mut topics, &mut sink, sink_timeout).await {
                             AfterCommand::Continue => {}
                             AfterCommand::Reconnect => break,
                         }
@@ -228,6 +249,7 @@ async fn handle_command(
     command: BusCommand,
     topics: &mut HashMap<String, TopicEntry>,
     sink: &mut PubSubSink,
+    sink_timeout: Duration,
 ) -> AfterCommand {
     match command {
         BusCommand::Subscribe { channel, ack } => match topics.entry(channel) {
@@ -238,35 +260,49 @@ async fn handle_command(
                 }
                 AfterCommand::Continue
             }
-            Entry::Vacant(entry) => match sink.subscribe(entry.key()).await {
-                Ok(()) => {
-                    let (tx, rx) = broadcast::channel(TOPIC_CAPACITY);
-                    if ack.send(Ok(rx)).is_ok() {
-                        entry.insert(TopicEntry { tx, subscribers: 1 });
-                    } else {
-                        // The subscriber timed out waiting; leave the channel
-                        // unsubscribed.
-                        let _ = sink.unsubscribe(entry.key()).await;
+            Entry::Vacant(entry) => {
+                match sink_call(sink.subscribe(entry.key()), sink_timeout).await {
+                    Ok(()) => {
+                        let (tx, rx) = broadcast::channel(TOPIC_CAPACITY);
+                        if ack.send(Ok(rx)).is_ok() {
+                            entry.insert(TopicEntry { tx, subscribers: 1 });
+                            AfterCommand::Continue
+                        } else {
+                            // The subscriber timed out waiting; leave the channel
+                            // unsubscribed.
+                            match sink_call(sink.unsubscribe(entry.key()), sink_timeout).await {
+                                Ok(()) => AfterCommand::Continue,
+                                Err(_) => AfterCommand::Reconnect,
+                            }
+                        }
                     }
-                    AfterCommand::Continue
+                    Err(err) => {
+                        let _ = ack.send(Err(SessionStoreError::Request {
+                            reason: format!("subscribe failed: {err}"),
+                        }));
+                        AfterCommand::Reconnect
+                    }
                 }
-                Err(err) => {
-                    let _ = ack.send(Err(SessionStoreError::Request {
-                        reason: format!("subscribe failed: {err}"),
-                    }));
-                    AfterCommand::Reconnect
-                }
-            },
+            }
         },
         BusCommand::Unsubscribe { channel } => {
             if let Entry::Occupied(mut entry) = topics.entry(channel) {
                 let topic = entry.get_mut();
+                // The dispatcher counts subscribers itself rather than using
+                // `Sender::receiver_count`, so this accounting cannot race
+                // the timing of receiver drops.
                 topic.subscribers = topic.subscribers.saturating_sub(1);
                 if topic.subscribers == 0 {
                     let (channel, _) = entry.remove_entry();
-                    // Best-effort: an orphaned redis-side subscription only
-                    // costs discarded deliveries until reconnect.
-                    let _ = sink.unsubscribe(&channel).await;
+                    // An orphaned redis-side subscription only costs
+                    // discarded deliveries until reconnect, but an
+                    // unresponsive sink means the connection is gone.
+                    if sink_call(sink.unsubscribe(&channel), sink_timeout)
+                        .await
+                        .is_err()
+                    {
+                        return AfterCommand::Reconnect;
+                    }
                 }
             }
             AfterCommand::Continue

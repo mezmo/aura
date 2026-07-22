@@ -835,3 +835,58 @@ mod a2a_bridge {
         assert_eq!(stored.status.state, TaskState::Canceled);
     }
 }
+
+/// Terminal states are immutable in the store: once a task is recorded
+/// terminal, a racing writer (e.g. an execution completing after a routed
+/// cancel recorded `Canceled`) cannot overwrite it.
+#[tokio::test]
+async fn update_of_terminal_task_is_rejected() {
+    let tasks = connect(&test_config(60)).await.tasks();
+    tasks
+        .create(make_task("t1", "c1", TaskState::Submitted))
+        .await
+        .unwrap();
+    tasks
+        .update(make_task("t1", "c1", TaskState::Canceled))
+        .await
+        .unwrap();
+
+    let err = tasks
+        .update(make_task("t1", "c1", TaskState::Completed))
+        .await
+        .expect_err("terminal task must reject updates");
+    assert!(err.to_string().contains("terminal"), "{err}");
+
+    let got = tasks.get("t1").await.unwrap().unwrap();
+    assert_eq!(got.status.state, TaskState::Canceled);
+}
+
+/// One undecodable stored record must not fail `list` for everyone.
+#[tokio::test]
+async fn corrupt_record_is_skipped_from_list() {
+    let config = test_config(60);
+    let tasks = connect(&config).await.tasks();
+    tasks
+        .create(make_task("t1", "c1", TaskState::Submitted))
+        .await
+        .unwrap();
+
+    // Plant a record whose task payload no instance can deserialize.
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    redis::pipe()
+        .hset_multiple(
+            format!("{}:a2a:task:corrupt", config.key_prefix),
+            &[("version", "1"), ("task", "not json"), ("terminal", "0")],
+        )
+        .sadd(format!("{}:a2a:tasks", config.key_prefix), "corrupt")
+        .query_async::<()>(&mut raw)
+        .await
+        .unwrap();
+
+    let resp = tasks.list(&list_req()).await.unwrap();
+    assert_eq!(
+        resp.tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["t1"]
+    );
+}
