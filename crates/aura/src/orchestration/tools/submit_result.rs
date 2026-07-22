@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::orchestration::context::NamedCheck;
+
 /// Worker-reported confidence level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,6 +37,13 @@ pub struct SubmitResultOutput {
     pub summary: String,
     pub result: String,
     pub confidence: Confidence,
+    /// The decisive verification whose result determines pass or fail, when
+    /// the task named one: the check performed and the result it produced.
+    /// Absent when the task named no such check. This is the acceptance
+    /// gate's data source — the coordinator does not treat the task as done on
+    /// the summary alone when a check was named.
+    #[serde(default)]
+    pub named_check: Option<NamedCheck>,
 }
 
 /// Shared state for capturing a worker's structured result.
@@ -62,6 +71,24 @@ pub struct SubmitResultArgs {
     pub result: String,
     /// Confidence in the result: "high", "medium", or "low".
     pub confidence: String,
+    /// The specific verification whose result determines pass or fail, when
+    /// the task named one. Omitted when the task named no such check.
+    #[serde(default)]
+    pub named_check: Option<NamedCheckArgs>,
+}
+
+/// Raw wire form of a worker's decisive named check: the check performed and
+/// the result it produced. Parsed into the bounded [`NamedCheck`] at the tool
+/// boundary.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct NamedCheckArgs {
+    /// The check that decides success: a specific verification whose result
+    /// determines pass or fail.
+    pub check: String,
+    /// The result the check actually produced. Absent when the worker named
+    /// the check but could not perform it.
+    #[serde(default)]
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,10 +164,22 @@ impl Tool for SubmitResultTool {
             _ => Confidence::Medium, // default for unexpected values
         };
 
+        let named_check = match &args.named_check {
+            Some(nc) => match NamedCheck::parse(&nc.check, nc.result.as_deref()) {
+                Ok(parsed) => Some(parsed),
+                Err(error) => {
+                    tracing::warn!(%error, "submit_result named_check failed to parse; dropping");
+                    None
+                }
+            },
+            None => None,
+        };
+
         *guard = Some(SubmitResultOutput {
             summary: args.summary,
             result: args.result,
             confidence,
+            named_check,
         });
 
         Ok(SubmitResultToolOutput {
@@ -164,6 +203,7 @@ mod tests {
                 summary: "Found 42 errors".to_string(),
                 result: "Full analysis...".to_string(),
                 confidence: "high".to_string(),
+                named_check: None,
             })
             .await
             .unwrap();
@@ -186,6 +226,7 @@ mod tests {
             summary: "First".to_string(),
             result: "First result".to_string(),
             confidence: "high".to_string(),
+            named_check: None,
         })
         .await
         .unwrap();
@@ -195,6 +236,7 @@ mod tests {
                 summary: "Second".to_string(),
                 result: "Second result".to_string(),
                 confidence: "low".to_string(),
+                named_check: None,
             })
             .await
             .unwrap();

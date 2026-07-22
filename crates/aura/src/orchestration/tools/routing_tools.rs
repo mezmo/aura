@@ -413,6 +413,7 @@ mod tests {
                 steps: vec![StepInput::LeafTask {
                     task: "Fetch recent logs".to_string(),
                     worker: Some("operations".to_string()),
+                    named_check: None,
                 }],
                 routing_rationale: "Requires tool execution".to_string(),
                 planning_summary: "Fetch and analyze recent logs".to_string(),

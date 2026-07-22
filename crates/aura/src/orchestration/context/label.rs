@@ -8,6 +8,7 @@
 use std::num::NonZeroUsize;
 
 use super::error::ContextError;
+use super::named_check::NamedCheck;
 use crate::orchestration::tools::submit_result::Confidence;
 use crate::orchestration::types::StructuredTaskOutput;
 
@@ -104,15 +105,19 @@ impl std::fmt::Display for IterationNumber {
 }
 
 /// A worker's own `submit_result` claim: distilled summary plus stated
-/// confidence.
+/// confidence, and the decisive named check when the task named one.
 ///
-/// The pair travels together. Confidence without a summary is
-/// unrepresentable, mirroring the collapse already encoded by
-/// `StructuredTaskOutput` in `orchestration::types`.
+/// The summary/confidence pair travels together. Confidence without a summary
+/// is unrepresentable, mirroring the collapse already encoded by
+/// `StructuredTaskOutput` in `orchestration::types`. The claim is the stand-in
+/// that survives result spill (`ArtifactStandIn::Claim`), so it is the carrier
+/// that keeps a task's decisive [`NamedCheck`] in the coordinator's view when
+/// the bulk result spills to an artifact (S46 packet section 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerClaim {
     summary: String,
     confidence: Confidence,
+    named_check: Option<NamedCheck>,
 }
 
 impl WorkerClaim {
@@ -129,7 +134,15 @@ impl WorkerClaim {
         Ok(Self {
             summary: summary.to_owned(),
             confidence,
+            named_check: None,
         })
+    }
+
+    /// Attach the task's decisive named check to this claim.
+    #[must_use]
+    pub fn with_named_check(mut self, named_check: NamedCheck) -> Self {
+        self.named_check = Some(named_check);
+        self
     }
 
     /// The worker's distilled summary of its own result.
@@ -140,6 +153,11 @@ impl WorkerClaim {
     /// The worker's stated confidence.
     pub fn confidence(&self) -> Confidence {
         self.confidence
+    }
+
+    /// The task's decisive named check, when one rides on this claim.
+    pub fn named_check(&self) -> Option<&NamedCheck> {
+        self.named_check.as_ref()
     }
 }
 

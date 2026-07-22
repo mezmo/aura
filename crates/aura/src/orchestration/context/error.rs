@@ -60,4 +60,18 @@ pub enum ContextError {
     /// ancestors gets no frame at all rather than an empty one.
     #[error("prior-work frame has no entries")]
     EmptyPriorWorkFrame,
+    /// A named-check identity was empty or whitespace-only.
+    #[error("named-check identity is empty")]
+    EmptyCheckIdentity,
+    /// A named-check identity exceeded the field's character bound.
+    #[error("named-check identity exceeds the field bound")]
+    CheckIdentityTooLong,
+    /// A named-check result was empty or whitespace-only; a check that was not
+    /// run is `CheckOutcome::NotRun`, never a blank result.
+    #[error("named-check result is empty")]
+    EmptyCheckResult,
+    /// A named-check result exceeded the field's character bound; bulk output
+    /// belongs in the spilled artifact, not the decisive check line.
+    #[error("named-check result exceeds the field bound")]
+    CheckResultTooLong,
 }

@@ -31,6 +31,13 @@ pub enum StepInput {
         task: String,
         #[serde(default)]
         worker: Option<String>,
+        /// The check that decides this task's success, when the task names
+        /// one: a specific verification whose result determines pass or fail.
+        /// Absent when the task names no such check. Carried as raw text here;
+        /// parsed into a bounded check identity downstream at the evidence
+        /// frame.
+        #[serde(default)]
+        named_check: Option<String>,
     },
 }
 
@@ -78,12 +85,17 @@ fn flatten_one(
     depth: usize,
 ) -> Result<Vec<usize>, String> {
     match step {
-        StepInput::LeafTask { task, worker } => {
+        StepInput::LeafTask {
+            task,
+            worker,
+            named_check,
+        } => {
             let id = *counter;
             *counter += 1;
             let mut t = Task::new(id, task.clone(), String::new());
             t.dependencies = frontier.to_vec();
             t.worker = worker.clone();
+            t.named_check_declaration = named_check.clone();
             tasks.push(t);
             Ok(vec![id])
         }
@@ -277,6 +289,12 @@ pub struct Task {
     /// Top-level because it's orthogonal to pass/fail — workers can submit
     /// structured output regardless of task outcome.
     pub structured_output: Option<StructuredTaskOutput>,
+    /// The check that decides this task's success, when the coordinator named
+    /// one at plan creation: a specific verification whose result determines
+    /// pass or fail. Raw text as declared; parsed into a bounded check
+    /// identity at the evidence frame, where it is reconciled with the
+    /// worker's carried result (present, or `NOT RUN` when absent).
+    pub named_check_declaration: Option<String>,
 }
 
 impl Serialize for Task {
@@ -304,6 +322,9 @@ impl Serialize for Task {
         if let Some(ref so) = self.structured_output {
             map.serialize_entry("structured_output", so)?;
         }
+        if let Some(ref nc) = self.named_check_declaration {
+            map.serialize_entry("named_check_declaration", nc)?;
+        }
         map.end()
     }
 }
@@ -327,6 +348,8 @@ impl<'de> Deserialize<'de> for Task {
             rationale: String,
             #[serde(default)]
             structured_output: Option<StructuredTaskOutput>,
+            #[serde(default)]
+            named_check_declaration: Option<String>,
         }
         let h = TaskHelper::deserialize(deserializer)?;
         let state = match h.status {
@@ -348,6 +371,7 @@ impl<'de> Deserialize<'de> for Task {
             worker: h.worker,
             rationale: h.rationale,
             structured_output: h.structured_output,
+            named_check_declaration: h.named_check_declaration,
         })
     }
 }
@@ -371,6 +395,7 @@ impl Task {
             worker: None,
             rationale: rationale.into(),
             structured_output: None,
+            named_check_declaration: None,
         }
     }
 
@@ -2023,6 +2048,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "t".to_string(),
                 worker: None,
+                named_check: None,
             }],
             routing_rationale: "reason_o".to_string(),
             planning_summary: "summary".to_string(),
@@ -2044,6 +2070,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "Do thing".to_string(),
                 worker: None,
+                named_check: None,
             }],
             routing_rationale: "Needs tool".to_string(),
             planning_summary: "Just do it".to_string(),
@@ -2064,10 +2091,12 @@ mod tests {
             StepInput::LeafTask {
                 task: "Compute mean of [10,20,30]".into(),
                 worker: Some("statistics".into()),
+                named_check: None,
             },
             StepInput::LeafTask {
                 task: "Multiply the result by 3".into(),
                 worker: Some("arithmetic".into()),
+                named_check: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2088,16 +2117,19 @@ mod tests {
                     StepInput::LeafTask {
                         task: "Compute median".into(),
                         worker: Some("statistics".into()),
+                        named_check: None,
                     },
                     StepInput::LeafTask {
                         task: "Compute sin(45)".into(),
                         worker: Some("trigonometry".into()),
+                        named_check: None,
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Multiply the two results".into(),
                 worker: Some("arithmetic".into()),
+                named_check: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2120,22 +2152,26 @@ mod tests {
                             StepInput::LeafTask {
                                 task: "Get A".into(),
                                 worker: Some("ops".into()),
+                                named_check: None,
                             },
                             StepInput::LeafTask {
                                 task: "Transform A".into(),
                                 worker: Some("ops".into()),
+                                named_check: None,
                             },
                         ],
                     },
                     StepInput::LeafTask {
                         task: "Get B".into(),
                         worker: Some("ops".into()),
+                        named_check: None,
                     },
                 ],
             },
             StepInput::LeafTask {
                 task: "Combine".into(),
                 worker: Some("ops".into()),
+                named_check: None,
             },
         ];
         let tasks = flatten_steps(&steps).unwrap();
@@ -2179,6 +2215,7 @@ mod tests {
                     items: vec![StepInput::LeafTask {
                         task: "too deep".into(),
                         worker: None,
+                        named_check: None,
                     }],
                 }],
             }],
@@ -2193,6 +2230,7 @@ mod tests {
         let steps = vec![StepInput::LeafTask {
             task: "Just one thing".into(),
             worker: None,
+            named_check: None,
         }];
         let tasks = flatten_steps(&steps).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -2220,7 +2258,7 @@ mod tests {
         let steps: Vec<StepInput> = serde_json::from_str(json).unwrap();
         assert_eq!(steps.len(), 2);
         match &steps[0] {
-            StepInput::LeafTask { task, worker } => {
+            StepInput::LeafTask { task, worker, .. } => {
                 assert_eq!(task, "Compute mean");
                 assert_eq!(worker.as_deref(), Some("stats"));
             }
@@ -2273,10 +2311,12 @@ mod tests {
                 StepInput::LeafTask {
                     task: "Step 1".into(),
                     worker: Some("w1".into()),
+                    named_check: None,
                 },
                 StepInput::LeafTask {
                     task: "Step 2".into(),
                     worker: Some("w2".into()),
+                    named_check: None,
                 },
             ],
             routing_rationale: "Needs orchestration".into(),
@@ -2309,7 +2349,7 @@ mod tests {
         let json = r#"{"type": "task", "task": "Fresh work", "worker": "ops"}"#;
         let step: StepInput = serde_json::from_str(json).unwrap();
         match &step {
-            StepInput::LeafTask { task, worker } => {
+            StepInput::LeafTask { task, worker, .. } => {
                 assert_eq!(task, "Fresh work");
                 assert_eq!(worker.as_deref(), Some("ops"));
             }

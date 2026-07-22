@@ -216,6 +216,7 @@ fn leaf(task: &str, worker: Option<&str>) -> StepInput {
     StepInput::LeafTask {
         task: task.to_owned(),
         worker: worker.map(str::to_owned),
+        named_check: None,
     }
 }
 

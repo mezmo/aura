@@ -718,6 +718,37 @@ impl ToolReasoningWidth {
     }
 }
 
+/// Character cap for a structured named-check field (check identity or its
+/// decisive result).
+///
+/// Business rule: the named-check field carries one decisive line — a count, a
+/// delta, an exit line — that must stay in view through result spill, so it is
+/// bounded to a short, fixed character width.
+///
+/// Unlike the other char widths in this module, this cap **rejects** rather
+/// than truncates: a decisive result is worthless if its deciding datum is
+/// silently cut, so [`NamedCheckWidth::fits`] is a checked predicate the
+/// field's parsing constructor uses to fail over-cap input, sending bulk to
+/// the artifact instead.
+///
+/// Forbidden invalid state: a zero cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedCheckWidth(CharWidth);
+
+impl NamedCheckWidth {
+    /// Default cap for a named-check field, in characters.
+    pub const DEFAULT: Self = Self(match NonZeroUsize::new(200) {
+        Some(n) => CharWidth(n),
+        None => panic!("fixed named-check cap must be non-zero"),
+    });
+
+    /// Whether `text` is within the cap. Checked, not truncating: the caller's
+    /// constructor rejects over-cap input rather than cutting a decisive datum.
+    pub fn fits(&self, text: &str) -> bool {
+        text.chars().count() <= self.0.get()
+    }
+}
+
 // ============================================================================
 // Byte-bounded observability previews
 // ============================================================================

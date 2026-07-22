@@ -1691,6 +1691,7 @@ impl Orchestrator {
                         .truncate(query)
                 ),
                 worker: None,
+                named_check: None,
             }],
             routing_rationale: "Fallback: all routing attempts failed".to_string(),
             planning_summary: String::new(),
@@ -1745,6 +1746,7 @@ impl Orchestrator {
                                 .truncate(query)
                         ),
                         worker: None,
+                        named_check: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_direct_answers=false). Original rationale: {} | Original answer: {}",
@@ -1776,6 +1778,7 @@ impl Orchestrator {
                                 .truncate(query)
                         ),
                         worker: None,
+                        named_check: None,
                     }],
                     routing_rationale: format!(
                         "Config override (allow_clarification=false). Original rationale: {} | Original question: {}",
@@ -4863,7 +4866,7 @@ mod tests {
                 assert_eq!(goal, "what is the meaning?");
                 assert_eq!(steps.len(), 1);
                 match &steps[0] {
-                    StepInput::LeafTask { task, worker } => {
+                    StepInput::LeafTask { task, worker, .. } => {
                         assert!(task.starts_with("Answer the user's query:"));
                         assert!(task.contains("what is the meaning?"));
                         assert!(worker.is_none());
@@ -4930,6 +4933,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "compute mean of 1,2,3".to_string(),
                 worker: Some("statistics".to_string()),
+                named_check: None,
             }],
             routing_rationale: "needs tool".to_string(),
             planning_summary: "single step".to_string(),
@@ -4975,6 +4979,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "do it".to_string(),
                 worker: None,
+                named_check: None,
             }],
             routing_rationale: "complex".to_string(),
             planning_summary: "A plan to do it".to_string(),

@@ -144,10 +144,12 @@ fn test_task_description_appears_at_most_once_across_conversation_and_continuati
             StepInput::LeafTask {
                 task: TASK_DESCRIPTION.to_string(),
                 worker: Some("operator".to_string()),
+                named_check: None,
             },
             StepInput::LeafTask {
                 task: "Compare captured firmware versions against the golden baseline".to_string(),
                 worker: Some("verifier".to_string()),
+                named_check: None,
             },
         ],
         routing_rationale: "Firmware inventory requires switch access through tools.".to_string(),
@@ -202,6 +204,7 @@ fn test_compact_decision_turn_fallback_tiers() {
         steps: vec![StepInput::LeafTask {
             task: "Enumerate pods".to_string(),
             worker: None,
+            named_check: None,
         }],
         routing_rationale: "  ".to_string(),
         planning_summary: String::new(),

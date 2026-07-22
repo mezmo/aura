@@ -325,17 +325,20 @@ mod tests {
                 StepInput::LeafTask {
                     task: "Enumerate pods in namespace ingest".to_owned(),
                     worker: Some("operator".to_owned()),
+                    named_check: None,
                 },
                 StepInput::ParallelGroup {
                     items: vec![
                         StepInput::LeafTask {
                             task: "Sample consumer lag metrics".to_owned(),
                             worker: None,
+                            named_check: None,
                         },
                         StepInput::SubChain {
                             steps: vec![StepInput::LeafTask {
                                 task: "Cross-check broker logs".to_owned(),
                                 worker: Some("verifier".to_owned()),
+                                named_check: None,
                             }],
                         },
                     ],
@@ -371,6 +374,7 @@ mod tests {
             steps: vec![StepInput::LeafTask {
                 task: "t".to_owned(),
                 worker: None,
+                named_check: None,
             }],
             routing_rationale: "  ".to_owned(),
             planning_summary: String::new(),

@@ -39,6 +39,7 @@ mod failure_history;
 mod frame;
 mod goal;
 mod label;
+mod named_check;
 mod rendered;
 mod turn;
 
@@ -53,6 +54,7 @@ pub use frame::{
 };
 pub use goal::PinnedGoal;
 pub use label::{CorrelationLabel, IterationNumber, TaskId, WorkerClaim, WorkerRole};
+pub use named_check::{CheckIdentity, CheckOutcome, CheckResult, NamedCheck};
 pub use rendered::RenderedContext;
 pub use turn::{
     ClarificationQuestion, CoordinatorTurn, FinalResponse, PlanShape, RoutingRationale,
