@@ -25,7 +25,7 @@ pub use checkpoint::{
     ApprovalOriginSnapshot, BlockedTaskBinding, CHECKPOINT_SCHEMA_VERSION, CheckpointCodecError,
     CheckpointEnvelope, ParkedApprovalSnapshot, PodLocalRef, RunCheckpoint,
 };
-pub use dispatch::{ArgsDigest, DispatchError, DispatchEvent, DispatchState};
+pub use dispatch::{ArgsDigest, DecisionConsumption, DispatchError, DispatchEvent, DispatchState};
 pub use headers::{CredentialSource, HeaderClass, IdentityHeader, UnparkableCredential};
 pub use ids::{AgentInstanceId, ChatSessionId, ConfigFingerprint, SessionId};
 pub use lease::{CasError, FencingGeneration, Lease};

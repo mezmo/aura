@@ -35,13 +35,30 @@ impl ArgsDigest {
     }
 }
 
-/// Consumption of a granted approval. The enum carries no `pending` or
-/// `denied` state: a dispatch record is minted only for an `Approved`
-/// decision (at the call site's `match`, the `Denied` arm mints none), so
-/// "a denial never reaches execution" holds because no value of this type
-/// can stand for one.
+/// Where one parked approval's decision stands. [`DispatchState`] - the
+/// consumption of a granted call - exists only inside `Approved`, so a
+/// pending or denied decision has no dispatch record: "a denial never
+/// reaches execution" holds because no value of any type can construct one.
+/// `Pending` and `Denied` are distinct variants, never conflated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "dispatch", rename_all = "snake_case")]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum DecisionConsumption {
+    /// No human decision yet.
+    Pending,
+    /// The human denied; terminal, never dispatched.
+    Denied {
+        reason: Option<String>,
+        at: Timestamp,
+    },
+    /// The human approved; consumption proceeds through `dispatch`.
+    Approved { dispatch: DispatchState },
+}
+
+/// Consumption of a granted approval. Reachable only through
+/// [`DecisionConsumption::Approved`], so no value of this type can stand
+/// for a denied or undecided approval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
 pub enum DispatchState {
     /// The approval is granted; no dispatcher has claimed it.
     Unclaimed,
@@ -98,8 +115,9 @@ impl DispatchState {
     ///
     /// Legality: `Unclaimed` is claimed by exactly one dispatcher, and only
     /// with a digest equal to `bound`; `Claimed` confirms `Executed` or
-    /// degrades to `ExecutionUnknown`; `Executed` and `ExecutionUnknown`
-    /// accept no event.
+    /// degrades to `ExecutionUnknown` but rejects a second `Claim`, so one
+    /// binding is consumed by at most one dispatcher; `Executed` and
+    /// `ExecutionUnknown` accept no event.
     pub fn apply(&self, event: DispatchEvent, bound: &ArgsDigest) -> Result<Self, DispatchError> {
         let _ = (event, bound);
         todo!("staged for #271 P-cards: dispatch consumption FSM")
@@ -186,6 +204,18 @@ mod tests {
                 Err(DispatchError::Illegal { .. })
             ));
         }
+    }
+
+    #[test]
+    fn claimed_rejects_a_second_claim() {
+        let claimed = DispatchState::Unclaimed
+            .apply(claim(bound()), &bound())
+            .expect("legal");
+        // A second dispatcher must not consume the same binding.
+        assert!(matches!(
+            claimed.apply(claim(bound()), &bound()),
+            Err(DispatchError::Illegal { .. })
+        ));
     }
 
     #[test]

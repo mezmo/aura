@@ -198,6 +198,11 @@ guard.
 Unclaimed -> Claimed -> Executed | ExecutionUnknown
 ```
 
+In the checkpoint a parked approval carries a `DecisionConsumption`
+(`Pending | Denied | Approved { dispatch }`); the dispatch FSM lives only
+inside `Approved`, so a pending or denied decision has no dispatch record
+and the two are never conflated.
+
 A crash after claim leaves `ExecutionUnknown`, never a silent retry, because
 the gated call may have executed. The binding is `(decision_id, args_digest)`
 where the digest is SHA-256 over the RFC 8785 (JCS) canonical form of the tool
