@@ -476,11 +476,31 @@ pipeline {
 
               environment {
                 ENABLE_DOCKER = 'false'
+                SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+                SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+                SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
               }
 
               steps {
                 sh './scripts/set-version.sh "$NEXT_RELEASE_VERSION"'
-                sh 'make build-binaries-darwin'
+                script {
+                  withCredentials([
+                    aws(
+                      credentialsId: 'oss-aws-build-cache',
+                      accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                      secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                  ]) {
+                    // sccache reaches its S3 cache with the credentials bound
+                    // above, so enable the wrapper only inside this block.
+                    // Stage-wide it would route the credential-free
+                    // set-version step through sccache and time out on the
+                    // IMDS credential fallback.
+                    withEnv(['AURA_RUSTC_WRAPPER=sccache']) {
+                      sh 'make build-binaries-darwin'
+                    }
+                  }
+                }
 
                 stash(
                   name: 'darwin-release-artifacts',
