@@ -1,5 +1,16 @@
 ## Changelog
 
+## [0.0.6](https://github.com/mezmo/aura/compare/v0.0.5...v0.0.6) (2026-07-22)
+
+
+### Continuous Integration
+
+* bump homebrew-tap on release [2566ea0](https://github.com/mezmo/aura/commit/2566ea016993419afd024d1812fe98eaf5a6c1e4) - Mike Shearer* **jenkins**: replace github credentials with aura specific [b806fe7](https://github.com/mezmo/aura/commit/b806fe7995a79dd879fd343fadd98ee68e4151da) - Jacob Hull* **release**: bump homebrew tap directly with dry-run validation [bb813e5](https://github.com/mezmo/aura/commit/bb813e54a07366353a4270a7a94fec3a392940bf) - Jacob Hull
+
+### Features
+
+* **cli**: add a contextual startup call-to-action [f3fa66b](https://github.com/mezmo/aura/commit/f3fa66b1c456bdaf66976b8e21624a00b879a970) - Mike Shearer [#373](https://github.com/mezmo/aura/issues/373)* **config**: support base_url for openai embeddings provider [349f4f9](https://github.com/mezmo/aura/commit/349f4f90d3f6ac7d2726854e6f2afd8386330477) - Andre Elizondo [#364](https://github.com/mezmo/aura/issues/364)* **install**: prefer homebrew on macos with direct-download fallback [e52e88a](https://github.com/mezmo/aura/commit/e52e88a01a1da92ff1a8bac004790ecfedee2b11) - Chip Johnson
+
 ## [0.0.5](https://github.com/mezmo/aura/compare/v0.0.4...v0.0.5) (2026-07-17)
 
 
