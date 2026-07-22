@@ -1991,6 +1991,7 @@ max_extraction_tokens = 4000
             llm: None,
             scratchpad: None,
             skills: None,
+            read_only: false,
         };
         let mut orch = OrchestrationConfig::default();
         for name in names {
@@ -2034,5 +2035,182 @@ max_extraction_tokens = 4000
         // No workers configured at all is fine.
         let orch = crate::OrchestrationConfig::default();
         assert!(orch.validate_worker_names().is_ok());
+    }
+
+    #[test]
+    fn test_orchestration_rejects_exact_duplicate_worker_header() {
+        // Defense-in-depth: the toml parser is expected to reject this at
+        // parse time, but we pin the behavior here so a future parser change
+        // doesn't silently regress into last-write-wins merging.
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "m"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.investigator]
+description = "first"
+preamble = "p"
+
+[orchestration.worker.investigator]
+description = "second"
+preamble = "p"
+"#;
+        assert!(
+            load_config_from_str(config_str).is_err(),
+            "duplicate [orchestration.worker.X] headers must be rejected"
+        );
+    }
+
+    // ========================================================================
+    // Read-only worker validation
+    // ========================================================================
+
+    fn read_only_worker_config(filter_lines: &str) -> String {
+        format!(
+            r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "m"
+
+[orchestration]
+enabled = true
+
+[orchestration.worker.watcher]
+description = "d"
+preamble = "p"
+read_only = true
+{filter_lines}
+"#
+        )
+    }
+
+    #[test]
+    fn test_read_only_worker_rejects_empty_mcp_filter() {
+        // Empty mcp_filter means "all MCP tools" at runtime, which a
+        // read-only worker must never get.
+        let err = load_config_from_str(&read_only_worker_config(""))
+            .expect_err("empty filter on read_only worker must be rejected")
+            .to_string();
+        assert!(err.contains("read_only"), "got: {err}");
+        assert!(err.contains("ALL MCP tools"), "got: {err}");
+    }
+
+    #[test]
+    fn test_read_only_worker_rejects_glob_filter() {
+        let err = load_config_from_str(&read_only_worker_config("mcp_filter = [\"list_*\"]"))
+            .expect_err("glob filter on read_only worker must be rejected")
+            .to_string();
+        assert!(err.contains("not glob patterns"), "got: {err}");
+    }
+
+    #[test]
+    fn test_read_only_worker_accepts_exact_names() {
+        load_config_from_str(&read_only_worker_config(
+            "mcp_filter = [\"list_pods\", \"get_logs\"]",
+        ))
+        .expect("exact-name filter on read_only worker should pass");
+    }
+
+    #[test]
+    fn test_non_read_only_worker_keeps_glob_and_empty_filters() {
+        // The restriction applies only to read_only workers; ordinary
+        // workers keep the documented empty/glob semantics.
+        let config = read_only_worker_config("mcp_filter = [\"mezmo_*\"]")
+            .replace("read_only = true", "read_only = false");
+        load_config_from_str(&config).expect("non-read-only glob filter should pass");
+    }
+
+    // ========================================================================
+    // [bootstrap] table
+    // ========================================================================
+
+    const MINIMAL_AGENT: &str = r#"
+[agent]
+name = "assistant"
+system_prompt = "You are helpful."
+
+[agent.llm]
+provider = "ollama"
+model = "qwen3:8b"
+"#;
+
+    #[test]
+    fn bootstrap_absent_by_default() {
+        let config = load_config_from_str(MINIMAL_AGENT).unwrap();
+        assert!(config.bootstrap.is_none());
+    }
+
+    #[test]
+    fn bootstrap_table_parses_enabled() {
+        let toml = format!("{MINIMAL_AGENT}\n[bootstrap]\nenabled = true\n");
+        let config = load_config_from_str(&toml).unwrap();
+        let bootstrap = config.bootstrap.expect("bootstrap table present");
+        assert!(bootstrap.enabled);
+        assert!(bootstrap.llm.is_none());
+    }
+
+    #[test]
+    fn bootstrap_enabled_defaults_false() {
+        let toml = format!("{MINIMAL_AGENT}\n[bootstrap]\n");
+        let config = load_config_from_str(&toml).unwrap();
+        assert!(!config.bootstrap.unwrap().enabled);
+    }
+
+    #[test]
+    fn bootstrap_llm_override_parses() {
+        let toml = format!(
+            "{MINIMAL_AGENT}\n[bootstrap]\nenabled = true\n\n\
+             [bootstrap.llm]\nprovider = \"ollama\"\nmodel = \"qwen3:32b\"\n"
+        );
+        let config = load_config_from_str(&toml).unwrap();
+        let llm = config.bootstrap.unwrap().llm.expect("llm override");
+        assert_eq!(llm.model_info(), ("ollama", "qwen3:32b"));
+    }
+
+    #[test]
+    fn bootstrap_llm_override_requires_api_key() {
+        let toml = format!(
+            "{MINIMAL_AGENT}\n[bootstrap]\nenabled = true\n\n\
+             [bootstrap.llm]\nprovider = \"openai\"\napi_key = \"\"\nmodel = \"gpt-5.1\"\n"
+        );
+        let err = load_config_from_str(&toml).unwrap_err();
+        assert!(err.to_string().contains("bootstrap.llm"), "got: {err}");
+    }
+
+    #[test]
+    fn bootstrap_rejects_unknown_fields() {
+        let toml = format!("{MINIMAL_AGENT}\n[bootstrap]\nenabledd = true\n");
+        assert!(load_config_from_str(&toml).is_err());
+    }
+
+    // ========================================================================
+    // per-worker read_only flag
+    // ========================================================================
+
+    #[test]
+    fn worker_read_only_defaults_false_and_parses_true() {
+        let toml = format!(
+            "{MINIMAL_AGENT}\n[orchestration]\nenabled = true\n\n\
+             [orchestration.worker.watcher]\n\
+             description = \"d\"\npreamble = \"p\"\nread_only = true\n\
+             mcp_filter = [\"list_pods\"]\n\n\
+             [orchestration.worker.doer]\n\
+             description = \"d\"\npreamble = \"p\"\n"
+        );
+        let config = load_config_from_str(&toml).unwrap();
+        let workers = &config.orchestration.unwrap().workers;
+        assert!(workers["watcher"].read_only);
+        assert!(!workers["doer"].read_only);
     }
 }

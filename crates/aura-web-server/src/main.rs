@@ -1,5 +1,4 @@
 use a2a_server::StaticAgentCard;
-use aura_config::load_config;
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -22,7 +21,7 @@ use aura_web_server::streaming;
 use aura_web_server::types;
 
 use streaming::ToolResultMode;
-use types::{ActiveRequestTracker, AppState, ErrorDetail, ErrorResponse};
+use types::{ActiveRequestTracker, AppState, ConfigRegistry, ErrorDetail, ErrorResponse};
 
 /// CLI arguments for the web server
 #[derive(Parser, Debug)]
@@ -208,9 +207,18 @@ async fn run() -> std::io::Result<()> {
     info!("Starting Aura Web Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Loading configuration from: {}", args.config);
 
-    let configs = match load_config(&args.config) {
-        Ok(cfgs) => cfgs,
+    let config_pairs = match aura_config::load_config_with_paths(&args.config) {
+        Ok(pairs) => pairs,
         Err(e) => {
+            if !std::path::Path::new(&args.config).exists() {
+                let msg = format!(
+                    "No configuration found at '{}'. Generate a starter config with \
+                     `aura init`, then start the server again.",
+                    args.config
+                );
+                error!("{msg}");
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+            }
             error!("Failed to load configuration: {}", e);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -219,11 +227,24 @@ async fn run() -> std::io::Result<()> {
         }
     };
 
-    for config in &configs {
+    for (_, config) in &config_pairs {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
         let (provider, model) = config.agent.llm.model_info();
         info!("Loaded agent '{}' ({}/{})", id, provider, model);
     }
+
+    // Bootstrap-specific roster invariants (reserved name + single enabler).
+    if let Err(msg) = aura::bootstrap::validate_roster(&config_pairs) {
+        error!("{msg}");
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    let bootstrap_declaration = config_pairs
+        .iter()
+        .find(|(_, c)| c.bootstrap.as_ref().is_some_and(|b| b.enabled))
+        .map(|(path, config)| (path.clone(), config.clone()));
+
+    let configs: Vec<aura_config::Config> =
+        config_pairs.into_iter().map(|(_, config)| config).collect();
 
     // Validate DEFAULT_AGENT matches a loaded config
     if let Some(ref default_agent) = args.default_agent {
@@ -246,7 +267,79 @@ async fn run() -> std::io::Result<()> {
         info!("Default agent: '{}'", default_agent);
     }
 
-    let configs_arc = Arc::new(configs);
+    let roster_names: Vec<String> = configs.iter().map(|c| c.agent_id().to_string()).collect();
+    let configs_arc = Arc::new(ConfigRegistry::new(configs));
+
+    // Token-gated aura-bootstrap agent, when exactly one config enabled it.
+    // The agent lives outside the registry: hot reloads never touch it, so a
+    // bootstrap conversation survives the configs it applies. Its token and
+    // LLM are fixed at startup — [bootstrap] changes take effect on restart.
+    let bootstrap_state = bootstrap_declaration.map(|(declaring_path, declaring)| {
+        let token = match std::env::var("AURA_BOOTSTRAP_TOKEN") {
+            Ok(t) if !t.trim().is_empty() => {
+                tracing::warn!("Bootstrap agent enabled; token taken from AURA_BOOTSTRAP_TOKEN");
+                t.trim().to_string()
+            }
+            _ => {
+                let token = uuid::Uuid::new_v4().to_string();
+                // Printed to logs by design: whoever can read this server's
+                // logs is authorized to administer its configuration.
+                tracing::warn!(
+                    "Bootstrap agent enabled; no AURA_BOOTSTRAP_TOKEN set — generated \
+                     token: {token}"
+                );
+                token
+            }
+        };
+        tracing::warn!(
+            "Chat with the bootstrap agent: aura --api-url http://{}:{} \
+             --model {} --api-key <token>",
+            args.host,
+            args.port,
+            aura::bootstrap::BOOTSTRAP_AGENT_NAME,
+        );
+
+        let target = aura::bootstrap::ConfigTarget {
+            config_path: std::path::PathBuf::from(&args.config),
+            target: declaring_path,
+        };
+
+        // Hot reload: re-load from disk and swap the roster. Captures the
+        // registry (not the AppState) to avoid a reference cycle.
+        let registry = configs_arc.clone();
+        let reload_path = args.config.clone();
+        let default_agent = args.default_agent.clone();
+        let reload: aura::bootstrap::ReloadHook = Arc::new(move || {
+            let config_pairs =
+                aura_config::load_config_with_paths(&reload_path).map_err(|e| e.to_string())?;
+            aura::bootstrap::validate_roster(&config_pairs)?;
+            let configs: Vec<aura_config::Config> =
+                config_pairs.into_iter().map(|(_, c)| c).collect();
+            let names: Vec<String> = configs.iter().map(|c| c.agent_id().to_string()).collect();
+            if let Some(da) = &default_agent
+                && !names.iter().any(|n| n == da)
+            {
+                tracing::warn!("DEFAULT_AGENT '{da}' no longer matches any agent after hot reload");
+            }
+            let count = names.len();
+            registry.replace(configs);
+            tracing::warn!("Hot reload applied: {count} agent(s) now live");
+            Ok(format!(
+                "Hot reload applied; {count} agent(s) now live: {}",
+                names.join(", ")
+            ))
+        });
+
+        types::BootstrapState {
+            agent_config: aura::bootstrap::bootstrap_agent_config(
+                &declaring,
+                &target,
+                &roster_names,
+            ),
+            token,
+            tools: aura::bootstrap::bootstrap_tools_factory(target, reload),
+        }
+    });
 
     // Two-phase shutdown: gate (immediate 503) → grace period → stream drain ([DONE])
     let shutdown_token = CancellationToken::new();
@@ -266,6 +359,7 @@ async fn run() -> std::io::Result<()> {
 
     let app_state = Arc::new(AppState {
         configs: configs_arc,
+        bootstrap: bootstrap_state,
         tool_result_mode: args.tool_result_mode,
         tool_result_max_length: args.tool_result_max_length,
         streaming_buffer_size: args.streaming_buffer_size,

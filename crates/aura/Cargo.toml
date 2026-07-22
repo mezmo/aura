@@ -58,6 +58,7 @@ uuid = { workspace = true }
 
 regex = "1"
 async-stream = "0.3"
+toml = "0.8"
 strum = { workspace = true }
 
 # Tokenization for scratchpad context budget
@@ -74,6 +75,5 @@ integration-stdio = []
 
 [dev-dependencies]
 tempfile = "3.23.0"
-toml = "0.8"
 tokio = { version = "1.45", features = ["test-util", "macros", "rt"] }
 
