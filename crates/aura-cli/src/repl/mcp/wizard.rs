@@ -1304,14 +1304,19 @@ mod tests {
         let base = "[agent]\nname = \"a\"\n\n[orchestration]\nenabled = %E%\n\n\
                     [orchestration.worker.ops]\ndescription = \"d\"\npreamble = \"p\"\n\
                     mcp_filter = [\"logs_*\"]\n\n\
+                    [orchestration.worker.silent]\ndescription = \"d\"\npreamble = \"p\"\n\
+                    mcp_filter = []\n\n\
                     [orchestration.worker.writer]\ndescription = \"d\"\npreamble = \"p\"\n";
 
         fs::write(&path, base.replace("%E%", "true")).unwrap();
         let workers = orchestrated_workers(&path);
+        // `mcp_filter = []` must stay distinct from an omitted filter — the
+        // lockdown/grant partition hinges on it.
         assert_eq!(
             workers,
             [
                 ("ops".to_string(), Some(vec!["logs_*".to_string()])),
+                ("silent".to_string(), Some(vec![])),
                 ("writer".to_string(), None),
             ]
         );

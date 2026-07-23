@@ -614,10 +614,18 @@ impl Orchestrator {
             );
 
             if !has_matching_tool {
-                tracing::warn!(
-                    "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping",
-                    task_id
-                );
+                if worker_filter.is_some_and(<[String]>::is_empty) {
+                    // The deliberate no-tools assignment — nothing to intercept.
+                    tracing::info!(
+                        "Worker {}: mcp_filter = [] (no MCP tools); scratchpad not needed",
+                        task_id
+                    );
+                } else {
+                    tracing::warn!(
+                        "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping",
+                        task_id
+                    );
+                }
             } else {
                 // Validation enforces these upstream; re-check here so runtime
                 // misconfiguration fails loudly instead of silently degrading.
