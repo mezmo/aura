@@ -751,12 +751,43 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
         if confirm(ctx, "Does the server need an auth header? [y/N] ")
             && let Some(header) = ask_with_default(ctx, "Header name", "Authorization")
         {
-            let source = collect_credential(
-                ctx,
-                &derive_env_var(&name, &header),
-                &format!("`{header}` header value (full value, e.g. `Bearer <token>`)"),
-            )?;
-            headers.insert(header, format!("{{{{ env.{} }}}}", source.env_var()));
+            println!("How is the `{header}` value formed?");
+            println!("  1. Bearer <secret>");
+            println!("  2. Token <secret>");
+            println!("  3. <secret> only (no prefix)");
+            println!("  4. Custom prefix");
+            let prefix = loop {
+                let answer = ask(ctx, "Choice [1-4]: ")?;
+                match answer.as_str() {
+                    "1" => break "Bearer ".to_string(),
+                    "2" => break "Token ".to_string(),
+                    "3" => break String::new(),
+                    "4" => {
+                        // `ask` trims, so a separating space can't be typed —
+                        // add it for any non-empty prefix.
+                        let custom = ask(ctx, "Prefix: ")?;
+                        break if custom.is_empty() {
+                            custom
+                        } else {
+                            format!("{custom} ")
+                        };
+                    }
+                    _ => println!("Enter a number between 1 and 4."),
+                }
+            };
+            let secret_prompt = if prefix.is_empty() {
+                format!("`{header}` secret")
+            } else {
+                format!(
+                    "`{header}` secret (without the `{}` prefix)",
+                    prefix.trim_end()
+                )
+            };
+            let source = collect_credential(ctx, &derive_env_var(&name, &header), &secret_prompt)?;
+            headers.insert(
+                header,
+                format!("{prefix}{{{{ env.{} }}}}", source.env_var()),
+            );
             secrets.push(source);
         }
         let server = if transport == "1" {
