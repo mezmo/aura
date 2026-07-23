@@ -359,13 +359,14 @@ fn verify_server(
 ///
 /// Two cases, both via the format-preserving `append_worker_mcp_filter`
 /// writer:
-/// - Workers *without* an `mcp_filter` already see the new server (empty
-///   filter = every MCP tool; see `resolve_worker_tools` in the
-///   orchestrator). They're offered *scoping*: writing their first filter
-///   entries narrows them from all tools to exactly the listed ones, so
-///   that tradeoff is stated and defaults to no.
-/// - Allowlisted workers don't see the new server; they're offered a grant
-///   appending to their existing filter.
+/// - Workers *without* an `mcp_filter` already see the new server (an
+///   omitted filter = every MCP tool; see `resolve_worker_tools` in the
+///   orchestrator). They're offered a lockdown choice: scope to this
+///   server's tools, assign no MCP tools (`mcp_filter = []`), or keep
+///   all-tools access (the default).
+/// - Workers with a filter (including the explicit no-tools `[]`) don't
+///   see the new server; they're offered a grant appending to their
+///   filter.
 fn offer_worker_access(
     ctx: &mut CommandContext,
     config_path: &Path,
@@ -377,9 +378,9 @@ fn offer_worker_access(
         return;
     }
     let entries = filter_entries(tool_names);
-    let (open, allowlisted): (Vec<_>, Vec<_>) = workers
+    let (open, filtered): (Vec<_>, Vec<_>) = workers
         .into_iter()
-        .partition(|(_, filter)| filter.is_empty());
+        .partition(|(_, filter)| filter.is_none());
 
     if !open.is_empty() {
         let names: Vec<&str> = open.iter().map(|(name, _)| name.as_str()).collect();
@@ -389,25 +390,42 @@ fn offer_worker_access(
             names.join(", ")
         );
         println!(
-            "You can scope them to `{server}` now (adds {} as the worker's \
-             mcp_filter). Scoping limits a worker to exactly the listed tools — \
-             extend its filter as you add more servers:",
-            entries_summary(&entries)
+            "You can lock each one down now — a written mcp_filter limits the \
+             worker to exactly the listed tools:"
         );
         for (worker, _) in open {
-            if confirm(ctx, &format!("  Scope `{worker}` to `{server}`? [y/N] ")) {
-                append_filter_and_report(config_path, &worker, &entries);
+            println!("  `{worker}`:");
+            println!(
+                "    1. Scope to `{server}`'s tools ({})",
+                entries_summary(&entries)
+            );
+            println!("    2. No MCP tools at all (mcp_filter = [])");
+            println!("    3. Keep access to every tool");
+            loop {
+                let Some(answer) = ask(ctx, "    Choice [1-3, default 3]: ") else {
+                    return;
+                };
+                match answer.as_str() {
+                    "1" => append_filter_and_report(config_path, &worker, &entries),
+                    "2" => append_filter_and_report(config_path, &worker, &[]),
+                    "3" | "" => {}
+                    _ => {
+                        println!("    Enter 1, 2, or 3.");
+                        continue;
+                    }
+                }
+                break;
             }
         }
     }
 
-    if !allowlisted.is_empty() {
+    if !filtered.is_empty() {
         println!(
-            "\nWorkers with tool allowlists don't see `{server}` yet. \
+            "\nWorkers with an mcp_filter don't see `{server}` yet. \
              Grant access per worker (adds {} to their mcp_filter):",
             entries_summary(&entries)
         );
-        for (worker, _) in allowlisted {
+        for (worker, _) in filtered {
             if confirm(ctx, &format!("  Grant `{worker}` access? [y/N] ")) {
                 append_filter_and_report(config_path, &worker, &entries);
             }
@@ -441,27 +459,29 @@ fn append_filter_and_report(config_path: &Path, worker: &str, entries: &[String]
 }
 
 /// When the new server couldn't be verified (so its tool names are
-/// unknown), allowlisted workers still won't see it — say so instead of
-/// leaving them silently blind to the new server.
+/// unknown), workers with an mcp_filter still won't see it — say so
+/// instead of leaving them silently blind to the new server.
 fn print_allowlist_hint(config_path: &Path, server: &str) {
-    let allowlisted: Vec<String> = orchestrated_workers(config_path)
+    let filtered: Vec<String> = orchestrated_workers(config_path)
         .into_iter()
-        .filter(|(_, filter)| !filter.is_empty())
+        .filter(|(_, filter)| filter.is_some())
         .map(|(name, _)| name)
         .collect();
-    if !allowlisted.is_empty() {
+    if !filtered.is_empty() {
         println!(
-            "Workers with mcp_filter allowlists ({}) won't see `{server}`'s tools \
+            "Workers with an mcp_filter ({}) won't see `{server}`'s tools \
              until matching patterns are added to their filters.",
-            allowlisted.join(", ")
+            filtered.join(", ")
         );
     }
 }
 
 /// Read `(worker name, mcp_filter)` pairs from the config file when
 /// orchestration is enabled; empty when it isn't (or on any parse problem —
-/// this is an optional convenience step, not a gate).
-fn orchestrated_workers(config_path: &Path) -> Vec<(String, Vec<String>)> {
+/// this is an optional convenience step, not a gate). `None` = the worker
+/// has no `mcp_filter` key (all tools); `Some` mirrors the written array,
+/// where empty is the explicit no-tools assignment.
+fn orchestrated_workers(config_path: &Path) -> Vec<(String, Option<Vec<String>>)> {
     let Ok(content) = fs::read_to_string(config_path) else {
         return Vec::new();
     };
@@ -484,7 +504,7 @@ fn orchestrated_workers(config_path: &Path) -> Vec<(String, Vec<String>)> {
     else {
         return Vec::new();
     };
-    let mut result: Vec<(String, Vec<String>)> = workers
+    let mut result: Vec<(String, Option<Vec<String>>)> = workers
         .iter()
         .map(|(name, worker)| {
             let filter = worker
@@ -495,8 +515,7 @@ fn orchestrated_workers(config_path: &Path) -> Vec<(String, Vec<String>)> {
                         .iter()
                         .filter_map(|v| v.as_str().map(str::to_owned))
                         .collect()
-                })
-                .unwrap_or_default();
+                });
             (name.to_string(), filter)
         })
         .collect();
@@ -1292,8 +1311,8 @@ mod tests {
         assert_eq!(
             workers,
             [
-                ("ops".to_string(), vec!["logs_*".to_string()]),
-                ("writer".to_string(), vec![]),
+                ("ops".to_string(), Some(vec!["logs_*".to_string()])),
+                ("writer".to_string(), None),
             ]
         );
 

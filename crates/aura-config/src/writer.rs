@@ -50,9 +50,10 @@ pub fn append_worker_mcp_filter(
 /// The worker table must already exist — this never creates workers.
 /// Entries already present are skipped; a missing `mcp_filter` array is
 /// created. Callers should mind the filter's semantics when creating it:
-/// an empty or absent `mcp_filter` grants a worker every MCP tool, so
-/// adding the first entries *narrows* that worker's access to just the
-/// listed patterns.
+/// an *absent* `mcp_filter` grants a worker every MCP tool while a
+/// written one limits the worker to its entries, so creating the array
+/// narrows the worker — and calling with empty `entries` writes the
+/// explicit no-tools assignment (`mcp_filter = []`).
 pub fn append_worker_mcp_filter_in_str(
     content: &str,
     worker: &str,
@@ -550,6 +551,17 @@ preamble = "You write"
                 .mcp_filter
                 .as_deref(),
             Some(["k8s_*".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn empty_entries_write_the_no_tools_assignment() {
+        let updated = append_worker_mcp_filter_in_str(ORCHESTRATED_CONFIG, "writer", &[]).unwrap();
+        assert!(updated.contains("mcp_filter = []"), "{updated}");
+        let config = load_config_from_str(&updated).expect("config must parse");
+        assert_eq!(
+            config.orchestration.expect("orchestration table").workers["writer"].mcp_filter,
+            Some(vec![])
         );
     }
 
