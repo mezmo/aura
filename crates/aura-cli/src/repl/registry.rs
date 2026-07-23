@@ -177,8 +177,8 @@ pub(crate) const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/mcp",
-        description: "List the MCP servers available to the agent",
-        usage_hint: None,
+        description: "List MCP servers, or set one up with `add`",
+        usage_hint: Some("[add]"),
         handler: cmd_mcp,
         validate: None,
         mid_stream: MidStream::Defer,
@@ -283,7 +283,7 @@ fn cmd_style(_ctx: &mut CommandContext, args: &str) -> CommandOutcome {
 }
 
 fn cmd_mcp(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
-    super::mcp::handle_mcp(args, ctx.rt, ctx.backend);
+    super::mcp::handle_mcp(ctx, args);
     CommandOutcome::Handled
 }
 

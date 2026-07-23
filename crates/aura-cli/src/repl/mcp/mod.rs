@@ -4,21 +4,37 @@
 //! startup call-to-action uses, so it works identically against a local
 //! standalone agent and a remote aura-web-server.
 
+#[cfg(feature = "standalone-cli")]
+mod catalog;
+#[cfg(feature = "standalone-cli")]
+mod wizard;
+
 use aura_events::{AgentInfo, McpServerOverview};
 
-use crate::backend::Backend;
+use super::registry::CommandContext;
 use crate::theme::{AuraStyle, Themed};
 use crate::ui::prompt::redraw_input_frame;
 
-pub(crate) fn handle_mcp(args: &str, rt: &tokio::runtime::Runtime, backend: &Backend) {
-    let body = match args.trim() {
+pub(crate) fn handle_mcp(ctx: &mut CommandContext, args: &str) {
+    match args.trim() {
         "" => {
-            let agent = rt.block_on(backend.startup_agent_overview());
-            format_server_list(agent.as_ref())
+            let agent = ctx.rt.block_on(ctx.backend.startup_agent_overview());
+            println!("{}", format_server_list(agent.as_ref()));
         }
-        other => format!("Unknown /mcp subcommand: {other}\nRun /mcp to list configured servers."),
-    };
-    println!("{body}");
+        "add" => {
+            #[cfg(feature = "standalone-cli")]
+            wizard::run(ctx);
+            #[cfg(not(feature = "standalone-cli"))]
+            println!(
+                "/mcp add edits a local agent config and needs a build with the \
+                 standalone-cli feature; this build is HTTP-only."
+            );
+        }
+        other => println!(
+            "Unknown /mcp subcommand: {other}\n\
+             Run /mcp to list configured servers, or /mcp add to set one up."
+        ),
+    }
     redraw_input_frame();
 }
 
