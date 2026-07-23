@@ -15,22 +15,97 @@ use crate::error::ConfigError;
 /// Map-valued fields of an MCP server table.
 const MAP_FIELDS: [&str; 4] = ["env", "headers", "headers_from_request", "scratchpad"];
 
-/// Insert or replace `[mcp.servers.<name>]` in the config file at `path`.
+/// Insert or replace `[mcp.servers.<name>]` in the config file at `path`,
+/// atomically (see [`rewrite_file`]).
 ///
-/// The file is rewritten atomically (temp file + rename in the same
-/// directory), carrying the original file's permissions over — agent
-/// configs hold credentials, so a `chmod 600` must survive the rewrite.
 /// A missing file is an error rather than an implicit create: a config
 /// that holds only an MCP table is not runnable, so the caller is
-/// expected to target an existing config. On any error the original
-/// file is left untouched and the temp file removed.
+/// expected to target an existing config.
 pub fn upsert_mcp_server(
     path: &Path,
     name: &str,
     server: &McpServerConfig,
 ) -> Result<(), ConfigError> {
+    rewrite_file(path, |existing| {
+        upsert_mcp_server_in_str(existing, name, server)
+    })
+}
+
+/// Append `entries` to `[orchestration.worker.<worker>].mcp_filter` in the
+/// config file at `path`, with the same atomic-write guarantees as
+/// [`upsert_mcp_server`].
+pub fn append_worker_mcp_filter(
+    path: &Path,
+    worker: &str,
+    entries: &[String],
+) -> Result<(), ConfigError> {
+    rewrite_file(path, |existing| {
+        append_worker_mcp_filter_in_str(existing, worker, entries)
+    })
+}
+
+/// String-level core of [`append_worker_mcp_filter`]: returns the updated
+/// TOML text.
+///
+/// The worker table must already exist — this never creates workers.
+/// Entries already present are skipped; a missing `mcp_filter` array is
+/// created. Callers should mind the filter's semantics when creating it:
+/// an empty or absent `mcp_filter` grants a worker every MCP tool, so
+/// adding the first entries *narrows* that worker's access to just the
+/// listed patterns.
+pub fn append_worker_mcp_filter_in_str(
+    content: &str,
+    worker: &str,
+    entries: &[String],
+) -> Result<String, ConfigError> {
+    let mut doc: toml_edit::DocumentMut = content.parse()?;
+    let worker_table = doc
+        .get_mut("orchestration")
+        .and_then(|o| o.get_mut("worker"))
+        .and_then(|w| w.get_mut(worker))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "no [orchestration.worker.{worker}] table in the config"
+            ))
+        })?;
+    if worker_table.get("mcp_filter").is_none() {
+        worker_table.insert(
+            "mcp_filter",
+            toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())),
+        );
+    }
+    let filter = worker_table
+        .get_mut("mcp_filter")
+        .and_then(toml_edit::Item::as_array_mut)
+        .ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "`mcp_filter` for worker `{worker}` is not a TOML array"
+            ))
+        })?;
+    let existing: Vec<String> = filter
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    for entry in entries {
+        if !existing.contains(entry) {
+            filter.push(entry.as_str());
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Apply a text transformation to the file at `path` and write the result
+/// atomically (temp file + rename in the same directory), carrying the
+/// original file's permissions over — agent configs hold credentials, so a
+/// `chmod 600` must survive the rewrite. On any error the original file is
+/// left untouched and the temp file removed.
+fn rewrite_file(
+    path: &Path,
+    transform: impl FnOnce(&str) -> Result<String, ConfigError>,
+) -> Result<(), ConfigError> {
     let existing = fs::read_to_string(path)?;
-    let updated = upsert_mcp_server_in_str(&existing, name, server)?;
+    let updated = transform(&existing)?;
     let permissions = fs::metadata(path)?.permissions();
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     let written = fs::write(&tmp, updated)
@@ -418,6 +493,77 @@ url = "https://old.example.com/mcp"
         let content = format!("mcp = 3\n{BASE_CONFIG}");
         let err = upsert_mcp_server_in_str(&content, "srv", &stdio_server()).unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)), "{err:?}");
+    }
+
+    const ORCHESTRATED_CONFIG: &str = r#"[agent]
+name = "Coordinator"
+system_prompt = "Coordinate"
+
+[agent.llm]
+provider = "anthropic"
+api_key = "test_key"
+model = "claude-3-sonnet-20240229"
+
+[orchestration]
+enabled = true
+
+# Ops worker comment
+[orchestration.worker.operations]
+description = "ops"
+preamble = "You are ops"
+mcp_filter = ["logs_*"] # trailing comment
+
+[orchestration.worker.writer]
+description = "writes summaries"
+preamble = "You write"
+"#;
+
+    #[test]
+    fn appends_filter_entries_and_dedupes() {
+        let updated = append_worker_mcp_filter_in_str(
+            ORCHESTRATED_CONFIG,
+            "operations",
+            &["mezmo_*".to_string(), "logs_*".to_string()],
+        )
+        .unwrap();
+        assert!(
+            updated.contains(r#"mcp_filter = ["logs_*", "mezmo_*"]"#),
+            "existing entry deduped, new one appended:\n{updated}"
+        );
+        assert!(updated.contains("# Ops worker comment"), "{updated}");
+        let config = load_config_from_str(&updated).expect("config must parse");
+        let orch = config.orchestration.expect("orchestration table");
+        assert_eq!(orch.workers["operations"].mcp_filter, ["logs_*", "mezmo_*"]);
+    }
+
+    #[test]
+    fn creates_missing_filter_array() {
+        let updated =
+            append_worker_mcp_filter_in_str(ORCHESTRATED_CONFIG, "writer", &["k8s_*".to_string()])
+                .unwrap();
+        let config = load_config_from_str(&updated).expect("config must parse");
+        assert_eq!(
+            config.orchestration.expect("orchestration table").workers["writer"].mcp_filter,
+            ["k8s_*"]
+        );
+    }
+
+    #[test]
+    fn errors_on_unknown_worker() {
+        let err =
+            append_worker_mcp_filter_in_str(ORCHESTRATED_CONFIG, "nope", &["k8s_*".to_string()])
+                .unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn file_append_worker_filter_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, ORCHESTRATED_CONFIG).unwrap();
+        append_worker_mcp_filter(&path, "operations", &["mezmo_*".to_string()]).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains(r#"["logs_*", "mezmo_*"]"#), "{written}");
     }
 
     #[test]
