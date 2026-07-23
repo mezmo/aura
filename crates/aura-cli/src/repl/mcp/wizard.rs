@@ -354,14 +354,18 @@ fn verify_server(
     })
 }
 
-/// Offer to expose a freshly verified server's tools to orchestration
-/// workers.
+/// Offer to expose (or scope) a freshly verified server's tools per
+/// orchestration worker.
 ///
-/// Workers without an `mcp_filter` already see the new server (empty
-/// filter = every MCP tool; see `resolve_worker_tools` in the
-/// orchestrator), so that's stated rather than asked; only allowlisted
-/// workers are offered an update, via the format-preserving
-/// `append_worker_mcp_filter` writer.
+/// Two cases, both via the format-preserving `append_worker_mcp_filter`
+/// writer:
+/// - Workers *without* an `mcp_filter` already see the new server (empty
+///   filter = every MCP tool; see `resolve_worker_tools` in the
+///   orchestrator). They're offered *scoping*: writing their first filter
+///   entries narrows them from all tools to exactly the listed ones, so
+///   that tradeoff is stated and defaults to no.
+/// - Allowlisted workers don't see the new server; they're offered a grant
+///   appending to their existing filter.
 fn offer_worker_access(
     ctx: &mut CommandContext,
     config_path: &Path,
@@ -372,37 +376,67 @@ fn offer_worker_access(
     if workers.is_empty() || tool_names.is_empty() {
         return;
     }
+    let entries = filter_entries(tool_names);
     let (open, allowlisted): (Vec<_>, Vec<_>) = workers
         .into_iter()
         .partition(|(_, filter)| filter.is_empty());
+
     if !open.is_empty() {
         let names: Vec<&str> = open.iter().map(|(name, _)| name.as_str()).collect();
         println!(
-            "\nWorkers without an mcp_filter receive every MCP tool, including \
-             `{server}`: {}.",
+            "\nWorkers without an mcp_filter receive every MCP tool, so `{server}` \
+             is already visible to: {}.",
             names.join(", ")
         );
+        println!(
+            "You can scope them to `{server}` now (adds {} as the worker's \
+             mcp_filter). Scoping limits a worker to exactly the listed tools — \
+             extend its filter as you add more servers:",
+            entries_summary(&entries)
+        );
+        for (worker, _) in open {
+            if confirm(ctx, &format!("  Scope `{worker}` to `{server}`? [y/N] ")) {
+                append_filter_and_report(config_path, &worker, &entries);
+            }
+        }
     }
-    if allowlisted.is_empty() {
-        return;
+
+    if !allowlisted.is_empty() {
+        println!(
+            "\nWorkers with tool allowlists don't see `{server}` yet. \
+             Grant access per worker (adds {} to their mcp_filter):",
+            entries_summary(&entries)
+        );
+        for (worker, _) in allowlisted {
+            if confirm(ctx, &format!("  Grant `{worker}` access? [y/N] ")) {
+                append_filter_and_report(config_path, &worker, &entries);
+            }
+        }
     }
-    let entries = filter_entries(tool_names);
-    println!(
-        "\nWorkers with tool allowlists don't see `{server}` yet. \
-         Grant access per worker (adds {} to their mcp_filter):",
+}
+
+/// Compact display form of filter entries for prompts; the full list is
+/// always what gets written.
+fn entries_summary(entries: &[String]) -> String {
+    const SHOW: usize = 5;
+    if entries.len() <= SHOW {
         entries.join(", ")
-    );
-    for (worker, _) in allowlisted {
-        if !confirm(ctx, &format!("  Grant `{worker}` access? [y/N] ")) {
-            continue;
-        }
-        match aura_config::writer::append_worker_mcp_filter(config_path, &worker, &entries) {
-            Ok(()) => println!("  {} updated `{worker}`", "✓".themed(AuraStyle::Success)),
-            Err(e) => println!(
-                "  {} failed to update `{worker}`: {e}",
-                "error:".themed(AuraStyle::Error)
-            ),
-        }
+    } else {
+        format!(
+            "{}, ... ({} tools)",
+            entries[..SHOW].join(", "),
+            entries.len()
+        )
+    }
+}
+
+fn append_filter_and_report(config_path: &Path, worker: &str, entries: &[String]) {
+    match aura_config::writer::append_worker_mcp_filter(config_path, worker, entries) {
+        Ok(()) => println!("  {} updated `{worker}`", "✓".themed(AuraStyle::Success)),
+        Err(e) => println!(
+            "  {} failed to update `{worker}`: {e}",
+            "error:".themed(AuraStyle::Error)
+        ),
     }
 }
 
@@ -1200,6 +1234,17 @@ mod tests {
 
         let single = vec!["only_tool".to_string()];
         assert_eq!(filter_entries(&single), single);
+    }
+
+    #[test]
+    fn entries_summary_truncates_long_lists() {
+        let short: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(entries_summary(&short), "a, b");
+        let long: Vec<String> = (0..8).map(|i| format!("tool_{i}")).collect();
+        assert_eq!(
+            entries_summary(&long),
+            "tool_0, tool_1, tool_2, tool_3, tool_4, ... (8 tools)"
+        );
     }
 
     #[test]
