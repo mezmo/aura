@@ -8,6 +8,12 @@ pub enum ConfigError {
     #[error("TOML parse error: {0}")]
     TomlParse(#[from] toml::de::Error),
 
+    #[error("TOML edit error: {0}")]
+    TomlEdit(#[from] toml_edit::TomlError),
+
+    #[error("TOML serialize error: {0}")]
+    TomlSerialize(#[from] toml_edit::ser::Error),
+
     #[error("Environment variable error: {0}")]
     EnvVar(String),
 

@@ -25,9 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 # Format-preserving TOML editor for in-place [telemetry] cli.toml edits.
-# Pinned to the 0.22 line that `toml` 0.8 already builds on, so it adds
-# no new transitive tree.
-toml_edit = "0.22"
+toml_edit = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
