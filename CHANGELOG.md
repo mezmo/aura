@@ -1,5 +1,24 @@
 ## Changelog
 
+## [0.0.7](https://github.com/mezmo/aura/compare/v0.0.6...v0.0.7) (2026-07-23)
+
+
+### Bug Fixes
+
+* enable sccache in mac ci build [ddbbf8f](https://github.com/mezmo/aura/commit/ddbbf8f6a9f6c9a05e25babd4bebf8d01f3f27e5) - Jacob Hull
+
+### Code Refactoring
+
+* **orchestration**: trim turn-nudge comments to essentials [68c6c6e](https://github.com/mezmo/aura/commit/68c6c6e88741b7ef0a554dc065b7b496ed27b9d6) - Mike Shearer [#379](https://github.com/mezmo/aura/issues/379)
+
+### Documentation
+
+* **config**: document turn-limit nudge settings [8ba372b](https://github.com/mezmo/aura/commit/8ba372b0deda45368b213c81332deb8efb8ee077) - Mike Shearer [#379](https://github.com/mezmo/aura/issues/379)
+
+### Features
+
+* **orchestration**: nudge agents approaching the turn depth limit [acb2e2d](https://github.com/mezmo/aura/commit/acb2e2dbae3c5d59e88d362de91546bc2e5d576b) - Mike Shearer [#379](https://github.com/mezmo/aura/issues/379)
+
 ## [0.0.6](https://github.com/mezmo/aura/compare/v0.0.5...v0.0.6) (2026-07-22)
 
 

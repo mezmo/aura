@@ -1,6 +1,6 @@
 {
   "name": "@mezmoinc/aura",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "private": true,
   "description": "A production-ready framework for declaratively composing AI agents.",
   "keywords": [
