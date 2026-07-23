@@ -198,6 +198,10 @@ impl Tool for CreatePlanTool {
                     "type": "string",
                     "description": "Name of the specialized worker to assign this task to. Required when type=task."
                 },
+                "named_check": {
+                    "type": "string",
+                    "description": "The success criteria for this task: the one specific verification whose result decides whether the task passed, stated together with the criterion it must meet. Declare it only when the task description or a prior task's results already establish that check; a task that investigates a question or establishes an unknown names none. Optional; omit when no single check decides success."
+                },
                 "items": {
                     "type": "array",
                     "description": "Steps to run concurrently. Required when type=parallel.",

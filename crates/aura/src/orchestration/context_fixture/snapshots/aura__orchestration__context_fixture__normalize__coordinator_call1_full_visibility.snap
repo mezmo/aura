@@ -83,6 +83,7 @@ When creating plans with `create_plan`, provide an ordered list of **steps**:
 - **Use `{"parallel": [...]}` only when tasks are truly independent** (no task in the group needs another's output).
 - Assign each step to the worker whose capabilities best match it.
 - Keep task descriptions specific and actionable.
+- When one specific verification decides a task's success, declare it in that task's `named_check`: the success criteria, stated with its criterion. Declare a check only where the task description or a prior task's results already establish it; a task that investigates a question or establishes an unknown names none.
 
 ### Example: Sequential (most common)
 
@@ -220,6 +221,10 @@ Call the appropriate routing tool now.
                   "type": "object"
                 },
                 "type": "array"
+              },
+              "named_check": {
+                "description": "The success criteria for this task: the one specific verification whose result decides whether the task passed, stated together with the criterion it must meet. Declare it only when the task description or a prior task's results already establish that check; a task that investigates a question or establishes an unknown names none. Optional; omit when no single check decides success.",
+                "type": "string"
               },
               "steps": {
                 "description": "Sequential steps in a sub-chain. Required when type=chain.",

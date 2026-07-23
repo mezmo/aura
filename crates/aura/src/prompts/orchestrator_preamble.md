@@ -38,6 +38,7 @@ When creating plans with `create_plan`, provide an ordered list of **steps**:
 - **Use `{"parallel": [...]}` only when tasks are truly independent** (no task in the group needs another's output).
 - Assign each step to the worker whose capabilities best match it.
 - Keep task descriptions specific and actionable.
+- When one specific verification decides a task's success, declare it in that task's `named_check`: the success criteria, stated with its criterion. Declare a check only where the task description or a prior task's results already establish it; a task that investigates a question or establishes an unknown names none.
 
 ### Example: Sequential (most common)
 
