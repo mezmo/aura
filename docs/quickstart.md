@@ -131,7 +131,7 @@ url = "http://host.docker.internal:9000/mcp"
 
 Use `host.docker.internal` to reach services running on your host machine.
 
-Then scope the tools per worker: set `mcp_filter` on each worker that should use them (see [Customize orchestration](#customize-orchestration)). A worker with no `mcp_filter` receives **all** MCP tools, so set it explicitly on every tool-using worker and keep tool-free workers (like the default `writer`) on a non-matching pattern.
+Then scope the tools per worker: set `mcp_filter` on each worker that should use them (see [Customize orchestration](#customize-orchestration)). A worker with no `mcp_filter` receives **all** MCP tools, so set it explicitly on every tool-using worker and give tool-free workers (like the default `writer`) an explicit empty filter (`mcp_filter = []`).
 
 ### Add vector search
 
@@ -217,12 +217,12 @@ preamble = """
 You are a knowledge specialist completing one assigned task.
 Search available documentation to answer the question.
 """
-mcp_filter = ["__none__"]      # non-matching pattern: no MCP tools, vector search only
+mcp_filter = []                # no MCP tools: vector search only
 vector_stores = ["docs"]
 turn_depth = 5
 ```
 
-> **Note:** a worker whose `mcp_filter` is omitted or empty (`[]`) is granted **every** MCP tool, not none. Set an explicit `mcp_filter` on each worker once an MCP server is configured, and use a non-matching pattern (e.g. `["__none__"]`) for any worker you want to keep tool-free.
+> **Note:** a worker whose `mcp_filter` is *omitted* is granted **every** MCP tool. Set an explicit `mcp_filter` on each worker once an MCP server is configured; `mcp_filter = []` keeps a worker tool-free.
 
 Each worker inherits the agent's LLM by default. To run a worker on a different model, add a complete `[orchestration.worker.<name>.llm]` block — see the [orchestration config reference](../README.md#orchestration) for all fields.
 

@@ -79,10 +79,10 @@ preamble = """
 You are a Writing Specialist. Take the coordinator's goal and any research
 findings and produce a concise, well-structured response.
 """
-# The writer synthesizes text and needs no tools. This non-matching pattern
-# keeps it tool-free even after you enable an MCP server (an omitted/empty
-# filter would otherwise grant it every tool). Leave it as-is.
-mcp_filter = ["__none__"]
+# The writer synthesizes text and needs no tools. The explicit empty
+# filter keeps it tool-free even after you enable an MCP server (an
+# omitted filter would grant it every tool). Leave it as-is.
+mcp_filter = []
 
 # ── MCP Tool Servers (optional) ─────────────────────────────────────
 # To give your workers external tools:

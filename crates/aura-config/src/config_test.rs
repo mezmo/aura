@@ -1985,7 +1985,7 @@ max_extraction_tokens = 4000
         let worker = WorkerConfig {
             description: "d".to_string(),
             preamble: "p".to_string(),
-            mcp_filter: Vec::new(),
+            mcp_filter: None,
             vector_stores: Vec::new(),
             turn_depth: None,
             llm: None,
