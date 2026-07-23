@@ -134,15 +134,33 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             ));
         }
     }
-    if !collected.secrets.is_empty() {
-        let vars: Vec<&str> = collected
-            .secrets
-            .iter()
-            .map(|(var, _)| var.as_str())
-            .collect();
+    let new_secrets: Vec<(String, String)> = collected
+        .secrets
+        .iter()
+        .filter_map(|source| match source {
+            CredentialSource::New { env_var, value } => Some((env_var.clone(), value.clone())),
+            CredentialSource::Existing { .. } => None,
+        })
+        .collect();
+    if !new_secrets.is_empty() {
+        let vars: Vec<&str> = new_secrets.iter().map(|(var, _)| var.as_str()).collect();
         println!(
             "Secrets are stored in `.env` next to the config ({}), not in the TOML.",
             vars.join(", ")
+        );
+    }
+    let existing_vars: Vec<&str> = collected
+        .secrets
+        .iter()
+        .filter_map(|source| match source {
+            CredentialSource::Existing { env_var, .. } => Some(env_var.as_str()),
+            CredentialSource::New { .. } => None,
+        })
+        .collect();
+    if !existing_vars.is_empty() {
+        println!(
+            "References environment variable(s) you already manage ({}) — nothing is written for them.",
+            existing_vars.join(", ")
         );
     }
     if !confirm(ctx, &format!("Write to {}? [Y/n] ", config_path.display())) {
@@ -156,9 +174,9 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             "failed to update the config: {e}\nThe config file was left unchanged."
         ));
     }
-    if !collected.secrets.is_empty() {
+    if !new_secrets.is_empty() {
         let env_path = config_path.parent().unwrap_or(Path::new(".")).join(".env");
-        if let Err(e) = write_env_secrets(&env_path, &collected.secrets) {
+        if let Err(e) = write_env_secrets(&env_path, &new_secrets) {
             return WizardEnd::Failed(format!(
                 "the server was written to the config, but saving secrets to {} failed: {e}\n\
                  Add the variable(s) to that file manually.",
@@ -168,6 +186,33 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         println!("Saved secrets to {}.", env_path.display());
     }
 
+    let unresolved: Vec<&str> = collected
+        .secrets
+        .iter()
+        .filter(|source| source.known_value().is_none())
+        .map(CredentialSource::env_var)
+        .collect();
+    if !unresolved.is_empty() {
+        println!(
+            "\nSkipping the connection check — {} not set in this session.",
+            unresolved.join(", ")
+        );
+        return WizardEnd::Written {
+            name: collected.name,
+            starter_prompt: collected.starter_prompt,
+            verified: false,
+        };
+    }
+    let known_values: Vec<(String, String)> = collected
+        .secrets
+        .iter()
+        .filter_map(|source| {
+            source
+                .known_value()
+                .map(|value| (source.env_var().to_string(), value.to_string()))
+        })
+        .collect();
+
     println!(
         "\nVerifying connection to `{}` (up to {}s)...",
         collected.name,
@@ -176,7 +221,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
     let verified = match verify_server(
         ctx.rt,
         &collected.name,
-        inline_secrets(&collected.server, &collected.secrets),
+        inline_secrets(&collected.server, &known_values),
     ) {
         Ok((aura::mcp::ConnectionStatus::Connected, tools_count)) => {
             println!(
@@ -288,9 +333,99 @@ fn verify_server(
 struct CollectedServer {
     name: String,
     server: McpServerConfig,
-    /// `(env var, secret value)` pairs.
-    secrets: Vec<(String, String)>,
+    secrets: Vec<CredentialSource>,
     starter_prompt: Option<&'static str>,
+}
+
+/// Where a credential's value comes from.
+enum CredentialSource {
+    /// Entered during the wizard.
+    New { env_var: String, value: String },
+    /// An env var the user already exports.
+    Existing {
+        env_var: String,
+        value: Option<String>,
+    },
+}
+
+impl CredentialSource {
+    fn env_var(&self) -> &str {
+        match self {
+            CredentialSource::New { env_var, .. } | CredentialSource::Existing { env_var, .. } => {
+                env_var
+            }
+        }
+    }
+
+    /// The value as known this session (always known for `New`; for
+    /// `Existing` only when the var is actually set).
+    fn known_value(&self) -> Option<&str> {
+        match self {
+            CredentialSource::New { value, .. } => Some(value),
+            CredentialSource::Existing { value, .. } => value.as_deref(),
+        }
+    }
+}
+
+/// Collect one credential: prefer an env var the user already exports
+/// (auto-offered when the conventional var is set) over entering the value
+/// now, which is the only path that writes to `.env`.
+fn collect_credential(
+    ctx: &mut CommandContext,
+    default_env_var: &str,
+    secret_prompt: &str,
+) -> Option<CredentialSource> {
+    if let Some(value) = set_env_value(default_env_var)
+        && confirm(
+            ctx,
+            &format!("{default_env_var} is already set in your environment — use it? [Y/n] "),
+        )
+    {
+        return Some(CredentialSource::Existing {
+            env_var: default_env_var.to_string(),
+            value: Some(value),
+        });
+    }
+    println!("How do you want to provide the {secret_prompt}?");
+    println!("  1. Enter it now (saved to .env next to the config)");
+    println!("  2. Reference an environment variable you already export");
+    loop {
+        let answer = ask(ctx, "Choice [1-2]: ")?;
+        match answer.as_str() {
+            "1" => {
+                let value = ask_secret(&format!("{secret_prompt}: "))?;
+                return Some(CredentialSource::New {
+                    env_var: default_env_var.to_string(),
+                    value,
+                });
+            }
+            "2" => {
+                let env_var = loop {
+                    let name = ask_with_default(ctx, "Environment variable", default_env_var)?;
+                    if is_valid_env_var(&name) {
+                        break name;
+                    }
+                    println!(
+                        "Variable names contain letters, digits, and `_`, and don't \
+                         start with a digit."
+                    );
+                };
+                let value = set_env_value(&env_var);
+                if value.is_none() {
+                    println!(
+                        "note: {env_var} is not set in this session, so the connection \
+                         check will be skipped."
+                    );
+                }
+                return Some(CredentialSource::Existing { env_var, value });
+            }
+            _ => println!("Enter 1 or 2."),
+        }
+    }
+}
+
+fn set_env_value(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn collect_catalog(
@@ -310,12 +445,15 @@ fn collect_catalog(
             let mut header_map = HashMap::new();
             let mut secrets = Vec::new();
             for template in *headers {
-                let value = ask_secret(&format!("{}: ", template.secret_prompt))?;
-                header_map.insert(
-                    template.header.to_string(),
-                    template.value_template.to_string(),
+                let source = collect_credential(ctx, template.env_var, template.secret_prompt)?;
+                // The template names the conventional var; rewrite its
+                // placeholder when the user picked a different one.
+                let value = template.value_template.replace(
+                    &format!("{{{{ env.{} }}}}", template.env_var),
+                    &format!("{{{{ env.{} }}}}", source.env_var()),
                 );
-                secrets.push((template.env_var.to_string(), value));
+                header_map.insert(template.header.to_string(), value);
+                secrets.push(source);
             }
             (
                 http_streamable(url.to_string(), header_map, entry.description),
@@ -388,12 +526,13 @@ fn collect_custom(ctx: &mut CommandContext, config_path: &Path) -> Option<Collec
         if confirm(ctx, "Does the server need an auth header? [y/N] ")
             && let Some(header) = ask_with_default(ctx, "Header name", "Authorization")
         {
-            let env_var = derive_env_var(&name, &header);
-            let value = ask_secret(&format!(
-                "Value for `{header}` (full value, e.g. `Bearer <token>`): "
-            ))?;
-            headers.insert(header, format!("{{{{ env.{env_var} }}}}"));
-            secrets.push((env_var, value));
+            let source = collect_credential(
+                ctx,
+                &derive_env_var(&name, &header),
+                &format!("`{header}` header value (full value, e.g. `Bearer <token>`)"),
+            )?;
+            headers.insert(header, format!("{{{{ env.{} }}}}", source.env_var()));
+            secrets.push(source);
         }
         let server = if transport == "1" {
             http_streamable(url, headers, "")
@@ -559,6 +698,12 @@ fn is_valid_server_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+fn is_valid_env_var(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Whitespace-split a command line into `cmd = [first]` + `args = rest`.
 /// No shell quoting — the wizard says so in the prompt example.
 fn parse_command_line(line: &str) -> Option<(Vec<String>, Vec<String>)> {
@@ -640,6 +785,35 @@ mod tests {
             derive_env_var("my-server", "X-Api-Key"),
             "MY_SERVER_X_API_KEY"
         );
+    }
+
+    #[test]
+    fn validates_env_var_names() {
+        assert!(is_valid_env_var("MEZMO_API_KEY"));
+        assert!(is_valid_env_var("_PRIVATE"));
+        assert!(!is_valid_env_var(""));
+        assert!(!is_valid_env_var("1BAD"));
+        assert!(!is_valid_env_var("HAS-DASH"));
+    }
+
+    #[test]
+    fn credential_source_reports_env_var_and_value() {
+        let new = CredentialSource::New {
+            env_var: "A".to_string(),
+            value: "v".to_string(),
+        };
+        assert_eq!(new.env_var(), "A");
+        assert_eq!(new.known_value(), Some("v"));
+        let set = CredentialSource::Existing {
+            env_var: "B".to_string(),
+            value: Some("w".to_string()),
+        };
+        assert_eq!(set.known_value(), Some("w"));
+        let unset = CredentialSource::Existing {
+            env_var: "C".to_string(),
+            value: None,
+        };
+        assert_eq!(unset.known_value(), None);
     }
 
     #[test]
