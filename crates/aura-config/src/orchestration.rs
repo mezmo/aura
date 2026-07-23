@@ -127,21 +127,38 @@ pub struct WorkerConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeoutsConfig {
-    /// Per-call timeout (seconds) for coordinator and worker LLM calls.
+    /// Wall-clock timeout (seconds) for coordinator and worker LLM streams.
     ///
-    /// Each individual `.chat()` call (planning, continuation, worker task)
-    /// is wrapped with this timeout. Prevents a single hung LLM call from blocking
-    /// the request.
+    /// For coordinator one-shot phases (planning, continuation routing) this
+    /// bounds a single call. For workers it bounds the WHOLE task: the timeout
+    /// wraps the full ReAct loop (every turn and tool execution up to
+    /// `max_depth`), not one provider call. A long-running but healthy worker
+    /// can therefore hit this limit; to detect hung providers instead, use
+    /// `inactivity_timeout_secs`.
     ///
-    /// Default: 0 (disabled). Set to a positive value to enable per-call timeouts.
+    /// Default: 0 (disabled). Set to a positive value to enable the wall-clock
+    /// bound.
     #[serde(default = "default_per_call_timeout_secs")]
     pub per_call_timeout_secs: u64,
+
+    /// Inactivity timeout (seconds) for worker LLM streams.
+    ///
+    /// The deadline re-arms on every stream item (text delta, reasoning delta,
+    /// tool call, tool result all count as liveness); the stream fails only
+    /// after this many consecutive silent seconds. Distinguishes a hung
+    /// provider from a busy worker, which `per_call_timeout_secs` cannot.
+    ///
+    /// Default: 0 (disabled). Set to a positive value to enable the
+    /// inactivity bound.
+    #[serde(default = "default_inactivity_timeout_secs")]
+    pub inactivity_timeout_secs: u64,
 }
 
 impl Default for TimeoutsConfig {
     fn default() -> Self {
         Self {
             per_call_timeout_secs: default_per_call_timeout_secs(),
+            inactivity_timeout_secs: default_inactivity_timeout_secs(),
         }
     }
 }
@@ -360,9 +377,16 @@ impl OrchestrationConfig {
         Ok(())
     }
 
-    /// Per-call timeout (seconds) for coordinator and worker LLM calls.
+    /// Wall-clock timeout (seconds): per-call for coordinator one-shot
+    /// phases, whole-task for workers.
     pub fn per_call_timeout_secs(&self) -> u64 {
         self.timeouts.per_call_timeout_secs
+    }
+
+    /// Inactivity timeout (seconds) for worker streams; the deadline re-arms
+    /// on every stream item. 0 disables.
+    pub fn inactivity_timeout_secs(&self) -> u64 {
+        self.timeouts.inactivity_timeout_secs
     }
 
     /// Optional memory/persistence directory.
@@ -581,6 +605,10 @@ fn default_per_call_timeout_secs() -> u64 {
     0
 }
 
+fn default_inactivity_timeout_secs() -> u64 {
+    0
+}
+
 fn default_max_plan_parse_retries() -> usize {
     3
 }
@@ -638,6 +666,7 @@ mod tests {
         assert_eq!(config.max_tools_per_worker, 10);
         assert!(config.coordinator_vector_stores.is_empty());
         assert_eq!(config.per_call_timeout_secs(), 0);
+        assert_eq!(config.inactivity_timeout_secs(), 0);
         assert_eq!(config.result_artifact_threshold(), 4000);
         assert_eq!(config.result_summary_length(), 2000);
         assert!(config.memory_dir().is_none());
@@ -931,6 +960,7 @@ mod tests {
 
             [timeouts]
             per_call_timeout_secs = 45
+            inactivity_timeout_secs = 90
 
             [artifacts]
             memory_dir = "/tmp/new-style"
@@ -939,6 +969,7 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.per_call_timeout_secs(), 45);
+        assert_eq!(config.inactivity_timeout_secs(), 90);
         assert_eq!(config.memory_dir(), Some("/tmp/new-style"));
         assert_eq!(config.result_artifact_threshold(), 8000);
         assert_eq!(config.result_summary_length(), 1500);

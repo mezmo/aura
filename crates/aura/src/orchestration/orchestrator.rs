@@ -888,7 +888,10 @@ impl Orchestrator {
     /// - Uses `agent.stream_chat()` which respects the agent's configured `max_depth`
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx`
     /// - No early-exit — runs the complete ReAct loop
-    /// - Timeout wrapping via `per_call_timeout_secs`
+    /// - Whole-task timeout wrapping via `per_call_timeout_secs`
+    /// - Per-item inactivity bound via `inactivity_timeout_secs` (the deadline
+    ///   re-arms on every stream item, so it catches hung providers without
+    ///   capping busy workers)
     async fn stream_and_forward(
         &self,
         agent: &Agent,
@@ -911,6 +914,9 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
+        let liveness = crate::orchestration::stream_liveness::StreamLiveness::from_secs(
+            self.config.inactivity_timeout_secs(),
+        );
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
             let mut stream = agent.stream_chat(prompt, history).await;
@@ -927,7 +933,10 @@ impl Orchestrator {
             // ObserverWrapper) are never double-emitted.
             let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
-            while let Some(item) = stream.next().await {
+            while let Some(item) = liveness.next_item(&mut stream).await.map_err(|inactive| {
+                tracing::warn!("{}: {}", phase, inactive);
+                format!("{} failed: {}", phase, inactive)
+            })? {
                 match item {
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
                         content.push_str(&t);

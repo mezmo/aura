@@ -56,6 +56,7 @@ mod persistence;
 mod persistence_wrapper;
 mod prompt_constants;
 mod stream_events;
+mod stream_liveness;
 mod templates;
 pub mod tools;
 mod types;
