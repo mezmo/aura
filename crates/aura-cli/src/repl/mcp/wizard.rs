@@ -149,7 +149,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             vars.join(", ")
         );
     }
-    let existing_vars: Vec<&str> = collected
+    let mut existing_vars: Vec<&str> = collected
         .secrets
         .iter()
         .filter_map(|source| match source {
@@ -157,6 +157,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             CredentialSource::New { .. } => None,
         })
         .collect();
+    existing_vars.dedup();
     if !existing_vars.is_empty() {
         println!(
             "References environment variable(s) you already manage ({}) — nothing is written for them.",
@@ -186,12 +187,13 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         println!("Saved secrets to {}.", env_path.display());
     }
 
-    let unresolved: Vec<&str> = collected
+    let mut unresolved: Vec<&str> = collected
         .secrets
         .iter()
         .filter(|source| source.known_value().is_none())
         .map(CredentialSource::env_var)
         .collect();
+    unresolved.dedup();
     if !unresolved.is_empty() {
         println!(
             "\nSkipping the connection check — {} not set in this session.",
@@ -243,7 +245,14 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             print_allowlist_hint(config_path, &collected.name);
             false
         }
-        Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) => false,
+        Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) => {
+            println!(
+                "{} The connection was not attempted.",
+                "!".themed(AuraStyle::Warning)
+            );
+            print_allowlist_hint(config_path, &collected.name);
+            false
+        }
         Err(reason) => {
             println!(
                 "{} Could not verify the connection: {reason}",
@@ -348,10 +357,10 @@ fn verify_server(
 /// Offer to expose a freshly verified server's tools to orchestration
 /// workers.
 ///
-/// Worker `mcp_filter` globs match *tool names*, and an empty filter grants
-/// every MCP tool — so workers without a filter already see the new server
-/// (that's stated, not asked), and only allowlisted workers are offered an
-/// update. Grants go through the format-preserving
+/// Workers without an `mcp_filter` already see the new server (empty
+/// filter = every MCP tool; see `resolve_worker_tools` in the
+/// orchestrator), so that's stated rather than asked; only allowlisted
+/// workers are offered an update, via the format-preserving
 /// `append_worker_mcp_filter` writer.
 fn offer_worker_access(
     ctx: &mut CommandContext,
@@ -461,8 +470,20 @@ fn orchestrated_workers(config_path: &Path) -> Vec<(String, Vec<String>)> {
     result
 }
 
-/// Filter entries granting exactly the given tools: a `{prefix}*` glob when
-/// every tool shares a meaningful prefix (≥4 chars), else the exact names.
+/// Tool-name stems too generic to anchor a glob.
+const GENERIC_STEMS: [&str; 10] = [
+    "get", "list", "read", "set", "create", "delete", "update", "query", "fetch", "describe",
+];
+
+/// Filter entries granting the given tools: a `{prefix}*` glob when every
+/// tool shares a namespacing prefix, else the exact names.
+///
+/// Globs are matched against the tool names of *every* configured server,
+/// so a glob is only used when the shared prefix looks like a namespace
+/// rather than a verb: it must end at a `_`/`-` separator, be at least 5
+/// chars, and its stem must not be a [`GENERIC_STEMS`] verb — `mezmo_*`
+/// qualifies, but `get_issue`/`get_pr` fall back to exact names because
+/// `get_*` would also grant `get_logs` from an unrelated server.
 fn filter_entries(tool_names: &[String]) -> Vec<String> {
     if tool_names.len() > 1 {
         let first = &tool_names[0];
@@ -478,8 +499,12 @@ fn filter_entries(tool_names: &[String]) -> Vec<String> {
         while len > 0 && !first.is_char_boundary(len) {
             len -= 1;
         }
-        if len >= 4 {
-            return vec![format!("{}*", &first[..len])];
+        if let Some(sep) = first[..len].rfind(['_', '-']) {
+            let prefix = &first[..=sep];
+            let stem = first[..sep].to_ascii_lowercase();
+            if prefix.len() >= 5 && !GENERIC_STEMS.contains(&stem.as_str()) {
+                return vec![format!("{prefix}*")];
+            }
         }
     }
     tool_names.to_vec()
@@ -550,6 +575,16 @@ fn collect_credential(
         match answer.as_str() {
             "1" => {
                 let value = ask_secret(&format!("{secret_prompt}: "))?;
+                // At startup the shell's export wins over .env (dotenvy
+                // never overwrites existing env), so a value entered here
+                // is dead weight while the export exists.
+                if set_env_value(default_env_var).is_some() {
+                    println!(
+                        "note: {default_env_var} is exported in your shell, and exported \
+                         values override .env at startup — unset or update the export \
+                         for this value to take effect."
+                    );
+                }
                 return Some(CredentialSource::New {
                     env_var: default_env_var.to_string(),
                     value,
@@ -1139,13 +1174,26 @@ mod tests {
     }
 
     #[test]
-    fn filter_entries_prefer_common_prefix_glob() {
+    fn filter_entries_prefer_namespace_prefix_glob() {
         let tools = vec![
             "mezmo_logs".to_string(),
             "mezmo_pipelines".to_string(),
             "mezmo_export".to_string(),
         ];
         assert_eq!(filter_entries(&tools), ["mezmo_*"]);
+
+        // A generic verb stem must not become a glob: `get_*` would also
+        // match other servers' tools.
+        let generic = vec![
+            "get_issue".to_string(),
+            "get_pr".to_string(),
+            "get_file".to_string(),
+        ];
+        assert_eq!(filter_entries(&generic), generic);
+
+        // Too-short namespace falls back to exact names.
+        let short = vec!["dd_metrics".to_string(), "dd_monitors".to_string()];
+        assert_eq!(filter_entries(&short), short);
 
         let mixed = vec!["ListKnowledgeBases".to_string(), "QueryBases".to_string()];
         assert_eq!(filter_entries(&mixed), mixed);
