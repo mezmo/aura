@@ -1,8 +1,6 @@
-//! `/mcp` — inspect the MCP servers available to the active agent.
-//!
-//! Reads the same credential-free [`AgentInfo::mcp_servers`] view the
-//! startup call-to-action uses, so it works identically against a local
-//! standalone agent and a remote aura-web-server.
+//! `/mcp` — inspect and install MCP servers for the active agent. Listing
+//! reads the credential-free [`AgentInfo::mcp_servers`] view, identical in
+//! standalone and HTTP modes.
 
 #[cfg(feature = "standalone-cli")]
 mod catalog;

@@ -1,9 +1,8 @@
-//! Guided `/mcp add` flow: pick a catalog server (or define a custom one),
-//! collect credentials with masked input, and write the result to the
-//! standalone config via `aura_config::writer` plus `.env` for secrets.
+//! Guided `/mcp add` flow: pick a catalog or custom server, collect
+//! credentials with masked input, write the config + `.env`.
 //!
-//! Standalone mode only — HTTP mode's config lives on the remote server.
-//! The flow is deliberately deterministic: no LLM ever sees a credential.
+//! Standalone mode only, and deliberately deterministic: no LLM ever
+//! sees a credential.
 
 use std::collections::HashMap;
 use std::fs;
@@ -29,9 +28,8 @@ enum WizardEnd {
 }
 
 pub(super) fn run(ctx: &mut CommandContext) {
-    // The REPL loop hides the cursor before dispatching a command and only
-    // re-shows it on the next prompt; this handler reads input, so bring
-    // the cursor back for its prompts.
+    // The REPL loop hides the cursor around dispatch; this handler reads
+    // input, so bring it back.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
     let Backend::Direct(direct) = ctx.backend else {
         println!(
@@ -159,10 +157,9 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         })
         .collect();
 
-    // Verify BEFORE asking to write, so consent to the config change is
-    // informed by a live connection result and the discovered tools — and
-    // a failing credential never lands on disk unless explicitly chosen.
-    // The check runs against an in-memory copy; nothing is written yet.
+    // Verify before asking to write (in memory — nothing on disk yet):
+    // consent is informed by the live result, and a failing credential
+    // never lands in the config unless explicitly chosen.
     let mut verified = false;
     let mut tool_names: Vec<String> = Vec::new();
     if !unresolved.is_empty() {
@@ -230,8 +227,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             existing_vars.join(", ")
         );
     }
-    // A verified (or knowingly unverifiable) server defaults to yes; a
-    // server that just failed its check defaults to no.
+    // A failed check flips the default to no.
     let write_prompt = if verified || !unresolved.is_empty() {
         format!("Write to {}? [Y/n] ", config_path.display())
     } else {
@@ -276,12 +272,9 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
     }
 }
 
-/// Replace each `{{ env.VAR }}` placeholder with its collected secret value.
-///
-/// The connectivity check needs real credentials, but the freshly written
-/// `.env` is only read at process startup (dotenvy), so the placeholders
-/// can't resolve through the normal loader this session. The inlined copy
-/// exists only in memory for the duration of the check.
+/// Replace `{{ env.VAR }}` placeholders with the collected values, in
+/// memory only — `.env` isn't re-read until restart, so the connection
+/// check can't resolve placeholders through the normal loader.
 fn inline_secrets(server: &McpServerConfig, secrets: &[(String, String)]) -> McpServerConfig {
     let mut server = server.clone();
     let inline = |values: &mut HashMap<String, String>| {
@@ -300,16 +293,11 @@ fn inline_secrets(server: &McpServerConfig, secrets: &[(String, String)]) -> Mcp
     server
 }
 
-/// Throwaway connection + tool-discovery check against just the new server.
-///
-/// Builds a single-server `McpManager` (entirely separate from the running
-/// agent — the new server only joins the real roster on restart), reads the
-/// resulting status and tool count, and closes every client — including any
-/// spawned stdio child process — before returning.
-/// Bounds the whole connect + tool-discovery attempt: the underlying HTTP
-/// client has no timeout of its own, so a blackholed endpoint (or npx
-/// downloading a stdio server on first run) would otherwise hang the REPL
-/// with no Ctrl-C escape.
+/// Throwaway single-server connection + tool-discovery check, entirely
+/// separate from the running agent. Closes every client — including
+/// spawned stdio children — before returning.
+/// Bounds the connect + tool-discovery attempt — the underlying HTTP
+/// client has no timeout, and Ctrl-C can't interrupt the blocking check.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn verify_server(
@@ -360,19 +348,9 @@ fn verify_server(
     })
 }
 
-/// Offer to expose (or scope) a freshly verified server's tools per
-/// orchestration worker.
-///
-/// Two cases, both via the format-preserving `append_worker_mcp_filter`
-/// writer:
-/// - Workers *without* an `mcp_filter` already see the new server (an
-///   omitted filter = every MCP tool; see `resolve_worker_tools` in the
-///   orchestrator). They're offered a lockdown choice: scope to this
-///   server's tools, assign no MCP tools (`mcp_filter = []`), or keep
-///   all-tools access (the default).
-/// - Workers with a filter (including the explicit no-tools `[]`) don't
-///   see the new server; they're offered a grant appending to their
-///   filter.
+/// Offer per-worker access to a freshly verified server: workers without
+/// an `mcp_filter` already see it (omitted = every tool) and get a
+/// lockdown choice; workers with one don't and get an append-style grant.
 fn offer_worker_access(
     ctx: &mut CommandContext,
     config_path: &Path,
@@ -464,9 +442,8 @@ fn append_filter_and_report(config_path: &Path, worker: &str, entries: &[String]
     }
 }
 
-/// When the new server couldn't be verified (so its tool names are
-/// unknown), workers with an mcp_filter still won't see it — say so
-/// instead of leaving them silently blind to the new server.
+/// Unverified server → tool names unknown; name the filtered workers that
+/// won't see it rather than leaving them silently blind.
 fn print_allowlist_hint(config_path: &Path, server: &str) {
     let filtered: Vec<String> = orchestrated_workers(config_path)
         .into_iter()
@@ -482,11 +459,9 @@ fn print_allowlist_hint(config_path: &Path, server: &str) {
     }
 }
 
-/// Read `(worker name, mcp_filter)` pairs from the config file when
-/// orchestration is enabled; empty when it isn't (or on any parse problem —
-/// this is an optional convenience step, not a gate). `None` = the worker
-/// has no `mcp_filter` key (all tools); `Some` mirrors the written array,
-/// where empty is the explicit no-tools assignment.
+/// `(worker, mcp_filter)` pairs from the config file; empty unless
+/// orchestration is enabled (or on any parse problem — a convenience
+/// step, not a gate). `None` = no `mcp_filter` key.
 fn orchestrated_workers(config_path: &Path) -> Vec<(String, Option<Vec<String>>)> {
     let Ok(content) = fs::read_to_string(config_path) else {
         return Vec::new();
@@ -534,15 +509,11 @@ const GENERIC_STEMS: [&str; 10] = [
     "get", "list", "read", "set", "create", "delete", "update", "query", "fetch", "describe",
 ];
 
-/// Filter entries granting the given tools: a `{prefix}*` glob when every
-/// tool shares a namespacing prefix, else the exact names.
-///
-/// Globs are matched against the tool names of *every* configured server,
-/// so a glob is only used when the shared prefix looks like a namespace
-/// rather than a verb: it must end at a `_`/`-` separator, be at least 5
-/// chars, and its stem must not be a [`GENERIC_STEMS`] verb — `mezmo_*`
-/// qualifies, but `get_issue`/`get_pr` fall back to exact names because
-/// `get_*` would also grant `get_logs` from an unrelated server.
+/// A `{prefix}*` glob when every tool shares a namespacing prefix, else
+/// the exact names. Globs match against *every* server's tools, so the
+/// prefix must end at a `_`/`-` separator, be ≥5 chars, and not stem from
+/// a [`GENERIC_STEMS`] verb (`get_*` would grant another server's
+/// `get_logs`).
 fn filter_entries(tool_names: &[String]) -> Vec<String> {
     if tool_names.len() > 1 {
         let first = &tool_names[0];
@@ -597,8 +568,7 @@ impl CredentialSource {
         }
     }
 
-    /// The value as known this session (always known for `New`; for
-    /// `Existing` only when the var is actually set).
+    /// The value as known this session, if any.
     fn known_value(&self) -> Option<&str> {
         match self {
             CredentialSource::New { value, .. } => Some(value),
@@ -607,9 +577,9 @@ impl CredentialSource {
     }
 }
 
-/// Collect one credential: prefer an env var the user already exports
-/// (auto-offered when the conventional var is set) over entering the value
-/// now, which is the only path that writes to `.env`.
+/// Collect one credential: an already-exported env var (auto-offered when
+/// the conventional var is set) or a value entered now — only the latter
+/// writes to `.env`.
 fn collect_credential(
     ctx: &mut CommandContext,
     default_env_var: &str,
@@ -634,9 +604,8 @@ fn collect_credential(
         match answer.as_str() {
             "1" => {
                 let value = ask_secret(&format!("{secret_prompt}: "))?;
-                // At startup the shell's export wins over .env (dotenvy
-                // never overwrites existing env), so a value entered here
-                // is dead weight while the export exists.
+                // Shell exports override .env at startup (dotenvy never
+                // overwrites), so warn when one shadows this value.
                 if set_env_value(default_env_var).is_some() {
                     println!(
                         "note: {default_env_var} is exported in your shell, and exported \
@@ -894,12 +863,9 @@ fn config_has_server(config_path: &Path, name: &str) -> bool {
         .is_some()
 }
 
-/// Merge `(env var, value)` pairs into the `.env` file, creating it (with
-/// the do-not-commit header and `0o600` on unix) when absent. Values of
-/// existing keys are replaced; unrelated lines are preserved. Values are
-/// quoted as needed so dotenvy can parse them back — an unquoted space or
-/// `#` doesn't just corrupt that entry, it aborts dotenvy's parse and
-/// silently drops every line after it.
+/// Merge `(env var, value)` pairs into `.env`, creating it (0600 on unix)
+/// when absent. Values are quoted as needed — an unquoted space or `#`
+/// aborts dotenvy's parse and silently drops every later line.
 fn write_env_secrets(env_path: &Path, secrets: &[(String, String)]) -> std::io::Result<()> {
     let mut content = match fs::read_to_string(env_path) {
         Ok(content) => content,
@@ -936,10 +902,8 @@ fn write_env_secrets(env_path: &Path, secrets: &[(String, String)]) -> std::io::
     Ok(())
 }
 
-/// Quote a dotenv value when it contains characters dotenvy would misparse
-/// unquoted (whitespace, `#`, quotes, backslash). Plain token-like values
-/// stay unquoted; single quotes are preferred because dotenvy treats their
-/// contents as fully literal.
+/// Quote a dotenv value when dotenvy would misparse it unquoted; single
+/// quotes preferred (fully literal in dotenvy).
 fn quote_env_value(value: &str) -> String {
     let plain = value
         .chars()
@@ -993,8 +957,8 @@ fn parse_command_line(line: &str) -> Option<(Vec<String>, Vec<String>)> {
     Some((vec![first], tokens.collect()))
 }
 
-/// One line of wizard input via the REPL's rustyline editor (which owns the
-/// terminal between dispatches). `None` on Ctrl-C/Ctrl-D — treat as abort.
+/// One wizard line via the REPL's rustyline editor (idle between
+/// dispatches). `None` on Ctrl-C/Ctrl-D — treat as abort.
 fn ask(ctx: &mut CommandContext, prompt: &str) -> Option<String> {
     ctx.input_reader
         .readline(prompt)
@@ -1022,15 +986,11 @@ fn confirm(ctx: &mut CommandContext, prompt: &str) -> bool {
     }
 }
 
-/// Masked credential input straight from the tty (never echoed, never in
-/// rustyline history). Empty input gets one re-prompt (rpassword runs in
-/// cooked mode where Ctrl-C doesn't interrupt, so Enter-on-empty is the
-/// documented escape); `None` aborts the wizard.
-///
-/// Clears [`SIGINT_RECEIVED`](crate::ui::state::SIGINT_RECEIVED) before
-/// returning: a Ctrl-C pressed during the masked read only sets the flag,
-/// and left set it would count as a phantom first quit-press on the next
-/// streaming turn.
+/// Masked tty input — never echoed, never in rustyline history. Empty
+/// input gets one re-prompt (Ctrl-C can't interrupt rpassword's cooked-mode
+/// read; Enter-on-empty is the escape); `None` aborts. Clears
+/// [`SIGINT_RECEIVED`](crate::ui::state::SIGINT_RECEIVED) so a Ctrl-C
+/// during the read doesn't become a phantom quit-press later.
 fn ask_secret(prompt: &str) -> Option<String> {
     let mut result = None;
     for attempt in 0..2 {

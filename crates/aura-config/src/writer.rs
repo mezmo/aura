@@ -1,10 +1,8 @@
 //! Format-preserving writes to an agent config file.
 //!
-//! The MCP install helper (and any other tooling that mutates a user's
-//! `config.toml`) must not destroy unrelated settings, comments, or
-//! `{{ env.VAR }}` placeholders. This module edits the raw TOML text via
-//! `toml_edit` instead of round-tripping through [`crate::Config`], so
-//! everything outside the touched `[mcp]` tables survives byte-for-byte.
+//! Edits raw TOML text via `toml_edit` (no round-trip through
+//! [`crate::Config`]), so unrelated settings, comments, and
+//! `{{ env.VAR }}` placeholders survive untouched.
 
 use std::fs;
 use std::path::Path;
@@ -16,11 +14,8 @@ use crate::error::ConfigError;
 const MAP_FIELDS: [&str; 4] = ["env", "headers", "headers_from_request", "scratchpad"];
 
 /// Insert or replace `[mcp.servers.<name>]` in the config file at `path`,
-/// atomically (see [`rewrite_file`]).
-///
-/// A missing file is an error rather than an implicit create: a config
-/// that holds only an MCP table is not runnable, so the caller is
-/// expected to target an existing config.
+/// atomically (see [`rewrite_file`]). A missing file is an error, not an
+/// implicit create — the caller targets an existing config.
 pub fn upsert_mcp_server(
     path: &Path,
     name: &str,
@@ -47,13 +42,10 @@ pub fn append_worker_mcp_filter(
 /// String-level core of [`append_worker_mcp_filter`]: returns the updated
 /// TOML text.
 ///
-/// The worker table must already exist — this never creates workers.
-/// Entries already present are skipped; a missing `mcp_filter` array is
-/// created. Callers should mind the filter's semantics when creating it:
-/// an *absent* `mcp_filter` grants a worker every MCP tool while a
-/// written one limits the worker to its entries, so creating the array
-/// narrows the worker — and calling with empty `entries` writes the
-/// explicit no-tools assignment (`mcp_filter = []`).
+/// Never creates workers; dedupes entries; creates a missing `mcp_filter`
+/// array. Note the semantics: writing the array narrows an absent-filter
+/// (all-tools) worker, and empty `entries` writes the explicit no-tools
+/// `mcp_filter = []`.
 pub fn append_worker_mcp_filter_in_str(
     content: &str,
     worker: &str,
@@ -96,11 +88,10 @@ pub fn append_worker_mcp_filter_in_str(
     Ok(doc.to_string())
 }
 
-/// Apply a text transformation to the file at `path` and write the result
-/// atomically (temp file + rename in the same directory), carrying the
-/// original file's permissions over — agent configs hold credentials, so a
-/// `chmod 600` must survive the rewrite. On any error the original file is
-/// left untouched and the temp file removed.
+/// Apply a text transformation to `path` and write the result atomically
+/// (temp + rename), preserving the file's permissions (configs holding
+/// credentials may be chmod 600). On error the original is untouched and
+/// the temp file removed.
 fn rewrite_file(
     path: &Path,
     transform: impl FnOnce(&str) -> Result<String, ConfigError>,
@@ -120,14 +111,10 @@ fn rewrite_file(
 
 /// String-level core of [`upsert_mcp_server`]: returns the updated TOML text.
 ///
-/// `[mcp]` and `[mcp.servers]` are created as implicit tables when absent,
-/// so a fresh insert emits only the `[mcp.servers.<name>]` header; when one
-/// of them exists as an *inline* table (`mcp = { ... }`), it is restyled to
-/// a header table so the new server can nest under it. Replacing an existing
-/// server keeps the comments directly above its header (they live in the
-/// table's decor) but drops comments inside the replaced table. Errors
-/// (rather than clobbering) when `content` is not valid TOML or when an
-/// existing `mcp`/`servers` key holds something other than a table.
+/// `[mcp]`/`[mcp.servers]` are created implicitly when absent (and restyled
+/// from inline tables); replacing a server keeps the comments above its
+/// header but drops those inside it. Errors (rather than clobbering) on
+/// invalid TOML or a non-table `mcp`/`servers` key.
 pub fn upsert_mcp_server_in_str(
     content: &str,
     name: &str,
@@ -150,12 +137,9 @@ pub fn upsert_mcp_server_in_str(
 }
 
 /// Serialize a server config into an explicit-header `toml_edit` table.
-///
-/// Serde emits the `transport` tag first and struct fields in declaration
-/// order, which is already deterministic. Two cleanups on top of that keep
-/// the written config tidy and stable: empty optional collections (`args`
-/// plus the [`MAP_FIELDS`]) are omitted entirely, and map-valued fields are
-/// key-sorted so `HashMap` iteration order never leaks into the file.
+/// Empty optional collections (`args` plus the [`MAP_FIELDS`]) are omitted
+/// and map-valued fields key-sorted, so `HashMap` iteration order never
+/// leaks into the file.
 fn server_to_table(server: &McpServerConfig) -> Result<toml_edit::Table, ConfigError> {
     let mut doc = toml_edit::ser::to_document(server)?;
     let mut table = std::mem::take(doc.as_table_mut());
@@ -186,13 +170,10 @@ fn item_is_empty_collection(item: Option<&toml_edit::Item>) -> bool {
     }
 }
 
-/// Get `parent[key]` as a mutable table, creating it as an *implicit* table
-/// when absent (implicit tables render no header of their own, so creating
-/// `[mcp]`/`[mcp.servers]` here adds no visible lines to the file). An
-/// existing inline table is converted to a header table in place — inline
-/// tables can't be extended with `[header]`-style children, and the loader
-/// accepts both spellings, so the data is equivalent. Errors when an
-/// existing `key` holds a non-table value (including `[[array]]` tables).
+/// Get `parent[key]` as a mutable table, creating it implicitly (no header
+/// line of its own) when absent, and converting an existing inline table in
+/// place — inline tables can't take `[header]`-style children. Errors when
+/// `key` holds anything else (including `[[array]]` tables).
 fn ensure_table<'a>(
     parent: &'a mut toml_edit::Table,
     key: &str,
