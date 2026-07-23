@@ -1,5 +1,20 @@
 ## Changelog
 
+## [0.0.8](https://github.com/mezmo/aura/compare/v0.0.7...v0.0.8) (2026-07-23)
+
+
+### Bug Fixes
+
+* **hitl**: park approval record before publishing lifecycle events [4489835](https://github.com/mezmo/aura/commit/4489835d199105806e8749b0b5644bdcf3786dc5) - Justin Gross* **session-store**: harden a2a bus bridge and redis task store [40a683b](https://github.com/mezmo/aura/commit/40a683be880b4e0009df4df272982d7987de6bcb) - Justin Gross
+
+### Code Refactoring
+
+* **session-store**: use module_name.rs file layout [86ece6c](https://github.com/mezmo/aura/commit/86ece6caacbdf85d2a410ece5dbe6ad4b55dfa9a) - Justin Gross
+
+### Features
+
+* **session-store**: add redis-backed a2a task store [ca8c719](https://github.com/mezmo/aura/commit/ca8c71977e80cb3aa0c01bac8148cee42620ad24) - Justin Gross [#328](https://github.com/mezmo/aura/issues/328)* **session-store**: add redis-backed hitl approvals and event bus [8ff84c4](https://github.com/mezmo/aura/commit/8ff84c44201c3ec5d664032fa488c4011d01a482) - Justin Gross [#329](https://github.com/mezmo/aura/issues/329)* **session-store**: bridge a2a streaming and cancel over the bus [de0ba65](https://github.com/mezmo/aura/commit/de0ba65959e374c21d46ec7cf505255b3d0d95d1) - Justin Gross [#330](https://github.com/mezmo/aura/issues/330)
+
 ## [0.0.7](https://github.com/mezmo/aura/compare/v0.0.6...v0.0.7) (2026-07-23)
 
 
