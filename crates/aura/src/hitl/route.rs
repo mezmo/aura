@@ -101,18 +101,18 @@ impl DecisionRoute {
 
         match self {
             Self::Conversational { registry, timeout } => {
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Requested((&request).into()),
-                )
-                .await;
-
+                let requested_event = ApprovalLifecycleEvent::Requested((&request).into());
                 let expires_at = chrono::Utc::now()
                     + chrono::Duration::from_std(*timeout)
                         .expect("approval timeout fits in chrono");
                 let pending_event = events::pending(&request, &expires_at);
+
+                // Register before publishing anything: both events carry the
+                // decision id off-process (SSE), and an approver reacting to
+                // either must find the parked record already resolvable.
                 let handle = registry.register(request, *timeout).await;
 
+                approval_event_broker::publish(&request_id, requested_event).await;
                 approval_event_broker::publish(
                     &request_id,
                     ApprovalLifecycleEvent::Pending(pending_event),
@@ -517,6 +517,62 @@ mod tests {
             result,
             ApprovalOutcome::Cancelled(super::super::decision::CancelReason::ClientDisconnected)
         );
+    }
+
+    #[tokio::test]
+    async fn conversational_resolve_at_requested_event_succeeds() {
+        use super::super::decision::ApprovalDecision;
+        use super::super::registry::PendingApprovals;
+
+        let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
+        let mut rx = crate::approval_event_broker::subscribe(&request_id).await;
+
+        let registry = PendingApprovals::new();
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: std::time::Duration::from_secs(60),
+        };
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: request_id.clone(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "dangerous_*".into(),
+            },
+            items: vec![],
+        };
+        let decision_id = request.decision_id;
+
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let decide_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { route.decide(request, &cancel).await }
+        });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("requested event should arrive")
+            .expect("requested event channel open");
+        assert!(matches!(
+            first,
+            crate::approval_event_broker::ApprovalLifecycleEvent::Requested(_)
+        ));
+
+        // An approver reacting to `Requested` immediately must find the
+        // record already parked — resolving here may not race registration.
+        registry
+            .resolve(&decision_id, ApprovalDecision::Approved)
+            .await
+            .expect("record must be resolvable once Requested is observable");
+
+        let outcome = decide_handle.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+
+        crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
     #[tokio::test]
