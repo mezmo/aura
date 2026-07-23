@@ -150,10 +150,87 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         println!("Saved secrets to {}.", env_path.display());
     }
 
+    println!("\nVerifying connection to `{}`...", collected.name);
+    match verify_server(
+        ctx.rt,
+        &collected.name,
+        inline_secrets(&collected.server, &collected.secrets),
+    ) {
+        Ok((aura::mcp::ConnectionStatus::Connected, tools_count)) => println!(
+            "{} Connected — {tools_count} tool(s) discovered.",
+            "✓".themed(AuraStyle::Success)
+        ),
+        Ok((aura::mcp::ConnectionStatus::Failed(reason), _)) => println!(
+            "{} Connection failed: {reason}\n\
+             The config entry was kept. Fix the credentials in .env (or the \
+             server settings) and run /mcp add again to overwrite it.",
+            "✗".themed(AuraStyle::Error)
+        ),
+        Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) | Err(_) => println!(
+            "{} Could not verify the connection; check the server after restarting.",
+            "!".themed(AuraStyle::Warning)
+        ),
+    }
+
     WizardEnd::Written {
         name: collected.name,
         starter_prompt: collected.starter_prompt,
     }
+}
+
+/// Replace each `{{ env.VAR }}` placeholder with its collected secret value.
+///
+/// The connectivity check needs real credentials, but the freshly written
+/// `.env` is only read at process startup (dotenvy), so the placeholders
+/// can't resolve through the normal loader this session. The inlined copy
+/// exists only in memory for the duration of the check.
+fn inline_secrets(server: &McpServerConfig, secrets: &[(String, String)]) -> McpServerConfig {
+    let mut server = server.clone();
+    let inline = |values: &mut HashMap<String, String>| {
+        for value in values.values_mut() {
+            for (var, secret) in secrets {
+                *value = value.replace(&format!("{{{{ env.{var} }}}}"), secret);
+            }
+        }
+    };
+    match &mut server {
+        McpServerConfig::HttpStreamable { headers, .. } | McpServerConfig::Sse { headers, .. } => {
+            inline(headers);
+        }
+        McpServerConfig::Stdio { env, .. } => inline(env),
+    }
+    server
+}
+
+/// Throwaway connection + tool-discovery check against just the new server.
+///
+/// Builds a single-server `McpManager` (entirely separate from the running
+/// agent — the new server only joins the real roster on restart), reads the
+/// resulting status and tool count, and closes every client — including any
+/// spawned stdio child process — before returning.
+fn verify_server(
+    rt: &tokio::runtime::Runtime,
+    name: &str,
+    server: McpServerConfig,
+) -> Result<(aura::mcp::ConnectionStatus, usize), String> {
+    let mcp_config = aura_config::config::McpConfig {
+        servers: HashMap::from([(name.to_string(), server)]),
+        sanitize_schemas: true,
+    };
+    rt.block_on(async {
+        let manager = aura::mcp::McpManager::initialize_from_config(&mcp_config)
+            .await
+            .map_err(|e| e.to_string())?;
+        let result = manager
+            .server_info
+            .get(name)
+            .map(|info| (info.status.clone(), info.tools_count))
+            .ok_or_else(|| format!("`{name}` missing from the connection status snapshot"));
+        manager
+            .cancel_and_close_all("mcp-add-verify", "verification complete")
+            .await;
+        result
+    })
 }
 
 /// Everything the interactive steps produce for the write phase.
@@ -555,6 +632,37 @@ mod tests {
             let mode = fs::metadata(&env_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn inlines_secrets_for_verification_without_touching_original() {
+        let server = http_streamable(
+            "https://mcp.mezmo.com/mcp".to_string(),
+            HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer {{ env.MEZMO_API_KEY }}".to_string(),
+            )]),
+            "",
+        );
+        let inlined = inline_secrets(
+            &server,
+            &[("MEZMO_API_KEY".to_string(), "sk-live-123".to_string())],
+        );
+        let McpServerConfig::HttpStreamable { headers, .. } = &inlined else {
+            panic!("transport changed");
+        };
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer sk-live-123")
+        );
+        // The original (destined for the config file) keeps the placeholder.
+        let McpServerConfig::HttpStreamable { headers, .. } = &server else {
+            panic!("transport changed");
+        };
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer {{ env.MEZMO_API_KEY }}")
+        );
     }
 
     #[test]
