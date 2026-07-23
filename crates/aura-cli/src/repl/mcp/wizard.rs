@@ -125,15 +125,6 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         return WizardEnd::Aborted;
     };
 
-    // Preview exactly what will be appended before touching the file.
-    match aura_config::writer::upsert_mcp_server_in_str("", &collected.name, &collected.server) {
-        Ok(preview) => println!("\nThis will be added to the config:\n\n{preview}"),
-        Err(e) => {
-            return WizardEnd::Failed(format!(
-                "could not render the server config: {e}\nNothing was written."
-            ));
-        }
-    }
     let new_secrets: Vec<(String, String)> = collected
         .secrets
         .iter()
@@ -142,13 +133,6 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             CredentialSource::Existing { .. } => None,
         })
         .collect();
-    if !new_secrets.is_empty() {
-        let vars: Vec<&str> = new_secrets.iter().map(|(var, _)| var.as_str()).collect();
-        println!(
-            "Secrets are stored in `.env` next to the config ({}), not in the TOML.",
-            vars.join(", ")
-        );
-    }
     let mut existing_vars: Vec<&str> = collected
         .secrets
         .iter()
@@ -158,13 +142,105 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         })
         .collect();
     existing_vars.dedup();
+    let mut unresolved: Vec<&str> = collected
+        .secrets
+        .iter()
+        .filter(|source| source.known_value().is_none())
+        .map(CredentialSource::env_var)
+        .collect();
+    unresolved.dedup();
+    let known_values: Vec<(String, String)> = collected
+        .secrets
+        .iter()
+        .filter_map(|source| {
+            source
+                .known_value()
+                .map(|value| (source.env_var().to_string(), value.to_string()))
+        })
+        .collect();
+
+    // Verify BEFORE asking to write, so consent to the config change is
+    // informed by a live connection result and the discovered tools — and
+    // a failing credential never lands on disk unless explicitly chosen.
+    // The check runs against an in-memory copy; nothing is written yet.
+    let mut verified = false;
+    let mut tool_names: Vec<String> = Vec::new();
+    if !unresolved.is_empty() {
+        println!(
+            "\nSkipping the connection check — {} not set in this session.",
+            unresolved.join(", ")
+        );
+    } else {
+        println!(
+            "\nVerifying connection to `{}` (up to {}s)...",
+            collected.name,
+            VERIFY_TIMEOUT.as_secs()
+        );
+        match verify_server(
+            ctx.rt,
+            &collected.name,
+            inline_secrets(&collected.server, &known_values),
+        ) {
+            Ok((aura::mcp::ConnectionStatus::Connected, names)) => {
+                println!(
+                    "{} Connected — {} tool(s) discovered.",
+                    "✓".themed(AuraStyle::Success),
+                    names.len()
+                );
+                if !names.is_empty() {
+                    println!("  {}", entries_summary(&names).themed(AuraStyle::Muted));
+                }
+                verified = true;
+                tool_names = names;
+            }
+            Ok((aura::mcp::ConnectionStatus::Failed(reason), _)) => println!(
+                "{} Connection failed: {reason}",
+                "✗".themed(AuraStyle::Error)
+            ),
+            Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) => println!(
+                "{} The connection was not attempted.",
+                "!".themed(AuraStyle::Warning)
+            ),
+            Err(reason) => println!(
+                "{} Could not verify the connection: {reason}",
+                "!".themed(AuraStyle::Warning)
+            ),
+        }
+    }
+
+    // Preview exactly what will be appended before touching the file.
+    match aura_config::writer::upsert_mcp_server_in_str("", &collected.name, &collected.server) {
+        Ok(preview) => println!("\nThis will be added to the config:\n\n{preview}"),
+        Err(e) => {
+            return WizardEnd::Failed(format!(
+                "could not render the server config: {e}\nNothing was written."
+            ));
+        }
+    }
+    if !new_secrets.is_empty() {
+        let vars: Vec<&str> = new_secrets.iter().map(|(var, _)| var.as_str()).collect();
+        println!(
+            "Secrets are stored in `.env` next to the config ({}), not in the TOML.",
+            vars.join(", ")
+        );
+    }
     if !existing_vars.is_empty() {
         println!(
             "References environment variable(s) you already manage ({}) — nothing is written for them.",
             existing_vars.join(", ")
         );
     }
-    if !confirm(ctx, &format!("Write to {}? [Y/n] ", config_path.display())) {
+    // A verified (or knowingly unverifiable) server defaults to yes; a
+    // server that just failed its check defaults to no.
+    let write_prompt = if verified || !unresolved.is_empty() {
+        format!("Write to {}? [Y/n] ", config_path.display())
+    } else {
+        format!(
+            "The connection could not be verified — write to {} anyway? [y/N] ",
+            config_path.display()
+        )
+    };
+    if !confirm(ctx, &write_prompt) {
         return WizardEnd::Aborted;
     }
 
@@ -187,81 +263,11 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         println!("Saved secrets to {}.", env_path.display());
     }
 
-    let mut unresolved: Vec<&str> = collected
-        .secrets
-        .iter()
-        .filter(|source| source.known_value().is_none())
-        .map(CredentialSource::env_var)
-        .collect();
-    unresolved.dedup();
-    if !unresolved.is_empty() {
-        println!(
-            "\nSkipping the connection check — {} not set in this session.",
-            unresolved.join(", ")
-        );
+    if verified {
+        offer_worker_access(ctx, config_path, &collected.name, &tool_names);
+    } else {
         print_allowlist_hint(config_path, &collected.name);
-        return WizardEnd::Written {
-            name: collected.name,
-            starter_prompt: collected.starter_prompt,
-            verified: false,
-        };
     }
-    let known_values: Vec<(String, String)> = collected
-        .secrets
-        .iter()
-        .filter_map(|source| {
-            source
-                .known_value()
-                .map(|value| (source.env_var().to_string(), value.to_string()))
-        })
-        .collect();
-
-    println!(
-        "\nVerifying connection to `{}` (up to {}s)...",
-        collected.name,
-        VERIFY_TIMEOUT.as_secs()
-    );
-    let verified = match verify_server(
-        ctx.rt,
-        &collected.name,
-        inline_secrets(&collected.server, &known_values),
-    ) {
-        Ok((aura::mcp::ConnectionStatus::Connected, tool_names)) => {
-            println!(
-                "{} Connected — {} tool(s) discovered.",
-                "✓".themed(AuraStyle::Success),
-                tool_names.len()
-            );
-            offer_worker_access(ctx, config_path, &collected.name, &tool_names);
-            true
-        }
-        Ok((aura::mcp::ConnectionStatus::Failed(reason), _)) => {
-            println!(
-                "{} Connection failed: {reason}\n\
-                 The config entry was kept. Fix the credentials in .env (or the \
-                 server settings) and run /mcp add again to overwrite it.",
-                "✗".themed(AuraStyle::Error)
-            );
-            print_allowlist_hint(config_path, &collected.name);
-            false
-        }
-        Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) => {
-            println!(
-                "{} The connection was not attempted.",
-                "!".themed(AuraStyle::Warning)
-            );
-            print_allowlist_hint(config_path, &collected.name);
-            false
-        }
-        Err(reason) => {
-            println!(
-                "{} Could not verify the connection: {reason}",
-                "!".themed(AuraStyle::Warning)
-            );
-            print_allowlist_hint(config_path, &collected.name);
-            false
-        }
-    };
 
     WizardEnd::Written {
         name: collected.name,
