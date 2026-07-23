@@ -110,8 +110,7 @@ pub fn estimate_scratchpad_overhead(
 }
 
 /// BPE-count the JSON-Schema bodies of every MCP tool the agent will see,
-/// optionally filtered by glob patterns (`None` = include all; an empty
-/// `Some` filter is the explicit no-tools assignment and includes none).
+/// optionally filtered by glob patterns (`None` = include all).
 ///
 /// Each tool is serialized as `{name, description, input_schema}` — the same
 /// shape the LLM sees in its tool list. Per-provider serialization differs

@@ -1964,9 +1964,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut worker_tools = std::collections::HashMap::new();
 
         for (worker_name, worker_config) in &self.config.workers {
-            // Match MCP tools via mcp_filter: an omitted filter grants every
-            // MCP tool (backwards compatibility); `mcp_filter = []` is the
-            // explicit no-tools assignment and matches nothing.
+            // Omitted filter = every MCP tool (backwards compatibility);
+            // `mcp_filter = []` = none.
             let mut matching_tools: Vec<String> = match &worker_config.mcp_filter {
                 None => all_tools.clone(),
                 Some(filter) => all_tools

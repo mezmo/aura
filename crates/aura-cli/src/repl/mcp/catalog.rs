@@ -1,10 +1,6 @@
-//! Curated MCP servers `/mcp add` can install without hand-authoring TOML.
-//!
-//! Each entry carries everything the guided flow needs: the config shape to
-//! write, the credentials to collect (as `{{ env.VAR }}` placeholders so
-//! secrets land in `.env`, never in the TOML), the prerequisites to show
-//! before asking for anything, and a starter prompt that exercises the
-//! integration once connected.
+//! Curated MCP servers `/mcp add` can install: the config shape to write,
+//! the credentials to collect (as `{{ env.VAR }}` placeholders), the
+//! prerequisites to show first, and a starter prompt.
 
 /// A blessed MCP server the wizard can install.
 pub(crate) struct CatalogEntry {

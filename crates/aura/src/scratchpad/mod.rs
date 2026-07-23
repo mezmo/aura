@@ -121,13 +121,10 @@ pub fn scratchpad_tool_map(
     resolved
 }
 
-/// True when at least one tool reachable through `mcp_filter` is keyed in
-/// the resolved scratchpad map — i.e. there's something for the wrapper to
-/// intercept. `None` means "all tools are reachable"; an empty `Some`
-/// filter is the explicit no-tools assignment, so nothing is reachable.
-///
-/// Now an exact lookup since `scratchpad_tool_map` is keyed by tool name
-/// (not pattern) — no glob iteration on the hot path.
+/// True when at least one tool reachable through `mcp_filter` (`None` =
+/// all reachable, empty `Some` = none) is keyed in the resolved scratchpad
+/// map — i.e. there's something for the wrapper to intercept. An exact
+/// lookup: `scratchpad_tool_map` is keyed by tool name, not pattern.
 pub fn has_accessible_scratchpad_tool(
     tool_names: &[String],
     mcp_filter: Option<&[String]>,

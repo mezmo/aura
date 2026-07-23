@@ -119,11 +119,9 @@ impl DirectBackend {
         })
     }
 
-    /// Path the agent configs were loaded from, as given at startup.
-    ///
-    /// `load_config` accepts both a single TOML file and a directory of
-    /// them, so callers that want to *write* config (e.g. `/mcp add`) must
-    /// check `is_file()` before treating this as an editable target.
+    /// Path the agent configs were loaded from, as given at startup. May
+    /// be a directory (`load_config` accepts both) — writers must check
+    /// `is_file()` first.
     pub fn config_path(&self) -> &Path {
         &self.config_path
     }
