@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use aura_config::config::McpServerConfig;
 
@@ -16,17 +17,22 @@ use crate::backend::Backend;
 use crate::repl::registry::CommandContext;
 use crate::theme::{AuraStyle, Themed};
 
-/// The wizard's terminal states, folded into a user-facing message by [`run`].
+/// How the wizard ended.
 enum WizardEnd {
     Written {
         name: String,
         starter_prompt: Option<&'static str>,
+        verified: bool,
     },
     Aborted,
     Failed(String),
 }
 
 pub(super) fn run(ctx: &mut CommandContext) {
+    // The REPL loop hides the cursor before dispatching a command and only
+    // re-shows it on the next prompt; this handler reads input, so bring
+    // the cursor back for its prompts.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
     let Backend::Direct(direct) = ctx.backend else {
         println!(
             "/mcp add edits the local agent config, so it is only available in \
@@ -49,26 +55,32 @@ pub(super) fn run(ctx: &mut CommandContext) {
         WizardEnd::Written {
             name,
             starter_prompt,
+            verified,
         } => {
-            println!(
-                "\n{} `{name}` added to {}.",
-                "✓".themed(AuraStyle::Success),
-                config_path.display()
-            );
-            println!("Restart aura to activate the new server.");
-            if let Some(prompt) = starter_prompt {
+            if verified {
                 println!(
-                    "\nTry this once it's live:\n  {}",
-                    prompt.themed(AuraStyle::Emphasis)
+                    "\n{} `{name}` added to {} and verified.",
+                    "✓".themed(AuraStyle::Success),
+                    config_path.display()
                 );
+                println!("Restart aura to activate the new server.");
+                if let Some(prompt) = starter_prompt {
+                    println!(
+                        "\nTry this once it's live:\n  {}",
+                        prompt.themed(AuraStyle::Emphasis)
+                    );
+                }
+            } else {
+                println!(
+                    "\n`{name}` added to {} (connection not verified).",
+                    config_path.display()
+                );
+                println!("Restart aura to activate the new server once it's reachable.");
             }
         }
         WizardEnd::Aborted => println!("\n/mcp add aborted — nothing was written."),
         WizardEnd::Failed(reason) => {
-            println!(
-                "\n{} {reason}\nNothing was partially applied to the config.",
-                "error:".themed(AuraStyle::Error)
-            );
+            println!("\n{} {reason}", "error:".themed(AuraStyle::Error));
         }
     }
 }
@@ -116,7 +128,11 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
     // Preview exactly what will be appended before touching the file.
     match aura_config::writer::upsert_mcp_server_in_str("", &collected.name, &collected.server) {
         Ok(preview) => println!("\nThis will be added to the config:\n\n{preview}"),
-        Err(e) => return WizardEnd::Failed(format!("could not render the server config: {e}")),
+        Err(e) => {
+            return WizardEnd::Failed(format!(
+                "could not render the server config: {e}\nNothing was written."
+            ));
+        }
     }
     if !collected.secrets.is_empty() {
         let vars: Vec<&str> = collected
@@ -136,7 +152,9 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
     if let Err(e) =
         aura_config::writer::upsert_mcp_server(config_path, &collected.name, &collected.server)
     {
-        return WizardEnd::Failed(format!("failed to update the config: {e}"));
+        return WizardEnd::Failed(format!(
+            "failed to update the config: {e}\nThe config file was left unchanged."
+        ));
     }
     if !collected.secrets.is_empty() {
         let env_path = config_path.parent().unwrap_or(Path::new(".")).join(".env");
@@ -150,31 +168,46 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         println!("Saved secrets to {}.", env_path.display());
     }
 
-    println!("\nVerifying connection to `{}`...", collected.name);
-    match verify_server(
+    println!(
+        "\nVerifying connection to `{}` (up to {}s)...",
+        collected.name,
+        VERIFY_TIMEOUT.as_secs()
+    );
+    let verified = match verify_server(
         ctx.rt,
         &collected.name,
         inline_secrets(&collected.server, &collected.secrets),
     ) {
-        Ok((aura::mcp::ConnectionStatus::Connected, tools_count)) => println!(
-            "{} Connected — {tools_count} tool(s) discovered.",
-            "✓".themed(AuraStyle::Success)
-        ),
-        Ok((aura::mcp::ConnectionStatus::Failed(reason), _)) => println!(
-            "{} Connection failed: {reason}\n\
-             The config entry was kept. Fix the credentials in .env (or the \
-             server settings) and run /mcp add again to overwrite it.",
-            "✗".themed(AuraStyle::Error)
-        ),
-        Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) | Err(_) => println!(
-            "{} Could not verify the connection; check the server after restarting.",
-            "!".themed(AuraStyle::Warning)
-        ),
-    }
+        Ok((aura::mcp::ConnectionStatus::Connected, tools_count)) => {
+            println!(
+                "{} Connected — {tools_count} tool(s) discovered.",
+                "✓".themed(AuraStyle::Success)
+            );
+            true
+        }
+        Ok((aura::mcp::ConnectionStatus::Failed(reason), _)) => {
+            println!(
+                "{} Connection failed: {reason}\n\
+                 The config entry was kept. Fix the credentials in .env (or the \
+                 server settings) and run /mcp add again to overwrite it.",
+                "✗".themed(AuraStyle::Error)
+            );
+            false
+        }
+        Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) => false,
+        Err(reason) => {
+            println!(
+                "{} Could not verify the connection: {reason}",
+                "!".themed(AuraStyle::Warning)
+            );
+            false
+        }
+    };
 
     WizardEnd::Written {
         name: collected.name,
         starter_prompt: collected.starter_prompt,
+        verified,
     }
 }
 
@@ -208,6 +241,12 @@ fn inline_secrets(server: &McpServerConfig, secrets: &[(String, String)]) -> Mcp
 /// agent — the new server only joins the real roster on restart), reads the
 /// resulting status and tool count, and closes every client — including any
 /// spawned stdio child process — before returning.
+/// Bounds the whole connect + tool-discovery attempt: the underlying HTTP
+/// client has no timeout of its own, so a blackholed endpoint (or npx
+/// downloading a stdio server on first run) would otherwise hang the REPL
+/// with no Ctrl-C escape.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn verify_server(
     rt: &tokio::runtime::Runtime,
     name: &str,
@@ -218,9 +257,21 @@ fn verify_server(
         sanitize_schemas: true,
     };
     rt.block_on(async {
-        let manager = aura::mcp::McpManager::initialize_from_config(&mcp_config)
-            .await
-            .map_err(|e| e.to_string())?;
+        let manager = match tokio::time::timeout(
+            VERIFY_TIMEOUT,
+            aura::mcp::McpManager::initialize_from_config(&mcp_config),
+        )
+        .await
+        {
+            Err(_) => {
+                return Err(format!(
+                    "timed out after {}s; check the server after restarting",
+                    VERIFY_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(Err(e)) => return Err(e.to_string()),
+            Ok(Ok(manager)) => manager,
+        };
         let result = manager
             .server_info
             .get(name)
@@ -237,7 +288,7 @@ fn verify_server(
 struct CollectedServer {
     name: String,
     server: McpServerConfig,
-    /// `(env var, secret value)` pairs destined for `.env`.
+    /// `(env var, secret value)` pairs.
     secrets: Vec<(String, String)>,
     starter_prompt: Option<&'static str>,
 }
@@ -425,7 +476,10 @@ fn config_has_server(config_path: &Path, name: &str) -> bool {
 
 /// Merge `(env var, value)` pairs into the `.env` file, creating it (with
 /// the do-not-commit header and `0o600` on unix) when absent. Values of
-/// existing keys are replaced; unrelated lines are preserved.
+/// existing keys are replaced; unrelated lines are preserved. Values are
+/// quoted as needed so dotenvy can parse them back — an unquoted space or
+/// `#` doesn't just corrupt that entry, it aborts dotenvy's parse and
+/// silently drops every line after it.
 fn write_env_secrets(env_path: &Path, secrets: &[(String, String)]) -> std::io::Result<()> {
     let mut content = match fs::read_to_string(env_path) {
         Ok(content) => content,
@@ -434,19 +488,49 @@ fn write_env_secrets(env_path: &Path, secrets: &[(String, String)]) -> std::io::
     };
     let creating = content.is_empty();
     for (var, value) in secrets {
+        let value = quote_env_value(value);
         if content.is_empty() {
-            content = crate::init::render_env(var, value);
+            content = crate::init::render_env(var, &value);
         } else {
-            content = crate::init::merge_env(&content, var, value);
+            content = crate::init::merge_env(&content, var, &value);
         }
     }
-    fs::write(env_path, content)?;
+    // On unix, apply 0600 at creation rather than after the write so the
+    // secrets are never on disk in a umask-default readable file.
     #[cfg(unix)]
-    if creating {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(env_path, fs::Permissions::from_mode(0o600))?;
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        if creating {
+            options.mode(0o600);
+        }
+        options.open(env_path)?.write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = creating;
+        fs::write(env_path, content)?;
     }
     Ok(())
+}
+
+/// Quote a dotenv value when it contains characters dotenvy would misparse
+/// unquoted (whitespace, `#`, quotes, backslash). Plain token-like values
+/// stay unquoted; single quotes are preferred because dotenvy treats their
+/// contents as fully literal.
+fn quote_env_value(value: &str) -> String {
+    let plain = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if plain {
+        value.to_string()
+    } else if !value.contains('\'') {
+        format!("'{value}'")
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 /// `GRAFANA` + `Authorization` → `GRAFANA_AUTHORIZATION`: uppercase, with
@@ -513,11 +597,33 @@ fn confirm(ctx: &mut CommandContext, prompt: &str) -> bool {
 }
 
 /// Masked credential input straight from the tty (never echoed, never in
-/// rustyline history). `None` on error or empty input — treat as abort.
+/// rustyline history). Empty input gets one re-prompt (rpassword runs in
+/// cooked mode where Ctrl-C doesn't interrupt, so Enter-on-empty is the
+/// documented escape); `None` aborts the wizard.
+///
+/// Clears [`SIGINT_RECEIVED`](crate::ui::state::SIGINT_RECEIVED) before
+/// returning: a Ctrl-C pressed during the masked read only sets the flag,
+/// and left set it would count as a phantom first quit-press on the next
+/// streaming turn.
 fn ask_secret(prompt: &str) -> Option<String> {
-    let value = rpassword::prompt_password(prompt).ok()?;
-    let value = value.trim().to_string();
-    if value.is_empty() { None } else { Some(value) }
+    let mut result = None;
+    for attempt in 0..2 {
+        match rpassword::prompt_password(prompt).ok() {
+            None => break,
+            Some(value) => {
+                let value = value.trim().to_string();
+                if !value.is_empty() {
+                    result = Some(value);
+                    break;
+                }
+                if attempt == 0 {
+                    println!("Empty input — enter the value, or press Enter again to abort.");
+                }
+            }
+        }
+    }
+    crate::ui::state::SIGINT_RECEIVED.store(false, std::sync::atomic::Ordering::Relaxed);
+    result
 }
 
 #[cfg(test)]
@@ -632,6 +738,43 @@ mod tests {
             let mode = fs::metadata(&env_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn env_values_with_spaces_survive_dotenv_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        write_env_secrets(
+            &env_path,
+            &[
+                ("AUTH_HEADER".to_string(), "Bearer abc def#ghi".to_string()),
+                ("PLAIN_KEY".to_string(), "sk-plain-123".to_string()),
+            ],
+        )
+        .unwrap();
+        // An unquoted space would abort dotenvy's parse here and drop every
+        // later line, so parse the whole file back and check both keys.
+        let parsed: HashMap<String, String> = dotenvy::from_path_iter(&env_path)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            parsed.get("AUTH_HEADER").map(String::as_str),
+            Some("Bearer abc def#ghi")
+        );
+        assert_eq!(
+            parsed.get("PLAIN_KEY").map(String::as_str),
+            Some("sk-plain-123")
+        );
+    }
+
+    #[test]
+    fn quotes_env_values_only_when_needed() {
+        assert_eq!(quote_env_value("sk-plain_123"), "sk-plain_123");
+        assert_eq!(quote_env_value("Bearer abc"), "'Bearer abc'");
+        assert_eq!(quote_env_value("with#hash"), "'with#hash'");
+        assert_eq!(quote_env_value("it's"), "\"it's\"");
+        assert_eq!(quote_env_value("a\"b"), "'a\"b'");
     }
 
     #[test]

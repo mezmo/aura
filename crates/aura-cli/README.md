@@ -274,6 +274,7 @@ Once inside the REPL, the slash commands below are available. All slash commands
 | `/rename <name>`   | Rename the current conversation                                     |
 | `/model <filter>`  | Browse and select a model (see [Model Selection](#model-selection)) |
 | `/style [name]`    | Switch visual style: `normal`, `high-contrast`, `no-colors`         |
+| `/mcp [add]`       | List the agent's MCP servers, or install one via a guided flow      |
 | `/quit` or `/exit` | Exit the REPL                                                       |
 
 ---

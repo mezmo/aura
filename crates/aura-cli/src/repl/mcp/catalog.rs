@@ -38,10 +38,9 @@ pub(crate) struct HeaderTemplate {
     /// Literal header value written to the config, e.g.
     /// `"Bearer {{ env.MEZMO_API_KEY }}"`.
     pub value_template: &'static str,
-    /// The env var the placeholder references; its value is collected
-    /// with masked input and written to `.env`.
+    /// The env var the placeholder references.
     pub env_var: &'static str,
-    /// Masked-input prompt shown when collecting the secret.
+    /// Masked-input prompt for this credential.
     pub secret_prompt: &'static str,
 }
 
@@ -106,10 +105,11 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         key: "kubernetes",
         description: "Kubernetes cluster inspection via kubernetes-mcp-server",
         prerequisites: "Requires Node.js (npx) and a working kubeconfig context.\n\
-                        AURA will access your cluster with your kubeconfig's permissions.",
+                        AURA gets read-only access to your cluster through your kubeconfig \
+                        (the server runs with --read-only; edit the config to allow writes).",
         template: Template::Stdio {
             cmd: &["npx"],
-            args: &["-y", "kubernetes-mcp-server@latest"],
+            args: &["-y", "kubernetes-mcp-server@latest", "--read-only"],
         },
         starter_prompt: "What pods are running in my cluster, and are any of them unhealthy?",
     },
