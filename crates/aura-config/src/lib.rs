@@ -8,6 +8,7 @@ pub mod orchestration;
 pub mod scratchpad;
 pub mod session_store;
 pub mod skills;
+pub mod writer;
 
 #[cfg(test)]
 mod config_test;
@@ -25,6 +26,7 @@ pub use orchestration::{
 pub use scratchpad::{ScratchpadConfig, ScratchpadToolEntry};
 pub use session_store::{RedisSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 pub use skills::SkillName;
+pub use writer::upsert_mcp_server;
 
 use std::collections::HashSet;
 use std::fs;
