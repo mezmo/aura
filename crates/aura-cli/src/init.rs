@@ -39,6 +39,7 @@ mod provider;
 mod ranking;
 mod render;
 mod spec;
+
 #[cfg(test)]
 mod test_support;
 
@@ -50,7 +51,8 @@ use std::io::IsTerminal;
 use model_list::HttpModelLister;
 use prompt::Prompter;
 use provider::Provider;
-use render::{merge_env, next_steps, render_config, render_env};
+pub(crate) use render::{merge_env, render_env};
+use render::{next_steps, render_config};
 use spec::{ApiKeySource, resolve_spec};
 
 #[derive(Debug, clap::Args)]
