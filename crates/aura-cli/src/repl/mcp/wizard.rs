@@ -197,6 +197,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
             "\nSkipping the connection check — {} not set in this session.",
             unresolved.join(", ")
         );
+        print_allowlist_hint(config_path, &collected.name);
         return WizardEnd::Written {
             name: collected.name,
             starter_prompt: collected.starter_prompt,
@@ -223,11 +224,13 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         &collected.name,
         inline_secrets(&collected.server, &known_values),
     ) {
-        Ok((aura::mcp::ConnectionStatus::Connected, tools_count)) => {
+        Ok((aura::mcp::ConnectionStatus::Connected, tool_names)) => {
             println!(
-                "{} Connected — {tools_count} tool(s) discovered.",
-                "✓".themed(AuraStyle::Success)
+                "{} Connected — {} tool(s) discovered.",
+                "✓".themed(AuraStyle::Success),
+                tool_names.len()
             );
+            offer_worker_access(ctx, config_path, &collected.name, &tool_names);
             true
         }
         Ok((aura::mcp::ConnectionStatus::Failed(reason), _)) => {
@@ -237,6 +240,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
                  server settings) and run /mcp add again to overwrite it.",
                 "✗".themed(AuraStyle::Error)
             );
+            print_allowlist_hint(config_path, &collected.name);
             false
         }
         Ok((aura::mcp::ConnectionStatus::NotAttempted, _)) => false,
@@ -245,6 +249,7 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
                 "{} Could not verify the connection: {reason}",
                 "!".themed(AuraStyle::Warning)
             );
+            print_allowlist_hint(config_path, &collected.name);
             false
         }
     };
@@ -296,7 +301,7 @@ fn verify_server(
     rt: &tokio::runtime::Runtime,
     name: &str,
     server: McpServerConfig,
-) -> Result<(aura::mcp::ConnectionStatus, usize), String> {
+) -> Result<(aura::mcp::ConnectionStatus, Vec<String>), String> {
     let mcp_config = aura_config::config::McpConfig {
         servers: HashMap::from([(name.to_string(), server)]),
         sanitize_schemas: true,
@@ -320,13 +325,164 @@ fn verify_server(
         let result = manager
             .server_info
             .get(name)
-            .map(|info| (info.status.clone(), info.tools_count))
+            .map(|info| {
+                let tools: Vec<String> = manager
+                    .streamable_tools
+                    .get(name)
+                    .into_iter()
+                    .chain(manager.sse_tools.get(name))
+                    .chain(manager.stdio_tools.get(name))
+                    .flatten()
+                    .map(|tool| tool.name.to_string())
+                    .collect();
+                (info.status.clone(), tools)
+            })
             .ok_or_else(|| format!("`{name}` missing from the connection status snapshot"));
         manager
             .cancel_and_close_all("mcp-add-verify", "verification complete")
             .await;
         result
     })
+}
+
+/// Offer to expose a freshly verified server's tools to orchestration
+/// workers.
+///
+/// Worker `mcp_filter` globs match *tool names*, and an empty filter grants
+/// every MCP tool — so workers without a filter already see the new server
+/// (that's stated, not asked), and only allowlisted workers are offered an
+/// update. Grants go through the format-preserving
+/// `append_worker_mcp_filter` writer.
+fn offer_worker_access(
+    ctx: &mut CommandContext,
+    config_path: &Path,
+    server: &str,
+    tool_names: &[String],
+) {
+    let workers = orchestrated_workers(config_path);
+    if workers.is_empty() || tool_names.is_empty() {
+        return;
+    }
+    let (open, allowlisted): (Vec<_>, Vec<_>) = workers
+        .into_iter()
+        .partition(|(_, filter)| filter.is_empty());
+    if !open.is_empty() {
+        let names: Vec<&str> = open.iter().map(|(name, _)| name.as_str()).collect();
+        println!(
+            "\nWorkers without an mcp_filter receive every MCP tool, including \
+             `{server}`: {}.",
+            names.join(", ")
+        );
+    }
+    if allowlisted.is_empty() {
+        return;
+    }
+    let entries = filter_entries(tool_names);
+    println!(
+        "\nWorkers with tool allowlists don't see `{server}` yet. \
+         Grant access per worker (adds {} to their mcp_filter):",
+        entries.join(", ")
+    );
+    for (worker, _) in allowlisted {
+        if !confirm(ctx, &format!("  Grant `{worker}` access? [y/N] ")) {
+            continue;
+        }
+        match aura_config::writer::append_worker_mcp_filter(config_path, &worker, &entries) {
+            Ok(()) => println!("  {} updated `{worker}`", "✓".themed(AuraStyle::Success)),
+            Err(e) => println!(
+                "  {} failed to update `{worker}`: {e}",
+                "error:".themed(AuraStyle::Error)
+            ),
+        }
+    }
+}
+
+/// When the new server couldn't be verified (so its tool names are
+/// unknown), allowlisted workers still won't see it — say so instead of
+/// leaving them silently blind to the new server.
+fn print_allowlist_hint(config_path: &Path, server: &str) {
+    let allowlisted: Vec<String> = orchestrated_workers(config_path)
+        .into_iter()
+        .filter(|(_, filter)| !filter.is_empty())
+        .map(|(name, _)| name)
+        .collect();
+    if !allowlisted.is_empty() {
+        println!(
+            "Workers with mcp_filter allowlists ({}) won't see `{server}`'s tools \
+             until matching patterns are added to their filters.",
+            allowlisted.join(", ")
+        );
+    }
+}
+
+/// Read `(worker name, mcp_filter)` pairs from the config file when
+/// orchestration is enabled; empty when it isn't (or on any parse problem —
+/// this is an optional convenience step, not a gate).
+fn orchestrated_workers(config_path: &Path) -> Vec<(String, Vec<String>)> {
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(orchestration) = doc.get("orchestration") else {
+        return Vec::new();
+    };
+    if !orchestration
+        .get("enabled")
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let Some(workers) = orchestration
+        .get("worker")
+        .and_then(toml_edit::Item::as_table_like)
+    else {
+        return Vec::new();
+    };
+    let mut result: Vec<(String, Vec<String>)> = workers
+        .iter()
+        .map(|(name, worker)| {
+            let filter = worker
+                .get("mcp_filter")
+                .and_then(toml_edit::Item::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name.to_string(), filter)
+        })
+        .collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    result
+}
+
+/// Filter entries granting exactly the given tools: a `{prefix}*` glob when
+/// every tool shares a meaningful prefix (≥4 chars), else the exact names.
+fn filter_entries(tool_names: &[String]) -> Vec<String> {
+    if tool_names.len() > 1 {
+        let first = &tool_names[0];
+        let mut len = first.len();
+        for name in &tool_names[1..] {
+            let common = first
+                .bytes()
+                .zip(name.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            len = len.min(common);
+        }
+        while len > 0 && !first.is_char_boundary(len) {
+            len -= 1;
+        }
+        if len >= 4 {
+            return vec![format!("{}*", &first[..len])];
+        }
+    }
+    tool_names.to_vec()
 }
 
 /// Everything the interactive steps produce for the write phase.
@@ -980,6 +1136,45 @@ mod tests {
             headers.get("Authorization").map(String::as_str),
             Some("Bearer {{ env.MEZMO_API_KEY }}")
         );
+    }
+
+    #[test]
+    fn filter_entries_prefer_common_prefix_glob() {
+        let tools = vec![
+            "mezmo_logs".to_string(),
+            "mezmo_pipelines".to_string(),
+            "mezmo_export".to_string(),
+        ];
+        assert_eq!(filter_entries(&tools), ["mezmo_*"]);
+
+        let mixed = vec!["ListKnowledgeBases".to_string(), "QueryBases".to_string()];
+        assert_eq!(filter_entries(&mixed), mixed);
+
+        let single = vec!["only_tool".to_string()];
+        assert_eq!(filter_entries(&single), single);
+    }
+
+    #[test]
+    fn reads_orchestrated_workers_only_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let base = "[agent]\nname = \"a\"\n\n[orchestration]\nenabled = %E%\n\n\
+                    [orchestration.worker.ops]\ndescription = \"d\"\npreamble = \"p\"\n\
+                    mcp_filter = [\"logs_*\"]\n\n\
+                    [orchestration.worker.writer]\ndescription = \"d\"\npreamble = \"p\"\n";
+
+        fs::write(&path, base.replace("%E%", "true")).unwrap();
+        let workers = orchestrated_workers(&path);
+        assert_eq!(
+            workers,
+            [
+                ("ops".to_string(), vec!["logs_*".to_string()]),
+                ("writer".to_string(), vec![]),
+            ]
+        );
+
+        fs::write(&path, base.replace("%E%", "false")).unwrap();
+        assert!(orchestrated_workers(&path).is_empty());
     }
 
     #[test]
