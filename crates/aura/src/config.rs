@@ -248,8 +248,10 @@ impl AgentRuntimeConfig {
     ///
     /// Returns true if:
     /// - No filter is set (None) - all tools pass
-    /// - Filter is empty - all tools pass
     /// - Tool name matches at least one pattern
+    ///
+    /// An empty filter (`mcp_filter = []`) matches nothing — it is the
+    /// explicit "no MCP tools" assignment, distinct from omitting the field.
     ///
     /// Checks the extension field (`self.mcp_filter`, set by orchestrator) first,
     /// then falls back to the TOML-parseable field (`self.agent.mcp_filter`).
@@ -261,7 +263,6 @@ impl AgentRuntimeConfig {
         let effective = self.mcp_filter.as_ref().or(self.agent.mcp_filter.as_ref());
         match effective {
             None => true,
-            Some(patterns) if patterns.is_empty() => true,
             Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
         }
     }
@@ -306,12 +307,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_matches_filter_empty() {
+    fn test_tool_matches_filter_empty_denies_all() {
         let config = AgentRuntimeConfig {
             mcp_filter: Some(vec![]),
             ..Default::default()
         };
-        assert!(config.tool_matches_filter("any_tool"));
+        assert!(!config.tool_matches_filter("any_tool"));
     }
 
     #[test]

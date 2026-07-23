@@ -110,7 +110,8 @@ pub fn estimate_scratchpad_overhead(
 }
 
 /// BPE-count the JSON-Schema bodies of every MCP tool the agent will see,
-/// optionally filtered by glob patterns (empty filter = include all).
+/// optionally filtered by glob patterns (`None` = include all; an empty
+/// `Some` filter is the explicit no-tools assignment and includes none).
 ///
 /// Each tool is serialized as `{name, description, input_schema}` — the same
 /// shape the LLM sees in its tool list. Per-provider serialization differs
@@ -121,12 +122,13 @@ pub fn estimate_scratchpad_overhead(
 pub fn count_mcp_tool_schema_tokens<'a>(
     counter: &dyn TokenCounter,
     tools: impl IntoIterator<Item = &'a rmcp::model::Tool>,
-    mcp_filter: &[String],
+    mcp_filter: Option<&[String]>,
 ) -> usize {
     tools
         .into_iter()
-        .filter(|t| {
-            mcp_filter.is_empty() || mcp_filter.iter().any(|p| glob_match(p, t.name.as_ref()))
+        .filter(|t| match mcp_filter {
+            None => true,
+            Some(filter) => filter.iter().any(|p| glob_match(p, t.name.as_ref())),
         })
         .map(|t| {
             let json = serde_json::json!({
@@ -227,7 +229,7 @@ mod tests {
                 "required": ["pattern"]
             }),
         );
-        let actual = count_mcp_tool_schema_tokens(&*c, std::iter::once(&tool), &[]);
+        let actual = count_mcp_tool_schema_tokens(&*c, std::iter::once(&tool), None);
         let expected_json = serde_json::json!({
             "name": tool.name,
             "description": tool.description,
@@ -253,9 +255,9 @@ mod tests {
             serde_json::json!({"type": "object"}),
         );
         let filter: Vec<String> = vec!["alpha_*".into()];
-        let all = count_mcp_tool_schema_tokens(&*c, [&alpha, &beta], &[]);
-        let filtered = count_mcp_tool_schema_tokens(&*c, [&alpha, &beta], &filter);
-        let alpha_only = count_mcp_tool_schema_tokens(&*c, std::iter::once(&alpha), &[]);
+        let all = count_mcp_tool_schema_tokens(&*c, [&alpha, &beta], None);
+        let filtered = count_mcp_tool_schema_tokens(&*c, [&alpha, &beta], Some(&filter));
+        let alpha_only = count_mcp_tool_schema_tokens(&*c, std::iter::once(&alpha), None);
         assert_eq!(filtered, alpha_only);
         assert!(all > filtered, "unfiltered must exceed filtered");
     }
