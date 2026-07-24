@@ -174,8 +174,8 @@ The full list of suite feature flags, plus the `make test-integration-*` workflo
 
 ## Configuration
 
-The server uses the AURA TOML configuration system. See the [main README](../../README.md#configuration) for:
-- LLM provider configuration (OpenAI, Anthropic)
+The server uses the AURA TOML configuration system. See the [configuration reference](../../docs/configuration-reference.md) for:
+- LLM provider configuration (OpenAI, Anthropic, Bedrock, Gemini, Ollama, OpenRouter)
 - MCP server setup (HTTP, SSE, STDIO)
 - Vector store and RAG integration
 - Agent settings and prompts
@@ -199,6 +199,7 @@ Example configurations are in the [`examples/`](../../examples/) directory.
 | `CONFIG_PATH` | `config.toml` | Path to a config file or directory of configs |
 | `HOST` | `127.0.0.1` | Server bind address |
 | `PORT` | `8080` | Server port |
+| `AURA_SERVER_URL` | host/port | Canonical public origin published in the A2A agent card. Set when running behind a proxy, load balancer, or in Kubernetes — see [docs/a2a-implementation.md](../../docs/a2a-implementation.md#agent-card-url-aura_server_url) |
 | `DEFAULT_AGENT` | *(none)* | Agent name or alias used when `model` is omitted. Not needed when only one config is loaded. |
 | `AURA_CUSTOM_EVENTS` | `false` | Emit `aura.*` SSE events alongside OpenAI-compatible chunks |
 | `AURA_EMIT_REASONING` | `false` | Emit `aura.reasoning` events (requires `AURA_CUSTOM_EVENTS=true`) |
@@ -208,6 +209,7 @@ Example configurations are in the [`examples/`](../../examples/) directory.
 | `FIRST_CHUNK_TIMEOUT_SECS` | `90` | Max wait for the first LLM chunk before treating the connection as hung (0 = disabled) |
 | `SHUTDOWN_TIMEOUT_SECS` | `30` | Grace period for in-flight streams after SIGTERM/SIGINT |
 | `STREAMING_BUFFER_SIZE` | `400` | SSE chunk buffer size; higher values reduce latency but increase memory use |
+| `AURA_DEBUG_PROVIDER_ERRORS` | `false` | **Dev only.** Surface raw upstream provider errors to clients (capped). Keep off when public-facing — error bodies can echo request content. Raw error is always in logs/OTel. |
 
 ## See Also
 

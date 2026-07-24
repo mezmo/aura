@@ -311,26 +311,9 @@ In **HTTP mode**, the model list is fetched from the server's `/v1/models` endpo
 
 ## Client-Side Tools
 
-> ---
-> # **USE AT YOUR OWN RISK**
-> ---
->
-> **Enabling client-side tools gives an LLM the ability to execute commands on your machine.** That includes running shell commands, reading and modifying files, and searching your filesystem — with the same privileges as the user running `aura`. Treat `--enable-client-tools` as functionally equivalent to handing the model a shell prompt.
->
-> **The risks are real:**
-> - **Prompt injection.** Anything the model reads — a file, a tool output, an MCP response, a webpage retrieved by another tool — can contain instructions that hijack the model into running destructive commands (`rm -rf`, exfiltrating secrets, modifying source code, etc.).
-> - **Hallucination.** The model can confidently call the wrong tool with the wrong arguments. There is no undo for a `Shell("rm ...")` call.
-> - **No sandbox.** Tools run directly on the host. There is no container, no chroot, no syscall filter. If you can run it from your shell, the model can run it through the CLI.
-> - **The permission system reduces blast radius but is not a security boundary.** Globs are easy to over-grant (`Shell(*)` allows anything). Treat allow-rules conservatively and prefer prompt-on-execute for anything sensitive.
->
-> **Only enable when:**
-> - You trust the model and provider.
-> - You trust every input the model can read (configs, MCP servers, vector stores, URLs).
-> - You are running in a workspace where worst-case loss (deleted files, leaked credentials, modified source) is acceptable or recoverable from version control / backups.
->
-> Disabled by default. Opting in is your decision and your responsibility.
+> **USE AT YOUR OWN RISK.** Enabling client-side tools gives an LLM the ability to execute commands on your machine — shell commands, file reads/writes, filesystem search — with the same privileges as the user running `aura`. Treat `--enable-client-tools` as functionally equivalent to handing the model a shell prompt. See [docs/client-side-tools.md](../../docs/client-side-tools.md) for the full risk model, protocol mechanics, and server/client configuration.
 
-By default, AURA CLI is a **pure chat client** — no local tools are advertised to the model and the REPL never executes anything on the host. Pass `--enable-client-tools` (or set `AURA_ENABLE_CLIENT_TOOLS=true`) to opt in to local tool execution, at which point the model can call tools like `Shell`, `Read`, and `Update` and the REPL runs them locally with permission checks.
+By default, AURA CLI is a **pure chat client** — no local tools are advertised to the model and the REPL never executes anything on the host. Pass `--enable-client-tools` (or set `AURA_ENABLE_CLIENT_TOOLS=true`) to opt in, at which point the model can call tools like `Shell`, `Read`, and `Update` and the REPL runs them locally with permission checks ([Permissions](#permissions)).
 
 ```bash
 # Disabled (default) — chat only
@@ -344,28 +327,9 @@ AURA_ENABLE_CLIENT_TOOLS=true aura
 aura --enable-client-tools=false
 ```
 
-### How it works
+**Single-agent configurations only.** Client-side tools are not supported when the selected config has `[orchestration].enabled = true` — tools advertised to an orchestrated config are dropped with a warning.
 
-When enabled, the CLI sends a `tools` field on every request describing the local tools (Shell, Read, Update, ListFiles, FindFiles, SearchFiles, FileInfo). The server registers them as **passthrough** tools — the LLM sees them as callable, but instead of executing server-side, the stream terminates with `finish_reason: "tool_calls"`. The CLI then executes the tool locally (after permission checks), appends the result to the conversation as a `role: "tool"` message, and submits a follow-up request. This keeps the permission system, Update grouping, and other interactive UX firmly in the REPL.
-
-### Backend symmetry
-
-> **Single-agent configurations only.** Client-side tools are not supported when the selected config has `[orchestration].enabled = true`. Tools advertised to an orchestrated config are dropped with a warning. Use a single-agent config (no `[orchestration]`, or `enabled = false`) to enable local tools.
-
-Both halves of the system gate this independently — **and both must opt in for local tools to fire**, in HTTP mode and standalone mode alike. Standalone is not a special case: it uses the same handler path as `aura-web-server`, so the agent's `[agent].enable_client_tools = true` is required there too. The CLI side has a single switch (`--enable-client-tools`) that turns advertisement on or off. The server side is **per-agent** in TOML — `[agent].enable_client_tools = true` opts the single-agent config in, with an optional `client_tool_filter = ["..."]` glob list. There is no server-wide `--enable-client-tools` flag.
-
-| Mode                                 | TOML side (`[agent].enable_client_tools`) | CLI side (`--enable-client-tools`) | Effective                                                                                        |
-| ------------------------------------ | ----------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------ |
-| Standalone, single-agent, both on    | `true`                                    | required                           | Local tools fully enabled                                                                        |
-| Standalone, single-agent, TOML off   | absent / `false`                          | (any)                              | Tools advertised but the in-process server **silently drops** them; CLI prints a startup warning |
-| HTTP, single-agent, both on          | `true`                                    | required                           | Local tools fully enabled                                                                        |
-| HTTP, single-agent, agent off        | absent / `false`                          | (any)                              | Tools advertised but server **silently drops** them — no local tools                             |
-| Standalone or HTTP, **orchestrated** | any orchestrated config                   | (any)                              | Tools advertised but server **drops with warning** — orchestration unsupported                   |
-| Both off                             | absent / `false`                          | CLI without flag                   | Pure chat                                                                                        |
-
-Precedence for resolving the CLI flag: `--enable-client-tools` argument or `AURA_ENABLE_CLIENT_TOOLS` env var > `<project>/.aura/cli.toml` > `~/.aura/cli.toml` (`enable_client_tools = true|false`) > default (`false`). The CLI arg and env var sit at the same tier — either one will override values set in `cli.toml`.
-
-If local tools never fire when you expect them to, check that **both** sides are opted in: the agent's TOML has `enable_client_tools = true` (and the config is single-agent), and `--enable-client-tools` is set on the CLI. In standalone mode the CLI prints a startup warning when the flag is set but no loaded config opts in.
+**Both the CLI and the server agent must opt in** for local tools to fire — see [docs/client-side-tools.md#backend-symmetry](../../docs/client-side-tools.md#backend-symmetry) for the full mode/effective-behavior table. Precedence for resolving the CLI flag: `--enable-client-tools` argument or `AURA_ENABLE_CLIENT_TOOLS` env var > `<project>/.aura/cli.toml` > `~/.aura/cli.toml` (`enable_client_tools = true|false`) > default (`false`). If local tools never fire when you expect them to, check that the agent's TOML has `enable_client_tools = true` (and the config is single-agent) as well as the CLI flag — in standalone mode the CLI prints a startup warning when the flag is set but no loaded config opts in.
 
 ---
 

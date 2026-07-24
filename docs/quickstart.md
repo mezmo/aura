@@ -224,7 +224,7 @@ turn_depth = 5
 
 > **Note:** a worker whose `mcp_filter` is omitted or empty (`[]`) is granted **every** MCP tool, not none. Set an explicit `mcp_filter` on each worker once an MCP server is configured, and use a non-matching pattern (e.g. `["__none__"]`) for any worker you want to keep tool-free.
 
-Each worker inherits the agent's LLM by default. To run a worker on a different model, add a complete `[orchestration.worker.<name>.llm]` block — see the [orchestration config reference](../README.md#orchestration) for all fields.
+Each worker inherits the agent's LLM by default. To run a worker on a different model, add a complete `[orchestration.worker.<name>.llm]` block — see the [orchestration config reference](configuration-reference.md#orchestration) for all fields.
 
 Restart with `docker compose restart aura` and try asking a multi-step question. Watch the coordinator plan and dispatch in the CLI's event panel, or in Phoenix at <http://localhost:6006>.
 

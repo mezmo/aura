@@ -1,8 +1,23 @@
 # Tracing Span Layout
 
+## Enabling tracing
+
+OpenTelemetry support is enabled by default via the `otel` feature in both
+`aura` and `aura-web-server`. Configure your OTLP endpoint using standard
+environment variables (for example `OTEL_EXPORTER_OTLP_ENDPOINT`) to export
+traces — no endpoint set means no OTel layer is installed.
+
+AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinference/tree/main/spec)
+semantic convention (`llm.*`, `tool.*`, `input.*`, `output.*`) rather than the
+`gen_ai.*` conventions. Any `gen_ai.*` attributes from underlying provider
+libraries (Rig.rs) are automatically translated to OpenInference equivalents
+at export time. This makes AURA traces natively compatible with
+[Phoenix](https://github.com/Arize-ai/phoenix) and other OpenInference-aware
+observability tools.
+
 AURA exports OpenTelemetry spans via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT`
-is set. Spans follow the [OpenInference](https://github.com/Arize-ai/openinference)
-taxonomy so they render correctly in Phoenix, Jaeger, and similar tools.
+is set. Spans follow the OpenInference taxonomy so they render correctly in
+Phoenix, Jaeger, and similar tools.
 
 ## Trace structure
 
