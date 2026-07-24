@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh 
 | `AURA_COMPONENT` | `all` | Which binary: `all`, `server`, or `cli` |
 | `AURA_REQUIRE_CHECKSUM` | `0` | `1` to fail when a release checksum is missing, `0` to warn and continue |
 
-Running a binary needs a config — see the [quickstart guide](docs/quickstart.md) and [Configuration](#configuration). To try AURA with no setup, use the Quick Start below.
+Running a binary needs a config — see the [quickstart guide](https://docs.mezmo.com/aura/quickstart) and the [configuration reference](https://docs.mezmo.com/aura/configuration-reference). To try AURA with no setup, use the Quick Start below.
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ Aura boots in **orchestrator mode**: a coordinator routes each request — answe
 
 Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://localhost:6006> to inspect traces in Phoenix.
 
-**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
+**[Full quickstart guide](https://docs.mezmo.com/aura/quickstart)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
 
 ### More Quickstarts
 
@@ -610,18 +610,16 @@ AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinfer
 
 ## Documentation
 
-- [docs/quickstart.md](docs/quickstart.md): getting started guide — setup, customization, architecture, and troubleshooting.
-- [CHANGELOG.md](CHANGELOG.md): release and version history.
-- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
-- [docs/hitl.md](docs/hitl.md): human approval gates for orchestration worker tool calls, including webhook and conversational routes.
-- [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
-- [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
+Full user-facing documentation — quickstarts, configuration reference, feature guides, CLI reference, and web server reference — lives at **[docs.mezmo.com/aura](https://docs.mezmo.com/aura)**.
+
+This repo's own docs are developer/contributor-facing only (see [Development and Contributing](#development-and-contributing) above for build/test/contribution docs):
+
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
-- [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
-- [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
-- [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
-- [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
-- [docs/telemetry.md](docs/telemetry.md): anonymous, opt-out CLI telemetry — the three-state consent model, exactly what is and isn't collected, kill switches, and how to audit it.
+- [docs/adr/](docs/adr/): architecture decision records.
+- [docs/design/](docs/design/): design and implementation notes.
+- [CHANGELOG.md](CHANGELOG.md): release and version history.
+- [crates/aura-cli/README.md](crates/aura-cli/README.md): building and testing the `aura` CLI.
+- [crates/aura-web-server/README.md](crates/aura-web-server/README.md): running the web server's integration test suite.
 
 ## License
 

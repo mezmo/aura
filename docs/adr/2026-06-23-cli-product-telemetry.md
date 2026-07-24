@@ -142,7 +142,7 @@ a reviewed `ModelId` newtype), so it cannot land as a free-form string.
 
 ## Links <!-- optional -->
 
-- [docs/telemetry.md](../telemetry.md): the user-facing privacy contract
+- [docs.mezmo.com/aura/telemetry](https://docs.mezmo.com/aura/telemetry): the user-facing privacy contract
   (states, events, kill switches, audit guide).
 - Allow-list and gate: `crates/aura-telemetry/src/properties.rs` and the
   `compile_fail` tests in `crates/aura-telemetry/tests/`.

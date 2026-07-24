@@ -9,7 +9,7 @@
 # Usage:
 #   CONFIG_PATH=examples/minimal/ollama.toml cargo run --bin aura-web-server
 #
-# See docs/ollama-guide.md for model recommendations and caveats.
+# See https://docs.mezmo.com/aura/ollama-guide for model recommendations and caveats.
 
 [agent]
 name = "Local Assistant"
