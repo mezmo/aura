@@ -86,31 +86,15 @@ aura/
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 
 ### Scratchpad (Context Window Management)
-- Intercepts large MCP tool outputs and saves them to disk instead of filling the context window
-- Eight read-only exploration tools: `head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`
-- Per-tool token thresholds configured via `[mcp.servers.<name>.scratchpad]` TOML sections (`min_tokens`, default `5_120`). Keys are **glob patterns** matched against tool names at interception time; when multiple patterns match the same tool, the longest (most specific) wins, ties broken by smallest threshold
-- Token counting is provider-aware (real tokenization, not heuristics): **OpenAI** via tiktoken-rs (`o200k_base` for GPT-5/4o/o-series, `cl100k_base` for older models); **Gemini** via the `gemini-tokenizer` crate's embedded Gemma 3 SentencePiece model (exact, fully local); **Anthropic/Bedrock-Claude** via a calibrated `cl100k_base × 1.1` approximation (Claude ships no public tokenizer); `o200k_base` fallback for everything else. Dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); Bedrock routes to the Claude counter only for Claude model ids
-- **Works in both single-agent and orchestration mode**:
-  - Single-agent: configure `[agent.scratchpad]` with top-level `memory_dir = "..."` — storage lands under `{memory_dir}/scratchpad/`, budget built from `[agent.llm].context_window`
-  - Orchestration: `[agent.scratchpad]` provides defaults, `[orchestration.worker.<name>.scratchpad]` overrides per worker; top-level `memory_dir` also roots orchestration persistence (legacy `[orchestration.artifacts].memory_dir` still works as a fallback)
-- **Per-worker budgets**: each worker gets a fresh `ContextBudget` scoped to its effective LLM (worker's `llm` override if set, otherwise `[agent.llm]`)
-- Workers never share an "orchestrator-level" budget; budgets are created at `create_worker()` time and live on `Agent.scratchpad_budget`
-- LLM-reported usage feedback (`input_tokens` + `output_tokens`) feeds into the budget as ground truth each turn — orchestration via `StreamItem::TurnUsage`, single-agent via the streaming hook's `on_stream_completion_response_finish`
-- Per-call extraction limit (`max_extraction_tokens`, default 10k) prevents single reads from flooding context
-- The scratchpad read tools resolve files anywhere under a per-agent **read root**, not just the scratchpad subdir. Single-agent: read root = the scratchpad dir. Orchestration workers: read root = the session dir, so result artifacts (`{memory_dir}/{session}/{run}/artifacts/`) are explorable **in place** without copying. Writes stay confined to the scratchpad dir (`ScratchpadStorage::with_read_root`)
-- Orchestration `read_artifact` is budget-aware (shares `check_and_record_budget` with the read tools): a result artifact that fits is inlined and recorded against the budget; one that exceeds the limit is returned as a scratchpad pointer (built via the same `build_file_pointer` helper as intercepted MCP output) referencing the artifact in place. The coordinator has no scratchpad, so its `read_artifact` always returns inline content
-- Auto-increased `turn_depth` when scratchpad is active (`turn_depth_bonus`, default 6) — applied in both single-agent and worker contexts
-- `aura.scratchpad_usage` SSE event emitted per-agent with `agent_id`, `tokens_intercepted`, `tokens_extracted` — fires in both single-agent and orchestration contexts (lives in base `aura.*` namespace, not `aura.orchestrator.*`)
-- Storage (orchestration): `{memory_dir}/{run_id}/iteration-{n}/scratchpad/`
-- Storage (single-agent): `{memory_dir}/scratchpad/`
-- `memory_dir` is a top-level TOML field shared by single-agent scratchpad and orchestration persistence
+- Intercepts large MCP tool outputs and saves them to disk instead of filling the context window; works in both single-agent and orchestration mode. Full usage/config docs: docs.mezmo.com/aura/scratchpad
+- Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `Agent.scratchpad_budget`, created at `create_worker()` time; read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
 
 ### Orchestration (Multi-Agent)
 - Coordinator/worker architecture with DAG-based parallel task execution
 - Per-worker LLM overrides: workers inherit `[agent.llm]` by default; `[orchestration.worker.<name>.llm]` overrides it (different model, same provider config). Resolved inline at worker construction (`worker.llm.as_ref().unwrap_or(&agent.llm)`)
 - Dependency-aware multi-wave execution with iterative re-planning (`max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
-- `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
+- `aura.orchestrator.*` SSE events for real-time visibility (see docs.mezmo.com/aura/streaming-api-guide)
 
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
@@ -121,8 +105,7 @@ aura/
 - `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for AURA vs OpenAI-compatible service
 - `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
 - Local tool execution: Shell, Read, ListFiles, Update, SearchFiles, FindFiles, FileInfo
-- CLI advertises local tools to the server with `--enable-client-tools`; the server attaches them only when `[agent].enable_client_tools = true` (filtered by `client_tool_filter` globs). **Single-agent configs only** — orchestrated configs drop the tools with a warning. No server-wide `--enable-client-tools` flag.
-- **USE AT YOUR OWN RISK.** Enabling client-side tools is functionally equivalent to handing the LLM a shell prompt on the client machine — prompt injection, hallucination, and lack of sandboxing are real failure modes. See the prominent warnings in `README.md` and `crates/aura-cli/README.md` before enabling for any user-facing config.
+- **USE AT YOUR OWN RISK.** CLI advertises local tools to the server with `--enable-client-tools`; the server attaches them only when `[agent].enable_client_tools = true` (filtered by `client_tool_filter` globs). Both sides must opt in; single-agent configs only. Functionally equivalent to handing the LLM a shell prompt on the client machine. Full risk model and protocol details: docs.mezmo.com/aura/client-side-tools
 - Permission system (`.aura/permissions.json`, formerly `settings.json`) with allow/deny glob rules. Discovered by walking up from `$PWD` to find the closest `.aura/`. **Project-scoped only** — no global `~/.aura/permissions.json`. Legacy `settings.json` is still read with a deprecation warning; new rules saved at the prompt land in `permissions.json` and migrate any existing legacy rules forward.
 - CLI preferences live in `~/.aura/cli.toml` (global) and `<project>/.aura/cli.toml` (per-project override, walk-up discovered, merged on top of global per-field). Renamed from `~/.aura/config.toml` to avoid collision with AURA **agent** TOML configs; the old name is still read with a deprecation warning.
 - `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
@@ -243,18 +226,13 @@ make lint                   # Run clippy + fmt check
 
 ## Documentation
 
-Which docs go where: put new documentation in the file that owns the topic.
+All user-facing documentation (quickstarts, configuration reference, feature guides, CLI reference, web server reference) lives externally at **docs.mezmo.com/aura** (repo: `mezmo/documentation`, content under `aura/`) — not in this repo. This repo's own docs are developer/contributor-facing only:
 
-- `README.md` - User-facing only: what AURA is, quick start, usage (web server, A2A, client-side tools), and configuration reference. No table of contents (GitHub generates one). No build-from-source, testing, architecture, or contributor content; link to `DEVELOPMENT.md` / `CONTRIBUTING.md` instead.
+- `README.md` - User-facing only: what AURA is, quick start, and pointers to `DEVELOPMENT.md`/`CONTRIBUTING.md`/the hosted docs. No table of contents (GitHub generates one). No usage/configuration content, build-from-source, testing, architecture, or contributor content — those live at docs.mezmo.com/aura, in `DEVELOPMENT.md`, or in `CONTRIBUTING.md`.
 - `DEVELOPMENT.md` - Developer-facing: prerequisites, building from source, project structure, Make targets, testing (unit + integration suites and feature flags), and the architecture overview.
 - `CONTRIBUTING.md` - Contribution process only: CLA, workflow, code quality standards, commit conventions, PR and review process. Build/test details belong in `DEVELOPMENT.md`; link, don't duplicate.
-- `docs/` - Deep-dive guides for a single subsystem or protocol (streaming, request lifecycle, HITL, A2A, Ollama, telemetry, tracing, breaking changes). ADRs in `docs/adr/`, design docs in `docs/design/`.
-- `crates/*/README.md` - Crate-specific usage and build instructions (e.g. `crates/aura-cli/README.md`)
+- `docs/` - Architecture/rationale only, not usage guides: `docs/rig-fork-changes.md` (Rig fork changes and rationale). ADRs in `docs/adr/`, design docs in `docs/design/`.
+- `crates/*/README.md` - Crate-specific build/test instructions only (e.g. `crates/aura-cli/README.md` covers building and testing the CLI; its usage docs are on the hosted site).
 - `CHANGELOG.md` - Auto-generated version history; never edit by hand
 
-Key deep-dive guides:
-
-- `docs/streaming-api-guide.md` - SSE streaming, custom events, and orchestration events
-- `docs/ollama-guide.md` - Ollama configuration, fallback tool parsing, and local model guidance
-- `docs/request-lifecycle.md` - Request flow, lifecycle, timeout, cancellation, and shutdown
-- `docs/rig-fork-changes.md` - Rig fork changes, tool execution order, and rationale
+When adding or changing a user-facing feature, update the corresponding page in the `mezmo/documentation` repo (`aura/` directory) — this repo's `docs/` folder is not the place for it.

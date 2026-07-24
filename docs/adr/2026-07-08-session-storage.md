@@ -183,7 +183,7 @@ the design note, not in this decision.
 - Unblocks the single-pod limitation in
   [2026-06-16-hitl-approval-architecture.md](2026-06-16-hitl-approval-architecture.md)
   (durable park-and-resume across processes)
-- Relates to [docs/hitl.md](../hitl.md) and
-  [docs/a2a-implementation.md](../a2a-implementation.md) (the two affected surfaces)
+- Relates to [docs.mezmo.com/aura/hitl](https://docs.mezmo.com/aura/hitl) and
+  [docs.mezmo.com/aura/a2a-implementation](https://docs.mezmo.com/aura/a2a-implementation) (the two affected surfaces)
 - RFC 2119: <https://www.rfc-editor.org/rfc/rfc2119>
 </content>

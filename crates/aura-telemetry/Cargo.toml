@@ -2,7 +2,7 @@
 name = "aura-telemetry"
 version.workspace = true
 edition = "2021"
-description = "Opt-out, anonymous-tier product telemetry for aura. See docs/telemetry.md."
+description = "Opt-out, anonymous-tier product telemetry for aura. See docs.mezmo.com/aura/telemetry."
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
