@@ -15,7 +15,9 @@ use super::history::ConversationHistory;
 use super::input_reader::AuraHelper;
 use crate::backend::Backend;
 use crate::ui::prompt::{is_expanded_output, with_event_log};
-use crate::ui::state::{MODEL_MATCHES, RESUME_MATCHES, STYLE_MATCHES, get_tab_select_index};
+use crate::ui::state::{
+    MODEL_MATCHES, RESUME_MATCHES, STYLE_MATCHES, get_tab_select_index, set_tab_select_index,
+};
 
 /// Mutable per-session state passed to each command handler.
 pub(crate) struct CommandContext<'a> {
@@ -198,6 +200,18 @@ pub(crate) fn lookup(name: &str) -> Option<&'static Command> {
     COMMANDS.iter().find(|c| c.name == name)
 }
 
+/// Return commands whose names start with a slash-command prefix.
+pub(crate) fn matching_commands(prefix: &str) -> Vec<&'static Command> {
+    if !prefix.starts_with('/') || prefix.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+
+    COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(prefix))
+        .collect()
+}
+
 /// Split a resolved command line into its command word (the leading
 /// whitespace-delimited token) and the trimmed argument remainder.
 pub(crate) fn split_command(resolved: &str) -> (&str, &str) {
@@ -210,7 +224,14 @@ pub(crate) fn split_command(resolved: &str) -> (&str, &str) {
 /// the line names no known command.
 pub(crate) fn dispatch(line: &str, ctx: &mut CommandContext) -> Option<CommandOutcome> {
     let (word, args) = split_command(line);
-    Some((lookup(word)?.handler)(ctx, args))
+    let command = lookup(word).or_else(|| {
+        let command = matching_commands(word)
+            .get(get_tab_select_index()?)
+            .copied();
+        set_tab_select_index(None);
+        command
+    })?;
+    Some((command.handler)(ctx, args))
 }
 
 fn cmd_exit(ctx: &mut CommandContext, _args: &str) -> CommandOutcome {
@@ -348,6 +369,18 @@ mod tests {
     fn lookup_is_exact() {
         assert!(lookup("/he").is_none());
         assert!(lookup("/nope").is_none());
+    }
+
+    #[test]
+    fn command_completion_matches_prefixes_and_rejects_arguments() {
+        let matches: Vec<&str> = matching_commands("/m")
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(matches, vec!["/model", "/mcp"]);
+        assert_eq!(matching_commands("/mc")[0].name, "/mcp");
+        assert!(matching_commands("m").is_empty());
+        assert!(matching_commands("/model gpt").is_empty());
     }
 
     #[test]

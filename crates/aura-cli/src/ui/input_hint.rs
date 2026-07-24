@@ -10,7 +10,7 @@ use std::time::Duration;
 use crossterm::style::Stylize;
 
 use crate::repl::conversations::ConversationStore;
-use crate::repl::registry::{COMMANDS, Command, lookup, split_command};
+use crate::repl::registry::{lookup, matching_commands, split_command};
 
 use super::input_frame::resize_status_area;
 use super::state::{
@@ -354,37 +354,26 @@ pub fn update_input_hint(line: &str) {
             let entries: Vec<String> = filtered.iter().map(|n| mark(n)).collect();
             build_columnar_hints(&entries, tab_idx)
         }
-    } else if let Some(prefix) = line.strip_prefix('/') {
+    } else if line.starts_with('/') {
         if let Ok(mut guard) = RESUME_MATCHES.lock() {
             guard.clear();
         }
-        let matching: Vec<&Command> = COMMANDS
-            .iter()
-            .filter(|c| {
-                c.name
-                    .strip_prefix('/')
-                    .unwrap_or(c.name)
-                    .starts_with(prefix)
-            })
-            .collect();
+        let matching = matching_commands(line);
+        let tab_idx = get_tab_select_index();
         if matching.is_empty() {
             vec![]
-        } else if matching.len() == 1 {
+        } else if matching.len() == 1 && tab_idx.is_none() {
             vec![format!(
                 "{}",
                 format!("{} — {}", matching[0].name, matching[0].description)
                     .themed(AuraStyle::Muted)
             )]
         } else {
-            vec![format!(
-                "{}",
-                matching
-                    .iter()
-                    .map(|c| c.name)
-                    .collect::<Vec<_>>()
-                    .join("  ")
-                    .themed(AuraStyle::Muted)
-            )]
+            let entries: Vec<String> = matching
+                .iter()
+                .map(|command| command.name.to_owned())
+                .collect();
+            build_columnar_hints(&entries, tab_idx)
         }
     } else {
         if let Ok(mut guard) = RESUME_MATCHES.lock() {
