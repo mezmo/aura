@@ -42,11 +42,10 @@ Defines the agent identity, system prompt, and behavioral settings.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | `"Assistant"` | Display name. Doubles as the model identifier clients send in requests. |
+| `name` | string | *required* | Display name. Doubles as the model identifier clients send in requests. |
 | `alias` | string | — | Stable identifier for model selection. Clients send this as the `model` field. Useful when the name contains spaces. |
-| `system_prompt` | string | `"You are a helpful assistant."` | The agent's system prompt. Multi-line strings use TOML `"""..."""` syntax. |
-| `context` | list of strings | `[]` | Additional context strings prepended to the system prompt. |
-| `turn_depth` | integer | `5` | Max tool-call rounds per user turn. Set to `0` to disable. Acts as a failsafe to prevent models from spinning out in unbounded tool-call loops. |
+| `system_prompt` | string | *required* | The agent's system prompt. Multi-line strings use TOML `"""..."""` syntax. |
+| `turn_depth` | integer | `5` | Max tool-call rounds per user turn. Acts as a failsafe to prevent models from spinning out in unbounded tool-call loops. |
 | `nudge_last_turn` | bool | `false` | Append a wrap-up warning to tool output on the final turn before `turn_depth` terminates the run (orchestration workers are told to call `submit_result`), rather than silently losing all gathered work. |
 | `nudge_turns_remaining` | integer | — | Start wrap-up warnings when N or fewer tool-calling turns remain. Independent of `nudge_last_turn`; both default to off and can be enabled separately. |
 | `mcp_filter` | list of strings | — | Glob patterns selecting which MCP tools to expose. When omitted, all tools are included. |
@@ -92,7 +91,8 @@ Each agent is identified by its `alias` (if set) or `name`. Clients discover ava
 Agent selection follows this order:
 1. If only one config is loaded, it is always used (the `model` field is ignored).
 2. Otherwise, `model` is matched first, then `DEFAULT_AGENT` if `model` is absent.
-3. Returns a 400 error if multiple configs are loaded and neither `model` nor `DEFAULT_AGENT` resolves to a match.
+3. Returns a 400 error if multiple configs are loaded and neither `model` nor `DEFAULT_AGENT` is supplied at all.
+4. Returns a 404 error if a `model` or `DEFAULT_AGENT` value is supplied but matches no loaded config.
 
 ```toml
 [agent]
@@ -275,7 +275,7 @@ sanitize_schemas = true
 
 Each server is a named entry under `[mcp.servers]`. The `transport` field selects the connection type.
 
-Tool names are not namespaced by server. If two servers register a tool with the same name, the first one loaded wins silently ([#186](https://github.com/mezmo/aura/issues/186)).
+Tool names are not namespaced by server. If two servers register a tool with the same name, registration overwrites the earlier entry — since registration order is not the same as config declaration order, which tool ends up callable is effectively arbitrary, not deterministically "first" or "last" in TOML order ([#186](https://github.com/mezmo/aura/issues/186)).
 
 #### `transport = "http_streamable"` (recommended)
 
@@ -361,7 +361,7 @@ Override when a tool's output gets intercepted by the scratchpad system. Keys ar
 
 Controls context window management. When enabled, large MCP tool outputs are saved to disk and replaced with a file pointer. The agent then uses eight exploration tools (`head`, `slice`, `grep`, `schema`, `item_schema`, `get_in`, `iterate_over`, `read`) to selectively read the data it needs.
 
-Requires `memory_dir` to be set at the root level and `context_window` to be set on `[agent.llm]`.
+Requires `memory_dir` to be set at the root level and `context_window` to be set on `[agent.llm]`. Orchestration also accepts the legacy `[orchestration.artifacts].memory_dir` as a fallback when the top-level field is absent.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -403,7 +403,7 @@ source = "skills/"        # relative to process CWD, or absolute
 source = "/opt/shared-skills"
 ```
 
-A `load_skill` tool is exposed to the agent that loads and executes skills on demand.
+A `load_skill` tool is exposed to the agent that loads and executes skills on demand, along with a `read_skill_file` tool for fetching individual resource files from a skill's directory.
 
 ---
 
@@ -487,12 +487,43 @@ Enables built-in server-side tools.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `filesystem` | bool | `false` | Expose basic filesystem read/write tools to the agent. |
+| `filesystem` | bool | `false` | Expose basic read-only filesystem tools (read file, list directory) to the agent. |
 | `custom_tools` | list of strings | `[]` | Reserved for future use. |
 
 ```toml
 [tools]
 filesystem = true
+```
+
+---
+
+## `[hitl]`
+
+Human-in-the-loop (HITL) approval gates let an agent ask for permission before running selected MCP tools. `[hitl]` is the enable bit — there is no separate `enabled` field; presence of the table turns it on, and `route` is required when it's present. See [`docs/hitl.md`](hitl.md) for the full route contracts, SSE lifecycle events, and current scope (single-agent vs. orchestration worker gating).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `require_approval` | list of glob patterns | `[]` | Tool-name globs that gate a matching call behind approval. |
+| `route` | table | *required* | The decision route — see `[hitl.route]` below. |
+
+### `[hitl.route]`
+
+Tagged by `mode`: `"conversational"` or `"webhook"`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | — | **Required.** `"conversational"` (attended, over an open SSE stream) or `"webhook"` (unattended, posts to a URL). |
+| `timeout_secs` | integer | `60` (conversational) / `300` (webhook) | Seconds to wait for a decision before failing closed. |
+| `url` | string | — | **Required for `webhook` mode only.** Must start with `http://` or `https://`. |
+
+```toml
+[hitl]
+require_approval = ["kubectl_*", "restart_*", "dangerous_*"]
+
+[hitl.route]
+mode = "webhook"
+url = "https://approvals.example.com/aura"
+timeout_secs = 300
 ```
 
 ---

@@ -85,10 +85,12 @@ Span kind is inferred from the span name by the custom exporter in
 
 | Kind | Spans |
 |------|-------|
-| **LLM** | `chat_streaming`, `agent.turn` |
+| **LLM** | `chat`, `chat_streaming`, `agent.turn` |
 | **TOOL** | `execute_tool`, `mcp.tool_call` |
-| **AGENT** | `agent.stream`, `orchestration.worker` |
+| **AGENT** | `agent.stream`, `agent.prompt`, `agent.chat`, `orchestration.worker` |
 | **CHAIN** | `chat_completions`, `streaming_completion`, `orchestration`, `orchestration.planning`, `orchestration.iteration` |
+
+`chat`, `agent.prompt`, and `agent.chat` are non-streaming entry points; the trace diagrams above cover the streaming path, which is the one AURA's HTTP/CLI backends use.
 
 ## Span parenting
 

@@ -74,7 +74,8 @@ Content-Type: application/json
 The `model` field selects which agent handles the request by matching against agent `alias` or `name`. Agent selection follows this order:
 1. If only one config is loaded, it is always used (the `model` field is ignored)
 2. Otherwise, `model` is matched first, then `DEFAULT_AGENT` if `model` is absent
-3. Returns a 400 error if multiple configs are loaded and neither `model` nor `DEFAULT_AGENT` resolves to a match
+3. Returns a 400 error if multiple configs are loaded and neither `model` nor `DEFAULT_AGENT` is supplied at all
+4. Returns a 404 error if a `model` or `DEFAULT_AGENT` value is supplied but matches no loaded config
 
 Request body:
 ```json
@@ -199,6 +200,7 @@ Example configurations are in the [`examples/`](../../examples/) directory.
 | `CONFIG_PATH` | `config.toml` | Path to a config file or directory of configs |
 | `HOST` | `127.0.0.1` | Server bind address |
 | `PORT` | `8080` | Server port |
+| `AURA_ENABLE_A2A` | `false` | Enable A2A protocol endpoints (`/a2a/v1/*`, `/.well-known/agent-card.json`). Disabled by default — see [docs/a2a-implementation.md](../../docs/a2a-implementation.md) |
 | `AURA_SERVER_URL` | host/port | Canonical public origin published in the A2A agent card. Set when running behind a proxy, load balancer, or in Kubernetes — see [docs/a2a-implementation.md](../../docs/a2a-implementation.md#agent-card-url-aura_server_url) |
 | `DEFAULT_AGENT` | *(none)* | Agent name or alias used when `model` is omitted. Not needed when only one config is loaded. |
 | `AURA_CUSTOM_EVENTS` | `false` | Emit `aura.*` SSE events alongside OpenAI-compatible chunks |
