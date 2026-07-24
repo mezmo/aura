@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::repl::registry::{lookup, matching_commands};
 use crate::ui::prompt::{
     at_stream_top, check_resize, clear_screen_preserve_frame, commit_cursor_row,
     enter_stream_focus, exit_stream_focus, handle_resize_frame, is_stream_panel_focused,
@@ -270,7 +271,7 @@ impl ConditionalEventHandler for PageUpHandler {
     }
 }
 
-/// Tab: cycle through model/conversation matches with visual highlighting.
+/// Tab: cycle through slash commands or command-specific matches.
 struct TabHandler;
 
 impl ConditionalEventHandler for TabHandler {
@@ -282,7 +283,10 @@ impl ConditionalEventHandler for TabHandler {
         ctx: &EventContext,
     ) -> Option<Cmd> {
         let line = ctx.line();
-        let match_count = if line == "/model" || line.starts_with("/model ") {
+        let command_match_count = matching_commands(line).len();
+        let match_count = if lookup(line).is_none() && command_match_count > 0 {
+            command_match_count
+        } else if line == "/model" || line.starts_with("/model ") {
             get_model_matches().len()
         } else if line == "/resume" || line.starts_with("/resume ") {
             RESUME_MATCHES.lock().map(|g| g.len()).unwrap_or(0)
@@ -306,7 +310,7 @@ impl ConditionalEventHandler for TabHandler {
     }
 }
 
-/// Shift+Tab: cycle backward through model/conversation matches.
+/// Shift+Tab: cycle backward through slash commands or command-specific matches.
 struct ShiftTabHandler;
 
 impl ConditionalEventHandler for ShiftTabHandler {
@@ -318,7 +322,10 @@ impl ConditionalEventHandler for ShiftTabHandler {
         ctx: &EventContext,
     ) -> Option<Cmd> {
         let line = ctx.line();
-        let match_count = if line == "/model" || line.starts_with("/model ") {
+        let command_match_count = matching_commands(line).len();
+        let match_count = if lookup(line).is_none() && command_match_count > 0 {
+            command_match_count
+        } else if line == "/model" || line.starts_with("/model ") {
             get_model_matches().len()
         } else if line == "/resume" || line.starts_with("/resume ") {
             RESUME_MATCHES.lock().map(|g| g.len()).unwrap_or(0)
@@ -437,7 +444,7 @@ pub(crate) fn create_input_reader() -> rustyline::Result<Editor<AuraHelper, Defa
         KeyEvent(KeyCode::PageUp, Modifiers::NONE),
         EventHandler::Conditional(Box::new(PageUpHandler)),
     );
-    // Tab: cycle through model/conversation matches
+    // Tab: cycle through command and argument matches
     input_reader.bind_sequence(
         KeyEvent(KeyCode::Tab, Modifiers::NONE),
         EventHandler::Conditional(Box::new(TabHandler)),

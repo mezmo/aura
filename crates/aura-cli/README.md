@@ -132,7 +132,7 @@ cargo build -p aura-cli --no-default-features
 - **Local tool execution** — the model can read files, search code, list directories, run shell commands, and edit files on your behalf
 - **Standalone mode** (default) — run agents directly from TOML config without a web server
 - **Conversation persistence** — pick up where you left off with `--resume` or `/resume`
-- **Tab completion** — cycle through matching models and conversations with `Tab` / `Shift+Tab`
+- **Tab completion** — cycle through slash commands, models, and conversations with `Tab` / `Shift+Tab`
 - **Model selection** — browse and select models from the server (or loaded configs in standalone mode)
 - **Permission system** — control which local tools are allowed, denied, or prompted before execution
 - **SSE streaming** — real-time token-by-token output with a toggleable event panel
@@ -286,7 +286,7 @@ Once inside the REPL, the slash commands below are available. All slash commands
 | `Enter`                 | Submit input                                                         |
 | `Ctrl+C`                | Cancel the current streaming request, or exit if idle                |
 | `Ctrl+L`                | Clear the current input line; if the line is empty, clear the screen |
-| `Tab`                   | Cycle forward through matches (in `/model` and `/resume`)            |
+| `Tab`                   | Cycle forward through slash-command and argument matches             |
 | `Shift+Tab`             | Cycle backward through matches                                       |
 | `Esc`                   | Cancel tab-completion selection, or exit stream panel focus          |
 | `Up` / `Down`           | Navigate input history                                               |
