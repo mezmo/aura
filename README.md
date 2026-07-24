@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh 
 | `AURA_COMPONENT` | `all` | Which binary: `all`, `server`, or `cli` |
 | `AURA_REQUIRE_CHECKSUM` | `0` | `1` to fail when a release checksum is missing, `0` to warn and continue |
 
-Running a binary needs a config — see the [quickstart guide](docs/quickstart.md) and [Configuration](#configuration). To try AURA with no setup, use the Quick Start below.
+Running a binary needs a config — see the [quickstart guide](https://docs.mezmo.com/AURA/quickstart) and [Configuration](#configuration). To try AURA with no setup, use the Quick Start below.
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ Aura boots in **orchestrator mode**: a coordinator routes each request — answe
 
 Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://localhost:6006> to inspect traces in Phoenix.
 
-**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
+**[Full quickstart guide](https://docs.mezmo.com/AURA/quickstart)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
 
 ### More Quickstarts
 
@@ -610,7 +610,7 @@ AURA emits spans using the [OpenInference](https://github.com/Arize-ai/openinfer
 
 ## Documentation
 
-- [docs/quickstart.md](docs/quickstart.md): getting started guide — setup, customization, architecture, and troubleshooting.
+- [AURA quickstart (docs.mezmo.com)](https://docs.mezmo.com/AURA/quickstart): getting started guide — setup, customization, architecture, and troubleshooting.
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
 - [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
 - [docs/hitl.md](docs/hitl.md): human approval gates for orchestration worker tool calls, including webhook and conversational routes.
