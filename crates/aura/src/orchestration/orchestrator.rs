@@ -601,7 +601,7 @@ impl Orchestrator {
                 .unwrap_or_default();
             let scratchpad_tool_map =
                 scratchpad::scratchpad_tool_map(self.agent_config.mcp.as_ref(), &tools_per_server);
-            let worker_filter = worker_cfg.map(|w| w.mcp_filter.as_slice()).unwrap_or(&[]);
+            let worker_filter = worker_cfg.and_then(|w| w.mcp_filter.as_deref());
             let accessible_tools = self
                 .mcp_manager
                 .as_ref()
@@ -614,10 +614,18 @@ impl Orchestrator {
             );
 
             if !has_matching_tool {
-                tracing::warn!(
-                    "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping",
-                    task_id
-                );
+                if worker_filter.is_some_and(<[String]>::is_empty) {
+                    // The deliberate no-tools assignment — nothing to intercept.
+                    tracing::info!(
+                        "Worker {}: mcp_filter = [] (no MCP tools); scratchpad not needed",
+                        task_id
+                    );
+                } else {
+                    tracing::warn!(
+                        "Worker {}: scratchpad enabled but no MCP tool matches a scratchpad threshold; skipping",
+                        task_id
+                    );
+                }
             } else {
                 // Validation enforces these upstream; re-check here so runtime
                 // misconfiguration fails loudly instead of silently degrading.
@@ -782,8 +790,8 @@ impl Orchestrator {
             let full_preamble = super::config::WORKER_PREAMBLE_TEMPLATE
                 .replace("{{worker_system_prompt}}", &worker.preamble);
             worker_config.preamble_override = Some(full_preamble);
-            if !worker.mcp_filter.is_empty() {
-                worker_config.mcp_filter = Some(worker.mcp_filter.clone());
+            if let Some(filter) = &worker.mcp_filter {
+                worker_config.mcp_filter = Some(filter.clone());
             }
 
             // Filter vector stores: worker only gets stores explicitly assigned to it
@@ -1956,20 +1964,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let mut worker_tools = std::collections::HashMap::new();
 
         for (worker_name, worker_config) in &self.config.workers {
-            // Match MCP tools via mcp_filter (empty = all MCP tools for backwards compatibility)
-            let mut matching_tools: Vec<String> = if worker_config.mcp_filter.is_empty() {
-                all_tools.clone()
-            } else {
-                all_tools
+            // Omitted filter = every MCP tool (backwards compatibility);
+            // `mcp_filter = []` = none.
+            let mut matching_tools: Vec<String> = match &worker_config.mcp_filter {
+                None => all_tools.clone(),
+                Some(filter) => all_tools
                     .iter()
                     .filter(|tool_name| {
-                        worker_config
-                            .mcp_filter
+                        filter
                             .iter()
                             .any(|pattern| crate::config::glob_match(pattern, tool_name))
                     })
                     .cloned()
-                    .collect()
+                    .collect(),
             };
 
             // Add vector store tools based on explicit vector_stores assignment
@@ -4501,7 +4508,7 @@ mod tests {
             WorkerConfig {
                 description: "For logs and pipelines".to_string(),
                 preamble: "Operations specialist.".to_string(),
-                mcp_filter: vec!["mezmo_*".to_string()],
+                mcp_filter: Some(vec!["mezmo_*".to_string()]),
                 vector_stores: vec![], // No RAG for operations
                 turn_depth: None,
                 llm: None,
@@ -4514,7 +4521,7 @@ mod tests {
             WorkerConfig {
                 description: "For documentation".to_string(),
                 preamble: "Knowledge specialist.".to_string(),
-                mcp_filter: vec![],                            // No MCP tools
+                mcp_filter: Some(vec![]), // No MCP tools
                 vector_stores: vec!["mezmo_docs".to_string()], // RAG access
                 turn_depth: None,
                 llm: None,
@@ -4579,7 +4586,7 @@ mod tests {
             WorkerConfig {
                 description: "For documentation queries".to_string(),
                 preamble: "Documentation specialist.".to_string(),
-                mcp_filter: vec![],
+                mcp_filter: Some(vec![]),
                 vector_stores: vec!["docs".to_string()],
                 turn_depth: None,
                 llm: None,
@@ -4594,7 +4601,7 @@ mod tests {
             WorkerConfig {
                 description: "For knowledge base queries".to_string(),
                 preamble: "Knowledge specialist.".to_string(),
-                mcp_filter: vec![],
+                mcp_filter: Some(vec![]),
                 vector_stores: vec!["kb".to_string(), "runbooks".to_string()],
                 turn_depth: None,
                 llm: None,
@@ -4609,7 +4616,7 @@ mod tests {
             WorkerConfig {
                 description: "For operational tasks".to_string(),
                 preamble: "Operations specialist.".to_string(),
-                mcp_filter: vec!["mezmo_*".to_string()],
+                mcp_filter: Some(vec!["mezmo_*".to_string()]),
                 vector_stores: vec![], // Explicitly no RAG access
                 turn_depth: None,
                 llm: None,
@@ -4743,7 +4750,7 @@ mod tests {
             WorkerConfig {
                 description: "Test".to_string(),
                 preamble: "Test".to_string(),
-                mcp_filter: vec![],
+                mcp_filter: Some(vec![]),
                 vector_stores: vec!["worker_store".to_string()],
                 turn_depth: None,
                 llm: None,

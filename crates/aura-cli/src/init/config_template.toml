@@ -114,7 +114,8 @@ per_call_timeout_secs = 120
 
 # ─── Workers ────────────────────────────────────────────────────
 # Each worker specializes in a domain. Add mcp_filter to restrict
-# which MCP tools a worker can see — without it, workers see all.
+# which MCP tools a worker can see — without it, workers see all;
+# mcp_filter = [] gives a worker no MCP tools.
 
 [orchestration.worker.incident-responder]
 description = "Incident triage: fetch incident details, parse alerts, check oncall schedules, and escalation policies"

@@ -121,22 +121,23 @@ pub fn scratchpad_tool_map(
     resolved
 }
 
-/// True when at least one tool reachable through `mcp_filter` is keyed in
-/// the resolved scratchpad map — i.e. there's something for the wrapper to
-/// intercept. Empty `mcp_filter` means "all tools are reachable".
-///
-/// Now an exact lookup since `scratchpad_tool_map` is keyed by tool name
-/// (not pattern) — no glob iteration on the hot path.
+/// True when at least one tool reachable through `mcp_filter` (`None` =
+/// all reachable, empty `Some` = none) is keyed in the resolved scratchpad
+/// map — i.e. there's something for the wrapper to intercept. An exact
+/// lookup: `scratchpad_tool_map` is keyed by tool name, not pattern.
 pub fn has_accessible_scratchpad_tool(
     tool_names: &[String],
-    mcp_filter: &[String],
+    mcp_filter: Option<&[String]>,
     scratchpad_tool_map: &HashMap<String, usize>,
 ) -> bool {
     if scratchpad_tool_map.is_empty() {
         return false;
     }
     tool_names.iter().any(|name| {
-        let reachable = mcp_filter.is_empty() || mcp_filter.iter().any(|p| glob_match(p, name));
+        let reachable = match mcp_filter {
+            None => true,
+            Some(filter) => filter.iter().any(|p| glob_match(p, name)),
+        };
         reachable && scratchpad_tool_map.contains_key(name)
     })
 }
@@ -400,7 +401,7 @@ mod tests {
     fn has_accessible_returns_false_when_map_is_empty() {
         assert!(!has_accessible_scratchpad_tool(
             &["foo".to_string()],
-            &[],
+            None,
             &HashMap::new(),
         ));
     }
@@ -410,7 +411,7 @@ mod tests {
         let map = HashMap::from([("foo".to_string(), 256)]);
         assert!(has_accessible_scratchpad_tool(
             &["foo".to_string(), "bar".to_string()],
-            &[],
+            None,
             &map,
         ));
     }
@@ -422,7 +423,7 @@ mod tests {
         // though it's in the map.
         assert!(!has_accessible_scratchpad_tool(
             &["foo".to_string()],
-            &["bar_*".to_string()],
+            Some(&["bar_*".to_string()]),
             &map,
         ));
     }
@@ -432,7 +433,7 @@ mod tests {
         let map = HashMap::from([("foo_get".to_string(), 256)]);
         assert!(has_accessible_scratchpad_tool(
             &["foo_get".to_string()],
-            &["foo_*".to_string()],
+            Some(&["foo_*".to_string()]),
             &map,
         ));
     }

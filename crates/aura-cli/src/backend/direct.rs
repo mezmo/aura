@@ -7,6 +7,7 @@
 //! identical behavior whether the CLI connects via HTTP or runs standalone.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -50,6 +51,8 @@ fn additional_tools_factory() -> Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + S
 pub struct DirectBackend {
     app_state: Arc<AppState>,
     extra_headers: HashMap<String, String>,
+    /// Filesystem source of the loaded configs (file or directory).
+    config_path: PathBuf,
 }
 
 impl DirectBackend {
@@ -112,7 +115,15 @@ impl DirectBackend {
         Ok(Self {
             app_state,
             extra_headers: headers_map,
+            config_path: PathBuf::from(config_path),
         })
+    }
+
+    /// Path the agent configs were loaded from, as given at startup. May
+    /// be a directory (`load_config` accepts both) — writers must check
+    /// `is_file()` first.
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
     /// Return `true` if any loaded config enables client-side tools.
@@ -459,6 +470,9 @@ mod tests {
         DirectBackend {
             app_state,
             extra_headers: HashMap::new(),
+            // Synthetic: these configs were built in memory, not loaded
+            // from disk, so point at a path that cannot exist.
+            config_path: PathBuf::from("/nonexistent/in-memory-test-config.toml"),
         }
     }
 

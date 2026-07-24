@@ -1,5 +1,34 @@
 ## Changelog
 
+# [0.1.0](https://github.com/mezmo/aura/compare/v0.0.8...v0.1.0) (2026-07-24)
+
+
+### Bug Fixes
+
+* **cli**: harden /mcp add from review findings [75c3b9e](https://github.com/mezmo/aura/commit/75c3b9e60ef3ddffed9855ce4810aacf9a4c2002) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: tighten worker glob grants and credential messaging [5055838](https://github.com/mezmo/aura/commit/5055838ef0fa6b74187df0e029f51630e5f0b06d) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **orchestration**: empty mcp_filter now grants no tools [caa562f](https://github.com/mezmo/aura/commit/caa562ffd0c16b88d78ffdd51120e61085452591) - Tony Rogers [#378](https://github.com/mezmo/aura/issues/378)
+
+### Code Refactoring
+
+* **cli**: verify the mcp server before the config-write prompt [7057988](https://github.com/mezmo/aura/commit/7057988271f5718d7c4ba8ac2c45f0987edd8fb3) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)
+
+### Documentation
+
+* **config**: document the empty mcp_filter breaking change [28a6d85](https://github.com/mezmo/aura/commit/28a6d8546ca0c92c734b92a915c56e5f4282e2e8) - Tony Rogers [#378](https://github.com/mezmo/aura/issues/378)
+
+### Features
+
+* **cli**: add /mcp command listing the agent's mcp servers [f933a9f](https://github.com/mezmo/aura/commit/f933a9f92d0eedd8c9ff18a4651e74fec78e8b1c) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: ask for the auth scheme prefix on custom mcp servers [02c09ca](https://github.com/mezmo/aura/commit/02c09ca896e30c125340ca6938b1f869ac10c3c2) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: guided /mcp add wizard for installing mcp servers [22f0a50](https://github.com/mezmo/aura/commit/22f0a508c8daeccce995f9872e4f49b195f4dd4d) - Tony Rogers [#310](https://github.com/mezmo/aura/issues/310) [#403](https://github.com/mezmo/aura/issues/403)* **cli**: let /mcp add reference already-exported secrets [bd9ea1a](https://github.com/mezmo/aura/commit/bd9ea1ab40569e6324c1e5edc07dec2126c655f8) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: offer the no-tools assignment in /mcp add worker scoping [2a2de33](https://github.com/mezmo/aura/commit/2a2de33482be00f3bfa71120f2c3cbaa522960e2) - Tony Rogers [#378](https://github.com/mezmo/aura/issues/378) [#403](https://github.com/mezmo/aura/issues/403)* **cli**: offer to scope open workers when adding an mcp server [f5bbe3f](https://github.com/mezmo/aura/commit/f5bbe3f3e32b46ca80ed805644e4d3ce4fe2c1f4) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: offer worker access grants after /mcp add verification [258b8ec](https://github.com/mezmo/aura/commit/258b8ecf6a8fa7a09ea3c52e7c53a554bd0741b7) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: remember the config source path in DirectBackend [ca5f196](https://github.com/mezmo/aura/commit/ca5f1965c7cc3273e4a1c29392dc2d0e9cc8a079) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)* **cli**: verify mcp server connectivity after /mcp add [67f07e8](https://github.com/mezmo/aura/commit/67f07e87f138a43fa86bff05511bca2a9c916da3) - Tony Rogers [#310](https://github.com/mezmo/aura/issues/310) [#403](https://github.com/mezmo/aura/issues/403)* **config**: add format-preserving writer for mcp server entries [d44658e](https://github.com/mezmo/aura/commit/d44658eae7d4ae69b721021ececa247c81ddddb9) - Tony Rogers [#310](https://github.com/mezmo/aura/issues/310) [#402](https://github.com/mezmo/aura/issues/402)* **config**: append entries to a worker's mcp_filter [8a8d132](https://github.com/mezmo/aura/commit/8a8d13220e8e03579c13468776c446eec88b43c8) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)
+
+### Style
+
+* trim verbose comments in the mcp install flow [a3a1f48](https://github.com/mezmo/aura/commit/a3a1f48f347685c70aa13f3709a34b4a0463f999) - Tony Rogers [#403](https://github.com/mezmo/aura/issues/403)
+
+### **BREAKING CHANGES**
+
+* **orchestration:** a configured but empty mcp_filter ([]) previously
+granted every MCP tool; it now grants none. Omit the field to keep
+the grant-all behavior.
+
 ## [0.0.8](https://github.com/mezmo/aura/compare/v0.0.7...v0.0.8) (2026-07-23)
 
 
