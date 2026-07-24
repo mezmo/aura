@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh 
 | `AURA_COMPONENT` | `all` | Which binary: `all`, `server`, or `cli` |
 | `AURA_REQUIRE_CHECKSUM` | `0` | `1` to fail when a release checksum is missing, `0` to warn and continue |
 
-Running a binary needs a config — see the [quickstart guide](docs/quickstart.md) and the [configuration reference](docs/configuration-reference.md). To try AURA with no setup, use the Quick Start below.
+Running a binary needs a config — see the [quickstart guide](https://docs.mezmo.com/aura/quickstart) and the [configuration reference](https://docs.mezmo.com/aura/configuration-reference). To try AURA with no setup, use the Quick Start below.
 
 ## Quick Start
 
@@ -50,13 +50,13 @@ Aura boots in **orchestrator mode**: a coordinator routes each request — answe
 
 Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://localhost:6006> to inspect traces in Phoenix.
 
-**[Full quickstart guide](docs/quickstart.md)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
+**[Full quickstart guide](https://docs.mezmo.com/aura/quickstart)** — provider setup (OpenAI, Anthropic, Ollama, llama-server), adding MCP tools, enabling vector search, serving multiple agents, and troubleshooting.
 
 ### More Quickstarts
 
-- **[Orchestration — Math MCP](examples/quickstart-orchestration-math/README.md)** — Multi-agent orchestration with coordinator/worker architecture
-- **[Kubernetes SRE](examples/quickstart-k8s-sre/README.md)** — AI-powered SRE agent on KIND with Kubernetes and Prometheus MCP servers
-- **[Example Configs](examples/README.md)** — Minimal per-provider configs and complete agent compositions
+- **[Orchestration — Math MCP](https://docs.mezmo.com/aura/quickstart-orchestration-math)** — Multi-agent orchestration with coordinator/worker architecture
+- **[Kubernetes SRE](https://docs.mezmo.com/aura/quickstart-k8s-sre)** — AI-powered SRE agent on KIND with Kubernetes and Prometheus MCP servers
+- **[Example Configs](https://docs.mezmo.com/aura/example-configs)** — Minimal per-provider configs and complete agent compositions
 
 ## Development and Contributing
 
@@ -65,35 +65,16 @@ Prefer a browser? Open <http://localhost:3080> to chat in LibreChat, or <http://
 
 ## Documentation
 
-**Configuration**
+Full user-facing documentation — quickstarts, configuration reference, feature guides, CLI reference, and web server reference — lives at **[docs.mezmo.com/aura](https://docs.mezmo.com/aura)**.
 
-- [docs/configuration-reference.md](docs/configuration-reference.md): complete TOML field reference — agent, LLM providers, MCP, vector stores, scratchpad, skills, orchestration — plus multiple-agent serving and session store env vars.
-- [docs/quickstart.md](docs/quickstart.md): getting started guide — setup, customization, architecture, and troubleshooting.
+This repo's own docs are developer/contributor-facing only (see [Development and Contributing](#development-and-contributing) above for build/test/contribution docs):
 
-**Subsystems**
-
-- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol guide, event taxonomy, tool result modes, custom `aura.*` events, orchestration events, and client examples.
-- [docs/a2a-implementation.md](docs/a2a-implementation.md): A2A protocol endpoints, transport modes (REST and JSON-RPC), task lifecycle, and testing examples.
-- [docs/hitl.md](docs/hitl.md): human approval gates for orchestration worker tool calls, including webhook and conversational routes.
-- [docs/scratchpad.md](docs/scratchpad.md): context window management — large tool output interception, exploration tools, and token budgeting.
-- [docs/skills.md](docs/skills.md): on-demand agent instructions — the Agent Skills format, discovery, and orchestration inheritance.
-- [docs/client-side-tools.md](docs/client-side-tools.md): client-side tool passthrough — risk model, protocol mechanics, and server/CLI configuration.
-- [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow diagram, lifecycle, timeout, cancellation, and shutdown behavior.
-- [docs/ollama-guide.md](docs/ollama-guide.md): Ollama configuration, fallback tool parsing, and local model guidance.
-- [docs/tracing-spans.md](docs/tracing-spans.md): enabling OpenTelemetry, span layout, OpenInference span kinds, and trace parenting for both single-agent and orchestration modes.
-- [docs/telemetry.md](docs/telemetry.md): anonymous, opt-out CLI telemetry — the three-state consent model, exactly what is and isn't collected, kill switches, and how to audit it.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): Rig fork changes, tool execution order, and rationale.
-
-**Reference**
-
+- [docs/adr/](docs/adr/): architecture decision records.
+- [docs/design/](docs/design/): design and implementation notes.
 - [CHANGELOG.md](CHANGELOG.md): release and version history.
-- [docs/breaking-changes/20260421-llm-under-agent.md](docs/breaking-changes/20260421-llm-under-agent.md): breaking configuration changes from 21 April 2026 — `[llm]` moved under `[agent.llm]` and per-worker LLM overrides.
-- [docs/breaking-changes/20260410-agent-llm-toml-configuration.md](docs/breaking-changes/20260410-agent-llm-toml-configuration.md): breaking configuration changes from 10 April 2026 — field migrations from `[agent]` to `[llm]` and Ollama parameter consolidation.
-
-**Crate-specific**
-
-- [crates/aura-cli/README.md](crates/aura-cli/README.md): the `aura` CLI — REPL, one-shot mode, permissions, local tools.
-- [crates/aura-web-server/README.md](crates/aura-web-server/README.md): `aura-web-server` — endpoints, deployment env vars, integration tests.
+- [crates/aura-cli/README.md](crates/aura-cli/README.md): building and testing the `aura` CLI.
+- [crates/aura-web-server/README.md](crates/aura-web-server/README.md): running the web server's integration test suite.
 
 ## License
 

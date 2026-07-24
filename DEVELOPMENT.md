@@ -49,7 +49,7 @@ aura/
 │   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
 │   ├── aura-config/         # TOML parser and config loader
 │   ├── aura-events/         # Shared SSE event types (lightweight, no agent deps)
-│   ├── aura-telemetry/      # Anonymous CLI telemetry (see docs/telemetry.md)
+│   ├── aura-telemetry/      # Anonymous CLI telemetry (see docs.mezmo.com/aura/telemetry)
 │   ├── aura-telemetry-derive/ # Derive macros for aura-telemetry
 │   ├── aura-test-utils/     # Shared testing utilities
 │   └── aura-web-server/     # OpenAI-compatible HTTP/SSE server
@@ -202,7 +202,7 @@ Orchestrator components and loop:
 
 Worth reading before diving into the code:
 
-- [docs/streaming-api-guide.md](docs/streaming-api-guide.md): SSE protocol, event types, and client handling.
-- [docs/request-lifecycle.md](docs/request-lifecycle.md): request flow, timeouts, cancellation, and shutdown.
+- [Streaming API Guide](https://docs.mezmo.com/aura/streaming-api-guide): SSE protocol, event types, and client handling.
+- [Request Lifecycle](https://docs.mezmo.com/aura/request-lifecycle): request flow, timeouts, cancellation, and shutdown.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): why AURA uses a Rig.rs fork, what changed, and tool execution ordering (important for `tool_event_broker.rs`).
-- [docs/tracing-spans.md](docs/tracing-spans.md): OpenTelemetry span layout and trace parenting.
+- [Tracing & Span Layout](https://docs.mezmo.com/aura/tracing-spans): OpenTelemetry span layout and trace parenting.

@@ -497,8 +497,8 @@ behind `PendingApprovals` gains the store/bus handles.
   cross-pod), **no session affinity is required** — leave the Service at the default
   `sessionAffinity: None`. `ClientIP` or ingress cookie affinity is not needed and should
   not be added.
-- `AURA_SERVER_URL` already must be the external origin behind the LB (documented in
-  `docs/a2a-implementation.md`); no change, just reconfirm for multi-pod.
+- `AURA_SERVER_URL` already must be the external origin behind the LB (documented at
+  docs.mezmo.com/aura/a2a-implementation); no change, just reconfirm for multi-pod.
 
 ---
 

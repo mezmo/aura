@@ -86,7 +86,7 @@ aura/
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 
 ### Scratchpad (Context Window Management)
-- Intercepts large MCP tool outputs and saves them to disk instead of filling the context window; works in both single-agent and orchestration mode. Full usage/config docs: `docs/scratchpad.md`
+- Intercepts large MCP tool outputs and saves them to disk instead of filling the context window; works in both single-agent and orchestration mode. Full usage/config docs: docs.mezmo.com/aura/scratchpad
 - Code pointers: token-counter dispatch lives in `token_counter_for_provider` (`scratchpad/context_budget.rs`); per-agent budgets live on `Agent.scratchpad_budget`, created at `create_worker()` time; read tools resolve files under a per-agent **read root** distinct from the write-confined scratchpad dir (`ScratchpadStorage::with_read_root`)
 
 ### Orchestration (Multi-Agent)
@@ -94,7 +94,7 @@ aura/
 - Per-worker LLM overrides: workers inherit `[agent.llm]` by default; `[orchestration.worker.<name>.llm]` overrides it (different model, same provider config). Resolved inline at worker construction (`worker.llm.as_ref().unwrap_or(&agent.llm)`)
 - Dependency-aware multi-wave execution with iterative re-planning (`max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
-- `aura.orchestrator.*` SSE events for real-time visibility (see `docs/streaming-api-guide.md`)
+- `aura.orchestrator.*` SSE events for real-time visibility (see docs.mezmo.com/aura/streaming-api-guide)
 
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
@@ -105,7 +105,7 @@ aura/
 - `--system-prompt` works in both modes: standalone prompts for append/replace; HTTP prompts for AURA vs OpenAI-compatible service
 - `--force` bypasses non-critical warnings (e.g. HTTP system-prompt in query mode)
 - Local tool execution: Shell, Read, ListFiles, Update, SearchFiles, FindFiles, FileInfo
-- **USE AT YOUR OWN RISK.** CLI advertises local tools to the server with `--enable-client-tools`; the server attaches them only when `[agent].enable_client_tools = true` (filtered by `client_tool_filter` globs). Both sides must opt in; single-agent configs only. Functionally equivalent to handing the LLM a shell prompt on the client machine. Full risk model and protocol details: `docs/client-side-tools.md`
+- **USE AT YOUR OWN RISK.** CLI advertises local tools to the server with `--enable-client-tools`; the server attaches them only when `[agent].enable_client_tools = true` (filtered by `client_tool_filter` globs). Both sides must opt in; single-agent configs only. Functionally equivalent to handing the LLM a shell prompt on the client machine. Full risk model and protocol details: docs.mezmo.com/aura/client-side-tools
 - Permission system (`.aura/permissions.json`, formerly `settings.json`) with allow/deny glob rules. Discovered by walking up from `$PWD` to find the closest `.aura/`. **Project-scoped only** — no global `~/.aura/permissions.json`. Legacy `settings.json` is still read with a deprecation warning; new rules saved at the prompt land in `permissions.json` and migrate any existing legacy rules forward.
 - CLI preferences live in `~/.aura/cli.toml` (global) and `<project>/.aura/cli.toml` (per-project override, walk-up discovered, merged on top of global per-field). Renamed from `~/.aura/config.toml` to avoid collision with AURA **agent** TOML configs; the old name is still read with a deprecation warning.
 - `/model` command works in both modes — lists server models (HTTP) or loaded TOML configs (standalone)
@@ -226,26 +226,13 @@ make lint                   # Run clippy + fmt check
 
 ## Documentation
 
-Which docs go where: put new documentation in the file that owns the topic.
+All user-facing documentation (quickstarts, configuration reference, feature guides, CLI reference, web server reference) lives externally at **docs.mezmo.com/aura** (repo: `mezmo/documentation`, content under `aura/`) — not in this repo. This repo's own docs are developer/contributor-facing only:
 
-- `README.md` - User-facing only: what AURA is, quick start, and pointers to `DEVELOPMENT.md`/`CONTRIBUTING.md` and the documentation index. No table of contents (GitHub generates one). No usage/configuration content, build-from-source, testing, architecture, or contributor content — those live in `docs/`, `crates/*/README.md`, `DEVELOPMENT.md`, and `CONTRIBUTING.md`.
+- `README.md` - User-facing only: what AURA is, quick start, and pointers to `DEVELOPMENT.md`/`CONTRIBUTING.md`/the hosted docs. No table of contents (GitHub generates one). No usage/configuration content, build-from-source, testing, architecture, or contributor content — those live at docs.mezmo.com/aura, in `DEVELOPMENT.md`, or in `CONTRIBUTING.md`.
 - `DEVELOPMENT.md` - Developer-facing: prerequisites, building from source, project structure, Make targets, testing (unit + integration suites and feature flags), and the architecture overview.
 - `CONTRIBUTING.md` - Contribution process only: CLA, workflow, code quality standards, commit conventions, PR and review process. Build/test details belong in `DEVELOPMENT.md`; link, don't duplicate.
-- `docs/` - Deep-dive guides for a single subsystem or protocol (streaming, request lifecycle, HITL, A2A, Ollama, telemetry, tracing, scratchpad, skills, client-side tools, configuration reference, breaking changes). ADRs in `docs/adr/`, design docs in `docs/design/`.
-- `crates/*/README.md` - Crate-specific usage and build instructions (e.g. `crates/aura-cli/README.md`)
+- `docs/` - Architecture/rationale only, not usage guides: `docs/rig-fork-changes.md` (Rig fork changes and rationale). ADRs in `docs/adr/`, design docs in `docs/design/`.
+- `crates/*/README.md` - Crate-specific build/test instructions only (e.g. `crates/aura-cli/README.md` covers building and testing the CLI; its usage docs are on the hosted site).
 - `CHANGELOG.md` - Auto-generated version history; never edit by hand
 
-Key deep-dive guides:
-
-- `docs/configuration-reference.md` - Complete TOML field reference for every config section
-- `docs/streaming-api-guide.md` - SSE streaming, custom events, and orchestration events
-- `docs/scratchpad.md` - Context window management: tool output interception, exploration tools, token budgeting
-- `docs/skills.md` - On-demand agent instructions: Agent Skills format, discovery, orchestration inheritance
-- `docs/client-side-tools.md` - Client-side tool passthrough: risk model, protocol mechanics, server/CLI configuration
-- `docs/hitl.md` - Human-in-the-loop approval gates: webhook and conversational routes
-- `docs/a2a-implementation.md` - A2A protocol endpoints, transport modes, and task lifecycle
-- `docs/ollama-guide.md` - Ollama configuration, fallback tool parsing, and local model guidance
-- `docs/request-lifecycle.md` - Request flow, lifecycle, timeout, cancellation, and shutdown
-- `docs/tracing-spans.md` - Enabling OpenTelemetry, span layout, and OpenInference span kinds
-- `docs/telemetry.md` - CLI anonymous telemetry: consent model, collected data, opt-out
-- `docs/rig-fork-changes.md` - Rig fork changes, tool execution order, and rationale
+When adding or changing a user-facing feature, update the corresponding page in the `mezmo/documentation` repo (`aura/` directory) — this repo's `docs/` folder is not the place for it.
