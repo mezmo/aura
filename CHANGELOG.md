@@ -1,5 +1,12 @@
 ## Changelog
 
+## [0.1.1](https://github.com/mezmo/aura/compare/v0.1.0...v0.1.1) (2026-07-24)
+
+
+### Features
+
+* **cli**: add slash command tab completion [266990f](https://github.com/mezmo/aura/commit/266990fa5be253e3c41c924f3c2197d6741cc6dd) - Henry Andrews [#415](https://github.com/mezmo/aura/issues/415)
+
 # [0.1.0](https://github.com/mezmo/aura/compare/v0.0.8...v0.1.0) (2026-07-24)
 
 
