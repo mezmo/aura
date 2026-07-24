@@ -164,8 +164,8 @@ After you submit, watch the PR for automated check results, the CLA bot's reques
 If your change affects any of the following, update the relevant docs (see the documentation map in [CLAUDE.md](CLAUDE.md)):
 
 - **Configuration options**: update `examples/reference.toml` and the relevant `examples/` files.
-- **API behavior**: update `docs/streaming-api-guide.md` or `docs/request-lifecycle.md`.
-- **New features**: add usage examples to the README or create a new guide in `docs/`.
+- **API behavior**: update the corresponding page in the `mezmo/documentation` repo (`aura/streaming-api-guide.mdx` or `aura/request-lifecycle.mdx`).
+- **New features**: add a usage guide in the `mezmo/documentation` repo (`aura/` directory), not in this repo.
 - **Build, testing, or architecture changes**: update `DEVELOPMENT.md` and the relevant doc in `docs/`, and note any impacts in `CLAUDE.md`.
 
 ## Reporting Issues
