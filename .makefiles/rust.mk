@@ -188,8 +188,38 @@ build-binaries-linux: ## Build binaries for linux (amd64 + arm64, PROFILE=releas
 build-binaries-darwin: ## Build binaries for darwin (amd64 + arm64, PROFILE=release|debug)
 	$(MAKE) build-binary-darwin-amd64 build-binary-darwin-arm64
 
+# Signing identity and notarytool credentials for the darwin binaries.
+# Supply on the make command line or via the environment. CODESIGN_IDENTITY is
+# the SHA-1 hash of the Developer ID Application certificate in the keychain.
+CODESIGN_IDENTITY ?=
+NOTARY_APPLE_ID ?=
+NOTARY_PASSWORD ?=
+NOTARY_TEAM_ID ?=
+
+# The darwin binaries produced by build-release-binaries-darwin.
+DARWIN_RELEASE_BINARIES := \
+	aura-darwin-amd64 aura-web-server-darwin-amd64 \
+	aura-darwin-arm64 aura-web-server-darwin-arm64
+
+.PHONY: sign-release-binaries-darwin
+sign-release-binaries-darwin: $(DIST_DIR) $(DOCKER_ENV) ## Codesign and notarize the darwin release binaries (requires CODESIGN_IDENTITY, NOTARY_APPLE_ID, NOTARY_PASSWORD, NOTARY_TEAM_ID)
+	@[ -n "$(CODESIGN_IDENTITY)" ] || { echo "error: CODESIGN_IDENTITY is required" >&2; exit 1; }
+	@[ -n "$(NOTARY_APPLE_ID)" ] || { echo "error: NOTARY_APPLE_ID is required" >&2; exit 1; }
+	@[ -n "$(NOTARY_PASSWORD)" ] || { echo "error: NOTARY_PASSWORD is required" >&2; exit 1; }
+	@[ -n "$(NOTARY_TEAM_ID)" ] || { echo "error: NOTARY_TEAM_ID is required" >&2; exit 1; }
+	$(RUN) bash -c "\
+		$(call require_host,Darwin,) \
+		cd $(DIST_DIR) && for bin in $(DARWIN_RELEASE_BINARIES); do \
+			echo signing \$$bin; \
+			codesign --force --timestamp --options runtime --sign '$(CODESIGN_IDENTITY)' \$$bin; \
+			echo notarizing \$$bin; \
+			ditto -c -k \$$bin \$$bin.zip; \
+			xcrun notarytool submit \$$bin.zip --apple-id '$(NOTARY_APPLE_ID)' --password '$(NOTARY_PASSWORD)' --team-id '$(NOTARY_TEAM_ID)' --wait; \
+			rm -f \$$bin.zip; \
+		done"
+
 .PHONY: build-checksums
-build-checksums: ## Write sha256 checksums for the binaries in dist
+build-checksums: ## Write sha256 checksums for the release binaries in dist
 	cd $(DIST_DIR) && sha256sum aura-* > checksums.txt
 
 # Every binary a complete release must contain, across all platforms.
