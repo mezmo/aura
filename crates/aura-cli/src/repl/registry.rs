@@ -176,6 +176,14 @@ pub(crate) const COMMANDS: &[Command] = &[
         mid_stream: MidStream::Live(crate::ui::mid_stream::live_style),
     },
     Command {
+        name: "/mcp",
+        description: "List MCP servers, or set one up with `add`",
+        usage_hint: Some("[add]"),
+        handler: cmd_mcp,
+        validate: None,
+        mid_stream: MidStream::Defer,
+    },
+    Command {
         name: "/telemetry",
         description: "Inspect or disable anonymous usage telemetry",
         usage_hint: Some("status|recent|disable"),
@@ -271,6 +279,11 @@ fn cmd_model(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
 
 fn cmd_style(_ctx: &mut CommandContext, args: &str) -> CommandOutcome {
     commands::handle_style(args);
+    CommandOutcome::Handled
+}
+
+fn cmd_mcp(ctx: &mut CommandContext, args: &str) -> CommandOutcome {
+    super::mcp::handle_mcp(ctx, args);
     CommandOutcome::Handled
 }
 

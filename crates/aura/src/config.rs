@@ -106,9 +106,8 @@ pub struct AgentRuntimeConfig {
     pub preamble_override: Option<String>,
 
     /// Glob patterns for filtering which MCP tools to include.
-    /// When set, only tools matching at least one pattern are added.
-    /// Supports glob syntax: `*` (any chars), `?` (single char).
-    /// Empty or None means all tools are included.
+    /// When set, only tools matching at least one pattern are added
+    /// (`None` = all tools, empty = none). Glob syntax: `*`, `?`.
     pub mcp_filter: Option<Vec<String>>,
 
     /// Shared persistence for injecting `read_artifact` tool into workers.
@@ -244,24 +243,17 @@ impl AgentRuntimeConfig {
             .or_else(|| self.orchestration.as_ref().and_then(|o| o.memory_dir()))
     }
 
-    /// Check if a tool name matches the mcp_filter patterns.
+    /// Check if a tool name matches the mcp_filter patterns (glob syntax:
+    /// `*` any chars, `?` one char). No filter (`None`) passes everything;
+    /// an empty filter (`mcp_filter = []`) is the explicit no-tools
+    /// assignment and matches nothing.
     ///
-    /// Returns true if:
-    /// - No filter is set (None) - all tools pass
-    /// - Filter is empty - all tools pass
-    /// - Tool name matches at least one pattern
-    ///
-    /// Checks the extension field (`self.mcp_filter`, set by orchestrator) first,
-    /// then falls back to the TOML-parseable field (`self.agent.mcp_filter`).
-    ///
-    /// Supports simple glob patterns:
-    /// - `*` matches any sequence of characters
-    /// - `?` matches any single character
+    /// Checks the extension field (`self.mcp_filter`, set by orchestrator)
+    /// first, then falls back to `self.agent.mcp_filter`.
     pub fn tool_matches_filter(&self, tool_name: &str) -> bool {
         let effective = self.mcp_filter.as_ref().or(self.agent.mcp_filter.as_ref());
         match effective {
             None => true,
-            Some(patterns) if patterns.is_empty() => true,
             Some(patterns) => patterns.iter().any(|p| glob_match(p, tool_name)),
         }
     }
@@ -306,12 +298,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_matches_filter_empty() {
+    fn test_tool_matches_filter_empty_denies_all() {
         let config = AgentRuntimeConfig {
             mcp_filter: Some(vec![]),
             ..Default::default()
         };
-        assert!(config.tool_matches_filter("any_tool"));
+        assert!(!config.tool_matches_filter("any_tool"));
     }
 
     #[test]

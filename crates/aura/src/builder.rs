@@ -187,8 +187,7 @@ impl Agent {
         let filter = config
             .mcp_filter
             .as_deref()
-            .or(config.agent.mcp_filter.as_deref())
-            .unwrap_or(&[]);
+            .or(config.agent.mcp_filter.as_deref());
         if !scratchpad::has_accessible_scratchpad_tool(
             &accessible_tools,
             filter,

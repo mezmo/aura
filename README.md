@@ -480,7 +480,7 @@ For a fuller multi-worker example, see [configs/example-math-orchestration.toml]
 |-------|------|---------|-------------|
 | `description` | string | *required* | Short description shown to coordinator during planning |
 | `preamble` | string | *required* | System prompt for this worker |
-| `mcp_filter` | list | `[]` | Glob patterns selecting which MCP tools this worker can use |
+| `mcp_filter` | list | — | Glob patterns selecting which MCP tools this worker can use; omitted = all tools, `[]` = none |
 | `vector_stores` | list | `[]` | Named vector stores this worker has access to |
 | `turn_depth` | int | — | Per-worker tool-call depth limit (overrides `[agent].turn_depth`) |
 | `llm` | table | inherits `[agent.llm]` | Optional per-worker LLM override — different model (and other `[agent.llm]` fields) while reusing provider credentials |

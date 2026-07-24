@@ -832,7 +832,8 @@ pub struct AgentSettings {
     /// Glob patterns for filtering which MCP tools to include.
     /// When set, only tools matching at least one pattern are added.
     /// Supports glob syntax: `*` (any chars), `?` (single char).
-    /// Empty or None means all tools are included.
+    /// None (omitted) means all tools are included; an empty list
+    /// (`mcp_filter = []`) includes none.
     /// Can be set via `[agent].mcp_filter` in TOML for single-agent configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_filter: Option<Vec<String>>,

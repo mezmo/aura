@@ -66,13 +66,14 @@ pub struct WorkerConfig {
     /// Glob patterns for which MCP tools this worker gets access to.
     ///
     /// Examples:
+    /// - omitted - all tools (default)
     /// - `["mezmo_*"]` - all tools starting with "mezmo_"
     /// - `["ListKnowledgeBases", "QueryKnowledgeBases"]` - specific tools
-    /// - `["*"]` or empty - all tools (default)
+    /// - `[]` - no MCP tools
     ///
     /// Patterns are matched using glob syntax (supports `*`, `**`, `?`, `[abc]`).
     #[serde(default)]
-    pub mcp_filter: Vec<String>,
+    pub mcp_filter: Option<Vec<String>>,
 
     /// Vector stores this worker has access to.
     ///
@@ -678,18 +679,29 @@ mod tests {
         let config: WorkerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.description, "For operations");
         assert_eq!(config.preamble, "You are an Operations Specialist.");
-        assert_eq!(config.mcp_filter, vec!["mezmo_*"]);
+        assert_eq!(config.mcp_filter, Some(vec!["mezmo_*".to_string()]));
     }
 
     #[test]
-    fn test_worker_config_empty_filter() {
+    fn test_worker_config_omitted_filter_is_none() {
         let toml = r#"
             description = "Generic tasks"
             preamble = "Generic worker."
         "#;
         let config: WorkerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.preamble, "Generic worker.");
-        assert!(config.mcp_filter.is_empty());
+        assert_eq!(config.mcp_filter, None);
+    }
+
+    #[test]
+    fn test_worker_config_empty_filter_is_explicit() {
+        let toml = r#"
+            description = "No tools"
+            preamble = "Tool-free worker."
+            mcp_filter = []
+        "#;
+        let config: WorkerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.mcp_filter, Some(vec![]));
     }
 
     #[test]
@@ -700,17 +712,10 @@ mod tests {
             mcp_filter = ["ListKnowledgeBases", "QueryKnowledgeBases"]
         "#;
         let config: WorkerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.mcp_filter.len(), 2);
-        assert!(
-            config
-                .mcp_filter
-                .contains(&"ListKnowledgeBases".to_string())
-        );
-        assert!(
-            config
-                .mcp_filter
-                .contains(&"QueryKnowledgeBases".to_string())
-        );
+        let filter = config.mcp_filter.expect("filter present");
+        assert_eq!(filter.len(), 2);
+        assert!(filter.contains(&"ListKnowledgeBases".to_string()));
+        assert!(filter.contains(&"QueryKnowledgeBases".to_string()));
     }
 
     #[test]
@@ -737,12 +742,12 @@ mod tests {
         let ops = config.get_worker("operations").unwrap();
         assert_eq!(ops.description, "For logs and pipelines");
         assert_eq!(ops.preamble, "Operations specialist.");
-        assert_eq!(ops.mcp_filter, vec!["mezmo_*"]);
+        assert_eq!(ops.mcp_filter, Some(vec!["mezmo_*".to_string()]));
 
         let kb = config.get_worker("knowledge").unwrap();
         assert_eq!(kb.description, "For documentation");
         assert_eq!(kb.preamble, "Knowledge specialist.");
-        assert_eq!(kb.mcp_filter.len(), 2);
+        assert_eq!(kb.mcp_filter.as_ref().map(Vec::len), Some(2));
     }
 
     #[test]
