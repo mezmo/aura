@@ -190,7 +190,7 @@ impl ScratchpadStorage {
     /// `{run}/iteration-1/scratchpad`, this returns `../../artifacts/x.txt`.
     /// The result is validated through [`validate_path`](Self::validate_path),
     /// so a path outside the read root is rejected.
-    pub fn relative_ref(&self, abs: &Path) -> Result<String, ScratchpadPathError> {
+    pub async fn relative_ref(&self, abs: &Path) -> Result<String, ScratchpadPathError> {
         let abs_norm = normalize_path(abs);
         let dir_norm = normalize_path(&self.dir);
 
@@ -216,7 +216,7 @@ impl ScratchpadStorage {
 
         let token = rel.to_string_lossy().to_string();
         // Defense-in-depth: confirm the token resolves back inside the read root.
-        self.validate_path(&token)?;
+        self.validate_path(&token).await?;
         Ok(token)
     }
 
@@ -282,7 +282,7 @@ impl ScratchpadStorage {
     ) -> std::io::Result<Vec<CompanionFile>> {
         let mut companions = Vec::new();
         for pending in Self::plan_companions(tool_call_id, value) {
-            let path = self.safe_companion_path(&pending.filename)?;
+            let path = self.safe_companion_path(&pending.filename).await?;
             fs::write(&path, &pending.content).await?;
             debug!(
                 "Companion file extracted: {} (key={}, {} lines, {})",
@@ -299,8 +299,8 @@ impl ScratchpadStorage {
     /// Resolve a companion filename inside the scratchpad directory. Rejects
     /// any filename that would escape the dir (defense-in-depth behind the
     /// `slugify_component` applied upstream).
-    fn safe_companion_path(&self, filename: &str) -> std::io::Result<PathBuf> {
-        self.validate_path(filename).map_err(|e| {
+    async fn safe_companion_path(&self, filename: &str) -> std::io::Result<PathBuf> {
+        self.validate_path(filename).await.map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("Rejected companion filename {filename:?}: {e}"),
@@ -411,9 +411,11 @@ impl ScratchpadStorage {
     /// process can write to `/tmp`).
     ///
     /// For files that don't exist yet (e.g., the destination path during a
-    /// write), stage 2 is skipped — `canonicalize` would fail with
-    /// `ENOENT`. The lexical check still applies.
-    pub fn validate_path(&self, file_path: &str) -> Result<PathBuf, ScratchpadPathError> {
+    /// write), stage 2 is skipped — `canonicalize` reports `NotFound`. The
+    /// lexical check still applies. Any other canonicalize failure (stale
+    /// network mount, permission error) is a real I/O fault and surfaces as
+    /// [`ScratchpadPathError::Io`], not as a containment violation.
+    pub async fn validate_path(&self, file_path: &str) -> Result<PathBuf, ScratchpadPathError> {
         let requested = self.dir.join(file_path);
 
         // Stage 1: lexical normalization (handles ../).
@@ -426,28 +428,31 @@ impl ScratchpadStorage {
             });
         }
 
-        // Stage 2: symlink resolution if the file exists. We compare the
-        // canonicalized request against the canonicalized read root
-        // (canonicalize is consistent on macOS where /tmp is a symlink for
-        // /private/tmp — comparing one canonical to one non-canonical
-        // would always reject).
-        if normalized.exists() {
-            let canonical_root = std::fs::canonicalize(&self.read_root).map_err(|_| {
-                ScratchpadPathError::OutsideDirectory {
-                    path: file_path.to_string(),
-                    dir: self.read_root.display().to_string(),
+        // Stage 2: symlink resolution. We compare the canonicalized request
+        // against the canonicalized read root (canonicalize is consistent on
+        // macOS where /tmp is a symlink for /private/tmp — comparing one
+        // canonical to one non-canonical would always reject).
+        match fs::canonicalize(&normalized).await {
+            Ok(canonical_path) => {
+                let canonical_root = fs::canonicalize(&self.read_root).await.map_err(|source| {
+                    ScratchpadPathError::Io {
+                        path: file_path.to_string(),
+                        source,
+                    }
+                })?;
+                if !canonical_path.starts_with(&canonical_root) {
+                    return Err(ScratchpadPathError::OutsideDirectory {
+                        path: file_path.to_string(),
+                        dir: self.read_root.display().to_string(),
+                    });
                 }
-            })?;
-            let canonical_path = std::fs::canonicalize(&normalized).map_err(|_| {
-                ScratchpadPathError::OutsideDirectory {
+            }
+            // The file doesn't exist yet; the lexical check stands.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ScratchpadPathError::Io {
                     path: file_path.to_string(),
-                    dir: self.read_root.display().to_string(),
-                }
-            })?;
-            if !canonical_path.starts_with(&canonical_root) {
-                return Err(ScratchpadPathError::OutsideDirectory {
-                    path: file_path.to_string(),
-                    dir: self.read_root.display().to_string(),
+                    source,
                 });
             }
         }
@@ -546,8 +551,12 @@ fn normalize_path(path: &Path) -> PathBuf {
 pub enum ScratchpadPathError {
     #[error("Path '{path}' is outside scratchpad directory '{dir}'")]
     OutsideDirectory { path: String, dir: String },
-    #[error("File not found: {0}")]
-    NotFound(String),
+    #[error("I/O error while validating path '{path}': {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[cfg(test)]
@@ -789,7 +798,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = storage.validate_path("call-1.json");
+        let result = storage.validate_path("call-1.json").await;
         assert!(result.is_ok());
     }
 
@@ -814,11 +823,11 @@ mod tests {
         std::fs::write(&artifact, "artifact content").unwrap();
 
         // relative_ref builds the token the read tools accept.
-        let token = storage.relative_ref(&artifact).unwrap();
+        let token = storage.relative_ref(&artifact).await.unwrap();
         assert!(token.contains("artifacts/result.txt"), "got token: {token}");
 
         // The token validates and resolves to the artifact on disk.
-        let resolved = storage.validate_path(&token).unwrap();
+        let resolved = storage.validate_path(&token).await.unwrap();
         assert_eq!(
             std::fs::canonicalize(&resolved).unwrap(),
             std::fs::canonicalize(&artifact).unwrap()
@@ -837,7 +846,7 @@ mod tests {
             .with_read_root(run_dir.clone());
 
         // ../../.. climbs above the run dir (read_root) → rejected.
-        let result = storage.validate_path("../../../etc/passwd");
+        let result = storage.validate_path("../../../etc/passwd").await;
         assert!(result.is_err(), "path escaping read_root must be rejected");
     }
 
@@ -853,7 +862,7 @@ mod tests {
             .with_read_root(run_dir.clone());
 
         let outside = tmp.path().join("other").join("secret.txt");
-        assert!(storage.relative_ref(&outside).is_err());
+        assert!(storage.relative_ref(&outside).await.is_err());
     }
 
     /// `with_read_root` ignores a root that is not an ancestor of the write
@@ -878,7 +887,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = storage.validate_path("../../etc/passwd");
+        let result = storage.validate_path("../../etc/passwd").await;
         assert!(result.is_err());
     }
 
@@ -907,7 +916,7 @@ mod tests {
 
         // Lexical check passes (the path string is "link.txt", inside the
         // dir), but the canonicalization step must catch the escape.
-        let result = storage.validate_path("link.txt");
+        let result = storage.validate_path("link.txt").await;
         assert!(
             result.is_err(),
             "validate_path must reject a symlink that escapes the scratchpad dir"
@@ -923,10 +932,38 @@ mod tests {
         let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-nx")
             .await
             .unwrap();
-        let result = storage.validate_path("not_yet_written.json");
+        let result = storage.validate_path("not_yet_written.json").await;
         assert!(
             result.is_ok(),
             "non-existent paths inside the dir must validate (used during writes)"
+        );
+    }
+
+    /// A canonicalize failure that is NOT NotFound (here: a search-permission
+    /// denial on the parent dir) must surface as `Io`, not as a containment
+    /// violation — on a stale network mount the LLM should see a truthful
+    /// I/O error, not a fabricated "outside scratchpad directory".
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_validate_path_io_error_is_not_containment_violation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-io")
+            .await
+            .unwrap();
+        let sub = storage.dir().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), "x").unwrap();
+
+        // Remove search permission so canonicalize fails with EACCES.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = storage.validate_path("locked/f.txt").await;
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            matches!(result, Err(ScratchpadPathError::Io { .. })),
+            "expected Io error, got {result:?}"
         );
     }
 

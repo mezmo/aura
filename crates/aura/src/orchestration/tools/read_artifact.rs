@@ -55,7 +55,7 @@ impl ReadArtifactTool {
     ///
     /// `abs_path` is the artifact's absolute path (already resolved & validated
     /// by the caller); it's used to build the in-place `file=` reference.
-    fn surface_content(&self, filename: &str, abs_path: &Path, content: String) -> String {
+    async fn surface_content(&self, filename: &str, abs_path: &Path, content: String) -> String {
         let Some(sp) = &self.scratchpad else {
             return content;
         };
@@ -67,7 +67,7 @@ impl ReadArtifactTool {
         let tokens = sp.budget.count_tokens(&content);
         let line_count = content.lines().count();
         let (format, _) = ContentFormat::detect_and_parse(&content);
-        match sp.storage.relative_ref(abs_path) {
+        match sp.storage.relative_ref(abs_path).await {
             Ok(file_ref) => {
                 let headline = format!(
                     "[artifact '{filename}' is too large for the context window \
@@ -182,7 +182,7 @@ impl Tool for ReadArtifactTool {
         match result {
             Ok(content) => {
                 let content = match abs_path {
-                    Some(path) => self.surface_content(&args.filename, &path, content),
+                    Some(path) => self.surface_content(&args.filename, &path, content).await,
                     // No resolvable path (shouldn't happen on a successful
                     // read) — inline rather than dropping content.
                     None => content,

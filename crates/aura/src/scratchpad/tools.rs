@@ -8,7 +8,7 @@ use super::schema::{
     MAX_SCHEMA_DEPTH, analyze_json_structure, analyze_markdown_structure, format_markdown_schema,
     format_schema,
 };
-use super::storage::ScratchpadStorage;
+use super::storage::{ScratchpadPathError, ScratchpadStorage};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,19 @@ pub enum ScratchpadToolError {
     NotJson,
     #[error("Key path not found: {0}")]
     KeyNotFound(String),
+}
+
+impl From<ScratchpadPathError> for ScratchpadToolError {
+    /// Containment violations stay path errors; validation-time I/O faults
+    /// (stale network mount, permission error) surface as I/O errors so the
+    /// LLM sees a truthful, retryable failure instead of a fabricated
+    /// containment violation.
+    fn from(e: ScratchpadPathError) -> Self {
+        match e {
+            ScratchpadPathError::Io { source, .. } => ScratchpadToolError::Io(source),
+            other => ScratchpadToolError::Path(other.to_string()),
+        }
+    }
 }
 
 // ============================================================================
@@ -105,9 +118,7 @@ async fn read_scratchpad_file(
     storage: &ScratchpadStorage,
     file: &str,
 ) -> Result<String, ScratchpadToolError> {
-    let path = storage
-        .validate_path(file)
-        .map_err(|e| ScratchpadToolError::Path(e.to_string()))?;
+    let path = storage.validate_path(file).await?;
     tokio::fs::read_to_string(&path)
         .await
         .map_err(ScratchpadToolError::Io)
@@ -1591,7 +1602,7 @@ impl Tool for ReadTool {
         // rejection only, biased toward the common case of obviously oversized
         // files. If the estimate already exceeds the per-call limit, bail out.
         if let Some(limit) = self.budget.max_extraction_tokens()
-            && let Ok(path) = self.storage.validate_path(&args.file)
+            && let Ok(path) = self.storage.validate_path(&args.file).await
             && let Ok(meta) = tokio::fs::metadata(&path).await
         {
             let approx_tokens = (meta.len() as usize) / 3;
