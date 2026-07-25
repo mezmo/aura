@@ -150,7 +150,8 @@ type above, preserving byte-identical output on every S2 manifest surface.
   validation could have rejected configs production accepts today (zero
   thresholds, misordered duplicate-call thresholds, `max_tools_per_worker =
   0`). Repairs 1-2 model these as valid states; R6 records that any FUTURE
-  tightening is a behavior change requiring its own card (candidate: S14).
+  tightening is a behavior change requiring its own card (candidate: a future
+  card).
 - **R7 - token budgets not colocated.** `BoundingConfig` centralizes the
   byte/char bounding decisions, display limits, and session-history limit, but
   does NOT own the two token budgets. The prior-work `TokenBudget`

@@ -122,8 +122,10 @@ impl std::fmt::Display for ArtifactRef {
 const ARTIFACT_WRITE_FAILED_MARKER: &str = "[Artifact write failed; full result unavailable]";
 
 /// Spill `result` to an artifact when it exceeds the configured threshold.
-/// Returns the original text when it fits inline. On write failure, returns
-/// the bounded inline summary with a failure marker instead of the full body.
+/// Returns the original text when it fits inline. On a successful spill,
+/// returns the bounded summary with an artifact-pointer footer. On write
+/// failure, returns the bounded inline summary with a failure marker
+/// instead of the full body.
 pub async fn maybe_spill_result(
     persistence: &ExecutionPersistence,
     spill: &ResultSpillBudget,
