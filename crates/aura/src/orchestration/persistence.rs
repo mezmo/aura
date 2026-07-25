@@ -935,23 +935,34 @@ pub async fn load_session_manifests(
         Err(e) => return Err(e),
     };
 
-    let mut manifests = Vec::new();
-
+    // Collect candidate run dirs first, newest first, so manifest reads can
+    // stop at `limit` instead of reading every prior run. Run IDs are UUIDv7,
+    // so lexicographic order is creation order (the same invariant
+    // prune_session_runs relies on). Selection is therefore by creation
+    // order, not the manifest's completion timestamp; the two diverge only
+    // for overlapping runs of one session, and either is a defensible
+    // "most recent".
+    let mut run_dirs: Vec<String> = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
         match entry.file_type().await {
             Ok(ft) if ft.is_dir() => {}
             _ => continue,
         }
-
-        // Skip the current run and the "latest" symlink
-        if let Some(dir_name) = path.file_name().and_then(|n| n.to_str())
-            && (dir_name == exclude_run_id || dir_name == "latest")
+        if let Ok(dir_name) = entry.file_name().into_string()
+            && dir_name != exclude_run_id
+            && dir_name != "latest"
         {
-            continue;
+            run_dirs.push(dir_name);
         }
+    }
+    run_dirs.sort_unstable_by(|a, b| b.cmp(a));
 
-        let manifest_path = path.join("manifest.json");
+    let mut manifests = Vec::new();
+    for dir_name in run_dirs {
+        if manifests.len() >= limit {
+            break;
+        }
+        let manifest_path = session_dir.join(&dir_name).join("manifest.json");
         match fs::read_to_string(&manifest_path).await {
             Ok(content) => match serde_json::from_str::<RunManifest>(&content) {
                 Ok(manifest) => manifests.push(manifest),
@@ -976,11 +987,9 @@ pub async fn load_session_manifests(
         }
     }
 
-    // Sort by timestamp descending (most recent first)
+    // Manifests were read in dir-name (creation) order; sort by recorded
+    // timestamp so the documented contract holds even if the two disagree.
     manifests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    // Take the most recent `limit` manifests
-    manifests.truncate(limit);
 
     Ok(manifests)
 }
@@ -1644,11 +1653,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let session_dir = temp_dir.path().join("cs_test");
 
+        // Timestamps deliberately DESCEND as dir names ascend: selection is
+        // by dir-name (creation) order, so run-4/run-3 must survive even
+        // though run-0 carries the newest completion timestamp.
         for i in 0..5 {
             let id = format!("run-{}", i);
             let dir = session_dir.join(&id);
             fs::create_dir_all(&dir).await.unwrap();
-            let m = make_test_manifest(&id, &format!("2026-03-20T0{}:00:00Z", i), "Query");
+            let m = make_test_manifest(&id, &format!("2026-03-20T0{}:00:00Z", 5 - i), "Query");
             fs::write(
                 dir.join("manifest.json"),
                 serde_json::to_string_pretty(&m).unwrap(),
@@ -1662,6 +1674,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
+        // Output order is by manifest timestamp: run-3 (02:00) before run-4 (01:00).
+        assert_eq!(result[0].run_id, "run-3");
+        assert_eq!(result[1].run_id, "run-4");
     }
 
     #[tokio::test]
