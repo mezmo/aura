@@ -274,42 +274,7 @@ impl ScratchpadStorage {
         })
     }
 
-    /// Write tool output synchronously (for use in sync callbacks like `transform_output`).
-    ///
-    /// JSON content is pretty-printed before writing. Large string values
-    /// inside JSON that contain structured content (markdown, escaped JSON)
-    /// are extracted to companion files for direct exploration with line-based tools.
-    pub fn write_output_sync(
-        &self,
-        tool_call_id: &str,
-        content: &str,
-    ) -> std::io::Result<WriteResult> {
-        let (path, format, to_write, parsed) = self.prepare_write(tool_call_id, content);
-        let line_count = to_write.lines().count();
-        std::fs::write(&path, &to_write)?;
-        debug!(
-            "Scratchpad file written: {} ({} bytes, {} lines, {})",
-            path.display(),
-            to_write.len(),
-            line_count,
-            format.as_str()
-        );
-
-        let companions = if let Some(value) = &parsed {
-            self.extract_companions_sync(tool_call_id, value)?
-        } else {
-            vec![]
-        };
-
-        Ok(WriteResult {
-            path,
-            format,
-            line_count,
-            companions,
-        })
-    }
-
-    /// Extract large structured string values from JSON as companion files (async).
+    /// Extract large structured string values from JSON as companion files.
     async fn extract_companions_async(
         &self,
         tool_call_id: &str,
@@ -319,28 +284,6 @@ impl ScratchpadStorage {
         for pending in Self::plan_companions(tool_call_id, value) {
             let path = self.safe_companion_path(&pending.filename)?;
             fs::write(&path, &pending.content).await?;
-            debug!(
-                "Companion file extracted: {} (key={}, {} lines, {})",
-                path.display(),
-                pending.companion.source_key,
-                pending.companion.line_count,
-                pending.companion.format.as_str()
-            );
-            companions.push(pending.companion);
-        }
-        Ok(companions)
-    }
-
-    /// Extract large structured string values from JSON as companion files (sync).
-    fn extract_companions_sync(
-        &self,
-        tool_call_id: &str,
-        value: &serde_json::Value,
-    ) -> std::io::Result<Vec<CompanionFile>> {
-        let mut companions = Vec::new();
-        for pending in Self::plan_companions(tool_call_id, value) {
-            let path = self.safe_companion_path(&pending.filename)?;
-            std::fs::write(&path, &pending.content)?;
             debug!(
                 "Companion file extracted: {} (key={}, {} lines, {})",
                 path.display(),
@@ -462,7 +405,7 @@ impl ScratchpadStorage {
     /// **Trust boundary**: this only matters if a process with write access
     /// to `memory_dir` is hostile. In the orchestration flow only aura
     /// itself writes to the scratchpad directory (via
-    /// `ScratchpadStorage::write_output_sync`), and aura never creates
+    /// `ScratchpadStorage::write_output`), and aura never creates
     /// symlinks. Stage 2 is therefore defense-in-depth against an
     /// out-of-band adversary (e.g., a multi-tenant host where another
     /// process can write to `/tmp`).

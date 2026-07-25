@@ -244,7 +244,7 @@ pub trait ToolWrapper: Send + Sync {
     ///
     /// # Returns
     /// Transformed output
-    fn transform_output(
+    async fn transform_output(
         &self,
         output: String,
         _outcome: &CallOutcome,
@@ -435,7 +435,7 @@ where
     fn call(
         &self,
         args: Self::Args,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + Sync + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + '_>> {
         let inner = self.inner.clone();
         let wrapper = self.wrapper.clone();
         let tool_name = self.inner.name();
@@ -582,8 +582,9 @@ where
             match result {
                 Ok(output) => {
                     let outcome = CallOutcome::classify_from_output(&output);
-                    let transformed =
-                        wrapper.transform_output(output, &outcome, &ctx, extracted.as_ref());
+                    let transformed = wrapper
+                        .transform_output(output, &outcome, &ctx, extracted.as_ref())
+                        .await;
 
                     if let Some(warning) = &transformed.warning {
                         tracing::warn!("Tool wrapper warning for {}: {}", tool_name, warning);
@@ -741,7 +742,7 @@ impl ToolWrapper for ComposedWrapper {
         Ok(PreCallOutcome::Proceed { overrides })
     }
 
-    fn transform_output(
+    async fn transform_output(
         &self,
         mut output: String,
         outcome: &CallOutcome,
@@ -749,7 +750,9 @@ impl ToolWrapper for ComposedWrapper {
         extracted: Option<&Value>,
     ) -> TransformOutputResult {
         for wrapper in self.wrappers.iter().rev() {
-            let result = wrapper.transform_output(output, outcome, ctx, extracted);
+            let result = wrapper
+                .transform_output(output, outcome, ctx, extracted)
+                .await;
             output = result.output;
         }
         TransformOutputResult::new(output)
@@ -833,8 +836,8 @@ mod tests {
         assert_eq!(result.warning, Some("minor issue".to_string()));
     }
 
-    #[test]
-    fn test_noop_wrapper_passthrough() {
+    #[tokio::test]
+    async fn test_noop_wrapper_passthrough() {
         let wrapper = NoOpWrapper;
 
         // Schema unchanged
@@ -851,7 +854,9 @@ mod tests {
         // Output unchanged
         let output = "test output".to_string();
         let outcome = CallOutcome::Success(output.clone());
-        let result = wrapper.transform_output(output.clone(), &outcome, &ctx, None);
+        let result = wrapper
+            .transform_output(output.clone(), &outcome, &ctx, None)
+            .await;
         assert_eq!(result.output, output);
     }
 

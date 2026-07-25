@@ -163,7 +163,7 @@ impl TurnNudgeWrapper {
 
 #[async_trait]
 impl ToolWrapper for TurnNudgeWrapper {
-    fn transform_output(
+    async fn transform_output(
         &self,
         output: String,
         _outcome: &CallOutcome,

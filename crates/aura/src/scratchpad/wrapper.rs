@@ -69,7 +69,7 @@ impl ScratchpadWrapper {
 
 #[async_trait]
 impl ToolWrapper for ScratchpadWrapper {
-    fn transform_output(
+    async fn transform_output(
         &self,
         output: String,
         outcome: &CallOutcome,
@@ -130,24 +130,11 @@ impl ToolWrapper for ScratchpadWrapper {
         )
         .replace(['/', '\\', ':', ' '], "_");
 
-        // Sync write: actix-web spawns one current_thread tokio runtime per
-        // worker, so `block_in_place` would panic ("can call blocking only
-        // when running on the multi-threaded runtime").
-        //
-        // Going async here is a larger refactor than it looks: `#[async_trait]`
-        // on `ToolWrapper` produces `Send`-only futures, but `WrappedTool::call`
-        // (and `definition`) self-imposes `+ Send + Sync` on its return type.
-        // Making `transform_output` async would force dropping that `+ Sync`
-        // bound on the wrapper plumbing, async-ifying the trait method (a
-        // breaking change for ToolWrapper impls), updating ComposedWrapper to
-        // chain async transforms, and updating all four wrapper impls
-        // (Scratchpad/Persistence/Observer/DuplicateCallGuard).
-        //
-        // KB-sized writes complete in sub-millisecond time — far cheaper than
-        // the LLM round-trip that follows — so briefly blocking the actix
-        // worker is acceptable (for now). Revisit if scratchpad payloads grow into the
-        // multi-MB range or if profiling shows the sync write on the hot path.
-        let write = self.storage.write_output_sync(&file_id, content);
+        // The write is awaited before the pointer is returned: the LLM's next
+        // tool call may read the file, so durability must precede pointer
+        // visibility. On slow (network) storage the latency lands on this one
+        // tool result, not on the runtime thread.
+        let write = self.storage.write_output(&file_id, content).await;
         match write {
             Ok(result) => {
                 let filename = result
@@ -292,7 +279,9 @@ mod tests {
         ctx.tool_initiator_id = "incident".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(large_output, &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(large_output, &ok(), &ctx, None)
+            .await;
         assert!(
             result.output.contains("[scratchpad:"),
             "exact-name lookup must intercept; got: {}",
@@ -330,8 +319,12 @@ mod tests {
         ctx.tool_initiator_id = "worker_loop".to_string();
         ctx.attempt = Some(0);
 
-        let r1 = wrapper.transform_output(large_output.clone(), &ok(), &ctx, None);
-        let r2 = wrapper.transform_output(large_output, &ok(), &ctx, None);
+        let r1 = wrapper
+            .transform_output(large_output.clone(), &ok(), &ctx, None)
+            .await;
+        let r2 = wrapper
+            .transform_output(large_output, &ok(), &ctx, None)
+            .await;
         assert_eq!(
             r1.output, r2.output,
             "identical raw output must produce identical pointer strings so DuplicateCallGuard can detect loops"
@@ -360,7 +353,9 @@ mod tests {
         ctx.tool_initiator_id = "worker_abc".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(large_output, &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(large_output, &ok(), &ctx, None)
+            .await;
         let output = result.output;
 
         assert!(output.contains("[scratchpad:"));
@@ -417,7 +412,9 @@ mod tests {
         ctx.tool_initiator_id = "metrics".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(with_footer, &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(with_footer, &ok(), &ctx, None)
+            .await;
         assert!(result.output.contains("[scratchpad:"), "must intercept");
 
         let files = storage.list_files().await.unwrap();
@@ -457,7 +454,9 @@ mod tests {
         let small_output = "small result".to_string();
         let ctx = ToolCallContext::new("search_knowledge_base");
 
-        let result = wrapper.transform_output(small_output.clone(), &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(small_output.clone(), &ok(), &ctx, None)
+            .await;
         assert_eq!(
             result.output, small_output,
             "small output should pass through unchanged"
@@ -493,7 +492,9 @@ mod tests {
         let large_output = "x".repeat(500);
         let ctx = ToolCallContext::new("other_tool");
 
-        let result = wrapper.transform_output(large_output.clone(), &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(large_output.clone(), &ok(), &ctx, None)
+            .await;
         assert_eq!(result.output, large_output);
     }
 
@@ -519,7 +520,9 @@ mod tests {
         let large_output = (0..500).map(|i| format!("line_{} ", i)).collect::<String>();
         for tool_name in ["load_skill", "read_skill_file"] {
             let ctx = ToolCallContext::new(tool_name);
-            let result = wrapper.transform_output(large_output.clone(), &ok(), &ctx, None);
+            let result = wrapper
+                .transform_output(large_output.clone(), &ok(), &ctx, None)
+                .await;
             assert_eq!(
                 result.output, large_output,
                 "{tool_name} output must pass through unintercepted"
@@ -557,7 +560,9 @@ mod tests {
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(content.clone(), &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(content.clone(), &ok(), &ctx, None)
+            .await;
         assert!(
             result.output.contains("[scratchpad:"),
             "Output at exact threshold should be intercepted, got: {}",
@@ -570,7 +575,9 @@ mod tests {
         let budget2 = ContextBudget::new(128_000, 0.20, 0, Arc::new(counter2));
         let wrapper2 = ScratchpadWrapper::new(tools_above, storage, budget2);
 
-        let result2 = wrapper2.transform_output(content.clone(), &ok(), &ctx, None);
+        let result2 = wrapper2
+            .transform_output(content.clone(), &ok(), &ctx, None)
+            .await;
         assert_eq!(
             result2.output, content,
             "Output below threshold should pass through unchanged"
@@ -603,7 +610,7 @@ mod tests {
 
         assert_eq!(budget.scratchpad_usage(), (0, 0));
 
-        let result = wrapper.transform_output(content, &ok(), &ctx, None);
+        let result = wrapper.transform_output(content, &ok(), &ctx, None).await;
         assert!(result.output.contains("[scratchpad:"));
 
         let (intercepted, _) = budget.scratchpad_usage();
@@ -616,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrapper_falls_back_on_write_failure() {
         // Point storage at a non-existent directory that we then remove,
-        // so write_output_sync will fail with an I/O error.
+        // so the write will fail with an I/O error.
         let tmp = TempDir::new().unwrap();
         let storage = Arc::new(
             ScratchpadStorage::with_base_dir(tmp.path(), "req-wrap-fail")
@@ -638,7 +645,9 @@ mod tests {
         ctx.tool_initiator_id = "worker".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(large_output.clone(), &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(large_output.clone(), &ok(), &ctx, None)
+            .await;
 
         // Returning the raw payload would re-introduce the overflow scratchpad
         // exists to prevent. The wrapper must instead surface a compact error
@@ -698,7 +707,9 @@ mod tests {
         ctx.tool_initiator_id = "worker_a".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(outer.to_string(), &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(outer.to_string(), &ok(), &ctx, None)
+            .await;
         let output = result.output;
 
         // The companion was a JSON tree, so the pointer must list JSON-aware
@@ -759,7 +770,9 @@ mod tests {
         ctx.tool_initiator_id = "worker_rca".to_string();
         ctx.attempt = Some(0);
 
-        let result = wrapper.transform_output(large_output, &ok(), &ctx, None);
+        let result = wrapper
+            .transform_output(large_output, &ok(), &ctx, None)
+            .await;
         let output = result.output;
 
         // Primary file pointer

@@ -203,7 +203,7 @@ impl ToolWrapper for PersistenceWrapper {
     /// Duration-based promotion is handled in `on_complete` — those artifacts
     /// are written for observability but lack an inline footer because the
     /// output has already been returned to the LLM by that point.
-    fn transform_output(
+    async fn transform_output(
         &self,
         output: String,
         _outcome: &CallOutcome,
@@ -842,7 +842,9 @@ mod tests {
 
         let raw = "gigantic raw tool output that scratchpad would rewrite to a pointer";
         let outcome = crate::mcp_response::CallOutcome::Success(raw.to_string());
-        let _ = wrapper.transform_output(raw.to_string(), &outcome, &ctx, Some(&extracted));
+        let _ = wrapper
+            .transform_output(raw.to_string(), &outcome, &ctx, Some(&extracted))
+            .await;
 
         // Cached under the call id until on_complete consumes it.
         assert_eq!(
@@ -924,7 +926,9 @@ mod tests {
         // Use varied content to avoid tokenizer compression masking the threshold.
         let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
         let outcome = crate::mcp_response::CallOutcome::Success(raw.clone());
-        let result = composed.transform_output(raw.clone(), &outcome, &ctx, Some(&extracted));
+        let result = composed
+            .transform_output(raw.clone(), &outcome, &ctx, Some(&extracted))
+            .await;
 
         assert!(
             result.output.contains("[scratchpad:"),
@@ -1057,8 +1061,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn test_transform_output_appends_footer_when_size_exceeded() {
+    #[tokio::test]
+    async fn test_transform_output_appends_footer_when_size_exceeded() {
         let wrapper = promotion_wrapper(Some("sre".to_string()), 2, true, 10, 5000);
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
@@ -1066,37 +1070,41 @@ mod tests {
         let outcome = CallOutcome::Success(String::new());
         let long_output = "x".repeat(20);
 
-        let result =
-            wrapper.transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted));
+        let result = wrapper
+            .transform_output(long_output.clone(), &outcome, &ctx, Some(&extracted))
+            .await;
         assert!(result.output.contains(
             "[Tool output saved to artifact: task-0-sre-iter-2-log-search-0-output.txt]"
         ));
         assert!(result.output.starts_with(&long_output));
     }
 
-    #[test]
-    fn test_transform_output_no_footer_when_below_threshold() {
+    #[tokio::test]
+    async fn test_transform_output_no_footer_when_below_threshold() {
         let wrapper = promotion_wrapper(Some("sre".to_string()), 1, true, 500, 5000);
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result =
-            wrapper.transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted));
+        let result = wrapper
+            .transform_output("short output".to_string(), &outcome, &ctx, Some(&extracted))
+            .await;
         assert_eq!(result.output, "short output");
         assert!(!result.output.contains("[Tool output saved to artifact"));
     }
 
-    #[test]
-    fn test_transform_output_promotes_all_when_size_zero() {
+    #[tokio::test]
+    async fn test_transform_output_promotes_all_when_size_zero() {
         let wrapper = promotion_wrapper(None, 1, true, 0, 5000);
 
         let ctx = ToolCallContext::new("my_tool").with_task_context(3, "w".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result = wrapper.transform_output("tiny".to_string(), &outcome, &ctx, Some(&extracted));
+        let result = wrapper
+            .transform_output("tiny".to_string(), &outcome, &ctx, Some(&extracted))
+            .await;
         assert!(result.output.contains(
             "[Tool output saved to artifact: task-3-default-iter-1-my-tool-0-output.txt]"
         ));
@@ -1234,16 +1242,17 @@ mod tests {
         assert_eq!(extract_call_idx(Some(&serde_json::json!({}))), 0);
     }
 
-    #[test]
-    fn test_tool_output_artifact_filename_sanitization() {
+    #[tokio::test]
+    async fn test_tool_output_artifact_filename_sanitization() {
         let wrapper = promotion_wrapper(Some("SRE/Ops Worker".to_string()), 1, true, 0, 5000);
 
         let ctx = ToolCallContext::new("my_search tool").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result =
-            wrapper.transform_output("output".to_string(), &outcome, &ctx, Some(&extracted));
+        let result = wrapper
+            .transform_output("output".to_string(), &outcome, &ctx, Some(&extracted))
+            .await;
         assert!(
             result
                 .output
@@ -1251,20 +1260,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_transform_output_no_footer_when_persistence_disabled() {
+    #[tokio::test]
+    async fn test_transform_output_no_footer_when_persistence_disabled() {
         let wrapper = promotion_wrapper(Some("sre".to_string()), 1, false, 0, 5000);
 
         let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
         let extracted = serde_json::json!({"reasoning": "", "call_idx": 0});
         let outcome = CallOutcome::Success(String::new());
 
-        let result = wrapper.transform_output(
-            "big output here".to_string(),
-            &outcome,
-            &ctx,
-            Some(&extracted),
-        );
+        let result = wrapper
+            .transform_output(
+                "big output here".to_string(),
+                &outcome,
+                &ctx,
+                Some(&extracted),
+            )
+            .await;
         assert_eq!(result.output, "big output here");
         assert!(!result.output.contains("[Tool output saved to artifact"));
     }

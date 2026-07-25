@@ -1993,7 +1993,7 @@ mod tests {
                 TransformArgsResult::new(args)
             }
 
-            fn transform_output(
+            async fn transform_output(
                 &self,
                 output: String,
                 _outcome: &CallOutcome,
@@ -2054,7 +2054,9 @@ mod tests {
         // it to a pointer.
         let raw: String = (0..500).map(|i| format!("entry_{} ", i)).collect();
         let outcome = CallOutcome::Success(raw.clone());
-        let result = composed.transform_output(raw.clone(), &outcome, &ctx, None);
+        let result = composed
+            .transform_output(raw.clone(), &outcome, &ctx, None)
+            .await;
 
         assert_eq!(
             recording.output_seen.lock().unwrap().as_deref(),

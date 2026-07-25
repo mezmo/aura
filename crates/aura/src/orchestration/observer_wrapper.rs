@@ -10,11 +10,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::mcp_response::CallOutcome;
 use crate::tool_call_observer::{RetryHint, ToolCallObserver, ToolEvent};
-use crate::tool_wrapper::{
-    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
-};
+use crate::tool_wrapper::{ToolCallContext, ToolWrapper, TransformArgsResult};
 use rig::tool::ToolError;
 
 /// Counter for generating unique tool call IDs within a process.
@@ -71,16 +68,6 @@ impl ToolWrapper for ObserverWrapper {
             args,
             extracted: Some(extracted),
         }
-    }
-
-    fn transform_output(
-        &self,
-        output: String,
-        _outcome: &CallOutcome,
-        _ctx: &ToolCallContext,
-        _extracted: Option<&Value>,
-    ) -> TransformOutputResult {
-        TransformOutputResult::new(output)
     }
 
     fn handle_error(
