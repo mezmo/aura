@@ -204,6 +204,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "base64",
  "chrono",
+ "fastrand",
  "futures",
  "gemini-tokenizer",
  "http 1.4.0",

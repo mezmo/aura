@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use rig::client::CompletionClient;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
@@ -84,6 +85,75 @@ const PLANNING_COORDINATOR_MAX_DEPTH: usize = 6;
 /// Maximum attempts for a worker task before giving up.
 /// Attempt 1 = normal execution. Attempt 2 = retry with correction prompt.
 const MAX_WORKER_ATTEMPTS: usize = 2;
+
+/// Base delay for the planning transient retry backoff.
+const PLANNING_RETRY_BASE_MS: u64 = 250;
+
+/// Maximum delay for the planning transient retry backoff.
+const PLANNING_RETRY_CAP_MS: u64 = 4000;
+
+/// Jitter range as a percentage of the unjittered delay.
+const PLANNING_RETRY_JITTER_PERCENT: u64 = 25;
+
+// ============================================================================
+// Retry Backoff Abstractions
+// ============================================================================
+
+/// Sleep implementation used by the planning retry arm.
+/// Injected in tests so retry delays are recorded rather than waited out.
+#[async_trait::async_trait]
+trait Sleeper: Send + Sync {
+    async fn sleep(&self, duration: Duration);
+}
+
+/// Production sleeper: real `tokio::time::sleep`.
+struct TokioSleeper;
+
+#[async_trait::async_trait]
+impl Sleeper for TokioSleeper {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
+
+/// Source of bounded randomness for planning retry jitter.
+/// Injected in tests so delay bounds are deterministic.
+trait Jitter: Send + Sync {
+    /// Return a value in `[0, max)`.
+    fn next_u64(&self, max: u64) -> u64;
+}
+
+/// Production jitter: `fastrand` global thread-local RNG.
+struct FastrandJitter;
+
+impl Jitter for FastrandJitter {
+    fn next_u64(&self, max: u64) -> u64 {
+        if max == 0 {
+            return 0;
+        }
+        fastrand::u64(0..max)
+    }
+}
+
+/// Compute the jittered exponential backoff delay for a planning retry.
+///
+/// Delay is `min(cap, base * 2^(attempt-1))` plus a jitter drawn from
+/// `[-jitter_percent * unjittered, +jitter_percent * unjittered]`.
+fn compute_jittered_backoff(
+    attempt: usize,
+    base_ms: u64,
+    cap_ms: u64,
+    jitter_percent: u64,
+    jitter: &dyn Jitter,
+) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(63);
+    let unjittered_ms = base_ms.saturating_mul(1u64 << exponent).min(cap_ms);
+    let jitter_range = (unjittered_ms * jitter_percent) / 100;
+    let jitter_delta = jitter.next_u64(jitter_range.saturating_mul(2).saturating_add(1)) as i64
+        - jitter_range as i64;
+    let jittered_ms = unjittered_ms.saturating_add_signed(jitter_delta);
+    Duration::from_millis(jittered_ms)
+}
 
 // ============================================================================
 // Helper Structs
@@ -439,6 +509,14 @@ pub struct Orchestrator {
     /// the first one. Assigned by the factory after construction; see
     /// `OrchestratorFactory::spawn_orchestration_stream`.
     pub(super) usage_state: crate::UsageState,
+
+    /// Sleep implementation for the planning transient retry arm.
+    /// Production uses `tokio::time::sleep`; tests inject a recording mock.
+    sleeper: Arc<dyn Sleeper + Send + Sync>,
+
+    /// Randomness source for planning retry jitter.
+    /// Production uses `fastrand`; tests inject a deterministic mock.
+    jitter: Arc<dyn Jitter + Send + Sync>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -529,6 +607,8 @@ impl Orchestrator {
             mcp_manager,
             persistence,
             usage_state: crate::UsageState::new(),
+            sleeper: Arc::new(TokioSleeper),
+            jitter: Arc::new(FastrandJitter),
         })
     }
 
@@ -1568,12 +1648,14 @@ impl Orchestrator {
                         .conversation
                         .push(rig::completion::Message::user(&prompt));
                     if is_transient_planning_error(&err_str) {
-                        tracing::warn!(
-                            "Planning attempt {} transient error after {:.1}s, retrying: {}",
+                        handle_transient_planning_error(
                             attempt,
-                            attempt_start.elapsed().as_secs_f64(),
-                            err_str,
-                        );
+                            &err_str,
+                            attempt_start,
+                            &*self.sleeper,
+                            &*self.jitter,
+                        )
+                        .await;
                         continue;
                     }
                     tracing::warn!(
@@ -4437,6 +4519,42 @@ fn is_transient_planning_error(error: &str) -> bool {
     )
 }
 
+/// Sleep with a jittered exponential backoff before a transient planning retry.
+///
+/// Emits a dedicated `orchestration.planning.retry` span around the warning so
+/// each retry attempt is visible in traces, then waits for the computed delay.
+async fn handle_transient_planning_error(
+    attempt: usize,
+    err_str: &str,
+    attempt_start: Instant,
+    sleeper: &dyn Sleeper,
+    jitter: &dyn Jitter,
+) {
+    let delay = compute_jittered_backoff(
+        attempt,
+        PLANNING_RETRY_BASE_MS,
+        PLANNING_RETRY_CAP_MS,
+        PLANNING_RETRY_JITTER_PERCENT,
+        jitter,
+    );
+    let retry_span = tracing::info_span!(
+        "orchestration.planning.retry",
+        attempt,
+        delay_ms = delay.as_millis() as u64
+    );
+    async move {
+        tracing::warn!(
+            "Planning attempt {} transient error after {:.1}s, retrying: {}",
+            attempt,
+            attempt_start.elapsed().as_secs_f64(),
+            err_str,
+        );
+        sleeper.sleep(delay).await;
+    }
+    .instrument(retry_span)
+    .await;
+}
+
 /// Get a user-friendly suggestion for recovering from context overflow.
 fn context_overflow_suggestion(phase: &str) -> String {
     use super::prompt_constants::context_overflow;
@@ -4451,6 +4569,189 @@ fn context_overflow_suggestion(phase: &str) -> String {
 mod tests {
     use super::*;
     use crate::orchestration::persistence::artifact_kind_from_filename;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // =======================================================================
+    // Planning retry backoff mocks
+    // =======================================================================
+
+    struct RecordingSleeper {
+        durations: StdMutex<Vec<Duration>>,
+    }
+
+    impl RecordingSleeper {
+        fn new() -> Self {
+            Self {
+                durations: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn durations(&self) -> Vec<Duration> {
+            self.durations.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sleeper for RecordingSleeper {
+        async fn sleep(&self, duration: Duration) {
+            self.durations.lock().unwrap().push(duration);
+        }
+    }
+
+    struct FixedJitter(u64);
+
+    impl Jitter for FixedJitter {
+        fn next_u64(&self, _max: u64) -> u64 {
+            self.0
+        }
+    }
+
+    type CapturedEvent = (Option<String>, String);
+
+    struct CaptureLayer {
+        events: Arc<StdMutex<Vec<CapturedEvent>>>,
+    }
+
+    impl CaptureLayer {
+        fn new() -> (Self, Arc<StdMutex<Vec<CapturedEvent>>>) {
+            let events = Arc::new(StdMutex::new(Vec::new()));
+            (
+                Self {
+                    events: events.clone(),
+                },
+                events,
+            )
+        }
+    }
+
+    struct EventVisitor(String);
+
+    impl tracing::field::Visit for EventVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}={:?} ", field.name(), value);
+        }
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = EventVisitor(String::new());
+            event.record(&mut visitor);
+            let span_name = ctx.lookup_current().map(|s| s.name().to_string());
+            self.events.lock().unwrap().push((span_name, visitor.0));
+        }
+    }
+
+    // =======================================================================
+    // Planning retry backoff tests
+    // =======================================================================
+
+    #[test]
+    fn test_jittered_backoff_bounds() {
+        let base = 250;
+        let cap = 4000;
+        let jitter_percent = 25;
+
+        // No jitter: exact base delay.
+        let delay = compute_jittered_backoff(1, base, cap, jitter_percent, &FixedJitter(62));
+        assert_eq!(delay, Duration::from_millis(250));
+
+        // Maximum jitter for attempt 1: 250 + 25% rounded to 62ms = 312ms.
+        let delay = compute_jittered_backoff(1, base, cap, jitter_percent, &FixedJitter(124));
+        assert_eq!(delay, Duration::from_millis(312));
+
+        // Minimum jitter for attempt 1: 250 - 62ms = 188ms.
+        let delay = compute_jittered_backoff(1, base, cap, jitter_percent, &FixedJitter(0));
+        assert_eq!(delay, Duration::from_millis(188));
+    }
+
+    #[test]
+    fn test_jittered_backoff_exponential_and_cap() {
+        let base = 250;
+        let cap = 4000;
+        let jitter_percent = 25;
+
+        // No-jitter points.
+        assert_eq!(
+            compute_jittered_backoff(1, base, cap, jitter_percent, &FixedJitter(62)),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            compute_jittered_backoff(2, base, cap, jitter_percent, &FixedJitter(125)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            compute_jittered_backoff(3, base, cap, jitter_percent, &FixedJitter(250)),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            compute_jittered_backoff(4, base, cap, jitter_percent, &FixedJitter(500)),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            compute_jittered_backoff(5, base, cap, jitter_percent, &FixedJitter(1000)),
+            Duration::from_millis(4000)
+        );
+        // Beyond the cap the delay stays capped.
+        assert_eq!(
+            compute_jittered_backoff(10, base, cap, jitter_percent, &FixedJitter(1000)),
+            Duration::from_millis(4000)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_transient_planning_error_applies_backoff() {
+        let sleeper = Arc::new(RecordingSleeper::new());
+        let jitter = Arc::new(FixedJitter(62)); // No jitter for deterministic delay.
+
+        handle_transient_planning_error(
+            1,
+            "provider overloaded",
+            Instant::now(),
+            &*sleeper,
+            &*jitter,
+        )
+        .await;
+
+        let durations = sleeper.durations();
+        assert_eq!(durations.len(), 1);
+        assert_eq!(durations[0], Duration::from_millis(250));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_transient_planning_error_emits_retry_span() {
+        let (layer, events) = CaptureLayer::new();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sleeper = Arc::new(RecordingSleeper::new());
+        let jitter = Arc::new(FixedJitter(62));
+
+        handle_transient_planning_error(
+            1,
+            "provider overloaded",
+            Instant::now(),
+            &*sleeper,
+            &*jitter,
+        )
+        .await;
+
+        let has_retry_span = events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(span, _)| span.as_deref() == Some("orchestration.planning.retry"));
+        assert!(has_retry_span, "expected a retry span to be emitted");
+    }
 
     #[test]
     fn test_is_context_overflow_error_openai_style() {

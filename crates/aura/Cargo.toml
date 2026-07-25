@@ -49,6 +49,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 chrono = "0.4"
+fastrand = "2"
 
 # Vector stores - Qdrant support
 rig-qdrant = { workspace = true }
