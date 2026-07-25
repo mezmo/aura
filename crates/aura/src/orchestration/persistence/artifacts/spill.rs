@@ -117,8 +117,13 @@ impl std::fmt::Display for ArtifactRef {
     }
 }
 
+/// Marker appended when persistence fails to write the artifact, so the
+/// failure is visible inline instead of silently returning the full body.
+const ARTIFACT_WRITE_FAILED_MARKER: &str = "[Artifact write failed; full result unavailable]";
+
 /// Spill `result` to an artifact when it exceeds the configured threshold.
-/// Returns the original text when it fits inline or when writing fails.
+/// Returns the original text when it fits inline. On write failure, returns
+/// the bounded inline summary with a failure marker instead of the full body.
 pub async fn maybe_spill_result(
     persistence: &ExecutionPersistence,
     spill: &ResultSpillBudget,
@@ -147,7 +152,8 @@ pub async fn maybe_spill_result(
                 task_id,
                 e
             );
-            result
+            let summary = spill.truncate_to_summary(&result);
+            format!("{summary}\n\n{ARTIFACT_WRITE_FAILED_MARKER}")
         }
     }
 }
@@ -174,5 +180,48 @@ pub fn artifact_kind_from_filename(filename: &str) -> ArtifactKind {
         ArtifactKind::ToolOutput { tool_name }
     } else {
         ArtifactKind::Result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spill_failure_returns_bounded_summary() {
+        let budget = ResultSpillBudget::test_budget(10, 5);
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path(), None)
+            .await
+            .expect("valid temp dir should initialize");
+
+        // Fault injection: place a file where the artifacts directory must be
+        // created, forcing `write_result_artifact` to fail.
+        let artifacts_path = persistence.run_path().join("artifacts");
+        std::fs::write(&artifacts_path, "block").unwrap();
+
+        let result = "this result is longer than the threshold and should be spilled".to_string();
+        let got =
+            maybe_spill_result(&persistence, &budget, 7, Some("analyst"), result.clone()).await;
+
+        assert!(
+            !got.contains(&result),
+            "full unbounded result must not be returned inline"
+        );
+        assert!(
+            got.starts_with("this "),
+            "bounded summary prefix must be present"
+        );
+        assert!(
+            got.contains(ARTIFACT_WRITE_FAILED_MARKER),
+            "failure must be visibly marked"
+        );
+        let max_len = budget.summary_width().get() + ARTIFACT_WRITE_FAILED_MARKER.len() + 2;
+        assert!(
+            got.len() <= max_len,
+            "result must stay bounded: got {} bytes, max {} bytes",
+            got.len(),
+            max_len
+        );
     }
 }

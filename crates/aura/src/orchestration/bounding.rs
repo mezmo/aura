@@ -326,7 +326,7 @@ impl ResultSpillBudget {
     }
 
     #[cfg(test)]
-    fn test_budget(threshold: usize, summary: usize) -> Self {
+    pub(crate) fn test_budget(threshold: usize, summary: usize) -> Self {
         Self::from_config(threshold, summary)
     }
 
