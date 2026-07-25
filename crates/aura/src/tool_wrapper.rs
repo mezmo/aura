@@ -29,10 +29,21 @@
 //! // Create a wrapper that adds metrics
 //! struct MetricsWrapper { /* ... */ }
 //!
+//! #[async_trait::async_trait]
 //! impl ToolWrapper for MetricsWrapper {
 //!     fn wrap_schema(&self, schema: Value) -> Value { schema }
-//!     fn transform_args(&self, args: Value) -> Value { args }
-//!     fn transform_output(&self, output: String) -> String { output }
+//!     fn transform_args(&self, args: Value, ctx: &ToolCallContext) -> TransformArgsResult {
+//!         TransformArgsResult::new(args)
+//!     }
+//!     async fn transform_output(
+//!         &self,
+//!         output: String,
+//!         outcome: &CallOutcome,
+//!         ctx: &ToolCallContext,
+//!         extracted: Option<&Value>,
+//!     ) -> TransformOutputResult {
+//!         TransformOutputResult::new(output)
+//!     }
 //! }
 //!
 //! // Wrap a tool
@@ -581,30 +592,60 @@ where
             // Transform result
             match result {
                 Ok(output) => {
-                    let outcome = CallOutcome::classify_from_output(&output);
-                    let transformed = wrapper
-                        .transform_output(output, &outcome, &ctx, extracted.as_ref())
-                        .await;
+                    // Supervise the transform + completion hook in a spawned
+                    // task: transform_output can suspend (the scratchpad
+                    // wrapper awaits a filesystem write), and if this request
+                    // were cancelled mid-await the tool's success would
+                    // otherwise vanish — no persistence record, no observer
+                    // completion, a half-written scratchpad batch. The
+                    // spawned task runs to completion even after the caller
+                    // drops the JoinHandle.
+                    let wrapper_clone = wrapper.clone();
+                    let ctx_clone = ctx.clone();
+                    let extracted_clone = extracted.clone();
+                    let span = tracing::Span::current();
+                    let transform_handle = tokio::spawn(tracing::Instrument::instrument(
+                        async move {
+                            let outcome = CallOutcome::classify_from_output(&output);
+                            let transformed = wrapper_clone
+                                .transform_output(
+                                    output,
+                                    &outcome,
+                                    &ctx_clone,
+                                    extracted_clone.as_ref(),
+                                )
+                                .await;
+
+                            // Completion hook is fire-and-forget so it never
+                            // blocks the response; spawned from inside the
+                            // supervised task so it fires even when the
+                            // request has already been cancelled.
+                            let output_clone = transformed.output.clone();
+                            tokio::spawn(async move {
+                                wrapper_clone
+                                    .on_complete(
+                                        &ctx_clone,
+                                        extracted_clone.as_ref(),
+                                        Ok(&output_clone),
+                                        duration_ms,
+                                    )
+                                    .await;
+                            });
+
+                            transformed
+                        },
+                        span,
+                    ));
+                    let transformed = match transform_handle.await {
+                        Ok(t) => t,
+                        Err(join_error) => {
+                            return Err(ToolError::ToolCallError(join_error.into()));
+                        }
+                    };
 
                     if let Some(warning) = &transformed.warning {
                         tracing::warn!("Tool wrapper warning for {}: {}", tool_name, warning);
                     }
-
-                    // Spawn async completion hook (fire-and-forget, don't block the response)
-                    let wrapper_clone = wrapper.clone();
-                    let ctx_clone = ctx.clone();
-                    let extracted_clone = extracted.clone();
-                    let output_clone = transformed.output.clone();
-                    tokio::spawn(async move {
-                        wrapper_clone
-                            .on_complete(
-                                &ctx_clone,
-                                extracted_clone.as_ref(),
-                                Ok(&output_clone),
-                                duration_ms,
-                            )
-                            .await;
-                    });
 
                     Ok(transformed.output)
                 }

@@ -920,8 +920,11 @@ const SESSION_HISTORY_TEMPLATE: &str = include_str!("../prompts/session_history.
 
 /// Load run manifests from prior runs in a session directory.
 ///
-/// Reads `{base_path}/{session_id}/*/manifest.json`, sorts by timestamp
-/// descending, excludes the current run, and returns up to `limit` manifests.
+/// Reads `{base_path}/{session_id}/*/manifest.json`, excludes the current
+/// run, selects the `limit` most recently *created* runs (UUIDv7 dir-name
+/// order), and returns their manifests sorted by recorded timestamp
+/// descending. Creation order and completion-timestamp order diverge only
+/// for overlapping runs of one session.
 pub async fn load_session_manifests(
     base_path: &Path,
     session_id: &str,
@@ -936,12 +939,9 @@ pub async fn load_session_manifests(
     };
 
     // Collect candidate run dirs first, newest first, so manifest reads can
-    // stop at `limit` instead of reading every prior run. Run IDs are UUIDv7,
-    // so lexicographic order is creation order (the same invariant
-    // prune_session_runs relies on). Selection is therefore by creation
-    // order, not the manifest's completion timestamp; the two diverge only
-    // for overlapping runs of one session, and either is a defensible
-    // "most recent".
+    // stop at `limit` instead of reading every prior run. Run IDs are UUIDv7
+    // (since e689c79e), so lexicographic order is creation order (the same
+    // invariant prune_session_runs relies on).
     let mut run_dirs: Vec<String> = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
         match entry.file_type().await {
@@ -957,9 +957,19 @@ pub async fn load_session_manifests(
     }
     run_dirs.sort_unstable_by(|a, b| b.cmp(a));
 
+    // Sessions created before the v7 switch hold UUIDv4 run dirs, and v4
+    // names have no chronology — a v4 starting with 'f' would outrank every
+    // v7 starting with '0' and starve recent runs out of the limit. If any
+    // candidate is not v7, read every manifest and let the timestamp sort
+    // pick, matching the run's actual recency.
+    let all_v7 = run_dirs
+        .iter()
+        .all(|name| uuid::Uuid::parse_str(name).is_ok_and(|u| u.get_version_num() == 7));
+    let read_cap = if all_v7 { limit } else { usize::MAX };
+
     let mut manifests = Vec::new();
     for dir_name in run_dirs {
-        if manifests.len() >= limit {
+        if manifests.len() >= read_cap {
             break;
         }
         let manifest_path = session_dir.join(&dir_name).join("manifest.json");
@@ -990,6 +1000,7 @@ pub async fn load_session_manifests(
     // Manifests were read in dir-name (creation) order; sort by recorded
     // timestamp so the documented contract holds even if the two disagree.
     manifests.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    manifests.truncate(limit);
 
     Ok(manifests)
 }
@@ -1653,9 +1664,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let session_dir = temp_dir.path().join("cs_test");
 
-        // Timestamps deliberately DESCEND as dir names ascend: selection is
-        // by dir-name (creation) order, so run-4/run-3 must survive even
-        // though run-0 carries the newest completion timestamp.
+        // Non-UUID names (legacy-style) with timestamps DESCENDING as names
+        // ascend: the non-v7 fallback reads every manifest, so selection is
+        // by timestamp and run-0 (newest, 05:00) wins despite sorting last
+        // by name.
         for i in 0..5 {
             let id = format!("run-{}", i);
             let dir = session_dir.join(&id);
@@ -1674,9 +1686,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        // Output order is by manifest timestamp: run-3 (02:00) before run-4 (01:00).
-        assert_eq!(result[0].run_id, "run-3");
-        assert_eq!(result[1].run_id, "run-4");
+        assert_eq!(result[0].run_id, "run-0");
+        assert_eq!(result[1].run_id, "run-1");
+    }
+
+    #[tokio::test]
+    async fn test_load_session_manifests_v7_bounded_by_creation_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join("cs_test");
+
+        // All-v7 session: selection walks dir names newest-created-first and
+        // stops at `limit`, so the last two created runs survive even though
+        // their manifests carry the OLDEST timestamps.
+        let ids: Vec<String> = (0..4)
+            .map(|i| {
+                uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
+                    uuid::NoContext,
+                    1_750_000_000 + i,
+                    0,
+                ))
+                .to_string()
+            })
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            let dir = session_dir.join(id);
+            fs::create_dir_all(&dir).await.unwrap();
+            let m = make_test_manifest(id, &format!("2026-03-20T0{}:00:00Z", 5 - i), "Query");
+            fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_string_pretty(&m).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = load_session_manifests(temp_dir.path(), "cs_test", "exclude-none", 2)
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        // ids[2] and ids[3] are the newest-created; output is timestamp-sorted
+        // so ids[2] (03:00) precedes ids[3] (02:00).
+        assert_eq!(result[0].run_id, ids[2]);
+        assert_eq!(result[1].run_id, ids[3]);
     }
 
     #[tokio::test]
