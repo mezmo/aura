@@ -106,7 +106,7 @@ trait Sleeper: Send + Sync {
     async fn sleep(&self, duration: Duration);
 }
 
-/// Production sleeper: real `tokio::time::sleep`.
+/// Production sleeper: real async sleep.
 struct TokioSleeper;
 
 #[async_trait::async_trait]
@@ -123,7 +123,7 @@ trait Jitter: Send + Sync {
     fn next_u64(&self, max: u64) -> u64;
 }
 
-/// Production jitter: `fastrand` global thread-local RNG.
+/// Production jitter: thread-local non-cryptographic RNG.
 struct FastrandJitter;
 
 impl Jitter for FastrandJitter {
@@ -137,8 +137,9 @@ impl Jitter for FastrandJitter {
 
 /// Compute the jittered exponential backoff delay for a planning retry.
 ///
-/// Delay is `min(cap, base * 2^(attempt-1))` plus a jitter drawn from
-/// `[-jitter_percent * unjittered, +jitter_percent * unjittered]`.
+/// The unjittered delay is `min(cap, base * 2^(attempt-1))`. Jitter is then
+/// applied in `[-jitter_percent * unjittered, +jitter_percent * unjittered]`,
+/// and the final value is hard-clamped to `cap_ms`.
 fn compute_jittered_backoff(
     attempt: usize,
     base_ms: u64,
@@ -151,7 +152,9 @@ fn compute_jittered_backoff(
     let jitter_range = (unjittered_ms * jitter_percent) / 100;
     let jitter_delta = jitter.next_u64(jitter_range.saturating_mul(2).saturating_add(1)) as i64
         - jitter_range as i64;
-    let jittered_ms = unjittered_ms.saturating_add_signed(jitter_delta);
+    let jittered_ms = unjittered_ms
+        .saturating_add_signed(jitter_delta)
+        .min(cap_ms);
     Duration::from_millis(jittered_ms)
 }
 
@@ -511,11 +514,11 @@ pub struct Orchestrator {
     pub(super) usage_state: crate::UsageState,
 
     /// Sleep implementation for the planning transient retry arm.
-    /// Production uses `tokio::time::sleep`; tests inject a recording mock.
+    /// Production uses the real async sleep implementation.
     sleeper: Arc<dyn Sleeper + Send + Sync>,
 
     /// Randomness source for planning retry jitter.
-    /// Production uses `fastrand`; tests inject a deterministic mock.
+    /// Production uses a thread-local non-cryptographic RNG.
     jitter: Arc<dyn Jitter + Send + Sync>,
 }
 
@@ -1648,10 +1651,12 @@ impl Orchestrator {
                         .conversation
                         .push(rig::completion::Message::user(&prompt));
                     if is_transient_planning_error(&err_str) {
+                        let will_retry = attempt < max_correction_attempts;
                         handle_transient_planning_error(
                             attempt,
                             &err_str,
                             attempt_start,
+                            will_retry,
                             &*self.sleeper,
                             &*self.jitter,
                         )
@@ -4522,11 +4527,13 @@ fn is_transient_planning_error(error: &str) -> bool {
 /// Sleep with a jittered exponential backoff before a transient planning retry.
 ///
 /// Emits a dedicated `orchestration.planning.retry` span around the warning so
-/// each retry attempt is visible in traces, then waits for the computed delay.
+/// each retry attempt is visible in traces, then waits for the computed delay
+/// when a retry will actually follow.
 async fn handle_transient_planning_error(
     attempt: usize,
     err_str: &str,
     attempt_start: Instant,
+    will_retry: bool,
     sleeper: &dyn Sleeper,
     jitter: &dyn Jitter,
 ) {
@@ -4549,7 +4556,9 @@ async fn handle_transient_planning_error(
             attempt_start.elapsed().as_secs_f64(),
             err_str,
         );
-        sleeper.sleep(delay).await;
+        if will_retry {
+            sleeper.sleep(delay).await;
+        }
     }
     .instrument(retry_span)
     .await;
@@ -4605,6 +4614,16 @@ mod tests {
     impl Jitter for FixedJitter {
         fn next_u64(&self, _max: u64) -> u64 {
             self.0
+        }
+    }
+
+    /// Jitter that always returns the maximum possible value, producing the
+    /// largest positive jitter delta for cap-clamping tests.
+    struct MaxJitter;
+
+    impl Jitter for MaxJitter {
+        fn next_u64(&self, max: u64) -> u64 {
+            max.saturating_sub(1)
         }
     }
 
@@ -4706,6 +4725,15 @@ mod tests {
             compute_jittered_backoff(10, base, cap, jitter_percent, &FixedJitter(1000)),
             Duration::from_millis(4000)
         );
+        // Even with maximum positive jitter the final delay is clamped to the cap.
+        assert_eq!(
+            compute_jittered_backoff(5, base, cap, jitter_percent, &MaxJitter),
+            Duration::from_millis(cap)
+        );
+        assert_eq!(
+            compute_jittered_backoff(10, base, cap, jitter_percent, &MaxJitter),
+            Duration::from_millis(cap)
+        );
     }
 
     #[tokio::test]
@@ -4717,6 +4745,7 @@ mod tests {
             1,
             "provider overloaded",
             Instant::now(),
+            true,
             &*sleeper,
             &*jitter,
         )
@@ -4740,6 +4769,7 @@ mod tests {
             1,
             "provider overloaded",
             Instant::now(),
+            true,
             &*sleeper,
             &*jitter,
         )
@@ -4751,6 +4781,57 @@ mod tests {
             .iter()
             .any(|(span, _)| span.as_deref() == Some("orchestration.planning.retry"));
         assert!(has_retry_span, "expected a retry span to be emitted");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_handle_transient_planning_error_final_attempt_does_not_sleep() {
+        let (layer, events) = CaptureLayer::new();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sleeper = Arc::new(RecordingSleeper::new());
+        let jitter = Arc::new(FixedJitter(62)); // No jitter for deterministic delay.
+
+        // Non-final attempt: should sleep before the retry.
+        handle_transient_planning_error(
+            1,
+            "provider overloaded",
+            Instant::now(),
+            true,
+            &*sleeper,
+            &*jitter,
+        )
+        .await;
+
+        // Final attempt: span and warning must still be emitted, but no sleep.
+        handle_transient_planning_error(
+            3,
+            "provider overloaded",
+            Instant::now(),
+            false,
+            &*sleeper,
+            &*jitter,
+        )
+        .await;
+
+        let durations = sleeper.durations();
+        assert_eq!(
+            durations.len(),
+            1,
+            "final transient attempt must not invoke the sleeper"
+        );
+        assert_eq!(durations[0], Duration::from_millis(250));
+
+        let retry_event_count = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(span, _)| span.as_deref() == Some("orchestration.planning.retry"))
+            .count();
+        assert_eq!(
+            retry_event_count, 2,
+            "retry span must be emitted for both final and non-final attempts"
+        );
     }
 
     #[test]
