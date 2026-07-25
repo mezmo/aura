@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::orchestration::persistence::ExecutionPersistence;
-use crate::scratchpad::storage::ContentFormat;
+use crate::scratchpad::storage::{ContentFormat, ScratchpadPathError};
 use crate::scratchpad::tools::check_and_record_budget;
 use crate::scratchpad::wrapper::build_file_pointer;
 use crate::scratchpad::{ContextBudget, ScratchpadStorage};
@@ -75,6 +75,21 @@ impl ReadArtifactTool {
                     fmt = format.as_str(),
                 );
                 build_file_pointer(&headline, &file_ref)
+            }
+            // A validation-time I/O fault (stale mount, permission error) is
+            // transient territory: tell the model storage failed and a retry
+            // may work, instead of telling it to narrow the task.
+            Err(e @ ScratchpadPathError::Io { .. }) => {
+                tracing::warn!(
+                    "read_artifact: storage error building in-place reference for {}: {}",
+                    filename,
+                    e
+                );
+                format!(
+                    "[artifact '{filename}' was read (~{tokens} tokens) but a storage \
+                     error prevented building an in-place reference: {e}. This may be \
+                     transient - retry the read_artifact call.]"
+                )
             }
             Err(e) => {
                 // Can't reference the artifact in place (e.g. it lives outside

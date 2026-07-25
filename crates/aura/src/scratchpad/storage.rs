@@ -300,11 +300,15 @@ impl ScratchpadStorage {
     /// any filename that would escape the dir (defense-in-depth behind the
     /// `slugify_component` applied upstream).
     async fn safe_companion_path(&self, filename: &str) -> std::io::Result<PathBuf> {
-        self.validate_path(filename).await.map_err(|e| {
-            std::io::Error::new(
+        self.validate_path(filename).await.map_err(|e| match e {
+            // A genuine I/O fault keeps its kind (EIO on a stale mount must
+            // not read as an invalid filename); containment rejections
+            // become InvalidInput.
+            ScratchpadPathError::Io { source, .. } => source,
+            containment => std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Rejected companion filename {filename:?}: {e}"),
-            )
+                format!("Rejected companion filename {filename:?}: {containment}"),
+            ),
         })
     }
 
@@ -447,8 +451,21 @@ impl ScratchpadStorage {
                     });
                 }
             }
-            // The file doesn't exist yet; the lexical check stands.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // NotFound usually means the file doesn't exist yet (a write
+            // destination) and the lexical check stands — but a *dangling
+            // symlink* also canonicalizes to NotFound, and a later write
+            // through it would create a file wherever it points. Reject the
+            // symlink case; symlink_metadata does not follow the link.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(meta) = fs::symlink_metadata(&normalized).await
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(ScratchpadPathError::OutsideDirectory {
+                        path: file_path.to_string(),
+                        dir: self.read_root.display().to_string(),
+                    });
+                }
+            }
             Err(source) => {
                 return Err(ScratchpadPathError::Io {
                     path: file_path.to_string(),
@@ -958,12 +975,41 @@ mod tests {
 
         // Remove search permission so canonicalize fails with EACCES.
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (CAP_DAC_OVERRIDE) traverses 000 dirs anyway; the fault can't
+        // be established there, so skip rather than assert a non-failure.
+        let denial_holds = std::fs::metadata(sub.join("f.txt")).is_err();
         let result = storage.validate_path("locked/f.txt").await;
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        if !denial_holds {
+            eprintln!("skipping: process bypasses directory permissions (running as root?)");
+            return;
+        }
         assert!(
             matches!(result, Err(ScratchpadPathError::Io { .. })),
             "expected Io error, got {result:?}"
+        );
+    }
+
+    /// A dangling symlink canonicalizes to NotFound, which must NOT be
+    /// treated as a safe not-yet-written destination: a write through it
+    /// would create a file wherever the link points.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_validate_path_dangling_symlink_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-dangle")
+            .await
+            .unwrap();
+
+        let link = storage.dir().join("dangle.txt");
+        std::os::unix::fs::symlink(outside.path().join("planted.txt"), &link).unwrap();
+
+        let result = storage.validate_path("dangle.txt").await;
+        assert!(
+            matches!(result, Err(ScratchpadPathError::OutsideDirectory { .. })),
+            "expected containment rejection for dangling symlink, got {result:?}"
         );
     }
 

@@ -24,30 +24,33 @@
 //! # Example
 //!
 //! ```ignore
-//! use aura::tool_wrapper::{ToolWrapper, ToolWrapperConfig, WrappedTool};
+//! use std::sync::Arc;
 //!
-//! // Create a wrapper that adds metrics
-//! struct MetricsWrapper { /* ... */ }
+//! use aura::mcp_response::CallOutcome;
+//! use aura::tool_wrapper::{
+//!     ToolCallContext, ToolWrapper, TransformOutputResult, WrappedTool,
+//! };
+//! use serde_json::Value;
+//!
+//! // A wrapper that observes tool output; every method has a passthrough
+//! // default, so override only what you need.
+//! struct MetricsWrapper;
 //!
 //! #[async_trait::async_trait]
 //! impl ToolWrapper for MetricsWrapper {
-//!     fn wrap_schema(&self, schema: Value) -> Value { schema }
-//!     fn transform_args(&self, args: Value, ctx: &ToolCallContext) -> TransformArgsResult {
-//!         TransformArgsResult::new(args)
-//!     }
 //!     async fn transform_output(
 //!         &self,
 //!         output: String,
-//!         outcome: &CallOutcome,
-//!         ctx: &ToolCallContext,
-//!         extracted: Option<&Value>,
+//!         _outcome: &CallOutcome,
+//!         _ctx: &ToolCallContext,
+//!         _extracted: Option<&Value>,
 //!     ) -> TransformOutputResult {
 //!         TransformOutputResult::new(output)
 //!     }
 //! }
 //!
-//! // Wrap a tool
-//! let wrapped = WrappedTool::new(inner_tool, Arc::new(metrics_wrapper));
+//! // Wrap a tool (inner_tool: any rig Tool with Value args / String output)
+//! let wrapped = WrappedTool::new(inner_tool, Arc::new(MetricsWrapper));
 //! ```
 
 use async_trait::async_trait;
@@ -503,12 +506,15 @@ where
             }
 
             // Async pre-call gate (e.g. HITL approval): may call an external
-            // service or park for a human decision before the tool runs. Spawned
-            // (like the inner call below) so this future stays `Sync` — the
-            // async_trait `pre_call` future is `Send` but not `Sync`, and awaiting
-            // it inline would taint `call`'s returned future. Like validate_args,
-            // a rejection still runs on_complete so wrappers can clean up, and the
-            // error is returned to the LLM.
+            // service or park for a human decision before the tool runs.
+            // Spawned so the gate survives caller cancellation: a parked HITL
+            // approval owns registry state and timeout bookkeeping that its
+            // future must live to release — dropping it mid-await would strand
+            // the approval entry. The JoinHandle await is the cancellation
+            // point instead; the detached gate observes the request's
+            // cancellation token and cleans up. Like validate_args, a
+            // rejection still runs on_complete so wrappers can clean up, and
+            // the error is returned to the LLM.
             let pre_wrapper = wrapper.clone();
             let pre_args = clean_args.clone();
             let pre_ctx = ctx.clone();
@@ -570,8 +576,12 @@ where
                 }
             };
 
-            // Call inner tool (spawn to handle non-Sync futures).
-            // Propagate the current span so mcp.tool_call nests under execute_tool.
+            // Call inner tool in a spawned task: a panic in a third-party
+            // tool then surfaces as a JoinError-backed ToolError and flows
+            // through handle_error + on_complete like any tool failure,
+            // instead of unwinding the request task with observer and
+            // persistence state stranded mid-call. The current span is
+            // propagated so mcp.tool_call nests under execute_tool.
             let inner_clone = inner.clone();
             let args_clone = clean_args.clone();
             let tool_span = tracing::Span::current();
@@ -581,7 +591,6 @@ where
                 }),
                 tool_span,
             ));
-
             let result = match result_handle.await {
                 Ok(r) => r,
                 Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
@@ -639,7 +648,25 @@ where
                     let transformed = match transform_handle.await {
                         Ok(t) => t,
                         Err(join_error) => {
-                            return Err(ToolError::ToolCallError(join_error.into()));
+                            // A panicked transform never reached its own
+                            // on_complete spawn; emit the failure completion
+                            // here so observer and persistence state close out.
+                            let error = ToolError::ToolCallError(join_error.into());
+                            let error_msg = error.to_string();
+                            let wrapper_clone = wrapper.clone();
+                            let ctx_clone = ctx.clone();
+                            let extracted_clone = extracted.clone();
+                            tokio::spawn(async move {
+                                wrapper_clone
+                                    .on_complete(
+                                        &ctx_clone,
+                                        extracted_clone.as_ref(),
+                                        Err(&error_msg),
+                                        duration_ms,
+                                    )
+                                    .await;
+                            });
+                            return Err(error);
                         }
                     };
 
