@@ -460,8 +460,7 @@ impl From<TaskArtifactUpdateEvent> for LegacyTaskArtifactUpdateEvent {
     }
 }
 
-/// A v0.3 agent event — a task, a message, or a task update — discriminated on
-/// the wire by each variant's own `kind` field.
+/// A v0.3 agent event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum LegacyEvent {

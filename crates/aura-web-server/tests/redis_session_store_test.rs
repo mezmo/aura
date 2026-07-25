@@ -416,8 +416,7 @@ async fn approval_concurrent_resolves_have_exactly_one_winner() {
     );
 }
 
-/// A resolution leaves a durable decision record readable from any instance
-/// (issue #474), and the (rejected) second resolve does not disturb it.
+/// A resolution leaves a durable decision record readable from any instance (issue #474).
 #[tokio::test]
 async fn approval_resolve_records_decision_readable_cross_instance() {
     let config = test_config(60);
@@ -448,9 +447,7 @@ async fn approval_resolve_records_decision_readable_cross_instance() {
     );
 }
 
-/// The decision record's TTL keeps a margin past the parked record's, so the
-/// parking instance's deadline backstop can still read a decision that
-/// arrived just before expiry.
+/// The decision record's TTL keeps a margin past the parked record's.
 #[tokio::test]
 async fn decision_record_outlives_parked_record_ttl() {
     let approvals = connect(&test_config(60)).await.approvals();
@@ -655,10 +652,7 @@ async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
     );
 }
 
-/// The issue #474 repro over live Redis: the decision lands in the store but
-/// no wake is ever published (a suppressed wake channel, or a resolver crash
-/// after the claim). The parking instance's store poll recovers the decision
-/// well before the approval timeout instead of failing closed.
+/// Store poll recovers the decision well before the approval timeout.
 #[tokio::test]
 async fn store_only_resolve_wakes_parking_instance_via_poll() {
     let config = test_config(60);
@@ -923,10 +917,7 @@ mod a2a_bridge {
         assert_eq!(stored.status.state, TaskState::Canceled);
     }
 
-    /// The executing instance's own subscribers must learn the outcome of a
-    /// cancel driven from elsewhere: stopping the execution ends its stream
-    /// with no terminal event, so without the routed cancel's status they see
-    /// only a bare close and cannot tell a cancel from a dropped connection.
+    /// Subscribers on the executing instance learn the outcome of a routed cancel.
     #[tokio::test]
     async fn cancel_on_other_instance_terminates_subscribers_on_the_executing_one() {
         let config = test_config(60);
@@ -1005,9 +996,7 @@ async fn update_of_terminal_task_is_rejected() {
     assert_eq!(got.status.state, TaskState::Canceled);
 }
 
-/// Immutability rejects a *different* terminal state, not a second write of
-/// the one already recorded: both ends of a routed cancel record `Canceled`,
-/// and neither may see its write fail.
+/// Immutability rejects a *different* terminal state, not a second write of the same state.
 #[tokio::test]
 async fn rewriting_the_recorded_terminal_state_is_accepted() {
     let tasks = connect(&test_config(60)).await.tasks();

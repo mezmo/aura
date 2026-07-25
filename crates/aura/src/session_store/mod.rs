@@ -59,11 +59,7 @@ pub trait ApprovalStore: Send + Sync {
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
-    /// Record a terminal decision and remove the parked entry, atomically —
-    /// at-most-once resolution is enforced here, in the store. The recorded
-    /// decision must stay readable via [`Self::decision`] until at least the
-    /// approval's `expires_at`, so the parking process can recover a decision
-    /// whose bus wake was lost.
+    /// Record a terminal decision and remove the parked entry atomically.
     async fn resolve(
         &self,
         id: &DecisionId,

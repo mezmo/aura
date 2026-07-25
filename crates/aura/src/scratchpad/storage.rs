@@ -433,9 +433,7 @@ impl ScratchpadStorage {
         }
 
         // Stage 2: symlink resolution. We compare the canonicalized request
-        // against the canonicalized read root (canonicalize is consistent on
-        // macOS where /tmp is a symlink for /private/tmp — comparing one
-        // canonical to one non-canonical would always reject).
+        // against the canonicalized read root.
         match fs::canonicalize(&normalized).await {
             Ok(canonical_path) => {
                 let canonical_root = fs::canonicalize(&self.read_root).await.map_err(|source| {
@@ -452,18 +450,57 @@ impl ScratchpadStorage {
                 }
             }
             // NotFound usually means the file doesn't exist yet (a write
-            // destination) and the lexical check stands — but a *dangling
-            // symlink* also canonicalizes to NotFound, and a later write
-            // through it would create a file wherever it points. Reject the
-            // symlink case; symlink_metadata does not follow the link.
+            // destination) and the lexical check stands — but a dangling symlink
+            // also canonicalizes to NotFound. Walk from the leaf up: reject the
+            // first existing component if it is a symlink, otherwise require it
+            // to canonicalize inside the root.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Ok(meta) = fs::symlink_metadata(&normalized).await
-                    && meta.file_type().is_symlink()
-                {
-                    return Err(ScratchpadPathError::OutsideDirectory {
+                let canonical_root = fs::canonicalize(&self.read_root).await.map_err(|source| {
+                    ScratchpadPathError::Io {
                         path: file_path.to_string(),
-                        dir: self.read_root.display().to_string(),
-                    });
+                        source,
+                    }
+                })?;
+                let mut cursor = Some(normalized.as_path());
+                while let Some(component) = cursor {
+                    match fs::symlink_metadata(component).await {
+                        // First existing component: containment is judged on
+                        // its canonical target; a dangling link is rejected.
+                        Ok(_) => {
+                            match fs::canonicalize(component).await {
+                                Ok(canonical) => {
+                                    if !canonical.starts_with(&canonical_root) {
+                                        return Err(ScratchpadPathError::OutsideDirectory {
+                                            path: file_path.to_string(),
+                                            dir: self.read_root.display().to_string(),
+                                        });
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                    return Err(ScratchpadPathError::OutsideDirectory {
+                                        path: file_path.to_string(),
+                                        dir: self.read_root.display().to_string(),
+                                    });
+                                }
+                                Err(source) => {
+                                    return Err(ScratchpadPathError::Io {
+                                        path: file_path.to_string(),
+                                        source,
+                                    });
+                                }
+                            }
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            cursor = component.parent();
+                        }
+                        Err(source) => {
+                            return Err(ScratchpadPathError::Io {
+                                path: file_path.to_string(),
+                                source,
+                            });
+                        }
+                    }
                 }
             }
             Err(source) => {
@@ -956,10 +993,7 @@ mod tests {
         );
     }
 
-    /// A canonicalize failure that is NOT NotFound (here: a search-permission
-    /// denial on the parent dir) must surface as `Io`, not as a containment
-    /// violation — on a stale network mount the LLM should see a truthful
-    /// I/O error, not a fabricated "outside scratchpad directory".
+    /// A canonicalize failure that is NOT NotFound surfaces as `Io`.
     #[tokio::test]
     #[cfg(unix)]
     async fn test_validate_path_io_error_is_not_containment_violation() {
@@ -991,9 +1025,7 @@ mod tests {
         );
     }
 
-    /// A dangling symlink canonicalizes to NotFound, which must NOT be
-    /// treated as a safe not-yet-written destination: a write through it
-    /// would create a file wherever the link points.
+    /// A dangling symlink must NOT be treated as a safe not-yet-written destination.
     #[tokio::test]
     #[cfg(unix)]
     async fn test_validate_path_dangling_symlink_rejected() {
@@ -1010,6 +1042,47 @@ mod tests {
         assert!(
             matches!(result, Err(ScratchpadPathError::OutsideDirectory { .. })),
             "expected containment rejection for dangling symlink, got {result:?}"
+        );
+    }
+
+    /// A symlinked *ancestor* directory with a not-yet-created leaf is rejected.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_validate_path_symlinked_ancestor_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-alias")
+            .await
+            .unwrap();
+
+        // `alias` points at a real directory outside the read root.
+        let alias = storage.dir().join("alias");
+        std::os::unix::fs::symlink(outside.path(), &alias).unwrap();
+
+        let result = storage.validate_path("alias/new.json").await;
+        assert!(
+            matches!(result, Err(ScratchpadPathError::OutsideDirectory { .. })),
+            "expected containment rejection for symlinked ancestor, got {result:?}"
+        );
+    }
+
+    /// A symlink resolving *inside* the read root is legitimate.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_validate_path_in_root_symlink_ancestor_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let storage = ScratchpadStorage::with_base_dir(tmp.path(), "req-inlink")
+            .await
+            .unwrap();
+
+        let real = storage.dir().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, storage.dir().join("alias")).unwrap();
+
+        let result = storage.validate_path("alias/new.json").await;
+        assert!(
+            result.is_ok(),
+            "in-root symlinked ancestor must validate, got {result:?}"
         );
     }
 

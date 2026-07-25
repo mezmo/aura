@@ -128,12 +128,7 @@ impl RedisTaskStore {
         }
     }
 
-    /// Answer a write the script refused because the record is already
-    /// terminal. Re-recording the state that is already stored is a duplicate
-    /// of an outcome two instances both write (a routed cancel is recorded by
-    /// the instance that received it and by the one executing the task), so it
-    /// leaves the record alone and reports its unchanged version; any other
-    /// state is the conflict the script exists to reject.
+    /// Answer a write the script refused because the record is already terminal.
     async fn resolve_terminal_write(&self, task: &Task) -> Result<Option<u64>, A2AError> {
         let mut conn = self.conn.clone();
         let (stored, version): (Option<String>, Option<u64>) = redis::pipe()

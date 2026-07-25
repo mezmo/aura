@@ -1669,10 +1669,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let session_dir = temp_dir.path().join("cs_test");
 
-        // Non-UUID names (legacy-style) with timestamps DESCENDING as names
-        // ascend: the non-v7 fallback reads every manifest, so selection is
-        // by timestamp and run-0 (newest, 05:00) wins despite sorting last
-        // by name.
+        // Non-UUID names fall back to full traversal and timestamp sorting.
         for i in 0..5 {
             let id = format!("run-{}", i);
             let dir = session_dir.join(&id);
@@ -1700,9 +1697,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let session_dir = temp_dir.path().join("cs_test");
 
-        // All-v7 session: selection walks dir names newest-created-first and
-        // stops at `limit`, so the last two created runs survive even though
-        // their manifests carry the OLDEST timestamps.
+        // All-v7 session: selection stops at `limit` based on directory names.
         let ids: Vec<String> = (0..4)
             .map(|i| {
                 uuid::Uuid::new_v7(uuid::Timestamp::from_unix(
@@ -1730,8 +1725,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        // ids[2] and ids[3] are the newest-created; output is timestamp-sorted
-        // so ids[2] (03:00) precedes ids[3] (02:00).
+        // Output is timestamp-sorted.
         assert_eq!(result[0].run_id, ids[2]);
         assert_eq!(result[1].run_id, ids[3]);
     }

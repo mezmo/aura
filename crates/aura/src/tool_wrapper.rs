@@ -507,14 +507,7 @@ where
 
             // Async pre-call gate (e.g. HITL approval): may call an external
             // service or park for a human decision before the tool runs.
-            // Spawned so the gate survives caller cancellation: a parked HITL
-            // approval owns registry state and timeout bookkeeping that its
-            // future must live to release — dropping it mid-await would strand
-            // the approval entry. The JoinHandle await is the cancellation
-            // point instead; the detached gate observes the request's
-            // cancellation token and cleans up. Like validate_args, a
-            // rejection still runs on_complete so wrappers can clean up, and
-            // the error is returned to the LLM.
+            // Spawned so the gate survives caller cancellation.
             let pre_wrapper = wrapper.clone();
             let pre_args = clean_args.clone();
             let pre_ctx = ctx.clone();
@@ -576,12 +569,8 @@ where
                 }
             };
 
-            // Call inner tool in a spawned task: a panic in a third-party
-            // tool then surfaces as a JoinError-backed ToolError and flows
-            // through handle_error + on_complete like any tool failure,
-            // instead of unwinding the request task with observer and
-            // persistence state stranded mid-call. The current span is
-            // propagated so mcp.tool_call nests under execute_tool.
+            // Call inner tool in a spawned task to isolate panics.
+            // Propagate the current span so mcp.tool_call nests under execute_tool.
             let inner_clone = inner.clone();
             let args_clone = clean_args.clone();
             let tool_span = tracing::Span::current();
@@ -601,14 +590,8 @@ where
             // Transform result
             match result {
                 Ok(output) => {
-                    // Supervise the transform + completion hook in a spawned
-                    // task: transform_output can suspend (the scratchpad
-                    // wrapper awaits a filesystem write), and if this request
-                    // were cancelled mid-await the tool's success would
-                    // otherwise vanish — no persistence record, no observer
-                    // completion, a half-written scratchpad batch. The
-                    // spawned task runs to completion even after the caller
-                    // drops the JoinHandle.
+                    // Supervise the transform + completion hook in a spawned task
+                    // so it runs to completion even if the request is cancelled.
                     let wrapper_clone = wrapper.clone();
                     let ctx_clone = ctx.clone();
                     let extracted_clone = extracted.clone();
@@ -625,10 +608,7 @@ where
                                 )
                                 .await;
 
-                            // Completion hook is fire-and-forget so it never
-                            // blocks the response; spawned from inside the
-                            // supervised task so it fires even when the
-                            // request has already been cancelled.
+                            // Fire-and-forget completion hook.
                             let output_clone = transformed.output.clone();
                             tokio::spawn(async move {
                                 wrapper_clone
@@ -648,9 +628,7 @@ where
                     let transformed = match transform_handle.await {
                         Ok(t) => t,
                         Err(join_error) => {
-                            // A panicked transform never reached its own
-                            // on_complete spawn; emit the failure completion
-                            // here so observer and persistence state close out.
+                            // Emit failure completion on transform panic to close state.
                             let error = ToolError::ToolCallError(join_error.into());
                             let error_msg = error.to_string();
                             let wrapper_clone = wrapper.clone();

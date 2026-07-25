@@ -58,8 +58,7 @@ struct PendingApprovalsInner {
     wakes: Mutex<BTreeMap<DecisionId, WakeEntry>>,
 }
 
-/// The process-local half of one parked approval: its wake handle and wake
-/// task.
+/// The process-local half of one parked approval.
 struct WakeEntry {
     request_id: String,
     wake: oneshot::Sender<ApprovalDecision>,

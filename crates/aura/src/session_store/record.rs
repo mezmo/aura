@@ -61,9 +61,7 @@ pub enum OriginRecord {
     AgentRequested { reason: String },
 }
 
-/// Storage form of a recorded [`ApprovalDecision`]: the durable record that a
-/// resolution happened, what it was, and when. Same flat `approved`/`reason`
-/// shape as the webhook wire (`hitl::protocol::ApprovalDecisionWire`).
+/// Storage form of a recorded [`ApprovalDecision`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionRecord {
     pub approved: bool,
@@ -71,7 +69,7 @@ pub struct DecisionRecord {
     pub decided_at: Timestamp,
 }
 
-/// Stamps `decided_at` with the conversion (i.e. resolve) time.
+/// Stamps `decided_at` with the resolve time.
 impl From<&ApprovalDecision> for DecisionRecord {
     fn from(decision: &ApprovalDecision) -> Self {
         let (approved, reason) = match decision {

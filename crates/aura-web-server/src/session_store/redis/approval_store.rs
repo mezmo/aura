@@ -33,16 +33,10 @@ use super::request_err;
 const MIN_TTL_SECS: u64 = 1;
 /// Margin the request index's TTL keeps over its newest record's TTL.
 const REQ_INDEX_TTL_MARGIN_SECS: u64 = 60;
-/// Margin the decision record's TTL keeps over the parked record's remaining
-/// TTL.
+/// Decision TTL margin over the parked record's remaining TTL.
 const DECISION_TTL_MARGIN_MS: u64 = 60_000;
 
-/// The at-most-once claim plus the durable decision write, in one atomic step:
-/// take the parked record (KEYS[1]) and, only if it existed, record the
-/// decision (KEYS[2] = ARGV[1]) with the parked record's remaining TTL plus
-/// ARGV[2] milliseconds. Returns the parked record JSON, or nil when no live
-/// entry existed. Atomicity is what makes a resolver crash unable to consume
-/// the parked entry without leaving the decision behind.
+/// Atomic script for the at-most-once claim and durable decision write.
 static RESOLVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     redis::Script::new(
         r#"

@@ -130,10 +130,7 @@ impl ToolWrapper for ScratchpadWrapper {
         )
         .replace(['/', '\\', ':', ' '], "_");
 
-        // The write is awaited before the pointer is returned: the LLM's next
-        // tool call may read the file, so durability must precede pointer
-        // visibility. On slow (network) storage the latency lands on this one
-        // tool result, not on the runtime thread.
+        // The write is awaited before returning the pointer.
         let write = self.storage.write_output(&file_id, content).await;
         match write {
             Ok(result) => {

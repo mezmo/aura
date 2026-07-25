@@ -37,9 +37,7 @@ pub enum ScratchpadToolError {
 
 impl From<ScratchpadPathError> for ScratchpadToolError {
     /// Containment violations stay path errors; validation-time I/O faults
-    /// (stale network mount, permission error) surface as I/O errors so the
-    /// LLM sees a truthful, retryable failure instead of a fabricated
-    /// containment violation.
+    /// surface as I/O errors.
     fn from(e: ScratchpadPathError) -> Self {
         match e {
             ScratchpadPathError::Io { source, .. } => ScratchpadToolError::Io(source),
