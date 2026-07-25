@@ -384,8 +384,9 @@ impl ExecutionPersistence {
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
+            match entry.file_type().await {
+                Ok(ft) if ft.is_dir() => {}
+                _ => continue,
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name == "latest" || name == self.run_id {
@@ -695,11 +696,12 @@ impl ExecutionPersistence {
             .base_path
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "No parent directory"))?;
-        let canonical_session = session_dir
-            .canonicalize()
-            .unwrap_or_else(|_| session_dir.to_path_buf());
-        let canonical_artifact = artifact_path
-            .canonicalize()
+        let canonical_session = match fs::canonicalize(session_dir).await {
+            Ok(p) => p,
+            Err(_) => session_dir.to_path_buf(),
+        };
+        let canonical_artifact = fs::canonicalize(&artifact_path)
+            .await
             .map_err(|e| io::Error::new(e.kind(), format!("Artifact not found: {e}")))?;
         if !canonical_artifact.starts_with(&canonical_session) {
             return Err(io::Error::new(
@@ -761,11 +763,11 @@ impl ExecutionPersistence {
         }
 
         let artifacts_dir = self.artifacts_path();
-        if !artifacts_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = fs::read_dir(&artifacts_dir).await?;
+        let mut entries = match fs::read_dir(&artifacts_dir).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let mut filenames = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             if let Some(name) = entry.file_name().to_str() {
@@ -783,11 +785,11 @@ impl ExecutionPersistence {
         }
 
         let artifacts_dir = self.artifacts_path();
-        if !artifacts_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = fs::read_dir(&artifacts_dir).await?;
+        let mut entries = match fs::read_dir(&artifacts_dir).await {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
         let mut results = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             if let Some(name) = entry.file_name().to_str() {
@@ -813,9 +815,6 @@ impl ExecutionPersistence {
 
         for iter_num in 1..=self.current_iteration {
             let iter_dir = self.base_path.join(format!("iteration-{iter_num}"));
-            if !iter_dir.exists() {
-                continue;
-            }
             let Ok(mut entries) = fs::read_dir(&iter_dir).await else {
                 continue;
             };
@@ -888,11 +887,10 @@ impl ExecutionPersistence {
         let tool_calls_path = iter_path.join(&tool_file);
 
         // Read existing tool calls or start fresh
-        let mut tool_calls: Vec<ToolCallRecord> = if tool_calls_path.exists() {
-            let content = fs::read_to_string(&tool_calls_path).await?;
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            Vec::new()
+        let mut tool_calls: Vec<ToolCallRecord> = match fs::read_to_string(&tool_calls_path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
         };
 
         // Append new record
@@ -931,17 +929,19 @@ pub async fn load_session_manifests(
     limit: usize,
 ) -> io::Result<Vec<RunManifest>> {
     let session_dir = base_path.join(session_id);
-    if !session_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let mut entries = match fs::read_dir(&session_dir).await {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
 
     let mut manifests = Vec::new();
-    let mut entries = fs::read_dir(&session_dir).await?;
 
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
+        match entry.file_type().await {
+            Ok(ft) if ft.is_dir() => {}
+            _ => continue,
         }
 
         // Skip the current run and the "latest" symlink
@@ -952,10 +952,6 @@ pub async fn load_session_manifests(
         }
 
         let manifest_path = path.join("manifest.json");
-        if !manifest_path.exists() {
-            continue;
-        }
-
         match fs::read_to_string(&manifest_path).await {
             Ok(content) => match serde_json::from_str::<RunManifest>(&content) {
                 Ok(manifest) => manifests.push(manifest),
@@ -967,6 +963,9 @@ pub async fn load_session_manifests(
                     );
                 }
             },
+            // A run dir without a manifest is expected (crashed or in-flight
+            // run) and skipped without noise.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
                 tracing::warn!(
                     "Failed to read manifest at {}: {}",
@@ -2356,6 +2355,31 @@ mod tests {
 
         let empty = persistence.load_tool_records_for_task(99).await;
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_append_tool_call_accumulates() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+            .await
+            .unwrap();
+
+        let record = ToolCallRecord {
+            tool: "log_search".to_string(),
+            arguments: serde_json::json!({"query": "errors"}),
+            reasoning: "Searching".to_string(),
+            output: Some("found".to_string()),
+            error: None,
+            duration_ms: 10,
+            artifact_filename: None,
+        };
+
+        // First append lands on a missing file (fresh vec), second reads it back.
+        persistence.append_tool_call(0, 1, &record).await.unwrap();
+        persistence.append_tool_call(0, 1, &record).await.unwrap();
+
+        let records = persistence.load_tool_records_for_task(0).await;
+        assert_eq!(records.len(), 2);
     }
 
     #[tokio::test]
