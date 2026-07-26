@@ -82,6 +82,22 @@ async fn ping_succeeds() {
     assert_eq!(store.backend(), SessionStoreBackend::Redis);
 }
 
+/// The same battery the in-memory and file backends run in `aura`'s suite: a
+/// backend is only substitutable if it satisfies the shared contract, so redis
+/// is held to it against a live server rather than to a redis-shaped variant
+/// of it.
+#[tokio::test]
+async fn redis_conforms_to_the_approval_store_contract() {
+    let store = connect(&test_config(60)).await;
+    aura::session_store::conformance::assert_approval_store_conformance(store.approvals()).await;
+}
+
+#[tokio::test]
+async fn redis_conforms_to_the_event_bus_contract() {
+    let store = connect(&test_config(60)).await;
+    aura::session_store::conformance::assert_event_bus_conformance(store.bus()).await;
+}
+
 #[tokio::test]
 async fn connect_to_unreachable_backend_fails_fast() {
     let config = RedisSessionStoreConfig {

@@ -2,8 +2,16 @@
 //! for cross-instance session state ([`ApprovalStore`] and [`EventBus`] from
 //! `aura::session_store`, plus the upstream `a2a_server::TaskStore`).
 //!
-//! See `docs/design/session-storage.md` and
-//! `docs/adr/2026-07-08-session-storage.md`.
+//! `AURA_SESSION_STORE=file` buys durable parked HITL approvals and nothing
+//! else: that backend composes the file approval store with a process-local
+//! bus and a process-local A2A task store, so A2A tasks do **not** survive a
+//! restart under it. The composition is deliberate — a decision published to a
+//! process that no longer exists has no reader, and durable A2A tasks are the
+//! Redis backend's job (`docs/adr/2026-07-21-hitl-park-reify.md` decision 14).
+//!
+//! See `docs/design/session-storage.md`,
+//! `docs/adr/2026-07-08-session-storage.md`, and
+//! `docs/adr/2026-07-21-hitl-park-reify.md`.
 
 #[cfg(feature = "session-store-redis")]
 mod redis;
@@ -13,9 +21,10 @@ use std::sync::Arc;
 use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
-    ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
+    ApprovalStore, EventBus, FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus,
+    SessionStoreError,
 };
-use aura_config::{SessionStoreBackend, SessionStoreConfig};
+use aura_config::{FileSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 
 #[cfg(feature = "session-store-redis")]
 pub use redis::RedisSessionStore;
@@ -40,13 +49,15 @@ pub trait SessionStore: Send + Sync {
     async fn ping(&self) -> Result<(), SessionStoreError>;
 }
 
-/// Construct the configured backend. Fails fast on an unreachable networked
-/// backend or a `redis` config in a build without `session-store-redis`.
+/// Construct the configured backend. Fails fast on an unwritable file root, an
+/// unreachable networked backend, or a `redis` config in a build without
+/// `session-store-redis`.
 pub async fn build_session_store(
     config: &SessionStoreConfig,
 ) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
+        SessionStoreConfig::File(file_config) => Ok(Arc::new(FileSessionStore::open(file_config)?)),
         #[cfg(feature = "session-store-redis")]
         SessionStoreConfig::Redis(redis_config) => {
             Ok(Arc::new(RedisSessionStore::connect(redis_config).await?))
@@ -104,5 +115,163 @@ impl SessionStore for InMemorySessionStore {
 
     async fn ping(&self) -> Result<(), SessionStoreError> {
         Ok(())
+    }
+}
+
+/// Durable approvals under a filesystem root, composed with the process-local
+/// bus and A2A task store.
+pub struct FileSessionStore {
+    approvals: Arc<FileApprovalStore>,
+    tasks: Arc<InMemoryTaskStore>,
+    bus: Arc<InMemoryEventBus>,
+}
+
+impl FileSessionStore {
+    /// Open the store root, creating it if absent.
+    pub fn open(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
+        Ok(Self {
+            approvals: Arc::new(FileApprovalStore::open(&config.root)?),
+            tasks: Arc::new(InMemoryTaskStore::new()),
+            bus: Arc::new(InMemoryEventBus::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl SessionStore for FileSessionStore {
+    fn backend(&self) -> SessionStoreBackend {
+        SessionStoreBackend::File
+    }
+
+    fn approvals(&self) -> Arc<dyn ApprovalStore> {
+        self.approvals.clone()
+    }
+
+    fn tasks(&self) -> Arc<dyn TaskStore> {
+        self.tasks.clone()
+    }
+
+    fn bus(&self) -> Arc<dyn EventBus> {
+        self.bus.clone()
+    }
+
+    async fn ping(&self) -> Result<(), SessionStoreError> {
+        self.approvals.ping().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use a2a::{Task, TaskState, TaskStatus};
+    use aura::hitl::{
+        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, PROTOCOL_VERSION,
+        ParkedApproval,
+    };
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    /// Long enough for a process-local publish to land, short enough that a
+    /// backend that never delivers does not stall the suite.
+    const NON_DELIVERY_WINDOW: Duration = Duration::from_millis(200);
+
+    fn parked() -> ParkedApproval {
+        let now = chrono::Utc::now();
+        ParkedApproval {
+            request: ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                decision_id: DecisionId::generate(),
+                request_id: "req-file".to_string(),
+                scope: AgentScope::Single { session_id: None },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "test_*".to_string(),
+                },
+                items: vec![ApprovalItem {
+                    tool_name: "test_tool".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            },
+            registered_at: now,
+            expires_at: now + chrono::Duration::seconds(60),
+        }
+    }
+
+    fn task(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            context_id: "ctx-file".to_string(),
+            status: TaskStatus {
+                state: TaskState::Submitted,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        }
+    }
+
+    /// The file backend's composition is a deliberate mix, so pin all three
+    /// capabilities at once: a second store over the same root sees the first
+    /// store's approvals and none of its tasks or published events.
+    #[tokio::test]
+    async fn file_backend_composes_durable_approvals_with_a_process_local_bus_and_tasks() {
+        let root = tempfile::tempdir().unwrap();
+        let config = SessionStoreConfig::File(FileSessionStoreConfig {
+            root: root.path().to_path_buf(),
+        });
+
+        let first = build_session_store(&config).await.unwrap();
+        assert_eq!(first.backend(), SessionStoreBackend::File);
+        first.ping().await.unwrap();
+
+        let approval = parked();
+        let decision_id = approval.request.decision_id;
+        first.approvals().register(approval).await.unwrap();
+        first.tasks().create(task("task-file")).await.unwrap();
+        let mut subscriber = first.bus().subscribe("topic-file").await.unwrap();
+
+        let second = build_session_store(&config).await.unwrap();
+        assert!(
+            second
+                .approvals()
+                .get(&decision_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "approvals are file-backed, so a fresh store on the same root sees them",
+        );
+        assert!(
+            second.tasks().get("task-file").await.unwrap().is_none(),
+            "A2A tasks are in-memory, so they do not outlive the store that created them",
+        );
+
+        second
+            .bus()
+            .publish("topic-file", Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(NON_DELIVERY_WINDOW, subscriber.next())
+                .await
+                .is_err(),
+            "the bus is in-memory, so a separate store's publish reaches no subscriber here",
+        );
+    }
+
+    #[tokio::test]
+    async fn file_backend_rejects_a_root_it_cannot_create() {
+        let root = tempfile::NamedTempFile::new().unwrap();
+        let config = SessionStoreConfig::File(FileSessionStoreConfig {
+            root: root.path().to_path_buf(),
+        });
+
+        let Err(err) = build_session_store(&config).await else {
+            panic!("a plain file cannot serve as a store root");
+        };
+        assert!(matches!(err, SessionStoreError::Connect { .. }), "{err:?}");
     }
 }

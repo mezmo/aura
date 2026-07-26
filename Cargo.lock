@@ -386,6 +386,7 @@ dependencies = [
  "rig-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-test",
