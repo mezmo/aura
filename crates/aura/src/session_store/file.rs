@@ -19,14 +19,14 @@
 //! Every guarantee rests on a filesystem primitive rather than a process-local
 //! lock, so a root on shared storage behaves the same as one on a local disk.
 //!
-//! Durability invariant: every directory entry this backend depends on is
-//! synced into its parent before the store is handed out or a write is
+//! Durability invariant: every directory entry this backend creates is synced
+//! into the directory holding it, before the store is handed out or a write is
 //! acknowledged. That covers the record files, the `approvals/` directory, and
-//! any ancestor of the configured root that `open` had to create. It stops at
-//! the parent of the outermost directory it creates, which it did not create
-//! and does not sync: that parent is taken to be part of the deployment (a
-//! mount point, a package-created data directory) and to have outlived its own
-//! creation.
+//! any ancestor of the configured root that `open` had to create. Committing
+//! the outermost of those means syncing the pre-existing directory it landed
+//! in, so that directory is reached as well; what stays unsynced is its own
+//! entry one level higher up. The deployment is assumed to have supplied that
+//! path already durable (a mount point, a package-created data directory).
 //!
 //! POSIX only. Committing a directory entry needs `fsync` on a directory
 //! handle, which Windows does not offer, so [`FileApprovalStore::open`] refuses
@@ -44,9 +44,11 @@ use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 use super::{ApprovalStore, ParkedApprovalRecord, SessionStoreError};
 
+#[cfg(not(windows))]
 const APPROVALS_DIR: &str = "approvals";
 const RECORD_EXTENSION: &str = "json";
 const TAKEN_EXTENSION: &str = "taken";
+#[cfg(not(windows))]
 const PROBE_EXTENSION: &str = "probe";
 
 /// Parked approvals as one JSON file per decision, under a directory root.
@@ -83,6 +85,13 @@ impl FileApprovalStore {
 
     #[cfg(not(windows))]
     fn open_blocking(root: &Path) -> Result<Self, SessionStoreError> {
+        // Absolute from here down. A relative root's ancestor chain ends in the
+        // empty path, which has no parent to sync, and a store that outlives a
+        // change of working directory would otherwise stop naming its own
+        // files.
+        let root = std::path::absolute(root).map_err(|e| SessionStoreError::Connect {
+            reason: format!("cannot resolve {}: {e}", root.display()),
+        })?;
         let dir = root.join(APPROVALS_DIR);
         let created = uncreated_ancestors(&dir);
         fs::create_dir_all(&dir).map_err(|e| SessionStoreError::Connect {
@@ -251,6 +260,9 @@ fn take_record(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
 /// The directories on the way down to `dir` that do not exist yet, shallowest
 /// first. Collected before creation, since afterwards they are
 /// indistinguishable from directories the deployment supplied.
+///
+/// `dir` must be absolute: a relative chain ends at the empty path, which names
+/// the working directory but reports no parent to sync.
 #[cfg(not(windows))]
 fn uncreated_ancestors(dir: &Path) -> Vec<PathBuf> {
     let mut missing: Vec<PathBuf> = dir
@@ -336,7 +348,9 @@ fn io_err(action: &str, path: &Path, e: &io::Error) -> SessionStoreError {
     }
 }
 
-#[cfg(test)]
+/// The backend refuses to open on windows, so every test that opens one is
+/// POSIX-only; the contract for windows is pinned in `windows_tests`.
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
@@ -349,6 +363,11 @@ mod tests {
 
     /// Names the store root for the child half of the kill test.
     const CHILD_ROOT_ENV: &str = "AURA_TEST_FILE_STORE_ROOT";
+    /// Names the working directory the relative-root child runs from.
+    const CHILD_CWD_ENV: &str = "AURA_TEST_FILE_STORE_CWD";
+    /// A single-component relative root, the shape that has no absolute
+    /// ancestor chain to walk.
+    const RELATIVE_ROOT: &str = "session-store";
     /// Prefixes the line the child prints once its approval is on disk.
     const CHILD_READY: &str = "registered-decision-id=";
     /// Upper bound on the killed child's life, so an aborted parent cannot
@@ -393,7 +412,6 @@ mod tests {
 
     /// Shallowest first is the crash-consistency order: an ancestor's entry has
     /// to be committed before the entry it contains.
-    #[cfg(not(windows))]
     #[test]
     fn uncreated_ancestors_run_shallowest_first() {
         let root = tempfile::tempdir().unwrap();
@@ -404,11 +422,57 @@ mod tests {
         assert_eq!(uncreated_ancestors(&dir), vec![outer, inner, dir]);
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn an_existing_directory_has_no_uncreated_ancestors() {
         let root = tempfile::tempdir().unwrap();
         assert!(uncreated_ancestors(root.path()).is_empty());
+    }
+
+    /// `AURA_SESSION_STORE_URL` accepts a relative path, whose ancestor chain
+    /// ends at a path with no parent. The open runs in a child process so the
+    /// working directory it needs cannot disturb the rest of the suite, and so
+    /// the relative root lands in a temporary directory rather than the source
+    /// tree.
+    #[tokio::test]
+    async fn a_missing_relative_root_opens_on_the_first_try() {
+        let cwd = tempfile::tempdir().unwrap();
+        // The exit status and the resulting directory carry the whole verdict,
+        // so the child's own test output stays out of this run's.
+        let status = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "--ignored",
+                "session_store::file::tests::child_opens_a_relative_root",
+            ])
+            .env(CHILD_CWD_ENV, cwd.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("spawn the child test process");
+
+        assert!(status.success(), "opening a relative root failed: {status}");
+        assert!(
+            cwd.path().join(RELATIVE_ROOT).join(APPROVALS_DIR).is_dir(),
+            "the child's relative root must resolve under its working directory",
+        );
+    }
+
+    /// The child half of [`a_missing_relative_root_opens_on_the_first_try`]:
+    /// opens a single-component relative root once, from a working directory
+    /// the parent owns, and parks an approval in it.
+    #[tokio::test]
+    #[ignore = "spawned as a child process by a_missing_relative_root_opens_on_the_first_try"]
+    async fn child_opens_a_relative_root() {
+        let cwd = std::env::var(CHILD_CWD_ENV).expect("the parent sets the working directory");
+        std::env::set_current_dir(&cwd).expect("enter the parent's working directory");
+
+        let store = FileApprovalStore::open(RELATIVE_ROOT)
+            .await
+            .expect("a missing relative root opens on the first try");
+        let entry = parked("req-relative");
+        let id = entry.request.decision_id;
+        store.register(entry).await.expect("register succeeds");
+        assert!(store.get(&id).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -554,5 +618,24 @@ mod tests {
         stdout.flush().unwrap();
 
         tokio::time::sleep(CHILD_MAX_LIFETIME).await;
+    }
+}
+
+/// Runs only on a windows builder, where it is the whole contract: the backend
+/// refuses rather than opening a store it cannot make durable.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn open_refuses_to_run_on_windows() {
+        let Err(err) = FileApprovalStore::open(std::env::temp_dir()).await else {
+            panic!("the file session store must refuse to open on windows");
+        };
+        let SessionStoreError::Connect { reason } = err else {
+            panic!("expected a Connect error, got {err:?}");
+        };
+        assert!(reason.contains("not supported on windows"), "{reason}");
+        assert!(reason.contains("AURA_SESSION_STORE=memory"), "{reason}");
     }
 }
