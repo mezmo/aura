@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use aura_web_server::handlers::{self, CollectedResult, DeliveryMode};
-use aura_web_server::session_store::InMemorySessionStore;
+use aura_web_server::session_store::build_session_store;
 use aura_web_server::streaming::ToolResultMode;
 use aura_web_server::types::{
     ActiveRequestTracker, AppState, ChatCompletionRequest, ChatMessage, ChatMessageFunctionCall,
@@ -102,6 +102,25 @@ impl DirectBackend {
             }
         }
 
+        // Standalone selects a session store from the environment exactly as
+        // the server does, and threads the same store into the approval
+        // registry, so `AURA_SESSION_STORE=file` gives durable parking here
+        // too rather than a registry over its own private in-memory store.
+        let session_store_config = aura_config::SessionStoreConfig::from_env()
+            .context("Failed to read the session store configuration")?;
+        let session_store = build_session_store(&session_store_config)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open the {} session store",
+                    session_store_config.backend()
+                )
+            })?;
+        let pending_approvals = aura::hitl::PendingApprovals::with_backend(
+            session_store.approvals(),
+            session_store.bus(),
+        );
+
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: ToolResultMode::Aura,
@@ -118,9 +137,9 @@ impl DirectBackend {
             active_requests: Arc::new(ActiveRequestTracker::new()),
             default_agent: None,
             additional_tools: additional_tools_factory(),
-            pending_approvals: aura::hitl::PendingApprovals::new(),
+            pending_approvals,
             hitl_webhook_hmac,
-            session_store: Arc::new(InMemorySessionStore::new()),
+            session_store,
         });
 
         let headers_map = extra_headers.into_iter().collect();
@@ -459,8 +478,18 @@ fn convert_cli_tool_def(def: &ToolDefinition) -> ClientToolDefinition {
 
 #[cfg(test)]
 mod tests {
+    use aura_config::SessionStoreBackend;
+    use aura_web_server::session_store::InMemorySessionStore;
+    use tokio::sync::Mutex;
+
     use super::*;
     use crate::api::types::Message;
+
+    /// Serializes the tests that mutate the `AURA_SESSION_STORE*` variables,
+    /// which are process-global while `cargo test` runs threads in one process.
+    /// Async-aware because the window a test must hold it for spans the
+    /// awaited construction that reads those variables.
+    static SESSION_STORE_ENV: Mutex<()> = Mutex::const_new(());
 
     /// Construct a DirectBackend with test configs (no real TOML loading).
     fn make_backend(configs: Vec<aura_config::Config>) -> DirectBackend {
@@ -835,5 +864,99 @@ preamble = "p"
         let tools = req.tools.expect("tools should be present");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].function.name, "Shell");
+    }
+
+    const MINIMAL_CONFIG: &str = r#"
+[agent]
+name = "standalone-session-store"
+system_prompt = "p"
+
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "sk-standalone-test"
+"#;
+
+    /// Selecting the file backend is only half the requirement: the approval
+    /// registry the agent actually parks through must be the one built over
+    /// that store, so assert against the store root rather than `backend()`.
+    #[tokio::test]
+    async fn standalone_file_backend_parks_approvals_in_the_store_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("agent.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+        let root = workspace.path().join("session-store");
+
+        let backend = {
+            let _guard = SESSION_STORE_ENV.lock().await;
+            unsafe {
+                std::env::set_var("AURA_SESSION_STORE", "file");
+                std::env::set_var("AURA_SESSION_STORE_URL", &root);
+            }
+            let backend = DirectBackend::from_toml(config_path.to_str().unwrap(), Vec::new()).await;
+            unsafe {
+                std::env::remove_var("AURA_SESSION_STORE");
+                std::env::remove_var("AURA_SESSION_STORE_URL");
+            }
+            backend.expect("the file backend opens under a writable root")
+        };
+        assert_eq!(
+            backend.app_state.session_store.backend(),
+            SessionStoreBackend::File
+        );
+
+        let awaiting = backend
+            .app_state
+            .pending_approvals
+            .register(
+                aura::hitl::ApprovalRequest {
+                    version: aura::hitl::PROTOCOL_VERSION,
+                    decision_id: aura::hitl::DecisionId::generate(),
+                    request_id: "req-standalone".to_string(),
+                    scope: aura::hitl::AgentScope::Single { session_id: None },
+                    origin: aura::hitl::ApprovalOrigin::ConfigGate {
+                        matched_pattern: "test_*".to_string(),
+                    },
+                    items: vec![aura::hitl::ApprovalItem {
+                        tool_name: "test_tool".to_string(),
+                        arguments: serde_json::json!({}),
+                        tool_call_intent: None,
+                    }],
+                },
+                Duration::from_secs(60),
+            )
+            .await;
+
+        let record = std::fs::read(
+            root.join("approvals")
+                .join(format!("{}.json", awaiting.id())),
+        )
+        .expect("the parked approval is a file under the store root");
+        let record: aura::session_store::ParkedApprovalRecord =
+            serde_json::from_slice(&record).unwrap();
+        assert_eq!(record.decision_id, awaiting.id());
+    }
+
+    #[tokio::test]
+    async fn standalone_reports_an_unusable_session_store_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config_path = workspace.path().join("agent.toml");
+        std::fs::write(&config_path, MINIMAL_CONFIG).unwrap();
+
+        let _guard = SESSION_STORE_ENV.lock().await;
+        unsafe {
+            std::env::set_var("AURA_SESSION_STORE", "file");
+            std::env::set_var("AURA_SESSION_STORE_URL", &config_path);
+        }
+        let err = DirectBackend::from_toml(config_path.to_str().unwrap(), Vec::new()).await;
+        unsafe {
+            std::env::remove_var("AURA_SESSION_STORE");
+            std::env::remove_var("AURA_SESSION_STORE_URL");
+        }
+
+        let Err(err) = err else {
+            panic!("a plain file cannot serve as a store root");
+        };
+        assert!(err.to_string().contains("file session store"), "{err:#}");
     }
 }
