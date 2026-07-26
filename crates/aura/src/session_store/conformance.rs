@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use futures::StreamExt;
 use uuid::Uuid;
@@ -34,6 +34,8 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const RESOLVER_COUNT: usize = 8;
 /// How many times that race is rerun.
 const RACE_ROUNDS: usize = 32;
+/// Approvals parked under the one request the cancellation row cancels.
+const CANCELLED_APPROVALS: usize = 3;
 
 /// Assert `store` satisfies the [`ApprovalStore`] contract, panicking with
 /// every failing row.
@@ -276,26 +278,39 @@ async fn remove_is_idempotent(store: &dyn ApprovalStore) -> Result<()> {
     Ok(())
 }
 
+/// One request can hold several approvals, so cancellation is a fan-out, not a
+/// lookup: a backend that removes the first match it finds and stops must fail
+/// here. The survivor is resolved as well as read, because an index-backed
+/// backend can leave an entry visible but no longer consumable.
 async fn cancel_request_removes_only_its_own(store: &dyn ApprovalStore) -> Result<()> {
     let doomed_request = unique("cancel");
     let kept_request = unique("kept");
-    let doomed = parked_single(&doomed_request);
+    let mut doomed_ids = Vec::with_capacity(CANCELLED_APPROVALS);
+    for _ in 0..CANCELLED_APPROVALS {
+        let doomed = parked_single(&doomed_request);
+        doomed_ids.push(doomed.request.decision_id);
+        store.register(doomed).await?;
+    }
     let kept = parked_single(&kept_request);
-    let doomed_id = doomed.request.decision_id;
     let kept_id = kept.request.decision_id;
-    store.register(doomed).await?;
     store.register(kept).await?;
 
     store.cancel_request(&doomed_request).await?;
 
-    ensure!(
-        store.get(&doomed_id).await?.is_none(),
-        "cancelling a request must remove its approvals",
-    );
+    for id in &doomed_ids {
+        ensure!(
+            store.get(id).await?.is_none(),
+            "cancelling a request must remove every one of its {CANCELLED_APPROVALS} approvals; \
+             {id} survived",
+        );
+    }
     ensure!(
         store.get(&kept_id).await?.is_some(),
         "cancelling a request must leave other requests' approvals alone",
     );
+    resolve(store, &kept_id)
+        .await
+        .context("an approval left by cancel_request must still be resolvable")?;
     Ok(())
 }
 
