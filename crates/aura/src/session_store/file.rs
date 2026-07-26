@@ -9,6 +9,7 @@
 //! | `{root}/approvals/{decision_id}.json` | one [`ParkedApprovalRecord`]        |
 //! | `{root}/approvals/*.tmp`              | an interrupted write, ignored       |
 //! | `{root}/approvals/*.taken`            | an interrupted take, ignored        |
+//! | `{root}/approvals/*.probe`            | an interrupted open check, ignored  |
 //!
 //! There is no file-backed [`EventBus`](super::EventBus): a decision published
 //! to a process that is no longer awaiting it has no reader, so the file
@@ -20,6 +21,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -32,6 +34,7 @@ use super::{ApprovalStore, ParkedApprovalRecord, SessionStoreError};
 const APPROVALS_DIR: &str = "approvals";
 const RECORD_EXTENSION: &str = "json";
 const TAKEN_EXTENSION: &str = "taken";
+const PROBE_EXTENSION: &str = "probe";
 
 /// Parked approvals as one JSON file per decision, under a directory root.
 pub struct FileApprovalStore {
@@ -39,13 +42,19 @@ pub struct FileApprovalStore {
 }
 
 impl FileApprovalStore {
-    /// Open the approval directory under `root`, creating it if absent so an
-    /// unwritable root fails here rather than at the first park.
+    /// Open the approval directory under `root`, creating it if absent, and
+    /// prove it is writable before returning.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
         let dir = root.as_ref().join(APPROVALS_DIR);
         fs::create_dir_all(&dir).map_err(|e| SessionStoreError::Connect {
             reason: format!("cannot create {}: {e}", dir.display()),
         })?;
+        // `create_dir_all` is satisfied by an existing directory this process
+        // cannot write to, and only an actual write proves otherwise. Deferring
+        // that discovery to the first park is not equivalent: a park failing to
+        // persist is not fatal to the park, so the fault would surface as a
+        // caller waiting out its whole timeout instead of as a startup error.
+        probe_writable(&dir)?;
         Ok(Self { dir })
     }
 
@@ -100,10 +109,7 @@ impl ApprovalStore for FileApprovalStore {
         _decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
         let id = *id;
-        match self
-            .blocking(move |dir| take_record(&record_path(&dir, &id)))
-            .await
-        {
+        match self.blocking(move |dir| take_record(&dir, &id)).await {
             Ok(true) => Ok(()),
             Ok(false) => Err(ResolveError::NotFound),
             Err(err) => Err(ResolveError::Store(err)),
@@ -112,7 +118,7 @@ impl ApprovalStore for FileApprovalStore {
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         let id = *id;
-        self.blocking(move |dir| take_record(&record_path(&dir, &id)).map(|_| ()))
+        self.blocking(move |dir| take_record(&dir, &id).map(|_| ()))
             .await
     }
 
@@ -130,16 +136,39 @@ fn record_path(dir: &Path, id: &DecisionId) -> PathBuf {
 /// Write to a uniquely named temporary file and rename it over the record
 /// path: a concurrent reader sees either the previous record or the whole new
 /// one, never a half-written file. A failed rename leaves no debris behind.
+///
+/// Both syncs are load-bearing, and neither is implied by the rename. Without
+/// the file sync a crash can resurrect the record as a zero-length or torn
+/// file; without the directory sync the new name itself can be lost, and a
+/// park the caller was told is durable disappears across a reboot.
 fn write_record(dir: &Path, record: &ParkedApprovalRecord) -> Result<(), SessionStoreError> {
     let payload = serde_json::to_vec(record).expect("approval record serializes to JSON");
     let staged = dir.join(format!("{}.{}.tmp", record.decision_id, Uuid::now_v7()));
-    fs::write(&staged, payload).map_err(|e| io_err("write", &staged, &e))?;
+    write_synced(&staged, &payload).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })?;
 
     let path = record_path(dir, &record.decision_id);
     fs::rename(&staged, &path).map_err(|e| {
         let _ = fs::remove_file(&staged);
         io_err("commit", &path, &e)
-    })
+    })?;
+    sync_dir(dir)
+}
+
+fn write_synced(path: &Path, payload: &[u8]) -> Result<(), SessionStoreError> {
+    let mut file = fs::File::create(path).map_err(|e| io_err("create", path, &e))?;
+    file.write_all(payload)
+        .map_err(|e| io_err("write", path, &e))?;
+    file.sync_all().map_err(|e| io_err("sync", path, &e))
+}
+
+/// Commit a name change in the directory itself, so the entry a rename created
+/// or removed survives a host crash rather than only a process crash.
+fn sync_dir(dir: &Path) -> Result<(), SessionStoreError> {
+    fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|e| io_err("sync", dir, &e))
 }
 
 fn read_record(path: &Path) -> Result<Option<ParkedApproval>, SessionStoreError> {
@@ -157,19 +186,37 @@ fn read_record(path: &Path) -> Result<Option<ParkedApproval>, SessionStoreError>
 /// concurrent unlinks of one path each report success, which would hand the
 /// same approval to several consumers.
 ///
-/// Discarding the renamed file is best effort: the take already succeeded, so
-/// a failure there must not be reported as a lost race. What it can leave
-/// behind is an inert file no read path considers.
-fn take_record(path: &Path) -> Result<bool, SessionStoreError> {
-    let taken = path.with_extension(format!("{}.{TAKEN_EXTENSION}", Uuid::now_v7()));
-    match fs::rename(path, &taken) {
+/// The claim is only a claim once the directory entry is durable. An unsynced
+/// rename can be rolled back by a host crash, restoring the record for a
+/// second consumer after the first already ran the gated call — so a sync
+/// failure is reported as a lost take rather than a won one.
+///
+/// Discarding the claimed file afterwards is best effort: the take has already
+/// succeeded, so a failure there must not be reported as a lost race. What it
+/// can leave behind is an inert file no read path considers.
+fn take_record(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
+    let path = record_path(dir, id);
+    let claimed = dir.join(format!("{id}.{}.{TAKEN_EXTENSION}", Uuid::now_v7()));
+    match fs::rename(&path, &claimed) {
         Ok(()) => {
-            let _ = fs::remove_file(&taken);
+            sync_dir(dir)?;
+            let _ = fs::remove_file(&claimed);
             Ok(true)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(io_err("take", path, &e)),
+        Err(e) => Err(io_err("take", &path, &e)),
     }
+}
+
+/// Prove the directory accepts writes, by making one.
+fn probe_writable(dir: &Path) -> Result<(), SessionStoreError> {
+    let probe = dir.join(format!("{}.{PROBE_EXTENSION}", Uuid::now_v7()));
+    fs::write(&probe, b"").map_err(|e| SessionStoreError::Connect {
+        reason: format!("cannot write to {}: {e}", dir.display()),
+    })?;
+    fs::remove_file(&probe).map_err(|e| SessionStoreError::Connect {
+        reason: format!("cannot remove {}: {e}", probe.display()),
+    })
 }
 
 /// Scan for the request's approvals rather than keeping an index: cancellation
@@ -181,7 +228,7 @@ fn remove_by_request(dir: &Path, request_id: &str) -> Result<(), SessionStoreErr
             continue;
         };
         if parked.request.request_id == request_id {
-            take_record(&path)?;
+            take_record(dir, &parked.request.decision_id)?;
         }
     }
     Ok(())
@@ -267,6 +314,44 @@ mod tests {
         let nested = root.path().join("deep").join("store");
         FileApprovalStore::open(&nested).unwrap();
         assert!(nested.join(APPROVALS_DIR).is_dir());
+    }
+
+    #[tokio::test]
+    async fn open_leaves_no_probe_behind() {
+        let root = tempfile::tempdir().unwrap();
+        FileApprovalStore::open(root.path()).unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.path().join(APPROVALS_DIR))
+                .unwrap()
+                .count(),
+            0,
+        );
+    }
+
+    /// An existing directory satisfies `create_dir_all` whatever its mode, so
+    /// the open check has to be a write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_rejects_a_directory_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(APPROVALS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Mode bits do not constrain a superuser, so only assert when the
+        // directory is genuinely closed to this process.
+        let closed = std::fs::write(dir.join("writability-check"), b"").is_err();
+        let opened = FileApprovalStore::open(root.path());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if closed {
+            let Err(err) = opened else {
+                panic!("open must reject an approval directory it cannot write");
+            };
+            assert!(matches!(err, SessionStoreError::Connect { .. }), "{err:?}");
+        }
     }
 
     #[tokio::test]
