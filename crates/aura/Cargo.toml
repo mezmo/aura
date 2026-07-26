@@ -68,6 +68,9 @@ gemini-tokenizer = "0.2.0"
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Exports `session_store::conformance` so other crates can run the session-store
+# contract battery against their own backends.
+test-support = []
 # Integration test umbrella (mirrors aura-web-server pattern)
 integration = ["integration-stdio"]
 integration-stdio = []
