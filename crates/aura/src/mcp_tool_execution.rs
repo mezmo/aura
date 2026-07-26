@@ -108,7 +108,7 @@ pub async fn execute_mcp_tool(
 
     // Log tool call initiation
     info!(
-        "Calling HTTP Streamable MCP tool '{}' on server '{}'",
+        "Calling MCP tool '{}' on server '{}'",
         tool_name,
         client.server_url()
     );
@@ -136,10 +136,7 @@ pub async fn execute_mcp_tool(
     match result {
         Ok(response) => {
             let response_preview = preview_response(&response, 200);
-            info!(
-                "HTTP Streamable MCP tool '{}' completed: {}",
-                tool_name, response_preview
-            );
+            info!("MCP tool '{}' completed: {}", tool_name, response_preview);
             Ok(response)
         }
         Err(e) => {
@@ -148,16 +145,13 @@ pub async fn execute_mcp_tool(
                 None => {
                     // Cancellations must propagate unmodified — downstream
                     // lifecycle handling keys off the original error.
-                    info!("HTTP Streamable MCP tool '{}' cancelled", tool_name);
+                    info!("MCP tool '{}' cancelled", tool_name);
                     Err(ToolError::ToolCallError(e.into()))
                 }
                 Some(bounded) => {
                     // Full detail is preserved in the log line; the agent only
                     // ever sees the bounded message.
-                    error!(
-                        "HTTP Streamable MCP tool '{}' failed: {}",
-                        tool_name, err_str
-                    );
+                    error!("MCP tool '{}' failed: {}", tool_name, err_str);
                     Err(ToolError::ToolCallError(anyhow::anyhow!(bounded).into()))
                 }
             }
