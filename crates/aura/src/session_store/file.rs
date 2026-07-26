@@ -50,6 +50,9 @@ const RECORD_EXTENSION: &str = "json";
 const TAKEN_EXTENSION: &str = "taken";
 #[cfg(not(windows))]
 const PROBE_EXTENSION: &str = "probe";
+/// Non-empty, so the probe's file sync has bytes to flush.
+#[cfg(not(windows))]
+const PROBE_PAYLOAD: &[u8] = b"aura session store probe";
 
 /// Parked approvals as one JSON file per decision, under a directory root.
 pub struct FileApprovalStore {
@@ -58,8 +61,17 @@ pub struct FileApprovalStore {
 
 impl FileApprovalStore {
     /// Open the approval directory under `root`, creating and durably
-    /// committing any directory it has to make, and prove the result is
-    /// writable before returning.
+    /// committing any directory it has to make.
+    ///
+    /// Returning `Ok` means the mount has passed a dry run of a park, covering:
+    ///
+    /// - creating and writing a file
+    /// - `fsync` on that file
+    /// - `fsync` on the approval directory
+    /// - removing the file
+    ///
+    /// A mount that fails any step is rejected here rather than at the first
+    /// park.
     ///
     /// Supported on POSIX platforms only; see the durability invariant in the
     /// module documentation.
@@ -98,11 +110,11 @@ impl FileApprovalStore {
             reason: format!("cannot create {}: {e}", dir.display()),
         })?;
         commit_created_dirs(&created)?;
-        // `create_dir_all` is satisfied by an existing directory this process
-        // cannot write to, and only an actual write proves otherwise. Deferring
-        // that discovery to the first park is not equivalent: a park failing to
-        // persist is not fatal to the park, so the fault would surface as a
-        // caller waiting out its whole timeout instead of as a startup error.
+        // `create_dir_all` says nothing about what this mount will accept.
+        // Deferring that discovery to the first park is not equivalent: a park
+        // failing to persist is not fatal to the park, so the fault would
+        // surface as a caller waiting out its whole timeout instead of as a
+        // startup error.
         probe_writable(&dir)?;
         Ok(Self { dir })
     }
@@ -288,22 +300,46 @@ fn commit_created_dirs(created: &[PathBuf]) -> Result<(), SessionStoreError> {
             reason: format!("store path {} has no parent directory", dir.display()),
         })?;
         sync_dir(parent).map_err(|e| SessionStoreError::Connect {
-            reason: e.to_string(),
+            reason: format!("cannot commit {}: {}", dir.display(), detail(&e)),
         })?;
     }
     Ok(())
 }
 
-/// Prove the directory accepts writes, by making one.
+/// Prove the mount supports every step a park takes: create, write, sync the
+/// file, sync the directory, remove. Permission alone is not the question — a
+/// filesystem that rejects either sync leaves the store unable to make a single
+/// approval durable, and it must say so at startup rather than at the first
+/// park.
+///
+/// The probe runs the same helpers the write path does, so it cannot pass a
+/// primitive production would fail on.
 #[cfg(not(windows))]
 fn probe_writable(dir: &Path) -> Result<(), SessionStoreError> {
     let probe = dir.join(format!("{}.{PROBE_EXTENSION}", Uuid::now_v7()));
-    fs::write(&probe, b"").map_err(|e| SessionStoreError::Connect {
-        reason: format!("cannot write to {}: {e}", dir.display()),
-    })?;
-    fs::remove_file(&probe).map_err(|e| SessionStoreError::Connect {
-        reason: format!("cannot remove {}: {e}", probe.display()),
-    })
+    let exercised = write_synced(&probe, PROBE_PAYLOAD).and_then(|()| sync_dir(dir));
+    // Unconditional, so a failed check leaves the directory as it found it.
+    let removed = fs::remove_file(&probe);
+
+    exercised
+        .and_then(|()| removed.map_err(|e| io_err("remove", &probe, &e)))
+        .map_err(|err| SessionStoreError::Connect {
+            reason: format!(
+                "{} is unusable as a store root: {}",
+                dir.display(),
+                detail(&err)
+            ),
+        })
+}
+
+/// Unwrap one layer of error prose, so a startup failure reads as a single
+/// sentence naming the primitive that failed.
+#[cfg(not(windows))]
+fn detail(err: &SessionStoreError) -> String {
+    match err {
+        SessionStoreError::Request { reason } => reason.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Scan for the request's approvals rather than keeping an index: cancellation
