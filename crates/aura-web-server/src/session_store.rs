@@ -3,11 +3,11 @@
 //! `aura::session_store`, plus the upstream `a2a_server::TaskStore`).
 //!
 //! `AURA_SESSION_STORE=file` buys durable parked HITL approvals and nothing
-//! else: that backend composes the file approval store with a process-local
-//! bus and a process-local A2A task store, so A2A tasks do **not** survive a
-//! restart under it. The composition is deliberate — a decision published to a
-//! process that no longer exists has no reader, and durable A2A tasks are the
-//! Redis backend's job (`docs/adr/2026-07-21-hitl-park-reify.md` decision 14).
+//! else. That backend pairs the file approval store with a process-local bus
+//! and a process-local A2A task store, so A2A tasks under it are lost on
+//! restart. Two reasons, both deliberate: a decision published to a process
+//! that no longer exists has no reader, and durable A2A tasks belong to the
+//! Redis backend (`docs/adr/2026-07-21-hitl-park-reify.md` decision 14).
 //!
 //! See `docs/design/session-storage.md`,
 //! `docs/adr/2026-07-08-session-storage.md`, and
@@ -57,7 +57,9 @@ pub async fn build_session_store(
 ) -> Result<Arc<dyn SessionStore>, SessionStoreError> {
     match config {
         SessionStoreConfig::Memory => Ok(Arc::new(InMemorySessionStore::new())),
-        SessionStoreConfig::File(file_config) => Ok(Arc::new(FileSessionStore::open(file_config)?)),
+        SessionStoreConfig::File(file_config) => {
+            Ok(Arc::new(FileSessionStore::open(file_config).await?))
+        }
         #[cfg(feature = "session-store-redis")]
         SessionStoreConfig::Redis(redis_config) => {
             Ok(Arc::new(RedisSessionStore::connect(redis_config).await?))
@@ -118,8 +120,8 @@ impl SessionStore for InMemorySessionStore {
     }
 }
 
-/// Durable approvals under a filesystem root, composed with the process-local
-/// bus and A2A task store.
+/// Durable approvals under a filesystem root, alongside the process-local bus
+/// and A2A task store.
 pub struct FileSessionStore {
     approvals: Arc<FileApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
@@ -128,9 +130,9 @@ pub struct FileSessionStore {
 
 impl FileSessionStore {
     /// Open the store root, creating it if absent.
-    pub fn open(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
+    pub async fn open(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
         Ok(Self {
-            approvals: Arc::new(FileApprovalStore::open(&config.root)?),
+            approvals: Arc::new(FileApprovalStore::open(config.root.clone()).await?),
             tasks: Arc::new(InMemoryTaskStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
         })
