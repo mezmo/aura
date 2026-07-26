@@ -162,7 +162,9 @@ impl SessionStore for FileSessionStore {
     }
 }
 
-#[cfg(test)]
+/// Every row here opens a file backend, which refuses to run on windows; the
+/// refusal itself is pinned in `aura::session_store`.
+#[cfg(all(test, not(windows)))]
 mod tests {
     use std::time::Duration;
 

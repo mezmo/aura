@@ -478,8 +478,10 @@ fn convert_cli_tool_def(def: &ToolDefinition) -> ClientToolDefinition {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
     use aura_config::SessionStoreBackend;
     use aura_web_server::session_store::InMemorySessionStore;
+    #[cfg(not(windows))]
     use tokio::sync::Mutex;
 
     use super::*;
@@ -489,6 +491,7 @@ mod tests {
     /// which are process-global while `cargo test` runs threads in one process.
     /// Async-aware because the window a test must hold it for spans the
     /// awaited construction that reads those variables.
+    #[cfg(not(windows))]
     static SESSION_STORE_ENV: Mutex<()> = Mutex::const_new(());
 
     /// Construct a DirectBackend with test configs (no real TOML loading).
@@ -866,6 +869,7 @@ preamble = "p"
         assert_eq!(tools[0].function.name, "Shell");
     }
 
+    #[cfg(not(windows))]
     const MINIMAL_CONFIG: &str = r#"
 [agent]
 name = "standalone-session-store"
@@ -880,6 +884,9 @@ api_key = "sk-standalone-test"
     /// Selecting the file backend is only half the requirement: the approval
     /// registry the agent actually parks through must be the one built over
     /// that store, so assert against the store root rather than `backend()`.
+    ///
+    /// POSIX-only, like every row that opens a file backend.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn standalone_file_backend_parks_approvals_in_the_store_root() {
         let workspace = tempfile::tempdir().unwrap();
@@ -937,6 +944,9 @@ api_key = "sk-standalone-test"
         assert_eq!(record.decision_id, awaiting.id());
     }
 
+    /// POSIX-only: on windows the backend refuses for its own reason, so this
+    /// row would pass without exercising the unusable-root path at all.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn standalone_reports_an_unusable_session_store_root() {
         let workspace = tempfile::tempdir().unwrap();
