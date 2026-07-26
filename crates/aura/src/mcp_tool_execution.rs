@@ -88,7 +88,7 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
     }
 }
 
-/// Execute an HTTP MCP tool with unified logging and error handling
+/// Execute an MCP tool with unified logging and error handling
 ///
 /// Provides consistent behavior with:
 /// 1. Structured logging (tool call start, arguments, completion)
