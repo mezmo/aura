@@ -79,7 +79,7 @@ integration-scratchpad = []  # scratchpad_test
 
 # Session-store integration tests (needs a live Redis/Valkey; see
 # `AURA_TEST_REDIS_URL` in tests/redis_session_store_test.rs)
-integration-session-store = ["session-store-redis"]  # redis_session_store_test
+integration-session-store = ["session-store-redis", "aura/test-support"]  # redis_session_store_test
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -93,3 +93,4 @@ aura-test-utils = { path = "../aura-test-utils" }
 aura-events = { path = "../aura-events" }
 tower = "0.5"
 http-body-util = "0.1"
+tempfile = "3"
