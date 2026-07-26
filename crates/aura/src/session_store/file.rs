@@ -1,7 +1,7 @@
 //! File-backed session-store capabilities: durable parked approvals with no
 //! infrastructure beyond a writable directory.
 //!
-//! On-disk layout under the store root — a persisted contract shared by every
+//! On-disk layout under the store root, a persisted contract shared by every
 //! process reading the store:
 //!
 //! | Path                                  | Contents                            |
@@ -18,6 +18,19 @@
 //!
 //! Every guarantee rests on a filesystem primitive rather than a process-local
 //! lock, so a root on shared storage behaves the same as one on a local disk.
+//!
+//! Durability invariant: every directory entry this backend depends on is
+//! synced into its parent before the store is handed out or a write is
+//! acknowledged. That covers the record files, the `approvals/` directory, and
+//! any ancestor of the configured root that `open` had to create. It stops at
+//! the parent of the outermost directory it creates, which it did not create
+//! and does not sync: that parent is taken to be part of the deployment (a
+//! mount point, a package-created data directory) and to have outlived its own
+//! creation.
+//!
+//! POSIX only. Committing a directory entry needs `fsync` on a directory
+//! handle, which Windows does not offer, so [`FileApprovalStore::open`] refuses
+//! to run there rather than silently dropping the durability claim.
 
 use std::fs;
 use std::io;
@@ -42,13 +55,40 @@ pub struct FileApprovalStore {
 }
 
 impl FileApprovalStore {
-    /// Open the approval directory under `root`, creating it if absent, and
-    /// prove it is writable before returning.
-    pub fn open(root: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
-        let dir = root.as_ref().join(APPROVALS_DIR);
+    /// Open the approval directory under `root`, creating and durably
+    /// committing any directory it has to make, and prove the result is
+    /// writable before returning.
+    ///
+    /// Supported on POSIX platforms only; see the durability invariant in the
+    /// module documentation.
+    pub async fn open(root: impl Into<PathBuf>) -> Result<Self, SessionStoreError> {
+        let root = root.into();
+        tokio::task::spawn_blocking(move || Self::open_blocking(&root))
+            .await
+            .map_err(|e| SessionStoreError::Connect {
+                reason: format!("file store open did not complete: {e}"),
+            })?
+    }
+
+    #[cfg(windows)]
+    fn open_blocking(_root: &Path) -> Result<Self, SessionStoreError> {
+        Err(SessionStoreError::Connect {
+            reason: "the file session store is not supported on windows: committing a \
+                     directory entry requires fsync on a directory handle, which windows \
+                     does not provide, so parked approvals could not be made durable. Use \
+                     AURA_SESSION_STORE=memory or AURA_SESSION_STORE=redis"
+                .to_string(),
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn open_blocking(root: &Path) -> Result<Self, SessionStoreError> {
+        let dir = root.join(APPROVALS_DIR);
+        let created = uncreated_ancestors(&dir);
         fs::create_dir_all(&dir).map_err(|e| SessionStoreError::Connect {
             reason: format!("cannot create {}: {e}", dir.display()),
         })?;
+        commit_created_dirs(&created)?;
         // `create_dir_all` is satisfied by an existing directory this process
         // cannot write to, and only an actual write proves otherwise. Deferring
         // that discovery to the first park is not equivalent: a park failing to
@@ -137,10 +177,10 @@ fn record_path(dir: &Path, id: &DecisionId) -> PathBuf {
 /// path: a concurrent reader sees either the previous record or the whole new
 /// one, never a half-written file. A failed rename leaves no debris behind.
 ///
-/// Both syncs are load-bearing, and neither is implied by the rename. Without
-/// the file sync a crash can resurrect the record as a zero-length or torn
-/// file; without the directory sync the new name itself can be lost, and a
-/// park the caller was told is durable disappears across a reboot.
+/// The rename implies neither sync. Without the file sync, a crash can leave
+/// the record zero-length or torn; without the directory sync, the new name
+/// itself may not survive the reboot. Either omission quietly downgrades a park
+/// the caller was told was durable.
 fn write_record(dir: &Path, record: &ParkedApprovalRecord) -> Result<(), SessionStoreError> {
     let payload = serde_json::to_vec(record).expect("approval record serializes to JSON");
     let staged = dir.join(format!("{}.{}.tmp", record.decision_id, Uuid::now_v7()));
@@ -182,14 +222,14 @@ fn read_record(path: &Path) -> Result<Option<ParkedApproval>, SessionStoreError>
 /// Take the record by renaming it to a name only this call knows, reporting
 /// whether this call is the one that got it. Rename is the at-most-once
 /// primitive: of any number of concurrent callers exactly one moves the file
-/// and the rest see it already gone. Unlinking is not a substitute — on macOS,
+/// and the rest see it already gone. Unlinking is not a substitute: on macOS,
 /// concurrent unlinks of one path each report success, which would hand the
 /// same approval to several consumers.
 ///
 /// The claim is only a claim once the directory entry is durable. An unsynced
 /// rename can be rolled back by a host crash, restoring the record for a
-/// second consumer after the first already ran the gated call — so a sync
-/// failure is reported as a lost take rather than a won one.
+/// second consumer after the first already ran the gated call. A sync failure
+/// is reported as a lost take rather than a won one.
 ///
 /// Discarding the claimed file afterwards is best effort: the take has already
 /// succeeded, so a failure there must not be reported as a lost race. What it
@@ -208,7 +248,42 @@ fn take_record(dir: &Path, id: &DecisionId) -> Result<bool, SessionStoreError> {
     }
 }
 
+/// The directories on the way down to `dir` that do not exist yet, shallowest
+/// first. Collected before creation, since afterwards they are
+/// indistinguishable from directories the deployment supplied.
+#[cfg(not(windows))]
+fn uncreated_ancestors(dir: &Path) -> Vec<PathBuf> {
+    let mut missing: Vec<PathBuf> = dir
+        .ancestors()
+        .take_while(|path| !path.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    missing.reverse();
+    missing
+}
+
+/// Commit each newly created directory by syncing the directory that names it.
+/// Creating a directory is a namespace change like any other: without this, a
+/// register can sync a record into an `approvals/` directory that a host crash
+/// then takes away, losing the approval and the directory together.
+///
+/// Shallowest first, so an ancestor's entry is durable before the entry it
+/// contains.
+#[cfg(not(windows))]
+fn commit_created_dirs(created: &[PathBuf]) -> Result<(), SessionStoreError> {
+    for dir in created {
+        let parent = dir.parent().ok_or_else(|| SessionStoreError::Connect {
+            reason: format!("store path {} has no parent directory", dir.display()),
+        })?;
+        sync_dir(parent).map_err(|e| SessionStoreError::Connect {
+            reason: e.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
 /// Prove the directory accepts writes, by making one.
+#[cfg(not(windows))]
 fn probe_writable(dir: &Path) -> Result<(), SessionStoreError> {
     let probe = dir.join(format!("{}.{PROBE_EXTENSION}", Uuid::now_v7()));
     fs::write(&probe, b"").map_err(|e| SessionStoreError::Connect {
@@ -304,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn conforms_to_the_approval_store_contract() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileApprovalStore::open(root.path()).unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
         conformance::assert_approval_store_conformance(std::sync::Arc::new(store)).await;
     }
 
@@ -312,14 +387,34 @@ mod tests {
     async fn open_creates_a_missing_root() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("deep").join("store");
-        FileApprovalStore::open(&nested).unwrap();
+        FileApprovalStore::open(&nested).await.unwrap();
         assert!(nested.join(APPROVALS_DIR).is_dir());
+    }
+
+    /// Shallowest first is the crash-consistency order: an ancestor's entry has
+    /// to be committed before the entry it contains.
+    #[cfg(not(windows))]
+    #[test]
+    fn uncreated_ancestors_run_shallowest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let outer = root.path().join("deep");
+        let inner = outer.join("store");
+        let dir = inner.join(APPROVALS_DIR);
+
+        assert_eq!(uncreated_ancestors(&dir), vec![outer, inner, dir]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_existing_directory_has_no_uncreated_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(uncreated_ancestors(root.path()).is_empty());
     }
 
     #[tokio::test]
     async fn open_leaves_no_probe_behind() {
         let root = tempfile::tempdir().unwrap();
-        FileApprovalStore::open(root.path()).unwrap();
+        FileApprovalStore::open(root.path()).await.unwrap();
         assert_eq!(
             std::fs::read_dir(root.path().join(APPROVALS_DIR))
                 .unwrap()
@@ -343,7 +438,7 @@ mod tests {
         // Mode bits do not constrain a superuser, so only assert when the
         // directory is genuinely closed to this process.
         let closed = std::fs::write(dir.join("writability-check"), b"").is_err();
-        let opened = FileApprovalStore::open(root.path());
+        let opened = FileApprovalStore::open(root.path()).await;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         if closed {
@@ -360,18 +455,18 @@ mod tests {
         let entry = parked("req-reopen");
         let id = entry.request.decision_id;
 
-        let first = FileApprovalStore::open(root.path()).unwrap();
+        let first = FileApprovalStore::open(root.path()).await.unwrap();
         first.register(entry).await.unwrap();
         drop(first);
 
-        let second = FileApprovalStore::open(root.path()).unwrap();
+        let second = FileApprovalStore::open(root.path()).await.unwrap();
         assert!(second.get(&id).await.unwrap().is_some());
     }
 
     #[tokio::test]
     async fn ping_fails_once_the_root_is_gone() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileApprovalStore::open(root.path()).unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
         store.ping().await.unwrap();
 
         std::fs::remove_dir_all(root.path()).unwrap();
@@ -381,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_record_is_a_decode_error() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileApprovalStore::open(root.path()).unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
         let id = DecisionId::generate();
         std::fs::write(record_path(&store.dir, &id), b"{not json").unwrap();
 
@@ -394,7 +489,7 @@ mod tests {
     #[tokio::test]
     async fn an_interrupted_write_is_not_read_as_a_record() {
         let root = tempfile::tempdir().unwrap();
-        let store = FileApprovalStore::open(root.path()).unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
         let kept = parked("req-scan");
         let kept_id = kept.request.decision_id;
         store.register(kept).await.unwrap();
@@ -425,7 +520,7 @@ mod tests {
         child.kill().expect("kill the child process");
         child.wait().expect("reap the child process");
 
-        let store = FileApprovalStore::open(root.path()).unwrap();
+        let store = FileApprovalStore::open(root.path()).await.unwrap();
         assert!(
             store.get(&id).await.unwrap().is_some(),
             "the approval registered by the killed process must survive it",
@@ -449,7 +544,7 @@ mod tests {
     #[ignore = "spawned as a child process by an_approval_survives_a_killed_process"]
     async fn child_registers_then_waits() {
         let root = std::env::var(CHILD_ROOT_ENV).expect("the parent sets the store root");
-        let store = FileApprovalStore::open(&root).unwrap();
+        let store = FileApprovalStore::open(&root).await.unwrap();
         let entry = parked("req-killed");
         let id = entry.request.decision_id;
         store.register(entry).await.unwrap();

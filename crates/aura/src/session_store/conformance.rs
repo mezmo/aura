@@ -222,7 +222,7 @@ async fn resolve_of_an_unknown_id_is_not_found(store: &dyn ApprovalStore) -> Res
 /// At-most-once consumption is the store's job: whichever caller wins, no
 /// second caller may also see success and run the gated call twice.
 ///
-/// A non-atomic take only misbehaves when the calls genuinely overlap, and how
+/// A non-atomic take only misbehaves when the calls overlap in time, and how
 /// wide that window gets depends on the caller's runtime, so the race is
 /// released from a barrier and rerun enough times that a broken backend cannot
 /// pass by luck.
@@ -278,10 +278,11 @@ async fn remove_is_idempotent(store: &dyn ApprovalStore) -> Result<()> {
     Ok(())
 }
 
-/// One request can hold several approvals, so cancellation is a fan-out, not a
-/// lookup: a backend that removes the first match it finds and stops must fail
-/// here. The survivor is resolved as well as read, because an index-backed
-/// backend can leave an entry visible but no longer consumable.
+/// One request can hold several approvals, so cancelling it has to sweep all
+/// of them. A backend that stops at the first match must fail this row.
+///
+/// The survivor is resolved after the read. An index-backed backend can leave
+/// an entry readable while it is already unconsumable.
 async fn cancel_request_removes_only_its_own(store: &dyn ApprovalStore) -> Result<()> {
     let doomed_request = unique("cancel");
     let kept_request = unique("kept");
