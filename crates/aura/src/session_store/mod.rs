@@ -1,13 +1,20 @@
 //! Pluggable cross-instance session-state capabilities: a durable store for parked
 //! HITL approvals and a pub/sub event bus.
 //!
-//! The in-memory implementations are the default; a networked backend (e.g.
+//! The in-memory implementations are the default; a file backend adds
+//! restart durability with no infrastructure; a networked backend (e.g.
 //! Redis/Valkey) implements the same traits to make a load-balanced multi-instance
-//! deployment behave like one process.
+//! deployment behave like one process. The `conformance` module (behind the
+//! `test-support` feature) holds the contract all of them are held to.
 //!
-//! See `docs/design/session-storage.md` and
-//! `docs/adr/2026-07-08-session-storage.md`.
+//! See `docs/design/session-storage.md`,
+//! `docs/adr/2026-07-08-session-storage.md`, and
+//! `docs/adr/2026-07-21-hitl-park-reify.md`.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
+
+mod file;
 mod memory;
 mod record;
 
@@ -20,6 +27,7 @@ use futures::Stream;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
+pub use file::FileApprovalStore;
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
 pub use record::{InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 
