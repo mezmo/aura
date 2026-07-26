@@ -3514,13 +3514,8 @@ impl StreamHandler for ReplStreamHandler {
                     // parented to the stream's trace.
                     let resolve = tracing::Instrument::instrument(
                         async move {
-                            if let Err(aura::hitl::ResolveError::NotFound) =
-                                registry.resolve(&id, decision).await
-                            {
-                                eprintln!(
-                                    "warning: approval decision was not found \
-                                     (it may have already expired or been cancelled)."
-                                );
+                            if let Err(err) = registry.resolve(&id, decision).await {
+                                eprintln!("{}", resolve_failure_message(&err));
                             }
                         },
                         tracing::Span::current(),
@@ -3638,6 +3633,29 @@ impl StreamHandler for ReplStreamHandler {
             *guard = Some((wave_anim, wave_stop));
         }
         prepare_input_line(&self.input_buf, Some(&self.cancel));
+    }
+}
+
+/// The stderr line for an approval decision that did not take effect.
+///
+/// A store fault reports at `error:` rather than `warning:`. Unlike a decision
+/// that is simply gone, the gated call is still waiting on an answer the
+/// operator already gave, and that answer has now been lost rather than
+/// arriving late.
+#[cfg(feature = "standalone-cli")]
+fn resolve_failure_message(err: &aura::hitl::ResolveError) -> String {
+    match err {
+        aura::hitl::ResolveError::NotFound => "warning: approval decision was not found \
+             (it may have already expired or been cancelled)."
+            .to_string(),
+        aura::hitl::ResolveError::Store(err) => format!(
+            "error: approval decision could not be recorded: {err}. \
+             The gated call was not resolved and will be denied when it times out."
+        ),
+        other => format!(
+            "error: approval decision could not be recorded: {other:?}. \
+             The gated call was not resolved and will be denied when it times out."
+        ),
     }
 }
 
@@ -3843,5 +3861,30 @@ mod tests {
                 "alias {bare:?} targets unknown command {target:?}",
             );
         }
+    }
+
+    /// A store fault leaves the operator's answer unrecorded while the gated
+    /// call is still waiting, so it must not be filed under the same quiet
+    /// `warning:` as a decision that simply went away.
+    #[cfg(feature = "standalone-cli")]
+    #[test]
+    fn a_store_fault_resolving_an_approval_is_reported_as_an_error() {
+        let message = super::resolve_failure_message(&aura::hitl::ResolveError::Store(
+            aura::session_store::SessionStoreError::Request {
+                reason: "cannot sync /srv/aura/approvals".to_string(),
+            },
+        ));
+        assert!(message.starts_with("error:"), "{message}");
+        assert!(
+            message.contains("cannot sync /srv/aura/approvals"),
+            "{message}"
+        );
+    }
+
+    #[cfg(feature = "standalone-cli")]
+    #[test]
+    fn a_missing_approval_stays_a_warning() {
+        let message = super::resolve_failure_message(&aura::hitl::ResolveError::NotFound);
+        assert!(message.starts_with("warning:"), "{message}");
     }
 }
