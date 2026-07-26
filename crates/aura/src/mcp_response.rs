@@ -352,6 +352,21 @@ mod tests {
     }
 
     #[test]
+    fn truncate_preview_content_pattern_renders_exact_string() {
+        // The `{}...` pattern used by the structured-content and text-content
+        // preview sites in this module.
+        let ascii = "a".repeat(250);
+        let rendered = format!("{}...", safe_truncate(&ascii, 200).0);
+        assert_eq!(rendered, format!("{}...", "a".repeat(200)));
+
+        let mut multibyte = "a".repeat(198);
+        multibyte.push('─');
+        multibyte.push_str(&"b".repeat(50));
+        let rendered = format!("{}...", safe_truncate(&multibyte, 200).0);
+        assert_eq!(rendered, format!("{}...", "a".repeat(198)));
+    }
+
+    #[test]
     fn test_extract_structured_content() {
         let result = CallToolResult {
             content: vec![],
