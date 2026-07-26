@@ -2450,6 +2450,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
         let temperature = worker_config.llm.temperature();
         let shared_mcp: Option<Arc<McpManager>> = self.mcp_manager.clone();
 
+        // Box<dyn ToolDyn> is not Clone, so each provider arm constructs its own instance.
+        let wait_for_tools = || -> Vec<Box<dyn rig::tool::ToolDyn>> {
+            shared_mcp
+                .as_ref()
+                .map(|mcp| {
+                    vec![
+                        Box::new(super::tools::wait_for::WaitForTool::new(Arc::clone(mcp)))
+                            as Box<dyn rig::tool::ToolDyn>,
+                    ]
+                })
+                .unwrap_or_default()
+        };
+
         match &worker_config.llm {
             LlmConfig::OpenAI {
                 api_key,
@@ -2493,7 +2506,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.max_tokens(max);
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                        .await?;
                 Ok((ProviderAgent::OpenAI(state.build()), model.clone()))
             }
             LlmConfig::Anthropic {
@@ -2524,7 +2539,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                        .await?;
                 Ok((ProviderAgent::Anthropic(state.build()), model.clone()))
             }
             LlmConfig::Bedrock {
@@ -2563,7 +2580,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                        .await?;
                 Ok((ProviderAgent::Bedrock(state.build()), model.clone()))
             }
             LlmConfig::Gemini {
@@ -2591,7 +2610,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                        .await?;
                 Ok((ProviderAgent::Gemini(state.build()), model.clone()))
             }
             LlmConfig::Ollama {
@@ -2618,7 +2639,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                        .await?;
                 Ok((ProviderAgent::Ollama(state.build()), model.clone()))
             }
             LlmConfig::OpenRouter {
@@ -2649,7 +2672,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     builder = builder.additional_params(params.clone());
                 }
                 let state = BuilderState::Initial(builder);
-                let state = Agent::add_all_tools(state, worker_config, &shared_mcp, vec![]).await?;
+                let state =
+                    Agent::add_all_tools(state, worker_config, &shared_mcp, wait_for_tools())
+                        .await?;
                 Ok((ProviderAgent::OpenRouter(state.build()), model.clone()))
             }
         }

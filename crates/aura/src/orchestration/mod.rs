@@ -77,6 +77,7 @@ pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;
 pub use tools::ListPriorRunsTool;
 pub use tools::ReadArtifactTool;
+pub use tools::wait_for::{StopReason, WaitForError, WaitForOutput, WaitForTool};
 pub use tools::{SubmitResultDecision, SubmitResultOutput, SubmitResultTool};
 
 pub use prompt_constants::{context, fields, sections};
