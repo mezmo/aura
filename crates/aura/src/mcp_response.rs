@@ -6,6 +6,7 @@
  * and traditional text-based responses.
  */
 
+use crate::string_utils::safe_truncate;
 use anyhow::Result;
 use base64::Engine;
 use rmcp::model::CallToolResult;
@@ -245,7 +246,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
         debug!(
             "   Structured content preview: {}",
             if json_str.len() > 200 {
-                format!("{}...", &json_str[..200])
+                format!("{}...", safe_truncate(&json_str, 200).0)
             } else {
                 json_str.clone()
             }
@@ -291,7 +292,7 @@ pub fn extract_tool_result(result: CallToolResult, tool_name: &str) -> Result<Ca
     debug!(
         "   Content preview: {}",
         if content.len() > 200 {
-            format!("{}...", &content[..200])
+            format!("{}...", safe_truncate(&content, 200).0)
         } else {
             content.clone()
         }
@@ -314,6 +315,41 @@ mod tests {
         Content, RawContent, RawEmbeddedResource, RawResource, RawTextContent, ResourceContents,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn truncate_preview_multibyte_straddling_limit() {
+        // 198 ASCII bytes, then a 3-byte '─' (U+2500) occupying bytes 198..201,
+        // as produced by box-drawing tree output.
+        let mut s = "a".repeat(198);
+        s.push('─');
+        s.push_str(&"b".repeat(50));
+
+        let truncated = safe_truncate(&s, 200).0;
+        assert_eq!(truncated, "a".repeat(198));
+    }
+
+    #[test]
+    fn truncate_preview_ascii_under_limit_is_unchanged() {
+        let s = "a".repeat(150);
+        assert_eq!(safe_truncate(&s, 200).0, s);
+
+        // Rendered preview as the call sites build it for a short response.
+        let rendered = if s.len() > 200 {
+            format!("{}... ({} chars)", safe_truncate(&s, 200).0, s.len())
+        } else {
+            s.clone()
+        };
+        assert_eq!(rendered, "a".repeat(150));
+    }
+
+    #[test]
+    fn truncate_preview_ascii_over_limit_matches_previous_rendering() {
+        let s = "a".repeat(250);
+        assert_eq!(safe_truncate(&s, 200).0, "a".repeat(200));
+
+        let rendered = format!("{}... ({} chars)", safe_truncate(&s, 200).0, s.len());
+        assert_eq!(rendered, format!("{}... (250 chars)", "a".repeat(200)));
+    }
 
     #[test]
     fn test_extract_structured_content() {

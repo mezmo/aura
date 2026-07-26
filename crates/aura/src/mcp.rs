@@ -1296,7 +1296,11 @@ macro_rules! create_mcp_tool_struct {
                     Ok(response) => {
                         debug!("  Response: {}", response);
                         let response_summary = if response.len() > 200 {
-                            format!("{}... ({} chars)", &response[..200], response.len())
+                            format!(
+                                "{}... ({} chars)",
+                                crate::string_utils::safe_truncate(&response, 200).0,
+                                response.len()
+                            )
                         } else {
                             response.clone()
                         };
@@ -1397,7 +1401,11 @@ impl RigTool for StreamableHttpMcpTool {
             Ok(result) => {
                 debug!("  Tool execution successful");
                 let response_summary = if result.len() > 200 {
-                    format!("{}... ({} chars)", &result[..200], result.len())
+                    format!(
+                        "{}... ({} chars)",
+                        crate::string_utils::safe_truncate(&result, 200).0,
+                        result.len()
+                    )
                 } else {
                     result.clone()
                 };
@@ -1557,7 +1565,11 @@ impl RigTool for FallbackHttpMcpTool {
             Ok(result) => {
                 debug!("  Fallback tool execution successful");
                 let response_summary = if result.len() > 200 {
-                    format!("{}... ({} chars)", &result[..200], result.len())
+                    format!(
+                        "{}... ({} chars)",
+                        crate::string_utils::safe_truncate(&result, 200).0,
+                        result.len()
+                    )
                 } else {
                     result.clone()
                 };
