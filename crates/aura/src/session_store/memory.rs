@@ -185,6 +185,18 @@ mod tests {
     use crate::hitl::{
         AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, PROTOCOL_VERSION,
     };
+    use crate::session_store::conformance;
+
+    #[tokio::test]
+    async fn conforms_to_the_approval_store_contract() {
+        conformance::assert_approval_store_conformance(Arc::new(InMemoryApprovalStore::new()))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn conforms_to_the_event_bus_contract() {
+        conformance::assert_event_bus_conformance(Arc::new(InMemoryEventBus::new())).await;
+    }
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
