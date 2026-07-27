@@ -8,6 +8,10 @@
 use std::time::Duration;
 use tokio::time::Instant;
 
+/// Sentinel prefix of an inactivity-stall error message; deliberately
+/// neutral about blame.
+pub const STALL_MESSAGE: &str = "no stream progress for";
+
 /// Re-arming deadline that fires after a window of provider silence.
 #[derive(Debug)]
 pub struct InactivityDeadline {
@@ -92,6 +96,13 @@ impl InactivityDeadline {
 
     pub fn window(&self) -> Duration {
         self.window
+    }
+
+    /// Error for a fired deadline, logged and carrying [`STALL_MESSAGE`].
+    pub fn stall_error(&self, phase: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        let secs = self.window.as_secs();
+        tracing::warn!("{phase}: {STALL_MESSAGE} {secs}s (inactivity_timeout_secs={secs})");
+        format!("{phase}: {STALL_MESSAGE} {secs}s").into()
     }
 }
 

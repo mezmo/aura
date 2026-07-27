@@ -49,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
+use crate::inactivity::STALL_MESSAGE;
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
@@ -422,6 +423,39 @@ struct StreamCallParams<'a> {
     history: Vec<rig::completion::Message>,
     phase: &'a str,
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+}
+
+/// One guarded step of a deadline-wrapped stream loop.
+enum LoopStep {
+    End,
+    Continue,
+}
+
+/// How a stream item bears on the inactivity deadline.
+#[derive(Clone, Copy)]
+enum Liveness {
+    Activity,
+    ToolStarted,
+    ToolFinished,
+}
+
+/// Tool execution happens inside the following `stream.next()` (rig yields
+/// `ToolCall` before executing and `ToolResult` after), so `ToolStarted`
+/// suspends across exactly the window where provider silence is expected.
+/// Correct pairing relies on rig's sequential tool execution (see "Critical
+/// Assumption" in CLAUDE.md); parallel tool calls would resume on the first
+/// result while a second tool runs.
+fn liveness_of<E>(item: &Result<StreamItem, E>) -> Liveness {
+    use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
+    match item {
+        Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(_))) => {
+            Liveness::ToolStarted
+        }
+        Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(_))) => {
+            Liveness::ToolFinished
+        }
+        _ => Liveness::Activity,
+    }
 }
 
 impl Orchestrator {
@@ -998,6 +1032,7 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
+        let inactivity_secs = self.config.inactivity_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
             let mut stream = agent.stream_chat(prompt, history).await;
@@ -1014,115 +1049,157 @@ impl Orchestrator {
             // ObserverWrapper) are never double-emitted.
             let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                        content.push_str(&t);
+            // Two guarded phases per iteration, so the body (its sends and the
+            // decision-ready branch's inner `next()`) runs under the deadline
+            // state the received item implies, not the previous item's state.
+            // A ToolCall's suspension lands after its body, covering exactly
+            // the next receive, where rig executes the tool.
+            let mut deadline =
+                crate::inactivity::InactivityDeadline::new(Duration::from_secs(inactivity_secs));
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = deadline.expired() => {
+                        return Err(deadline.stall_error(phase));
                     }
-                    Ok(StreamItem::StreamAssistantItem(
-                        StreamedAssistantContent::ReasoningDelta { delta, .. },
-                    )) => {
-                        if let Some(tx) = event_tx {
-                            if let Some(ref ctx) = stream_context {
-                                let _ = tx
-                                    .send(Ok(StreamItem::OrchestratorEvent(
-                                        OrchestratorEvent::WorkerReasoning {
-                                            task_id: ctx.task_id,
-                                            worker_id: ctx.worker_id.to_string(),
-                                            content: delta,
-                                        },
-                                    )))
-                                    .await;
-                            } else {
-                                let _ = tx
-                                    .send(Ok(StreamItem::StreamAssistantItem(
-                                        StreamedAssistantContent::ReasoningDelta {
-                                            delta,
-                                            id: None,
-                                        },
-                                    )))
-                                    .await;
+                    item = stream.next() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
+                let liveness = liveness_of(&item);
+                match liveness {
+                    // `touch` is ignored while suspended, so a finished tool
+                    // must resume explicitly.
+                    Liveness::ToolFinished => deadline.resume(),
+                    _ => deadline.touch(),
+                }
+                let body = async {
+                    match item {
+                        Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                            content.push_str(&t);
+                        }
+                        Ok(StreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ReasoningDelta { delta, .. },
+                        )) => {
+                            if let Some(tx) = event_tx {
+                                if let Some(ref ctx) = stream_context {
+                                    let _ = tx
+                                        .send(Ok(StreamItem::OrchestratorEvent(
+                                            OrchestratorEvent::WorkerReasoning {
+                                                task_id: ctx.task_id,
+                                                worker_id: ctx.worker_id.to_string(),
+                                                content: delta,
+                                            },
+                                        )))
+                                        .await;
+                                } else {
+                                    let _ = tx
+                                        .send(Ok(StreamItem::StreamAssistantItem(
+                                            StreamedAssistantContent::ReasoningDelta {
+                                                delta,
+                                                id: None,
+                                            },
+                                        )))
+                                        .await;
+                                }
                             }
                         }
-                    }
-                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(_))) => {
-                        // Final reasoning block — already forwarded as deltas above.
-                        // Skip to avoid double-emission.
-                    }
-                    // Forward calls to the non-MCP tools ObserverWrapper does not
-                    // cover: skills and orchestration operations always, scratchpad
-                    // tools only when the debug flag is on. The matching completion
-                    // is emitted from the ToolResult arm below.
-                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
-                        ref tc,
-                    ))) if scratchpad::should_forward_tool_event(
-                        &tc.name,
-                        emit_scratchpad_events,
-                    ) =>
-                    {
-                        let (task_id, worker_id) = match stream_context.as_ref() {
-                            Some(w) => (Some(w.task_id), w.worker_id),
-                            None => (None, "main"),
-                        };
-                        forward_internal_tool_started(
-                            event_tx,
-                            task_id,
-                            worker_id,
-                            &tc.id,
+                        Ok(StreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Reasoning(_),
+                        )) => {
+                            // Final reasoning block — already forwarded as deltas above.
+                            // Skip to avoid double-emission.
+                        }
+                        // Forward calls to the non-MCP tools ObserverWrapper does not
+                        // cover: skills and orchestration operations always, scratchpad
+                        // tools only when the debug flag is on. The matching completion
+                        // is emitted from the ToolResult arm below.
+                        Ok(StreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ToolCall(ref tc),
+                        )) if scratchpad::should_forward_tool_event(
                             &tc.name,
-                            &tc.arguments,
-                            &mut internal_tool_starts,
-                        )
-                        .await;
-                    }
-                    Ok(StreamItem::Final(info)) => {
-                        content = info.content;
-                        usage = info.usage;
-                        break;
-                    }
-                    Ok(StreamItem::FinalMarker) => {
-                        // Per-turn marker — not end-of-stream. Continue collecting.
-                    }
-                    Ok(StreamItem::TurnUsage(turn)) => {
-                        usage.input_tokens += turn.input_tokens;
-                        usage.output_tokens += turn.output_tokens;
-                        usage.total_tokens += turn.total_tokens;
-                        self.usage_state
-                            .accumulate_usage(turn.input_tokens, turn.output_tokens);
-                        if let Some(ref budget) = agent.scratchpad_budget {
-                            budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
+                            emit_scratchpad_events,
+                        ) =>
+                        {
+                            let (task_id, worker_id) = match stream_context.as_ref() {
+                                Some(w) => (Some(w.task_id), w.worker_id),
+                                None => (None, "main"),
+                            };
+                            forward_internal_tool_started(
+                                event_tx,
+                                task_id,
+                                worker_id,
+                                &tc.id,
+                                &tc.name,
+                                &tc.arguments,
+                                &mut internal_tool_starts,
+                            )
+                            .await;
                         }
-                    }
-                    Err(e) => return Err(e),
-                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
-                        // No-op unless a start was tracked above; emitting here (not
-                        // in a dedicated arm) keeps the decision short-circuit intact
-                        // for tools like submit_result.
-                        forward_internal_tool_completed(
-                            event_tx,
-                            stream_context.as_ref().map(|w| w.task_id),
-                            &tr.id,
-                            &tr.result,
-                            &mut internal_tool_starts,
-                        )
-                        .await;
-                        tracing::debug!(
-                            "{}: tool result received (id={}, call_id={})",
-                            phase,
-                            tr.id,
-                            tr.call_id.as_deref().unwrap_or("-")
-                        );
-                        if decision_ready().await {
-                            tracing::debug!("{}: decision captured, reading turn usage", phase);
-                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                usage.input_tokens += turn.input_tokens;
-                                usage.output_tokens += turn.output_tokens;
-                                usage.total_tokens += turn.total_tokens;
+                        Ok(StreamItem::Final(info)) => {
+                            content = info.content;
+                            usage = info.usage;
+                            return Ok(LoopStep::End);
+                        }
+                        Ok(StreamItem::FinalMarker) => {
+                            // Per-turn marker — not end-of-stream. Continue collecting.
+                        }
+                        Ok(StreamItem::TurnUsage(turn)) => {
+                            usage.input_tokens += turn.input_tokens;
+                            usage.output_tokens += turn.output_tokens;
+                            usage.total_tokens += turn.total_tokens;
+                            self.usage_state
+                                .accumulate_usage(turn.input_tokens, turn.output_tokens);
+                            if let Some(ref budget) = agent.scratchpad_budget {
+                                budget.set_estimated_used(turn.input_tokens, turn.output_tokens);
                             }
-                            break;
                         }
+                        Err(e) => return Err(e),
+                        Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                            // No-op unless a start was tracked above; emitting here (not
+                            // in a dedicated arm) keeps the decision short-circuit intact
+                            // for tools like submit_result.
+                            forward_internal_tool_completed(
+                                event_tx,
+                                stream_context.as_ref().map(|w| w.task_id),
+                                &tr.id,
+                                &tr.result,
+                                &mut internal_tool_starts,
+                            )
+                            .await;
+                            tracing::debug!(
+                                "{}: tool result received (id={}, call_id={})",
+                                phase,
+                                tr.id,
+                                tr.call_id.as_deref().unwrap_or("-")
+                            );
+                            if decision_ready().await {
+                                tracing::debug!("{}: decision captured, reading turn usage", phase);
+                                if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
+                                    usage.input_tokens += turn.input_tokens;
+                                    usage.output_tokens += turn.output_tokens;
+                                    usage.total_tokens += turn.total_tokens;
+                                }
+                                return Ok(LoopStep::End);
+                            }
+                        }
+                        _ => {} // ToolCall, ToolCallDelta — rig handles execution
                     }
-                    _ => {} // ToolCall, ToolCallDelta — rig handles execution
+                    Ok(LoopStep::Continue)
+                };
+                let step = tokio::select! {
+                    biased;
+                    _ = deadline.expired() => {
+                        return Err(deadline.stall_error(phase));
+                    }
+                    step = body => step?,
+                };
+                if matches!(step, LoopStep::End) {
+                    break;
+                }
+                if matches!(liveness, Liveness::ToolStarted) {
+                    deadline.suspend();
                 }
             }
 
@@ -1185,6 +1262,7 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
+        let inactivity_secs = self.config.inactivity_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
             let mut stream = agent
@@ -1201,107 +1279,142 @@ impl Orchestrator {
             // to the main agent.
             let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
-            while let Some(item) = stream.next().await {
-                match item {
-                    // Text accumulation
-                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
-                        content.push_str(&t);
+            // Same two-phase guarded shape as `stream_and_forward`; see the
+            // rationale there.
+            let mut deadline =
+                crate::inactivity::InactivityDeadline::new(Duration::from_secs(inactivity_secs));
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = deadline.expired() => {
+                        return Err(deadline.stall_error(phase));
                     }
-                    // Reasoning forwarding (fixes reasoning token discard during orchestration)
-                    Ok(StreamItem::StreamAssistantItem(
-                        ref sa @ StreamedAssistantContent::ReasoningDelta { .. },
-                    )) => {
-                        if let Some(tx) = event_tx {
-                            let _ = tx
-                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
-                                .await;
+                    item = stream.next() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
+                let liveness = liveness_of(&item);
+                match liveness {
+                    Liveness::ToolFinished => deadline.resume(),
+                    _ => deadline.touch(),
+                }
+                let body = async {
+                    match item {
+                        // Text accumulation
+                        Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
+                            content.push_str(&t);
                         }
-                    }
-                    Ok(StreamItem::StreamAssistantItem(
-                        ref sa @ StreamedAssistantContent::Reasoning(_),
-                    )) => {
-                        if let Some(tx) = event_tx {
-                            let _ = tx
-                                .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
-                                .await;
-                        }
-                    }
-                    // Forward non-MCP tool calls (skills, orchestration operations)
-                    // so coordinator skill use surfaces over SSE like a worker's.
-                    Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(
-                        ref tc,
-                    ))) if scratchpad::should_forward_tool_event(
-                        &tc.name,
-                        emit_scratchpad_events,
-                    ) =>
-                    {
-                        forward_internal_tool_started(
-                            event_tx,
-                            None,
-                            "main",
-                            &tc.id,
-                            &tc.name,
-                            &tc.arguments,
-                            &mut internal_tool_starts,
-                        )
-                        .await;
-                    }
-                    // Tool result — check decision, short-circuit (fixes ReAct loop waste)
-                    Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
-                        forward_internal_tool_completed(
-                            event_tx,
-                            None,
-                            &tr.id,
-                            &tr.result,
-                            &mut internal_tool_starts,
-                        )
-                        .await;
-                        tracing::debug!(
-                            "{}: tool result received (id={}, call_id={})",
-                            phase,
-                            tr.id,
-                            tr.call_id.as_deref().unwrap_or("-")
-                        );
-                        if decision_ready().await {
-                            tracing::debug!("{}: decision captured, reading turn usage", phase);
-                            if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
-                                usage.input_tokens += turn.input_tokens;
-                                usage.output_tokens += turn.output_tokens;
-                                usage.total_tokens += turn.total_tokens;
-                                self.usage_state
-                                    .accumulate_usage(turn.input_tokens, turn.output_tokens);
+                        // Reasoning forwarding (fixes reasoning token discard during orchestration)
+                        Ok(StreamItem::StreamAssistantItem(
+                            ref sa @ StreamedAssistantContent::ReasoningDelta { .. },
+                        )) => {
+                            if let Some(tx) = event_tx {
+                                let _ = tx
+                                    .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                                    .await;
                             }
-                            break;
                         }
-                    }
-                    // Final response — authoritative content + usage
-                    Ok(StreamItem::Final(info)) => {
-                        content = info.content;
-                        usage = info.usage;
-                        break;
-                    }
-                    Ok(StreamItem::TurnUsage(turn)) => {
-                        usage.input_tokens += turn.input_tokens;
-                        usage.output_tokens += turn.output_tokens;
-                        usage.total_tokens += turn.total_tokens;
-                        self.usage_state
-                            .accumulate_usage(turn.input_tokens, turn.output_tokens);
-                    }
-                    Ok(StreamItem::FinalMarker) => break,
-                    // MaxDepthError: success if decision was captured, error otherwise
-                    Err(ref e) if is_max_depth_error(e.as_ref()) => {
-                        if decision_ready().await {
-                            tracing::debug!("{}: depth cap hit but decision captured", phase);
-                            break;
+                        Ok(StreamItem::StreamAssistantItem(
+                            ref sa @ StreamedAssistantContent::Reasoning(_),
+                        )) => {
+                            if let Some(tx) = event_tx {
+                                let _ = tx
+                                    .send(Ok(StreamItem::StreamAssistantItem(sa.clone())))
+                                    .await;
+                            }
                         }
-                        return Err(format!("{}: {}", phase, e).into());
+                        // Forward non-MCP tool calls (skills, orchestration operations)
+                        // so coordinator skill use surfaces over SSE like a worker's.
+                        Ok(StreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ToolCall(ref tc),
+                        )) if scratchpad::should_forward_tool_event(
+                            &tc.name,
+                            emit_scratchpad_events,
+                        ) =>
+                        {
+                            forward_internal_tool_started(
+                                event_tx,
+                                None,
+                                "main",
+                                &tc.id,
+                                &tc.name,
+                                &tc.arguments,
+                                &mut internal_tool_starts,
+                            )
+                            .await;
+                        }
+                        // Tool result — check decision, short-circuit (fixes ReAct loop waste)
+                        Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(ref tr))) => {
+                            forward_internal_tool_completed(
+                                event_tx,
+                                None,
+                                &tr.id,
+                                &tr.result,
+                                &mut internal_tool_starts,
+                            )
+                            .await;
+                            tracing::debug!(
+                                "{}: tool result received (id={}, call_id={})",
+                                phase,
+                                tr.id,
+                                tr.call_id.as_deref().unwrap_or("-")
+                            );
+                            if decision_ready().await {
+                                tracing::debug!("{}: decision captured, reading turn usage", phase);
+                                if let Some(Ok(StreamItem::TurnUsage(turn))) = stream.next().await {
+                                    usage.input_tokens += turn.input_tokens;
+                                    usage.output_tokens += turn.output_tokens;
+                                    usage.total_tokens += turn.total_tokens;
+                                    self.usage_state
+                                        .accumulate_usage(turn.input_tokens, turn.output_tokens);
+                                }
+                                return Ok(LoopStep::End);
+                            }
+                        }
+                        // Final response — authoritative content + usage
+                        Ok(StreamItem::Final(info)) => {
+                            content = info.content;
+                            usage = info.usage;
+                            return Ok(LoopStep::End);
+                        }
+                        Ok(StreamItem::TurnUsage(turn)) => {
+                            usage.input_tokens += turn.input_tokens;
+                            usage.output_tokens += turn.output_tokens;
+                            usage.total_tokens += turn.total_tokens;
+                            self.usage_state
+                                .accumulate_usage(turn.input_tokens, turn.output_tokens);
+                        }
+                        Ok(StreamItem::FinalMarker) => return Ok(LoopStep::End),
+                        // MaxDepthError: success if decision was captured, error otherwise
+                        Err(ref e) if is_max_depth_error(e.as_ref()) => {
+                            if decision_ready().await {
+                                tracing::debug!("{}: depth cap hit but decision captured", phase);
+                                return Ok(LoopStep::End);
+                            }
+                            return Err(format!("{}: {}", phase, e).into());
+                        }
+                        // Context overflow — propagate
+                        Err(ref e) if is_context_overflow_error(e.as_ref()) => {
+                            return Err(format!("{}: {}", phase, e).into());
+                        }
+                        Err(e) => return Err(e),
+                        _ => {} // ToolCall (non-forwarded), ToolCallDelta — rig handles execution
                     }
-                    // Context overflow — propagate
-                    Err(ref e) if is_context_overflow_error(e.as_ref()) => {
-                        return Err(format!("{}: {}", phase, e).into());
+                    Ok(LoopStep::Continue)
+                };
+                let step = tokio::select! {
+                    biased;
+                    _ = deadline.expired() => {
+                        return Err(deadline.stall_error(phase));
                     }
-                    Err(e) => return Err(e),
-                    _ => {} // ToolCall (non-forwarded), ToolCallDelta — rig handles execution
+                    step = body => step?,
+                };
+                if matches!(step, LoopStep::End) {
+                    break;
+                }
+                if matches!(liveness, Liveness::ToolStarted) {
+                    deadline.suspend();
                 }
             }
             Ok(CompletionResponse { content, usage })
@@ -3364,7 +3477,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Revisit if/when we replace rig.
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
-        if lower.contains("timed out") {
+        if lower.contains(STALL_MESSAGE) {
+            // Inactivity stall carries its own sentinel so it cannot collide
+            // with provider errors that merely mention a timeout.
+            FailureCategory::AgentTimeout
+        } else if lower.contains("timed out") {
             FailureCategory::AgentTimeout
         } else if (lower.contains("context")
             && (lower.contains("limit")
@@ -5515,6 +5632,59 @@ mod tests {
             Orchestrator::categorize_failure_error("Request timed out after 503 retries"),
             FailureCategory::AgentTimeout
         );
+    }
+
+    #[test]
+    fn test_categorize_failure_stall_sentinel_first() {
+        // The `429` fragment must not win: it would otherwise land in
+        // ProviderOverloaded.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "worker-1: no stream progress for 120s (429 seen earlier)"
+            ),
+            FailureCategory::AgentTimeout
+        );
+    }
+
+    #[test]
+    fn test_liveness_of_stream_items() {
+        use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
+        let tool_call = Ok::<_, StreamError>(StreamItem::StreamAssistantItem(
+            StreamedAssistantContent::ToolCall(crate::provider_agent::ToolCall {
+                id: "t1".into(),
+                name: "search".into(),
+                arguments: String::new(),
+            }),
+        ));
+        assert!(matches!(liveness_of(&tool_call), Liveness::ToolStarted));
+
+        let tool_result = Ok::<_, StreamError>(StreamItem::StreamUserItem(
+            StreamedUserContent::ToolResult(crate::provider_agent::ToolResult {
+                id: "t1".into(),
+                call_id: None,
+                result: String::new(),
+            }),
+        ));
+        assert!(matches!(liveness_of(&tool_result), Liveness::ToolFinished));
+
+        let text = Ok::<_, StreamError>(StreamItem::StreamAssistantItem(
+            StreamedAssistantContent::Text("hi".into()),
+        ));
+        assert!(matches!(liveness_of(&text), Liveness::Activity));
+
+        // Deltas precede the full ToolCall; they must keep the deadline alive,
+        // not suspend it.
+        let delta = Ok::<_, StreamError>(StreamItem::StreamAssistantItem(
+            StreamedAssistantContent::ToolCallDelta {
+                id: "t1".into(),
+                name: None,
+                delta: Some("{".into()),
+            },
+        ));
+        assert!(matches!(liveness_of(&delta), Liveness::Activity));
+
+        let err = Err::<StreamItem, _>(StreamError::from("boom"));
+        assert!(matches!(liveness_of(&err), Liveness::Activity));
     }
 
     #[test]
