@@ -49,6 +49,7 @@ impl OrchestratorFactory {
         cancel_token: CancellationToken,
         request_id: String,
         usage_state: crate::UsageState,
+        outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
         let agent_config = self.agent_config.clone();
 
@@ -71,6 +72,7 @@ impl OrchestratorFactory {
                 // Share the caller's usage handle so accumulate_usage() writes
                 // are visible to the streaming handler (UsageState is Arc-backed).
                 orchestrator.usage_state = usage_state;
+                orchestrator.outer_budget = outer_budget;
 
                 // Set MCP request ID for progress notification routing, and
                 // surface per-server connection status so degraded/unavailable
@@ -164,6 +166,7 @@ impl StreamingAgent for OrchestratorFactory {
             cancel_token,
             request_id.to_string(),
             crate::UsageState::new(),
+            None,
         ))
     }
 
@@ -197,6 +200,7 @@ impl StreamingAgent for OrchestratorFactory {
             cancel_token,
             request_id.to_string(),
             usage_state.clone(),
+            (!timeout.is_zero()).then_some(timeout),
         );
 
         (stream, cancel_tx, usage_state)

@@ -402,6 +402,9 @@ pub struct Orchestrator {
     /// the first one. Assigned by the factory after construction; see
     /// `OrchestratorFactory::spawn_orchestration_stream`.
     pub(super) usage_state: crate::UsageState,
+
+    /// Outer wall-clock budget for the whole run; `None` is unbounded.
+    pub(super) outer_budget: Option<Duration>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -508,6 +511,7 @@ impl Orchestrator {
             prompt_journal,
             current_iteration: AtomicUsize::new(0),
             usage_state: crate::UsageState::new(),
+            outer_budget: None,
         })
     }
 
@@ -931,52 +935,10 @@ impl Orchestrator {
         })
     }
 
-    /// Execute a blocking chat call with timeout — for **worker tasks only**.
-    ///
-    /// Workers need the full ReAct loop for sequential MCP tool chains.
-    /// Coordinator phases (planning, continuation routing) use `stream_and_collect()`
-    /// for early exit after one-shot tool decisions and reasoning forwarding.
-    ///
-    /// Returns `Err` with a timeout message if the call exceeds `per_call_timeout_secs`.
-    /// A value of 0 (the default) disables the per-call timeout.
-    #[allow(dead_code)]
-    async fn chat_with_timeout(
-        &self,
-        agent: &Agent,
-        prompt: &str,
-        history: Vec<rig::completion::Message>,
-        phase: &str,
-    ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let timeout_secs = self.config.per_call_timeout_secs();
-        if timeout_secs == 0 {
-            return agent.chat(prompt, history).await;
-        }
-
-        let timeout = Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, agent.chat(prompt, history)).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    "{} LLM call timed out after {}s (per_call_timeout_secs={})",
-                    phase,
-                    timeout_secs,
-                    timeout_secs,
-                );
-                Err(format!(
-                    "{} timed out after {}s — the LLM provider did not respond in time",
-                    phase, timeout_secs
-                )
-                .into())
-            }
-        }
-    }
-
     /// Stream a full ReAct chat, forwarding reasoning events and collecting the final response.
     ///
-    /// Unlike `stream_and_collect` (which uses `max_depth=1` and early-exit for coordinator
-    /// one-shot tool phases), this uses the agent's configured `max_depth` and runs the
-    /// full multi-turn tool loop. Used for workers and phase continuation.
+    /// Runs the full multi-turn tool loop at the agent's configured
+    /// `max_depth`, unlike `stream_and_collect`.
     ///
     /// Key behaviors:
     /// - Uses `agent.stream_chat()` which respects the agent's configured `max_depth`
@@ -1203,11 +1165,12 @@ impl Orchestrator {
 
     /// Stream a coordinator call with early exit and optional reasoning forwarding.
     ///
-    /// Replaces `chat_with_timeout` for one-shot tool phases (planning, continuation routing).
-    /// Workers MUST NOT use this — they need the full ReAct loop for MCP tool chains.
+    /// Workers MUST NOT use this — they need the full ReAct loop for MCP
+    /// tool chains.
     ///
     /// Key behaviors:
-    /// - Opens stream with `max_depth=1` (rig safety net, but early exit is primary guard)
+    /// - Opens the stream depth-capped at `PLANNING_COORDINATOR_MAX_DEPTH`
+    ///   (rig safety net, but early exit is the primary guard)
     /// - Forwards `ReasoningDelta`/`Reasoning` items through `event_tx` when provided
     /// - Short-circuits after first `ToolResult` when `decision_ready()` returns true
     /// - Falls back to normal completion for text-only responses
@@ -1393,7 +1356,6 @@ impl Orchestrator {
             Ok(CompletionResponse { content, usage })
         };
 
-        // Timeout wrapping (preserves chat_with_timeout behavior)
         if timeout_secs == 0 {
             stream_future.await
         } else {
@@ -3726,9 +3688,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// max iterations are reached. On re-plan, uses `plan_with_routing()` and
     /// expects an `Orchestrated` response (falls back to single-task if not).
     ///
-    /// Budget enforcement: at each iteration boundary, checks whether remaining
-    /// wall-clock time is less than `per_call_timeout_secs`. If so, returns the
-    /// best available result instead of starting a new iteration.
+    /// Budget enforcement lives in the create_plan decision inside
+    /// `run_iteration`: a replan request is refused, with raw task results
+    /// returned, once `max_planning_cycles` or the outer time budget
+    /// (`budget_exhausted`) is spent.
     #[allow(clippy::too_many_arguments)]
     async fn run_orchestration_loop(
         &self,
@@ -4108,23 +4071,37 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "create_plan");
 
-                if iteration >= self.config.max_planning_cycles {
+                let exhausted = if iteration >= self.config.max_planning_cycles {
+                    Some((
+                        "Replan budget exhausted",
+                        "Replan budget exhausted: coordinator requested another iteration but max_planning_cycles reached",
+                    ))
+                } else if budget_exhausted(
+                    orchestration_start.elapsed(),
+                    self.config.per_call_timeout_secs(),
+                    self.outer_budget,
+                ) {
+                    Some((
+                        "Time budget exhausted",
+                        "Time budget exhausted: the remaining outer budget cannot fit another iteration",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((reasoning, detail)) = exhausted {
                     tracing::warn!(
-                        "Coordinator chose create_plan on final iteration {} (max={}). \
+                        "Coordinator chose create_plan on iteration {} but {}. \
                          Returning raw task results instead of looping.",
                         iteration,
-                        self.config.max_planning_cycles,
+                        reasoning,
                     );
-                    let raw = Self::build_raw_task_results(
-                        &plan,
-                        "Replan budget exhausted: coordinator requested another iteration but max_planning_cycles reached",
-                    );
+                    let raw = Self::build_raw_task_results(&plan, detail);
                     Self::emit_event(
                         event_tx,
                         OrchestratorEvent::IterationComplete {
                             iteration,
                             will_replan: false,
-                            reasoning: "Replan budget exhausted".to_string(),
+                            reasoning: reasoning.to_string(),
                             gaps: vec![],
                             timings,
                         },
@@ -4550,6 +4527,17 @@ fn is_transient_planning_error(error: &str) -> bool {
         Orchestrator::categorize_failure_error(error),
         FailureCategory::ProviderOverloaded | FailureCategory::AgentTimeout
     )
+}
+
+/// Whether starting another iteration would overrun the outer budget: the
+/// remaining budget cannot fit even one more `per_call` slice. An iteration
+/// can cost several slices (a worker wave plus continuation), so this is a
+/// floor, not a guarantee against mid-wave kills.
+fn budget_exhausted(elapsed: Duration, per_call_secs: u64, outer_budget: Option<Duration>) -> bool {
+    let Some(budget) = outer_budget else {
+        return false;
+    };
+    per_call_secs > 0 && elapsed + Duration::from_secs(per_call_secs) > budget
 }
 
 /// Get a user-friendly suggestion for recovering from context overflow.
@@ -5605,6 +5593,16 @@ mod tests {
             Orchestrator::categorize_failure_error("Request timed out after 503 retries"),
             FailureCategory::AgentTimeout
         );
+    }
+
+    #[test]
+    fn test_budget_exhausted() {
+        let secs = Duration::from_secs;
+        // Equality still fits: `>` must not fire.
+        assert!(!budget_exhausted(secs(240), 60, Some(secs(300))));
+        assert!(budget_exhausted(secs(241), 60, Some(secs(300))));
+        assert!(!budget_exhausted(secs(1000), 0, Some(secs(300))));
+        assert!(!budget_exhausted(secs(1000), 60, None));
     }
 
     #[test]

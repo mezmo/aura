@@ -125,18 +125,13 @@ pub struct WorkerConfig {
 /// ```toml
 /// [orchestration.timeouts]
 /// per_call_timeout_secs = 120
-/// inactivity_timeout_secs = 120
+/// inactivity_timeout_secs = 45
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimeoutsConfig {
-    /// Per-call timeout (seconds) for coordinator and worker LLM calls.
-    ///
-    /// Each individual `.chat()` call (planning, continuation, worker task)
-    /// is wrapped with this timeout. Prevents a single hung LLM call from blocking
-    /// the request.
-    ///
-    /// Default: 0 (disabled). Set to a positive value to enable per-call timeouts.
+    /// Wall-clock budget (seconds) for one coordinator phase or one worker
+    /// task. 0 disables.
     #[serde(default = "default_per_call_timeout_secs")]
     pub per_call_timeout_secs: u64,
 

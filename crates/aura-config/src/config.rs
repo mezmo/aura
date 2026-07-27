@@ -398,6 +398,18 @@ impl Config {
             tracing::warn!("{msg}");
         }
 
+        if let Some(orch) = self.orchestration.as_ref().filter(|o| o.enabled) {
+            let per_call = orch.timeouts.per_call_timeout_secs;
+            let inactivity = orch.timeouts.inactivity_timeout_secs;
+            let agent = &self.agent.name;
+            if let Some(msg) = no_inner_bound_warning(per_call, inactivity) {
+                tracing::warn!("agent '{agent}': {msg}");
+            }
+            if let Some(msg) = inactivity_vs_per_call_warning(per_call, inactivity) {
+                tracing::warn!("agent '{agent}': {msg}");
+            }
+        }
+
         if let Some(orch) = &self.orchestration {
             orch.validate_worker_names()?;
         }
@@ -465,6 +477,35 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+/// Warn when both orchestration timeouts are disabled, leaving only the
+/// server-level streaming timeout to bound a hung provider.
+fn no_inner_bound_warning(
+    per_call_timeout_secs: u64,
+    inactivity_timeout_secs: u64,
+) -> Option<String> {
+    if per_call_timeout_secs == 0 && inactivity_timeout_secs == 0 {
+        Some(
+            "orchestration has per_call_timeout_secs = 0 and inactivity_timeout_secs = 0; a hung provider is only bounded by the server-level streaming timeout".to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Warn when the inactivity window cannot fire before the per-call budget.
+fn inactivity_vs_per_call_warning(
+    per_call_timeout_secs: u64,
+    inactivity_timeout_secs: u64,
+) -> Option<String> {
+    if per_call_timeout_secs > 0 && inactivity_timeout_secs >= per_call_timeout_secs {
+        Some(format!(
+            "inactivity_timeout_secs ({inactivity_timeout_secs}s) is greater than or equal to per_call_timeout_secs ({per_call_timeout_secs}s); the per-call budget always fires first and the inactivity window is dead config"
+        ))
+    } else {
+        None
     }
 }
 
@@ -1005,6 +1046,21 @@ mod tests {
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
+    }
+
+    #[test]
+    fn test_no_inner_bound_warning() {
+        assert!(no_inner_bound_warning(0, 0).is_some());
+        assert!(no_inner_bound_warning(60, 0).is_none());
+        assert!(no_inner_bound_warning(0, 60).is_none());
+    }
+
+    #[test]
+    fn test_inactivity_vs_per_call_warning() {
+        assert!(inactivity_vs_per_call_warning(60, 60).is_some());
+        assert!(inactivity_vs_per_call_warning(60, 120).is_some());
+        assert!(inactivity_vs_per_call_warning(60, 30).is_none());
+        assert!(inactivity_vs_per_call_warning(0, 120).is_none());
     }
 
     #[test]

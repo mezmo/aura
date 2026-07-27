@@ -200,6 +200,72 @@ async fn shutdown_guard(
     next.run(request).await
 }
 
+/// Startup warnings relating the per-request budgets (CLI/env) to an agent's
+/// orchestration timeouts (TOML). `aura-config` validation sees only the TOML
+/// layer, so cross-layer checks live here.
+fn warn_timeout_relationships(agent_id: &str, config: &aura_config::Config, args: &Args) {
+    let Some(orch) = config.orchestration.as_ref().filter(|o| o.enabled) else {
+        return;
+    };
+    let per_call = orch.timeouts.per_call_timeout_secs;
+    let toml_inactivity = orch.timeouts.inactivity_timeout_secs;
+    let streaming = args.streaming_timeout_secs;
+    let server_inactivity = args.inactivity_timeout_secs;
+
+    if let Some(msg) = per_call_vs_streaming_warning(per_call, streaming) {
+        tracing::warn!("agent '{agent_id}': {msg}");
+    }
+    if let Some(msg) = server_window_shadows_tools_warning(server_inactivity, toml_inactivity) {
+        tracing::warn!("agent '{agent_id}': {msg}");
+    }
+    if let Some(hitl) = config.hitl.as_ref() {
+        let route_timeout = match &hitl.route {
+            aura_config::DecisionRouteConfig::Webhook { timeout_secs, .. } => *timeout_secs,
+            aura_config::DecisionRouteConfig::Conversational { timeout_secs, .. } => *timeout_secs,
+        };
+        if let Some(msg) = hitl_route_vs_server_window_warning(route_timeout, server_inactivity) {
+            tracing::warn!("agent '{agent_id}': {msg}");
+        }
+    }
+}
+
+/// Warn when a single worker task cannot finish inside the request budget.
+fn per_call_vs_streaming_warning(per_call: u64, streaming: u64) -> Option<String> {
+    if streaming > 0 && per_call >= streaming {
+        return Some(format!(
+            "per_call_timeout_secs ({per_call}s) >= streaming timeout ({streaming}s); a single worker task cannot finish inside the request budget"
+        ));
+    }
+    None
+}
+
+/// Warn when the server inactivity window fires before (or instead of) the
+/// TOML window that exempts orchestrated worker tools.
+fn server_window_shadows_tools_warning(
+    server_inactivity: u64,
+    toml_inactivity: u64,
+) -> Option<String> {
+    if server_inactivity > 0 && (toml_inactivity == 0 || server_inactivity <= toml_inactivity) {
+        return Some(format!(
+            "the server inactivity window ({server_inactivity}s) does not exempt orchestrated worker tools; set [orchestration.timeouts].inactivity_timeout_secs below it (currently {toml_inactivity}s) so the inner window, which does exempt tools, fires first"
+        ));
+    }
+    None
+}
+
+/// Warn when a parked HITL approval can outlive the server inactivity window.
+fn hitl_route_vs_server_window_warning(
+    route_timeout: u64,
+    server_inactivity: u64,
+) -> Option<String> {
+    if server_inactivity > 0 && route_timeout >= server_inactivity {
+        return Some(format!(
+            "hitl route timeout ({route_timeout}s) >= server inactivity window ({server_inactivity}s); approvals parked during orchestrated runs may be killed as stalls"
+        ));
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let result = run().await;
@@ -237,6 +303,7 @@ async fn run() -> std::io::Result<()> {
         let id = config.agent.alias.as_deref().unwrap_or(&config.agent.name);
         let (provider, model) = config.agent.llm.model_info();
         info!("Loaded agent '{}' ({}/{})", id, provider, model);
+        warn_timeout_relationships(id, config, &args);
     }
 
     // Validate DEFAULT_AGENT matches a loaded config
@@ -451,4 +518,35 @@ async fn run() -> std::io::Result<()> {
             shutdown_rx.await.ok();
         })
         .await
+}
+
+#[cfg(test)]
+mod timeout_warning_tests {
+    use super::*;
+
+    #[test]
+    fn per_call_vs_streaming_boundaries() {
+        assert!(per_call_vs_streaming_warning(900, 900).is_some());
+        assert!(per_call_vs_streaming_warning(901, 900).is_some());
+        assert!(per_call_vs_streaming_warning(899, 900).is_none());
+        assert!(per_call_vs_streaming_warning(900, 0).is_none());
+    }
+
+    #[test]
+    fn server_window_shadows_tools_boundaries() {
+        assert!(server_window_shadows_tools_warning(30, 0).is_some());
+        assert!(server_window_shadows_tools_warning(30, 30).is_some());
+        assert!(server_window_shadows_tools_warning(30, 60).is_some());
+        assert!(server_window_shadows_tools_warning(30, 20).is_none());
+        assert!(server_window_shadows_tools_warning(0, 0).is_none());
+        assert!(server_window_shadows_tools_warning(0, 60).is_none());
+    }
+
+    #[test]
+    fn hitl_route_vs_server_window_boundaries() {
+        assert!(hitl_route_vs_server_window_warning(300, 300).is_some());
+        assert!(hitl_route_vs_server_window_warning(600, 300).is_some());
+        assert!(hitl_route_vs_server_window_warning(299, 300).is_none());
+        assert!(hitl_route_vs_server_window_warning(600, 0).is_none());
+    }
 }
