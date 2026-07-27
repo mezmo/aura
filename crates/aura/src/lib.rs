@@ -14,6 +14,7 @@ pub mod error;
 pub mod fallback_tool_parser;
 pub mod fallback_tool_stream;
 pub mod hitl;
+pub mod inactivity;
 pub mod logging;
 pub mod mcp;
 pub mod mcp_dynamic;

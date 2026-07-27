@@ -65,6 +65,7 @@ allow_clarification = false
 
 [orchestration.timeouts]
 per_call_timeout_secs = 90
+inactivity_timeout_secs = 120
 
 [orchestration.worker.data-explorer]
 description = "Data retrieval and exploration using scratchpad tools"

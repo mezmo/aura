@@ -92,6 +92,8 @@ pub struct AppState {
     pub streaming_timeout_secs: u64,
     /// First chunk timeout in seconds (0 = disabled). Protects against hung provider connections.
     pub first_chunk_timeout_secs: u64,
+    /// Inactivity timeout in seconds (0 = disabled).
+    pub inactivity_timeout_secs: u64,
     /// Shutdown gate — cancelled immediately on SIGTERM/SIGINT to reject new requests (503)
     pub shutdown_token: CancellationToken,
     /// Stream shutdown — cancelled after grace period to terminate in-flight streams

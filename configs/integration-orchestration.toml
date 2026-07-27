@@ -50,6 +50,7 @@ tools_in_planning = "summary"
 
 [orchestration.timeouts]
 per_call_timeout_secs = 60
+inactivity_timeout_secs = 120
 
 [orchestration.artifacts]
 memory_dir = "/tmp/aura-orchestration-test"

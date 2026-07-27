@@ -111,6 +111,9 @@ tools_in_planning = "summary"
 
 [orchestration.timeouts]
 per_call_timeout_secs = 120
+# Fail a coordinator/worker stream after this many seconds of provider
+# silence (tool execution is exempt). 0 disables.
+inactivity_timeout_secs = 0
 
 # ─── Workers ────────────────────────────────────────────────────
 # Each worker specializes in a domain. Add mcp_filter to restrict

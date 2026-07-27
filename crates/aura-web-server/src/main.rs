@@ -121,6 +121,14 @@ struct Args {
     #[arg(long, env = "FIRST_CHUNK_TIMEOUT_SECS", default_value = "90")]
     first_chunk_timeout_secs: u64,
 
+    /// Inactivity timeout in seconds.
+    /// Maximum silence between stream items after the first chunk before the
+    /// stream is failed. Tool execution is exempt. Set to 0 to disable.
+    /// Note: some providers emit nothing during long reasoning phases; enable
+    /// only with a window that accommodates them.
+    #[arg(long, env = "INACTIVITY_TIMEOUT_SECS", default_value = "0")]
+    inactivity_timeout_secs: u64,
+
     /// Graceful shutdown timeout in seconds.
     /// On SIGTERM/SIGINT, new requests are rejected immediately (503), but in-flight
     /// streaming requests are given this long to finish naturally before being terminated.
@@ -317,6 +325,7 @@ async fn run() -> std::io::Result<()> {
         debug_provider_errors: args.debug_provider_errors,
         streaming_timeout_secs: args.streaming_timeout_secs,
         first_chunk_timeout_secs: args.first_chunk_timeout_secs,
+        inactivity_timeout_secs: args.inactivity_timeout_secs,
         shutdown_token: shutdown_token.clone(),
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
