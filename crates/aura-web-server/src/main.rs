@@ -121,11 +121,15 @@ struct Args {
     #[arg(long, env = "FIRST_CHUNK_TIMEOUT_SECS", default_value = "90")]
     first_chunk_timeout_secs: u64,
 
-    /// Inactivity timeout in seconds.
+    /// Inactivity timeout in seconds (streaming requests only).
     /// Maximum silence between stream items after the first chunk before the
-    /// stream is failed. Tool execution is exempt. Set to 0 to disable.
-    /// Note: some providers emit nothing during long reasoning phases; enable
-    /// only with a window that accommodates them.
+    /// stream is failed. Single-agent tool execution is exempt; orchestrated
+    /// worker tools are bounded by the TOML inactivity_timeout_secs instead,
+    /// so size this window above it for orchestrated configs. Set to 0 to
+    /// disable.
+    /// Note: some providers emit nothing during long mid-stream reasoning
+    /// phases; the window must exceed the longest such gap, not just startup
+    /// latency.
     #[arg(long, env = "INACTIVITY_TIMEOUT_SECS", default_value = "0")]
     inactivity_timeout_secs: u64,
 

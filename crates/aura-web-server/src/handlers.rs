@@ -124,6 +124,7 @@ pub struct CompletionConfig {
     pub request_id: String,
     pub timeout_duration: std::time::Duration,
     pub first_chunk_timeout: Option<std::time::Duration>,
+    pub inactivity_timeout: Option<std::time::Duration>,
     pub stream_config: StreamConfig,
     pub turn_context: TurnContext,
     pub stream_shutdown_token: tokio_util::sync::CancellationToken,
@@ -426,6 +427,11 @@ pub fn build_completion_config(
     } else {
         None
     };
+    let inactivity_timeout = if data.inactivity_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(data.inactivity_timeout_secs))
+    } else {
+        None
+    };
     let request_id = setup.request_id.clone();
     let fallback_tool_parsing = setup.config.is_fallback_tool_parsing_enabled();
 
@@ -463,6 +469,7 @@ pub fn build_completion_config(
         request_id,
         timeout_duration,
         first_chunk_timeout,
+        inactivity_timeout,
         stream_config,
         turn_context,
         stream_shutdown_token: data.stream_shutdown_token.clone(),
@@ -594,6 +601,7 @@ pub async fn execute_completion(
                 config.timeout_duration,
                 heartbeat_interval,
                 config.first_chunk_timeout,
+                config.inactivity_timeout,
                 callbacks,
             )
             .await
@@ -1388,6 +1396,7 @@ mod tests {
             request_id,
             timeout_duration: Duration::from_secs(30),
             first_chunk_timeout: None,
+            inactivity_timeout: None,
             stream_config: StreamConfig::new(false, false, ToolResultMode::default(), 0),
             turn_context: TurnContext::new(
                 "chatcmpl-test".to_string(),

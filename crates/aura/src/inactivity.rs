@@ -5,12 +5,38 @@
 //! silence. Suspension exempts tool execution, where provider silence is
 //! expected (tool hangs are a separate concern, tracked by #187).
 
+use crate::provider_agent::{StreamItem, StreamedAssistantContent, StreamedUserContent};
 use std::time::Duration;
 use tokio::time::Instant;
 
 /// Sentinel prefix of an inactivity-stall error message; deliberately
 /// neutral about blame.
 pub const STALL_MESSAGE: &str = "no stream progress for";
+
+/// How a stream item bears on the inactivity deadline.
+#[derive(Debug, Clone, Copy)]
+pub enum Liveness {
+    Activity,
+    ToolStarted,
+    ToolFinished,
+}
+
+/// Tool execution happens inside the following `stream.next()` (rig yields
+/// `ToolCall` before executing and `ToolResult` after), so `ToolStarted`
+/// suspends across exactly the window where provider silence is expected.
+/// Pairing relies on rig's sequential tool execution ("Critical Assumption",
+/// CLAUDE.md).
+pub fn liveness_of<E>(item: &Result<StreamItem, E>) -> Liveness {
+    match item {
+        Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(_))) => {
+            Liveness::ToolStarted
+        }
+        Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(_))) => {
+            Liveness::ToolFinished
+        }
+        _ => Liveness::Activity,
+    }
+}
 
 /// Re-arming deadline that fires after a window of provider silence.
 #[derive(Debug)]

@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Agent;
 use crate::config::{AgentRuntimeConfig, LlmConfig};
-use crate::inactivity::STALL_MESSAGE;
+use crate::inactivity::{Liveness, STALL_MESSAGE, liveness_of};
 use crate::mcp::McpManager;
 use crate::provider_agent::{BuilderState, ProviderAgent, StreamError, StreamItem};
 use crate::scratchpad;
@@ -429,33 +429,6 @@ struct StreamCallParams<'a> {
 enum LoopStep {
     End,
     Continue,
-}
-
-/// How a stream item bears on the inactivity deadline.
-#[derive(Clone, Copy)]
-enum Liveness {
-    Activity,
-    ToolStarted,
-    ToolFinished,
-}
-
-/// Tool execution happens inside the following `stream.next()` (rig yields
-/// `ToolCall` before executing and `ToolResult` after), so `ToolStarted`
-/// suspends across exactly the window where provider silence is expected.
-/// Correct pairing relies on rig's sequential tool execution (see "Critical
-/// Assumption" in CLAUDE.md); parallel tool calls would resume on the first
-/// result while a second tool runs.
-fn liveness_of<E>(item: &Result<StreamItem, E>) -> Liveness {
-    use crate::provider_agent::{StreamedAssistantContent, StreamedUserContent};
-    match item {
-        Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall(_))) => {
-            Liveness::ToolStarted
-        }
-        Ok(StreamItem::StreamUserItem(StreamedUserContent::ToolResult(_))) => {
-            Liveness::ToolFinished
-        }
-        _ => Liveness::Activity,
-    }
 }
 
 impl Orchestrator {

@@ -106,6 +106,7 @@ pub async fn process_sse_stream_full<S>(
     timeout_duration: Duration,
     heartbeat_interval: Duration,
     first_chunk_timeout: Option<Duration>,
+    inactivity_timeout: Option<Duration>,
     mut callbacks: StreamingCallbacks,
 ) -> StreamTermination
 where
@@ -170,6 +171,14 @@ where
     tokio::pin!(first_chunk_sleep);
     let mut first_chunk_received = false;
 
+    // Disarmed so the first-chunk timeout alone governs the pre-response window.
+    // The progress, tool, approval, and usage arms also touch it: during
+    // orchestrated runs worker liveness reaches this loop through those
+    // channels rather than as stream items. Heartbeats prove the client
+    // link, not the provider, so they deliberately never touch it.
+    let mut inactivity =
+        aura::inactivity::InactivityDeadline::new_disarmed(inactivity_timeout.unwrap_or_default());
+
     let termination = loop {
         tokio::select! {
             // Normal stream processing — shared with collect_stream_to_completion
@@ -178,6 +187,13 @@ where
                 // responded — clear the first-chunk timeout regardless of content.
                 if !first_chunk_received {
                     first_chunk_received = true;
+                }
+                // ToolCall suspends after its sends, ToolResult restarts the
+                // window; pairing contract at `aura::inactivity::liveness_of`.
+                let liveness = item.as_ref().map(aura::inactivity::liveness_of);
+                match liveness {
+                    Some(aura::inactivity::Liveness::ToolFinished) => inactivity.resume(),
+                    _ => inactivity.touch(),
                 }
                 match process_stream_next(config, ctx, &mut state, item) {
                     NextItemResult::Continue(bytes_to_send) => {
@@ -213,11 +229,15 @@ where
                         break StreamTermination::Complete;
                     }
                 }
+                if matches!(liveness, Some(aura::inactivity::Liveness::ToolStarted)) {
+                    inactivity.suspend();
+                }
             }
 
             // MCP progress notification (only emit if custom events enabled)
             notification = callbacks.progress_rx.recv(), if emit_custom_events => {
                 if let Some(notification) = notification {
+                    inactivity.touch();
                     let event = AuraStreamEvent::progress(
                         notification.message.clone().unwrap_or_else(|| {
                             format!("Progress: {}/{:?}", notification.progress, notification.total)
@@ -244,6 +264,7 @@ where
             // MCP tool lifecycle events (requested when LLM decides, start when MCP begins)
             tool_event = callbacks.tool_event_rx.recv(), if emit_custom_events => {
                 if let Some(tool_event) = tool_event {
+                    inactivity.touch();
                     let sse_event = match tool_event {
                         ToolLifecycleEvent::Requested { tool_id, tool_name, arguments } => {
                             tracing::debug!(
@@ -282,6 +303,7 @@ where
             // HITL approval lifecycle events are protocol, not optional telemetry.
             approval_event = callbacks.approval_event_rx.recv() => {
                 if let Some(approval_event) = approval_event {
+                    inactivity.touch();
                     let event = match approval_event {
                         ApprovalLifecycleEvent::Requested(requested) => {
                             AuraStreamEvent::ApprovalRequested(requested)
@@ -303,6 +325,7 @@ where
             // Tool usage events from hook (associates tool_ids with usage snapshot)
             tool_usage = callbacks.tool_usage_rx.recv(), if emit_custom_events => {
                 if let Some(usage_event) = tool_usage {
+                    inactivity.touch();
                     tracing::debug!(
                         "Emitting aura.tool_usage event: tool_ids={:?}, prompt_tokens={}",
                         usage_event.tool_ids, usage_event.prompt_tokens
@@ -326,6 +349,15 @@ where
                 tracing::warn!(
                     "First chunk timeout ({:?}) - no response from LLM provider",
                     first_chunk_timeout.unwrap()
+                );
+                break StreamTermination::Timeout;
+            }
+
+            // Inactivity timeout: detect a provider that went silent mid-stream
+            _ = inactivity.expired() => {
+                tracing::warn!(
+                    "Inactivity timeout: no stream progress for {:?}",
+                    inactivity.window()
                 );
                 break StreamTermination::Timeout;
             }
@@ -1795,5 +1827,424 @@ mod tests {
             "Expected StreamError termination, got: {:?}",
             termination
         );
+    }
+
+    mod inactivity {
+        use super::*;
+        use async_trait::async_trait;
+        use aura::streaming::StreamingAgent;
+        use futures_util::stream::BoxStream;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        struct NoopAgent;
+
+        #[async_trait]
+        impl StreamingAgent for NoopAgent {
+            fn get_provider_info(&self) -> (&str, &str) {
+                ("test", "fake")
+            }
+
+            async fn stream(
+                &self,
+                _query: &str,
+                _chat_history: Vec<aura::Message>,
+                _cancel_token: CancellationToken,
+                _request_id: &str,
+            ) -> Result<
+                BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
+                aura::StreamError,
+            > {
+                Ok(Box::pin(futures_util::stream::pending()))
+            }
+
+            async fn stream_with_timeout(
+                &self,
+                _query: &str,
+                _chat_history: Vec<aura::Message>,
+                _timeout: Duration,
+                _request_id: &str,
+            ) -> (
+                BoxStream<'static, Result<aura::StreamItem, aura::StreamError>>,
+                watch::Sender<bool>,
+                aura::UsageState,
+            ) {
+                let (cancel_tx, _) = watch::channel(false);
+                (
+                    Box::pin(futures_util::stream::pending()),
+                    cancel_tx,
+                    aura::UsageState::new(),
+                )
+            }
+
+            async fn cancel_and_close_mcp(&self, _request_id: &str, _reason: &str) -> usize {
+                0
+            }
+        }
+
+        /// Event senders must outlive the loop: a closed channel's `recv()`
+        /// arm is permanently ready with `None`, which starves paused time.
+        #[derive(Clone)]
+        struct EventSenders {
+            _tool_event_tx: mpsc::Sender<ToolLifecycleEvent>,
+            _progress_tx: mpsc::Sender<ProgressNotification>,
+            _tool_usage_tx: mpsc::Sender<ToolUsageEvent>,
+            _approval_tx: mpsc::Sender<ApprovalLifecycleEvent>,
+        }
+
+        fn callbacks() -> (StreamingCallbacks, EventSenders) {
+            let (tool_event_tx, tool_event_rx) = mpsc::channel(8);
+            let (progress_tx, progress_rx) = mpsc::channel(8);
+            let (tool_usage_tx, tool_usage_rx) = mpsc::channel(8);
+            let (approval_tx, approval_event_rx) = mpsc::channel(8);
+            (
+                StreamingCallbacks {
+                    request_id: "req_inactivity_test".to_string(),
+                    agent: Arc::new(NoopAgent),
+                    tool_event_rx,
+                    progress_rx,
+                    tool_usage_rx,
+                    approval_event_rx,
+                    usage_state: aura::UsageState::new(),
+                    response_content: ResponseContent::new(),
+                    model_name: "test/fake".to_string(),
+                    stream_shutdown_token: CancellationToken::new(),
+                },
+                EventSenders {
+                    _tool_event_tx: tool_event_tx,
+                    _progress_tx: progress_tx,
+                    _tool_usage_tx: tool_usage_tx,
+                    _approval_tx: approval_tx,
+                },
+            )
+        }
+
+        fn text_item(s: &str) -> Result<StreamItem, StreamError> {
+            Ok(StreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Text(s.to_string()),
+            ))
+        }
+
+        /// Returns the termination and elapsed (virtual) seconds.
+        async fn run_loop<S>(
+            stream: S,
+            inactivity: Option<Duration>,
+            first_chunk: Option<Duration>,
+            heartbeat: Duration,
+        ) -> (StreamTermination, u64)
+        where
+            S: futures_util::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
+        {
+            let config = StreamConfig::new(false, false, ToolResultMode::None, 0);
+            let ctx = TurnContext::new(
+                "test-id".to_string(),
+                "test-model".to_string(),
+                0,
+                None,
+                "test-session",
+            );
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(8);
+            // Drain so sends (including heartbeats) never block the loop.
+            tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            let (cb, _senders) = callbacks();
+            let start = tokio::time::Instant::now();
+            let termination = process_sse_stream_full(
+                &config,
+                &ctx,
+                stream,
+                chunk_tx,
+                cancel_tx,
+                Duration::from_secs(900),
+                heartbeat,
+                first_chunk,
+                inactivity,
+                cb,
+            )
+            .await;
+            (termination, start.elapsed().as_secs())
+        }
+
+        const HB_QUIET: Duration = Duration::from_secs(86_400);
+
+        #[tokio::test(start_paused = true)]
+        async fn mid_stream_hang_fails_at_window() {
+            let stream = futures_util::stream::iter(vec![text_item("hi")])
+                .chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop(
+                Box::pin(stream),
+                Some(Duration::from_secs(30)),
+                None,
+                HB_QUIET,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 30);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn disabled_window_leaves_only_safety_net() {
+            let stream = futures_util::stream::iter(vec![text_item("hi")])
+                .chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop(Box::pin(stream), None, None, HB_QUIET).await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 900);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn disarmed_before_first_chunk() {
+            let stream = futures_util::stream::pending();
+            let (termination, elapsed) = run_loop(
+                Box::pin(stream),
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(90)),
+                HB_QUIET,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 90);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn flowing_items_keep_stream_alive_past_window() {
+            // 3 × 20s of flow, then a full 30s of silence.
+            let spaced = futures_util::stream::unfold(0u32, |n| async move {
+                if n < 3 {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    Some((text_item("tick"), n + 1))
+                } else {
+                    None
+                }
+            });
+            let stream = spaced.chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop(
+                Box::pin(stream),
+                Some(Duration::from_secs(30)),
+                None,
+                HB_QUIET,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 90);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn tool_execution_is_exempt() {
+            // ToolCall, then 100s of "execution" silence, then ToolResult and
+            // a clean end: far past the 30s window, but suspended throughout.
+            let spaced = futures_util::stream::unfold(0u32, |n| async move {
+                match n {
+                    0 => Some((
+                        Ok(StreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ToolCall(aura::ToolCall {
+                                id: "t1".into(),
+                                name: "slow_tool".into(),
+                                arguments: String::new(),
+                            }),
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_secs(100)).await;
+                        Some((
+                            Ok(StreamItem::StreamUserItem(
+                                aura::StreamedUserContent::ToolResult(aura::ToolResult {
+                                    id: "t1".into(),
+                                    call_id: None,
+                                    result: "ok".into(),
+                                }),
+                            )),
+                            2,
+                        ))
+                    }
+                    _ => None,
+                }
+            });
+            let (termination, elapsed) = run_loop(
+                Box::pin(spaced),
+                Some(Duration::from_secs(30)),
+                None,
+                HB_QUIET,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Complete);
+            assert_eq!(elapsed, 100);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn silence_after_tool_result_still_stalls() {
+            // The ToolResult resumes the countdown: post-tool provider silence
+            // is a stall, not more execution.
+            let spaced = futures_util::stream::unfold(0u32, |n| async move {
+                match n {
+                    0 => Some((
+                        Ok(StreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::ToolCall(aura::ToolCall {
+                                id: "t1".into(),
+                                name: "slow_tool".into(),
+                                arguments: String::new(),
+                            }),
+                        )),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_secs(100)).await;
+                        Some((
+                            Ok(StreamItem::StreamUserItem(
+                                aura::StreamedUserContent::ToolResult(aura::ToolResult {
+                                    id: "t1".into(),
+                                    call_id: None,
+                                    result: "ok".into(),
+                                }),
+                            )),
+                            2,
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop(
+                Box::pin(spaced),
+                Some(Duration::from_secs(30)),
+                None,
+                HB_QUIET,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 130);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn normal_completion_beats_a_short_window() {
+            let stream = futures_util::stream::iter(vec![text_item("hi"), text_item("there")]);
+            let (termination, _) = run_loop(
+                Box::pin(stream),
+                Some(Duration::from_secs(5)),
+                None,
+                HB_QUIET,
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Complete);
+        }
+
+        /// Like `run_loop`, but with custom events on and the senders handed
+        /// to a driver task so event arms can carry the liveness.
+        async fn run_loop_with_events<S, F>(
+            stream: S,
+            inactivity: Option<Duration>,
+            drive: impl FnOnce(EventSenders) -> F,
+        ) -> (StreamTermination, u64)
+        where
+            S: futures_util::Stream<Item = Result<StreamItem, StreamError>> + Unpin,
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            let config = StreamConfig::new(true, false, ToolResultMode::None, 0);
+            let ctx = TurnContext::new(
+                "test-id".to_string(),
+                "test-model".to_string(),
+                0,
+                None,
+                "test-session",
+            );
+            let (chunk_tx, mut chunk_rx) = mpsc::channel(64);
+            tokio::spawn(async move { while chunk_rx.recv().await.is_some() {} });
+            let (cancel_tx, _cancel_rx) = watch::channel(false);
+            let (cb, senders) = callbacks();
+            // The driver gets a clone; the originals stay alive past the loop.
+            tokio::spawn(drive(senders.clone()));
+            let start = tokio::time::Instant::now();
+            let termination = process_sse_stream_full(
+                &config,
+                &ctx,
+                stream,
+                chunk_tx,
+                cancel_tx,
+                Duration::from_secs(900),
+                HB_QUIET,
+                None,
+                inactivity,
+                cb,
+            )
+            .await;
+            (termination, start.elapsed().as_secs())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn progress_notifications_carry_liveness() {
+            // One stream item arms the window; MCP progress every 20s keeps a
+            // 30s window alive until the driver stops at 60s; stall at 90s.
+            let stream = futures_util::stream::iter(vec![text_item("hi")])
+                .chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop_with_events(
+                Box::pin(stream),
+                Some(Duration::from_secs(30)),
+                |s| async move {
+                    for n in 0..3i64 {
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        let _ = s
+                            ._progress_tx
+                            .send(aura::ProgressNotification {
+                                progress_token: aura::ProgressToken(aura::NumberOrString::Number(
+                                    n,
+                                )),
+                                progress: n as f64,
+                                total: Some(3.0),
+                                message: Some("working".into()),
+                            })
+                            .await;
+                    }
+                },
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 90);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn approval_events_carry_liveness() {
+            let stream = futures_util::stream::iter(vec![text_item("hi")])
+                .chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop_with_events(
+                Box::pin(stream),
+                Some(Duration::from_secs(30)),
+                |s| async move {
+                    tokio::time::sleep(Duration::from_secs(25)).await;
+                    let _ = s
+                        ._approval_tx
+                        .send(ApprovalLifecycleEvent::Pending(
+                            aura_events::ApprovalPending {
+                                decision_id: "d1".into(),
+                                tool_name: "dangerous_apply".into(),
+                                arguments: serde_json::json!({}),
+                                origin: aura_events::ApprovalOriginWire::ConfigGate {
+                                    matched_pattern: "dangerous_*".into(),
+                                },
+                                scope: aura_events::AgentScopeWire::Single { session_id: None },
+                                expires_at: "2026-01-01T00:00:00Z".into(),
+                            },
+                        ))
+                        .await;
+                },
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 55);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn heartbeats_do_not_feed_the_deadline() {
+            let stream = futures_util::stream::iter(vec![text_item("hi")])
+                .chain(futures_util::stream::pending());
+            let (termination, elapsed) = run_loop(
+                Box::pin(stream),
+                Some(Duration::from_secs(30)),
+                None,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(termination, StreamTermination::Timeout);
+            assert_eq!(elapsed, 30);
+        }
     }
 }
