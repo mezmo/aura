@@ -377,6 +377,23 @@ pub enum AuraStreamEvent {
         #[serde(flatten)]
         correlation: CorrelationContext,
     },
+    /// Per-agent context-window occupancy from the provider-reported input/output
+    /// of that agent's final LLM turn. Unlike [`Self::Usage`] (cumulative billed
+    /// tokens), this reflects the context carried into the last call. Derived
+    /// from provider usage, never a local tokenizer.
+    ContextUsage {
+        /// Provider-reported input tokens of the agent's final turn (context size).
+        context_tokens: u64,
+        /// Provider-reported output tokens of the agent's final turn.
+        response_tokens: u64,
+        /// Model context-window limit, when known, for a direct fill percentage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+        #[serde(flatten)]
+        agent: AgentContext,
+        #[serde(flatten)]
+        correlation: CorrelationContext,
+    },
     /// Emitted when a HITL approval request is raised.
     ApprovalRequested(ApprovalRequested),
     /// Emitted when a HITL approval is awaiting an attended decision.
@@ -410,6 +427,7 @@ impl AuraStreamEvent {
             Self::ToolUsage { .. } => event_names::TOOL_USAGE,
             Self::Usage { .. } => event_names::USAGE,
             Self::ScratchpadUsage { .. } => event_names::SCRATCHPAD_USAGE,
+            Self::ContextUsage { .. } => event_names::CONTEXT_USAGE,
             Self::ApprovalRequested(_) => event_names::APPROVAL_REQUESTED,
             Self::ApprovalPending(_) => event_names::APPROVAL_PENDING,
             Self::ApprovalCompleted(_) => event_names::APPROVAL_COMPLETED,
@@ -597,6 +615,23 @@ impl AuraStreamEvent {
             correlation,
         }
     }
+
+    /// Create a ContextUsage event (per-agent context-window occupancy).
+    pub fn context_usage(
+        context_tokens: u64,
+        response_tokens: u64,
+        context_window: Option<u64>,
+        agent: AgentContext,
+        correlation: CorrelationContext,
+    ) -> Self {
+        Self::ContextUsage {
+            context_tokens,
+            response_tokens,
+            context_window,
+            agent,
+            correlation,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +746,35 @@ mod tests {
                 assert_eq!(completion_tokens, 50);
             }
             other => panic!("expected Usage, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn context_usage_roundtrip_and_event_name() {
+        let event = AuraStreamEvent::context_usage(
+            12_000,
+            340,
+            Some(200_000),
+            AgentContext::worker("log-analyst", None, "orchestrator"),
+            CorrelationContext::new("s1", None),
+        );
+        assert_eq!(event.event_name(), "aura.context_usage");
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: AuraStreamEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AuraStreamEvent::ContextUsage {
+                context_tokens,
+                response_tokens,
+                context_window,
+                agent,
+                ..
+            } => {
+                assert_eq!(context_tokens, 12_000);
+                assert_eq!(response_tokens, 340);
+                assert_eq!(context_window, Some(200_000));
+                assert_eq!(agent.agent_id, "log-analyst");
+            }
+            other => panic!("expected ContextUsage, got {:?}", other),
         }
     }
 

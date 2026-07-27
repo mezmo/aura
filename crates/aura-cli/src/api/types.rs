@@ -243,6 +243,11 @@ pub enum DisplayEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    ContextUsage {
+        context_tokens: u64,
+        response_tokens: u64,
+        context_window: Option<u64>,
+    },
     Compacted {
         messages_removed: usize,
     },

@@ -81,7 +81,8 @@ aura/
 ### Streaming
 - OpenAI-compatible SSE streaming (`/v1/chat/completions`)
 - Custom `aura.*` events (opt-in via `AURA_CUSTOM_EVENTS=true`):
-  - `aura.session_info`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.scratchpad_usage`
+  - `aura.session_info`, `aura.mcp_status`, `aura.tool_requested`, `aura.tool_start`, `aura.tool_complete`, `aura.reasoning`, `aura.progress`, `aura.worker_phase`, `aura.tool_usage`, `aura.usage`, `aura.context_usage`, `aura.scratchpad_usage`
+  - `aura.usage` reports **cumulative provider-billed** tokens (Σ input + Σ output across every LLM turn), identical in single-agent and orchestration mode. `aura.context_usage` reports **context-window occupancy** — the provider's final-turn input/output (`context_tokens`/`response_tokens`) plus optional `context_window` — per-agent (single-agent emits one; orchestration emits one per worker + coordinator). Both derive from provider usage, not a local tokenizer. See `crates/aura/src/streaming_request_hook.rs` (`UsageState`) for the billed-vs-occupancy split
 - Request cancellation on timeout or client disconnect
 - Two-phase graceful shutdown: new requests rejected immediately (503), in-flight streams get configurable grace period (`SHUTDOWN_TIMEOUT_SECS`, default 30s)
 

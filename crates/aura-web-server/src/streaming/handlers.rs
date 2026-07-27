@@ -410,6 +410,34 @@ where
     termination
 }
 
+/// Resolve the cumulative billed usage `(prompt, completion, total)` for the
+/// final `aura.usage` event.
+///
+/// The single-agent path carries rig's turn-aggregated usage on
+/// `StreamItem::Final` (`usage_stats`), which sums every LLM turn — including
+/// tool-call-only turns. The hook's per-turn `store_usage` misses those turns:
+/// rig invokes `on_stream_completion_response_finish` only for turns that
+/// produced assistant text, so the hook total (`UsageState::get_final_usage`)
+/// under-reports whenever a tool turn had no text preamble (common on
+/// Bedrock-Claude). Prefer the aggregated `Final` usage when present.
+///
+/// Orchestration leaves `Final.usage` zero and accumulates billed tokens through
+/// `UsageState::accumulate_usage`, so fall back to the hook total when no
+/// aggregated `Final` usage is available.
+fn resolve_billed_usage(
+    usage_stats: &Option<UsageInfo>,
+    usage_state: &UsageState,
+) -> (u64, u64, u64) {
+    match usage_stats {
+        Some(u) if u.prompt_tokens > 0 => (
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.prompt_tokens + u.completion_tokens,
+        ),
+        _ => usage_state.get_final_usage(),
+    }
+}
+
 /// Send final usage events, finish chunk, and [DONE] marker to the client.
 async fn send_final_events(
     emit_custom_events: bool,
@@ -438,9 +466,10 @@ async fn send_final_events(
         }
     }
 
-    // Emit aura.usage at stream end
+    // Emit aura.usage (cumulative billed) and aura.context_usage at stream end.
     if emit_custom_events {
-        let (prompt, completion, total) = callbacks.usage_state.get_final_usage();
+        let (prompt, completion, total) =
+            resolve_billed_usage(&state.usage_stats, &callbacks.usage_state);
         if prompt > 0 {
             tracing::debug!(
                 "Emitting aura.usage event: prompt={}, completion={}, total={}",
@@ -451,6 +480,22 @@ async fn send_final_events(
             let usage_event =
                 AuraStreamEvent::usage(prompt, completion, total, ctx.correlation.clone());
             let _ = tx.send(Ok(Bytes::from(usage_event.format_sse()))).await;
+        }
+
+        // Single-agent context-window occupancy from the final turn. The
+        // orchestration path emits per-agent context_usage during execution and
+        // leaves the shared usage_state's context counters at zero, so this
+        // emission fires only for single-agent requests.
+        let (context_tokens, response_tokens) = callbacks.usage_state.get_context_usage();
+        if context_tokens > 0 {
+            let context_event = AuraStreamEvent::context_usage(
+                context_tokens,
+                response_tokens,
+                callbacks.agent.context_window(),
+                aura::stream_events::AgentContext::single_agent(),
+                ctx.correlation.clone(),
+            );
+            let _ = tx.send(Ok(Bytes::from(context_event.format_sse()))).await;
         }
     }
 
@@ -665,6 +710,32 @@ fn handle_stream_item(
             let event = AuraStreamEvent::scratchpad_usage(
                 *tokens_intercepted,
                 *tokens_extracted,
+                agent_ctx,
+                ctx.correlation.clone(),
+            );
+            vec![Bytes::from(event.format_sse())]
+        }
+        StreamItem::ContextUsage {
+            agent_id,
+            context_tokens,
+            response_tokens,
+            context_window,
+        } => {
+            tracing::debug!(
+                "Context usage for agent {}: context={} tokens, response={} tokens",
+                agent_id,
+                context_tokens,
+                response_tokens,
+            );
+            let agent_ctx = aura::stream_events::AgentContext {
+                agent_id: agent_id.clone(),
+                agent_name: None,
+                parent_agent_id: None,
+            };
+            let event = AuraStreamEvent::context_usage(
+                *context_tokens,
+                *response_tokens,
+                *context_window,
                 agent_ctx,
                 ctx.correlation.clone(),
             );
@@ -1490,6 +1561,69 @@ mod tests {
         assert!(!is_context_overflow_error("authentication failed"));
         assert!(!is_context_overflow_error("rate limit exceeded")); // rate limit != context
         assert!(!is_context_overflow_error("internal server error"));
+    }
+
+    #[test]
+    fn test_resolve_billed_usage_prefers_aggregated_final_over_hook_undercount() {
+        // Single-agent regression: a tool-call-only turn (no assistant text) is
+        // never seen by the hook — rig invokes
+        // on_stream_completion_response_finish only on text turns — so
+        // store_usage records only the final text turn and the hook total
+        // undercounts billed tokens.
+        let usage_state = UsageState::new();
+        // Real turns: tool turn (5000/50) then final text turn (7000/200).
+        // Only the text turn reaches store_usage.
+        usage_state.store_usage(7000, 200, 7200, false);
+        assert_eq!(
+            usage_state.get_final_usage(),
+            (7000, 200, 7200),
+            "hook total omits the tool-only turn"
+        );
+
+        // rig's aggregated Final usage sums both turns.
+        let usage_stats = Some(UsageInfo {
+            prompt_tokens: 12_000,
+            completion_tokens: 250,
+            total_tokens: 12_250,
+        });
+
+        // The fix: aura.usage reflects the aggregated total, not the undercount.
+        assert_eq!(
+            resolve_billed_usage(&usage_stats, &usage_state),
+            (12_000, 250, 12_250),
+            "aura.usage must include every turn, including tool-only turns"
+        );
+    }
+
+    #[test]
+    fn test_resolve_billed_usage_falls_back_to_hook_for_orchestration() {
+        // Orchestration emits StreamItem::Final with zero usage and accumulates
+        // billed tokens through UsageState::accumulate_usage, so resolve must
+        // fall back to the hook total when Final carries no aggregated usage.
+        let usage_state = UsageState::new();
+        usage_state.accumulate_usage(5000, 200); // planning
+        usage_state.accumulate_usage(8000, 400); // worker + synthesis
+
+        let usage_stats = Some(UsageInfo {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        });
+
+        assert_eq!(
+            resolve_billed_usage(&usage_stats, &usage_state),
+            (13_000, 600, 13_600),
+            "orchestration billed usage comes from accumulate_usage"
+        );
+    }
+
+    #[test]
+    fn test_resolve_billed_usage_falls_back_when_no_final() {
+        // Incomplete stream (timeout/shutdown before Final): no aggregated
+        // usage, so fall back to whatever the hook recorded.
+        let usage_state = UsageState::new();
+        usage_state.store_usage(1500, 100, 1600, false);
+        assert_eq!(resolve_billed_usage(&None, &usage_state), (1500, 100, 1600));
     }
 
     #[tokio::test]
