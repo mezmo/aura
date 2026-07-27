@@ -847,6 +847,7 @@ impl Orchestrator {
 
         // Orchestrator owns tool wrapping decision
         worker_config.tool_wrapper = Some(wrapper);
+        worker_config.turn_nudge = turn_nudge.clone();
 
         // Give workers access to result artifacts
         worker_config.orchestration_persistence = Some(self.persistence.clone());

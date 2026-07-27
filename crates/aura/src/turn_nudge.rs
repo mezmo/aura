@@ -3,9 +3,10 @@
 //! `MaxDepthError`.
 //!
 //! `Agent::count_turns` tracks the turn number (one `StreamItem::TurnUsage`
-//! per rig turn); [`TurnNudgeWrapper`] appends a notice to MCP tool output,
-//! which rig feeds back as the next turn's prompt. Enabled via
-//! `[agent].nudge_last_turn` and `[agent].nudge_turns_remaining`.
+//! per rig turn); [`TurnNudgeWrapper`] appends a notice to MCP tool output
+//! and [`NudgedTool`] to scratchpad read tool output, which rig feeds back
+//! as the next turn's prompt. Enabled via `[agent].nudge_last_turn` and
+//! `[agent].nudge_turns_remaining`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -179,6 +180,50 @@ impl ToolWrapper for TurnNudgeWrapper {
     }
 }
 
+/// Adapter that appends turn-limit nudges to a built-in tool's output —
+/// the counterpart of [`TurnNudgeWrapper`] for tools (scratchpad reads)
+/// whose typed args/errors don't fit `WrappedTool`.
+#[derive(Clone)]
+pub struct NudgedTool<T> {
+    inner: T,
+    state: Option<Arc<TurnNudgeState>>,
+}
+
+impl<T> NudgedTool<T> {
+    pub fn new(inner: T, state: Option<Arc<TurnNudgeState>>) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl<T> rig::tool::Tool for NudgedTool<T>
+where
+    T: rig::tool::Tool<Output = String>,
+{
+    const NAME: &'static str = T::NAME;
+    type Error = T::Error;
+    type Args = T::Args;
+    type Output = String;
+
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    async fn definition(&self, prompt: String) -> rig::completion::ToolDefinition {
+        self.inner.definition(prompt).await
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let output = self.inner.call(args).await?;
+        match self.state.as_ref().and_then(|s| s.nudge_message()) {
+            Some(nudge) => {
+                tracing::debug!(tool = %self.inner.name(), "appending turn-limit nudge to tool output");
+                Ok(format!("{output}{nudge}"))
+            }
+            None => Ok(output),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +329,59 @@ mod tests {
         state.reset();
         // Back in turn 1 (remaining 2): no nudge.
         assert!(state.nudge_message().is_none());
+    }
+
+    #[derive(Clone)]
+    struct EchoTool;
+
+    impl rig::tool::Tool for EchoTool {
+        const NAME: &'static str = "echo";
+        type Error = std::io::Error;
+        type Args = String;
+        type Output = String;
+
+        async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
+            rig::completion::ToolDefinition {
+                name: Self::NAME.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            }
+        }
+
+        async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+            Ok(args)
+        }
+    }
+
+    #[tokio::test]
+    async fn nudged_tool_appends_nudge_near_limit() {
+        use rig::tool::Tool;
+
+        let state = TurnNudgeState::new(true, None, 1).unwrap(); // 3 turns total
+        let tool = NudgedTool::new(EchoTool, Some(state.clone()));
+
+        // Turn 1 (remaining 2): output passes through untouched.
+        let out = tool.call("hello".to_string()).await.unwrap();
+        assert_eq!(out, "hello");
+
+        // Turn 2 (remaining 1): final-turn nudge appended.
+        state.record_turn_completed();
+        let out = tool.call("hello".to_string()).await.unwrap();
+        assert!(out.starts_with("hello"));
+        assert!(out.contains("FINAL TURN"));
+
+        // Second call in the same turn: shared state dedupes the nudge.
+        let out = tool.call("hello".to_string()).await.unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[tokio::test]
+    async fn nudged_tool_without_state_is_passthrough() {
+        use rig::tool::Tool;
+
+        let tool = NudgedTool::new(EchoTool, None);
+        assert_eq!(tool.name(), "echo");
+        let out = tool.call("hello".to_string()).await.unwrap();
+        assert_eq!(out, "hello");
     }
 }

@@ -364,6 +364,7 @@ impl Agent {
                 max_depth,
             )
         };
+        config_owned.turn_nudge = turn_nudge.clone();
         if let Some(ref state) = turn_nudge {
             // First in the vec → transform_output runs last, on the text the
             // LLM actually sees (after any scratchpad pointer rewrite).
@@ -982,20 +983,46 @@ impl Agent {
                 GetInTool, GrepTool, HeadTool, ItemSchemaTool, IterateOverTool, ReadTool,
                 SchemaTool, SliceTool,
             };
+            use crate::turn_nudge::NudgedTool;
             tracing::info!(
                 "Adding scratchpad tools (head, slice, grep, schema, item_schema, get_in, iterate_over, read)"
             );
             let s = &scratchpad.storage;
             let b = &scratchpad.budget;
+            let n = &config.turn_nudge;
             builder_state = builder_state
-                .add_tool(HeadTool::new(s.clone(), b.clone()))
-                .add_tool(SliceTool::new(s.clone(), b.clone()))
-                .add_tool(GrepTool::new(s.clone(), b.clone()))
-                .add_tool(SchemaTool::new(s.clone(), b.clone()))
-                .add_tool(ItemSchemaTool::new(s.clone(), b.clone()))
-                .add_tool(GetInTool::new(s.clone(), b.clone()))
-                .add_tool(IterateOverTool::new(s.clone(), b.clone()))
-                .add_tool(ReadTool::new(s.clone(), b.clone()));
+                .add_tool(NudgedTool::new(
+                    HeadTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    SliceTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    GrepTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    SchemaTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    ItemSchemaTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    GetInTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    IterateOverTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ))
+                .add_tool(NudgedTool::new(
+                    ReadTool::new(s.clone(), b.clone()),
+                    n.clone(),
+                ));
         }
 
         // Add read_artifact tool when orchestration persistence is available.

@@ -124,6 +124,9 @@ pub struct AgentRuntimeConfig {
     /// `Some` when scratchpad is wired up for this agent or worker.
     pub scratchpad_tools_config: Option<ScratchpadToolsConfig>,
 
+    /// Shared turn-limit nudge state for this agent's tool calls.
+    pub turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
+
     /// Shared decision state for worker `submit_result` tool.
     /// When set, workers get the `submit_result` tool for structured output.
     pub orchestration_submit_result: Option<crate::orchestration::SubmitResultDecision>,
@@ -167,6 +170,7 @@ impl Clone for AgentRuntimeConfig {
             orchestration_persistence: self.orchestration_persistence.clone(),
             session_id: self.session_id.clone(),
             scratchpad_tools_config: self.scratchpad_tools_config.clone(),
+            turn_nudge: self.turn_nudge.clone(),
             orchestration_submit_result: self.orchestration_submit_result.clone(),
             hitl: self.hitl.clone(),
             request_id: self.request_id.clone(),
@@ -203,6 +207,7 @@ impl std::fmt::Debug for AgentRuntimeConfig {
                     .map(|_| "<persistence>"),
             )
             .field("session_id", &self.session_id)
+            .field("turn_nudge", &self.turn_nudge.as_ref().map(|_| "<state>"))
             .field(
                 "orchestration_submit_result",
                 &self
