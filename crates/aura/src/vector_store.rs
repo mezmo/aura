@@ -116,15 +116,20 @@ impl VectorStoreManager {
         Ok(BedrockEmbeddingModel::new(aws_client, model, None))
     }
 
-    /// Load AWS SDK config with optional region and profile
+    /// Load AWS SDK config with optional region and profile. A named profile
+    /// forces its credentials even when env credentials are present.
     async fn load_aws_config(region: &str, profile: Option<&str>) -> aws_config::SdkConfig {
         use aws_config::{BehaviorVersion, Region};
 
         if let Some(profile_name) = profile {
             info!("Loading AWS config with profile '{}'", profile_name);
+            let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .profile_name(profile_name)
+                .build();
             aws_config::defaults(BehaviorVersion::latest())
                 .region(Region::new(region.to_string()))
                 .profile_name(profile_name)
+                .credentials_provider(credentials)
                 .load()
                 .await
         } else {
