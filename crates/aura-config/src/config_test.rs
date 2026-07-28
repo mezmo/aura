@@ -232,6 +232,62 @@ budget_tokens = 8000
         );
     }
 
+    fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+        let toml = format!(
+            r#"
+[agent]
+name = "t"
+system_prompt = "p"
+
+[agent.llm]
+provider = "openai"
+api_key = "k"
+model = "gpt-5.6-sol"
+reasoning_effort = "{value}"
+"#
+        );
+        let config = load_config_from_str(&toml).expect("config should parse");
+        let crate::config::LlmConfig::OpenAI {
+            reasoning_effort, ..
+        } = config.agent.llm
+        else {
+            panic!("test config should parse as OpenAI");
+        };
+        reasoning_effort
+    }
+
+    #[test]
+    fn reasoning_effort_all_variants_parse() {
+        assert_eq!(
+            parse_reasoning_effort("none"),
+            Some(ReasoningEffort::Disabled)
+        );
+        assert_eq!(
+            parse_reasoning_effort("minimal"),
+            Some(ReasoningEffort::Minimal)
+        );
+        assert_eq!(parse_reasoning_effort("low"), Some(ReasoningEffort::Low));
+        assert_eq!(
+            parse_reasoning_effort("medium"),
+            Some(ReasoningEffort::Medium)
+        );
+        assert_eq!(parse_reasoning_effort("high"), Some(ReasoningEffort::High));
+        assert_eq!(
+            parse_reasoning_effort("xhigh"),
+            Some(ReasoningEffort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_display_matches_openai_wire_values() {
+        assert_eq!(ReasoningEffort::Disabled.to_string(), "none");
+        assert_eq!(ReasoningEffort::Minimal.to_string(), "minimal");
+        assert_eq!(ReasoningEffort::Low.to_string(), "low");
+        assert_eq!(ReasoningEffort::Medium.to_string(), "medium");
+        assert_eq!(ReasoningEffort::High.to_string(), "high");
+        assert_eq!(ReasoningEffort::Xhigh.to_string(), "xhigh");
+    }
+
     #[test]
     fn test_minimal_config() {
         println!("\n=== TEST_MINIMAL_CONFIG ===");

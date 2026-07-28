@@ -33,19 +33,24 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    #[serde(rename = "none")]
+    Disabled,
     Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
 }
 
 impl fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
+            ReasoningEffort::Disabled => "none",
             ReasoningEffort::Minimal => "minimal",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
         };
         write!(f, "{s}")
     }
