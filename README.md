@@ -1,6 +1,6 @@
 <div align="center">
   <h1>AURA</h1>
-  <p><strong>AURA is a production-grade SRE agent platform you can deploy in minutes.</strong></p>
+  <p><strong>AURA is a production-tested SRE agent platform you can deploy in minutes.</strong></p>
   <img src="assets/aura-demo.gif" alt="AURA investigating an incident from the terminal" width="720">
   <p>
     <a href="#quick-start"><strong>Quick Start</strong></a> ·
