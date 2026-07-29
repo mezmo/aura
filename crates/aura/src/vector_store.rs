@@ -123,7 +123,11 @@ impl VectorStoreManager {
 
         if let Some(profile_name) = profile {
             info!("Loading AWS config with profile '{}'", profile_name);
+            // the provider's inner STS client needs the region wired explicitly
+            let provider_config = aws_config::provider_config::ProviderConfig::without_region()
+                .with_region(Some(Region::new(region.to_string())));
             let credentials = aws_config::profile::ProfileFileCredentialsProvider::builder()
+                .configure(&provider_config)
                 .profile_name(profile_name)
                 .build();
             aws_config::defaults(BehaviorVersion::latest())
