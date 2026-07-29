@@ -131,11 +131,12 @@ type above, preserving byte-identical output on every S2 manifest surface.
   surfaces and the character mechanism for char-bounded surfaces; a future
   card must decide whether to align the config labels or the implementation,
   because changing the unit would be a behavior change.
-- **R2 - fail-open spill defect (fixed in S14).** When persistence fails to
-  write the artifact, `maybe_spill_result` returns the bounded inline summary
-  with a visible `[Artifact write failed; full result unavailable]` marker
-  instead of the full unbounded result. The success path (artifact pointer)
-  is unchanged.
+- **R2 - fail-open spill defect (fixed in S14).** When the artifact is
+  unavailable — whether the write fails or persistence is disabled —
+  `maybe_spill_result` returns the bounded inline summary with a visible
+  `[Artifact write failed; full result unavailable]` marker instead of the
+  full unbounded result. The artifact-pointer render happens only when
+  `write_result_artifact` returns a real filename.
 - **R3 - SSE-handler truncation.** The comments in `events.rs` note that
   `planning_response`, `result`, and tool `result` fields are "truncated to
   Option in SSE." The actual byte caps live in the web-server SSE handlers,

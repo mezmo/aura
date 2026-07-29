@@ -143,10 +143,17 @@ pub async fn maybe_spill_result(
         .await
     {
         Ok(filename) => {
-            let truncated = spill.truncate_to_summary(&result);
-            SpilledArtifact::new(&filename, result.len())
-                .expect("filename guaranteed non-empty by write_result_artifact")
-                .render_with_prefix(&truncated.to_string())
+            let summary = spill.truncate_to_summary(&result);
+            match SpilledArtifact::new(&filename, result.len()) {
+                Ok(artifact) => artifact.render_with_prefix(&summary.to_string()),
+                Err(_) => {
+                    tracing::warn!(
+                        "Result artifact unavailable for task {}: persistence disabled",
+                        task_id
+                    );
+                    format!("{summary}\n\n{ARTIFACT_WRITE_FAILED_MARKER}")
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -217,6 +224,36 @@ mod tests {
         assert!(
             got.contains(ARTIFACT_WRITE_FAILED_MARKER),
             "failure must be visibly marked"
+        );
+        let max_len = budget.summary_width().get() + ARTIFACT_WRITE_FAILED_MARKER.len() + 2;
+        assert!(
+            got.len() <= max_len,
+            "result must stay bounded: got {} bytes, max {} bytes",
+            got.len(),
+            max_len
+        );
+    }
+
+    #[tokio::test]
+    async fn spill_disabled_persistence_returns_bounded_summary() {
+        let budget = ResultSpillBudget::test_budget(10, 5);
+        let persistence = ExecutionPersistence::disabled();
+
+        let result = "this result is longer than the threshold and should be spilled".to_string();
+        let got =
+            maybe_spill_result(&persistence, &budget, 7, Some("analyst"), result.clone()).await;
+
+        assert!(
+            !got.contains(&result),
+            "full unbounded result must not be returned inline"
+        );
+        assert!(
+            got.starts_with("this "),
+            "bounded summary prefix must be present"
+        );
+        assert!(
+            got.contains(ARTIFACT_WRITE_FAILED_MARKER),
+            "disabled persistence must be visibly marked"
         );
         let max_len = budget.summary_width().get() + ARTIFACT_WRITE_FAILED_MARKER.len() + 2;
         assert!(
