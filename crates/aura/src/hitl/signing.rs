@@ -2,16 +2,28 @@
 
 //! HMAC-SHA256 root of trust for HITL webhook traffic.
 //!
-//! Signs AURA's egress approval requests and verifies ingress decision
-//! posts. The feature is opt-in via environment variables; with no secret
-//! configured the module loads `None` and callers skip signing/verification
-//! entirely, leaving today's byte-identical behavior.
+//! Signs AURA's egress approval requests and verifies inbound decisions on
+//! both routes. The feature is opt-in via environment variables; with no
+//! secret configured the loader yields `None` and callers skip
+//! signing/verification entirely, leaving today's byte-identical behavior.
 //!
 //! Header contract:
 //!   X-Aura-Signature-256: sha256=<64 lowercase hex chars>
-//!   X-Aura-Timestamp: <unix seconds>
+//!   X-Aura-Timestamp: <unix seconds, canonical decimal>
 //!
-//! Signed payload: "{unix_seconds}.{raw_body_bytes}".
+//! Signed payload: `"{unix_seconds}.{context}.{raw_body_bytes}"`.
+//!
+//! The `{context}` segment binds each signature to its resource and
+//! direction so a captured signature cannot be re-aimed at another resource
+//! within the skew window (see `SigningContext` and `DESIGN.md` §1). The
+//! timestamp is rendered as canonical decimal and the context forbids the
+//! `.` delimiter, so the encoding is injective: two distinct
+//! `(timestamp, context, body)` triples cannot collide.
+//!
+//! Context registry (the exact labels the fill and both seams use):
+//!   egress approval-request POST: `approval-request:{decision_id}`
+//!   ingress decision POST and webhook-response leg:
+//!     `approval-decision:{decision_id}`
 
 use std::fmt;
 
@@ -19,6 +31,10 @@ pub const SIGNATURE_HEADER: &str = "X-Aura-Signature-256";
 pub const TIMESTAMP_HEADER: &str = "X-Aura-Timestamp";
 pub const SIGNATURE_PREFIX: &str = "sha256=";
 pub const DEFAULT_TOLERANCE_SECS: u64 = 300;
+/// Minimum accepted primary/secondary key length, in bytes (256 bits).
+pub const MIN_SECRET_BYTES: usize = 32;
+/// Maximum accepted skew tolerance, in seconds (one day).
+pub const MAX_TOLERANCE_SECS: u64 = 86_400;
 
 /// Primary HMAC secret. Can both sign egress and verify ingress.
 #[derive(Clone)]
@@ -73,6 +89,28 @@ impl fmt::Debug for SecretBytes {
     }
 }
 
+/// A validated label bound into the signed payload.
+///
+/// Carries the resource identity and direction (see the module-level context
+/// registry). Forbidding the `.` delimiter is what keeps the signed-string
+/// encoding injective, so the invariant is enforced at construction rather
+/// than assumed by callers.
+#[derive(Debug, Clone)]
+pub struct SigningContext(String);
+
+impl SigningContext {
+    #[expect(unused_variables, reason = "todo!() body; filled by W3")]
+    pub fn new(raw: &str) -> Result<Self, ContextError> {
+        todo!()
+    }
+}
+
+impl AsRef<str> for SigningContext {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A parsed `X-Aura-Signature-256` value.
 ///
 /// The raw header string is preserved so the wire form can be replayed
@@ -103,6 +141,10 @@ impl AsRef<Signature> for SignatureHeader {
 }
 
 /// A 32-byte HMAC-SHA256 signature tag.
+///
+/// Deliberately has no `PartialEq`/`Eq` and no public byte accessor:
+/// comparison happens only inside `WebhookHmac::verify` via a constant-time
+/// primitive, so a non-constant-time `==` cannot be written against it.
 #[derive(Debug, Clone)]
 pub struct Signature([u8; 32]);
 
@@ -111,12 +153,17 @@ pub struct Signature([u8; 32]);
 pub struct UnixTimestamp(u64);
 
 impl UnixTimestamp {
+    /// Parses a canonical decimal timestamp. Rejects a leading `+` and
+    /// leading zeros (except the literal `"0"`) so the parsed value renders
+    /// back to the exact bytes that were signed.
     #[expect(unused_variables, reason = "todo!() body; filled by W3")]
     pub fn parse(value: &str) -> Result<Self, VerificationError> {
         todo!()
     }
 
-    pub fn now() -> Self {
+    /// Current unix time. Fallible rather than panicking on a system clock
+    /// set before the unix epoch.
+    pub fn now() -> Result<Self, ClockError> {
         todo!()
     }
 }
@@ -132,8 +179,11 @@ impl fmt::Display for UnixTimestamp {
 pub struct Tolerance(u64);
 
 impl Tolerance {
-    pub const fn new(secs: u64) -> Self {
-        Self(secs)
+    /// Builds a tolerance, rejecting zero and anything above
+    /// `MAX_TOLERANCE_SECS`.
+    #[expect(unused_variables, reason = "todo!() body; filled by W3")]
+    pub fn new(secs: u64) -> Result<Self, ConfigError> {
+        todo!()
     }
 }
 
@@ -151,8 +201,10 @@ impl fmt::Display for Tolerance {
 
 /// The headers produced by signing an egress request.
 ///
-/// Both fields are validated: the signature matches the body and timestamp,
-/// and the timestamp is the one used in the signed payload.
+/// The signature and timestamp are a matched pair from one signing
+/// operation. The pair is consumed atomically by `into_pairs`, so a caller
+/// cannot attach a signature from one signing result with a timestamp from
+/// another.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
     signature: SignatureHeader,
@@ -160,19 +212,18 @@ pub struct SignedHeaders {
 }
 
 impl SignedHeaders {
-    pub fn signature(&self) -> &SignatureHeader {
-        &self.signature
-    }
-
-    pub fn timestamp(&self) -> &UnixTimestamp {
-        &self.timestamp
+    /// Consumes the pair into `(header_name, header_value)` entries ready to
+    /// attach to a request: the `X-Aura-Signature-256` and `X-Aura-Timestamp`
+    /// headers, in that order.
+    pub fn into_pairs(self) -> [(&'static str, String); 2] {
+        todo!()
     }
 }
 
-/// Loaded HMAC configuration. `None` means the feature is off.
+/// Loaded HMAC configuration. `None` from the loader means the feature is off.
 ///
-/// The off state is unrepresentable in `sign`/`verify`: callers must hold
-/// a `WebhookHmac` to call those methods.
+/// The off state is unrepresentable in `sign`/`verify`: callers must hold a
+/// `WebhookHmac` to reach those methods.
 #[derive(Clone)]
 pub struct WebhookHmac {
     primary: PrimarySecret,
@@ -181,7 +232,28 @@ pub struct WebhookHmac {
 }
 
 impl WebhookHmac {
-    pub fn load_from_env() -> Option<Self> {
+    /// Builds a configuration directly. Rejects a primary shorter than
+    /// `MIN_SECRET_BYTES`; a shorter secondary is likewise rejected. The
+    /// secret-length floor lives here (not on the secret constructors) so the
+    /// policy has one home and secret construction stays infallible.
+    #[expect(unused_variables, reason = "todo!() body; filled by W3")]
+    pub fn new(
+        primary: PrimarySecret,
+        secondary: Option<SecondarySecret>,
+        tolerance: Tolerance,
+    ) -> Result<Self, ConfigError> {
+        todo!()
+    }
+
+    /// Reads `AURA_HITL_WEBHOOK_SECRET`, `AURA_HITL_WEBHOOK_SECRET_SECONDARY`,
+    /// and `AURA_HITL_WEBHOOK_TOLERANCE_SECS`.
+    ///
+    /// Returns `Ok(None)` only when the primary is genuinely absent (feature
+    /// off). A secondary without a primary, an empty or too-short primary, a
+    /// malformed or out-of-range tolerance, or a non-Unicode value is a
+    /// misconfiguration and returns `Err`, so a typo fails loud instead of
+    /// silently disabling the control. A thin HITL-named wrapper over `new`.
+    pub fn load_from_env() -> Result<Option<Self>, ConfigError> {
         todo!()
     }
 
@@ -190,14 +262,25 @@ impl WebhookHmac {
         self.tolerance
     }
 
+    /// Signs `body` under `context`. Fallible only on a clock error.
     #[expect(unused_variables, reason = "todo!() body; filled by W3")]
-    pub fn sign(&self, body: &[u8]) -> SignedHeaders {
+    pub fn sign(
+        &self,
+        context: &SigningContext,
+        body: &[u8],
+    ) -> Result<SignedHeaders, SigningError> {
         todo!()
     }
 
+    /// Verifies a parsed signature over `"{timestamp}.{context}.{body}"`,
+    /// checking skew and comparing in constant time. Tries the primary, then
+    /// the secondary if configured; both candidates are evaluated on any
+    /// non-primary-match path so the fallback reveals nothing beyond "did the
+    /// primary sign this" to a party already holding a key.
     #[expect(unused_variables, reason = "todo!() body; filled by W3")]
     pub(crate) fn verify(
         &self,
+        context: &SigningContext,
         signature: &SignatureHeader,
         timestamp: UnixTimestamp,
         body: &[u8],
@@ -216,7 +299,51 @@ impl fmt::Debug for WebhookHmac {
     }
 }
 
-/// Errors that can occur when verifying an ingress request.
+/// Error building a [`SigningContext`].
+#[derive(Debug, thiserror::Error)]
+pub enum ContextError {
+    #[error("signing context must not be empty")]
+    Empty,
+    #[error("signing context must not contain the '.' delimiter")]
+    ContainsDelimiter,
+    #[error("signing context must be ASCII")]
+    NonAscii,
+}
+
+/// Error loading or building a [`WebhookHmac`] configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("primary secret is shorter than the {MIN_SECRET_BYTES}-byte minimum")]
+    PrimaryTooShort { len: usize },
+    #[error("secondary secret is shorter than the {MIN_SECRET_BYTES}-byte minimum")]
+    SecondaryTooShort { len: usize },
+    #[error("a secondary secret is configured without a primary")]
+    SecondaryWithoutPrimary,
+    #[error("tolerance is not a valid integer number of seconds")]
+    MalformedTolerance,
+    #[error("tolerance {secs}s is outside 1..={MAX_TOLERANCE_SECS}")]
+    ToleranceOutOfRange { secs: u64 },
+    #[error("environment variable {var} is not valid Unicode")]
+    NonUnicodeValue { var: &'static str },
+}
+
+/// System clock unavailable (set before the unix epoch).
+#[derive(Debug, thiserror::Error)]
+#[error("system clock is set before the unix epoch")]
+pub struct ClockError;
+
+/// Error signing an egress request.
+#[derive(Debug, thiserror::Error)]
+pub enum SigningError {
+    #[error(transparent)]
+    Clock(#[from] ClockError),
+}
+
+/// Errors that can occur when verifying an inbound request.
+///
+/// Every variant maps to a single uniform `401` on the wire; the variant is
+/// for logs only. In particular `SkewedTimestamp`'s `Display` (which names
+/// `now`/`tolerance`) must never reach a response body (see `DESIGN.md` §2).
 #[derive(Debug, thiserror::Error)]
 pub enum VerificationError {
     #[error("missing signature header")]
@@ -235,39 +362,51 @@ pub enum VerificationError {
     },
     #[error("signature mismatch")]
     Mismatch,
+    #[error(transparent)]
+    Clock(#[from] ClockError),
 }
 
 /// Body that has passed ingress authorization.
 ///
-/// When webhook verification is configured, this is only produced after the
-/// signature and timestamp headers are present, the timestamp is within the
-/// configured skew tolerance, and the signature matches the recomputed HMAC.
-/// When verification is disabled (`config` is `None`), the body passes through
-/// unverified.
-#[derive(Debug, Clone, Copy)]
-pub struct VerifiedBody<'a>(&'a [u8]);
+/// Wraps the owned body it was verified over. It has no public constructor
+/// other than [`authorize_ingress`], so possessing one proves authorization
+/// ran on exactly these bytes. Consuming the body (rather than borrowing it)
+/// keeps a raw-bytes bypass out of a caller's reach without a visible
+/// `into_inner`.
+pub struct VerifiedBody<B>(B);
 
-impl<'a> AsRef<[u8]> for VerifiedBody<'a> {
-    fn as_ref(&self) -> &[u8] {
+impl<B> VerifiedBody<B> {
+    pub fn into_inner(self) -> B {
         self.0
     }
 }
 
-/// Authorizes an ingress request.
+impl<B: AsRef<[u8]>> AsRef<[u8]> for VerifiedBody<B> {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+/// Authorizes an inbound request under `context`.
 ///
-/// - If `config` is `None`, the feature is off and the body is returned
+/// - If `config` is `None`, the feature is off and `body` is returned
 ///   unverified.
-/// - If `config` is `Some`, missing headers produce
-///   `VerificationError::MissingSignatureHeader` or
-///   `VerificationError::MissingTimestampHeader`, then the signature header is
-///   parsed, the timestamp is checked for skew, and the signature is verified
-///   in constant time.
+/// - If `config` is `Some`, an absent signature or timestamp header maps to
+///   `MissingSignatureHeader` / `MissingTimestampHeader`, then the signature
+///   header is parsed, the timestamp is skew-checked, and the signature is
+///   verified in constant time over `"{timestamp}.{context}.{body}"`.
+///
+/// Consumes the body so the only way past this function with the bytes in
+/// hand is through the returned [`VerifiedBody`]. Used by both the ingress
+/// decision handler and the webhook-response leg (same primitive, different
+/// context label).
 #[expect(unused_variables, reason = "todo!() body; filled by W3")]
-pub fn authorize_ingress<'a>(
+pub fn authorize_ingress<B: AsRef<[u8]>>(
     config: Option<&WebhookHmac>,
+    context: &SigningContext,
     signature_header: Option<&str>,
     timestamp_header: Option<&str>,
-    body: &'a [u8],
-) -> Result<VerifiedBody<'a>, VerificationError> {
+    body: B,
+) -> Result<VerifiedBody<B>, VerificationError> {
     todo!()
 }

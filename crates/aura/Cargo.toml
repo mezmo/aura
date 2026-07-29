@@ -29,7 +29,6 @@ url = "2"
 # HMAC root of trust for HITL webhook signing/verification (W3)
 hmac = "0.13"
 sha2 = "0.11"
-subtle = "2"
 hex = "0.4"
 
 # Shared event types (lightweight, no agent/MCP deps)
