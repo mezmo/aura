@@ -34,6 +34,7 @@ mod gate;
 mod protocol;
 mod registry;
 mod route;
+mod signing;
 mod tool;
 
 pub use decision::{
