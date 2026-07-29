@@ -36,9 +36,8 @@ const REASONING_FIELD: &str = "_aura_reasoning";
 /// `on_complete` can rendezvous on the same entry in `raw_outputs`.
 const CALL_ID_FIELD: &str = "_persistence_call_id";
 
-/// Marker appended to a tool-call record's output when the artifact write
-/// fails, so the failure is visible inline instead of silently storing the
-/// full body.
+/// Marker text written into a bounded tool-call record's output in place
+/// of the full body.
 const ARTIFACT_WRITE_FAILED_MARKER: &str = "[Artifact write failed; full result unavailable]";
 
 /// RAII guard that decrements the in-flight counter and notifies drain waiters
