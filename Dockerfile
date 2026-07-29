@@ -3,11 +3,23 @@
 # (mounted-workspace builds, the in-container coverage compile). Opt-in via
 # RUSTC_WRAPPER / RUSTC_WORKSPACE_WRAPPER; inert when those are unset.
 ARG SCCACHE_VERSION=0.16.0
-ARG SCCACHE_SHA256=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588
+ARG SCCACHE_SHA256_AMD64=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588
+ARG SCCACHE_SHA256_ARM64=f73a5c39f96bb6ebb89cc7915cf182260d4cbf30765322c5e793d0fe8bd80784
+
+# Zig + cargo-zigbuild give the runner a host-arch-agnostic cross linker, so the
+# packaged linux/amd64 and linux/arm64 binaries build on either an amd64 or an
+# arm64 runner. cargo-zigbuild 0.23 pairs with zig 0.16.
+ARG ZIG_VERSION=0.16.0
+ARG ZIG_SHA256_AMD64=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+ARG ZIG_SHA256_ARM64=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+ARG CARGO_ZIGBUILD_VERSION=0.23.0
+ARG CARGO_ZIGBUILD_SHA256_AMD64=c636e4f72b6f40a40ddf0414c8c6056f78b87eea3be0edf01f08d65fa028a373
+ARG CARGO_ZIGBUILD_SHA256_ARM64=5917d5416884cba0f23c2653016f7f2df2ec04e74eb6b259598fecc066f8c429
 
 # nfpm builds the .deb/.rpm release packages from the cross-compiled binaries.
 ARG NFPM_VERSION=2.47.0
-ARG NFPM_SHA256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+ARG NFPM_SHA256_AMD64=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+ARG NFPM_SHA256_ARM64=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
 
 ### 000 Chef
 FROM lukemathwalker/cargo-chef:latest-rust-1.95@sha256:00c3c07c51d092325df88f0df2d626cd4302e12933f179ba154509cc314d6c2a AS chef
@@ -16,18 +28,24 @@ FROM lukemathwalker/cargo-chef:latest-rust-1.95@sha256:00c3c07c51d092325df88f0df
 # sentencepiece-sys builds its C++ library from source.
 FROM chef AS core
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ g++-aarch64-linux-gnu \
+    cmake \
   && rm -rf /var/lib/apt/lists/*
 
 ### 002 Sccache
 # Download once; runner and test-tools COPY the binary from here.
 FROM core AS sccache-dl
 ARG SCCACHE_VERSION
-ARG SCCACHE_SHA256
+ARG SCCACHE_SHA256_AMD64
+ARG SCCACHE_SHA256_ARM64
 RUN <<EOR
   set -e
-  curl -fsSL -o /tmp/sccache.tar.gz "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-  printf '%s  /tmp/sccache.tar.gz\n' "${SCCACHE_SHA256}" > /tmp/sccache.tar.gz.sha256
+  case "$(uname -m)" in
+    x86_64)  scc_arch=x86_64;  scc_sha=${SCCACHE_SHA256_AMD64};;
+    aarch64) scc_arch=aarch64; scc_sha=${SCCACHE_SHA256_ARM64};;
+    *) echo "unsupported build arch: $(uname -m)" >&2; exit 1;;
+  esac
+  curl -fsSL -o /tmp/sccache.tar.gz "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${scc_arch}-unknown-linux-musl.tar.gz"
+  printf '%s  /tmp/sccache.tar.gz\n' "${scc_sha}" > /tmp/sccache.tar.gz.sha256
   sha256sum -c /tmp/sccache.tar.gz.sha256
   tar -xzf /tmp/sccache.tar.gz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache'
   rm /tmp/sccache.tar.gz /tmp/sccache.tar.gz.sha256
@@ -81,9 +99,42 @@ WORKDIR /home/aura
 RUN <<EOR
   set -e
   apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 curl nodejs npm \
-    libc6-dev-arm64-cross
+    ca-certificates libssl3 curl nodejs npm xz-utils
   rm -rf /var/lib/apt/lists/*
+EOR
+
+# Zig toolchain + cargo-zigbuild: the cross linker for the packaged binaries.
+# Pinned to the host arch so the runner image builds on amd64 or arm64.
+ARG ZIG_VERSION
+ARG ZIG_SHA256_AMD64
+ARG ZIG_SHA256_ARM64
+ARG CARGO_ZIGBUILD_VERSION
+ARG CARGO_ZIGBUILD_SHA256_AMD64
+ARG CARGO_ZIGBUILD_SHA256_ARM64
+RUN <<EOR
+  set -e
+  case "$(uname -m)" in
+    x86_64)  zig_arch=x86_64;  zig_sha=${ZIG_SHA256_AMD64}; cz_target=x86_64-unknown-linux-gnu;  cz_sha=${CARGO_ZIGBUILD_SHA256_AMD64};;
+    aarch64) zig_arch=aarch64; zig_sha=${ZIG_SHA256_ARM64}; cz_target=aarch64-unknown-linux-gnu; cz_sha=${CARGO_ZIGBUILD_SHA256_ARM64};;
+    *) echo "unsupported build arch: $(uname -m)" >&2; exit 1;;
+  esac
+  curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz"
+  printf '%s  /tmp/zig.tar.xz\n' "${zig_sha}" > /tmp/zig.tar.xz.sha256
+  sha256sum -c /tmp/zig.tar.xz.sha256
+  rm /tmp/zig.tar.xz.sha256
+  mkdir -p /opt/zig
+  tar -xJf /tmp/zig.tar.xz --strip-components=1 -C /opt/zig
+  ln -s /opt/zig/zig /usr/local/bin/zig
+  rm /tmp/zig.tar.xz
+  zig version
+  curl -fsSL -o /tmp/cargo-zigbuild.tar.xz \
+    "https://github.com/rust-cross/cargo-zigbuild/releases/download/v${CARGO_ZIGBUILD_VERSION}/cargo-zigbuild-${cz_target}.tar.xz"
+  printf '%s  /tmp/cargo-zigbuild.tar.xz\n' "${cz_sha}" > /tmp/cargo-zigbuild.tar.xz.sha256
+  sha256sum -c /tmp/cargo-zigbuild.tar.xz.sha256
+  rm /tmp/cargo-zigbuild.tar.xz.sha256
+  tar -xJf /tmp/cargo-zigbuild.tar.xz --strip-components=1 -C /usr/local/bin --wildcards '*/cargo-zigbuild'
+  chmod +x /usr/local/bin/cargo-zigbuild
+  rm /tmp/cargo-zigbuild.tar.xz
 EOR
 
 # Pinned STDIO integration fixture.
@@ -92,11 +143,17 @@ RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
 
 # nfpm packages release binaries into .deb/.rpm without dpkg/rpmbuild or root.
 ARG NFPM_VERSION
-ARG NFPM_SHA256
+ARG NFPM_SHA256_AMD64
+ARG NFPM_SHA256_ARM64
 RUN <<EOR
   set -e
-  curl -fsSL -o /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
-  printf '%s  /tmp/nfpm.tar.gz\n' "${NFPM_SHA256}" > /tmp/nfpm.tar.gz.sha256
+  case "$(uname -m)" in
+    x86_64)  nfpm_arch=x86_64; nfpm_sha=${NFPM_SHA256_AMD64};;
+    aarch64) nfpm_arch=arm64;  nfpm_sha=${NFPM_SHA256_ARM64};;
+    *) echo "unsupported build arch: $(uname -m)" >&2; exit 1;;
+  esac
+  curl -fsSL -o /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${nfpm_arch}.tar.gz"
+  printf '%s  /tmp/nfpm.tar.gz\n' "${nfpm_sha}" > /tmp/nfpm.tar.gz.sha256
   sha256sum -c /tmp/nfpm.tar.gz.sha256
   tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
   rm /tmp/nfpm.tar.gz /tmp/nfpm.tar.gz.sha256
@@ -110,7 +167,8 @@ USER 1000
 RUN <<EOR
   set -e
   rustup component add rustfmt clippy llvm-tools
-  rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
+  rustup component add --toolchain nightly rustfmt
+  rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 EOR
 
 ### 006 Test-tools

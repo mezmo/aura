@@ -127,33 +127,36 @@ CARGO_PROFILE_FLAG := $(if $(filter release,$(PROFILE)),--release,)
 # check runs against the same context that compiles.
 require_host = os=\$$(uname -s); arch=\$$(uname -m); if [ \$$os != $(1) ]$(if $(2), || [ \$$arch != $(2) ],); then echo error: $@ must be built on $(1)$(if $(2), $(2),), build host is \$$os \$$arch >&2; exit 1; fi;
 
+# Linux target triples. cargo-zigbuild links these with zig, so both build from
+# any Linux host arch — no matching cross-gcc toolchain required.
+LINUX_AMD64_TARGET := x86_64-unknown-linux-gnu
+LINUX_ARM64_TARGET := aarch64-unknown-linux-gnu
+
 .PHONY: build-binary-linux-amd64
 build-binary-linux-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/amd64 (PROFILE=release|debug)
 	$(RUN) bash -c "\
-		$(call require_host,Linux,x86_64) \
-		cargo build $(CARGO_PROFILE_FLAG) --bin aura-web-server && \
-		cargo build $(CARGO_PROFILE_FLAG) -p aura-cli --bin aura; \
+		$(call require_host,Linux,) \
+		rustup target add $(LINUX_AMD64_TARGET) 2>/dev/null; \
+		cargo zigbuild $(CARGO_PROFILE_FLAG) --target $(LINUX_AMD64_TARGET) --bin aura-web-server && \
+		cargo zigbuild $(CARGO_PROFILE_FLAG) --target $(LINUX_AMD64_TARGET) -p aura-cli --bin aura; \
 		rc=\$$?; \
 		if [ -n \"\$$RUSTC_WRAPPER\" ]; then sccache --show-stats || true; fi; \
 		exit \$$rc"
-	cp target/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
-	cp target/$(PROFILE)/aura $(DIST_DIR)/aura-linux-amd64
+	cp target/$(LINUX_AMD64_TARGET)/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-amd64
+	cp target/$(LINUX_AMD64_TARGET)/$(PROFILE)/aura $(DIST_DIR)/aura-linux-amd64
 
 .PHONY: build-binary-linux-arm64
 build-binary-linux-arm64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for linux/arm64 (PROFILE=release|debug)
 	$(RUN) bash -c "\
-		$(call require_host,Linux,x86_64) \
-		rustup target add aarch64-unknown-linux-gnu 2>/dev/null; \
-		export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
-		export CC_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-gcc; \
-		export CXX_aarch64_unknown_linux_gnu=/usr/bin/aarch64-linux-gnu-g++; \
-		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu --bin aura-web-server && \
-		cargo build $(CARGO_PROFILE_FLAG) --target aarch64-unknown-linux-gnu -p aura-cli --bin aura; \
+		$(call require_host,Linux,) \
+		rustup target add $(LINUX_ARM64_TARGET) 2>/dev/null; \
+		cargo zigbuild $(CARGO_PROFILE_FLAG) --target $(LINUX_ARM64_TARGET) --bin aura-web-server && \
+		cargo zigbuild $(CARGO_PROFILE_FLAG) --target $(LINUX_ARM64_TARGET) -p aura-cli --bin aura; \
 		rc=\$$?; \
 		if [ -n \"\$$RUSTC_WRAPPER\" ]; then sccache --show-stats || true; fi; \
 		exit \$$rc"
-	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
-	cp target/aarch64-unknown-linux-gnu/$(PROFILE)/aura $(DIST_DIR)/aura-linux-arm64
+	cp target/$(LINUX_ARM64_TARGET)/$(PROFILE)/aura-web-server $(DIST_DIR)/aura-web-server-linux-arm64
+	cp target/$(LINUX_ARM64_TARGET)/$(PROFILE)/aura $(DIST_DIR)/aura-linux-arm64
 
 .PHONY: build-binary-darwin-amd64
 build-binary-darwin-amd64: $(DIST_DIR) $(DOCKER_ENV) ## Build binaries for darwin/amd64 (PROFILE=release|debug)
