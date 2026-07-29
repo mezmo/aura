@@ -167,6 +167,10 @@ mod tests {
     use super::super::decision::{ApprovalOutcome, CancelReason};
     use super::*;
 
+    use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
+    use crate::hitl::PendingApprovals;
+    use crate::session_store::{ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus};
+
     #[test]
     fn mapping_approved_returns_ok_with_action() {
         let result = approval_outcome_to_tool_result(
@@ -277,17 +281,87 @@ mod tests {
     }
 
     // --------------------------------------------------------------------
-    // agent_requested path: blank _aura_reasoning must not reach the wire.
-    // Explicit "" or whitespace deserializes to Some(...); normalization
-    // collapses it to None before the ApprovalItem is built.
+    // agent_requested path: drive `RequestApprovalTool::call` end-to-end
+    // through a real `DecisionRoute::Conversational` and inspect the parked
+    // `ApprovalItem` the production call site builds. The round-3 tests only
+    // exercised `normalize_tool_call_intent` + a hand-built item, so reverting
+    // the call site (tool.rs `tool_call_intent,` -> `args.tool_call_intent.clone()`)
+    // left them green. These tests fail under that revert: the blank case
+    // asserts the parked item's `tool_call_intent` is `None`, which only holds
+    // when the production path normalizes `Some("")`/`Some("   ")` away.
     // --------------------------------------------------------------------
 
-    #[test]
-    fn request_approval_normalizes_blank_reasoning_to_absent() {
+    /// Drive `RequestApprovalTool::call` through a real conversational route
+    /// backed by an inspectable in-memory store, returning the production-built
+    /// `ApprovalItem` parked for the request. Approves the request so the
+    /// spawned call completes and the caller can await it.
+    async fn drive_request_approval_tool(
+        store: &Arc<dyn ApprovalStore>,
+        registry: &PendingApprovals,
+        route: &Arc<DecisionRoute>,
+        args: RequestApprovalArgs,
+    ) -> ApprovalItem {
+        let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
+        let tool = RequestApprovalTool::new(
+            route.clone(),
+            AgentScope::Single { session_id: None },
+            request_id.clone(),
+        );
+
+        // Subscribe before the call so the Requested event is captured.
+        let mut rx = approval_event_broker::subscribe(&request_id).await;
+
+        let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
+            tokio::spawn(async move { tool.call(args).await });
+
+        // Learn the decision_id from the Requested event, then read the
+        // parked request the production call site registered.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("requested event should arrive")
+            .expect("event channel open");
+        let decision_id = match event {
+            ApprovalLifecycleEvent::Requested(req) => {
+                DecisionId::parse(&req.decision_id).expect("valid decision id")
+            }
+            other => panic!("expected Requested event, got {:?}", other),
+        };
+
+        let parked = store
+            .get(&decision_id)
+            .await
+            .unwrap()
+            .expect("parked approval exists");
+
+        // Approve so the spawned tool call completes.
+        registry
+            .resolve(&decision_id, ApprovalDecision::Approved)
+            .await
+            .expect("resolve");
+
+        let result = call_handle.await.expect("call task did not panic");
+        assert!(result.is_ok(), "approved call should succeed: {:?}", result);
+
+        approval_event_broker::unsubscribe(&request_id).await;
+
+        parked.request.items.into_iter().next().expect("one item")
+    }
+
+    #[tokio::test]
+    async fn request_approval_normalizes_blank_reasoning_to_absent() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let registry = PendingApprovals::with_backend(store.clone(), bus);
+        let registry_for_resolve = registry.clone();
+        let route = Arc::new(DecisionRoute::Conversational {
+            registry,
+            timeout: std::time::Duration::from_secs(60),
+        });
+
         // Both empty and whitespace-only _aura_reasoning deserialize to
-        // Some(...) — the bug precondition. Normalization must collapse them
-        // to None before the ApprovalItem is built, so the field is omitted on
-        // the wire (never null, never empty string).
+        // Some(...) — the bug precondition. The production call site must
+        // normalize them to None before the ApprovalItem is built, so the
+        // field is omitted on the wire (never null, never empty string).
         for raw in ["", "   "] {
             let args: RequestApprovalArgs = serde_json::from_value(serde_json::json!({
                 "action_description": "deploy",
@@ -295,6 +369,8 @@ mod tests {
                 "_aura_reasoning": raw,
             }))
             .unwrap();
+            // Precondition: serde reads blank _aura_reasoning as Some(...),
+            // so only the production path's normalization can collapse it.
             assert_eq!(
                 args.tool_call_intent.as_deref(),
                 Some(raw),
@@ -302,21 +378,16 @@ mod tests {
                 raw,
             );
 
-            let intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
+            let item =
+                drive_request_approval_tool(&store, &registry_for_resolve, &route, args).await;
 
-            // Built ApprovalItem: blank reasoning must not reach it.
-            let item = ApprovalItem {
-                tool_name: RequestApprovalTool::NAME.to_string(),
-                arguments: serde_json::Value::Null,
-                tool_call_intent: intent,
-            };
             assert!(
                 item.tool_call_intent.is_none(),
-                "built ApprovalItem must have tool_call_intent None for blank _aura_reasoning {:?}",
+                "production-built item must have tool_call_intent None for blank _aura_reasoning {:?}, got: {:?}",
                 raw,
+                item.tool_call_intent,
             );
 
-            // Wire: tool_call_intent must be omitted entirely (skip_serializing_if).
             let wire = serde_json::to_value(&item).unwrap();
             assert!(
                 wire.get("tool_call_intent").is_none(),
@@ -324,13 +395,28 @@ mod tests {
                 raw,
                 wire,
             );
+            assert!(
+                item.arguments.get("_aura_reasoning").is_none(),
+                "items[].arguments must not contain _aura_reasoning for blank _aura_reasoning {:?}, got: {}",
+                raw,
+                item.arguments,
+            );
         }
     }
 
-    #[test]
-    fn request_approval_preserves_non_blank_reasoning() {
-        // Non-blank intent must flow through unchanged, surrounding whitespace
-        // included — guards against over-filtering (e.g. trimming the value).
+    #[tokio::test]
+    async fn request_approval_preserves_non_blank_reasoning() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let registry = PendingApprovals::with_backend(store.clone(), bus);
+        let registry_for_resolve = registry.clone();
+        let route = Arc::new(DecisionRoute::Conversational {
+            registry,
+            timeout: std::time::Duration::from_secs(60),
+        });
+
+        // Non-blank intent must flow through the production path unchanged,
+        // surrounding whitespace included — guards against over-filtering.
         let args: RequestApprovalArgs = serde_json::from_value(serde_json::json!({
             "action_description": "deploy",
             "risk_rationale": "prod change",
@@ -338,29 +424,25 @@ mod tests {
         }))
         .unwrap();
 
-        let intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
-        assert_eq!(
-            intent.as_deref(),
-            Some("  need to unblock the migration  "),
-            "non-blank reasoning must pass through unchanged",
-        );
+        let item = drive_request_approval_tool(&store, &registry_for_resolve, &route, args).await;
 
-        let item = ApprovalItem {
-            tool_name: RequestApprovalTool::NAME.to_string(),
-            arguments: serde_json::Value::Null,
-            tool_call_intent: intent,
-        };
         assert_eq!(
             item.tool_call_intent.as_deref(),
             Some("  need to unblock the migration  "),
-            "built ApprovalItem must carry non-blank tool_call_intent",
+            "production-built item must carry non-blank tool_call_intent unchanged",
         );
 
         let wire = serde_json::to_value(&item).unwrap();
         assert_eq!(
             wire.get("tool_call_intent").and_then(|v| v.as_str()),
             Some("  need to unblock the migration  "),
-            "non-blank tool_call_intent must appear on the wire unchanged",
+            "non-blank tool_call_intent must appear on the wire unchanged, got: {}",
+            wire,
+        );
+        assert!(
+            item.arguments.get("_aura_reasoning").is_none(),
+            "items[].arguments must not contain _aura_reasoning, got: {}",
+            item.arguments,
         );
     }
 }
