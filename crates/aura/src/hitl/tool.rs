@@ -50,6 +50,12 @@ pub struct RequestApprovalArgs {
     /// Optional structured metadata for the reviewer.
     #[serde(default)]
     pub context: Option<Value>,
+    /// Captured from the model's `_aura_reasoning`. `skip_serializing`
+    /// keeps it OUT of `items[].arguments` (the strip invariant); the
+    /// tool moves it to `ApprovalItem.tool_call_intent`. Not required,
+    /// matching PersistenceWrapper's optional reasoning schema.
+    #[serde(default, rename = "_aura_reasoning", skip_serializing)]
+    pub tool_call_intent: Option<String>,
 }
 
 /// Map [`DecisionRoute::decide`] outcome to [`Tool::Output`] / [`Tool::Error`].
@@ -111,6 +117,10 @@ impl Tool for RequestApprovalTool {
                     "context": {
                         "type": "object",
                         "description": "Optional additional structured metadata for the reviewer."
+                    },
+                    "_aura_reasoning": {
+                        "type": "string",
+                        "description": "Explain your reasoning for requesting this approval. Why does this specific action need a human decision?"
                     }
                 },
                 "required": ["action_description", "risk_rationale"]
@@ -130,6 +140,7 @@ impl Tool for RequestApprovalTool {
             items: vec![ApprovalItem {
                 tool_name: Self::NAME.to_string(),
                 arguments: serde_json::to_value(&args).unwrap_or_default(),
+                tool_call_intent: args.tool_call_intent.clone(),
             }],
         };
         let cancel =
@@ -216,5 +227,43 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Approval request failed"));
+    }
+
+    #[test]
+    fn request_approval_args_serialization_strips_aura_reasoning() {
+        let args = RequestApprovalArgs {
+            action_description: "deploy".to_string(),
+            risk_rationale: "prod change".to_string(),
+            context: None,
+            tool_call_intent: Some("need to unblock the migration".to_string()),
+        };
+        let serialized = serde_json::to_value(&args).unwrap();
+        // skip_serializing keeps _aura_reasoning OUT of the wire arguments
+        assert!(serialized.get("_aura_reasoning").is_none());
+        assert!(serialized.get("tool_call_intent").is_none());
+    }
+
+    #[test]
+    fn request_approval_args_deserializes_aura_reasoning_into_tool_call_intent() {
+        let json = serde_json::json!({
+            "action_description": "deploy",
+            "risk_rationale": "prod change",
+            "_aura_reasoning": "need to unblock the migration"
+        });
+        let args: RequestApprovalArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            args.tool_call_intent.as_deref(),
+            Some("need to unblock the migration")
+        );
+    }
+
+    #[test]
+    fn request_approval_args_deserializes_without_aura_reasoning() {
+        let json = serde_json::json!({
+            "action_description": "deploy",
+            "risk_rationale": "prod change"
+        });
+        let args: RequestApprovalArgs = serde_json::from_value(json).unwrap();
+        assert!(args.tool_call_intent.is_none());
     }
 }

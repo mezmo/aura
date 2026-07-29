@@ -298,6 +298,7 @@ mod tests {
             items: vec![ApprovalItem {
                 tool_name: "test_tool".to_string(),
                 arguments: json!({}),
+                tool_call_intent: None,
             }],
         }
     }
