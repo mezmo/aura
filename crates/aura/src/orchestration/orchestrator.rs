@@ -476,6 +476,16 @@ impl TurnTally {
     }
 }
 
+/// Outcome of a failed planning call after the transient-retry loop.
+enum PlanningCallError {
+    /// Transient provider error; the retry budget is exhausted.
+    TransientExhausted { source: StreamError, retries: usize },
+    /// Context-window overflow; the caller adds the remediation suggestion.
+    ContextOverflow,
+    /// Non-transient failure; never retried.
+    Fatal(StreamError),
+}
+
 struct ForwardedRun {
     response: crate::provider_agent::CompletionResponse,
     /// Provider-reported usage of the loop's last turn — context-window
@@ -1552,6 +1562,99 @@ impl Orchestrator {
         format!("Current time: {timestamp}\n\n{base}")
     }
 
+    /// Stream a planning call with transient-provider retry and backoff.
+    ///
+    /// Clears the routing decision before each call so the decision-ready
+    /// early-exit cannot observe a decision set by a failed stream. Transient
+    /// provider errors are resent the same prompt after an exponential backoff
+    /// governed by `[orchestration.retry]`; the conversation is never touched
+    /// here because the resent prompt is identical to the failed one.
+    async fn planning_stream_with_transient_retry(
+        &self,
+        agent: &Agent,
+        params: &StreamCallParams<'_>,
+        routing_decision: &super::tools::RoutingDecision,
+    ) -> Result<crate::provider_agent::CompletionResponse, PlanningCallError> {
+        let max_retries = self.config.retry.max_retries;
+        let mut transient_retries = 0usize;
+        let attempt_start = Instant::now();
+
+        loop {
+            // Clear any routing decision left by a prior call so the
+            // decision-ready check starts false for this stream.
+            {
+                let mut guard = routing_decision.lock().await;
+                *guard = None;
+            }
+
+            let call_start = Instant::now();
+            let rd = routing_decision.clone();
+            let result = self
+                .stream_and_collect(
+                    agent,
+                    StreamCallParams {
+                        prompt: params.prompt,
+                        history: params.history.clone(),
+                        phase: params.phase,
+                        event_tx: params.event_tx,
+                    },
+                    || {
+                        let rd = rd.clone();
+                        Box::pin(async move { rd.lock().await.is_some() })
+                    },
+                )
+                .await;
+
+            let response = match result {
+                Ok(r) => r,
+                Err(e) if is_context_overflow_error(e.as_ref()) => {
+                    return Err(PlanningCallError::ContextOverflow);
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if is_transient_planning_error(&err_str) {
+                        // Resend the same prompt after backoff. The provider
+                        // never produced a response, so the routing-tool
+                        // correction (meant for a response that skipped the
+                        // tool) does not apply. The failed prompt is not
+                        // appended to the conversation because it is about
+                        // to be resent verbatim — pushing it would leave an
+                        // unpaired/duplicated user message.
+                        if transient_retries >= max_retries {
+                            tracing::warn!(
+                                "Planning transient retries exhausted ({}/{}) after {:.1}s: {}",
+                                transient_retries,
+                                max_retries,
+                                attempt_start.elapsed().as_secs_f64(),
+                                err_str,
+                            );
+                            return Err(PlanningCallError::TransientExhausted {
+                                source: e,
+                                retries: transient_retries,
+                            });
+                        }
+                        transient_retries += 1;
+                        let delay = self.config.retry.delay_for_retry(transient_retries);
+                        tracing::warn!(
+                            "Planning transient error, retry {}/{} after {:.1}s, \
+                             sleeping {:.1}s before resend: {}",
+                            transient_retries,
+                            max_retries,
+                            call_start.elapsed().as_secs_f64(),
+                            delay.as_secs_f64(),
+                            err_str,
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(PlanningCallError::Fatal(e));
+                }
+            };
+
+            return Ok(response);
+        }
+    }
+
     /// Plan with routing tool support via persistent conversation.
     ///
     /// Uses the coordinator from `CoordinatorState` (created once at
@@ -1606,21 +1709,12 @@ impl Orchestrator {
             crate::logging::set_llm_invocation_parameters(&tracing::Span::current(), &params);
         }
 
-        for attempt in 1..=max_correction_attempts {
-            // Clear any stale routing decision
-            {
-                let mut guard = coordinator_state.routing_decision.lock().await;
-                *guard = None;
-            }
+        // Prompt sent to the coordinator on each attempt.
+        let mut current_prompt = planning_prompt.clone();
 
+        for attempt in 1..=max_correction_attempts {
             let attempt_start = Instant::now();
-            // First attempt sends the planning/continuation prompt; subsequent
-            // attempts send a correction message within the same conversation.
-            let prompt = if attempt == 1 {
-                planning_prompt.clone()
-            } else {
-                super::prompt_constants::corrections::ROUTING_TOOL_REQUIRED.to_string()
-            };
+            let prompt = current_prompt.clone();
 
             tracing::info!(
                 "Planning attempt {}/{} (per_call_timeout={}s, conversation_len={})",
@@ -1643,44 +1737,38 @@ impl Orchestrator {
                 &prompt,
             );
 
-            let rd = coordinator_state.routing_decision.clone();
             let response = match self
-                .stream_and_collect(
+                .planning_stream_with_transient_retry(
                     &coordinator_state.agent,
-                    StreamCallParams {
+                    &StreamCallParams {
                         prompt: &prompt,
                         history: full_history,
                         phase: "Planning",
                         event_tx,
                     },
-                    || {
-                        let rd = rd.clone();
-                        Box::pin(async move { rd.lock().await.is_some() })
-                    },
+                    &coordinator_state.routing_decision,
                 )
                 .await
             {
                 Ok(r) => r,
-                Err(e) if is_context_overflow_error(e.as_ref()) => {
+                Err(PlanningCallError::ContextOverflow) => {
                     let suggestion = context_overflow_suggestion("planning");
                     return Err(
                         format!("Context limit exceeded during planning. {}", suggestion).into(),
                     );
                 }
-                Err(e) => {
+                Err(PlanningCallError::TransientExhausted { source, retries }) => {
+                    return Err(format!(
+                        "Planning failed after {} transient provider retries: {}",
+                        retries, source
+                    )
+                    .into());
+                }
+                Err(PlanningCallError::Fatal(e)) => {
                     let err_str = e.to_string();
                     coordinator_state
                         .conversation
                         .push(rig::completion::Message::user(&prompt));
-                    if is_transient_planning_error(&err_str) {
-                        tracing::warn!(
-                            "Planning attempt {} transient error after {:.1}s, retrying: {}",
-                            attempt,
-                            attempt_start.elapsed().as_secs_f64(),
-                            err_str,
-                        );
-                        continue;
-                    }
                     tracing::warn!(
                         "Planning attempt {} failed after {:.1}s: {}",
                         attempt,
@@ -1776,6 +1864,11 @@ impl Orchestrator {
 
             final_prompt = Some(prompt);
             final_response = Some(response_text);
+
+            // Next attempt sends the routing-tool correction: the coordinator
+            // responded without calling a routing tool.
+            current_prompt =
+                super::prompt_constants::corrections::ROUTING_TOOL_REQUIRED.to_string();
         }
 
         // All correction attempts exhausted
