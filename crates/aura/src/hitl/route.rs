@@ -5,10 +5,12 @@
 //! [`DecisionRoute::decide`] holds the shared semantics (deadline, fail-closed
 //! mapping, event emission) in one place instead of per-impl.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aura_config::{DecisionRouteConfig, GlobPattern, HitlConfig, WebhookUrl};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::decision::{ApprovalDecision, ApprovalOutcome};
 use super::events;
@@ -38,11 +40,28 @@ impl HitlRuntime {
     /// Resolve the request-stable runtime from parsed `[hitl]` config: share the
     /// compiled globs and build the decision route once (the webhook client and
     /// its connection pool are created here).
+    ///
+    /// `req_headers` is the inbound client request's HTTP headers, used to
+    /// resolve `[hitl.route]` `headers_from_request` mappings. Pass `None`
+    /// outside an HTTP request context (e.g. CLI standalone mode).
     #[must_use]
-    pub fn from_config(config: &HitlConfig, pending_approvals: &PendingApprovals) -> Self {
+    pub fn from_config(
+        config: &HitlConfig,
+        pending_approvals: &PendingApprovals,
+        req_headers: Option<&HashMap<String, String>>,
+    ) -> Self {
         let route = match &config.route {
-            DecisionRouteConfig::Webhook { url, timeout_secs } => DecisionRoute::Webhook {
-                client: WebhookClient::new(build_webhook_client(), url.clone()),
+            DecisionRouteConfig::Webhook {
+                url,
+                timeout_secs,
+                headers,
+                headers_from_request,
+            } => DecisionRoute::Webhook {
+                client: WebhookClient::new_with_headers(
+                    build_webhook_client(),
+                    url.clone(),
+                    resolve_webhook_headers(headers, headers_from_request, req_headers),
+                ),
                 timeout: Duration::from_secs(*timeout_secs),
             },
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
@@ -177,17 +196,90 @@ pub(crate) fn build_webhook_client() -> reqwest::Client {
         .expect("reqwest client builder only fails on TLS backend init")
 }
 
+/// Resolve operator-configured webhook headers into a validated [`HeaderMap`]:
+/// static `headers` overlaid with `headers_from_request` values from the
+/// inbound client request. Invalid header names or values are skipped with
+/// a warning (matching `mcp_streamable_http.rs`).
+///
+/// Opt-in only: nothing is forwarded unless the operator configures it.
+/// Resolved per request at agent-build time (orchestration resolves once
+/// before workers spawn).
+///
+/// NOTE (271 board, ADR decision 13): the 271 park/reify board adds header
+/// classification (`identity` vs `credential`) at park time. Unclassified
+/// headers default to credential (fail-closed) there — they refuse to park.
+/// That classification's only enforcement point is park time, which does not
+/// exist on main. This wave ships the plain `headers` / `headers_from_request`
+/// surface without classification; adding a classification key later is purely
+/// additive TOML, never a retrofit break. Forwarded headers are never
+/// persisted anywhere in this wave.
+fn resolve_webhook_headers(
+    static_headers: &HashMap<String, String>,
+    headers_from_request: &HashMap<String, String>,
+    req_headers: Option<&HashMap<String, String>>,
+) -> HeaderMap {
+    let empty = HashMap::new();
+    let req_headers = req_headers.unwrap_or(&empty);
+
+    let mut resolved = static_headers.clone();
+    crate::rig_builder::apply_request_header_mappings(
+        &mut resolved,
+        headers_from_request,
+        req_headers,
+    );
+
+    let mut header_map = HeaderMap::new();
+    for (key, value) in &resolved {
+        match (
+            HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(name), Ok(val)) => {
+                header_map.insert(name, val);
+            }
+            _ => {
+                tracing::warn!(
+                    "Skipping invalid webhook header '{}' (failed to convert)",
+                    key
+                );
+            }
+        }
+    }
+    header_map
+}
+
 /// HTTP client for the webhook route. Carried over from the spike's
 /// `HttpApprovalDispatch`.
 pub struct WebhookClient {
     client: reqwest::Client,
     url: WebhookUrl,
+    /// Operator-configured headers resolved at agent-build time: static
+    /// `headers` overlaid with `headers_from_request` values from the
+    /// inbound client request. Invalid header names/values were skipped
+    /// with a warning at resolution time. Empty when no headers are
+    /// configured, producing the same bare POST as before.
+    headers: HeaderMap,
 }
 
 impl WebhookClient {
     #[must_use]
     pub fn new(client: reqwest::Client, url: WebhookUrl) -> Self {
-        Self { client, url }
+        Self {
+            client,
+            url,
+            headers: HeaderMap::new(),
+        }
+    }
+
+    /// Create a webhook client with resolved operator-configured headers
+    /// applied to every approval POST.
+    #[must_use]
+    pub fn new_with_headers(client: reqwest::Client, url: WebhookUrl, headers: HeaderMap) -> Self {
+        Self {
+            client,
+            url,
+            headers,
+        }
     }
 
     /// POST the request and resolve a decision, failing closed on timeout or
@@ -201,14 +293,20 @@ impl WebhookClient {
         // `origin` as the flat `aura_events` DTOs instead of leaking Rust enum
         // variant names onto the webhook contract.
         let wire = ApprovalRequestWire::from(request);
-        match self
+        let mut builder = self
             .client
             .post(self.url.as_str())
             .json(&wire)
-            .timeout(timeout)
-            .send()
-            .await
-        {
+            .timeout(timeout);
+
+        // Apply resolved operator-configured headers on top of the JSON body
+        // (which already set Content-Type). An empty map adds nothing, so the
+        // POST is byte-for-byte identical to the pre-header-forwarding path.
+        for (name, value) in self.headers.iter() {
+            builder = builder.header(name.clone(), value.clone());
+        }
+
+        match builder.send().await {
             Err(e) if e.is_timeout() => Ok(ApprovalOutcome::TimedOut { waited: timeout }),
             Err(e) => Err(ApprovalError::Transport(e.to_string())),
             Ok(resp) => {
@@ -628,5 +726,264 @@ mod tests {
         }
 
         crate::approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    // -----------------------------------------------------------------
+    // resolve_webhook_headers unit tests
+    // -----------------------------------------------------------------
+
+    fn make_req_headers(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn webhook_headers_static_only() {
+        let static_headers = make_req_headers(&[("x-tenant", "sre-prod")]);
+        let headers_from_request = std::collections::HashMap::new();
+        let header_map =
+            super::resolve_webhook_headers(&static_headers, &headers_from_request, None);
+        assert_eq!(header_map.get("x-tenant").unwrap(), "sre-prod");
+        assert_eq!(header_map.len(), 1);
+    }
+
+    #[test]
+    fn webhook_headers_mapped_only() {
+        let static_headers = std::collections::HashMap::new();
+        let headers_from_request = make_req_headers(&[("x-tenant", "x-incoming-tenant")]);
+        let req_headers = make_req_headers(&[("x-incoming-tenant", "forwarded-value")]);
+
+        let header_map = super::resolve_webhook_headers(
+            &static_headers,
+            &headers_from_request,
+            Some(&req_headers),
+        );
+        assert_eq!(header_map.get("x-tenant").unwrap(), "forwarded-value");
+        assert_eq!(header_map.len(), 1);
+    }
+
+    #[test]
+    fn webhook_headers_fallback_precedence() {
+        // When the mapped request header IS present, it overrides the static value.
+        let static_headers = make_req_headers(&[("authorization", "static-token")]);
+        let headers_from_request = make_req_headers(&[("authorization", "x-incoming-auth")]);
+        let req_headers = make_req_headers(&[("x-incoming-auth", "dynamic-token")]);
+
+        let header_map = super::resolve_webhook_headers(
+            &static_headers,
+            &headers_from_request,
+            Some(&req_headers),
+        );
+        assert_eq!(
+            header_map.get("authorization").unwrap(),
+            "dynamic-token",
+            "request header should override static"
+        );
+
+        // When the mapped request header is ABSENT, the static value is the fallback.
+        let req_headers_empty = std::collections::HashMap::new();
+        let header_map_fallback = super::resolve_webhook_headers(
+            &static_headers,
+            &headers_from_request,
+            Some(&req_headers_empty),
+        );
+        assert_eq!(
+            header_map_fallback.get("authorization").unwrap(),
+            "static-token",
+            "static header should be used when request header is absent"
+        );
+    }
+
+    #[test]
+    fn webhook_headers_case_insensitive_lookup() {
+        // TOML config uses "Authorization" (capitalized) but the inbound
+        // request header arrives lowercased. The lookup must be case-insensitive.
+        let static_headers = std::collections::HashMap::new();
+        let headers_from_request = make_req_headers(&[("Authorization", "Authorization")]);
+        let req_headers = make_req_headers(&[("authorization", "Token my-token")]);
+
+        let header_map = super::resolve_webhook_headers(
+            &static_headers,
+            &headers_from_request,
+            Some(&req_headers),
+        );
+        assert_eq!(
+            header_map.get("authorization").unwrap(),
+            "Token my-token",
+            "case-insensitive lookup should resolve lowercased request header"
+        );
+    }
+
+    #[test]
+    fn webhook_headers_invalid_skipped() {
+        // Header name with a space is invalid per RFC 7230; the entry must
+        // be skipped with a warning, not panic.
+        let static_headers = make_req_headers(&[("invalid header!", "value"), ("x-valid", "ok")]);
+        let headers_from_request = std::collections::HashMap::new();
+
+        let header_map =
+            super::resolve_webhook_headers(&static_headers, &headers_from_request, None);
+        assert_eq!(header_map.get("x-valid").unwrap(), "ok");
+        assert_eq!(
+            header_map.len(),
+            1,
+            "invalid header must be skipped, valid one must remain"
+        );
+    }
+
+    #[test]
+    fn webhook_headers_empty_config_produces_bare_post() {
+        // Empty config (no static, no from_request, no req_headers) must
+        // produce an empty HeaderMap. With an empty HeaderMap, the
+        // request_approval loop does not execute, so the POST is
+        // byte-for-byte identical to the pre-header-forwarding path.
+        let static_headers = std::collections::HashMap::new();
+        let headers_from_request = std::collections::HashMap::new();
+
+        let header_map =
+            super::resolve_webhook_headers(&static_headers, &headers_from_request, None);
+        assert!(
+            header_map.is_empty(),
+            "empty config must produce no headers (bare POST)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Integration tests: mock webhook asserts headers arrive on the POST
+    // -----------------------------------------------------------------
+
+    /// Spawn a mock webhook on a random port that captures the raw HTTP
+    /// request text and responds with `{"approved": true}`. Returns the
+    /// port and a oneshot receiver for the captured request.
+    async fn spawn_mock_webhook() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read until we have the complete header section (\r\n\r\n).
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            // Parse Content-Length so we can consume the request body before
+            // responding — otherwise reqwest may get a connection reset while
+            // still sending the POST body.
+            let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let header_section = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length: usize = header_section
+                .lines()
+                .find(|line| line.to_lowercase().starts_with("content-length:"))
+                .and_then(|line| line.split(':').nth(1))
+                .and_then(|val| val.trim().parse().ok())
+                .unwrap_or(0);
+            let body_already_read = buf.len() - header_end;
+            let remaining = content_length.saturating_sub(body_already_read);
+            if remaining > 0 {
+                let mut body_buf = vec![0u8; remaining];
+                socket.read_exact(&mut body_buf).await.unwrap();
+            }
+
+            // Respond with a valid approval. Content-Length is computed from
+            // the actual body so there is no mismatch.
+            let body = "{\"approved\": true}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = tx.send(header_section);
+        });
+
+        (port, rx)
+    }
+
+    fn make_approval_request() -> ApprovalRequest {
+        ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: "hdr-test".into(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "dangerous_*".into(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "dangerous_apply".into(),
+                arguments: serde_json::json!({}),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_forwards_configured_headers_to_mock_server() {
+        let (port, rx) = spawn_mock_webhook().await;
+
+        // Build a webhook client with a static header.
+        let mut header_map = reqwest::header::HeaderMap::new();
+        header_map.insert(
+            "x-tenant",
+            reqwest::header::HeaderValue::from_static("sre-prod"),
+        );
+        let client = super::WebhookClient::new_with_headers(
+            super::build_webhook_client(),
+            aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap(),
+            header_map,
+        );
+
+        let route = super::DecisionRoute::Webhook {
+            client,
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let result = route.decide(make_approval_request(), &cancel).await;
+        assert!(result.is_ok(), "mock webhook should return a decision");
+
+        let captured = rx.await.unwrap();
+        assert!(
+            captured.contains("x-tenant: sre-prod"),
+            "configured header must appear in the webhook POST, got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_empty_config_sends_no_custom_headers() {
+        let (port, rx) = spawn_mock_webhook().await;
+
+        // Empty HeaderMap — same as the pre-header-forwarding path.
+        let client = super::WebhookClient::new_with_headers(
+            super::build_webhook_client(),
+            aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap(),
+            reqwest::header::HeaderMap::new(),
+        );
+
+        let route = super::DecisionRoute::Webhook {
+            client,
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let result = route.decide(make_approval_request(), &cancel).await;
+        assert!(result.is_ok(), "mock webhook should return a decision");
+
+        let captured = rx.await.unwrap();
+        assert!(
+            !captured.contains("x-tenant"),
+            "no custom headers should appear with empty config, got: {captured}"
+        );
     }
 }

@@ -32,8 +32,11 @@ impl RigBuilder {
 
     /// Get the runtime [`AgentRuntimeConfig`] (mainly for tests/debugging).
     /// Skips skill discovery; build methods use [`Self::discovered_agent_config`].
+    /// Passes `None` for request headers — production paths that need
+    /// `headers_from_request` resolution use [`Self::build_agent`] or
+    /// [`Self::build_streaming_agent_with_headers`].
     pub fn get_agent_config(&self) -> AgentRuntimeConfig {
-        self.to_agent_config()
+        self.to_agent_config(None)
     }
 
     /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
@@ -44,7 +47,11 @@ impl RigBuilder {
     /// populated by callers (e.g. the orchestrator) as needed. Skills start
     /// empty here because discovery does filesystem IO and can fail; the
     /// fallible build paths run it via [`Self::discovered_agent_config`].
-    fn to_agent_config(&self) -> AgentRuntimeConfig {
+    ///
+    /// `req_headers` threads the inbound client request's HTTP headers through
+    /// to [`HitlRuntime::from_config`] for `[hitl.route]` `headers_from_request`
+    /// resolution. Pass `None` outside an HTTP request context.
+    fn to_agent_config(&self, req_headers: Option<&HashMap<String, String>>) -> AgentRuntimeConfig {
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
@@ -67,11 +74,9 @@ impl RigBuilder {
             tools: self.config.tools.clone(),
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
-            hitl: self
-                .config
-                .hitl
-                .as_ref()
-                .map(|cfg| crate::hitl::HitlRuntime::from_config(cfg, &self.pending_approvals)),
+            hitl: self.config.hitl.as_ref().map(|cfg| {
+                crate::hitl::HitlRuntime::from_config(cfg, &self.pending_approvals, req_headers)
+            }),
             ..Default::default()
         }
     }
@@ -80,8 +85,11 @@ impl RigBuilder {
     ///
     /// Effective skill sources are the explicit `[agent.skills]` config.
     /// Relative sources resolve from the process current working directory.
-    fn discovered_agent_config(&self) -> Result<AgentRuntimeConfig, BuilderError> {
-        let mut agent_config = self.to_agent_config();
+    fn discovered_agent_config(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+    ) -> Result<AgentRuntimeConfig, BuilderError> {
+        let mut agent_config = self.to_agent_config(req_headers);
 
         let skill_sources = self.config.agent.skills.local.clone();
         agent_config.agent.skills = aura_config::skills::discover_skills(&skill_sources)?;
@@ -120,7 +128,7 @@ impl RigBuilder {
         request_id: Option<String>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
-        let mut agent_config = self.discovered_agent_config()?;
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.request_id = request_id;
         agent_config.session_id = session_id;
@@ -146,7 +154,7 @@ impl RigBuilder {
         client_tools: Option<Vec<ClientTool>>,
         request_id: Option<String>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
-        let mut agent_config = self.discovered_agent_config()?;
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
@@ -154,6 +162,39 @@ impl RigBuilder {
         build_streaming_agent(&agent_config, client_tools)
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
+    }
+}
+
+/// Resolve `headers_from_request` mappings against the incoming request
+/// headers, overlaying resolved values on top of `headers`. Static values
+/// already present in `headers` serve as fallback when the mapped request
+/// header is absent.
+///
+/// HTTP header names are case-insensitive (RFC 7230): the inbound lookup
+/// lowercases both sides, so TOML config values using any casing match
+/// actix-web's lowercased header names.
+///
+/// NOTE (271 board, ADR decision 13): the 271 park/reify board adds header
+/// classification (`identity` vs `credential`) at park time. Unclassified
+/// headers default to credential (fail-closed) there — they refuse to park.
+/// That classification's only enforcement point is park time, which does not
+/// exist on main. This wave ships the plain `headers` / `headers_from_request`
+/// surface without classification; adding a classification key later is purely
+/// additive TOML. Forwarded headers are never persisted anywhere in this wave.
+pub(crate) fn apply_request_header_mappings(
+    headers: &mut HashMap<String, String>,
+    headers_from_request: &HashMap<String, String>,
+    req_headers: &HashMap<String, String>,
+) {
+    for (header_key, req_header_name) in headers_from_request.iter() {
+        let req_header_lower = req_header_name.to_lowercase();
+        if let Some(value) = req_headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == req_header_lower)
+            .map(|(_, v)| v)
+        {
+            headers.insert(header_key.clone(), value.clone());
+        }
     }
 }
 
@@ -192,27 +233,16 @@ fn resolve_mcp_headers(
             }
         };
 
-        // Resolve headers_from_request mappings using the incoming request headers.
-        // Static TOML headers are already in server_headers; this only overrides
-        // when the mapped request header is found.
-        for (header_key, req_header_name) in headers_from_request.iter() {
-            // Note: HTTP header names are case-insensitive (RFC 7230), so we compare
-            // lowercased names. Actix-web lowercases header names, but TOML config
-            // values may use any casing.
-            let req_header_lower = req_header_name.to_lowercase();
-            let Some(value) = req_headers
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == req_header_lower)
-                .map(|(_, v)| v)
-            else {
-                continue;
-            };
-            server_headers.insert(header_key.clone(), value.clone());
+        // Resolve headers_from_request mappings using the incoming request
+        // headers. Static TOML headers are already in server_headers; this
+        // only overrides when the mapped request header is found.
+        let before = server_headers.len();
+        apply_request_header_mappings(server_headers, headers_from_request, req_headers);
+        if server_headers.len() > before {
             tracing::info!(
-                "Server '{}': resolved header '{}' from request header '{}'",
+                "Server '{}': resolved {} header(s) from request",
                 server_name,
-                header_key,
-                req_header_name
+                server_headers.len() - before
             );
         }
     }
@@ -557,7 +587,7 @@ skills.local = []
 
         let config = aura_config::Config::parse_toml(&config_str).expect("config should parse");
         let agent_config = RigBuilder::new(config, PendingApprovals::new())
-            .discovered_agent_config()
+            .discovered_agent_config(None)
             .expect("discovery should succeed");
 
         match agent_config
@@ -613,7 +643,7 @@ source = '/nonexistent/path/to/worker/skills'
 "#;
         let config = aura_config::Config::parse_toml(config_str).expect("config should parse");
         let err = RigBuilder::new(config, PendingApprovals::new())
-            .discovered_agent_config()
+            .discovered_agent_config(None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
