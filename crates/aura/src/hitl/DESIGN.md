@@ -12,25 +12,32 @@ public type surface, `todo!()` bodies, zero behavior.
 | `PrimarySecret` | Only the primary secret may sign egress. | A secondary secret cannot be passed to `WebhookHmac::sign`; the signing path requires `PrimarySecret`. |
 | `SecondarySecret` | The secondary secret verifies ingress only during rotation. | There is no `sign` method on `SecondarySecret`; it cannot be used to produce egress signatures. |
 | `SignatureHeader` | The `X-Aura-Signature-256` value is a `sha256=` prefix followed by 64 lowercase hex chars. | A malformed or non-hex signature cannot be constructed; parsing returns `VerificationError::MalformedSignature`. |
-| `Signature` | A verified signature is exactly 32 bytes. | A signature of any other length cannot be represented; it is rejected at parse time. |
+| `Signature` | A parsed signature tag is exactly 32 bytes. | A signature tag of any other length cannot be represented; it is rejected at parse time. |
 | `UnixTimestamp` | `X-Aura-Timestamp` is a non-negative integer of unix seconds. | A non-numeric or negative timestamp cannot be represented; parsing returns `VerificationError::MalformedTimestamp`. |
 | `Tolerance` | Skew tolerance is a positive number of seconds. | Negative tolerance is unrepresentable (`u64`); zero is allowed but must be explicitly requested. |
 | `SignedHeaders` | Egress headers are produced as a matched pair from one signing operation. | A signature header and timestamp header generated independently cannot be represented; the type binds them. |
 | `WebhookHmac` | Signing and verification are only available when a secret is configured. | The "feature off" state is `Option<WebhookHmac>`; `sign`/`verify` are unreachable when the feature is off. |
 | `VerificationError` | Verification failures are classified precisely for observability and testing. | A catch-all error variant does not exist; every failure has a named, testable case. |
+| `VerifiedBody` | Ingress body bytes are only exposed after successful authorization or when verification is disabled. | Unverified body bytes cannot be passed directly to the JSON deserializer; `serde_json::from_slice` accepts only `VerifiedBody::as_ref()`. |
 
 ## 2. Visibility and seam table
 
 | Item | Visibility | Seam | Notes |
 |---|---|---|---|
 | `signing.rs` module | `pub(crate)` via `hitl/mod.rs` | Internal to `aura` crate | Re-exports intentionally deferred until the panel ratifies the public surface. |
-| `WebhookHmac::load_from_env` | `pub` | Env loader | Reads `AURA_HITL_WEBHOOK_SECRET` and `AURA_HITL_WEBHOOK_SECRET_SECONDARY`; returns `None` when the primary is absent/empty. |
+| `WebhookHmac::load_from_env` | `pub` | Env loader | Reads `AURA_HITL_WEBHOOK_SECRET`, `AURA_HITL_WEBHOOK_SECRET_SECONDARY`, and `AURA_HITL_WEBHOOK_TOLERANCE_SECS`; returns `None` when the primary is absent/empty. Tolerance defaults to 300s when absent. |
 | `WebhookHmac::sign` | `pub` | Egress signing | **Untouched integration seam**: `route.rs:195-230` (`WebhookClient::request_approval`) serializes `ApprovalRequestWire` to bytes with `serde_json::to_vec`, then calls `sign` and attaches `SIGNATURE_HEADER`/`TIMESTAMP_HEADER`. |
-| `WebhookHmac::verify` | `pub` | Ingress verification | **Untouched integration seam**: `handlers.rs:1032-1051` (`resolve_approval`) switches its axum extractor to `Bytes`. After verifying the two `X-Aura-*` headers it deserializes with `serde_json::from_slice::<ApprovalDecisionWire>(&bytes)`. |
-| `SignatureHeader::parse` | `pub` | Header parsing | Called by the ingress seam; rejects anything that is not `sha256=<64 hex chars>`. |
-| `UnixTimestamp::parse` | `pub` | Header parsing | Called by the ingress seam; rejects non-numeric timestamps. |
-| `PrimarySecret` / `SecondarySecret` | `pub` | Secret types | Construction via `new` only; `Debug` redacts material. |
-| `SignedHeaders` | `pub` | Signing result | Public fields because both `signature` and `timestamp` are validated by construction. |
+| `WebhookHmac::verify` | `pub(crate)` | Internal verification | Configured-path step called by `authorize_ingress`; not exposed outside the module. |
+| `WebhookHmac::tolerance` | `pub` | Config accessor | Returns the configured skew tolerance. |
+| `authorize_ingress` | `pub` | Ingress verification | **Untouched integration seam**: `handlers.rs:1032-1051` (`resolve_approval`) switches its axum extractor to `Bytes`, calls `authorize_ingress`, and `serde_json::from_slice::<ApprovalDecisionWire>(&verified_body.as_ref())` accepts only `VerifiedBody`. |
+| `VerifiedBody` | `pub` | Ingress witness | `AsRef<[u8]>` exposes authorized body bytes; produced unverified when `config` is `None`. |
+| `SignatureHeader::parse` | `pub` | Header parsing | Called by `authorize_ingress`; rejects anything that is not `sha256=<64 hex chars>`. |
+| `UnixTimestamp::parse` | `pub` | Header parsing | Called by `authorize_ingress`; rejects non-numeric timestamps. |
+| `UnixTimestamp::now` | `pub` | Clock source | Used by `authorize_ingress` for skew checks. |
+| `PrimarySecret` / `SecondarySecret` | `pub` | Secret types | Construction via `new` only; `Debug` redacts material. Public byte access removed; key material is reachable only inside this module. |
+| `Signature` | `pub` | Opaque tag | 32-byte HMAC-SHA256 tag with no public byte accessors; comparison happens only inside `WebhookHmac::verify`. |
+| `Tolerance` | `pub` | Config value | Skew tolerance in seconds; defaults to `DEFAULT_TOLERANCE_SECS` (300). |
+| `SignedHeaders` | `pub` | Signing result | Matched pair produced by construction; fields are private, accessed via `signature()` and `timestamp()`. |
 | `VerificationError` | `pub` | Error taxonomy | Carries validated newtypes in `SkewedTimestamp`, never bare domain values. |
 
 ## 3. Named residual risks
@@ -55,14 +62,15 @@ replaced.
 
 Baseline hole inventory (from `signing.rs`):
 
-| Line | Function | Hole |
+| Function | Line | Hole |
 |---|---|---|
-| `SignatureHeader::parse` | ~l60 | Parse `sha256=<hex>` and validate length/hex. |
-| `UnixTimestamp::parse` | ~l95 | Parse decimal unix seconds into `UnixTimestamp`. |
-| `UnixTimestamp::now` | ~l100 | Convert `SystemTime::now` to unix seconds. |
-| `WebhookHmac::load_from_env` | ~l125 | Read env vars, build `PrimarySecret` and optional `SecondarySecret`. |
-| `WebhookHmac::sign` | ~l140 | Build signed payload, compute HMAC-SHA256, hex-encode, return headers. |
-| `WebhookHmac::verify` | ~l147 | Check skew, recompute HMAC with primary then secondary, constant-time compare. |
+| `SignatureHeader::parse` | 88 | Parse `sha256=<hex>` and validate length/hex. |
+| `UnixTimestamp::parse` | 115 | Parse decimal unix seconds into `UnixTimestamp`. |
+| `UnixTimestamp::now` | 119 | Convert `SystemTime::now` to unix seconds. |
+| `WebhookHmac::load_from_env` | 184 | Read env vars, build `PrimarySecret` and optional `SecondarySecret`, parse tolerance. |
+| `WebhookHmac::sign` | 194 | Build signed payload, compute HMAC-SHA256, hex-encode, return headers. |
+| `WebhookHmac::verify` | 199 | Check skew, recompute HMAC with primary then secondary, constant-time compare. |
+| `authorize_ingress` | 266 | Route unverified when feature off; parse headers, check skew, call `verify`. |
 
 Removal condition: delete `#![allow(dead_code)]` and run the three cargo gates
 plus the W3 unit-test suite (known-answer vector, skew both ways, secondary
