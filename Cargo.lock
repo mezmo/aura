@@ -244,7 +244,6 @@ dependencies = [
  "sha2 0.11.0",
  "sse-stream",
  "strum",
- "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
