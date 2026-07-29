@@ -188,7 +188,9 @@ impl ToolWrapper for PersistenceWrapper {
     }
 
     fn write_context(&self, extracted: Option<&Value>, ctx: &mut ToolCallContext) {
-        if let Some(r) = find_field(extracted, "reasoning") {
+        // transform_args emits "reasoning": "" when the field was absent
+        // (it uses unwrap_or_default), so empty means absent.
+        if let Some(r) = find_field(extracted, "reasoning").filter(|r| !r.trim().is_empty()) {
             ctx.tool_call_intent = Some(r.to_string());
         }
     }
@@ -1354,15 +1356,25 @@ mod tests {
         let persistence = Arc::new(Mutex::new(ExecutionPersistence::disabled()));
         let wrapper = test_wrapper(persistence);
 
-        let extracted = serde_json::json!([{
-            "_persistence_call_id": "abc-123",
-            "call_idx": 0
-        }]);
+        // Feed the actual transform_args output (which emits "reasoning": ""
+        // for absent input), not a hand-built object missing the key.
+        let probe_ctx = ToolCallContext::new("test_tool");
+        let result = wrapper.transform_args(serde_json::json!({"param": "value"}), &probe_ctx);
+        let extracted = result
+            .extracted
+            .expect("transform_args always produces extracted");
+        assert_eq!(
+            extracted["reasoning"], "",
+            "absent reasoning => empty string in extracted"
+        );
 
         let mut ctx = ToolCallContext::new("test_tool");
         wrapper.write_context(Some(&extracted), &mut ctx);
 
-        assert!(ctx.tool_call_intent.is_none());
+        assert!(
+            ctx.tool_call_intent.is_none(),
+            "absent reasoning (transform_args emits \"\") must not surface as tool_call_intent"
+        );
     }
 
     // --------------------------------------------------------------------
@@ -1518,6 +1530,126 @@ mod tests {
         assert!(result.is_ok(), "approved call should succeed: {:?}", result);
 
         // The inner tool received args WITHOUT _aura_reasoning.
+        let executed = received
+            .lock()
+            .unwrap()
+            .take()
+            .expect("inner tool was called");
+        assert!(
+            executed.get("_aura_reasoning").is_none(),
+            "executed args must not contain _aura_reasoning"
+        );
+        assert_eq!(executed["namespace"], "prod");
+
+        approval_event_broker::unsubscribe(&request_id).await;
+    }
+
+    /// Absent-reasoning counterpart to `config_gate_forwards_tool_call_intent_and_strips_reasoning`:
+    /// a hard-gated tool call carrying NO `_aura_reasoning` must produce an
+    /// approval payload item that OMITS `tool_call_intent` entirely (never
+    /// `null`, never `""`) on the serialized wire.
+    #[tokio::test]
+    async fn config_gate_omits_tool_call_intent_when_reasoning_absent() {
+        use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
+        use crate::hitl::{
+            AgentScope, ApprovalDecision, DecisionId, DecisionRoute, HitlApprovalWrapper,
+            PendingApprovals,
+        };
+        use crate::orchestration::{RunId, TaskIdentity};
+        use crate::session_store::{
+            ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus,
+        };
+        use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper, WrappedTool};
+        use aura_config::GlobPattern;
+
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
+        let registry = PendingApprovals::with_backend(store.clone(), bus);
+        let registry_for_resolve = registry.clone();
+        let route = Arc::new(DecisionRoute::Conversational {
+            registry,
+            timeout: std::time::Duration::from_secs(60),
+        });
+
+        let run_id: RunId = "0191e8c0-2222-7000-8000-000000000000".parse().unwrap();
+        let scope = AgentScope::Worker {
+            run_id,
+            task: TaskIdentity::new(3, Some("k8s-agent".to_string())),
+            session_id: None,
+        };
+
+        let request_id = format!("req_w2_absent_{}", uuid::Uuid::new_v4().simple());
+
+        let gate: Arc<dyn ToolWrapper> = Arc::new(HitlApprovalWrapper::new(
+            Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
+            route,
+            scope,
+            request_id.clone(),
+        ));
+        let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(
+            ExecutionPersistence::disabled(),
+        ))));
+        let composed = ComposedWrapper::new(vec![gate, persistence]);
+
+        let received = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let inner = ArgsRecordingTool {
+            received: received.clone(),
+        };
+        let initiator = "k8s-agent".to_string();
+        let wrapped =
+            WrappedTool::new(inner, Arc::new(composed)).with_context_factory(move |tool_name| {
+                ToolCallContext::new(tool_name).with_task_context(3, initiator.clone(), 1)
+            });
+
+        let mut rx = approval_event_broker::subscribe(&request_id).await;
+
+        // NO _aura_reasoning — the model omitted the optional field.
+        let args = serde_json::json!({
+            "namespace": "prod",
+            "resource": "deploy/web"
+        });
+        let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
+            tokio::spawn(async move { wrapped.call(args).await });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("requested event should arrive")
+            .expect("event channel open");
+        let decision_id = match event {
+            ApprovalLifecycleEvent::Requested(req) => {
+                DecisionId::parse(&req.decision_id).expect("valid decision id")
+            }
+            other => panic!("expected Requested event, got {:?}", other),
+        };
+
+        let parked = store
+            .get(&decision_id)
+            .await
+            .unwrap()
+            .expect("parked approval exists");
+        assert_eq!(parked.request.items.len(), 1);
+        let item = &parked.request.items[0];
+        assert!(
+            item.tool_call_intent.is_none(),
+            "absent reasoning must not surface as tool_call_intent"
+        );
+
+        // Wire shape: tool_call_intent must be OMITTED (never null, never "").
+        let item_wire = serde_json::to_value(item).expect("item serializable");
+        assert!(
+            item_wire.get("tool_call_intent").is_none(),
+            "tool_call_intent must be omitted on the wire when reasoning is absent, got: {}",
+            item_wire
+        );
+
+        registry_for_resolve
+            .resolve(&decision_id, ApprovalDecision::Approved)
+            .await
+            .expect("resolve");
+
+        let result = call_handle.await.expect("call task did not panic");
+        assert!(result.is_ok(), "approved call should succeed: {:?}", result);
+
         let executed = received
             .lock()
             .unwrap()
