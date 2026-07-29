@@ -967,7 +967,7 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
-        let inactivity_secs = self.config.inactivity_timeout_secs();
+        let inactivity_secs = self.config.stream_inactivity_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
             let mut stream = agent.stream_chat(prompt, history).await;
@@ -989,8 +989,13 @@ impl Orchestrator {
             // state the received item implies, not the previous item's state.
             // A ToolCall's suspension lands after its body, covering exactly
             // the next receive, where rig executes the tool.
-            let mut deadline =
-                crate::inactivity::InactivityDeadline::new(Duration::from_secs(inactivity_secs));
+            //
+            // new_disarmed(): the per-call budget already bounds the wait for
+            // the first token, so this window governs only silence between
+            // stream items; the first touch arms it.
+            let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
+                Duration::from_secs(inactivity_secs),
+            );
             loop {
                 let item = tokio::select! {
                     biased;
@@ -1198,7 +1203,7 @@ impl Orchestrator {
             event_tx,
         } = params;
         let timeout_secs = self.config.per_call_timeout_secs();
-        let inactivity_secs = self.config.inactivity_timeout_secs();
+        let inactivity_secs = self.config.stream_inactivity_timeout_secs();
         let emit_scratchpad_events = scratchpad::emit_scratchpad_tool_events_enabled();
         let stream_future = async {
             let mut stream = agent
@@ -1216,9 +1221,10 @@ impl Orchestrator {
             let mut internal_tool_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
             // Same two-phase guarded shape as `stream_and_forward`; see the
-            // rationale there.
-            let mut deadline =
-                crate::inactivity::InactivityDeadline::new(Duration::from_secs(inactivity_secs));
+            // rationale there, including why new_disarmed() rather than new().
+            let mut deadline = crate::inactivity::InactivityDeadline::new_disarmed(
+                Duration::from_secs(inactivity_secs),
+            );
             loop {
                 let item = tokio::select! {
                     biased;

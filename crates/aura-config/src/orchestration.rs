@@ -125,7 +125,7 @@ pub struct WorkerConfig {
 /// ```toml
 /// [orchestration.timeouts]
 /// per_call_timeout_secs = 120
-/// inactivity_timeout_secs = 45
+/// stream_inactivity_timeout_secs = 45
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,17 +135,17 @@ pub struct TimeoutsConfig {
     #[serde(default = "default_per_call_timeout_secs")]
     pub per_call_timeout_secs: u64,
 
-    /// Inactivity window (seconds) for coordinator and worker streams. 0
-    /// disables.
-    #[serde(default = "default_inactivity_timeout_secs")]
-    pub inactivity_timeout_secs: u64,
+    /// Inactivity window (seconds) for coordinator and worker streams; governs
+    /// silence between stream items. 0 disables.
+    #[serde(default = "default_stream_inactivity_timeout_secs")]
+    pub stream_inactivity_timeout_secs: u64,
 }
 
 impl Default for TimeoutsConfig {
     fn default() -> Self {
         Self {
             per_call_timeout_secs: default_per_call_timeout_secs(),
-            inactivity_timeout_secs: default_inactivity_timeout_secs(),
+            stream_inactivity_timeout_secs: default_stream_inactivity_timeout_secs(),
         }
     }
 }
@@ -370,8 +370,8 @@ impl OrchestrationConfig {
     }
 
     /// Inactivity window (seconds) for coordinator and worker streams.
-    pub fn inactivity_timeout_secs(&self) -> u64 {
-        self.timeouts.inactivity_timeout_secs
+    pub fn stream_inactivity_timeout_secs(&self) -> u64 {
+        self.timeouts.stream_inactivity_timeout_secs
     }
 
     /// Optional memory/persistence directory.
@@ -590,7 +590,7 @@ fn default_per_call_timeout_secs() -> u64 {
     0
 }
 
-fn default_inactivity_timeout_secs() -> u64 {
+fn default_stream_inactivity_timeout_secs() -> u64 {
     0
 }
 
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(config.max_tools_per_worker, 10);
         assert!(config.coordinator_vector_stores.is_empty());
         assert_eq!(config.per_call_timeout_secs(), 0);
-        assert_eq!(config.inactivity_timeout_secs(), 0);
+        assert_eq!(config.stream_inactivity_timeout_secs(), 0);
         assert_eq!(config.result_artifact_threshold(), 4000);
         assert_eq!(config.result_summary_length(), 2000);
         assert!(config.memory_dir().is_none());
@@ -949,7 +949,7 @@ mod tests {
 
             [timeouts]
             per_call_timeout_secs = 45
-            inactivity_timeout_secs = 120
+            stream_inactivity_timeout_secs = 120
 
             [artifacts]
             memory_dir = "/tmp/new-style"
@@ -958,10 +958,29 @@ mod tests {
         "#;
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.per_call_timeout_secs(), 45);
-        assert_eq!(config.inactivity_timeout_secs(), 120);
+        assert_eq!(config.stream_inactivity_timeout_secs(), 120);
         assert_eq!(config.memory_dir(), Some("/tmp/new-style"));
         assert_eq!(config.result_artifact_threshold(), 8000);
         assert_eq!(config.result_summary_length(), 1500);
+    }
+
+    #[test]
+    fn test_timeouts_default_when_section_omitted() {
+        let toml = r#"
+            enabled = true
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.per_call_timeout_secs(), 0);
+        assert_eq!(config.stream_inactivity_timeout_secs(), 0);
+
+        let toml = r#"
+            enabled = true
+
+            [timeouts]
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.per_call_timeout_secs(), 0);
+        assert_eq!(config.stream_inactivity_timeout_secs(), 0);
     }
 
     #[test]

@@ -109,10 +109,11 @@ allow_clarification = true
 tools_in_planning = "summary"
 
 [orchestration.timeouts]
+# Wall-clock budget for one coordinator phase or one worker task; 0 disables.
 per_call_timeout_secs = 120
 # Fail a coordinator/worker stream after this many seconds of provider
 # silence (tool execution is exempt). 0 disables.
-inactivity_timeout_secs = 0
+stream_inactivity_timeout_secs = 0
 
 # ─── Workers ────────────────────────────────────────────────────
 # Each worker specializes in a domain. Add mcp_filter to restrict

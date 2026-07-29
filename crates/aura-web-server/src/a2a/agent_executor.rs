@@ -653,7 +653,7 @@ mod tests {
             debug_provider_errors: false,
             streaming_timeout_secs: 0,
             first_chunk_timeout_secs: 0,
-            inactivity_timeout_secs: 0,
+            stream_inactivity_timeout_secs: 0,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(ActiveRequestTracker::default()),

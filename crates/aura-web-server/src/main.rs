@@ -124,14 +124,14 @@ struct Args {
     /// Inactivity timeout in seconds (streaming requests only).
     /// Maximum silence between stream items after the first chunk before the
     /// stream is failed. Single-agent tool execution is exempt; orchestrated
-    /// worker tools are bounded by the TOML inactivity_timeout_secs instead,
+    /// worker tools are bounded by the TOML stream_inactivity_timeout_secs instead,
     /// so size this window above it for orchestrated configs. Set to 0 to
     /// disable.
     /// Note: some providers emit nothing during long mid-stream reasoning
     /// phases; the window must exceed the longest such gap, not just startup
     /// latency.
-    #[arg(long, env = "INACTIVITY_TIMEOUT_SECS", default_value = "0")]
-    inactivity_timeout_secs: u64,
+    #[arg(long, env = "STREAM_INACTIVITY_TIMEOUT_SECS", default_value = "0")]
+    stream_inactivity_timeout_secs: u64,
 
     /// Graceful shutdown timeout in seconds.
     /// On SIGTERM/SIGINT, new requests are rejected immediately (503), but in-flight
@@ -208,14 +208,17 @@ fn warn_timeout_relationships(agent_id: &str, config: &aura_config::Config, args
         return;
     };
     let per_call = orch.timeouts.per_call_timeout_secs;
-    let toml_inactivity = orch.timeouts.inactivity_timeout_secs;
+    let toml_inactivity = orch.timeouts.stream_inactivity_timeout_secs;
     let streaming = args.streaming_timeout_secs;
-    let server_inactivity = args.inactivity_timeout_secs;
+    let server_inactivity = args.stream_inactivity_timeout_secs;
 
     if let Some(msg) = per_call_vs_streaming_warning(per_call, streaming) {
         tracing::warn!("agent '{agent_id}': {msg}");
     }
     if let Some(msg) = server_window_shadows_tools_warning(server_inactivity, toml_inactivity) {
+        tracing::warn!("agent '{agent_id}': {msg}");
+    }
+    if let Some(msg) = server_inactivity_vs_orchestration_warning(server_inactivity) {
         tracing::warn!("agent '{agent_id}': {msg}");
     }
     if let Some(hitl) = config.hitl.as_ref() {
@@ -247,7 +250,25 @@ fn server_window_shadows_tools_warning(
 ) -> Option<String> {
     if server_inactivity > 0 && (toml_inactivity == 0 || server_inactivity <= toml_inactivity) {
         return Some(format!(
-            "the server inactivity window ({server_inactivity}s) does not exempt orchestrated worker tools; set [orchestration.timeouts].inactivity_timeout_secs below it (currently {toml_inactivity}s) so the inner window, which does exempt tools, fires first"
+            "the server inactivity window ({server_inactivity}s) does not exempt orchestrated worker tools; set [orchestration.timeouts].stream_inactivity_timeout_secs below it (currently {toml_inactivity}s) so the inner window, which does exempt tools, fires first"
+        ));
+    }
+    None
+}
+
+/// Warn when the server-level inactivity timeout is set for an orchestration agent.
+///
+/// The server-layer deadline re-arms on tool and progress events but cannot
+/// suspend during tool execution — only stream items carry the suspend signal.
+/// A long MCP tool call will trip the server deadline even when the TOML
+/// deadline is correctly suspended.
+fn server_inactivity_vs_orchestration_warning(server_inactivity: u64) -> Option<String> {
+    if server_inactivity > 0 {
+        return Some(format!(
+            "STREAM_INACTIVITY_TIMEOUT_SECS ({server_inactivity}s) is set for an orchestrated agent; \
+             the server-level inactivity deadline does not suspend during MCP tool calls — a long \
+             tool call can trip it. Use [orchestration.timeouts].stream_inactivity_timeout_secs instead, \
+             which suspends correctly. Set STREAM_INACTIVITY_TIMEOUT_SECS=0 for orchestration deployments."
         ));
     }
     None
@@ -396,7 +417,7 @@ async fn run() -> std::io::Result<()> {
         debug_provider_errors: args.debug_provider_errors,
         streaming_timeout_secs: args.streaming_timeout_secs,
         first_chunk_timeout_secs: args.first_chunk_timeout_secs,
-        inactivity_timeout_secs: args.inactivity_timeout_secs,
+        stream_inactivity_timeout_secs: args.stream_inactivity_timeout_secs,
         shutdown_token: shutdown_token.clone(),
         stream_shutdown_token: stream_shutdown_token.clone(),
         active_requests: active_requests.clone(),
@@ -548,5 +569,12 @@ mod timeout_warning_tests {
         assert!(hitl_route_vs_server_window_warning(600, 300).is_some());
         assert!(hitl_route_vs_server_window_warning(299, 300).is_none());
         assert!(hitl_route_vs_server_window_warning(600, 0).is_none());
+    }
+
+    #[test]
+    fn server_inactivity_vs_orchestration_boundaries() {
+        assert!(server_inactivity_vs_orchestration_warning(30).is_some());
+        assert!(server_inactivity_vs_orchestration_warning(1).is_some());
+        assert!(server_inactivity_vs_orchestration_warning(0).is_none());
     }
 }

@@ -400,7 +400,7 @@ impl Config {
 
         if let Some(orch) = self.orchestration.as_ref().filter(|o| o.enabled) {
             let per_call = orch.timeouts.per_call_timeout_secs;
-            let inactivity = orch.timeouts.inactivity_timeout_secs;
+            let inactivity = orch.timeouts.stream_inactivity_timeout_secs;
             let agent = &self.agent.name;
             if let Some(msg) = no_inner_bound_warning(per_call, inactivity) {
                 tracing::warn!("agent '{agent}': {msg}");
@@ -484,11 +484,11 @@ impl Config {
 /// server-level streaming timeout to bound a hung provider.
 fn no_inner_bound_warning(
     per_call_timeout_secs: u64,
-    inactivity_timeout_secs: u64,
+    stream_inactivity_timeout_secs: u64,
 ) -> Option<String> {
-    if per_call_timeout_secs == 0 && inactivity_timeout_secs == 0 {
+    if per_call_timeout_secs == 0 && stream_inactivity_timeout_secs == 0 {
         Some(
-            "orchestration has per_call_timeout_secs = 0 and inactivity_timeout_secs = 0; a hung provider is only bounded by the server-level streaming timeout".to_string(),
+            "orchestration has per_call_timeout_secs = 0 and stream_inactivity_timeout_secs = 0; a hung provider is only bounded by the server-level streaming timeout".to_string(),
         )
     } else {
         None
@@ -498,11 +498,11 @@ fn no_inner_bound_warning(
 /// Warn when the inactivity window cannot fire before the per-call budget.
 fn inactivity_vs_per_call_warning(
     per_call_timeout_secs: u64,
-    inactivity_timeout_secs: u64,
+    stream_inactivity_timeout_secs: u64,
 ) -> Option<String> {
-    if per_call_timeout_secs > 0 && inactivity_timeout_secs >= per_call_timeout_secs {
+    if per_call_timeout_secs > 0 && stream_inactivity_timeout_secs >= per_call_timeout_secs {
         Some(format!(
-            "inactivity_timeout_secs ({inactivity_timeout_secs}s) is greater than or equal to per_call_timeout_secs ({per_call_timeout_secs}s); the per-call budget always fires first and the inactivity window is dead config"
+            "stream_inactivity_timeout_secs is {stream_inactivity_timeout_secs}s but per_call_timeout_secs is {per_call_timeout_secs}s; the per-call budget always expires first, so the inactivity window never takes effect — set the inactivity window below the per-call budget"
         ))
     } else {
         None
@@ -1053,6 +1053,7 @@ mod tests {
         assert!(no_inner_bound_warning(0, 0).is_some());
         assert!(no_inner_bound_warning(60, 0).is_none());
         assert!(no_inner_bound_warning(0, 60).is_none());
+        assert!(no_inner_bound_warning(60, 60).is_none());
     }
 
     #[test]
@@ -1061,6 +1062,7 @@ mod tests {
         assert!(inactivity_vs_per_call_warning(60, 120).is_some());
         assert!(inactivity_vs_per_call_warning(60, 30).is_none());
         assert!(inactivity_vs_per_call_warning(0, 120).is_none());
+        assert!(inactivity_vs_per_call_warning(0, 0).is_none());
     }
 
     #[test]

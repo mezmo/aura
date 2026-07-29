@@ -427,8 +427,10 @@ pub fn build_completion_config(
     } else {
         None
     };
-    let inactivity_timeout = if data.inactivity_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(data.inactivity_timeout_secs))
+    let inactivity_timeout = if data.stream_inactivity_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(
+            data.stream_inactivity_timeout_secs,
+        ))
     } else {
         None
     };
@@ -1680,7 +1682,7 @@ mod tests {
             debug_provider_errors: false,
             streaming_timeout_secs: 0,
             first_chunk_timeout_secs: 0,
-            inactivity_timeout_secs: 0,
+            stream_inactivity_timeout_secs: 0,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
@@ -1754,7 +1756,7 @@ model = "gpt-4o"
             aura_emit_reasoning: false,
             streaming_timeout_secs: 0,
             first_chunk_timeout_secs: 0,
-            inactivity_timeout_secs: 0,
+            stream_inactivity_timeout_secs: 0,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
             active_requests: Arc::new(crate::types::ActiveRequestTracker::new()),
@@ -2090,7 +2092,7 @@ url = "http://127.0.0.1:9"
                 debug_provider_errors: false,
                 streaming_timeout_secs: 0,
                 first_chunk_timeout_secs: 0,
-                inactivity_timeout_secs: 0,
+                stream_inactivity_timeout_secs: 0,
                 shutdown_token: tokio_util::sync::CancellationToken::new(),
                 stream_shutdown_token: tokio_util::sync::CancellationToken::new(),
                 active_requests: Arc::new(ActiveRequestTracker::default()),

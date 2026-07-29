@@ -127,7 +127,7 @@ impl InactivityDeadline {
     /// Error for a fired deadline, logged and carrying [`STALL_MESSAGE`].
     pub fn stall_error(&self, phase: &str) -> Box<dyn std::error::Error + Send + Sync> {
         let secs = self.window.as_secs();
-        tracing::warn!("{phase}: {STALL_MESSAGE} {secs}s (inactivity_timeout_secs={secs})");
+        tracing::warn!("{phase}: {STALL_MESSAGE} {secs}s (stream_inactivity_timeout_secs={secs})");
         format!("{phase}: {STALL_MESSAGE} {secs}s").into()
     }
 }

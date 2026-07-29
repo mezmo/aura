@@ -74,7 +74,11 @@ allow_clarification = true
 tools_in_planning = "full"
 
 [orchestration.timeouts]
+# Wall-clock budget for one coordinator phase or one worker task; 0 disables.
 per_call_timeout_secs = 180
+# Max silence between stream items before the call fails as stalled; 0 disables.
+# Must be below per_call_timeout_secs to take effect. Tool execution is exempt.
+# stream_inactivity_timeout_secs = 60
 
 # Kubernetes worker
 [orchestration.worker.k8s-discovery]

@@ -63,8 +63,11 @@ allow_direct_answers = false
 allow_clarification = false
 
 [orchestration.timeouts]
+# Wall-clock budget for one coordinator phase or one worker task; 0 disables.
 per_call_timeout_secs = 90
-inactivity_timeout_secs = 60
+# Max silence between stream items before the call fails as stalled; 0 disables.
+# Must be below per_call_timeout_secs to take effect. Tool execution is exempt.
+stream_inactivity_timeout_secs = 60
 
 [orchestration.worker.data-explorer]
 description = "Data retrieval and exploration using scratchpad tools"
