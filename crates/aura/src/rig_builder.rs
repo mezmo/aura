@@ -170,6 +170,10 @@ impl RigBuilder {
 /// already present in `headers` serve as fallback when the mapped request
 /// header is absent.
 ///
+/// Returns the number of mappings that resolved a value from the request,
+/// counting both new inserts and overrides of an existing static header —
+/// not the change in `headers` length, which an override leaves unchanged.
+///
 /// HTTP header names are case-insensitive (RFC 7230): the inbound lookup
 /// lowercases both sides, so TOML config values using any casing match
 /// actix-web's lowercased header names.
@@ -185,7 +189,8 @@ pub(crate) fn apply_request_header_mappings(
     headers: &mut HashMap<String, String>,
     headers_from_request: &HashMap<String, String>,
     req_headers: &HashMap<String, String>,
-) {
+) -> usize {
+    let mut resolved = 0;
     for (header_key, req_header_name) in headers_from_request.iter() {
         let req_header_lower = req_header_name.to_lowercase();
         if let Some(value) = req_headers
@@ -194,8 +199,10 @@ pub(crate) fn apply_request_header_mappings(
             .map(|(_, v)| v)
         {
             headers.insert(header_key.clone(), value.clone());
+            resolved += 1;
         }
     }
+    resolved
 }
 
 /// Resolve MCP server headers by applying `headers_from_request` mappings from the
@@ -235,14 +242,16 @@ fn resolve_mcp_headers(
 
         // Resolve headers_from_request mappings using the incoming request
         // headers. Static TOML headers are already in server_headers; this
-        // only overrides when the mapped request header is found.
-        let before = server_headers.len();
-        apply_request_header_mappings(server_headers, headers_from_request, req_headers);
-        if server_headers.len() > before {
+        // only overrides when the mapped request header is found. Count
+        // resolved mappings (inserts AND overrides), not the length delta —
+        // an override leaves the map size unchanged but is still a resolution.
+        let resolved =
+            apply_request_header_mappings(server_headers, headers_from_request, req_headers);
+        if resolved > 0 {
             tracing::info!(
                 "Server '{}': resolved {} header(s) from request",
                 server_name,
-                server_headers.len() - before
+                resolved
             );
         }
     }
@@ -395,6 +404,39 @@ mod tests {
             Some(&"Token my-token".to_string()),
             "case-insensitive lookup should resolve lowercased request header"
         );
+    }
+
+    #[test]
+    fn apply_request_header_mappings_counts_overrides_and_misses() {
+        // FINDING 3: the resolved count is the number of mappings that found a
+        // request value, NOT the change in map length. An override (mapped key
+        // already present as a static fallback) leaves length unchanged but
+        // still counts as a resolution; a mapping whose request header is
+        // absent resolves zero.
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "static".to_string());
+        let mut headers_from_request = HashMap::new();
+        headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-incoming-auth".to_string(), "dynamic".to_string());
+
+        let len_before = headers.len();
+        let resolved =
+            apply_request_header_mappings(&mut headers, &headers_from_request, &req_headers);
+        assert_eq!(resolved, 1, "override must count as a resolution");
+        assert_eq!(
+            headers.len(),
+            len_before,
+            "override must not change map length (the undercount bug's root cause)"
+        );
+        assert_eq!(headers.get("authorization").unwrap(), "dynamic");
+
+        // A mapping whose request header is absent resolves nothing.
+        let mut miss_mappings = HashMap::new();
+        miss_mappings.insert("x-tenant".to_string(), "x-incoming-tenant".to_string());
+        let resolved_none =
+            apply_request_header_mappings(&mut headers, &miss_mappings, &HashMap::new());
+        assert_eq!(resolved_none, 0, "absent request header must not count");
     }
 
     // ------------------------------------------------------------------

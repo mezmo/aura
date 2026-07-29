@@ -833,6 +833,76 @@ mod tests {
         );
     }
 
+    /// Minimal tracing-capture facility: a shared buffer that implements
+    /// `io::Write` by reference, so `Arc<CapturedLog>` satisfies
+    /// `tracing_subscriber`'s `MakeWriter` (`impl MakeWriter for Arc<W>` when
+    /// `&W: Write`). The workspace has no existing fmt-log-text capture helper,
+    /// so this is the minimal in-test subscriber.
+    struct CapturedLog(std::sync::Mutex<Vec<u8>>);
+
+    impl std::io::Write for &CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn webhook_headers_invalid_value_skipped_with_warning_and_no_leak() {
+        // FINDING 2: a header VALUE with forbidden control characters must be
+        // skipped, a warning must be emitted, and the value must NOT appear in
+        // the captured log (the header name may). The prior invalid-header
+        // test exercised only an invalid NAME and never checked the warning or
+        // the no-value-leak contract.
+        use std::sync::Arc;
+
+        let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // A valid header name paired with a value containing CR/LF (forbidden
+        // in field values per RFC 7230) alongside a valid entry that must
+        // survive. HashMap iteration order is nondeterministic, but the invalid
+        // entry warns exactly once regardless of order.
+        let static_headers = make_req_headers(&[("x-bad", "bad\r\nvalue"), ("x-valid", "ok")]);
+        let headers_from_request = std::collections::HashMap::new();
+
+        let header_map = tracing::subscriber::with_default(subscriber, || {
+            super::resolve_webhook_headers(&static_headers, &headers_from_request, None)
+        });
+        let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+
+        // (a) the invalid entry is skipped; the valid one remains.
+        assert_eq!(header_map.get("x-valid").unwrap(), "ok");
+        assert!(
+            header_map.get("x-bad").is_none(),
+            "invalid-value header must be skipped"
+        );
+        assert_eq!(header_map.len(), 1);
+
+        // (b) the warning is emitted and names the offending header.
+        assert!(
+            log.contains("Skipping invalid webhook header"),
+            "warning must be emitted, got log: {log}"
+        );
+        assert!(
+            log.contains("x-bad"),
+            "warning must name the skipped header, got log: {log}"
+        );
+
+        // (c) the forbidden value must not leak into the log.
+        assert!(
+            !log.contains("bad\r\nvalue"),
+            "invalid header value must not appear in the log, got: {log:?}"
+        );
+    }
+
     #[test]
     fn webhook_headers_empty_config_produces_bare_post() {
         // Empty config (no static, no from_request, no req_headers) must
@@ -854,64 +924,82 @@ mod tests {
     // Integration tests: mock webhook asserts headers arrive on the POST
     // -----------------------------------------------------------------
 
-    /// Spawn a mock webhook on a random port that captures the raw HTTP
-    /// request text and responds with `{"approved": true}`. Returns the
-    /// port and a oneshot receiver for the captured request.
-    async fn spawn_mock_webhook() -> (u16, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::sync::oneshot;
+    /// Spawn a mock webhook on a random port that captures the COMPLETE raw
+    /// HTTP request (request line, headers, and body) for each of `count`
+    /// sequential connections, responding to each with `{"approved": true}`.
+    /// Returns the port and an mpsc receiver yielding one captured request
+    /// text per connection, in connection order.
+    ///
+    /// Capturing the full request (not just the header section) lets callers
+    /// assert byte-for-byte request equivalence between two client
+    /// constructors run sequentially against the SAME server — sequential
+    /// captures avoid Host/port drift between two separately-bound servers.
+    async fn spawn_capturing_webhook(count: usize) -> (u16, tokio::sync::mpsc::Receiver<String>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::mpsc;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let (tx, rx) = oneshot::channel::<String>();
+        let (tx, rx) = mpsc::channel::<String>(count);
 
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            // Read until we have the complete header section (\r\n\r\n).
-            loop {
-                let n = socket.read(&mut chunk).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
+            for _ in 0..count {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let captured = read_full_request(&mut socket).await;
+                let body = "{\"approved\": true}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = tx.send(captured).await;
             }
-
-            // Parse Content-Length so we can consume the request body before
-            // responding — otherwise reqwest may get a connection reset while
-            // still sending the POST body.
-            let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-            let header_section = String::from_utf8_lossy(&buf[..header_end]).to_string();
-            let content_length: usize = header_section
-                .lines()
-                .find(|line| line.to_lowercase().starts_with("content-length:"))
-                .and_then(|line| line.split(':').nth(1))
-                .and_then(|val| val.trim().parse().ok())
-                .unwrap_or(0);
-            let body_already_read = buf.len() - header_end;
-            let remaining = content_length.saturating_sub(body_already_read);
-            if remaining > 0 {
-                let mut body_buf = vec![0u8; remaining];
-                socket.read_exact(&mut body_buf).await.unwrap();
-            }
-
-            // Respond with a valid approval. Content-Length is computed from
-            // the actual body so there is no mismatch.
-            let body = "{\"approved\": true}";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            let _ = tx.send(header_section);
         });
 
         (port, rx)
+    }
+
+    /// Read one complete HTTP request (request line + headers + the
+    /// Content-Length-declared body) from `socket` and return it as a
+    /// lossy-UTF-8 string. Reading the body before responding prevents reqwest
+    /// from seeing a connection reset while it is still sending the POST body.
+    async fn read_full_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // Read until we have the complete header section (\r\n\r\n).
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        // Parse Content-Length so we can consume the request body before
+        // responding — otherwise reqwest may get a connection reset while
+        // still sending the POST body.
+        let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let header_section = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length: usize = header_section
+            .lines()
+            .find(|line| line.to_lowercase().starts_with("content-length:"))
+            .and_then(|line| line.split(':').nth(1))
+            .and_then(|val| val.trim().parse().ok())
+            .unwrap_or(0);
+        let body_already_read = buf.len() - header_end;
+        let remaining = content_length.saturating_sub(body_already_read);
+        if remaining > 0 {
+            let mut body_buf = vec![0u8; remaining];
+            socket.read_exact(&mut body_buf).await.unwrap();
+        }
+
+        String::from_utf8_lossy(&buf).to_string()
     }
 
     fn make_approval_request() -> ApprovalRequest {
@@ -932,7 +1020,7 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_forwards_configured_headers_to_mock_server() {
-        let (port, rx) = spawn_mock_webhook().await;
+        let (port, mut rx) = spawn_capturing_webhook(1).await;
 
         // Build a webhook client with a static header.
         let mut header_map = reqwest::header::HeaderMap::new();
@@ -954,7 +1042,7 @@ mod tests {
         let result = route.decide(make_approval_request(), &cancel).await;
         assert!(result.is_ok(), "mock webhook should return a decision");
 
-        let captured = rx.await.unwrap();
+        let captured = rx.recv().await.expect("mock webhook capture");
         assert!(
             captured.contains("x-tenant: sre-prod"),
             "configured header must appear in the webhook POST, got: {captured}"
@@ -963,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_empty_config_sends_no_custom_headers() {
-        let (port, rx) = spawn_mock_webhook().await;
+        let (port, mut rx) = spawn_capturing_webhook(1).await;
 
         // Empty HeaderMap — same as the pre-header-forwarding path.
         let client = super::WebhookClient::new_with_headers(
@@ -980,10 +1068,61 @@ mod tests {
         let result = route.decide(make_approval_request(), &cancel).await;
         assert!(result.is_ok(), "mock webhook should return a decision");
 
-        let captured = rx.await.unwrap();
+        let captured = rx.recv().await.expect("mock webhook capture");
         assert!(
             !captured.contains("x-tenant"),
             "no custom headers should appear with empty config, got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_empty_headers_match_bare_client_byte_for_byte() {
+        // FINDING 1: empty configuration must produce a request byte-for-byte
+        // identical to the pre-header-forwarding path (`WebhookClient::new`).
+        // The prior unit test only checked an empty `HeaderMap`; the prior
+        // integration test only checked that `x-tenant` was absent — neither
+        // excluded other request differences. Here we capture the COMPLETE raw
+        // request (headers AND body) from both constructors run sequentially
+        // against the SAME mock server (so Host and port are identical) and
+        // assert the captured request texts are equal.
+        //
+        // A single request is cloned for both calls so every wire field
+        // (notably decision_id) is identical — the body must not differ
+        // between the two captures.
+        let (port, mut rx) = spawn_capturing_webhook(2).await;
+        let url = aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        let request = make_approval_request();
+
+        // Capture 1: the pre-header-forwarding constructor (no headers field).
+        let bare = super::DecisionRoute::Webhook {
+            client: super::WebhookClient::new(super::build_webhook_client(), url.clone()),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let result = bare.decide(request.clone(), &cancel).await;
+        assert!(result.is_ok(), "bare client should get a decision");
+
+        // Capture 2: the headers constructor with an empty `HeaderMap` — the
+        // documented "empty config" path. Same server, sequential, so the
+        // Host header and port do not drift between captures.
+        let with_empty = super::DecisionRoute::Webhook {
+            client: super::WebhookClient::new_with_headers(
+                super::build_webhook_client(),
+                url,
+                reqwest::header::HeaderMap::new(),
+            ),
+            timeout: std::time::Duration::from_secs(5),
+        };
+        let result = with_empty.decide(request, &cancel).await;
+        assert!(result.is_ok(), "empty-headers client should get a decision");
+
+        let captured_bare = rx.recv().await.expect("first capture");
+        let captured_empty = rx.recv().await.expect("second capture");
+
+        assert_eq!(
+            captured_bare, captured_empty,
+            "WebhookClient::new and new_with_headers(HeaderMap::new()) must produce \
+             byte-for-byte identical requests\n--- bare ---\n{captured_bare}\n--- empty ---\n{captured_empty}"
         );
     }
 }
