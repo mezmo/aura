@@ -117,15 +117,17 @@ impl std::fmt::Display for ArtifactRef {
     }
 }
 
-/// Marker appended when persistence fails to write the artifact, so the
-/// failure is visible inline instead of silently returning the full body.
+/// Marker appended when the artifact is unavailable (the write failed or
+/// persistence is disabled), so the unavailability is visible inline
+/// instead of silently returning the full body.
 const ARTIFACT_WRITE_FAILED_MARKER: &str = "[Artifact write failed; full result unavailable]";
 
 /// Spill `result` to an artifact when it exceeds the configured threshold.
 /// Returns the original text when it fits inline. On a successful spill,
 /// returns the bounded summary with an artifact-pointer footer. On write
 /// failure, returns the bounded inline summary with a failure marker
-/// instead of the full body.
+/// instead of the full body. When persistence is disabled, returns the
+/// bounded inline summary with the same failure marker.
 pub async fn maybe_spill_result(
     persistence: &ExecutionPersistence,
     spill: &ResultSpillBudget,
@@ -146,11 +148,8 @@ pub async fn maybe_spill_result(
             let summary = spill.truncate_to_summary(&result);
             match SpilledArtifact::new(&filename, result.len()) {
                 Ok(artifact) => artifact.render_with_prefix(&summary.to_string()),
-                Err(_) => {
-                    tracing::warn!(
-                        "Result artifact unavailable for task {}: persistence disabled",
-                        task_id
-                    );
+                Err(e) => {
+                    tracing::warn!("Result artifact unavailable for task {}: {e}", task_id);
                     format!("{summary}\n\n{ARTIFACT_WRITE_FAILED_MARKER}")
                 }
             }
@@ -254,6 +253,10 @@ mod tests {
         assert!(
             got.contains(ARTIFACT_WRITE_FAILED_MARKER),
             "disabled persistence must be visibly marked"
+        );
+        assert!(
+            !got.contains("[Full result ("),
+            "disabled persistence must not render an artifact-pointer footer"
         );
         let max_len = budget.summary_width().get() + ARTIFACT_WRITE_FAILED_MARKER.len() + 2;
         assert!(
