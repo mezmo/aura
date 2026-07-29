@@ -36,6 +36,11 @@ const REASONING_FIELD: &str = "_aura_reasoning";
 /// `on_complete` can rendezvous on the same entry in `raw_outputs`.
 const CALL_ID_FIELD: &str = "_persistence_call_id";
 
+/// Marker appended to a tool-call record's output when the artifact write
+/// fails, so the failure is visible inline instead of silently storing the
+/// full body.
+const ARTIFACT_WRITE_FAILED_MARKER: &str = "[Artifact write failed; full result unavailable]";
+
 /// RAII guard that decrements the in-flight counter and notifies drain waiters
 /// on drop. Guarantees the counter is decremented even on early returns or
 /// panics inside `on_complete`.
@@ -295,8 +300,9 @@ impl ToolWrapper for PersistenceWrapper {
         // Single lock acquisition for both artifact write and tool call append
         let persistence_guard = lock_persistence(&self.persistence, "tool_output_write").await;
 
-        // Write artifact file if promoted
-        let artifact_filename = if should_promote && result.is_ok() {
+        // Write artifact file if promoted. Track failures so the record
+        // stores a bounded summary instead of the full clean output.
+        let (artifact_filename, artifact_write_failed) = if should_promote && result.is_ok() {
             match persistence_guard
                 .write_tool_output_artifact(
                     task_id,
@@ -308,21 +314,34 @@ impl ToolWrapper for PersistenceWrapper {
                 )
                 .await
             {
-                Ok(filename) => Some(filename),
+                Ok(filename) => (Some(filename), false),
                 Err(e) => {
                     tracing::warn!(
                         "Failed to write tool output artifact for {}: {}",
                         ctx.tool_name,
                         e
                     );
-                    None
+                    (None, true)
                 }
             }
         } else {
-            None
+            (None, false)
         };
 
-        // Build tool call record (store clean output without footer)
+        // Build tool call record. On artifact write failure, bound the output
+        // to the promotion threshold and append a failure marker so the full
+        // clean output never lands in the record.
+        let output = if artifact_write_failed {
+            let (summary, _) =
+                crate::string_utils::safe_truncate(output_clean, self.size_threshold);
+            Some(format!("{summary}\n\n{ARTIFACT_WRITE_FAILED_MARKER}"))
+        } else {
+            output.map(|o| {
+                o.rfind("\n\n[Tool output saved to artifact: ")
+                    .map(|pos| o[..pos].to_string())
+                    .unwrap_or(o)
+            })
+        };
         let record = ToolCallRecord {
             tool: ctx.tool_name.clone(),
             arguments: ctx
@@ -330,11 +349,7 @@ impl ToolWrapper for PersistenceWrapper {
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({})),
             reasoning,
-            output: output.map(|o| {
-                o.rfind("\n\n[Tool output saved to artifact: ")
-                    .map(|pos| o[..pos].to_string())
-                    .unwrap_or(o)
-            }),
+            output,
             error,
             duration_ms,
             artifact_filename,
@@ -1322,6 +1337,67 @@ mod tests {
         assert_eq!(
             records[0].artifact_filename.as_deref(),
             Some("task-0-sre-iter-1-log-search-0-output.txt")
+        );
+    }
+
+    /// Fault injection: when the artifact write fails, the tool-call record
+    /// holds a bounded summary plus the failure marker — not the full clean
+    /// output.
+    #[tokio::test]
+    async fn test_on_complete_artifact_write_failure_stores_bounded_summary() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let persistence = Arc::new(Mutex::new(
+            ExecutionPersistence::new(temp_dir.path().join("memory"), None)
+                .await
+                .unwrap(),
+        ));
+        let wrapper = enabled_wrapper(persistence.clone(), Some("sre".to_string()), 10, 5000).await;
+
+        // Fault injection: place a file where the artifacts directory must be
+        // created, forcing `write_tool_output_artifact` to fail.
+        let artifacts_path = {
+            let p = persistence.lock().await;
+            p.run_path().join("artifacts")
+        };
+        std::fs::write(&artifacts_path, "block").unwrap();
+
+        let ctx = ToolCallContext::new("log_search").with_task_context(0, "sre".to_string(), 1);
+        let extracted = serde_json::json!({"reasoning": "test", "call_idx": 0});
+        let long_output = "x".repeat(50);
+
+        wrapper
+            .on_complete(&ctx, Some(&extracted), Ok(&long_output), 100)
+            .await;
+
+        let p = persistence.lock().await;
+        let iter_path = p.run_path().join("iteration-1");
+        let tool_calls_path = iter_path.join("task-0.attempt-1.tool-calls.json");
+        let content = tokio::fs::read_to_string(&tool_calls_path).await.unwrap();
+        let records: Vec<ToolCallRecord> = serde_json::from_str(&content).unwrap();
+        assert_eq!(records.len(), 1);
+
+        let record_output = records[0]
+            .output
+            .as_deref()
+            .expect("output must be present on write failure");
+        assert!(
+            !record_output.contains(&long_output),
+            "full unbounded output must not be stored in the record"
+        );
+        assert!(
+            record_output.contains(ARTIFACT_WRITE_FAILED_MARKER),
+            "failure must be visibly marked"
+        );
+        let max_len = 10 + ARTIFACT_WRITE_FAILED_MARKER.len() + 2;
+        assert!(
+            record_output.len() <= max_len,
+            "record output must stay bounded: got {} bytes, max {} bytes",
+            record_output.len(),
+            max_len
+        );
+        assert!(
+            records[0].artifact_filename.is_none(),
+            "artifact_filename must be None on write failure"
         );
     }
 }
