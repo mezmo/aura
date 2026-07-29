@@ -46,6 +46,21 @@ pub struct ApprovalRequest {
 pub struct ApprovalItem {
     pub tool_name: String,
     pub arguments: Value,
+    /// Model-authored reasoning for this call, captured from
+    /// `_aura_reasoning` BEFORE `PersistenceWrapper` strips it.
+    ///
+    /// ADVISORY METADATA ONLY. MUST NOT enter any digest or binding
+    /// computation, now or in P7's exactly-once FSM — see the 271 ADR
+    /// addendum and DECISIONS-2026-07-28 ruling 5 (R5). The digest binds
+    /// `tool_name + arguments` only (what runs); this field is what the
+    /// model *thought* and stays out of the binding. Structurally
+    /// excluded because it is a sibling of `arguments`, not nested in it.
+    ///
+    /// Wire: omitted entirely when the model supplied no reasoning
+    /// (never null). One field per item. v1 receivers parse new payloads
+    /// unchanged (`#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_intent: Option<String>,
 }
 
 /// Wire form of a single decision: the `{ "approved": bool, "reason": ... }`

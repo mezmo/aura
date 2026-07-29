@@ -255,6 +255,7 @@ mod tests {
             items: vec![ApprovalItem {
                 tool_name: "shell_exec".to_string(),
                 arguments: json!({ "cmd": "ls -la" }),
+                tool_call_intent: None,
             }],
         };
 
@@ -278,6 +279,8 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["tool_name"], "shell_exec");
         assert_eq!(items[0]["arguments"]["cmd"], "ls -la");
+        // tool_call_intent is omitted when absent (never null on the wire)
+        assert!(items[0].get("tool_call_intent").is_none());
     }
 
     #[test]
@@ -314,6 +317,93 @@ mod tests {
         // regression guard: no externally-tagged domain variant keys.
         assert!(value["scope"].get("Worker").is_none());
         assert!(value["origin"].get("AgentRequested").is_none());
+    }
+
+    #[test]
+    fn config_gate_item_tool_call_intent_present_on_wire() {
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: "req-cg-intent".to_string(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "kubectl_*".to_string(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "kubectl_delete".to_string(),
+                arguments: json!({ "namespace": "prod" }),
+                tool_call_intent: Some("rollout restart to pick up the new config map".to_string()),
+            }],
+        };
+
+        let value =
+            serde_json::to_value(ApprovalRequestWire::from(&request)).expect("serializable");
+        let items = value["items"].as_array().expect("items array");
+        assert_eq!(
+            items[0]["tool_call_intent"],
+            "rollout restart to pick up the new config map"
+        );
+        // arguments stays clean — _aura_reasoning never leaks into it
+        assert!(items[0]["arguments"].get("_aura_reasoning").is_none());
+    }
+
+    #[test]
+    fn agent_requested_item_tool_call_intent_omitted_when_absent() {
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: "req-ar-none".to_string(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::AgentRequested {
+                reason: "touches prod".to_string(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "request_approval".to_string(),
+                arguments: json!({
+                    "action_description": "Delete namespace",
+                    "risk_rationale": "touches prod"
+                }),
+                tool_call_intent: None,
+            }],
+        };
+
+        let value =
+            serde_json::to_value(ApprovalRequestWire::from(&request)).expect("serializable");
+        let items = value["items"].as_array().expect("items array");
+        // omitted entirely when absent (never null)
+        assert!(items[0].get("tool_call_intent").is_none());
+    }
+
+    #[test]
+    fn agent_requested_item_tool_call_intent_present_on_wire() {
+        let request = ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: "req-ar-intent".to_string(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::AgentRequested {
+                reason: "touches prod".to_string(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "request_approval".to_string(),
+                arguments: json!({
+                    "action_description": "Delete namespace",
+                    "risk_rationale": "touches prod"
+                }),
+                tool_call_intent: Some(
+                    "namespace cleanup is the fastest path to unblock".to_string(),
+                ),
+            }],
+        };
+
+        let value =
+            serde_json::to_value(ApprovalRequestWire::from(&request)).expect("serializable");
+        let items = value["items"].as_array().expect("items array");
+        assert_eq!(
+            items[0]["tool_call_intent"],
+            "namespace cleanup is the fastest path to unblock"
+        );
+        assert!(items[0]["arguments"].get("_aura_reasoning").is_none());
     }
 
     #[test]
@@ -597,6 +687,7 @@ mod tests {
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
                 arguments: serde_json::json!({}),
+                tool_call_intent: None,
             }],
         };
 
