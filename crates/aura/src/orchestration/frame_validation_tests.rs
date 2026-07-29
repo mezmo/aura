@@ -6,12 +6,11 @@
 //! data: tool traces, artifact entries, failure categories, structured
 //! output, and cross-run references.
 //!
-//! S2 consolidation (and S17 follow-up): the cases whose asserted substrings
-//! the golden-frame snapshot corpus subsumes were deleted or replaced with
-//! snapshot fixtures in `context_fixture/golden_tests.rs` (coverage mapping
-//! recorded in `context_fixture/MANIFEST.md`). Every test remaining here owns
-//! coverage the corpus deliberately excludes — degenerate inputs the fixture
-//! types forbid by construction, multi-pattern failure ordering
+//! Cases the snapshot corpus subsumes live as snapshot fixtures in
+//! `context_fixture/golden_tests.rs` (coverage mapping recorded in
+//! `context_fixture/MANIFEST.md`). Every test remaining here owns
+//! coverage the corpus deliberately excludes — degenerate inputs the
+//! fixture types forbid by construction, multi-pattern failure ordering
 //! (HashMap-ordered, so not snapshot-stable), and plan-state machinery
 //! (`fail_descendants_of`).
 
@@ -121,10 +120,10 @@ fn test_continuation_soft_failure_without_structured_output() {
 }
 
 // ========================================================================
-// Frame 2b — Decision turn recording (R3b acceptance)
+// Frame 2b — Decision turn recording
 // ========================================================================
 
-/// R3b acceptance: after a `create_plan` decision, the task description
+/// After a `create_plan` decision, the task description
 /// appears at most once across the accumulated conversation and the next
 /// continuation prompt (`docs/redesign/ARCHITECTURE.md` section 2.3).
 ///
@@ -502,7 +501,7 @@ fn prompt_excerpt(s: &str) -> &str {
 }
 
 // ========================================================================
-// Frame 3b — Worker prior-work frame (R3c acceptance)
+// Frame 3b — Worker prior-work frame
 // ========================================================================
 
 #[test]

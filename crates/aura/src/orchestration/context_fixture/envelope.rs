@@ -20,11 +20,11 @@
 //!   filesystem discovery)
 //! - `persistence::build_session_context`
 //! - `Orchestrator::build_planning_wrapper`,
-//!   `Orchestrator::continuation_wrapper_for_golden` (test accessor over the
+//!   `Orchestrator::continuation_wrapper_for_test` (test accessor over the
 //!   private `build_continuation_wrapper`),
-//!   `Orchestrator::worker_prompt_sections_for_golden` (test accessor over
+//!   `Orchestrator::worker_prompt_sections_for_test` (test accessor over
 //!   the private `build_worker_prompt_sections`),
-//!   `Orchestrator::iteration_failures_for_golden` (test accessor over the
+//!   `Orchestrator::iteration_failures_for_test` (test accessor over the
 //!   private `collect_iteration_failures` — the failure-history fold is
 //!   production code, not a test-side re-statement),
 //!   `Orchestrator::compact_decision_turn`,
@@ -37,7 +37,7 @@
 //!   `load_skill`/`read_skill_file` when skills are configured)
 //!
 //! What the builder necessarily RE-STATES (each a named false-pass drift
-//! risk in `DESIGN.md` R3/R5/R8; the comparison gates landed in
+//! risk documented in `DESIGN.md`; the comparison gates in
 //! `golden_tests.rs` close item 4 and, vector position excepted, item 1 —
 //! items 2, 3, 5, and 6 stay named residues):
 //!
@@ -88,7 +88,7 @@ use crate::orchestration::{
 /// The complete aura-level request envelope for one model call.
 ///
 /// Business rule: this triple is everything aura hands the pinned rig fork
-/// for a coordinator or worker call — S2's request-envelope-identity
+/// for a coordinator or worker call — the request-envelope-identity
 /// claim quantifies over exactly these three surfaces. Forbidden state:
 /// an identity claim over a partial surface (rendered text only, tools
 /// omitted) — the type carries all three, and the snapshot renderer
@@ -126,9 +126,9 @@ fn assert_escape_hatch_unset() {
 /// Compose the coordinator system preamble for a [`PreambleFixture`]:
 /// `build_coordinator_preamble` output plus the appends in
 /// `create_coordinator` order — skill catalog, vector-store context, then
-/// `'\n'` + session history. This append SEQUENCE is the R3 re-statement;
-/// the R3 comparison gate byte-checks it against real `create_coordinator`
-/// output (`golden_tests.rs`).
+/// `'\n'` + session history. This append SEQUENCE is the re-stated
+/// coordinator append order; the comparison gate in `golden_tests.rs`
+/// byte-checks it against real `create_coordinator` output (MANIFEST §1).
 pub(super) fn compose_coordinator_preamble(fixture: &PreambleFixture) -> String {
     assert_escape_hatch_unset();
     let mut preamble = build_coordinator_preamble(
@@ -210,7 +210,7 @@ fn outcome_traces(outcome: &TaskOutcome) -> &[ToolTraceEntry] {
 /// recorded under the same task id across iterations 1..=N, in iteration
 /// order, skipping tasks with no records. Production merges through disk
 /// persistence (`load_tool_records_for_task` scans
-/// `iteration-*/task-{id}.attempt-*.tool-calls.json`); the R5 comparison
+/// `iteration-*/task-{id}.attempt-*.tool-calls.json`); the trace-merge comparison
 /// gate in `golden_tests.rs` byte-checks this fold against that production
 /// loader over a tempdir. Fixtures pin one attempt per task per iteration:
 /// within one iteration directory the production scan order over multiple
@@ -260,7 +260,7 @@ pub(crate) async fn coordinator_envelope(
 
     let orchestrator = section_orchestrator(scenario).await;
     let (worker_section, _worker_field, worker_guidelines) =
-        orchestrator.worker_prompt_sections_for_golden();
+        orchestrator.worker_prompt_sections_for_test();
 
     let planning_wrapper = Orchestrator::build_planning_wrapper(
         scenario.query().as_str(),
@@ -278,7 +278,7 @@ pub(crate) async fn coordinator_envelope(
             let plan = executed_plan(iteration);
             // Production folds this iteration's failures into the
             // accumulated history BEFORE building the context.
-            failure_history.extend(Orchestrator::iteration_failures_for_golden(
+            failure_history.extend(Orchestrator::iteration_failures_for_test(
                 &plan,
                 iteration_number,
             ));
@@ -292,14 +292,14 @@ pub(crate) async fn coordinator_envelope(
             )
             .with_pinned_goal(scenario.query().clone());
 
-            Orchestrator::push_assistant_turn_for_golden(
+            Orchestrator::push_assistant_turn_for_test(
                 &mut messages,
                 iteration.decision().as_response(),
                 "",
             );
-            Orchestrator::push_user_turn_for_golden(
+            Orchestrator::push_user_turn_for_test(
                 &mut messages,
-                &Orchestrator::continuation_wrapper_for_golden(
+                &Orchestrator::continuation_wrapper_for_test(
                     &context,
                     scenario.budget().get(),
                     config.show_tool_reasoning_in_continuation(),
@@ -375,7 +375,7 @@ pub(crate) async fn worker_envelope(
 }
 
 /// Compose the worker system preamble for a [`WorkerPreambleFixture`],
-/// re-stating `create_worker`'s per-branch append order (R3): role branch
+/// re-stating `create_worker`'s per-branch append order (MANIFEST §5): role branch
 /// vector-store context, then scratchpad, then skills; generic branch
 /// scratchpad, then skills.
 pub(crate) fn compose_worker_preamble(fixture: &WorkerPreambleFixture) -> String {

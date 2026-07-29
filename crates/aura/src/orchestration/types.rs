@@ -759,14 +759,14 @@ impl IterationContext {
     /// The goal line renders the pinned original user query when one is set
     /// (section 1.2), falling back to `previous_plan.goal` when no goal was
     /// pinned. Completed results are inlined fully when
-    /// no artifact was created (result at or under the threshold, R2 gate
-    /// decision 2); a spilled result shows its stand-in plus the artifact
-    /// pointer instead.
+    /// no artifact was created (the result fits at or under the spill
+    /// threshold, so a claim tags it rather than replacing it); a spilled
+    /// result shows its stand-in plus the artifact pointer instead.
     ///
-    /// `_content_max_length` is no longer read: error previews own their
-    /// 2000-character bound (`ErrorPreview::MAX_CHARS`, R2 gate decision 6).
-    /// The parameter stays until the orchestrator call site is updated by a
-    /// later card.
+    /// `_content_max_length` is unread: error previews own their
+    /// 2000-character bound (`ErrorPreview::MAX_CHARS`), decoupling error
+    /// width from the result-summary config knob. The parameter is retained
+    /// for the orchestrator call site's signature.
     pub fn build_continuation_prompt(
         &self,
         max_iterations: usize,
@@ -1743,7 +1743,7 @@ mod tests {
     }
 
     // ========================================================================
-    // R3a acceptance: evidence-framed continuation rendering
+    // Evidence-framed continuation rendering
     // ========================================================================
 
     // ARCHITECTURE.md section 1.2: the goal line is the verbatim original
@@ -1820,8 +1820,7 @@ mod tests {
                 "task description must not render: {description}"
             );
         }
-        // R2 gate decision 2: a claim tags a result; it does not replace a
-        // result that fits inline.
+        // A claim tags a result that fits inline; it does not replace it.
         assert!(!prompt.contains("QEMU running with VNC"));
     }
 
@@ -1875,9 +1874,8 @@ mod tests {
         ));
     }
 
-    // R2 gate decision 4 through the full render: repeat detection groups
-    // by the marker-after-cap handle, and the full description never
-    // renders.
+    // Through the full render: repeat detection groups by the
+    // marker-after-cap handle, and the full description never renders.
     #[test]
     fn repeated_failures_group_by_truncated_handle() {
         let long_description = format!(
@@ -2463,8 +2461,8 @@ mod tests {
             gaps: vec![],
         };
         let ctx = IterationContext::new(2, plan, Some(fs), failures, HashMap::new());
-        // The legacy width argument is ignored: error previews own their
-        // bound (R2 gate decision 6).
+        // The width argument is ignored: error previews own their bound
+        // (`ErrorPreview::MAX_CHARS`).
         let prompt = ctx.build_continuation_prompt(3, false, 200);
 
         assert!(

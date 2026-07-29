@@ -70,7 +70,7 @@ pub enum DependencyRelation {
 /// ancestors fill the remaining budget nearest-first; the frame header and
 /// separators count against the budget. The default is 8000 tokens to
 /// match the accepted baseline binary. Whether the value becomes a config
-/// knob or a constant is an R3c decision; either way this type carries it.
+/// knob or a constant, this type carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenBudget(NonZeroUsize);
 

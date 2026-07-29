@@ -178,7 +178,7 @@ struct TaskExecutionResult {
 /// Named return type for `create_*` coordinator/worker methods.
 ///
 /// Replaces bare `(Agent, String)` tuples where the `String` is the preamble
-/// captured for the golden-frame comparison gate (R3).
+/// captured for the preamble append-order comparison gate.
 struct AgentWithPreamble {
     agent: Agent,
     preamble: String,
@@ -229,9 +229,10 @@ pub(crate) struct CoordinatorTools {
 
 #[cfg(test)]
 impl CoordinatorTools {
-    /// Constructor for the R8 tool-order golden-frame gate.  Public only to
-    /// tests; production keeps the struct private.
-    pub(crate) fn new_for_golden_test(
+    /// Test-only constructor for the coordinator tool bundle, used by the
+    /// tool-registration-order comparison gate. Public only to tests;
+    /// production keeps the struct private.
+    pub(crate) fn new_for_test(
         list_tools: Option<ListToolsTool>,
         inspect_tool_params: Option<InspectToolParamsTool>,
         vector_tools: Vec<crate::vector_dynamic::DynamicVectorSearchTool>,
@@ -925,8 +926,8 @@ impl Orchestrator {
         );
 
         // Capture preamble before config is consumed by builder.  Always
-        // captured so the golden-frame harness can compare the real worker
-        // append order (R3).
+        // captured so the snapshot-test harness can compare the real worker
+        // append order (MANIFEST §5).
         let preamble = worker_config
             .preamble_override
             .as_deref()
@@ -1367,11 +1368,11 @@ impl Orchestrator {
         })
     }
 
-    /// Golden-frame seam (S2): expose the private continuation wrapper to
-    /// the `context_fixture` harness without widening production
-    /// visibility. Delegates; no test-only behavior.
+    /// Test-only accessor over the private `build_continuation_wrapper`,
+    /// exposing it to the `context_fixture` snapshot harness without
+    /// widening production visibility. Delegates; no test-only behavior.
     #[cfg(test)]
-    pub(crate) fn continuation_wrapper_for_golden(
+    pub(crate) fn continuation_wrapper_for_test(
         ctx: &IterationContext,
         max_iterations: usize,
         show_tool_chain: bool,
@@ -1380,21 +1381,22 @@ impl Orchestrator {
         Self::build_continuation_wrapper(ctx, max_iterations, show_tool_chain, content_max_length)
     }
 
-    /// Golden-frame seam (S2): expose the private worker prompt sections
-    /// (worker section, worker JSON field, worker guidelines) to the
-    /// `context_fixture` harness. Delegates; no test-only behavior.
+    /// Test-only accessor over the private `build_worker_prompt_sections`,
+    /// exposing the worker section, worker JSON field, and worker
+    /// guidelines to the `context_fixture` snapshot harness. Delegates;
+    /// no test-only behavior.
     #[cfg(test)]
-    pub(crate) fn worker_prompt_sections_for_golden(&self) -> (String, String, String) {
+    pub(crate) fn worker_prompt_sections_for_test(&self) -> (String, String, String) {
         self.build_worker_prompt_sections()
     }
 
-    /// Golden-frame seam (S2): expose the preamble the real
-    /// `create_coordinator` assembles, for the REQUIRED R3 comparison gate
-    /// (`context_fixture/DESIGN.md`) that byte-checks the harness's
+    /// Test-only accessor exposing the preamble the real
+    /// `create_coordinator` assembles, for the coordinator append-order
+    /// comparison gate (`MANIFEST.md` §1) that byte-checks the harness's
     /// re-stated append order against production output. Delegates; no
     /// test-only behavior.
     #[cfg(test)]
-    pub(crate) async fn coordinator_preamble_for_golden(
+    pub(crate) async fn coordinator_preamble_for_test(
         &self,
         allow_recon_tools: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1404,11 +1406,11 @@ impl Orchestrator {
         Ok(preamble)
     }
 
-    /// Golden-frame seam (S3): expose the preamble the real `create_worker`
-    /// assembles, for the R3 worker-side comparison gate.  Delegates; no
-    /// test-only behavior.
+    /// Test-only accessor exposing the preamble the real `create_worker`
+    /// assembles, for the worker append-order comparison gate
+    /// (`MANIFEST.md` §5). Delegates; no test-only behavior.
     #[cfg(test)]
-    pub(crate) async fn worker_preamble_for_golden(
+    pub(crate) async fn worker_preamble_for_test(
         &self,
         task_id: usize,
         attempt: usize,
@@ -1419,11 +1421,12 @@ impl Orchestrator {
         Ok(preamble)
     }
 
-    /// Golden-frame seam (S3): return the coordinator tool registration
-    /// order as tool-name strings, for the R8 comparison gate.  The order
-    /// mirrors `build_agent_with_tools` exactly.
+    /// Test-only accessor returning the coordinator tool registration
+    /// order as tool-name strings, for the tool-registration-order
+    /// comparison gate (`MANIFEST.md` §6b). The order mirrors
+    /// `build_agent_with_tools` exactly.
     #[cfg(test)]
-    pub(crate) fn coordinator_tool_order_for_golden(tools: &CoordinatorTools) -> Vec<&'static str> {
+    pub(crate) fn coordinator_tool_order_for_test(tools: &CoordinatorTools) -> Vec<&'static str> {
         let mut names = Vec::new();
         if tools.list_tools.is_some() {
             names.push("list_tools");
@@ -1450,12 +1453,13 @@ impl Orchestrator {
         names
     }
 
-    /// Golden-frame seam (S2): expose the private per-iteration failure
-    /// fold to the `context_fixture` harness, so the continuation prompt's
-    /// failure history is built by production code instead of a test-side
-    /// re-statement. Delegates; no test-only behavior.
+    /// Test-only accessor over the private `collect_iteration_failures`,
+    /// exposing the per-iteration failure fold to the `context_fixture`
+    /// snapshot harness so the continuation prompt's failure history is
+    /// built by production code instead of a test-side re-statement.
+    /// Delegates; no test-only behavior.
     #[cfg(test)]
-    pub(crate) fn iteration_failures_for_golden(
+    pub(crate) fn iteration_failures_for_test(
         plan: &Plan,
         iteration: usize,
     ) -> Vec<super::types::FailedTaskRecord> {
@@ -1493,16 +1497,16 @@ impl Orchestrator {
     }
 
     /// Push the user planning prompt into the conversation.  Extracted so
-    /// both production `plan_with_routing` and the golden-frame harness share
-    /// the same growth rule (R8).
+    /// both production `plan_with_routing` and the snapshot-test harness
+    /// share the same conversation-growth rule (`MANIFEST.md` §4).
     fn push_user_turn(conversation: &mut Vec<rig::completion::Message>, prompt: &str) {
         conversation.push(rig::completion::Message::user(prompt));
     }
 
     /// Push the compact assistant decision turn into the conversation and
     /// return the compact text so callers can reuse it.  Extracted so both
-    /// production `plan_with_routing` and the golden-frame harness share the
-    /// same growth rule (R8).
+    /// production `plan_with_routing` and the snapshot-test harness share
+    /// the same conversation-growth rule (`MANIFEST.md` §4).
     fn push_assistant_turn(
         conversation: &mut Vec<rig::completion::Message>,
         planning_response: &PlanningResponse,
@@ -1513,22 +1517,24 @@ impl Orchestrator {
         response_text
     }
 
-    /// Golden-frame seam (S3): expose the private user-turn push to the
-    /// `context_fixture` harness for the R8 conversation-growth comparison
-    /// gate.  Delegates; no test-only behavior.
+    /// Test-only accessor over the private `push_user_turn`, exposing it
+    /// to the `context_fixture` snapshot harness for the
+    /// conversation-growth comparison gate (`MANIFEST.md` §4). Delegates;
+    /// no test-only behavior.
     #[cfg(test)]
-    pub(crate) fn push_user_turn_for_golden(
+    pub(crate) fn push_user_turn_for_test(
         conversation: &mut Vec<rig::completion::Message>,
         prompt: &str,
     ) {
         Self::push_user_turn(conversation, prompt);
     }
 
-    /// Golden-frame seam (S3): expose the private assistant-turn push to the
-    /// `context_fixture` harness for the R8 conversation-growth comparison
-    /// gate.  Delegates; no test-only behavior.
+    /// Test-only accessor over the private `push_assistant_turn`, exposing
+    /// it to the `context_fixture` snapshot harness for the
+    /// conversation-growth comparison gate (`MANIFEST.md` §4). Delegates;
+    /// no test-only behavior.
     #[cfg(test)]
-    pub(crate) fn push_assistant_turn_for_golden(
+    pub(crate) fn push_assistant_turn_for_test(
         conversation: &mut Vec<rig::completion::Message>,
         planning_response: &PlanningResponse,
         model_text: &str,

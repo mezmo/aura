@@ -157,7 +157,7 @@ impl EvidenceEntry {
     /// summary preferred, bounded preview otherwise); anything else becomes
     /// [`EvidenceEntry::InlineResult`]. The classification is exclusive: the
     /// same text can never parse as both, because [`EvidenceText::new`]
-    /// rejects exactly what the footer parser accepts (R2 gate decision 5).
+    /// rejects exactly what the footer parser accepts.
     ///
     /// A footered result whose prefix is whitespace-only becomes
     /// [`EvidenceEntry::ArtifactPointerOnly`] so the pointer is not lost.
@@ -243,11 +243,11 @@ impl ErrorPreview {
     /// Hard cap on preview length, in characters. Matches the default
     /// `result_summary_length` width that today's renderer reuses for error
     /// truncation; owning the bound here decouples error width from that
-    /// config knob (R2 gate decision Q6).
+    /// config knob.
     pub const MAX_CHARS: usize = 2000;
 
     /// Marker appended by `Display` when truncation cut the error text, so
-    /// every cut is visible at the render site (R2 gate decision 5).
+    /// every cut is visible at the render site.
     pub const TRUNCATION_MARKER: &'static str = " [truncated]";
 
     /// Truncate raw error text to at most [`Self::MAX_CHARS`] characters,
@@ -419,8 +419,8 @@ mod tests {
         }
     }
 
-    // R2 gate decision 5: a value renders by exactly one degrade path,
-    // truncation happens at most once, and every cut is marked.
+    // A value renders by exactly one degrade path, truncation happens at
+    // most once, and every cut is marked.
     #[test]
     fn degrade_paths_are_mutually_exclusive() {
         let body = "b".repeat(100);
@@ -482,8 +482,8 @@ mod tests {
         assert_eq!(short.to_string(), "Connection refused");
     }
 
-    // R2 gate decision 2: at direct distance the full result renders when
-    // it fits; a claim tags it, it does not replace it.
+    // At direct distance the full result renders when it fits; a claim
+    // tags it, it does not replace it.
     #[test]
     fn full_result_stays_inline_when_it_fits_despite_claim() {
         let entry =

@@ -1,4 +1,4 @@
-//! S2 golden-frame harness: typed context fixtures, the request-envelope
+//! Snapshot-test harness: typed context fixtures, the request-envelope
 //! seam, and snapshot normalization.
 //!
 //! Test-only (`#[cfg(test)]` at the declaration site in
@@ -18,9 +18,9 @@
 //!
 //! The coverage ledger is `context_fixture/MANIFEST.md`; the type design
 //! record is `context_fixture/DESIGN.md`. The snapshot corpus and the
-//! REQUIRED R3/R5 comparison gates live in [`golden_tests`]; the
-//! `frame_validation_tests.rs` cases the corpus subsumes were deleted in
-//! the S2 implementation step.
+//! preamble append-order and trace-merge comparison gates live in
+//! [`golden_tests`]; `frame_validation_tests.rs` retains the cases the
+//! corpus deliberately excludes.
 
 mod envelope;
 mod golden_tests;

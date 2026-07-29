@@ -1,5 +1,5 @@
 #!/bin/bash
-# S2 slot-coverage proof: every envelope-surface %%SLOT%% is exercised by at
+# Slot-coverage proof: every envelope-surface %%SLOT%% is exercised by at
 # least one fixture-rendered snapshot, and no snapshot carries an unreplaced
 # placeholder token.
 set -u

@@ -8,7 +8,7 @@ use crate::orchestration::types::FailureCategory;
 
 /// Stable identity for a failed task: the first line of its description,
 /// cut at 120 characters, with a trailing `...` marker appended after the
-/// cut (R2 gate decision Q4: the marker sits outside the cap, so a cut
+/// cut (the marker sits outside the cap, so a cut
 /// handle is `MAX_CHARS` plus the marker, identically in display and in
 /// the grouping key).
 ///
@@ -114,9 +114,9 @@ mod tests {
     use super::*;
     use crate::orchestration::bounding::FailureHandleWidth;
 
-    // R2 gate decision 4: the `...` marker is appended after the
-    // 120-character cut, so a cut handle is MAX_CHARS plus the marker,
-    // identically in display and in the grouping key.
+    // The `...` marker is appended after the 120-character cut, so a cut
+    // handle is MAX_CHARS plus the marker, identically in display and in
+    // the grouping key.
     #[test]
     fn cut_handle_appends_marker_after_cap() {
         let description = "d".repeat(200);

@@ -6,8 +6,8 @@
 //! models the semantics that production already accepts today, it does not
 //! tighten them.
 //!
-//! This is the S3 bounding module: function bodies are implemented.  The
-//! call-site wiring to production code happens in the implementation phase.
+//! Function bodies are implemented; some public API is retained without a
+//! production call site, marked at its definition.
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -135,7 +135,7 @@ impl BoundingConfig {
 struct ByteWidth(NonZeroUsize);
 
 impl ByteWidth {
-    // Unused S3 API surface.
+    // Unused API surface (not wired to a production call site).
     #[allow(dead_code)]
     fn new(bytes: usize) -> Option<Self> {
         NonZeroUsize::new(bytes).map(Self)
@@ -154,7 +154,7 @@ impl ByteWidth {
 struct CharWidth(NonZeroUsize);
 
 impl CharWidth {
-    // Unused S3 API surface.
+    // Unused API surface (not wired to a production call site).
     #[allow(dead_code)]
     fn new(chars: usize) -> Option<Self> {
         NonZeroUsize::new(chars).map(Self)
@@ -287,7 +287,7 @@ impl TruncatedSummary {
         self.was_truncated
     }
 
-    // Unused S3 API surface.
+    // Unused API surface (not wired to a production call site).
     #[allow(dead_code)]
     pub fn into_string(self) -> String {
         self.text
@@ -338,7 +338,7 @@ impl ResultSpillBudget {
         self.summary_width
     }
 
-    // Unused S3 API surface.
+    // Unused API surface (not wired to a production call site).
     #[allow(dead_code)]
     pub fn decide(&self, text: &str) -> ResultSpillDecision {
         if self.threshold.allows_inline(text) {
@@ -361,7 +361,7 @@ impl ResultSpillBudget {
 }
 
 /// Decision produced by [`ResultSpillBudget::decide`].
-// Unused S3 API surface.
+// Unused API surface (not wired to a production call site).
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultSpillDecision {
@@ -660,7 +660,7 @@ impl FailureHandleWidth {
         }
     }
 
-    // Unused S3 API surface.
+    // Unused API surface (not wired to a production call site).
     #[allow(dead_code)]
     fn truncate(&self, text: &str) -> String {
         truncate_chars(text, self.0.get(), TruncateMarker::None)
@@ -1072,12 +1072,12 @@ impl PlanContentWidths {
 /// `ContextBudget.context_window` is private and `usable_budget() == 0` cannot
 /// distinguish a zero context window from a small window rounded to zero after
 /// the safety margin, so the wrapper is infallible.
-// Unused S3 API surface.
+// Unused API surface (not wired to a production call site).
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ScratchpadBudget(crate::scratchpad::ContextBudget);
 
-// Unused S3 API surface.
+// Unused API surface (not wired to a production call site).
 #[allow(dead_code)]
 impl ScratchpadBudget {
     pub fn new(budget: crate::scratchpad::ContextBudget) -> Self {

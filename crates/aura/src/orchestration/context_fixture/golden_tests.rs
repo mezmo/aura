@@ -1,11 +1,11 @@
-//! The S2 golden-frame snapshot corpus and the REQUIRED R3/R5 comparison
-//! gates.
+//! The snapshot corpus and the preamble append-order and trace-merge
+//! comparison gates.
 //!
 //! One test per covered `MANIFEST.md` row (or one test covering several
 //! rows where the manifest maps them so); every test renders a complete
 //! [`RequestEnvelope`] triple through [`assert_envelope_snapshot`], so the
 //! committed `.snap` files under `snapshots/` are the byte-identity
-//! baseline for refactor cards S3-S6.
+//! baseline for the envelope claim in `MANIFEST.md`.
 //!
 //! Fixture data rules:
 //! - the shared [`SOURCE_PLAYBOOK`] carries the 14 headed blocks of
@@ -781,10 +781,11 @@ async fn coordinator_call_all_failure_categories() {
     snapshot_coordinator("coordinator_call_all_failure_categories", &scenario).await;
 }
 
-/// Iterations 1-2 behind `coordinator_call3_failures` (also the R5 gate's
-/// trace data). Iteration 2 re-uses task id 0 and repeats iteration 1's
-/// failed handle+category, so the continuation shows cross-iteration
-/// artifact re-listing and a repeated-failure pattern.
+/// Iterations 1-2 behind `coordinator_call3_failures` (also the
+/// trace-merge comparison gate's trace data). Iteration 2 re-uses task id
+/// 0 and repeats iteration 1's failed handle+category, so the continuation
+/// shows cross-iteration artifact re-listing and a repeated-failure
+/// pattern.
 fn failure_thread_iterations() -> Vec<IterationFixture> {
     let iteration_one = IterationFixture::new(
         decision(
@@ -1201,10 +1202,10 @@ async fn worker_generic_custom() {
 }
 
 // ============================================================================
-// REQUIRED comparison gates (DESIGN.md R3/R5)
+// Preamble append-order and trace-merge comparison gates (MANIFEST §1, §3, §5)
 // ============================================================================
 
-/// R3 (coordinator side): the harness-composed preamble byte-equals the
+/// Coordinator side: the harness-composed preamble byte-equals the
 /// preamble the REAL `create_coordinator` assembles over a tempdir-backed
 /// config with skills and session history enabled and vector stores
 /// disabled. The vector append position stays re-stated (live-manager
@@ -1259,7 +1260,7 @@ async fn gate_r3_coordinator_preamble_matches_create_coordinator() {
         .await
         .expect("gate orchestrator constructs");
     let real = orchestrator
-        .coordinator_preamble_for_golden(true)
+        .coordinator_preamble_for_test(true)
         .await
         .expect("create_coordinator assembles the real preamble");
 
@@ -1282,7 +1283,7 @@ async fn gate_r3_coordinator_preamble_matches_create_coordinator() {
     );
 }
 
-/// R3 (worker side): the harness-composed worker preamble byte-equals the
+/// Worker side: the harness-composed worker preamble byte-equals the
 /// preamble the REAL `create_worker` assembles for both the named-role branch
 /// (with assigned vector stores and skills) and the generic branch (no custom
 /// prompt, no vector stores, skills only).  Scratchpad is enabled in config but
@@ -1348,7 +1349,7 @@ async fn gate_r3_worker_preamble_matches_create_worker() {
         .expect("gate orchestrator constructs with mcp and persistence disabled");
 
     let real = orchestrator
-        .worker_preamble_for_golden(0, 1, Some("role-worker"))
+        .worker_preamble_for_test(0, 1, Some("role-worker"))
         .await
         .expect("create_worker assembles the real worker preamble");
 
@@ -1375,7 +1376,7 @@ async fn gate_r3_worker_preamble_matches_create_worker() {
     // Scratchpad tools cannot wire without accessible MCP tools, so the gate
     // matches production output with `NotWired`.
     let real_generic = orchestrator
-        .worker_preamble_for_golden(0, 1, None)
+        .worker_preamble_for_test(0, 1, None)
         .await
         .expect("create_worker assembles the real generic worker preamble");
 
@@ -1395,7 +1396,7 @@ async fn gate_r3_worker_preamble_matches_create_worker() {
     );
 }
 
-/// R5: the harness's in-memory trace merge equals the production
+/// Trace-merge gate: the harness's in-memory trace merge equals the production
 /// disk-persistence merge (`load_tool_records_for_task` scanned per task
 /// across iterations, mapped through `ToolTraceEntry::from`) for the same
 /// records, written through a tempdir-backed `ExecutionPersistence`.
@@ -1447,7 +1448,7 @@ async fn gate_r5_trace_merge_matches_persistence_loader() {
 
     // Production merge: `load_tool_traces_for_plan`'s per-task loop over
     // the pub `load_tool_records_for_task` disk scan (the loop itself is
-    // reproduced here — a named residue in DESIGN.md R5).
+    // reproduced here — a named residue documented in `DESIGN.md`).
     let current_plan = {
         let last = iterations.last().expect("two iterations");
         let mut plan = last.decision().plan();
@@ -1626,20 +1627,20 @@ async fn empty_frame_branches_render_byte_identically() {
 }
 
 // ============================================================================
-// REQUIRED comparison gates (DESIGN.md R8)
+// Tool-registration-order and conversation-growth comparison gates
 // ============================================================================
 
 fn disabled_persistence() -> std::sync::Arc<tokio::sync::Mutex<ExecutionPersistence>> {
     std::sync::Arc::new(tokio::sync::Mutex::new(ExecutionPersistence::disabled()))
 }
 
-/// R8 (coordinator tool registration order): the tool names returned by the
+/// Coordinator tool registration order: the tool names returned by the
 /// production seam mirror the order `build_agent_with_tools` uses when all
 /// optional tool groups are present.
 #[tokio::test]
 async fn gate_r8_coordinator_tool_order() {
     let routing = RoutingToolSet::new();
-    let tools = CoordinatorTools::new_for_golden_test(
+    let tools = CoordinatorTools::new_for_test(
         Some(ListToolsTool::new(Vec::new())),
         Some(InspectToolParamsTool::new(HashMap::new())),
         Vec::new(), // vector tools are live-manager-constructed (MANIFEST §6a)
@@ -1651,7 +1652,7 @@ async fn gate_r8_coordinator_tool_order() {
         )),
         crate::skill_tool::SkillToolset::new(&fixture_skills()),
     );
-    let order = Orchestrator::coordinator_tool_order_for_golden(&tools);
+    let order = Orchestrator::coordinator_tool_order_for_test(&tools);
     assert_eq!(
         order,
         vec![
@@ -1669,7 +1670,7 @@ async fn gate_r8_coordinator_tool_order() {
     );
 }
 
-/// R8 (worker tool registration order): `worker_tool_definitions` returns the
+/// Worker tool registration order: `worker_tool_definitions` returns the
 /// in-repo worker tools in the order `Agent::add_all_tools` registers them.
 #[tokio::test]
 async fn gate_r8_worker_tool_order() {
@@ -1699,7 +1700,7 @@ async fn gate_r8_worker_tool_order() {
     );
 }
 
-/// R8 (conversation growth): the envelope builder grows the coordinator
+/// Conversation growth: the envelope builder grows the coordinator
 /// conversation using the same production helpers that `plan_with_routing`
 /// uses.
 #[tokio::test]
@@ -1721,7 +1722,7 @@ async fn gate_r8_conversation_growth() {
 
     let orchestrator = section_orchestrator(&scenario).await;
     let (worker_section, _worker_field, worker_guidelines) =
-        orchestrator.worker_prompt_sections_for_golden();
+        orchestrator.worker_prompt_sections_for_test();
     let planning_wrapper = Orchestrator::build_planning_wrapper(
         scenario.query().as_str(),
         &worker_section,
@@ -1736,7 +1737,7 @@ async fn gate_r8_conversation_growth() {
         for (idx, iteration) in iterations.iter().enumerate() {
             let iteration_number = idx + 1;
             let plan = executed_plan(iteration);
-            failure_history.extend(Orchestrator::iteration_failures_for_golden(
+            failure_history.extend(Orchestrator::iteration_failures_for_test(
                 &plan,
                 iteration_number,
             ));
@@ -1750,14 +1751,14 @@ async fn gate_r8_conversation_growth() {
             )
             .with_pinned_goal(scenario.query().clone());
 
-            Orchestrator::push_assistant_turn_for_golden(
+            Orchestrator::push_assistant_turn_for_test(
                 &mut expected,
                 iteration.decision().as_response(),
                 "",
             );
-            Orchestrator::push_user_turn_for_golden(
+            Orchestrator::push_user_turn_for_test(
                 &mut expected,
-                &Orchestrator::continuation_wrapper_for_golden(
+                &Orchestrator::continuation_wrapper_for_test(
                     &context,
                     scenario.budget().get(),
                     config.show_tool_reasoning_in_continuation(),

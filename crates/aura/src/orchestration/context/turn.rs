@@ -167,8 +167,7 @@ impl CoordinatorTurn {
     /// For `respond_directly` and `request_clarification` the recorded turn
     /// is the text the model produced, verbatim: the final response is
     /// "what the model actually said" (`ARCHITECTURE.md` section 2.3), and
-    /// the clarification turn quotes the question symmetrically
-    /// (`TYPE_PLAN.md` gate decision 3).
+    /// the clarification turn quotes the question symmetrically.
     pub fn render(&self) -> RenderedContext {
         let text = match self {
             Self::CreatePlan { rationale, shape } => {
@@ -293,9 +292,9 @@ mod tests {
         );
     }
 
-    // TYPE_PLAN.md: the respond_directly turn is the model's actual final
-    // response text, and the request_clarification turn quotes the
-    // question, symmetric with it (gate decision 3).
+    // The respond_directly turn is the model's actual final response text,
+    // and the request_clarification turn quotes the question, symmetric
+    // with it.
     #[test]
     fn terminal_turns_record_the_model_text_verbatim() {
         let respond = CoordinatorTurn::RespondDirectly {

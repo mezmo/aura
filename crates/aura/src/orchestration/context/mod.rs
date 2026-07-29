@@ -8,19 +8,17 @@
 //! (`docs/redesign/ARCHITECTURE.md` in the program repo), and every public
 //! type here maps to one business rule in `docs/redesign/TYPE_PLAN.md`.
 //!
-//! # Implementation status
+//! # Module contents
 //!
-//! R2 landed this module as a type skeleton; card R3a implemented the
-//! continuation-rendering bodies: the parsing constructors in `goal`,
-//! `label`, `evidence`, and `failure_history`, and the render methods
-//! for completed, failed, and blocked entries and failure records.
-//! Card R3b implemented the decision-turn bodies (`turn`); card R3c
-//! implemented the worker prior-work frame (`frame`) and the
-//! `EvidenceEntry::ArtifactPointerOnly` variant for spilled results with
-//! no inline content. The
-//! format-bearing `Display` bodies ([`SpilledArtifact`], [`ArtifactRef`])
-//! reproduce today's artifact footer and inventory line formats, which the
-//! architecture pins as unchanged.
+//! The continuation-rendering bodies live in `goal`, `label`, `evidence`,
+//! and `failure_history`: parsing constructors plus render methods for
+//! completed, failed, and blocked entries and failure records. The
+//! decision-turn bodies live in `turn`; the worker prior-work frame and
+//! the `EvidenceEntry::ArtifactPointerOnly` variant for spilled results
+//! with no inline content live in `frame`. The format-bearing `Display`
+//! bodies ([`SpilledArtifact`], [`ArtifactRef`]) reproduce the artifact
+//! footer and inventory line formats, which the architecture pins as
+//! unchanged.
 //!
 //! # Design rules
 //!

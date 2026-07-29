@@ -332,11 +332,9 @@ fn canonicalize_worker_order(planning_wrapper: &str) -> String {
 /// Assert the envelope's normalized snapshot against the committed
 /// snapshot named `name` (insta, strict).
 ///
-/// This is the byte-identity assertion mode for refactor cards S3-S6: run
-/// with stale-snapshot updating disabled, an unchanged corpus proves
-/// request-envelope identity over `MANIFEST.md`; any drift fails byte-for-
-/// byte. The mode is proven by a no-op refactor in the S2 implementation
-/// step.
+/// This is the byte-identity assertion mode: run with stale-snapshot
+/// updating disabled, an unchanged corpus proves request-envelope identity
+/// over `MANIFEST.md`; any drift fails byte-for-byte.
 pub(crate) fn assert_envelope_snapshot(name: &str, envelope: &RequestEnvelope) {
     let snapshot = normalize(envelope);
     insta::assert_snapshot!(name, snapshot.as_str());

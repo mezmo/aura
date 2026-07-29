@@ -1,5 +1,5 @@
-//! Fixture scenario types: the typed-context backbone of the S2
-//! golden-frame corpus.
+//! Fixture scenario types: the typed-context backbone of the snapshot
+//! corpus.
 //!
 //! Each type here maps to exactly one business rule of the prompt-assembly
 //! path at commit `9df96382`, and names the invalid state it forbids. The
@@ -261,13 +261,13 @@ pub(crate) struct PreambleFixture {
 /// (orchestrator.rs). Forbidden state: a roster and a valid-names list
 /// built from different worker sets.
 ///
-/// Implementation-step amendment (documented in `DESIGN.md`): the fixture
-/// also carries the agent-level `[[vector_stores]]` catalog, because the
-/// Full-visibility roster reads tool DESCRIPTIONS from
-/// `agent_config.vector_stores` (`get_all_tool_descriptions`), a second
-/// production input the skeleton conflated with the coordinator preamble
-/// append. The catalog feeds `AgentRuntimeConfig::vector_stores` on the
-/// section-building orchestrator; the preamble append stays on
+/// The fixture also carries the agent-level `[[vector_stores]]` catalog
+/// (documented in `DESIGN.md`): the Full-visibility roster reads tool
+/// DESCRIPTIONS from `agent_config.vector_stores`
+/// (`get_all_tool_descriptions`), a second production input distinct from
+/// the coordinator preamble append. The catalog feeds
+/// `AgentRuntimeConfig::vector_stores` on the section-building
+/// orchestrator; the preamble append stays on
 /// [`PreambleFixture::vector_stores`].
 ///
 /// The wrapped config's `workers` map is HashMap-ordered; the snapshot
