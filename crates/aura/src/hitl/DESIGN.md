@@ -18,7 +18,7 @@ public type surface, `todo!()` bodies, zero behavior.
 | `SignedHeaders` | Egress headers are produced as a matched pair from one signing operation. | A signature header and timestamp header generated independently cannot be represented; the type binds them. |
 | `WebhookHmac` | Signing and verification are only available when a secret is configured. | The "feature off" state is `Option<WebhookHmac>`; `sign`/`verify` are unreachable when the feature is off. |
 | `VerificationError` | Verification failures are classified precisely for observability and testing. | A catch-all error variant does not exist; every failure has a named, testable case. |
-| `VerifiedBody` | Ingress body bytes are only exposed after successful authorization or when verification is disabled. | Unverified body bytes cannot be passed directly to the JSON deserializer; `serde_json::from_slice` accepts only `VerifiedBody::as_ref()`. |
+| `VerifiedBody` | Ingress body bytes are meant to be read only after authorization runs. | A `VerifiedBody` cannot be forged: it has no public constructor and `authorize_ingress` is its only producer, so possession proves authorization ran. The handler deserializes via `verified_body.as_ref()`; exclusive use of that path is handler discipline checked at code review, not a compiler guarantee (see residual risk 7). |
 
 ## 2. Visibility and seam table
 
@@ -29,7 +29,7 @@ public type surface, `todo!()` bodies, zero behavior.
 | `WebhookHmac::sign` | `pub` | Egress signing | **Untouched integration seam**: `route.rs:195-230` (`WebhookClient::request_approval`) serializes `ApprovalRequestWire` to bytes with `serde_json::to_vec`, then calls `sign` and attaches `SIGNATURE_HEADER`/`TIMESTAMP_HEADER`. |
 | `WebhookHmac::verify` | `pub(crate)` | Internal verification | Configured-path step called by `authorize_ingress`; not exposed outside the module. |
 | `WebhookHmac::tolerance` | `pub` | Config accessor | Returns the configured skew tolerance. |
-| `authorize_ingress` | `pub` | Ingress verification | **Untouched integration seam**: `handlers.rs:1032-1051` (`resolve_approval`) switches its axum extractor to `Bytes`, calls `authorize_ingress`, and `serde_json::from_slice::<ApprovalDecisionWire>(&verified_body.as_ref())` accepts only `VerifiedBody`. |
+| `authorize_ingress` | `pub` | Ingress verification | **Untouched integration seam**: `handlers.rs:1032-1051` (`resolve_approval`) switches its axum extractor to `Bytes`, calls `authorize_ingress`, then deserializes with `serde_json::from_slice::<ApprovalDecisionWire>(verified_body.as_ref())`. The designed path goes through `VerifiedBody`; nothing in the type system stops a handler from parsing the raw bytes it still holds (residual risk 7). |
 | `VerifiedBody` | `pub` | Ingress witness | `AsRef<[u8]>` exposes authorized body bytes; produced unverified when `config` is `None`. |
 | `SignatureHeader::parse` | `pub` | Header parsing | Called by `authorize_ingress`; rejects anything that is not `sha256=<64 hex chars>`. |
 | `UnixTimestamp::parse` | `pub` | Header parsing | Called by `authorize_ingress`; rejects non-numeric timestamps. |
@@ -48,6 +48,7 @@ public type surface, `todo!()` bodies, zero behavior.
 4. **Clock skew source.** `UnixTimestamp::now` uses `SystemTime::now`. Container clock drift or host time jumps can cause legitimate requests to be rejected. The 300s default is industry standard but not a guarantee.
 5. **Raw-body extraction in axum.** Changing the handler extractor to `Bytes` is a visible signature change. Any middleware that also consumes the body stream will conflict because axum bodies are single-consumption.
 6. **Secondary-secret lifecycle.** There is no API to rotate or expire a secondary secret; it stays configured until the env var is unset. A long rotation window increases exposure if the old secret is compromised.
+7. **Seam bypass by handler defect.** `authorize_ingress` borrows the body, so the ingress handler still holds the raw bytes and a defective handler could parse them without authorizing. Compensating controls: Gate A review of the seam, and the card's e2e acceptance that an unsigned request gets 401 when a secret is set.
 
 ## 4. Out-of-scope seams
 
@@ -59,6 +60,13 @@ public type surface, `todo!()` bodies, zero behavior.
 The module starts with `#![allow(dead_code)]` because every behavior body is a
 `todo!()`. The allow is removed in the fill PR when the last `todo!()` is
 replaced.
+
+The module is deliberately private (`mod signing;`) until Mike ratifies the
+surface at U(design), so `aura-web-server` cannot reach the ingress seam yet.
+Fill step 1, post-ratification: add `pub use signing::{authorize_ingress,
+VerifiedBody, WebhookHmac, SignedHeaders, VerificationError,
+SIGNATURE_HEADER, TIMESTAMP_HEADER};` to `hitl/mod.rs`. The visibility-table
+rows above describe that post-re-export surface.
 
 Baseline hole inventory (from `signing.rs`):
 
