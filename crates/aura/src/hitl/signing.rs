@@ -27,6 +27,8 @@
 
 use std::fmt;
 
+use bytes::Bytes;
+
 pub const SIGNATURE_HEADER: &str = "X-Aura-Signature-256";
 pub const TIMESTAMP_HEADER: &str = "X-Aura-Timestamp";
 pub const SIGNATURE_PREFIX: &str = "sha256=";
@@ -368,22 +370,23 @@ pub enum VerificationError {
 
 /// Body that has passed ingress authorization.
 ///
-/// Wraps the owned body it was verified over. It has no public constructor
-/// other than [`authorize_ingress`], so possessing one proves authorization
-/// ran on exactly these bytes. Consuming the body (rather than borrowing it)
-/// keeps a raw-bytes bypass out of a caller's reach without a visible
-/// `into_inner`.
-pub struct VerifiedBody<B>(B);
+/// Wraps the immutable `Bytes` it was verified over. It has no public
+/// constructor other than [`authorize_ingress`], so possessing one proves
+/// authorization ran on exactly these bytes. The witness holds `Bytes`
+/// specifically — not a generic `AsRef<[u8]>` — so that the verified bytes
+/// are frozen at authorization time and a later read cannot return a
+/// different slice than the one that was verified.
+pub struct VerifiedBody(Bytes);
 
-impl<B> VerifiedBody<B> {
-    pub fn into_inner(self) -> B {
+impl VerifiedBody {
+    pub fn into_inner(self) -> Bytes {
         self.0
     }
 }
 
-impl<B: AsRef<[u8]>> AsRef<[u8]> for VerifiedBody<B> {
+impl AsRef<[u8]> for VerifiedBody {
     fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
+        &self.0
     }
 }
 
@@ -396,17 +399,18 @@ impl<B: AsRef<[u8]>> AsRef<[u8]> for VerifiedBody<B> {
 ///   header is parsed, the timestamp is skew-checked, and the signature is
 ///   verified in constant time over `"{timestamp}.{context}.{body}"`.
 ///
-/// Consumes the body so the only way past this function with the bytes in
-/// hand is through the returned [`VerifiedBody`]. Used by both the ingress
-/// decision handler and the webhook-response leg (same primitive, different
-/// context label).
+/// Takes an immutable `Bytes` so the verified content is frozen and the only
+/// way past this function with the bytes in hand is through the returned
+/// [`VerifiedBody`]. Used by both the ingress decision handler (axum's `Bytes`
+/// extractor) and the webhook-response leg (reqwest's response `Bytes`) — same
+/// primitive, different context label.
 #[expect(unused_variables, reason = "todo!() body; filled by W3")]
-pub fn authorize_ingress<B: AsRef<[u8]>>(
+pub fn authorize_ingress(
     config: Option<&WebhookHmac>,
     context: &SigningContext,
     signature_header: Option<&str>,
     timestamp_header: Option<&str>,
-    body: B,
-) -> Result<VerifiedBody<B>, VerificationError> {
+    body: Bytes,
+) -> Result<VerifiedBody, VerificationError> {
     todo!()
 }
