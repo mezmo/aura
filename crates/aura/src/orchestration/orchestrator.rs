@@ -3440,13 +3440,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// flattens HTTP status codes into the error string, so string matching is
     /// the only classification path available without forking rig's error types.
     /// Revisit if/when we replace rig.
+    ///
+    /// Arm ordering is load-bearing. The context arm precedes the provider arms
+    /// because context-overflow bodies embed large token counts (e.g. "135000
+    /// tokens") that collide with bare status-code substrings like "500". An
+    /// own-timeout guard precedes the provider arms because "timed out after"
+    /// is this orchestrator's timeout-format signature; its "invalid status
+    /// code" exclusion keeps a rig-flattened provider error whose body mentions
+    /// a timeout (e.g. "request timed out after 30s") on the provider arm,
+    /// since rig's "Invalid status code …" prefix proves provider origin. The
+    /// generic "timed out" arm follows the provider arms as the fallback for
+    /// other timeout phrasings (e.g. reqwest "operation timed out").
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains(STALL_MESSAGE) {
             // Inactivity stall carries its own sentinel so it cannot collide
             // with provider errors that merely mention a timeout.
-            FailureCategory::AgentTimeout
-        } else if lower.contains("timed out") {
             FailureCategory::AgentTimeout
         } else if (lower.contains("context")
             && (lower.contains("limit")
@@ -3464,18 +3473,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("input is too long")
         {
             FailureCategory::ContextOverflow
-        } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
-            FailureCategory::DepthExhausted
-        } else if lower.contains("duplicate call loop") {
-            FailureCategory::LoopDetected
-        } else if lower.contains("did not call submit_result") {
-            FailureCategory::SoftFailure
+        } else if lower.contains("timed out after") && !lower.contains("invalid status code") {
+            FailureCategory::AgentTimeout
         } else if lower.contains("rate limit")
             || lower.contains("429")
             || lower.contains("too many requests")
             || lower.contains("503")
             || lower.contains("502")
             || lower.contains("service unavailable")
+            || lower.contains("overloaded")
+            || lower.contains("529")
+            || lower.contains("500")
+            || lower.contains("internal server error")
+            || lower.contains("504")
+            || lower.contains("gateway timeout")
+            || lower.contains("connection refused")
+            || lower.contains("connection reset")
+            || lower.contains("reset by peer")
+            || lower.contains("dns error")
         {
             FailureCategory::ProviderOverloaded
         } else if lower.contains("authentication")
@@ -3490,6 +3505,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("is not found for api version")
         {
             FailureCategory::ProviderNotFound
+        } else if lower.contains("timed out") {
+            FailureCategory::AgentTimeout
+        } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
+            FailureCategory::DepthExhausted
+        } else if lower.contains("duplicate call loop") {
+            FailureCategory::LoopDetected
+        } else if lower.contains("did not call submit_result") {
+            FailureCategory::SoftFailure
         } else {
             FailureCategory::AgentError
         }
@@ -5476,6 +5499,17 @@ mod tests {
     }
 
     #[test]
+    fn test_should_short_circuit_connection_failures() {
+        let failures = vec![
+            make_failure("Http client error: connection refused"),
+            make_failure("Invalid status code: 500 Internal Server Error"),
+        ];
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
+    }
+
+    #[test]
     fn test_categorize_failure_loop_detected() {
         assert_eq!(
             Orchestrator::categorize_failure_error("Worker blocked by duplicate call loop"),
@@ -5617,10 +5651,73 @@ mod tests {
     }
 
     #[test]
-    fn test_categorize_failure_precedence_timeout_before_provider() {
-        // "timed out" should match AgentTimeout even if message also contains "503"
+    fn test_categorize_failure_precedence_provider_before_timeout() {
+        // Rig-flattened 503 whose body mentions a timeout: provider origin wins.
         assert_eq!(
-            Orchestrator::categorize_failure_error("Request timed out after 503 retries"),
+            Orchestrator::categorize_failure_error(
+                "Invalid status code 503 Service Unavailable with message: request timed out after 30s"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_provider_unavailable_patterns() {
+        // Anthropic 529 (overloaded_error), rig-flattened.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Invalid status code 529 with message: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Invalid status code: 500 Internal Server Error"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Invalid status code: 504 Gateway Timeout"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Http client error: error sending request for url (https://api.anthropic.com/v1/messages): error trying to connect: tcp connect error: Connection refused (os error 61)"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Http client error: connection reset by peer"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Http client error: error trying to connect: dns error: failed to lookup address information: nodename nor servname provided"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_own_timeout_stays_agent_timeout() {
+        // Regression guard: the orchestrator's own timeout strings stay
+        // AgentTimeout even when the budget's digits collide with a status
+        // substring (500s, 503s).
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "worker timed out after 500s — the LLM provider did not respond in time"
+            ),
+            FailureCategory::AgentTimeout
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("planning timed out after 503s"),
+            FailureCategory::AgentTimeout
+        );
+        // Non-colliding budget stays AgentTimeout too.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "worker timed out after 300s — the LLM provider did not respond in time"
+            ),
             FailureCategory::AgentTimeout
         );
     }
