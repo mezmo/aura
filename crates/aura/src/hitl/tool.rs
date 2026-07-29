@@ -89,6 +89,13 @@ fn approval_outcome_to_tool_result(
     }
 }
 
+/// Normalize model reasoning into a `tool_call_intent`: empty or
+/// whitespace-only means absent (`None`), consistent with the config_gate
+/// reasoning filter (`.filter(|r| !r.trim().is_empty())`).
+fn normalize_tool_call_intent(raw: Option<&str>) -> Option<String> {
+    raw.filter(|r| !r.trim().is_empty()).map(str::to_string)
+}
+
 impl Tool for RequestApprovalTool {
     const NAME: &'static str = "request_approval";
 
@@ -129,6 +136,8 @@ impl Tool for RequestApprovalTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        // Empty/whitespace-only reasoning means absent, consistent with the config_gate path.
+        let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
             decision_id: DecisionId::generate(),
@@ -140,7 +149,7 @@ impl Tool for RequestApprovalTool {
             items: vec![ApprovalItem {
                 tool_name: Self::NAME.to_string(),
                 arguments: serde_json::to_value(&args).unwrap_or_default(),
-                tool_call_intent: args.tool_call_intent.clone(),
+                tool_call_intent,
             }],
         };
         let cancel =
@@ -265,5 +274,93 @@ mod tests {
         });
         let args: RequestApprovalArgs = serde_json::from_value(json).unwrap();
         assert!(args.tool_call_intent.is_none());
+    }
+
+    // --------------------------------------------------------------------
+    // agent_requested path: blank _aura_reasoning must not reach the wire.
+    // Explicit "" or whitespace deserializes to Some(...); normalization
+    // collapses it to None before the ApprovalItem is built.
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn request_approval_normalizes_blank_reasoning_to_absent() {
+        // Both empty and whitespace-only _aura_reasoning deserialize to
+        // Some(...) — the bug precondition. Normalization must collapse them
+        // to None before the ApprovalItem is built, so the field is omitted on
+        // the wire (never null, never empty string).
+        for raw in ["", "   "] {
+            let args: RequestApprovalArgs = serde_json::from_value(serde_json::json!({
+                "action_description": "deploy",
+                "risk_rationale": "prod change",
+                "_aura_reasoning": raw,
+            }))
+            .unwrap();
+            assert_eq!(
+                args.tool_call_intent.as_deref(),
+                Some(raw),
+                "blank _aura_reasoning {:?} must deserialize to Some(...) first",
+                raw,
+            );
+
+            let intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
+
+            // Built ApprovalItem: blank reasoning must not reach it.
+            let item = ApprovalItem {
+                tool_name: RequestApprovalTool::NAME.to_string(),
+                arguments: serde_json::Value::Null,
+                tool_call_intent: intent,
+            };
+            assert!(
+                item.tool_call_intent.is_none(),
+                "built ApprovalItem must have tool_call_intent None for blank _aura_reasoning {:?}",
+                raw,
+            );
+
+            // Wire: tool_call_intent must be omitted entirely (skip_serializing_if).
+            let wire = serde_json::to_value(&item).unwrap();
+            assert!(
+                wire.get("tool_call_intent").is_none(),
+                "tool_call_intent must be omitted on the wire for blank _aura_reasoning {:?}, got: {}",
+                raw,
+                wire,
+            );
+        }
+    }
+
+    #[test]
+    fn request_approval_preserves_non_blank_reasoning() {
+        // Non-blank intent must flow through unchanged, surrounding whitespace
+        // included — guards against over-filtering (e.g. trimming the value).
+        let args: RequestApprovalArgs = serde_json::from_value(serde_json::json!({
+            "action_description": "deploy",
+            "risk_rationale": "prod change",
+            "_aura_reasoning": "  need to unblock the migration  ",
+        }))
+        .unwrap();
+
+        let intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
+        assert_eq!(
+            intent.as_deref(),
+            Some("  need to unblock the migration  "),
+            "non-blank reasoning must pass through unchanged",
+        );
+
+        let item = ApprovalItem {
+            tool_name: RequestApprovalTool::NAME.to_string(),
+            arguments: serde_json::Value::Null,
+            tool_call_intent: intent,
+        };
+        assert_eq!(
+            item.tool_call_intent.as_deref(),
+            Some("  need to unblock the migration  "),
+            "built ApprovalItem must carry non-blank tool_call_intent",
+        );
+
+        let wire = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            wire.get("tool_call_intent").and_then(|v| v.as_str()),
+            Some("  need to unblock the migration  "),
+            "non-blank tool_call_intent must appear on the wire unchanged",
+        );
     }
 }
