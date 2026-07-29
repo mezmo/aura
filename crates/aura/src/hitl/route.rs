@@ -852,11 +852,9 @@ mod tests {
 
     #[test]
     fn webhook_headers_invalid_value_skipped_with_warning_and_no_leak() {
-        // FINDING 2: a header VALUE with forbidden control characters must be
-        // skipped, a warning must be emitted, and the value must NOT appear in
-        // the captured log (the header name may). The prior invalid-header
-        // test exercised only an invalid NAME and never checked the warning or
-        // the no-value-leak contract.
+        // A header VALUE with forbidden control characters must be skipped,
+        // a warning must be emitted, and the value must NOT appear in the
+        // captured log (the header name may).
         use std::sync::Arc;
 
         let buf = Arc::new(CapturedLog(std::sync::Mutex::new(Vec::new())));
@@ -870,7 +868,8 @@ mod tests {
         // in field values per RFC 7230) alongside a valid entry that must
         // survive. HashMap iteration order is nondeterministic, but the invalid
         // entry warns exactly once regardless of order.
-        let static_headers = make_req_headers(&[("x-bad", "bad\r\nvalue"), ("x-valid", "ok")]);
+        let static_headers =
+            make_req_headers(&[("x-bad", "unique-secret\r\ninvalid"), ("x-valid", "ok")]);
         let headers_from_request = std::collections::HashMap::new();
 
         let header_map = tracing::subscriber::with_default(subscriber, || {
@@ -896,9 +895,16 @@ mod tests {
             "warning must name the skipped header, got log: {log}"
         );
 
-        // (c) the forbidden value must not leak into the log.
+        // (c) the forbidden value must not leak into the log. The secret
+        // substring survives debug escaping, so its absence proves the value
+        // itself was not logged — not just that the exact raw byte sequence
+        // was absent.
         assert!(
-            !log.contains("bad\r\nvalue"),
+            !log.contains("unique-secret"),
+            "secret substring from the invalid header value must not appear in the log, got: {log:?}"
+        );
+        assert!(
+            !log.contains("unique-secret\r\ninvalid"),
             "invalid header value must not appear in the log, got: {log:?}"
         );
     }
@@ -997,6 +1003,7 @@ mod tests {
         if remaining > 0 {
             let mut body_buf = vec![0u8; remaining];
             socket.read_exact(&mut body_buf).await.unwrap();
+            buf.extend_from_slice(&body_buf);
         }
 
         String::from_utf8_lossy(&buf).to_string()
@@ -1077,22 +1084,26 @@ mod tests {
 
     #[tokio::test]
     async fn webhook_empty_headers_match_bare_client_byte_for_byte() {
-        // FINDING 1: empty configuration must produce a request byte-for-byte
-        // identical to the pre-header-forwarding path (`WebhookClient::new`).
-        // The prior unit test only checked an empty `HeaderMap`; the prior
-        // integration test only checked that `x-tenant` was absent — neither
-        // excluded other request differences. Here we capture the COMPLETE raw
-        // request (headers AND body) from both constructors run sequentially
-        // against the SAME mock server (so Host and port are identical) and
-        // assert the captured request texts are equal.
+        // Empty configuration must produce a request byte-for-byte identical
+        // to the pre-header-forwarding path (`WebhookClient::new`). Here we
+        // capture the COMPLETE raw request (headers AND body) from both
+        // constructors run sequentially against the SAME mock server (so Host
+        // and port are identical) and assert the captured request texts are
+        // equal.
         //
         // A single request is cloned for both calls so every wire field
         // (notably decision_id) is identical — the body must not differ
-        // between the two captures.
+        // between the two captures. Each capture is checked for the body's
+        // decision_id before comparing, so a dropped body can never pass
+        // silently.
         let (port, mut rx) = spawn_capturing_webhook(2).await;
         let url = aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap();
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
         let request = make_approval_request();
+        // The decision_id appears only in the JSON body, not in the request
+        // line or headers. Checking each capture for it before comparing
+        // guarantees the body was actually captured.
+        let decision_id = request.decision_id.to_string();
 
         // Capture 1: the pre-header-forwarding constructor (no headers field).
         let bare = super::DecisionRoute::Webhook {
@@ -1118,6 +1129,18 @@ mod tests {
 
         let captured_bare = rx.recv().await.expect("first capture");
         let captured_empty = rx.recv().await.expect("second capture");
+
+        // Each capture must contain the body's decision_id before we compare
+        // the two — otherwise a dropped body could produce two identical
+        // header-only captures and pass silently.
+        assert!(
+            captured_bare.contains(&decision_id),
+            "first capture must contain the request body's decision_id ({decision_id}), got: {captured_bare}"
+        );
+        assert!(
+            captured_empty.contains(&decision_id),
+            "second capture must contain the request body's decision_id ({decision_id}), got: {captured_empty}"
+        );
 
         assert_eq!(
             captured_bare, captured_empty,

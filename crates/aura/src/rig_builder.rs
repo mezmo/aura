@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn apply_request_header_mappings_counts_overrides_and_misses() {
-        // FINDING 3: the resolved count is the number of mappings that found a
-        // request value, NOT the change in map length. An override (mapped key
+        // The resolved count is the number of mappings that found a request
+        // value, NOT the change in map length. An override (mapped key
         // already present as a static fallback) leaves length unchanged but
         // still counts as a resolution; a mapping whose request header is
         // absent resolves zero.
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(
             headers.len(),
             len_before,
-            "override must not change map length (the undercount bug's root cause)"
+            "override must not change map length"
         );
         assert_eq!(headers.get("authorization").unwrap(), "dynamic");
 
