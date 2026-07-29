@@ -203,10 +203,12 @@ impl fmt::Display for Tolerance {
 
 /// The headers produced by signing an egress request.
 ///
-/// The signature and timestamp are a matched pair from one signing
-/// operation. The pair is consumed atomically by `into_pairs`, so a caller
-/// cannot attach a signature from one signing result with a timestamp from
-/// another.
+/// The signature and timestamp are a matched pair from one signing operation.
+/// Consuming the pair via `into_pairs` (with no field accessors) makes mixing
+/// a signature and timestamp from different results deliberate work on the
+/// returned strings rather than a zero-effort default; it is atomic-use
+/// hygiene, not an unrepresentable state. A mismatched pair is a
+/// self-inflicted 401 at the receiver, with no attacker leverage.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
     signature: SignatureHeader,
