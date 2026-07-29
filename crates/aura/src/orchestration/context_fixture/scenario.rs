@@ -253,26 +253,9 @@ pub(crate) struct PreambleFixture {
     pub(crate) session_history: Option<SessionHistoryFixture>,
 }
 
-/// The worker roster configuration driving the `AVAILABLE WORKERS` section,
-/// the valid-worker-names guideline line, and the per-worker tool sections.
-///
-/// Business rule: all three planning-prompt worker surfaces derive from one
-/// `OrchestrationConfig` via `build_worker_prompt_sections`
-/// (orchestrator.rs). Forbidden state: a roster and a valid-names list
-/// built from different worker sets.
-///
-/// The fixture also carries the agent-level `[[vector_stores]]` catalog
-/// (documented in `DESIGN.md`): the Full-visibility roster reads tool
-/// DESCRIPTIONS from `agent_config.vector_stores`
-/// (`get_all_tool_descriptions`), a second production input distinct from
-/// the coordinator preamble append. The catalog feeds
-/// `AgentRuntimeConfig::vector_stores` on the section-building
-/// orchestrator; the preamble append stays on
-/// [`PreambleFixture::vector_stores`].
-///
-/// The wrapped config's `workers` map is HashMap-ordered; the snapshot
-/// normalizer (not the fixture) canonicalizes roster ordering. See
-/// `normalize.rs`.
+/// Test fixture bundling the worker-roster inputs for scenario
+/// construction: the orchestration config and the agent-level
+/// vector-store catalog.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerRosterFixture {
     config: OrchestrationConfig,

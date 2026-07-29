@@ -175,10 +175,8 @@ struct TaskExecutionResult {
     structured_output: Option<super::types::StructuredTaskOutput>,
 }
 
-/// Named return type for `create_*` coordinator/worker methods.
-///
-/// Replaces bare `(Agent, String)` tuples where the `String` is the preamble
-/// captured for the preamble append-order comparison gate.
+/// Named return type for `create_*` coordinator/worker methods: an agent
+/// paired with its resolved preamble string.
 struct AgentWithPreamble {
     agent: Agent,
     preamble: String,

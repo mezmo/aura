@@ -63,14 +63,7 @@ pub enum DependencyRelation {
     },
 }
 
-/// Token budget capping the rendered prior-work frame.
-///
-/// Semantics fixed by the architecture (`ARCHITECTURE.md` section 3.4):
-/// direct dependencies are the floor and are always kept; transitive
-/// ancestors fill the remaining budget nearest-first; the frame header and
-/// separators count against the budget. The default is 8000 tokens to
-/// match the accepted baseline binary. Whether the value becomes a config
-/// knob or a constant, this type carries it.
+/// Token budget capping the rendered prior-work frame, in tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenBudget(NonZeroUsize);
 
