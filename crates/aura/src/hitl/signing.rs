@@ -30,12 +30,6 @@ impl PrimarySecret {
     }
 }
 
-impl AsRef<[u8]> for PrimarySecret {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
 impl fmt::Debug for PrimarySecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrimarySecret").finish_non_exhaustive()
@@ -49,12 +43,6 @@ pub struct SecondarySecret(SecretBytes);
 impl SecondarySecret {
     pub fn new(bytes: &[u8]) -> Self {
         Self(SecretBytes::new(bytes))
-    }
-}
-
-impl AsRef<[u8]> for SecondarySecret {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
     }
 }
 
@@ -114,21 +102,9 @@ impl AsRef<Signature> for SignatureHeader {
     }
 }
 
-/// A 32-byte HMAC-SHA256 signature.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A 32-byte HMAC-SHA256 signature tag.
+#[derive(Debug, Clone)]
 pub struct Signature([u8; 32]);
-
-impl Signature {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl AsRef<[u8]> for Signature {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
 
 /// Unix seconds carried on `X-Aura-Timestamp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -179,8 +155,18 @@ impl fmt::Display for Tolerance {
 /// and the timestamp is the one used in the signed payload.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
-    pub signature: SignatureHeader,
-    pub timestamp: UnixTimestamp,
+    signature: SignatureHeader,
+    timestamp: UnixTimestamp,
+}
+
+impl SignedHeaders {
+    pub fn signature(&self) -> &SignatureHeader {
+        &self.signature
+    }
+
+    pub fn timestamp(&self) -> &UnixTimestamp {
+        &self.timestamp
+    }
 }
 
 /// Loaded HMAC configuration. `None` means the feature is off.
@@ -200,11 +186,6 @@ impl WebhookHmac {
     }
 
     #[must_use]
-    pub fn primary_secret(&self) -> &PrimarySecret {
-        &self.primary
-    }
-
-    #[must_use]
     pub fn tolerance(&self) -> Tolerance {
         self.tolerance
     }
@@ -215,7 +196,7 @@ impl WebhookHmac {
     }
 
     #[expect(unused_variables, reason = "todo!() body; filled by W3")]
-    pub fn verify(
+    pub(crate) fn verify(
         &self,
         signature: &SignatureHeader,
         timestamp: UnixTimestamp,
@@ -240,6 +221,8 @@ impl fmt::Debug for WebhookHmac {
 pub enum VerificationError {
     #[error("missing signature header")]
     MissingSignatureHeader,
+    #[error("missing timestamp header")]
+    MissingTimestampHeader,
     #[error("malformed signature header")]
     MalformedSignature,
     #[error("malformed timestamp header")]
@@ -252,4 +235,39 @@ pub enum VerificationError {
     },
     #[error("signature mismatch")]
     Mismatch,
+}
+
+/// Body that has passed ingress authorization.
+///
+/// When webhook verification is configured, this is only produced after the
+/// signature and timestamp headers are present, the timestamp is within the
+/// configured skew tolerance, and the signature matches the recomputed HMAC.
+/// When verification is disabled (`config` is `None`), the body passes through
+/// unverified.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedBody<'a>(&'a [u8]);
+
+impl<'a> AsRef<[u8]> for VerifiedBody<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.0
+    }
+}
+
+/// Authorizes an ingress request.
+///
+/// - If `config` is `None`, the feature is off and the body is returned
+///   unverified.
+/// - If `config` is `Some`, missing headers produce
+///   `VerificationError::MissingSignatureHeader` or
+///   `VerificationError::MissingTimestampHeader`, then the signature header is
+///   parsed, the timestamp is checked for skew, and the signature is verified
+///   in constant time.
+#[expect(unused_variables, reason = "todo!() body; filled by W3")]
+pub fn authorize_ingress<'a>(
+    config: Option<&WebhookHmac>,
+    signature_header: Option<&str>,
+    timestamp_header: Option<&str>,
+    body: &'a [u8],
+) -> Result<VerifiedBody<'a>, VerificationError> {
+    todo!()
 }
