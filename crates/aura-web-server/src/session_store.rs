@@ -22,7 +22,7 @@ use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
     ApprovalStore, EventBus, FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus,
-    SessionStoreError,
+    InMemoryRunStore, RunStore, SessionStoreError,
 };
 use aura_config::{FileSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 
@@ -45,8 +45,40 @@ pub trait SessionStore: Send + Sync {
     /// Allows for cross-instance pub/sub (in-memory SessionStore would be single-instance only).
     fn bus(&self) -> Arc<dyn EventBus>;
 
+    /// The durable-parking capability: run FSM records, checkpoint CAS, and
+    /// session leases. Optional because only backends with an atomic
+    /// run-store primitive provide it; `None` means durable parking refuses
+    /// fail-closed (see [`run_store_for_parking`]) rather than falling back.
+    fn runs(&self) -> Option<Arc<dyn RunStore>> {
+        None
+    }
+
     /// Cheap liveness check.
     async fn ping(&self) -> Result<(), SessionStoreError>;
+}
+
+/// A park was requested on a deployment whose session-store backend hands
+/// out no [`RunStore`], so the run cannot durably park and must fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "durable parking refused: session store backend '{backend}' does not provide the run-store capability"
+)]
+pub struct MissingRunStore {
+    pub backend: SessionStoreBackend,
+}
+
+/// The single gate between a configured deployment and a park commit: hands
+/// out the backend's [`RunStore`] or refuses, naming the missing capability
+/// and the identity [`SessionStore::backend`] reports. Never a silent
+/// fallback.
+#[expect(
+    unused_variables,
+    reason = "staged for #271: durable-parking preflight"
+)]
+pub fn run_store_for_parking(
+    store: &dyn SessionStore,
+) -> Result<Arc<dyn RunStore>, MissingRunStore> {
+    todo!("staged for #271: durable-parking preflight")
 }
 
 /// Construct the configured backend. Fails fast on an unwritable file root, an
@@ -78,6 +110,7 @@ pub struct InMemorySessionStore {
     approvals: Arc<InMemoryApprovalStore>,
     tasks: Arc<InMemoryTaskStore>,
     bus: Arc<InMemoryEventBus>,
+    runs: Arc<InMemoryRunStore>,
 }
 
 impl InMemorySessionStore {
@@ -87,6 +120,7 @@ impl InMemorySessionStore {
             approvals: Arc::new(InMemoryApprovalStore::new()),
             tasks: Arc::new(InMemoryTaskStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
+            runs: Arc::new(InMemoryRunStore::new()),
         }
     }
 }
@@ -113,6 +147,10 @@ impl SessionStore for InMemorySessionStore {
 
     fn bus(&self) -> Arc<dyn EventBus> {
         self.bus.clone()
+    }
+
+    fn runs(&self) -> Option<Arc<dyn RunStore>> {
+        Some(self.runs.clone())
     }
 
     async fn ping(&self) -> Result<(), SessionStoreError> {

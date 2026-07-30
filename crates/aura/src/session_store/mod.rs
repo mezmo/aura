@@ -26,10 +26,17 @@ use bytes::Bytes;
 use futures::Stream;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::orchestration::park::{
+    AgentInstanceId, CasError, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, SessionId,
+    SessionRecord, WakeReason,
+};
 
 pub use file::FileApprovalStore;
-pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
-pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
+pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemoryRunStore};
+pub use record::{
+    DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, RUN_RECORD_VERSION,
+    RunRecordError, ScopeRecord, decode_run_record, encode_run_record,
+};
 
 /// A fault in the backing session-store/bus backend.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -67,7 +74,10 @@ pub trait ApprovalStore: Send + Sync {
     /// Look up a parked approval.
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
-    /// Record a terminal decision and remove the parked entry atomically.
+    /// Record a terminal decision and remove the parked entry, atomically —
+    /// at-most-once resolution is enforced here, in the store. The
+    /// destructive path: superseded by [`Self::resolve_durable`] wherever a
+    /// parked run must survive the decision.
     async fn resolve(
         &self,
         id: &DecisionId,
@@ -80,11 +90,121 @@ pub trait ApprovalStore: Send + Sync {
         id: &DecisionId,
     ) -> Result<Option<ApprovalDecision>, SessionStoreError>;
 
+    /// Record a terminal decision as a durable wake reason WITHOUT
+    /// destroying the parked entry (ADR 2026-07-21, decision 8): the entry
+    /// and the returned wake reason survive until a claim consumes them.
+    /// At-most-once consumption moves out of resolution and into the
+    /// dispatch FSM's digest-bound claim; resolving an already-resolved or
+    /// unknown decision is [`ResolveError::NotFound`].
+    async fn resolve_durable(
+        &self,
+        id: &DecisionId,
+        decision: ApprovalDecision,
+    ) -> Result<WakeReason, ResolveError>;
+
     /// Remove a parked entry.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
 
     /// Remove every approval parked under a request id.
     async fn cancel_request(&self, request_id: &str) -> Result<(), SessionStoreError>;
+}
+
+/// Why a [`RunStore`] operation could not complete.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RunStoreError {
+    /// No record exists for the session.
+    #[error("no session record exists for session {session}")]
+    UnknownSession { session: SessionId },
+    /// [`RunStore::create`] found an existing record; session identities are
+    /// minted once and never overwritten.
+    #[error("a session record already exists for session {session}")]
+    SessionExists { session: SessionId },
+    /// The lease is held by a live owner; two agent instances never own one
+    /// session (ADR 2026-07-21, decision 5).
+    #[error("session lease held by agent instance {holder} until {expires_at}")]
+    LeaseHeld {
+        holder: AgentInstanceId,
+        expires_at: crate::hitl::Timestamp,
+    },
+    /// A fenced mutation was rejected: stale or unissued generation, an
+    /// illegal FSM transition, or a state that does not admit the operation.
+    #[error("fenced session mutation rejected: {0:?}")]
+    Cas(CasError),
+    /// A stored run record failed to decode.
+    #[error(transparent)]
+    Record(#[from] RunRecordError),
+    /// The backing store failed; nothing can be said about the record.
+    #[error(transparent)]
+    Store(#[from] SessionStoreError),
+}
+
+/// Durable storage for the run-level park/reify protocol: the fenced
+/// [`SessionRecord`] (run FSM plus checkpoint while parked), the session
+/// lease, and the CAS operations every backend must execute inside its
+/// atomic primitive (ADR 2026-07-21, decisions 3, 5, 7).
+///
+/// The transition semantics live on [`SessionRecord::apply`] and
+/// [`SessionRecord::park`]; a backend's job is to run them atomically
+/// against its stored record and persist the result, so every backend
+/// enforces identical rules. Exposed as an optional capability on the
+/// session-store factory: a backend without it cannot durably park, and the
+/// park path refuses fail-closed rather than falling back.
+#[async_trait]
+pub trait RunStore: Send + Sync {
+    /// Persist the record for a newly minted session. The record must be in
+    /// `Created` state; an existing record is [`RunStoreError::SessionExists`].
+    async fn create(&self, record: SessionRecord) -> Result<(), RunStoreError>;
+
+    /// Load the current record snapshot.
+    async fn load(&self, session: SessionId) -> Result<Option<SessionRecord>, RunStoreError>;
+
+    /// Acquire the session lease by CAS: free or expired leases transfer to
+    /// `holder` at the next fencing generation; a live lease held by another
+    /// instance is [`RunStoreError::LeaseHeld`]. The returned [`Lease`]
+    /// carries the fencing token every later mutation must present.
+    async fn acquire_lease(
+        &self,
+        session: SessionId,
+        holder: AgentInstanceId,
+        ttl: LeaseTtl,
+    ) -> Result<Lease, RunStoreError>;
+
+    /// Extend the held lease by `ttl` from now. The presented generation
+    /// must be the record's current one; a stale token means the lease was
+    /// lost and the caller must stop mutating.
+    async fn heartbeat_lease(
+        &self,
+        session: SessionId,
+        generation: FencingGeneration,
+        ttl: LeaseTtl,
+    ) -> Result<Lease, RunStoreError>;
+
+    /// Release the held lease, leaving the record unleased at the same
+    /// generation so the next claim fences correctly.
+    async fn release_lease(
+        &self,
+        session: SessionId,
+        generation: FencingGeneration,
+    ) -> Result<(), RunStoreError>;
+
+    /// Apply one run-FSM event through [`SessionRecord::apply`], atomically.
+    async fn apply(
+        &self,
+        session: SessionId,
+        presented: FencingGeneration,
+        event: RunEvent,
+    ) -> Result<SessionRecord, RunStoreError>;
+
+    /// Commit a park through [`SessionRecord::park`], atomically: the
+    /// `Running -> Parked` transition and its checkpoint are one write, and
+    /// no reader observes a parked record without its checkpoint.
+    async fn park(
+        &self,
+        session: SessionId,
+        presented: FencingGeneration,
+        commit: ParkCommit,
+    ) -> Result<SessionRecord, RunStoreError>;
 }
 
 /// The payload stream returned by [`EventBus::subscribe`].

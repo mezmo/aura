@@ -27,16 +27,27 @@ use crate::streaming::{
 use crate::types::*;
 
 /// RAII guard for request-scoped subscriptions. Ensures cleanup even on panic.
+///
+/// Approval deletion is gated on `approval_ownership`: a park commit
+/// transfers the request's approvals to session scope before the response
+/// closes, and a park-induced stream closure must then tear down every
+/// request-scoped resource EXCEPT the approvals the park exists to preserve.
 struct RequestResourceGuard {
     request_id: String,
     pending_approvals: aura::hitl::PendingApprovals,
+    approval_ownership: aura::hitl::ApprovalOwnership,
 }
 
 impl RequestResourceGuard {
     fn new(request_id: String, pending_approvals: aura::hitl::PendingApprovals) -> Self {
+        // Registered in the process-wide ownership registry so the park
+        // commit, which only carries the request id, can reach this marker
+        // via `ApprovalOwnership::for_request`.
+        let approval_ownership = aura::hitl::ApprovalOwnership::register(&request_id);
         Self {
             request_id,
             pending_approvals,
+            approval_ownership,
         }
     }
 }
@@ -47,18 +58,27 @@ impl Drop for RequestResourceGuard {
 
         // Synchronous so parked awaits cancel even when the runtime is
         // shutting down and the spawn below never polls.
-        self.pending_approvals
-            .cancel_request_local(&self.request_id);
+        aura::hitl::ApprovalOwnership::unregister(&self.request_id);
+        if self.approval_ownership.begin_teardown() {
+            self.pending_approvals
+                .cancel_request_local(&self.request_id);
+        }
 
         // Use try_current to avoid panic during runtime shutdown
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let id = self.request_id.clone();
             let pending_approvals = self.pending_approvals.clone();
+            let ownership = self.approval_ownership.clone();
             // Instrument with the span current at drop so cleanup events
             // stay parented to the request's trace.
             let cleanup = tracing::Instrument::instrument(
                 async move {
-                    pending_approvals.cancel_request(&id).await;
+                    // Re-checked inside the spawned task: this half may poll
+                    // long after drop, and must not delete approvals a park
+                    // now owns.
+                    if ownership.begin_teardown() {
+                        pending_approvals.cancel_request(&id).await;
+                    }
                     RequestCancellation::unregister(&id);
                     approval_event_unsubscribe(&id).await;
                     request_progress_unsubscribe(&id).await;
@@ -2753,5 +2773,74 @@ url = "http://127.0.0.1:9"
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
         }
+    }
+}
+
+#[cfg(test)]
+mod park_teardown_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aura::hitl::{
+        AgentScope, ApprovalItem, ApprovalOrigin, ApprovalOwnership, ApprovalRequest, DecisionId,
+        PROTOCOL_VERSION, PendingApprovals,
+    };
+    use aura::session_store::{ApprovalStore, InMemoryApprovalStore, InMemoryEventBus};
+
+    use super::RequestResourceGuard;
+
+    fn approval_request(request_id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: request_id.to_string(),
+            scope: AgentScope::Single { session_id: None },
+            origin: ApprovalOrigin::ConfigGate {
+                matched_pattern: "test_*".to_string(),
+            },
+            items: vec![ApprovalItem {
+                tool_name: "test_tool".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+        }
+    }
+
+    /// Staged: a park commit transfers approval ownership to the session
+    /// before the response closes, so the park-induced stream closure —
+    /// including the async store cleanup that races the park — must leave
+    /// the approval in the store (ADR 2026-07-21, decision 10).
+    #[tokio::test(start_paused = true)]
+    async fn park_induced_closure_preserves_approval_through_async_cleanup() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let approvals =
+            PendingApprovals::with_backend(store.clone(), Arc::new(InMemoryEventBus::new()));
+
+        let request = approval_request("req-park");
+        let decision_id = request.decision_id;
+        let _await_handle = approvals.register(request, Duration::from_secs(300)).await;
+
+        let guard = RequestResourceGuard::new("req-park".to_string(), approvals.clone());
+
+        // The park commit takes ownership BEFORE the stream closes, reaching
+        // the marker exactly as production does: registry lookup by the
+        // request id it carries.
+        ApprovalOwnership::for_request("req-park")
+            .expect("guard registered the ownership marker")
+            .transfer_to_session()
+            .expect("transfer precedes teardown");
+
+        // Park-induced SSE closure: both teardown halves run, the async one
+        // on its own schedule after the drop.
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            store
+                .get(&decision_id)
+                .await
+                .expect("store reachable")
+                .is_some(),
+            "park-induced closure must not delete the approval the park preserves",
+        );
     }
 }

@@ -279,6 +279,9 @@ impl Plan {
                     match dep.map(|t| &t.state) {
                         Some(TaskState::Complete { .. }) => continue,
                         Some(TaskState::Failed { .. }) => return false,
+                        // A dependency waiting on an approval decision holds
+                        // its dependents back until it re-runs and completes.
+                        Some(TaskState::Blocked { .. }) => return false,
                         _ => return false,
                     }
                 }
@@ -524,6 +527,14 @@ pub enum TaskState {
         error: String,
         category: FailureCategory,
     },
+    /// The task's worker attempt hit an approval gate and the approval was
+    /// durably parked; the task waits for the decision and re-runs on reify.
+    /// Runtime-only: the durable checkpoint stores a blocked task as
+    /// `Pending` plus a `BlockedTaskBinding`, and this variant is
+    /// reconstructed from the binding (ADR 2026-07-21, decision 3).
+    Blocked {
+        decision_id: crate::hitl::DecisionId,
+    },
 }
 
 impl From<&TaskState> for TaskStatus {
@@ -533,6 +544,10 @@ impl From<&TaskState> for TaskStatus {
             TaskState::Running => TaskStatus::Running,
             TaskState::Complete { .. } => TaskStatus::Complete,
             TaskState::Failed { .. } => TaskStatus::Failed,
+            // The persistent task vocabulary has no Blocked: a blocked task
+            // is stored `Pending`, with its decision binding carried by the
+            // checkpoint, never by this projection.
+            TaskState::Blocked { .. } => TaskStatus::Pending,
         }
     }
 }
@@ -868,6 +883,9 @@ impl IterationContext {
                         t.id, t.description
                     ));
                 }
+                TaskState::Blocked { .. } => {
+                    todo!("staged for #271: decision-blocked task in the continuation prompt")
+                }
             }
         }
 
@@ -1110,6 +1128,11 @@ pub(crate) enum IterationOutcome {
         /// Wall-clock of the continuation-decision call that produced `new_plan`.
         planning_ms: u64,
     },
+    /// The iteration drained to quiescence on blocked tasks and the run
+    /// committed its park: the loop ends without a final answer, and the
+    /// parked run outlives the request that started it.
+    #[expect(dead_code, reason = "constructed by the quiescent park commit (#271)")]
+    Parked(super::park::ParkedRun),
 }
 
 #[cfg(test)]
