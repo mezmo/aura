@@ -16,6 +16,7 @@ use super::decision::{ApprovalDecision, ApprovalOutcome};
 use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
+use super::signing::{SigningContext, WebhookHmac, authorize_ingress};
 use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
 
 /// Maximum time to wait for a TCP connection to the approval webhook before
@@ -39,7 +40,9 @@ pub struct HitlRuntime {
 impl HitlRuntime {
     /// Resolve the request-stable runtime from parsed `[hitl]` config: share the
     /// compiled globs and build the decision route once (the webhook client and
-    /// its connection pool are created here).
+    /// its connection pool are created here). This is the production
+    /// constructor path, and the only place HMAC signing is resolved from the
+    /// `AURA_HITL_WEBHOOK_SECRET*` environment.
     ///
     /// `req_headers` is the inbound client request's HTTP headers, used to
     /// resolve `[hitl.route]` `headers_from_request` mappings. Pass `None`
@@ -56,14 +59,22 @@ impl HitlRuntime {
                 timeout_secs,
                 headers,
                 headers_from_request,
-            } => DecisionRoute::Webhook {
-                client: WebhookClient::new_with_headers(
-                    build_webhook_client(),
-                    url.clone(),
-                    resolve_webhook_headers(headers, headers_from_request, req_headers),
-                ),
-                timeout: Duration::from_secs(*timeout_secs),
-            },
+            } => {
+                let signing = match WebhookHmac::load_from_env() {
+                    Ok(None) => EgressSigning::Disabled,
+                    Ok(Some(hmac)) => EgressSigning::Enabled(hmac),
+                    Err(e) => EgressSigning::Misconfigured(e.to_string()),
+                };
+                DecisionRoute::Webhook {
+                    client: WebhookClient::with_headers_and_signing(
+                        build_webhook_client(),
+                        url.clone(),
+                        resolve_webhook_headers(headers, headers_from_request, req_headers),
+                        signing,
+                    ),
+                    timeout: Duration::from_secs(*timeout_secs),
+                }
+            }
             DecisionRouteConfig::Conversational { timeout_secs } => DecisionRoute::Conversational {
                 registry: pending_approvals.clone(),
                 timeout: Duration::from_secs(*timeout_secs),
@@ -89,6 +100,19 @@ pub enum ApprovalError {
     BadStatus { status: u16 },
     #[error("approval webhook response parse error: {0}")]
     Parse(String),
+    /// The HMAC configuration is unusable (bad env values, or a plaintext
+    /// `http://` webhook URL with a secret configured). Fails closed on every
+    /// request rather than sending unsigned or trusting unverified responses.
+    #[error("approval webhook signing misconfigured: {0}")]
+    Misconfigured(String),
+    /// Egress signing failed (system clock unavailable).
+    #[error("approval webhook egress signing failed: {0}")]
+    Signing(String),
+    /// The webhook's HTTP response did not carry a valid signature over its
+    /// body (Route A response leg, verified with the same primitive as
+    /// ingress). The decision inside is untrusted and discarded.
+    #[error("approval webhook response failed signature verification: {0}")]
+    ResponseUnverified(String),
 }
 
 /// Where an approval decision comes from. Fixed per deployment by config.
@@ -245,6 +269,20 @@ fn resolve_webhook_headers(
     header_map
 }
 
+/// HMAC signing state for the webhook route, resolved once at client
+/// construction so a misconfiguration is diagnosed before the first request.
+enum EgressSigning {
+    /// No secret configured: requests go out unsigned and responses are
+    /// trusted, byte-identical to the pre-W3 behavior.
+    Disabled,
+    /// Secret configured: every egress POST is signed and every response body
+    /// must verify before it is treated as a decision.
+    Enabled(WebhookHmac),
+    /// The configuration is unusable; every request fails closed with
+    /// [`ApprovalError::Misconfigured`] instead of silently downgrading.
+    Misconfigured(String),
+}
+
 /// HTTP client for the webhook route. Carried over from the spike's
 /// `HttpApprovalDispatch`.
 pub struct WebhookClient {
@@ -252,52 +290,168 @@ pub struct WebhookClient {
     url: WebhookUrl,
     /// Resolved webhook headers.
     headers: HeaderMap,
+    signing: EgressSigning,
 }
 
 impl WebhookClient {
+    /// Builds an unsigned client. Deliberately does NOT read the environment
+    /// (so constructing one in a test never races env-mutating tests):
+    /// production construction goes through [`HitlRuntime::from_config`],
+    /// which resolves HMAC signing from `AURA_HITL_WEBHOOK_SECRET*` and calls
+    /// `with_signing`.
     #[must_use]
     pub fn new(client: reqwest::Client, url: WebhookUrl) -> Self {
-        Self {
-            client,
-            url,
-            headers: HeaderMap::new(),
-        }
+        Self::with_headers_and_signing(client, url, HeaderMap::new(), EgressSigning::Disabled)
     }
 
     /// Create a webhook client with resolved operator-configured headers
     /// applied to every approval POST.
     #[must_use]
     pub fn new_with_headers(client: reqwest::Client, url: WebhookUrl, headers: HeaderMap) -> Self {
+        Self::with_headers_and_signing(client, url, headers, EgressSigning::Disabled)
+    }
+
+    fn with_headers_and_signing(
+        client: reqwest::Client,
+        url: WebhookUrl,
+        headers: HeaderMap,
+        signing: EgressSigning,
+    ) -> Self {
+        // A plaintext response channel would defeat response-leg verification,
+        // so http:// with a secret configured is itself a misconfiguration
+        // (DESIGN.md §4, Route A).
+        let signing = match signing {
+            EgressSigning::Enabled(_) if url.as_str().starts_with("http://") => {
+                EgressSigning::Misconfigured(format!(
+                    "webhook url {} uses plaintext http:// while an HMAC secret is configured; \
+                     use https://",
+                    url.as_str()
+                ))
+            }
+            other => other,
+        };
+        if let EgressSigning::Misconfigured(reason) = &signing {
+            tracing::error!(
+                reason,
+                "HITL webhook HMAC misconfigured; every approval request on this route \
+                 will fail closed"
+            );
+        }
         Self {
             client,
             url,
             headers,
+            signing,
         }
     }
 
+    /// Apply operator-configured headers to a request builder. Called before
+    /// any signature headers so a mapped header can never displace them.
+    fn apply_operator_headers(
+        &self,
+        mut builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        for (name, value) in self.headers.iter() {
+            builder = builder.header(name.clone(), value.clone());
+        }
+        builder
+    }
+
     /// POST the request and resolve a decision, failing closed on timeout or
-    /// transport/parse error.
+    /// transport/parse error. With a secret configured the POST carries the
+    /// `X-Aura-*` signature headers (context `approval-request:{decision_id}`)
+    /// and the HTTP response must verify under
+    /// `approval-decision:{decision_id}` before its body is parsed.
     async fn request_approval(
         &self,
         request: &ApprovalRequest,
         timeout: Duration,
     ) -> Result<ApprovalOutcome, ApprovalError> {
+        let hmac = match &self.signing {
+            EgressSigning::Misconfigured(reason) => {
+                return Err(ApprovalError::Misconfigured(reason.clone()));
+            }
+            EgressSigning::Disabled => None,
+            EgressSigning::Enabled(hmac) => Some(hmac),
+        };
         // Serialize the wire view, not the domain request: it keeps `scope` /
         // `origin` as the flat `aura_events` DTOs instead of leaking Rust enum
         // variant names onto the webhook contract.
         let wire = ApprovalRequestWire::from(request);
-        let mut builder = self
-            .client
-            .post(self.url.as_str())
-            .json(&wire)
-            .timeout(timeout);
+        let Some(hmac) = hmac else {
+            return self.request_approval_unsigned(&wire, timeout).await;
+        };
 
-        // Apply resolved operator-configured headers on top of the JSON body
-        // (which already set Content-Type).
-        for (name, value) in self.headers.iter() {
-            builder = builder.header(name.clone(), value.clone());
+        // Signing requires the exact bytes that go on the wire, so serialize
+        // once and send that buffer instead of `.json(&wire)`.
+        let body = serde_json::to_vec(&wire).expect("approval request wire view serializes");
+        let egress_context =
+            SigningContext::new(&format!("approval-request:{}", request.decision_id))
+                .expect("decision id renders as dot-free ASCII");
+        let headers = hmac
+            .sign(&egress_context, &body)
+            .map_err(|e| ApprovalError::Signing(e.to_string()))?;
+        let mut post = self.apply_operator_headers(
+            self.client
+                .post(self.url.as_str())
+                .header(reqwest::header::CONTENT_TYPE, "application/json"),
+        );
+        for (name, value) in headers.into_pairs() {
+            post = post.header(name, value);
         }
+        match post.body(body).timeout(timeout).send().await {
+            Err(e) if e.is_timeout() => Ok(ApprovalOutcome::TimedOut { waited: timeout }),
+            Err(e) => Err(ApprovalError::Transport(e.to_string())),
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    return Err(ApprovalError::BadStatus {
+                        status: status.as_u16(),
+                    });
+                }
+                // Route A response leg: the decision arrives as this HTTP
+                // response, so it is verified with the same primitive as
+                // ingress before any parse.
+                let signature = header_value(resp.headers(), super::signing::SIGNATURE_HEADER);
+                let timestamp = header_value(resp.headers(), super::signing::TIMESTAMP_HEADER);
+                let body = match resp.bytes().await {
+                    Ok(body) => body,
+                    // A timeout firing mid-body download is still a timeout, not
+                    // a transport fault — keep the classification honest.
+                    Err(e) if e.is_timeout() => {
+                        return Ok(ApprovalOutcome::TimedOut { waited: timeout });
+                    }
+                    Err(e) => return Err(ApprovalError::Transport(e.to_string())),
+                };
+                let response_context =
+                    SigningContext::new(&format!("approval-decision:{}", request.decision_id))
+                        .expect("decision id renders as dot-free ASCII");
+                let verified = authorize_ingress(
+                    Some(hmac),
+                    &response_context,
+                    signature.as_deref(),
+                    timestamp.as_deref(),
+                    body,
+                )
+                .map_err(|e| ApprovalError::ResponseUnverified(e.to_string()))?;
+                match serde_json::from_slice::<ApprovalDecisionWire>(verified.as_ref()) {
+                    Ok(wire) => Ok(ApprovalOutcome::Decided(ApprovalDecision::from(wire))),
+                    Err(e) => Err(ApprovalError::Parse(e.to_string())),
+                }
+            }
+        }
+    }
 
+    /// The pre-W3 unsigned round trip, preserved byte-identically for the
+    /// no-secret configuration.
+    async fn request_approval_unsigned(
+        &self,
+        wire: &ApprovalRequestWire<'_>,
+        timeout: Duration,
+    ) -> Result<ApprovalOutcome, ApprovalError> {
+        let builder = self
+            .apply_operator_headers(self.client.post(self.url.as_str()).json(wire))
+            .timeout(timeout);
         match builder.send().await {
             Err(e) if e.is_timeout() => Ok(ApprovalOutcome::TimedOut { waited: timeout }),
             Err(e) => Err(ApprovalError::Transport(e.to_string())),
@@ -318,6 +472,46 @@ impl WebhookClient {
             }
         }
     }
+}
+
+/// A configured webhook URL that would carry signed traffic in plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "webhook url {url} uses plaintext http:// while an HMAC secret is configured; use https://"
+)]
+pub struct PlaintextWebhookUrlError {
+    url: String,
+}
+
+/// Boot-time guard: with an HMAC secret configured, a plaintext `http://`
+/// webhook URL must fail startup, not the first approval request. Call this
+/// for every `[hitl]` config once the secret has been loaded; the request-time
+/// `Misconfigured` rejection inside [`WebhookClient`] stays as defense in
+/// depth for paths that skip startup validation.
+pub fn validate_webhook_signing_config(
+    config: &HitlConfig,
+    hmac: Option<&WebhookHmac>,
+) -> Result<(), PlaintextWebhookUrlError> {
+    if hmac.is_none() {
+        return Ok(());
+    }
+    match &config.route {
+        DecisionRouteConfig::Webhook { url, .. } if url.as_str().starts_with("http://") => {
+            Err(PlaintextWebhookUrlError {
+                url: url.as_str().to_string(),
+            })
+        }
+        DecisionRouteConfig::Webhook { .. } | DecisionRouteConfig::Conversational { .. } => Ok(()),
+    }
+}
+
+/// First value of `name`, treating a non-UTF-8 header value as absent
+/// (DESIGN.md residual risk 8).
+fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -750,6 +944,319 @@ mod tests {
         crate::approval_event_broker::unsubscribe(&request_id).await;
     }
 
+    mod webhook_signing {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use reqwest::header::HeaderMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::super::super::decision::{
+            AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId,
+        };
+        use super::super::super::protocol::{ApprovalRequest, PROTOCOL_VERSION};
+        use super::super::super::signing::{
+            PrimarySecret, SIGNATURE_HEADER, SigningContext, TIMESTAMP_HEADER, Tolerance,
+            WebhookHmac, authorize_ingress,
+        };
+        use super::super::{
+            ApprovalError, ApprovalOutcome, EgressSigning, WebhookClient, build_webhook_client,
+        };
+
+        fn test_hmac() -> WebhookHmac {
+            WebhookHmac::new(
+                PrimarySecret::new(b"0123456789abcdef0123456789abcdef"),
+                None,
+                Tolerance::new(300).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn test_request(decision_id: DecisionId) -> ApprovalRequest {
+            ApprovalRequest {
+                version: PROTOCOL_VERSION,
+                decision_id,
+                request_id: "req-signed".into(),
+                scope: AgentScope::Single { session_id: None },
+                origin: ApprovalOrigin::ConfigGate {
+                    matched_pattern: "dangerous_*".into(),
+                },
+                items: vec![],
+            }
+        }
+
+        struct ReceivedRequest {
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        impl ReceivedRequest {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            }
+        }
+
+        /// One-shot HTTP/1.1 receiver: accepts a single POST, hands the
+        /// captured request back over the channel, and replies 200 with the
+        /// given extra headers and body.
+        async fn one_shot_receiver(
+            response_headers: Vec<(String, String)>,
+            response_body: String,
+        ) -> (String, tokio::sync::oneshot::Receiver<ReceivedRequest>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let header_end = loop {
+                    let mut chunk = [0u8; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "peer closed before request completed");
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos;
+                    }
+                };
+                let header_text = String::from_utf8(buf[..header_end].to_vec()).unwrap();
+                let headers: Vec<(String, String)> = header_text
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .collect();
+                let content_length: usize = headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, v)| v.parse().unwrap())
+                    .unwrap_or(0);
+                let mut body = buf[header_end + 4..].to_vec();
+                while body.len() < content_length {
+                    let mut chunk = [0u8; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "peer closed mid-body");
+                    body.extend_from_slice(&chunk[..n]);
+                }
+
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n",
+                    response_body.len()
+                );
+                for (name, value) in &response_headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str("\r\n");
+                response.push_str(&response_body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.ok();
+                tx.send(ReceivedRequest { headers, body }).ok();
+            });
+            (url, rx)
+        }
+
+        /// Builds a signing-enabled client directly against a loopback
+        /// `http://` receiver. Bypasses the https-only policy deliberately:
+        /// the policy is exercised by `http_url_with_secret_fails_closed`.
+        fn loopback_signed_client(url: &str, hmac: WebhookHmac) -> WebhookClient {
+            WebhookClient {
+                client: build_webhook_client(),
+                url: aura_config::WebhookUrl::new(url).unwrap(),
+                headers: HeaderMap::new(),
+                signing: EgressSigning::Enabled(hmac),
+            }
+        }
+
+        #[tokio::test]
+        async fn signed_egress_verified_by_receiver_and_signed_response_accepted() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+
+            // The mock receiver answers with a decision signed over its own
+            // response body under the approval-decision context.
+            let response_body = r#"{"approved":true}"#.to_string();
+            let response_context =
+                SigningContext::new(&format!("approval-decision:{decision_id}")).unwrap();
+            let response_headers = hmac
+                .sign(&response_context, response_body.as_bytes())
+                .unwrap()
+                .into_pairs()
+                .map(|(name, value)| (name.to_string(), value));
+            let (url, received) = one_shot_receiver(response_headers.to_vec(), response_body).await;
+
+            let client = loopback_signed_client(&url, hmac.clone());
+            let outcome = client
+                .request_approval(&test_request(decision_id), Duration::from_secs(5))
+                .await
+                .expect("signed round trip must succeed");
+            assert_eq!(
+                outcome,
+                ApprovalOutcome::Decided(ApprovalDecision::Approved)
+            );
+
+            // The receiver independently verifies the egress signature over
+            // the raw bytes it saw, bound to the approval-request context.
+            let received = received.await.unwrap();
+            assert_eq!(received.header("content-type"), Some("application/json"));
+            let signature = received.header(SIGNATURE_HEADER).map(str::to_owned);
+            let timestamp = received.header(TIMESTAMP_HEADER).map(str::to_owned);
+            assert!(signature.is_some(), "egress POST must carry the signature");
+            assert!(timestamp.is_some(), "egress POST must carry the timestamp");
+            let egress_context =
+                SigningContext::new(&format!("approval-request:{decision_id}")).unwrap();
+            authorize_ingress(
+                Some(&hmac),
+                &egress_context,
+                signature.as_deref(),
+                timestamp.as_deref(),
+                Bytes::from(received.body),
+            )
+            .expect("receiver must be able to verify the egress signature");
+        }
+
+        #[tokio::test]
+        async fn unsigned_response_rejected_when_secret_configured() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+            let (url, _received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+
+            let client = loopback_signed_client(&url, hmac);
+            let err = client
+                .request_approval(&test_request(decision_id), Duration::from_secs(5))
+                .await
+                .expect_err("an unsigned response must not become a decision");
+            assert!(
+                matches!(err, ApprovalError::ResponseUnverified(_)),
+                "expected ResponseUnverified, got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn response_signed_for_other_decision_rejected() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+
+            // Signed response, but bound to a different decision's context:
+            // the A1 context binding must reject the cross-decision replay.
+            let response_body = r#"{"approved":true}"#.to_string();
+            let other_context =
+                SigningContext::new(&format!("approval-decision:{}", DecisionId::generate()))
+                    .unwrap();
+            let response_headers = hmac
+                .sign(&other_context, response_body.as_bytes())
+                .unwrap()
+                .into_pairs()
+                .map(|(name, value)| (name.to_string(), value));
+            let (url, _received) =
+                one_shot_receiver(response_headers.to_vec(), response_body).await;
+
+            let client = loopback_signed_client(&url, hmac);
+            let err = client
+                .request_approval(&test_request(decision_id), Duration::from_secs(5))
+                .await
+                .expect_err("a cross-decision response signature must be rejected");
+            assert!(matches!(err, ApprovalError::ResponseUnverified(_)));
+        }
+
+        #[tokio::test]
+        async fn http_url_with_secret_fails_closed() {
+            let client = WebhookClient::with_headers_and_signing(
+                build_webhook_client(),
+                aura_config::WebhookUrl::new("http://approvals.example.com/aura").unwrap(),
+                HeaderMap::new(),
+                EgressSigning::Enabled(test_hmac()),
+            );
+            let err = client
+                .request_approval(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect_err("plaintext url with a secret must fail closed");
+            assert!(
+                matches!(err, ApprovalError::Misconfigured(_)),
+                "expected Misconfigured, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn boot_validation_rejects_plaintext_url_only_with_secret() {
+            use super::super::validate_webhook_signing_config;
+
+            let webhook = |url: &str| aura_config::HitlConfig {
+                require_approval: vec![],
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new(url).unwrap(),
+                    timeout_secs: 300,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::new(),
+                },
+            };
+            let hmac = test_hmac();
+
+            // Secret + http:// fails at boot.
+            let err = validate_webhook_signing_config(
+                &webhook("http://approvals.example.com/aura"),
+                Some(&hmac),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("plaintext http://"));
+
+            // Secret + https:// passes.
+            validate_webhook_signing_config(
+                &webhook("https://approvals.example.com/aura"),
+                Some(&hmac),
+            )
+            .unwrap();
+
+            // No secret: http:// stays allowed (today's behavior).
+            validate_webhook_signing_config(&webhook("http://approvals.example.com/aura"), None)
+                .unwrap();
+
+            // Conversational route has no URL to validate.
+            let conversational = aura_config::HitlConfig {
+                require_approval: vec![],
+                route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
+            };
+            validate_webhook_signing_config(&conversational, Some(&hmac)).unwrap();
+        }
+
+        #[tokio::test]
+        async fn no_secret_sends_unsigned_and_trusts_response() {
+            let decision_id = DecisionId::generate();
+            let (url, received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_string()).await;
+
+            let client = WebhookClient::with_headers_and_signing(
+                build_webhook_client(),
+                aura_config::WebhookUrl::new(&url).unwrap(),
+                HeaderMap::new(),
+                EgressSigning::Disabled,
+            );
+            let outcome = client
+                .request_approval(&test_request(decision_id), Duration::from_secs(5))
+                .await
+                .expect("unsigned round trip must keep working");
+            assert_eq!(
+                outcome,
+                ApprovalOutcome::Decided(ApprovalDecision::Approved)
+            );
+
+            let received = received.await.unwrap();
+            assert!(
+                received.header(SIGNATURE_HEADER).is_none(),
+                "no secret configured must mean no signature header"
+            );
+            assert!(received.header(TIMESTAMP_HEADER).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn webhook_route_emits_requested_and_completed_on_channel_error() {
         let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
@@ -1121,6 +1628,7 @@ mod tests {
             items: vec![ApprovalItem {
                 tool_name: "dangerous_apply".into(),
                 arguments: serde_json::json!({}),
+                tool_call_intent: None,
             }],
         }
     }
