@@ -280,6 +280,33 @@ async fn run() -> std::io::Result<()> {
     }
     info!("Session store backend: {}", session_store.backend());
 
+    // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
+    // misconfiguration instead of silently serving unsigned, unverified
+    // traffic. One load serves both legs: egress signing via AppState,
+    // ingress verification via the IngressHmac extension.
+    let ingress_hmac = aura::hitl::WebhookHmac::load_from_env().map_err(|e| {
+        error!("Invalid HITL webhook HMAC configuration: {e}");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HITL webhook HMAC configuration error: {e}"),
+        )
+    })?;
+    // With a secret configured, a plaintext webhook URL fails at boot rather
+    // than on the first approval request.
+    for config in configs_arc.iter() {
+        if let Some(hitl) = &config.hitl {
+            aura::hitl::validate_webhook_signing_config(hitl, ingress_hmac.as_ref()).map_err(
+                |e| {
+                    error!("Invalid HITL webhook configuration: {e}");
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("HITL webhook configuration error: {e}"),
+                    )
+                },
+            )?;
+        }
+    }
+
     let app_state = Arc::new(AppState {
         configs: configs_arc,
         tool_result_mode: args.tool_result_mode,
@@ -299,6 +326,7 @@ async fn run() -> std::io::Result<()> {
             session_store.approvals(),
             session_store.bus(),
         ),
+        hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
     });
 
@@ -316,6 +344,9 @@ async fn run() -> std::io::Result<()> {
             "/v1/approvals/{decision_id}",
             post(handlers::resolve_approval),
         )
+        .layer(axum::extract::Extension(handlers::IngressHmac(
+            ingress_hmac,
+        )))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             app_state.clone(),

@@ -104,6 +104,8 @@ pub struct AppState {
     /// Called once per request to produce fresh tool instances. Returns empty vec for the web server.
     pub additional_tools: Arc<dyn Fn() -> Vec<Box<dyn aura::ToolDyn>> + Send + Sync>,
     pub pending_approvals: aura::hitl::PendingApprovals,
+    /// Startup-loaded HMAC secret for the HITL webhook route (egress signing).
+    pub hitl_webhook_hmac: Option<aura::hitl::WebhookHmac>,
     /// The session-state backend.
     pub session_store: Arc<dyn SessionStore>,
 }

@@ -22,7 +22,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 authors = ["Mezmo <support@mezmo.com>"]
 license = "Apache-2.0"
@@ -69,6 +69,11 @@ config = { version = "0.14", features = ["toml"] }  # Alternative for custom han
 # Environment variables
 dotenvy = "0.15"
 regex = "1.11"
+
+# HMAC root of trust for HITL webhook signing/verification
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
 
 # Vector stores - pinned to exact version compatible with our rig-core 0.28.x fork
 rig-qdrant = "=0.1.34"

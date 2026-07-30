@@ -67,6 +67,8 @@ pub struct ToolCallContext {
     pub attempt: Option<usize>,
     /// Custom metadata that wrappers can use
     pub metadata: Option<Value>,
+    /// Agent's authored reasoning for the pending tool call.
+    pub tool_call_intent: Option<String>,
 }
 
 impl ToolCallContext {
@@ -102,6 +104,11 @@ impl ToolCallContext {
         self.metadata = Some(metadata);
         self
     }
+}
+
+/// Blank (empty or whitespace-only) reasoning counts as absent.
+pub(crate) fn non_blank(s: &str) -> Option<&str> {
+    (!s.trim().is_empty()).then_some(s)
 }
 
 /// Result of argument transformation.
@@ -290,6 +297,18 @@ pub trait ToolWrapper: Send + Sync {
         Ok(())
     }
 
+    /// Populate advisory context fields from data extracted during
+    /// `transform_args`.
+    ///
+    /// Called once between `transform_args` and `pre_call` in
+    /// `WrappedTool::call`, after the composed `extracted` payload is
+    /// available. Default is a no-op; wrappers that capture cross-cutting
+    /// data in `transform_args` (e.g. `PersistenceWrapper` stashes the
+    /// pre-strip reasoning) override this to surface it as a typed field
+    /// on the context rather than requiring every reader to search the
+    /// `extracted` `Value` blob by string key.
+    fn write_context(&self, _extracted: Option<&Value>, _ctx: &mut ToolCallContext) {}
+
     /// Async hook called before tool execution.
     ///
     /// Use this for async gates that must run before the tool executes, such as
@@ -433,6 +452,13 @@ where
 
             // Store clean args on context so on_complete can persist them
             ctx.metadata = Some(clean_args.clone());
+
+            // Let wrappers surface advisory fields from extracted data onto
+            // the context (e.g. PersistenceWrapper publishes the pre-strip
+            // reasoning as `tool_call_intent` for the HITL gate). Runs after
+            // transform_args (which produces `extracted`) and before pre_call
+            // (which reads it).
+            wrapper.write_context(extracted.as_ref(), &mut ctx);
 
             // Validate args (wrappers can reject tool calls here)
             if let Err(validation_error) =
@@ -663,6 +689,12 @@ impl ToolWrapper for ComposedWrapper {
             wrapper.validate_args(args, extracted, ctx)?;
         }
         Ok(())
+    }
+
+    fn write_context(&self, extracted: Option<&Value>, ctx: &mut ToolCallContext) {
+        for wrapper in &self.wrappers {
+            wrapper.write_context(extracted, ctx);
+        }
     }
 
     async fn pre_call(

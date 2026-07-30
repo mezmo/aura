@@ -84,6 +84,7 @@ impl ToolWrapper for HitlApprovalWrapper {
             items: vec![ApprovalItem {
                 tool_name: ctx.tool_name.clone(),
                 arguments: args.clone(),
+                tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
         let cancel =

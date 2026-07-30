@@ -5,6 +5,10 @@
 ARG SCCACHE_VERSION=0.16.0
 ARG SCCACHE_SHA256=aec995a83ad3dff3d14b6314e08858b7b73d35ca85a5bcf3d3a9ec07dee35588
 
+# nfpm builds the .deb/.rpm release packages from the cross-compiled binaries.
+ARG NFPM_VERSION=2.47.0
+ARG NFPM_SHA256=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+
 ### 000 Chef
 FROM lukemathwalker/cargo-chef:latest-rust-1.95@sha256:00c3c07c51d092325df88f0df2d626cd4302e12933f179ba154509cc314d6c2a AS chef
 
@@ -86,6 +90,19 @@ EOR
 RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
   && command -v mcp-server-everything
 
+# nfpm packages release binaries into .deb/.rpm without dpkg/rpmbuild or root.
+ARG NFPM_VERSION
+ARG NFPM_SHA256
+RUN <<EOR
+  set -e
+  curl -fsSL -o /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+  printf '%s  /tmp/nfpm.tar.gz\n' "${NFPM_SHA256}" > /tmp/nfpm.tar.gz.sha256
+  sha256sum -c /tmp/nfpm.tar.gz.sha256
+  tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+  rm /tmp/nfpm.tar.gz /tmp/nfpm.tar.gz.sha256
+  nfpm --version
+EOR
+
 COPY --from=sccache-dl /usr/local/bin/sccache /usr/local/bin/sccache
 
 USER 1000
@@ -100,7 +117,7 @@ EOR
 # Install tools before source COPY so source changes keep this layer cached.
 FROM cook-debug AS test-tools
 
-USER root
+USER 0
 # cook-debug writes these paths as root.
 RUN chown -R 1000:1000 /usr/local/cargo /usr/src/app
 
@@ -128,7 +145,7 @@ EOR
 # Keep this setup in sync with runner.
 FROM test-tools AS test
 
-USER root
+USER 0
 RUN groupadd --gid 1000 aura && useradd --uid 1000 --gid aura --shell /bin/bash --create-home aura
 
 RUN <<EOR
@@ -142,7 +159,7 @@ EOR
 RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
   && command -v mcp-server-everything
 
-USER aura
+USER 1000
 
 # grcov reads llvm-tools' profdata. clippy rides this image's cook-debug
 # deps for CI lint; rustfmt stays runner-only (fmt-check doesn't compile,
@@ -214,13 +231,13 @@ RUN <<EOR
   set -e
   apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl
   rm -rf /var/lib/apt/lists/*
-  useradd -r -s /bin/false appuser
+  useradd -r -u 1000 -s /bin/false appuser
 EOR
 
 WORKDIR /app
 RUN mkdir -p /app/config /app/skills && chown -R appuser:appuser /app
 
-USER appuser
+USER 1000
 EXPOSE 3030
 
 ENV HOST=0.0.0.0
@@ -228,7 +245,7 @@ ENV PORT=3030
 ENV CONFIG_PATH=/app/config/config.toml
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3030/health || exit 1
+  CMD ["/bin/sh", "-c", "curl -f http://localhost:3030/health || exit 1"]
 
 CMD ["./aura-web-server"]
 

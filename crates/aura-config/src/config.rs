@@ -1000,6 +1000,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 300,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
@@ -1012,6 +1014,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 30,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
@@ -1024,6 +1028,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 60,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1038,6 +1044,8 @@ mod tests {
             route: DecisionRouteConfig::Webhook {
                 url: WebhookUrl::new("http://localhost:9999").unwrap(),
                 timeout_secs: 120,
+                headers: HashMap::new(),
+                headers_from_request: HashMap::new(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1054,6 +1062,57 @@ mod tests {
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
         assert!(msg.contains("120s"));
+    }
+
+    #[test]
+    fn hitl_webhook_headers_parse_from_toml() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+headers = { "x-tenant" = "sre-prod" }
+headers_from_request = { "authorization" = "authorization" }
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                headers,
+                headers_from_request,
+                ..
+            } => {
+                assert_eq!(headers.get("x-tenant"), Some(&"sre-prod".to_string()));
+                assert_eq!(
+                    headers_from_request.get("authorization"),
+                    Some(&"authorization".to_string())
+                );
+            }
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hitl_webhook_headers_default_empty_when_absent() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                headers,
+                headers_from_request,
+                ..
+            } => {
+                assert!(headers.is_empty());
+                assert!(headers_from_request.is_empty());
+            }
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
     }
 }
 
@@ -1092,6 +1151,12 @@ pub enum DecisionRouteConfig {
         url: WebhookUrl,
         #[serde(default = "default_webhook_timeout_secs")]
         timeout_secs: u64,
+        /// Static webhook headers.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+        /// Outbound header name → inbound request header name mapping.
+        #[serde(default)]
+        headers_from_request: HashMap<String, String>,
     },
 }
 

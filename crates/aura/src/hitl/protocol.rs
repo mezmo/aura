@@ -46,6 +46,9 @@ pub struct ApprovalRequest {
 pub struct ApprovalItem {
     pub tool_name: String,
     pub arguments: Value,
+    /// Agent's stated rationale for the tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_intent: Option<String>,
 }
 
 /// Wire form of a single decision: the `{ "approved": bool, "reason": ... }`

@@ -530,7 +530,7 @@ pipeline {
             unstash 'linux-release-artifacts'
             unstash 'darwin-release-artifacts'
 
-            sh 'make verify-binaries'
+            sh 'make release-artifacts PACKAGE_VERSION="$NEXT_RELEASE_VERSION"'
 
             script {
               docker.withRegistry(

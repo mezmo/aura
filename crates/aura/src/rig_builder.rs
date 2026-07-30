@@ -20,6 +20,7 @@ use std::sync::Arc;
 pub struct RigBuilder {
     config: Config,
     pending_approvals: PendingApprovals,
+    hitl_hmac: Option<crate::hitl::WebhookHmac>,
 }
 
 impl RigBuilder {
@@ -27,13 +28,24 @@ impl RigBuilder {
         Self {
             config,
             pending_approvals,
+            hitl_hmac: None,
         }
+    }
+
+    /// Set the startup-loaded HITL webhook HMAC for the egress webhook route.
+    #[must_use]
+    pub fn with_hitl_hmac(mut self, hmac: Option<crate::hitl::WebhookHmac>) -> Self {
+        self.hitl_hmac = hmac;
+        self
     }
 
     /// Get the runtime [`AgentRuntimeConfig`] (mainly for tests/debugging).
     /// Skips skill discovery; build methods use [`Self::discovered_agent_config`].
+    /// Passes `None` for request headers — production paths that need
+    /// `headers_from_request` resolution use [`Self::build_agent`] or
+    /// [`Self::build_streaming_agent_with_headers`].
     pub fn get_agent_config(&self) -> AgentRuntimeConfig {
-        self.to_agent_config()
+        self.to_agent_config(None)
     }
 
     /// Project the parsed `Config` into the runtime `AgentRuntimeConfig`.
@@ -44,7 +56,11 @@ impl RigBuilder {
     /// populated by callers (e.g. the orchestrator) as needed. Skills start
     /// empty here because discovery does filesystem IO and can fail; the
     /// fallible build paths run it via [`Self::discovered_agent_config`].
-    fn to_agent_config(&self) -> AgentRuntimeConfig {
+    ///
+    /// `req_headers` threads the inbound client request's HTTP headers through
+    /// to [`HitlRuntime::from_config`] for `[hitl.route]` `headers_from_request`
+    /// resolution. Pass `None` outside an HTTP request context.
+    fn to_agent_config(&self, req_headers: Option<&HashMap<String, String>>) -> AgentRuntimeConfig {
         let agent = AgentSettings {
             name: self.config.agent.name.clone(),
             system_prompt: self.config.agent.system_prompt.clone(),
@@ -67,11 +83,14 @@ impl RigBuilder {
             tools: self.config.tools.clone(),
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
-            hitl: self
-                .config
-                .hitl
-                .as_ref()
-                .map(|cfg| crate::hitl::HitlRuntime::from_config(cfg, &self.pending_approvals)),
+            hitl: self.config.hitl.as_ref().map(|cfg| {
+                crate::hitl::HitlRuntime::from_config(
+                    cfg,
+                    &self.pending_approvals,
+                    self.hitl_hmac.as_ref(),
+                    req_headers,
+                )
+            }),
             ..Default::default()
         }
     }
@@ -80,8 +99,11 @@ impl RigBuilder {
     ///
     /// Effective skill sources are the explicit `[agent.skills]` config.
     /// Relative sources resolve from the process current working directory.
-    fn discovered_agent_config(&self) -> Result<AgentRuntimeConfig, BuilderError> {
-        let mut agent_config = self.to_agent_config();
+    fn discovered_agent_config(
+        &self,
+        req_headers: Option<&HashMap<String, String>>,
+    ) -> Result<AgentRuntimeConfig, BuilderError> {
+        let mut agent_config = self.to_agent_config(req_headers);
 
         let skill_sources = self.config.agent.skills.local.clone();
         agent_config.agent.skills = aura_config::skills::discover_skills(&skill_sources)?;
@@ -120,7 +142,7 @@ impl RigBuilder {
         request_id: Option<String>,
         session_id: Option<String>,
     ) -> Result<Agent, BuilderError> {
-        let mut agent_config = self.discovered_agent_config()?;
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.request_id = request_id;
         agent_config.session_id = session_id;
@@ -146,7 +168,7 @@ impl RigBuilder {
         client_tools: Option<Vec<ClientTool>>,
         request_id: Option<String>,
     ) -> Result<Arc<dyn StreamingAgent>, BuilderError> {
-        let mut agent_config = self.discovered_agent_config()?;
+        let mut agent_config = self.discovered_agent_config(req_headers)?;
         resolve_mcp_headers(&mut agent_config, req_headers);
         agent_config.session_id = session_id;
         agent_config.request_id = request_id;
@@ -155,6 +177,30 @@ impl RigBuilder {
             .await
             .map_err(|e| BuilderError::AgentError(format!("Failed to build streaming agent: {e}")))
     }
+}
+
+/// Resolve `headers_from_request` mappings against the incoming request
+/// headers, overlaying resolved values on top of `headers`. Static values
+/// already present in `headers` serve as fallback when the mapped request
+/// header is absent.
+pub(crate) fn apply_request_header_mappings(
+    headers: &mut HashMap<String, String>,
+    headers_from_request: &HashMap<String, String>,
+    req_headers: &HashMap<String, String>,
+) -> usize {
+    let mut resolved = 0;
+    for (header_key, req_header_name) in headers_from_request.iter() {
+        let req_header_lower = req_header_name.to_lowercase();
+        if let Some(value) = req_headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == req_header_lower)
+            .map(|(_, v)| v)
+        {
+            headers.insert(header_key.to_lowercase(), value.clone());
+            resolved += 1;
+        }
+    }
+    resolved
 }
 
 /// Resolve MCP server headers by applying `headers_from_request` mappings from the
@@ -192,27 +238,27 @@ fn resolve_mcp_headers(
             }
         };
 
-        // Resolve headers_from_request mappings using the incoming request headers.
-        // Static TOML headers are already in server_headers; this only overrides
-        // when the mapped request header is found.
-        for (header_key, req_header_name) in headers_from_request.iter() {
-            // Note: HTTP header names are case-insensitive (RFC 7230), so we compare
-            // lowercased names. Actix-web lowercases header names, but TOML config
-            // values may use any casing.
-            let req_header_lower = req_header_name.to_lowercase();
-            let Some(value) = req_headers
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == req_header_lower)
-                .map(|(_, v)| v)
-            else {
-                continue;
-            };
-            server_headers.insert(header_key.clone(), value.clone());
+        // Lowercase static header keys so mapped overrides (inserted under
+        // lowercased keys by `apply_request_header_mappings`) replace the
+        // static fallback rather than coexisting as a case-distinct entry.
+        let normalized: HashMap<String, String> = server_headers
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect();
+        *server_headers = normalized;
+
+        // Resolve headers_from_request mappings using the incoming request
+        // headers. Static TOML headers are already in server_headers; this
+        // only overrides when the mapped request header is found. Count
+        // resolved mappings (inserts AND overrides), not the length delta —
+        // an override leaves the map size unchanged but is still a resolution.
+        let resolved =
+            apply_request_header_mappings(server_headers, headers_from_request, req_headers);
+        if resolved > 0 {
             tracing::info!(
-                "Server '{}': resolved header '{}' from request header '{}'",
+                "Server '{}': resolved {} header(s) from request",
                 server_name,
-                header_key,
-                req_header_name
+                resolved
             );
         }
     }
@@ -361,9 +407,77 @@ mod tests {
 
         let headers = get_server_headers(&config);
         assert_eq!(
-            headers.get("Authorization"),
+            headers.get("authorization"),
             Some(&"Token my-token".to_string()),
             "case-insensitive lookup should resolve lowercased request header"
+        );
+    }
+
+    #[test]
+    fn apply_request_header_mappings_counts_overrides_and_misses() {
+        // The resolved count is the number of mappings that found a request
+        // value, NOT the change in map length. An override (mapped key
+        // already present as a static fallback) leaves length unchanged but
+        // still counts as a resolution; a mapping whose request header is
+        // absent resolves zero.
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "static".to_string());
+        let mut headers_from_request = HashMap::new();
+        headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-incoming-auth".to_string(), "dynamic".to_string());
+
+        let len_before = headers.len();
+        let resolved =
+            apply_request_header_mappings(&mut headers, &headers_from_request, &req_headers);
+        assert_eq!(resolved, 1, "override must count as a resolution");
+        assert_eq!(
+            headers.len(),
+            len_before,
+            "override must not change map length"
+        );
+        assert_eq!(headers.get("authorization").unwrap(), "dynamic");
+
+        // A mapping whose request header is absent resolves nothing.
+        let mut miss_mappings = HashMap::new();
+        miss_mappings.insert("x-tenant".to_string(), "x-incoming-tenant".to_string());
+        let resolved_none =
+            apply_request_header_mappings(&mut headers, &miss_mappings, &HashMap::new());
+        assert_eq!(resolved_none, 0, "absent request header must not count");
+    }
+
+    #[test]
+    fn headers_from_request_overrides_static_header_mixed_casing() {
+        // Static headers use "Authorization" (capitalized) while the
+        // headers_from_request outbound key uses "authorization" (lowercase).
+        // Both refer to the same HTTP header; the dynamic value must override
+        // the static fallback deterministically, not nondeterministically
+        // based on HashMap iteration order.
+        let mut static_headers = HashMap::new();
+        static_headers.insert("Authorization".to_string(), "static-token".to_string());
+        let mut headers_from_request = HashMap::new();
+        headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-incoming-auth".to_string(), "dynamic-token".to_string());
+
+        let mut config = make_agent_config(static_headers, headers_from_request);
+
+        resolve_mcp_headers(&mut config, Some(&req_headers));
+
+        let headers = get_server_headers(&config);
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"dynamic-token".to_string()),
+            "dynamic header must override static fallback regardless of key casing"
+        );
+        assert!(
+            headers.get("Authorization").is_none(),
+            "capitalized static key must not survive as a separate entry"
+        );
+        assert_eq!(
+            headers.len(),
+            1,
+            "exactly one entry after case-normalized override"
         );
     }
 
@@ -557,7 +671,7 @@ skills.local = []
 
         let config = aura_config::Config::parse_toml(&config_str).expect("config should parse");
         let agent_config = RigBuilder::new(config, PendingApprovals::new())
-            .discovered_agent_config()
+            .discovered_agent_config(None)
             .expect("discovery should succeed");
 
         match agent_config
@@ -613,7 +727,7 @@ source = '/nonexistent/path/to/worker/skills'
 "#;
         let config = aura_config::Config::parse_toml(config_str).expect("config should parse");
         let err = RigBuilder::new(config, PendingApprovals::new())
-            .discovered_agent_config()
+            .discovered_agent_config(None)
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }

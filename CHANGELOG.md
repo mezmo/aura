@@ -1,5 +1,40 @@
 ## Changelog
 
+## [0.1.9](https://github.com/mezmo/aura/compare/v0.1.8...v0.1.9) (2026-07-30)
+
+
+### Bug Fixes
+
+* **hitl**: add tool_call_intent to redis store test fixture (#277) [21adcab](https://github.com/mezmo/aura/commit/21adcab820422389ed18f8c91ddacd1e3baf8ea4) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)* **hitl**: address W1 gate-a findings (#276) [4373973](https://github.com/mezmo/aura/commit/4373973fc66da056252514e80e90b0faa2abab83) - Mike Shearer [#276](https://github.com/mezmo/aura/issues/276) [#276](https://github.com/mezmo/aura/issues/276)* **hitl**: finish byte-for-byte capture, harden log-leak test (#276) [2ae88ea](https://github.com/mezmo/aura/commit/2ae88ea9c64ca1c5f9c6b5d14e7592acec6be295) - Mike Shearer [#leak](https://github.com/mezmo/aura/issues/leak) [#276](https://github.com/mezmo/aura/issues/276) [#276](https://github.com/mezmo/aura/issues/276)* **hitl**: freeze VerifiedBody; fix empty-primary contract (#399) [32a489d](https://github.com/mezmo/aura/commit/32a489d6d41ac6ee8ba70203bf19afaae57666aa) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: load webhook hmac at startup, not per agent build (#399) [2c2f46c](https://github.com/mezmo/aura/commit/2c2f46c021c6364dbb6dd43520c4311bdc7d196d) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: normalize blank intent on the agent_requested path (#277) [dc60e21](https://github.com/mezmo/aura/commit/dc60e21c725d2e6c637fe5997cb73c5212a11722) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)* **hitl**: omit tool_call_intent when reasoning is blank (#277) [3e6b09f](https://github.com/mezmo/aura/commit/3e6b09f86b77de86e1a58e16ad7c80c17fc24ba0) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)* **mcp**: lowercase static header keys before request mapping [39387ce](https://github.com/mezmo/aura/commit/39387ce6fc7c8a1fdbe7132b85e02c7bb553f0ab) - Mike Shearer [#276](https://github.com/mezmo/aura/issues/276)
+
+### Chores
+
+* **hitl**: reduces more verbose comments [77128e4](https://github.com/mezmo/aura/commit/77128e43508bf1f20aca9b7551fb671d783e7beb) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277)
+
+### Code Refactoring
+
+* **hitl**: apply design-panel round-1 repairs (#399) [bffc14e](https://github.com/mezmo/aura/commit/bffc14e831ef99e938ff1aa4822de0ddc8195680) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: apply security-vet amendments A1-A9 (#399) [ec9eb43](https://github.com/mezmo/aura/commit/ec9eb437f1bb7a7eccb9f6c826475aed8ec68f5c) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: single-source blank-reasoning rule, trim docs (#277) [1ba200a](https://github.com/mezmo/aura/commit/1ba200ab2cb67622f0777115c59d269833878994) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)
+
+### Continuous Integration
+
+* **docker**: fix hadolint findings and pin linter version [14abae7](https://github.com/mezmo/aura/commit/14abae77ca5900515b44f4b4405dde062beb25e0) - Jacob Hull* **release**: build and publish deb/rpm packages [d1543f4](https://github.com/mezmo/aura/commit/d1543f43e74c96fe986830b9e3467b5054836b44) - Jacob Hull
+
+### Documentation
+
+* **hitl**: clean prose lint in DESIGN.md and the security note (#399) [fe41c70](https://github.com/mezmo/aura/commit/fe41c7073ee9701fd8d3d75f439f36cbab24ca7e) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: correct SignedHeaders atomic-use doc claim (#399) [7f66398](https://github.com/mezmo/aura/commit/7f66398f0a29a54fd89d4a3b7d764da6ce8ca852) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: square DESIGN.md claims with type guarantees (#399) [20bd8e7](https://github.com/mezmo/aura/commit/20bd8e7ceddd80ef5f1a6bb9b682d3e8231d3b95) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)
+
+### Features
+
+* **hitl**: forward configured headers on the approval webhook (#276) [664a125](https://github.com/mezmo/aura/commit/664a1254da521c7918d8fc4e7c7254d6e04baa54) - Mike Shearer [#276](https://github.com/mezmo/aura/issues/276) [#276](https://github.com/mezmo/aura/issues/276)* **hitl**: forward reasoning as tool_call_intent on approvals (#277) [24840ce](https://github.com/mezmo/aura/commit/24840ce39a566b0414a548de61f0ce7c84d22201) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)* **hitl**: typed-holes skeleton for the webhook HMAC module (#399) [a9964fa](https://github.com/mezmo/aura/commit/a9964fa1b3a7b8de2c4bfac4c1639bf851ad42d8) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)* **hitl**: verify webhook approvals with HMAC on both legs (#399) [35ca7a8](https://github.com/mezmo/aura/commit/35ca7a8c64935c5f8124450062e97467986b7e2e) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399) [#399](https://github.com/mezmo/aura/issues/399)
+
+### Style
+
+* **hitl**: dedupe classification note, drop history phrasing (#276) [681406c](https://github.com/mezmo/aura/commit/681406ca62b11c889eb06b4dac235a808c82eedf) - Mike Shearer [#276](https://github.com/mezmo/aura/issues/276) [#276](https://github.com/mezmo/aura/issues/276)
+
+### Tests
+
+* **hitl**: dedupe config_gate intent tests, drop no-op asserts (#277) [205e701](https://github.com/mezmo/aura/commit/205e701ebab838f8d1f21b0a6b66ee10d7c3d42a) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)* **hitl**: drive the agent_requested path in blank-intent tests (#277) [28f8759](https://github.com/mezmo/aura/commit/28f87591f67ba66a77ba31250f0a4e35c7ec9f5e) - Mike Shearer [#277](https://github.com/mezmo/aura/issues/277) [#277](https://github.com/mezmo/aura/issues/277)* **hitl**: trim overlapping webhook hmac tests [35483b9](https://github.com/mezmo/aura/commit/35483b9d2fadb24a09c4be74ef17d47678209f5a) - Mike Shearer [#399](https://github.com/mezmo/aura/issues/399)
+
 ## [0.1.8](https://github.com/mezmo/aura/compare/v0.1.7...v0.1.8) (2026-07-29)
 
 
