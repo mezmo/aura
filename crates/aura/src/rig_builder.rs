@@ -178,13 +178,11 @@ impl RigBuilder {
 /// lowercases both sides, so TOML config values using any casing match
 /// actix-web's lowercased header names.
 ///
-/// NOTE (271 board, ADR decision 13): the 271 park/reify board adds header
-/// classification (`identity` vs `credential`) at park time. Unclassified
-/// headers default to credential (fail-closed) there — they refuse to park.
-/// That classification's only enforcement point is park time, which does not
-/// exist on main. This wave ships the plain `headers` / `headers_from_request`
-/// surface without classification; adding a classification key later is purely
-/// additive TOML. Forwarded headers are never persisted anywhere in this wave.
+/// Header classification (`identity` vs `credential`) from the 271
+/// park/reify ADR (decision 13) is enforced at park time, its only
+/// enforcement point. This mapping surface carries no classification, so
+/// adding a classification key later is purely additive TOML. Forwarded
+/// headers are never persisted.
 pub(crate) fn apply_request_header_mappings(
     headers: &mut HashMap<String, String>,
     headers_from_request: &HashMap<String, String>,
