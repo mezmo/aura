@@ -9,8 +9,12 @@ use bytes::Bytes;
 use tokio::sync::broadcast;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::orchestration::park::{
+    AgentInstanceId, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, SessionId,
+    SessionRecord, WakeReason,
+};
 
-use super::{ApprovalStore, EventBus, SessionStoreError, Subscription};
+use super::{ApprovalStore, EventBus, RunStore, RunStoreError, SessionStoreError, Subscription};
 
 /// Buffered payloads per topic before slow subscribers start lagging.
 const TOPIC_CAPACITY: usize = 64;
@@ -57,6 +61,15 @@ impl ApprovalStore for InMemoryApprovalStore {
         }
     }
 
+    #[expect(unused_variables, reason = "staged for #271: durable resolution")]
+    async fn resolve_durable(
+        &self,
+        id: &DecisionId,
+        decision: ApprovalDecision,
+    ) -> Result<WakeReason, ResolveError> {
+        todo!("staged for #271: durable resolution preserving the parked entry")
+    }
+
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         self.lock().remove(id);
         Ok(())
@@ -66,6 +79,108 @@ impl ApprovalStore for InMemoryApprovalStore {
         self.lock()
             .retain(|_, parked| parked.request.request_id != request_id);
         Ok(())
+    }
+}
+
+/// The in-memory run store: fenced session records in a plain map, with the
+/// process-wide lock standing in for the backend atomic primitive.
+/// Single-process like every capability of the memory backend — it proves
+/// the protocol, not cross-instance claims.
+#[derive(Default)]
+pub struct InMemoryRunStore {
+    // `std::sync::Mutex`: every operation is a synchronous map op; nothing
+    // awaits while holding the lock.
+    #[expect(
+        dead_code,
+        reason = "staged for #271: read by the in-memory RunStore fill"
+    )]
+    records: Mutex<BTreeMap<SessionId, SessionRecord>>,
+}
+
+impl InMemoryRunStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl RunStore for InMemoryRunStore {
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: in-memory session record create"
+    )]
+    async fn create(&self, record: SessionRecord) -> Result<(), RunStoreError> {
+        todo!("staged for #271: in-memory session record create")
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: in-memory session record load"
+    )]
+    async fn load(&self, session: SessionId) -> Result<Option<SessionRecord>, RunStoreError> {
+        todo!("staged for #271: in-memory session record load")
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: in-memory CAS lease acquire"
+    )]
+    async fn acquire_lease(
+        &self,
+        session: SessionId,
+        holder: AgentInstanceId,
+        ttl: LeaseTtl,
+    ) -> Result<Lease, RunStoreError> {
+        todo!("staged for #271: in-memory CAS lease acquire")
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: in-memory lease heartbeat"
+    )]
+    async fn heartbeat_lease(
+        &self,
+        session: SessionId,
+        generation: FencingGeneration,
+        ttl: LeaseTtl,
+    ) -> Result<Lease, RunStoreError> {
+        todo!("staged for #271: in-memory lease heartbeat")
+    }
+
+    #[expect(unused_variables, reason = "staged for #271: in-memory lease release")]
+    async fn release_lease(
+        &self,
+        session: SessionId,
+        generation: FencingGeneration,
+    ) -> Result<(), RunStoreError> {
+        todo!("staged for #271: in-memory lease release")
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: in-memory fenced run event"
+    )]
+    async fn apply(
+        &self,
+        session: SessionId,
+        presented: FencingGeneration,
+        event: RunEvent,
+    ) -> Result<SessionRecord, RunStoreError> {
+        todo!("staged for #271: in-memory fenced run event")
+    }
+
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: in-memory atomic park commit"
+    )]
+    async fn park(
+        &self,
+        session: SessionId,
+        presented: FencingGeneration,
+        commit: ParkCommit,
+    ) -> Result<SessionRecord, RunStoreError> {
+        todo!("staged for #271: in-memory atomic park commit")
     }
 }
 

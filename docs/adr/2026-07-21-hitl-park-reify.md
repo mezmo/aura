@@ -298,6 +298,39 @@ decision 4 makes the session handle a bearer capability. So:
 Mike's `/aura` endpoint sketch (chat, list_session, load_session, kill, park,
 schedule, list_approvals) shapes these types but is not built in V1.
 
+### 18. Run-record serialization
+
+The stored session-run record is read and written only through
+version-owned wire types in `record.rs`, never through the domain types'
+own serde derives. The v1 shape is a frozen copy: `RunRecordV1` with
+nested wire structs for the session, run state, park reason, failure
+cause, and lease, ids as plain strings and generations as plain integers.
+Conversion from wire to domain is fallible, and a malformed field is a
+named decode error. A future domain change cannot silently rewrite v1; a
+breaking change adds `RunRecordV2` with an upcaster into the current
+domain form.
+
+The version tag is inlined in the record object with no wrapper envelope.
+Decoding dispatches on the tag, one decoder per version, and decoders are
+retained for as long as records of their version can exist. A version
+with no decoder is a refused read with a named error; a reader never
+guesses at a shape it does not know.
+
+Two payloads cross the wire copy deliberately. Timestamps use chrono's
+RFC 3339 form, that crate's stable contract. The checkpoint blob crosses
+as an opaque JSON value because decision 7 already freezes it
+independently, with its own `schema_version`, fail-closed codec, and
+golden fixture; the record decoder routes the blob through that codec, so
+the checkpoint's refusal discipline applies inside the record path too.
+
+The freeze is mechanical. A pin test asserts that a record serialized
+through the wire tree is byte-identical JSON to the domain record
+serialized directly, for every run state; the checkpoint interior is
+pinned structurally and by its own fixture. A serde change to a domain
+type breaks the pin instead of rewriting v1 in place. With no deployments
+to migrate yet there is no coordinated-cutover machinery, and a rolling
+upgrade relies on the fail-closed refusal.
+
 ### Positive Consequences <!-- optional -->
 
 - An orchestration run is no longer bounded by its SSE stream or its host

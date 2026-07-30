@@ -15,7 +15,41 @@ use serde_json::Value;
 use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute};
+use crate::orchestration::park::ToolAttemptOutcome;
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
+
+/// Typed side-channel carrying [`ToolAttemptOutcome::Blocked`] across the
+/// rig tool stack, whose `Tool` interface types failures as strings and
+/// would erase the block into an error. [`Self::deposit`] is the only write
+/// path: it stores the projection of the very [`PreCallOutcome`] it hands
+/// back to the wrapper chain, and [`Self::take_blocked`] returns the stored
+/// value verbatim — the channel and the returned outcome cannot diverge
+/// because there is one value.
+#[derive(Clone, Default)]
+pub struct BlockedSignal(Arc<std::sync::Mutex<Option<ToolAttemptOutcome>>>);
+
+impl BlockedSignal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store the blocked projection of `outcome` (a non-blocked outcome
+    /// stores nothing) and hand `outcome` back for the wrapper chain.
+    #[must_use]
+    pub fn deposit(&self, outcome: PreCallOutcome) -> PreCallOutcome {
+        if let Some(blocked) = outcome.clone().into_blocked_attempt() {
+            *self.0.lock().expect("blocked signal lock poisoned") = Some(blocked);
+        }
+        outcome
+    }
+
+    /// Take the stored blocked outcome, leaving the signal clear for the
+    /// next attempt.
+    pub fn take_blocked(&self) -> Option<ToolAttemptOutcome> {
+        self.0.lock().expect("blocked signal lock poisoned").take()
+    }
+}
 
 /// Gates matching tool calls behind an approval decision.
 pub struct HitlApprovalWrapper {
@@ -30,6 +64,10 @@ pub struct HitlApprovalWrapper {
     scope: AgentScope,
     /// Global request id, for SSE event routing.
     request_id: String,
+    /// Present only when the deployment supports durable parking: a gate hit
+    /// then parks the approval and ends the attempt as `Blocked` instead of
+    /// holding the await for the length of the request.
+    blocked_signal: Option<BlockedSignal>,
 }
 
 impl HitlApprovalWrapper {
@@ -45,7 +83,30 @@ impl HitlApprovalWrapper {
             route,
             scope,
             request_id,
+            blocked_signal: None,
         }
+    }
+
+    /// Arm the durable-park path: a gate hit parks the approval and reports
+    /// the block through `signal` instead of awaiting the decision in-request.
+    #[must_use]
+    pub fn with_blocked_signal(mut self, signal: BlockedSignal) -> Self {
+        self.blocked_signal = Some(signal);
+        self
+    }
+
+    /// Park the gated call durably and end the attempt blocked (ADR
+    /// 2026-07-21, decisions 1 and 11). The fill builds one
+    /// [`PreCallOutcome::Blocked`] and returns it THROUGH
+    /// [`BlockedSignal::deposit`], which stores its projection and hands the
+    /// outcome back — the side channel and the wrapper-chain value are one.
+    #[expect(unused_variables, reason = "staged for #271: durable gate park")]
+    fn park_instead_of_awaiting(
+        &self,
+        request: ApprovalRequest,
+        signal: &BlockedSignal,
+    ) -> Result<PreCallOutcome, ToolError> {
+        todo!("staged for #271: durable gate park -> ToolAttemptOutcome::Blocked")
     }
 
     /// First configured glob that matches `tool_name`, never gating the
@@ -87,6 +148,9 @@ impl ToolWrapper for HitlApprovalWrapper {
                 tool_call_intent: ctx.tool_call_intent.clone(),
             }],
         };
+        if let Some(signal) = &self.blocked_signal {
+            return self.park_instead_of_awaiting(request, signal);
+        }
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
                 .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);

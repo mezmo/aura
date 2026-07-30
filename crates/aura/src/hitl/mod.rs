@@ -35,13 +35,14 @@ mod protocol;
 mod registry;
 mod route;
 mod signing;
+mod teardown;
 mod tool;
 
 pub use decision::{
     AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, AwaitingDecision, CancelReason,
     DecisionId, Timestamp,
 };
-pub use gate::HitlApprovalWrapper;
+pub use gate::{BlockedSignal, HitlApprovalWrapper};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
 pub use route::{
@@ -52,4 +53,5 @@ pub use signing::{
     SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER, VerificationError,
     VerifiedBody, WebhookHmac, authorize_ingress,
 };
+pub use teardown::{ApprovalOwnership, TeardownUnderway};
 pub use tool::{RequestApprovalArgs, RequestApprovalTool};

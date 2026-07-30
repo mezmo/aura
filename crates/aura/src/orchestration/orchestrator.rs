@@ -61,12 +61,15 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
+use super::park::{ApprovalRef, NonEmpty, TaskExecutionOutcome, WaveOutcome};
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
+use super::sink::{ChannelEventSink, RunEventSink};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
     IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
 };
+use crate::session_store::RunStore;
 
 // ============================================================================
 // Constants
@@ -95,12 +98,6 @@ struct TaskExecutionParams<'a> {
     worker_name: Option<&'a str>,
 }
 
-/// Result from `execute_task` including structured output from `submit_result`.
-struct TaskExecutionResult {
-    result: String,
-    structured_output: Option<super::types::StructuredTaskOutput>,
-}
-
 /// Named return type for `create_*` coordinator/worker methods.
 ///
 /// Replaces bare `(Agent, String)` tuples where the `String` was the preamble
@@ -115,6 +112,11 @@ struct AgentWithPreamble {
     /// Shared state for the worker's `submit_result` tool. Read after the
     /// worker completes to extract structured output (summary, result, confidence).
     submit_result_decision: super::tools::SubmitResultDecision,
+    /// Side-channel for the HITL gate's park signal, present only when the
+    /// deployment supports durable parking. Read by `execute_task` after the
+    /// worker stream so a blocked attempt ends `Blocked`, not stringified
+    /// into a failure.
+    blocked_signal: Option<crate::hitl::BlockedSignal>,
 }
 
 /// Persistent coordinator state for conversation across planning iterations.
@@ -405,6 +407,13 @@ pub struct Orchestrator {
 
     /// Outer wall-clock budget for the whole run; `None` is unbounded.
     pub(super) outer_budget: Option<Duration>,
+
+    /// The durable-parking capability, when the deployment's session store
+    /// provides one. `None` means a quiescent-blocked run cannot park and
+    /// the park path refuses fail-closed, naming the missing capability.
+    /// Assigned by `OrchestratorFactory` after construction, like
+    /// `usage_state`.
+    pub(super) run_store: Option<Arc<dyn RunStore>>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -512,6 +521,7 @@ impl Orchestrator {
             current_iteration: AtomicUsize::new(0),
             usage_state: crate::UsageState::new(),
             outer_budget: None,
+            run_store: None,
         })
     }
 
@@ -581,6 +591,12 @@ impl Orchestrator {
             block,
             escalation_flag.clone(),
         ));
+        // Durable parking arms the gate's blocked path per worker attempt;
+        // without the capability the gate keeps its held-await behavior.
+        let blocked_signal = self
+            .run_store
+            .as_ref()
+            .map(|_| crate::hitl::BlockedSignal::new());
 
         // Create a modified config for workers with extension fields
         let mut worker_config = self.agent_config.clone();
@@ -773,13 +789,16 @@ impl Orchestrator {
                 session_id: session_id_owned.map(crate::config::SessionId::new),
             };
             let request_id = worker_config.request_id.clone().unwrap_or_default();
-            let gate = Arc::new(crate::hitl::HitlApprovalWrapper::new(
+            let mut gate = crate::hitl::HitlApprovalWrapper::new(
                 hitl.patterns.clone(),
                 hitl.route.clone(),
                 scope.clone(),
                 request_id.clone(),
-            ));
-            wrappers.insert(0, gate);
+            );
+            if let Some(signal) = &blocked_signal {
+                gate = gate.with_blocked_signal(signal.clone());
+            }
+            wrappers.insert(0, Arc::new(gate));
             worker_config.hitl_request_approval_tool = Some(crate::hitl::RequestApprovalTool::new(
                 hitl.route.clone(),
                 scope,
@@ -932,6 +951,7 @@ impl Orchestrator {
             preamble,
             escalation_flag,
             submit_result_decision,
+            blocked_signal,
         })
     }
 
@@ -2323,6 +2343,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             submit_result_decision: Arc::new(Mutex::new(None)),
+            // Coordinator-level blocking (#384) is declared, not built: the
+            // coordinator has no gated tools and never parks.
+            blocked_signal: None,
         })
     }
 
@@ -2744,16 +2767,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
     ///
     /// Returns the aggregate task-compute time (sum of per-task wall durations
     /// across all waves), used for the iteration's phase-timing breakdown.
+    /// Run the plan's waves to a drained boundary, returning how the drain
+    /// ended alongside the summed task compute time. `WaveOutcome::Blocked`
+    /// is the quiescence park point (ADR 2026-07-21, decision 1); `Continue`
+    /// here means the dependency chain broke on failures and the
+    /// failure-replan path takes over.
     async fn execute(
         &self,
         plan: &mut Plan,
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-    ) -> Result<u64, StreamError> {
+        sink: &dyn RunEventSink,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
+    ) -> Result<(WaveOutcome, u64), StreamError> {
         use futures::StreamExt;
         use futures::stream::FuturesUnordered;
 
         let mut task_compute_ms: u64 = 0;
-        while !plan.is_finished() {
+        let outcome = loop {
+            if plan.is_finished() {
+                break WaveOutcome::Finished;
+            }
             // Collect ready tasks with their context and worker assignment
             // Tuple: (task_id, description, context, worker_name)
             let ready_tasks: Vec<(usize, String, Option<String>, Option<String>)> = plan
@@ -2766,11 +2798,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 .collect();
 
             if ready_tasks.is_empty() {
+                if plan
+                    .tasks
+                    .iter()
+                    .any(|t| matches!(t.state, TaskState::Blocked { .. }))
+                {
+                    break Self::classify_blocked_drain(plan);
+                }
                 // No ready tasks but not finished - this shouldn't happen with valid plans
                 tracing::warn!(
                     "No ready tasks but plan not finished — blocked tasks remaining after failure (dependency chain broken)"
                 );
-                break;
+                break WaveOutcome::Continue;
             }
 
             let parallel_count = ready_tasks.len();
@@ -2791,16 +2830,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 if let Some(task) = plan.get_task_mut(*task_id) {
                     task.start();
                 }
-                let _ = event_tx
-                    .send(Ok(StreamItem::OrchestratorEvent(
-                        OrchestratorEvent::TaskStarted {
-                            task_id: *task_id,
-                            description: task_desc.clone(),
-                            orchestrator_id: self.orchestrator_id.clone(),
-                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
-                        },
-                    )))
-                    .await;
+                sink.emit(OrchestratorEvent::TaskStarted {
+                    task_id: *task_id,
+                    description: task_desc.clone(),
+                    orchestrator_id: self.orchestrator_id.clone(),
+                    worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                })
+                .await;
             }
 
             // Execute all ready tasks in parallel using FuturesUnordered
@@ -2814,7 +2850,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             task_context: &task_context,
                             worker_name: worker_name.as_deref(),
                         };
-                        let result = self.execute_task(task_id, &params, Some(event_tx)).await;
+                        let result = self.execute_task(task_id, &params, stream_tx).await;
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         (task_id, result, duration_ms, worker_name, task_desc)
                     },
@@ -2827,38 +2863,42 @@ Assign tasks to the worker whose tools best match the required operations."#,
             {
                 task_compute_ms += duration_ms;
                 match result {
-                    Ok(exec_result) => {
+                    #[expect(unused_variables, reason = "staged for #271: blocked task entry")]
+                    Ok(TaskExecutionOutcome::Blocked(approval)) => {
+                        todo!(
+                            "staged for #271: blocked task enters TaskState::Blocked and the wave drains around it"
+                        )
+                    }
+                    #[expect(unused_variables, reason = "staged for #271: typed failure entry")]
+                    Ok(TaskExecutionOutcome::Failed { error, category }) => {
+                        todo!("staged for #271: typed worker failure recorded on the task")
+                    }
+                    Ok(TaskExecutionOutcome::Complete {
+                        result,
+                        structured_output,
+                    }) => {
                         let final_result = self
-                            .maybe_create_artifact(
-                                task_id,
-                                worker_name.as_deref(),
-                                exec_result.result,
-                            )
+                            .maybe_create_artifact(task_id, worker_name.as_deref(), result)
                             .await;
                         let result_for_event = final_result.clone();
-                        let success = exec_result.structured_output.is_some();
+                        let success = structured_output.is_some();
                         if let Some(t) = plan.get_task_mut(task_id) {
                             if success {
                                 t.complete(final_result);
                             } else {
                                 t.fail(final_result, FailureCategory::SoftFailure);
                             }
-                            t.structured_output = exec_result.structured_output;
+                            t.structured_output = structured_output;
                         }
-                        let _ = event_tx
-                            .send(Ok(StreamItem::OrchestratorEvent(
-                                OrchestratorEvent::TaskCompleted {
-                                    task_id,
-                                    success,
-                                    duration_ms,
-                                    orchestrator_id: self.orchestrator_id.clone(),
-                                    worker_id: worker_name
-                                        .clone()
-                                        .unwrap_or(self.orchestrator_id.clone()),
-                                    result: result_for_event,
-                                },
-                            )))
-                            .await;
+                        sink.emit(OrchestratorEvent::TaskCompleted {
+                            task_id,
+                            success,
+                            duration_ms,
+                            orchestrator_id: self.orchestrator_id.clone(),
+                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                            result: result_for_event,
+                        })
+                        .await;
                         if success {
                             tracing::info!("Task {} completed in {}ms", task_id, duration_ms);
                         } else {
@@ -2875,20 +2915,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         if let Some(t) = plan.get_task_mut(task_id) {
                             t.fail(err_str.clone(), category);
                         }
-                        let _ = event_tx
-                            .send(Ok(StreamItem::OrchestratorEvent(
-                                OrchestratorEvent::TaskCompleted {
-                                    task_id,
-                                    success: false,
-                                    duration_ms,
-                                    orchestrator_id: self.orchestrator_id.clone(),
-                                    worker_id: worker_name
-                                        .clone()
-                                        .unwrap_or(self.orchestrator_id.clone()),
-                                    result: err_str.clone(),
-                                },
-                            )))
-                            .await;
+                        sink.emit(OrchestratorEvent::TaskCompleted {
+                            task_id,
+                            success: false,
+                            duration_ms,
+                            orchestrator_id: self.orchestrator_id.clone(),
+                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                            result: err_str.clone(),
+                        })
+                        .await;
                         let worker_label = worker_name.as_deref().unwrap_or("generic");
                         let (task_preview, _) = safe_truncate(&task_desc, 100);
                         tracing::warn!(
@@ -2903,9 +2938,35 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     }
                 }
             }
-        }
+        };
 
-        Ok(task_compute_ms)
+        Ok((outcome, task_compute_ms))
+    }
+
+    /// Classify a drained wave whose ready frontier is empty and that holds
+    /// at least one decision-blocked task (ADR 2026-07-21, decision 1),
+    /// reconciling decisions that arrived during the drain (decision 8).
+    #[expect(
+        unused_variables,
+        reason = "staged for #271: quiescent-drain classification"
+    )]
+    fn classify_blocked_drain(plan: &Plan) -> WaveOutcome {
+        todo!("staged for #271: quiescent-drain classification")
+    }
+
+    /// Commit the quiescent park: reconcile drain-time decisions, transfer
+    /// approval ownership to the session, commit `Running -> Parked` with
+    /// its checkpoint by CAS through the run store, and only then emit the
+    /// parked frame through `sink` (ADR 2026-07-21, decisions 7, 8, 10, 15).
+    /// Without a run store this refuses fail-closed, naming the missing
+    /// capability — never a silent fallback to in-request parking.
+    #[expect(unused_variables, reason = "staged for #271: atomic park commit")]
+    async fn commit_quiescent_park(
+        &self,
+        blocked_on: NonEmpty<ApprovalRef>,
+        sink: &dyn RunEventSink,
+    ) -> Result<IterationOutcome, StreamError> {
+        todo!("staged for #271: atomic park commit at the quiescent boundary")
     }
 
     /// Collect failed tasks from this iteration into failure records.
@@ -3036,7 +3097,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         task_id: usize,
         params: &TaskExecutionParams<'_>,
         event_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
-    ) -> Result<TaskExecutionResult, StreamError> {
+    ) -> Result<TaskExecutionOutcome, StreamError> {
         let TaskExecutionParams {
             task_description,
             task_context,
@@ -3082,6 +3143,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 preamble: worker_preamble,
                 escalation_flag,
                 submit_result_decision,
+                blocked_signal,
             } = self.create_worker(task_id, attempt, *worker_name).await?;
 
             // Build prompt for this attempt
@@ -3160,6 +3222,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 last_usage = response.usage;
             }
 
+            // A gate hit that durably parked ends the attempt as Blocked
+            // before error classification can stringify it into a failure
+            // (ADR 2026-07-21, decision 11).
+            if let Some(signal) = &blocked_signal
+                && let Some(blocked) = signal.take_blocked()
+            {
+                return self.attempt_blocked(blocked);
+            }
+
             // Detect context overflow and other errors — don't retry hard errors
             let result = match stream_result {
                 Ok(r) => Ok(r.content),
@@ -3210,7 +3281,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
-                            return Ok(TaskExecutionResult {
+                            return Ok(TaskExecutionOutcome::Complete {
                                 result: output.result,
                                 structured_output: Some(super::types::StructuredTaskOutput {
                                     summary: output.summary,
@@ -3240,7 +3311,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                                 &prompt,
                             )
                             .await;
-                            return Ok(TaskExecutionResult {
+                            return Ok(TaskExecutionOutcome::Complete {
                                 result: raw_response,
                                 structured_output: None,
                             });
@@ -3298,11 +3369,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 &base_worker_prompt,
             )
             .await;
-            Ok(TaskExecutionResult {
+            Ok(TaskExecutionOutcome::Complete {
                 result: last_raw_response,
                 structured_output: None,
             })
         }
+    }
+
+    /// End a worker attempt whose gate parked durably: the
+    /// [`ToolAttemptOutcome::Blocked`] carried out of the tool stack becomes
+    /// the task's `TaskExecutionOutcome::Blocked` (ADR 2026-07-21, decision
+    /// 11) — never a stringified failure.
+    ///
+    /// [`ToolAttemptOutcome::Blocked`]: super::park::ToolAttemptOutcome::Blocked
+    #[expect(unused_variables, reason = "staged for #271: blocked attempt outcome")]
+    fn attempt_blocked(
+        &self,
+        blocked: super::park::ToolAttemptOutcome,
+    ) -> Result<TaskExecutionOutcome, StreamError> {
+        todo!("staged for #271: ToolAttemptOutcome::Blocked -> TaskExecutionOutcome::Blocked")
     }
 
     /// Set token usage metrics on the current orchestration.worker span.
@@ -3401,6 +3486,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }
                     }
                     TaskState::Running => "▶ running".to_string(),
+                    TaskState::Blocked { .. } => {
+                        todo!("staged for #271: decision-blocked task in the execution summary")
+                    }
                 };
                 format!("Task {}: {} [{}]", t.id, t.description, status_detail)
             })
@@ -3491,36 +3579,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
         })
     }
 
-    /// Send an orchestrator event through the stream channel.
-    async fn emit_event(
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
-        event: OrchestratorEvent,
-    ) {
-        let _ = event_tx
-            .send(Ok(StreamItem::OrchestratorEvent(event)))
-            .await;
-    }
-
     /// Emit a ReplanStarted event and build the iteration context for the next cycle.
     ///
     /// Consolidates the common tail of the replan paths (coordinator-routed,
     /// failure-driven). Callers handle path-specific pre-work (e.g. IterationComplete
     /// events, persistence writes) before calling this.
     async fn trigger_replan(
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        sink: &dyn RunEventSink,
         iteration: usize,
         trigger: &str,
         plan: Plan,
         failure_summary: Option<FailureSummary>,
         failure_history: &[FailedTaskRecord],
     ) -> (Option<IterationContext>, Plan) {
-        Self::emit_event(
-            event_tx,
-            OrchestratorEvent::ReplanStarted {
-                iteration: iteration + 1,
-                trigger: trigger.to_string(),
-            },
-        )
+        sink.emit(OrchestratorEvent::ReplanStarted {
+            iteration: iteration + 1,
+            trigger: trigger.to_string(),
+        })
         .await;
 
         // tool_traces intentionally empty — this context is only used for
@@ -3597,6 +3672,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
             routing_decision,
         };
 
+        // Attended entry: loop events route through the sink abstraction so
+        // a reified headless run can swap in a bus-backed sink; the raw
+        // channel remains the token-stream path for worker/coordinator
+        // streaming.
+        let sink = ChannelEventSink::new(event_tx.clone());
+
         // Set iteration for initial planning (journal reads this via AtomicUsize)
         self.current_iteration.store(1, Ordering::Relaxed);
         // Planning latency: prompt → plan created (includes correction retries).
@@ -3621,13 +3702,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 response_summary,
             } => {
                 span.record("orchestration.routing", "direct");
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::DirectAnswer {
-                        response: response.clone(),
-                        routing_rationale,
-                    },
-                )
+                sink.emit(OrchestratorEvent::DirectAnswer {
+                    response: response.clone(),
+                    routing_rationale,
+                })
                 .await;
                 self.write_direct_response_manifest(query, &response, response_summary.as_deref())
                     .await;
@@ -3639,14 +3717,11 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 routing_rationale,
             } => {
                 span.record("orchestration.routing", "clarification");
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::ClarificationNeeded {
-                        question: question.clone(),
-                        options,
-                        routing_rationale,
-                    },
-                )
+                sink.emit(OrchestratorEvent::ClarificationNeeded {
+                    question: question.clone(),
+                    options,
+                    routing_rationale,
+                })
                 .await;
                 Ok(question)
             }
@@ -3656,16 +3731,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let planning_summary = response.planning_summary().unwrap_or_default().to_string();
                 let plan = response.into_plan().expect("StepsPlan always converts");
 
-                Self::emit_event(
-                    &event_tx,
-                    OrchestratorEvent::PlanCreated {
-                        goal: plan.goal.clone(),
-                        tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
-                        routing_rationale: routing_rationale.clone(),
-                        planning_response: planning_summary,
-                    },
-                )
+                sink.emit(OrchestratorEvent::PlanCreated {
+                    goal: plan.goal.clone(),
+                    tasks: plan.tasks.iter().map(|t| t.description.clone()).collect(),
+                    routing_mode: super::events::RoutingMode::for_plan(plan.tasks.len()),
+                    routing_rationale: routing_rationale.clone(),
+                    planning_response: planning_summary,
+                })
                 .await;
 
                 self.run_orchestration_loop(
@@ -3673,7 +3745,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan,
                     chat_history,
                     &mut coordinator_state,
-                    event_tx,
+                    &sink,
+                    Some(&event_tx),
                     orchestration_start,
                     initial_planning_ms,
                 )
@@ -3705,7 +3778,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         initial_plan: Plan,
         chat_history: Vec<rig::completion::Message>,
         coordinator_state: &mut CoordinatorState,
-        event_tx: tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        sink: &dyn RunEventSink,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
         orchestration_start: Instant,
         initial_planning_ms: u64,
     ) -> Result<String, StreamError> {
@@ -3730,7 +3804,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     &chat_history,
                     coordinator_state,
                     previous_context.as_ref(),
-                    &event_tx,
+                    sink,
+                    stream_tx,
                     orchestration_start,
                     planning_ms,
                     &mut failure_history,
@@ -3746,6 +3821,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     plan = new_plan;
                     previous_context = pc;
                     planning_ms = next_planning_ms;
+                }
+                #[expect(unused_variables, reason = "staged for #271: parked loop exit")]
+                IterationOutcome::Parked(parked) => {
+                    todo!(
+                        "staged for #271: a parked run leaves the loop without a final answer (frame already emitted post-CAS)"
+                    )
                 }
             }
         };
@@ -3776,7 +3857,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
         chat_history: &[rig::completion::Message],
         coordinator_state: &mut CoordinatorState,
         previous_context: Option<&IterationContext>,
-        event_tx: &tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>,
+        sink: &dyn RunEventSink,
+        stream_tx: Option<&tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
         orchestration_start: Instant,
         planning_ms: u64,
         failure_history: &mut Vec<FailedTaskRecord>,
@@ -3814,13 +3896,16 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // ----------------------------------------------------------------
         // EXECUTE: Run workers on tasks (parallel when possible)
         // ----------------------------------------------------------------
-        let task_compute_ms = match self.execute(&mut plan, event_tx).await {
-            Ok(ms) => ms,
+        let (drain, task_compute_ms) = match self.execute(&mut plan, sink, stream_tx).await {
+            Ok(drained) => drained,
             Err(e) => {
                 self.write_run_manifest(&plan, iteration, None).await;
                 return Err(e);
             }
         };
+        if let WaveOutcome::Blocked { on } = drain {
+            return self.commit_quiescent_park(on, sink).await;
+        }
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
         let this_iteration_failures = &failure_history[new_failure_start..];
@@ -3964,7 +4049,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             failure_history.clone(),
             tool_traces,
         );
-        Self::emit_event(event_tx, OrchestratorEvent::Synthesizing { iteration }).await;
+        sink.emit(OrchestratorEvent::Synthesizing { iteration })
+            .await;
         let decision_start = Instant::now();
         let routing = self
             .plan_with_routing(
@@ -3972,7 +4058,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 chat_history,
                 coordinator_state,
                 Some(&post_execute_ctx),
-                Some(event_tx),
+                stream_tx,
             )
             .await;
 
@@ -3996,24 +4082,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
             )) => {
                 tracing::Span::current()
                     .record("orchestration.post_execute_decision", "respond_directly");
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::DirectAnswer {
-                        response: response.clone(),
-                        routing_rationale,
-                    },
-                )
+                sink.emit(OrchestratorEvent::DirectAnswer {
+                    response: response.clone(),
+                    routing_rationale,
+                })
                 .await;
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::IterationComplete {
-                        iteration,
-                        will_replan: false,
-                        reasoning: String::new(),
-                        gaps: vec![],
-                        timings,
-                    },
-                )
+                sink.emit(OrchestratorEvent::IterationComplete {
+                    iteration,
+                    will_replan: false,
+                    reasoning: String::new(),
+                    gaps: vec![],
+                    timings,
+                })
                 .await;
                 tracing::info!(
                     "Iteration {} complete: elapsed={:.1}s (decision: respond_directly, {:.1}s)",
@@ -4043,25 +4123,19 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     "orchestration.post_execute_decision",
                     "request_clarification",
                 );
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::ClarificationNeeded {
-                        question: question.clone(),
-                        options,
-                        routing_rationale,
-                    },
-                )
+                sink.emit(OrchestratorEvent::ClarificationNeeded {
+                    question: question.clone(),
+                    options,
+                    routing_rationale,
+                })
                 .await;
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::IterationComplete {
-                        iteration,
-                        will_replan: false,
-                        reasoning: String::new(),
-                        gaps: vec![],
-                        timings,
-                    },
-                )
+                sink.emit(OrchestratorEvent::IterationComplete {
+                    iteration,
+                    will_replan: false,
+                    reasoning: String::new(),
+                    gaps: vec![],
+                    timings,
+                })
                 .await;
                 tracing::info!(
                     "Iteration {} complete: elapsed={:.1}s (decision: request_clarification, {:.1}s)",
@@ -4102,16 +4176,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         reasoning,
                     );
                     let raw = Self::build_raw_task_results(&plan, detail);
-                    Self::emit_event(
-                        event_tx,
-                        OrchestratorEvent::IterationComplete {
-                            iteration,
-                            will_replan: false,
-                            reasoning: reasoning.to_string(),
-                            gaps: vec![],
-                            timings,
-                        },
-                    )
+                    sink.emit(OrchestratorEvent::IterationComplete {
+                        iteration,
+                        will_replan: false,
+                        reasoning: reasoning.to_string(),
+                        gaps: vec![],
+                        timings,
+                    })
                     .await;
                     self.write_run_manifest(&plan, iteration, Some(timings))
                         .await;
@@ -4122,31 +4193,25 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 let planning_summary = resp.planning_summary().unwrap_or_default().to_string();
                 let new_plan = resp.into_plan().expect("StepsPlan always converts to plan");
 
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::PlanCreated {
-                        goal: new_plan.goal.clone(),
-                        tasks: new_plan
-                            .tasks
-                            .iter()
-                            .map(|t| t.description.clone())
-                            .collect(),
-                        routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
-                        routing_rationale,
-                        planning_response: planning_summary,
-                    },
-                )
+                sink.emit(OrchestratorEvent::PlanCreated {
+                    goal: new_plan.goal.clone(),
+                    tasks: new_plan
+                        .tasks
+                        .iter()
+                        .map(|t| t.description.clone())
+                        .collect(),
+                    routing_mode: super::events::RoutingMode::for_plan(new_plan.tasks.len()),
+                    routing_rationale,
+                    planning_response: planning_summary,
+                })
                 .await;
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::IterationComplete {
-                        iteration,
-                        will_replan: true,
-                        reasoning: String::new(),
-                        gaps: vec![],
-                        timings,
-                    },
-                )
+                sink.emit(OrchestratorEvent::IterationComplete {
+                    iteration,
+                    will_replan: true,
+                    reasoning: String::new(),
+                    gaps: vec![],
+                    timings,
+                })
                 .await;
 
                 // Persist plan state before replan
@@ -4158,7 +4223,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 }
 
                 let (new_previous_context, _) = Self::trigger_replan(
-                    event_tx,
+                    sink,
                     iteration,
                     "post_execute_create_plan",
                     plan,
@@ -4205,16 +4270,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 };
                 tracing::warn!("{}", note);
                 let raw = Self::build_raw_task_results(&plan, &note);
-                Self::emit_event(
-                    event_tx,
-                    OrchestratorEvent::IterationComplete {
-                        iteration,
-                        will_replan: false,
-                        reasoning: note,
-                        gaps: vec![],
-                        timings,
-                    },
-                )
+                sink.emit(OrchestratorEvent::IterationComplete {
+                    iteration,
+                    will_replan: false,
+                    reasoning: note,
+                    gaps: vec![],
+                    timings,
+                })
                 .await;
                 self.write_run_manifest(&plan, iteration, Some(timings))
                     .await;
@@ -4250,6 +4312,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         "## Task {}: {}\n\n(not executed)\n\n",
                         t.id, t.description
                     ));
+                }
+                TaskState::Blocked { .. } => {
+                    todo!("staged for #271: decision-blocked task in the raw-results fallback")
                 }
             }
         }

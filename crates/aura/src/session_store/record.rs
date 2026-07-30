@@ -18,6 +18,7 @@ use crate::hitl::{
     AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, ParkedApproval,
     Timestamp,
 };
+use crate::orchestration::park::{self, SessionRecord};
 use crate::orchestration::{RunId, TaskIdentity};
 
 /// Round-trippable storage form of a [`ParkedApproval`]. Field and tag names
@@ -66,6 +67,314 @@ pub enum OriginRecord {
 #[error("invalid stored approval record: {reason}")]
 pub struct InvalidRecord {
     pub reason: String,
+}
+
+/// Version every run record is written at today. A breaking shape change
+/// bumps this and adds a decoder for the new version; decoders for old
+/// versions are kept for as long as records of that version can exist.
+pub const RUN_RECORD_VERSION: u32 = 1;
+
+/// A stored run record this binary refuses to read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RunRecordError {
+    /// Fail-closed refusal of a version with no decoder here: a reader
+    /// never guesses at a shape it does not know.
+    #[error("run record version {found} has no decoder in this binary (latest known: {supported})")]
+    UnknownVersion { found: u32, supported: u32 },
+    /// The version was known but the body did not decode.
+    #[error("run record failed to decode: {reason}")]
+    Malformed { reason: String },
+}
+
+/// Frozen v1 wire shape of a stored session-run record, owned by the
+/// decoder and never public: [`decode_run_record`] is the only read path,
+/// so nothing can deserialize around the version gate. The version tag is
+/// inlined in the record object — no wrapper envelope.
+///
+/// Every nested shape is a version-owned copy of today's serialized form,
+/// not the domain type, so a later serde change to a domain type cannot
+/// silently rewrite v1: `v1_wire_matches_domain_serialization` pins the
+/// copies to the domain derives field-for-field. Frozen means a breaking
+/// change lands as a `RunRecordV2` with its own decoder (upcasting into the
+/// current domain form), never as an edit here. Two boundaries pass
+/// through deliberately:
+///
+/// - timestamps are `chrono::DateTime<Utc>`, whose RFC 3339 serde form is
+///   chrono's own stable contract;
+/// - the checkpoint blob is an opaque `serde_json::Value`, because it is
+///   already an independently frozen boundary — its own inline
+///   `schema_version`, its own fail-closed version-gated codec, and its own
+///   golden fixture (`park/testdata/checkpoint-v1.json`).
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct RunRecordV1 {
+    version: u32,
+    session: SessionV1Wire,
+    run_id: Option<String>,
+    state: RunStateV1Wire,
+    lease: Option<LeaseV1Wire>,
+    generation: u64,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct SessionV1Wire {
+    id: String,
+    chat_session_id: Option<String>,
+    created_at: Timestamp,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum RunStateV1Wire {
+    Created,
+    Running,
+    Parked {
+        reason: ParkReasonV1Wire,
+        parked_at: Timestamp,
+        expires_at: Timestamp,
+        checkpoint: serde_json::Value,
+    },
+    Completed,
+    Failed {
+        cause: RunFailureCauseV1Wire,
+    },
+    Cancelled,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ParkReasonV1Wire {
+    ApprovalsBlocked { decisions: Vec<String> },
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+enum RunFailureCauseV1Wire {
+    ParkExpired { summary: String },
+    ExecutionFailed { summary: String },
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct LeaseV1Wire {
+    holder: String,
+    acquired_at: Timestamp,
+    heartbeat_at: Timestamp,
+    expires_at: Timestamp,
+    generation: u64,
+}
+
+impl From<&SessionRecord> for RunRecordV1 {
+    fn from(record: &SessionRecord) -> Self {
+        Self {
+            version: RUN_RECORD_VERSION,
+            session: SessionV1Wire {
+                id: record.session.id.to_string(),
+                chat_session_id: record
+                    .session
+                    .chat_session_id
+                    .as_ref()
+                    .map(|id| id.as_str().to_string()),
+                created_at: record.session.created_at,
+            },
+            run_id: record.run_id.map(|id| id.to_string()),
+            state: RunStateV1Wire::from(&record.state),
+            lease: record.lease.as_ref().map(LeaseV1Wire::from),
+            generation: record.generation.into(),
+        }
+    }
+}
+
+impl From<&park::RunState> for RunStateV1Wire {
+    fn from(state: &park::RunState) -> Self {
+        match state {
+            park::RunState::Created => RunStateV1Wire::Created,
+            park::RunState::Running => RunStateV1Wire::Running,
+            park::RunState::Parked {
+                reason,
+                parked_at,
+                expires_at,
+                checkpoint,
+            } => RunStateV1Wire::Parked {
+                reason: reason.into(),
+                parked_at: *parked_at,
+                expires_at: *expires_at,
+                checkpoint: serde_json::to_value(checkpoint.as_ref())
+                    .expect("a checkpoint envelope serializes to JSON"),
+            },
+            park::RunState::Completed => RunStateV1Wire::Completed,
+            park::RunState::Failed { cause } => RunStateV1Wire::Failed {
+                cause: cause.into(),
+            },
+            park::RunState::Cancelled => RunStateV1Wire::Cancelled,
+        }
+    }
+}
+
+impl From<&park::ParkReason> for ParkReasonV1Wire {
+    fn from(reason: &park::ParkReason) -> Self {
+        match reason {
+            park::ParkReason::ApprovalsBlocked { decisions } => {
+                ParkReasonV1Wire::ApprovalsBlocked {
+                    decisions: decisions.iter().map(|id| id.to_string()).collect(),
+                }
+            }
+        }
+    }
+}
+
+impl From<&park::RunFailureCause> for RunFailureCauseV1Wire {
+    fn from(cause: &park::RunFailureCause) -> Self {
+        match cause {
+            park::RunFailureCause::ParkExpired { summary } => RunFailureCauseV1Wire::ParkExpired {
+                summary: summary.clone(),
+            },
+            park::RunFailureCause::ExecutionFailed { summary } => {
+                RunFailureCauseV1Wire::ExecutionFailed {
+                    summary: summary.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl From<&park::Lease> for LeaseV1Wire {
+    fn from(lease: &park::Lease) -> Self {
+        Self {
+            holder: lease.holder.to_string(),
+            acquired_at: lease.acquired_at,
+            heartbeat_at: lease.heartbeat_at,
+            expires_at: lease.expires_at,
+            generation: lease.generation.into(),
+        }
+    }
+}
+
+fn v1_malformed(field: &str, err: impl std::fmt::Display) -> RunRecordError {
+    RunRecordError::Malformed {
+        reason: format!("{field}: {err}"),
+    }
+}
+
+impl TryFrom<RunRecordV1> for SessionRecord {
+    type Error = RunRecordError;
+
+    fn try_from(wire: RunRecordV1) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session: park::Session {
+                id: park::SessionId::parse(&wire.session.id)
+                    .map_err(|e| v1_malformed("session.id", e))?,
+                chat_session_id: wire.session.chat_session_id.map(park::ChatSessionId::new),
+                created_at: wire.session.created_at,
+            },
+            run_id: wire
+                .run_id
+                .map(|raw| raw.parse::<RunId>().map_err(|e| v1_malformed("run_id", e)))
+                .transpose()?,
+            state: wire.state.try_into()?,
+            lease: wire.lease.map(park::Lease::try_from).transpose()?,
+            generation: wire.generation.into(),
+        })
+    }
+}
+
+impl TryFrom<RunStateV1Wire> for park::RunState {
+    type Error = RunRecordError;
+
+    fn try_from(wire: RunStateV1Wire) -> Result<Self, Self::Error> {
+        Ok(match wire {
+            RunStateV1Wire::Created => park::RunState::Created,
+            RunStateV1Wire::Running => park::RunState::Running,
+            RunStateV1Wire::Parked {
+                reason,
+                parked_at,
+                expires_at,
+                checkpoint,
+            } => park::RunState::Parked {
+                reason: reason.try_into()?,
+                parked_at,
+                expires_at,
+                // Routed through the checkpoint's own version-gated codec so
+                // its refusal discipline applies here too.
+                checkpoint: Box::new(
+                    park::CheckpointEnvelope::from_json(&checkpoint.to_string())
+                        .map_err(|e| v1_malformed("state.checkpoint", format!("{e:?}")))?,
+                ),
+            },
+            RunStateV1Wire::Completed => park::RunState::Completed,
+            RunStateV1Wire::Failed { cause } => park::RunState::Failed {
+                cause: cause.into(),
+            },
+            RunStateV1Wire::Cancelled => park::RunState::Cancelled,
+        })
+    }
+}
+
+impl TryFrom<ParkReasonV1Wire> for park::ParkReason {
+    type Error = RunRecordError;
+
+    fn try_from(wire: ParkReasonV1Wire) -> Result<Self, Self::Error> {
+        match wire {
+            ParkReasonV1Wire::ApprovalsBlocked { decisions } => {
+                let decisions = decisions
+                    .iter()
+                    .map(|raw| DecisionId::parse(raw))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| v1_malformed("state.reason.decisions", e))?;
+                Ok(park::ParkReason::ApprovalsBlocked {
+                    decisions: park::NonEmpty::new(decisions)
+                        .map_err(|e| v1_malformed("state.reason.decisions", e))?,
+                })
+            }
+        }
+    }
+}
+
+impl From<RunFailureCauseV1Wire> for park::RunFailureCause {
+    fn from(wire: RunFailureCauseV1Wire) -> Self {
+        match wire {
+            RunFailureCauseV1Wire::ParkExpired { summary } => {
+                park::RunFailureCause::ParkExpired { summary }
+            }
+            RunFailureCauseV1Wire::ExecutionFailed { summary } => {
+                park::RunFailureCause::ExecutionFailed { summary }
+            }
+        }
+    }
+}
+
+impl TryFrom<LeaseV1Wire> for park::Lease {
+    type Error = RunRecordError;
+
+    fn try_from(wire: LeaseV1Wire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            holder: park::AgentInstanceId::parse(&wire.holder)
+                .map_err(|e| v1_malformed("lease.holder", e))?,
+            acquired_at: wire.acquired_at,
+            heartbeat_at: wire.heartbeat_at,
+            expires_at: wire.expires_at,
+            generation: wire.generation.into(),
+        })
+    }
+}
+
+/// Encode a record for storage at [`RUN_RECORD_VERSION`].
+#[expect(
+    unused_variables,
+    reason = "staged for #271: versioned run record encode"
+)]
+pub fn encode_run_record(record: &SessionRecord) -> Result<String, RunRecordError> {
+    todo!("staged for #271: versioned run record encode")
+}
+
+/// Decode a stored record, dispatching on its inline version tag before any
+/// body field is interpreted; an unknown version is refused, never guessed
+/// at. One decoder per version, each upcasting into the current
+/// [`SessionRecord`].
+#[expect(
+    unused_variables,
+    reason = "staged for #271: versioned run record decode"
+)]
+pub fn decode_run_record(raw: &str) -> Result<SessionRecord, RunRecordError> {
+    todo!("staged for #271: versioned run record decode + refusal gate")
 }
 
 impl From<&ParkedApproval> for ParkedApprovalRecord {
@@ -275,5 +584,115 @@ mod tests {
         };
         let err = AgentScope::try_from(scope).unwrap_err();
         assert!(err.reason.contains("not-a-uuid"));
+    }
+
+    /// Pins each v1 wire copy to the domain serde derives at the byte
+    /// level: for every run state, serializing through the wire tree must
+    /// produce a byte-identical JSON string to serializing the domain
+    /// record directly (minus the wire's inline version tag), so a field
+    /// reorder trips the pin too. One audited, location-anchored
+    /// normalization: the checkpoint payload is compared structurally and
+    /// spliced out of both strings before the byte comparison, because it
+    /// crosses the wire as the declared pinned-opaque boundary (its byte
+    /// shape is owned by its own codec and golden fixture, and JSON key
+    /// order inside an opaque `Value` is not part of the v1 contract).
+    #[test]
+    fn v1_wire_matches_domain_serialization() {
+        use crate::orchestration::park::{
+            AgentInstanceId, ChatSessionId, CheckpointEnvelope, FencingGeneration, Lease, NonEmpty,
+            ParkReason, RunCheckpoint, RunFailureCause, RunState, Session, SessionId,
+            SessionRecord,
+        };
+        let now = chrono::Utc::now();
+        let states = [
+            RunState::Created,
+            RunState::Running,
+            RunState::Parked {
+                reason: ParkReason::ApprovalsBlocked {
+                    decisions: NonEmpty::new(vec![DecisionId::generate()]).unwrap(),
+                },
+                parked_at: now,
+                expires_at: now + chrono::Duration::seconds(300),
+                checkpoint: Box::new(CheckpointEnvelope::new(RunCheckpoint::test_minimal())),
+            },
+            RunState::Completed,
+            RunState::Failed {
+                cause: RunFailureCause::ParkExpired {
+                    summary: "expired".to_string(),
+                },
+            },
+            RunState::Failed {
+                cause: RunFailureCause::ExecutionFailed {
+                    summary: "boom".to_string(),
+                },
+            },
+            RunState::Cancelled,
+        ];
+        for state in states {
+            let record = SessionRecord {
+                session: Session {
+                    id: SessionId::generate(),
+                    chat_session_id: Some(ChatSessionId::new("cs_wire")),
+                    created_at: now,
+                },
+                run_id: Some("018f9d2e-7c3a-7000-8000-000000000271".parse().unwrap()),
+                state,
+                lease: Some(Lease {
+                    holder: AgentInstanceId::generate(),
+                    acquired_at: now,
+                    heartbeat_at: now,
+                    expires_at: now + chrono::Duration::seconds(60),
+                    generation: FencingGeneration::INITIAL.next(),
+                }),
+                generation: FencingGeneration::INITIAL.next(),
+            };
+            let mut domain = serde_json::to_string(&record).expect("domain serializes");
+            let wire_record = RunRecordV1::from(&record);
+            let mut wire = serde_json::to_string(&wire_record).expect("wire serializes");
+
+            // The wire record leads with its inline version tag; the domain
+            // record has no version field. The literal pins V1's version
+            // byte: bumping RUN_RECORD_VERSION alone must fail this test.
+            let tag = "{\"version\":1,";
+            assert!(
+                wire.starts_with(tag),
+                "wire must lead with the version tag: {wire}"
+            );
+            wire.replace_range(..tag.len(), "{");
+
+            if let RunState::Parked { checkpoint, .. } = &record.state {
+                let domain_ck =
+                    serde_json::to_string(checkpoint.as_ref()).expect("checkpoint serializes");
+                let RunStateV1Wire::Parked {
+                    checkpoint: wire_ck_value,
+                    ..
+                } = &wire_record.state
+                else {
+                    panic!("wire state must mirror the parked domain state");
+                };
+                let wire_ck =
+                    serde_json::to_string(wire_ck_value).expect("checkpoint value serializes");
+                let domain_ck_value: serde_json::Value =
+                    serde_json::from_str(&domain_ck).expect("checkpoint parses");
+                assert_eq!(
+                    &domain_ck_value, wire_ck_value,
+                    "the opaque checkpoint payload drifted structurally",
+                );
+                assert_eq!(
+                    domain.matches(&domain_ck).count(),
+                    1,
+                    "checkpoint text must appear exactly once in the domain record",
+                );
+                assert_eq!(
+                    wire.matches(&wire_ck).count(),
+                    1,
+                    "checkpoint text must appear exactly once in the wire record",
+                );
+                domain = domain.replacen(&domain_ck, "\"<checkpoint>\"", 1);
+                wire = wire.replacen(&wire_ck, "\"<checkpoint>\"", 1);
+            }
+
+            assert_eq!(wire, domain, "wire copy drifted from the domain shape");
+        }
     }
 }

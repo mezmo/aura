@@ -162,6 +162,26 @@ pub enum PreCallOutcome {
     Proceed,
     /// Skip the wrapped tool and return this output as a successful tool result.
     ShortCircuit { output: String },
+    /// A gate durably parked the call for a human decision: the attempt ends
+    /// without executing, and the referenced approval outlives the request.
+    /// Distinct from `ShortCircuit` because no tool output exists — the call
+    /// is neither executed nor denied yet. Carries the same [`ApprovalRef`]
+    /// as `ToolAttemptOutcome::Blocked`; [`Self::into_blocked_attempt`] is
+    /// the lossless projection between the two.
+    ///
+    /// [`ApprovalRef`]: crate::orchestration::park::ApprovalRef
+    Blocked(crate::orchestration::park::ApprovalRef),
+}
+
+impl PreCallOutcome {
+    /// The tool-attempt projection of this gate outcome. Delegates to
+    /// [`ToolAttemptOutcome::from_blocked_pre_call`], the single
+    /// construction point for a blocked attempt.
+    ///
+    /// [`ToolAttemptOutcome::from_blocked_pre_call`]: crate::orchestration::park::ToolAttemptOutcome::from_blocked_pre_call
+    pub fn into_blocked_attempt(self) -> Option<crate::orchestration::park::ToolAttemptOutcome> {
+        crate::orchestration::park::ToolAttemptOutcome::from_blocked_pre_call(self)
+    }
 }
 
 impl TransformOutputResult {
@@ -507,6 +527,15 @@ where
             };
             match pre_call_result {
                 Ok(PreCallOutcome::Proceed) => {}
+                #[expect(
+                    unused_variables,
+                    reason = "staged for #271: blocked attempt termination"
+                )]
+                Ok(PreCallOutcome::Blocked(approval)) => {
+                    todo!(
+                        "staged for #271: blocked gate outcome ends the attempt as ToolAttemptOutcome::Blocked without executing"
+                    )
+                }
                 Ok(PreCallOutcome::ShortCircuit { output }) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -708,7 +737,11 @@ impl ToolWrapper for ComposedWrapper {
         for wrapper in &self.wrappers {
             match wrapper.pre_call(args, ctx).await? {
                 PreCallOutcome::Proceed => {}
-                outcome @ PreCallOutcome::ShortCircuit { .. } => return Ok(outcome),
+                // A blocked call short-circuits the remaining wrappers the
+                // same way a denial does: nothing downstream may run it.
+                outcome @ (PreCallOutcome::ShortCircuit { .. } | PreCallOutcome::Blocked(_)) => {
+                    return Ok(outcome);
+                }
             }
         }
         Ok(PreCallOutcome::Proceed)
