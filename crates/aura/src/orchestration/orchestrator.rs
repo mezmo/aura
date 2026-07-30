@@ -3749,6 +3749,8 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("internal server error")
             || lower.contains("504")
             || lower.contains("gateway timeout")
+            || lower.contains("invalid status code 408")
+            || lower.contains("408 request timeout")
             || lower.contains("connection refused")
             || lower.contains("connection reset")
             || lower.contains("reset by peer")
@@ -6060,6 +6062,64 @@ mod tests {
     }
 
     #[test]
+    fn test_categorize_request_timeout_as_provider_overloaded() {
+        // rig retries 408 at stream-open and only surfaces it once its budget
+        // is spent, so the exhausted error is a provider condition, not a
+        // replannable agent mistake.
+        // Verbatim shape observed in the #454 harness (runs/t408-exhausted).
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Worker failed task 0 after 1 attempts: CompletionError: ProviderError: Invalid status code 408 Request Timeout with message: {\"error\":\"throttled\"}"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        // Bare reason-phrase form, for a provider that omits rig's prefix.
+        assert_eq!(
+            Orchestrator::categorize_failure_error("408 Request Timeout"),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_408_match_does_not_swallow_other_provider_categories() {
+        // Both 408 patterns are anchored so a stray "408" in another status's
+        // body cannot pull it onto the overloaded arm, which runs first.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 404 Not Found with message: model 'foo-408' not found"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 401 Unauthorized with message: key ending 408 is revoked"
+            ),
+            FailureCategory::ProviderAuthError
+        );
+    }
+
+    #[test]
+    fn test_own_streaming_timeout_is_not_a_provider_error() {
+        // streaming_request_hook.rs emits this noun-form message for aura's
+        // own deadline. It carries no status code, so it must not reach the
+        // provider arm. Pinned to the exact category it lands in today, so a
+        // future arm cannot quietly capture it.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Request timeout (30s) exceeded during planning - cancelling"
+            ),
+            FailureCategory::AgentError
+        );
+    }
+
+    #[test]
+    fn test_request_timeout_is_transient_for_the_planning_loop() {
+        assert!(is_transient_planning_error(
+            "CompletionError: ProviderError: Invalid status code 408 Request Timeout with message: upstream took too long"
+        ));
+    }
+
+    #[test]
     fn test_categorize_provider_not_found() {
         // Gemini 404 — rig formats as "Invalid status code 404 Not Found with message: ..."
         assert_eq!(
@@ -6221,6 +6281,10 @@ mod tests {
         );
         assert_eq!(
             Orchestrator::categorize_failure_error("planning timed out after 503s"),
+            FailureCategory::AgentTimeout
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("planning timed out after 408s"),
             FailureCategory::AgentTimeout
         );
         // Non-colliding budget stays AgentTimeout too.
