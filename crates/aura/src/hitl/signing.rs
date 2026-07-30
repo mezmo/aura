@@ -62,7 +62,7 @@ impl fmt::Debug for PrimarySecret {
     }
 }
 
-/// Secondary HMAC secret. The type has no sign method.
+/// Secondary HMAC secret.
 #[derive(Clone)]
 pub struct SecondarySecret(SecretBytes);
 
@@ -101,10 +101,8 @@ impl fmt::Debug for SecretBytes {
 
 /// A validated label bound into the signed payload.
 ///
-/// Carries the resource identity and direction (see the module-level context
-/// registry). Forbidding the `.` delimiter is what keeps the signed-string
-/// encoding injective, so the invariant is enforced at construction rather
-/// than assumed by callers.
+/// Carries the resource identity and direction (see the module-level
+/// context registry).
 #[derive(Debug, Clone)]
 pub struct SigningContext(String);
 
@@ -174,10 +172,6 @@ impl AsRef<Signature> for SignatureHeader {
 }
 
 /// A 32-byte HMAC-SHA256 signature tag.
-///
-/// Deliberately has no `PartialEq`/`Eq` and no public byte accessor:
-/// comparison is confined to the constant-time primitive inside this
-/// module, so a non-constant-time `==` cannot be written against it.
 #[derive(Debug, Clone)]
 pub struct Signature([u8; 32]);
 
@@ -246,13 +240,6 @@ impl fmt::Display for Tolerance {
 }
 
 /// The headers produced by signing an egress request.
-///
-/// The signature and timestamp are a matched pair from one signing operation.
-/// Consuming the pair via `into_pairs` (with no field accessors) makes mixing
-/// a signature and timestamp from different results deliberate work on the
-/// returned strings rather than a zero-effort default; it is atomic-use
-/// hygiene, not an unrepresentable state. A mismatched pair is a
-/// self-inflicted 401 at the receiver, with no attacker leverage.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
     signature: SignatureHeader,
@@ -263,6 +250,11 @@ impl SignedHeaders {
     /// Consumes the pair into `(header_name, header_value)` entries ready to
     /// attach to a request: the `X-Aura-Signature-256` and `X-Aura-Timestamp`
     /// headers, in that order.
+    ///
+    /// With no field accessors, mixing a signature and timestamp from different
+    /// results is deliberate work on the returned strings rather than a
+    /// zero-effort default. A mismatched pair is a self-inflicted 401 at the
+    /// receiver, with no attacker leverage.
     pub fn into_pairs(self) -> [(&'static str, String); 2] {
         [
             (SIGNATURE_HEADER, self.signature.raw),
@@ -271,10 +263,7 @@ impl SignedHeaders {
     }
 }
 
-/// Loaded HMAC configuration. `None` from the loader means the feature is off.
-///
-/// The off state is unrepresentable in `sign`/`verify`: callers must hold a
-/// `WebhookHmac` to reach those methods.
+/// Loaded HMAC configuration.
 #[derive(Clone)]
 pub struct WebhookHmac {
     primary: PrimarySecret,
@@ -510,13 +499,6 @@ pub enum VerificationError {
 }
 
 /// Body that has passed ingress authorization.
-///
-/// Wraps the immutable `Bytes` it was verified over. It has no public
-/// constructor other than [`authorize_ingress`], so possessing one proves
-/// authorization ran on exactly these bytes. The witness holds `Bytes`
-/// specifically — not a generic `AsRef<[u8]>` — so that the verified bytes
-/// are frozen at authorization time and a later read cannot return a
-/// different slice than the one that was verified.
 pub struct VerifiedBody(Bytes);
 
 impl VerifiedBody {
@@ -877,12 +859,9 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn signed_timestamp_renders_back_to_parsed_bytes() {
-        let ts = UnixTimestamp::now().unwrap();
-        assert_eq!(UnixTimestamp::parse(&ts.to_string()).unwrap(), ts);
+        // A rendered timestamp is canonical, so it parses back unchanged.
+        let now = UnixTimestamp::now().unwrap();
+        assert_eq!(UnixTimestamp::parse(&now.to_string()).unwrap(), now);
     }
 
     // --- constrained construction ---
@@ -983,17 +962,15 @@ mod tests {
     }
 
     #[test]
-    fn load_from_env_empty_primary_is_config_error() {
+    fn load_from_env_short_primary_is_config_error() {
+        // Empty hits the trim guard; "short" hits the constructor floor.
+        // Both are distinct rejection paths, not a silent disable.
         with_env(&[(PRIMARY_SECRET_VAR, Some(""))], || {
             assert!(matches!(
                 WebhookHmac::load_from_env().unwrap_err(),
                 ConfigError::PrimaryTooShort { len: 0 }
             ));
         });
-    }
-
-    #[test]
-    fn load_from_env_short_primary_is_config_error() {
         with_env(&[(PRIMARY_SECRET_VAR, Some("short"))], || {
             assert!(matches!(
                 WebhookHmac::load_from_env().unwrap_err(),
