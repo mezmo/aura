@@ -425,6 +425,7 @@ pub fn extract_reasoning(mut args: Value) -> (Option<String>, Value) {
 #[cfg(test)]
 mod tests {
     use crate::WrappedTool;
+    use crate::hitl::ApprovalItem;
     use rig::tool::{Tool as RigTool, ToolError};
 
     fn test_wrapper(persistence: Arc<Mutex<ExecutionPersistence>>) -> PersistenceWrapper {
@@ -1406,14 +1407,12 @@ mod tests {
         }
     }
 
-    /// Drives a hard-gated tool call carrying `_aura_reasoning` through the
-    /// full wrapper chain (PersistenceWrapper + HitlApprovalWrapper via
-    /// ComposedWrapper) and asserts:
-    /// - the approval payload item carries `tool_call_intent`
-    /// - `items[].arguments` does NOT contain `_aura_reasoning`
-    /// - the args the inner tool executes with do NOT contain `_aura_reasoning`
-    #[tokio::test]
-    async fn config_gate_forwards_tool_call_intent_and_strips_reasoning() {
+    /// Drive one hard-gated `kubectl_*` tool call through the full wrapper
+    /// chain (gate first, persistence last — the orchestrator.rs order, so
+    /// `transform_args` strips `_aura_reasoning` before the gate reads the
+    /// cleaned args) and return the production-built parked `ApprovalItem`
+    /// plus the args the inner tool executed with.
+    async fn run_config_gate_tool(reasoning: Option<&str>) -> (ApprovalItem, Value) {
         use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
         use crate::hitl::{
             AgentScope, ApprovalDecision, DecisionId, DecisionRoute, HitlApprovalWrapper,
@@ -1426,7 +1425,6 @@ mod tests {
         use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper, WrappedTool};
         use aura_config::GlobPattern;
 
-        // Inspectable store so we can read the parked ApprovalRequest.
         let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
         let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
         let registry = PendingApprovals::with_backend(store.clone(), bus);
@@ -1445,9 +1443,6 @@ mod tests {
 
         let request_id = format!("req_w2_{}", uuid::Uuid::new_v4().simple());
 
-        // Gate first, persistence last — matches orchestrator.rs wrapper vec
-        // order so persistence.transform_args strips _aura_reasoning before
-        // the gate's pre_call reads the cleaned args.
         let gate: Arc<dyn ToolWrapper> = Arc::new(HitlApprovalWrapper::new(
             Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
             route,
@@ -1469,18 +1464,19 @@ mod tests {
                 ToolCallContext::new(tool_name).with_task_context(2, initiator.clone(), 1)
             });
 
-        // Subscribe before the call so the Requested event is captured.
+        // Subscribe before the spawn so the Requested event is not missed.
         let mut rx = approval_event_broker::subscribe(&request_id).await;
 
-        let args = serde_json::json!({
+        let mut args = serde_json::json!({
             "namespace": "prod",
-            "resource": "deploy/web",
-            "_aura_reasoning": "rollout restart to pick up the new config map"
+            "resource": "deploy/web"
         });
+        if let Some(r) = reasoning {
+            args["_aura_reasoning"] = serde_json::Value::String(r.to_string());
+        }
         let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
             tokio::spawn(async move { wrapped.call(args).await });
 
-        // Wait for the Requested event and extract the decision_id.
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("requested event should arrive")
@@ -1492,14 +1488,38 @@ mod tests {
             other => panic!("expected Requested event, got {:?}", other),
         };
 
-        // Inspect the parked request.
         let parked = store
             .get(&decision_id)
             .await
             .unwrap()
             .expect("parked approval exists");
-        assert_eq!(parked.request.items.len(), 1);
-        let item = &parked.request.items[0];
+        assert_eq!(parked.request.items.len(), 1, "config_gate parks one item");
+        let item = parked.request.items.into_iter().next().expect("one item");
+
+        registry_for_resolve
+            .resolve(&decision_id, ApprovalDecision::Approved)
+            .await
+            .expect("resolve");
+
+        let result = call_handle.await.expect("call task did not panic");
+        assert!(result.is_ok(), "approved call should succeed: {:?}", result);
+
+        let executed = received
+            .lock()
+            .unwrap()
+            .take()
+            .expect("inner tool was called");
+
+        approval_event_broker::unsubscribe(&request_id).await;
+
+        (item, executed)
+    }
+
+    #[tokio::test]
+    async fn config_gate_forwards_tool_call_intent_and_strips_reasoning() {
+        let (item, executed) =
+            run_config_gate_tool(Some("rollout restart to pick up the new config map")).await;
+
         assert_eq!(
             item.tool_call_intent.as_deref(),
             Some("rollout restart to pick up the new config map"),
@@ -1510,157 +1530,43 @@ mod tests {
             "items[].arguments must not contain _aura_reasoning"
         );
 
-        // Verify the wire shape: ApprovalItem serializes with tool_call_intent
-        // present and _aura_reasoning absent from arguments.
-        let item_wire = serde_json::to_value(item).expect("item serializable");
+        let item_wire = serde_json::to_value(&item).expect("item serializable");
         assert_eq!(
             item_wire["tool_call_intent"],
             "rollout restart to pick up the new config map"
         );
         assert!(item_wire["arguments"].get("_aura_reasoning").is_none());
 
-        // Approve so the inner tool runs.
-        registry_for_resolve
-            .resolve(&decision_id, ApprovalDecision::Approved)
-            .await
-            .expect("resolve");
-
-        // Await the tool call.
-        let result = call_handle.await.expect("call task did not panic");
-        assert!(result.is_ok(), "approved call should succeed: {:?}", result);
-
-        // The inner tool received args WITHOUT _aura_reasoning.
-        let executed = received
-            .lock()
-            .unwrap()
-            .take()
-            .expect("inner tool was called");
         assert!(
             executed.get("_aura_reasoning").is_none(),
             "executed args must not contain _aura_reasoning"
         );
         assert_eq!(executed["namespace"], "prod");
-
-        approval_event_broker::unsubscribe(&request_id).await;
     }
 
-    /// Absent-reasoning counterpart to `config_gate_forwards_tool_call_intent_and_strips_reasoning`:
-    /// a hard-gated tool call carrying NO `_aura_reasoning` must produce an
+    /// A hard-gated tool call carrying NO `_aura_reasoning` must produce an
     /// approval payload item that OMITS `tool_call_intent` entirely (never
     /// `null`, never `""`) on the serialized wire.
     #[tokio::test]
     async fn config_gate_omits_tool_call_intent_when_reasoning_absent() {
-        use crate::approval_event_broker::{self, ApprovalLifecycleEvent};
-        use crate::hitl::{
-            AgentScope, ApprovalDecision, DecisionId, DecisionRoute, HitlApprovalWrapper,
-            PendingApprovals,
-        };
-        use crate::orchestration::{RunId, TaskIdentity};
-        use crate::session_store::{
-            ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus,
-        };
-        use crate::tool_wrapper::{ComposedWrapper, ToolCallContext, ToolWrapper, WrappedTool};
-        use aura_config::GlobPattern;
+        let (item, executed) = run_config_gate_tool(None).await;
 
-        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
-        let bus: Arc<dyn EventBus> = Arc::new(InMemoryEventBus::new());
-        let registry = PendingApprovals::with_backend(store.clone(), bus);
-        let registry_for_resolve = registry.clone();
-        let route = Arc::new(DecisionRoute::Conversational {
-            registry,
-            timeout: std::time::Duration::from_secs(60),
-        });
-
-        let run_id: RunId = "0191e8c0-2222-7000-8000-000000000000".parse().unwrap();
-        let scope = AgentScope::Worker {
-            run_id,
-            task: TaskIdentity::new(3, Some("k8s-agent".to_string())),
-            session_id: None,
-        };
-
-        let request_id = format!("req_w2_absent_{}", uuid::Uuid::new_v4().simple());
-
-        let gate: Arc<dyn ToolWrapper> = Arc::new(HitlApprovalWrapper::new(
-            Arc::from([GlobPattern::new("kubectl_*").unwrap()]),
-            route,
-            scope,
-            request_id.clone(),
-        ));
-        let persistence: Arc<dyn ToolWrapper> = Arc::new(test_wrapper(Arc::new(Mutex::new(
-            ExecutionPersistence::disabled(),
-        ))));
-        let composed = ComposedWrapper::new(vec![gate, persistence]);
-
-        let received = Arc::new(std::sync::Mutex::new(None::<Value>));
-        let inner = ArgsRecordingTool {
-            received: received.clone(),
-        };
-        let initiator = "k8s-agent".to_string();
-        let wrapped =
-            WrappedTool::new(inner, Arc::new(composed)).with_context_factory(move |tool_name| {
-                ToolCallContext::new(tool_name).with_task_context(3, initiator.clone(), 1)
-            });
-
-        let mut rx = approval_event_broker::subscribe(&request_id).await;
-
-        // NO _aura_reasoning — the model omitted the optional field.
-        let args = serde_json::json!({
-            "namespace": "prod",
-            "resource": "deploy/web"
-        });
-        let call_handle: tokio::task::JoinHandle<Result<String, ToolError>> =
-            tokio::spawn(async move { wrapped.call(args).await });
-
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("requested event should arrive")
-            .expect("event channel open");
-        let decision_id = match event {
-            ApprovalLifecycleEvent::Requested(req) => {
-                DecisionId::parse(&req.decision_id).expect("valid decision id")
-            }
-            other => panic!("expected Requested event, got {:?}", other),
-        };
-
-        let parked = store
-            .get(&decision_id)
-            .await
-            .unwrap()
-            .expect("parked approval exists");
-        assert_eq!(parked.request.items.len(), 1);
-        let item = &parked.request.items[0];
         assert!(
             item.tool_call_intent.is_none(),
             "absent reasoning must not surface as tool_call_intent"
         );
 
-        // Wire shape: tool_call_intent must be OMITTED (never null, never "").
-        let item_wire = serde_json::to_value(item).expect("item serializable");
+        let item_wire = serde_json::to_value(&item).expect("item serializable");
         assert!(
             item_wire.get("tool_call_intent").is_none(),
             "tool_call_intent must be omitted on the wire when reasoning is absent, got: {}",
             item_wire
         );
 
-        registry_for_resolve
-            .resolve(&decision_id, ApprovalDecision::Approved)
-            .await
-            .expect("resolve");
-
-        let result = call_handle.await.expect("call task did not panic");
-        assert!(result.is_ok(), "approved call should succeed: {:?}", result);
-
-        let executed = received
-            .lock()
-            .unwrap()
-            .take()
-            .expect("inner tool was called");
         assert!(
             executed.get("_aura_reasoning").is_none(),
             "executed args must not contain _aura_reasoning"
         );
         assert_eq!(executed["namespace"], "prod");
-
-        approval_event_broker::unsubscribe(&request_id).await;
     }
 }
