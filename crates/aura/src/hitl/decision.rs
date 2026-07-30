@@ -85,6 +85,14 @@ pub enum ApprovalOutcome {
     Cancelled(CancelReason),
 }
 
+/// The parked approval a blocked task is waiting on: the binding between a
+/// pending decision and the task whose gated call raised it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRef {
+    pub decision_id: DecisionId,
+    pub task: TaskIdentity,
+}
+
 /// Who is requesting the approval. Embedded in events and the webhook payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentScope {

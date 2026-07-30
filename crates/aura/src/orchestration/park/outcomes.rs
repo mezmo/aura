@@ -1,18 +1,11 @@
 //! Typed outcomes that carry a park signal from the tool layer to the run
 //! loop (ADR 2026-07-21, decision 11).
 
-use crate::hitl::{DecisionId, Timestamp};
-use crate::orchestration::types::{FailureCategory, StructuredTaskOutput, TaskIdentity};
+use crate::hitl::{ApprovalRef, Timestamp};
+use crate::orchestration::types::{FailureCategory, StructuredTaskOutput};
 
 use super::ids::SessionId;
 use super::non_empty::NonEmpty;
-
-/// The parked approval a blocked task is waiting on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApprovalRef {
-    pub decision_id: DecisionId,
-    pub task: TaskIdentity,
-}
 
 /// A blocked tool attempt. The field is private and the only constructor is
 /// [`ToolAttemptOutcome::from_blocked_pre_call`], so every

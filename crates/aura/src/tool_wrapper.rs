@@ -169,8 +169,8 @@ pub enum PreCallOutcome {
     /// as `ToolAttemptOutcome::Blocked`; [`Self::into_blocked_attempt`] is
     /// the lossless projection between the two.
     ///
-    /// [`ApprovalRef`]: crate::orchestration::park::ApprovalRef
-    Blocked(crate::orchestration::park::ApprovalRef),
+    /// [`ApprovalRef`]: crate::hitl::ApprovalRef
+    Blocked(crate::hitl::ApprovalRef),
 }
 
 impl PreCallOutcome {
