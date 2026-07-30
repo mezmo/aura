@@ -877,12 +877,9 @@ mod tests {
                 "{bad:?} must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn signed_timestamp_renders_back_to_parsed_bytes() {
-        let ts = UnixTimestamp::now().unwrap();
-        assert_eq!(UnixTimestamp::parse(&ts.to_string()).unwrap(), ts);
+        // A rendered timestamp is canonical, so it parses back unchanged.
+        let now = UnixTimestamp::now().unwrap();
+        assert_eq!(UnixTimestamp::parse(&now.to_string()).unwrap(), now);
     }
 
     // --- constrained construction ---
@@ -983,17 +980,15 @@ mod tests {
     }
 
     #[test]
-    fn load_from_env_empty_primary_is_config_error() {
+    fn load_from_env_short_primary_is_config_error() {
+        // Empty hits the trim guard; "short" hits the constructor floor.
+        // Both are distinct rejection paths, not a silent disable.
         with_env(&[(PRIMARY_SECRET_VAR, Some(""))], || {
             assert!(matches!(
                 WebhookHmac::load_from_env().unwrap_err(),
                 ConfigError::PrimaryTooShort { len: 0 }
             ));
         });
-    }
-
-    #[test]
-    fn load_from_env_short_primary_is_config_error() {
         with_env(&[(PRIMARY_SECRET_VAR, Some("short"))], || {
             assert!(matches!(
                 WebhookHmac::load_from_env().unwrap_err(),

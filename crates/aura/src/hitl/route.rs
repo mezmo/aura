@@ -431,7 +431,29 @@ mod tests {
     use super::super::protocol::{
         ApprovalDecisionWire, ApprovalItem, ApprovalRequest, ApprovalRequestWire, PROTOCOL_VERSION,
     };
+    use super::super::registry::PendingApprovals;
     use super::DecisionRoute;
+    use std::time::Duration;
+
+    fn conv_route(timeout: Duration) -> (PendingApprovals, DecisionRoute) {
+        let registry = PendingApprovals::new();
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout,
+        };
+        (registry, route)
+    }
+
+    fn single_request(request_id: &str, origin: ApprovalOrigin) -> ApprovalRequest {
+        ApprovalRequest {
+            version: PROTOCOL_VERSION,
+            decision_id: DecisionId::generate(),
+            request_id: request_id.into(),
+            scope: AgentScope::Single { session_id: None },
+            origin,
+            items: vec![],
+        }
+    }
 
     #[test]
     fn single_agent_request_wire_shape() {
@@ -532,25 +554,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_approved() {
-        use super::super::registry::PendingApprovals;
-        use std::time::Duration;
-
-        let registry = PendingApprovals::new();
-        let route = DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: Duration::from_secs(60),
-        };
-        let decision_id = DecisionId::generate();
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id,
-            request_id: "conv-req-1".into(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::AgentRequested {
+        let (registry, route) = conv_route(Duration::from_secs(60));
+        let request = single_request(
+            "conv-req-1",
+            ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
             },
-            items: vec![],
-        };
+        );
+        let decision_id = request.decision_id;
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
 
         let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
@@ -579,25 +590,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_denied() {
-        use super::super::registry::PendingApprovals;
-        use std::time::Duration;
-
-        let registry = PendingApprovals::new();
-        let route = DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: Duration::from_secs(60),
-        };
-        let decision_id = DecisionId::generate();
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id,
-            request_id: "conv-req-2".into(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::ConfigGate {
+        let (registry, route) = conv_route(Duration::from_secs(60));
+        let request = single_request(
+            "conv-req-2",
+            ApprovalOrigin::ConfigGate {
                 matched_pattern: "rm_*".into(),
             },
-            items: vec![],
-        };
+        );
+        let decision_id = request.decision_id;
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
 
         let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
@@ -633,25 +633,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_times_out() {
-        use super::super::registry::{PendingApprovals, ResolveError};
-        use std::time::Duration;
+        use super::super::registry::ResolveError;
 
-        let registry = PendingApprovals::new();
-        let route = DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: Duration::from_secs(5),
-        };
-        let decision_id = DecisionId::generate();
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id,
-            request_id: "conv-req-3".into(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::AgentRequested {
+        let (registry, route) = conv_route(Duration::from_secs(5));
+        let request = single_request(
+            "conv-req-3",
+            ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
             },
-            items: vec![],
-        };
+        );
+        let decision_id = request.decision_id;
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
 
         let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
@@ -674,24 +665,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn conversational_decide_cancelled_on_disconnect() {
-        use super::super::registry::PendingApprovals;
-        use std::time::Duration;
-
-        let registry = PendingApprovals::new();
-        let route = DecisionRoute::Conversational {
-            registry,
-            timeout: Duration::from_secs(60),
-        };
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id: DecisionId::generate(),
-            request_id: "conv-req-4".into(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::AgentRequested {
+        let (_, route) = conv_route(Duration::from_secs(60));
+        let request = single_request(
+            "conv-req-4",
+            ApprovalOrigin::AgentRequested {
                 reason: "test".into(),
             },
-            items: vec![],
-        };
+        );
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
 
         let decide_handle: tokio::task::JoinHandle<Result<ApprovalOutcome, super::ApprovalError>> =
@@ -712,27 +692,16 @@ mod tests {
 
     #[tokio::test]
     async fn conversational_resolve_at_requested_event_succeeds() {
-        use super::super::decision::ApprovalDecision;
-        use super::super::registry::PendingApprovals;
-
         let request_id = format!("req_test_{}", uuid::Uuid::new_v4().simple());
         let mut rx = crate::approval_event_broker::subscribe(&request_id).await;
 
-        let registry = PendingApprovals::new();
-        let route = DecisionRoute::Conversational {
-            registry: registry.clone(),
-            timeout: std::time::Duration::from_secs(60),
-        };
-        let request = ApprovalRequest {
-            version: PROTOCOL_VERSION,
-            decision_id: DecisionId::generate(),
-            request_id: request_id.clone(),
-            scope: AgentScope::Single { session_id: None },
-            origin: ApprovalOrigin::ConfigGate {
+        let (registry, route) = conv_route(Duration::from_secs(60));
+        let request = single_request(
+            &request_id,
+            ApprovalOrigin::ConfigGate {
                 matched_pattern: "dangerous_*".into(),
             },
-            items: vec![],
-        };
+        );
         let decision_id = request.decision_id;
 
         let cancel = crate::request_cancellation::RequestCancelToken::unbound();
@@ -741,7 +710,7 @@ mod tests {
             async move { route.decide(request, &cancel).await }
         });
 
-        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("requested event should arrive")
             .expect("requested event channel open");
