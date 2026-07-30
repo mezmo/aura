@@ -148,6 +148,70 @@ impl Default for TimeoutsConfig {
 }
 
 // ============================================================================
+// Retry Sub-Config
+// ============================================================================
+
+/// Retry configuration for the orchestration planning loop.
+///
+/// The schedule is local to aura-config: it does not reuse rig's
+/// `ExponentialBackoff` (aura-config stays free of rig-core) and is
+/// independent of `RetryHint`, which governs MCP tool-error retries for a
+/// different consumer.
+///
+/// # Example
+///
+/// ```toml
+/// [orchestration.retry]
+/// base_delay_ms = 500
+/// max_delay_ms = 5000
+/// max_retries = 3
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Base delay (milliseconds). Default: 500.
+    #[serde(default = "default_base_delay_ms")]
+    pub base_delay_ms: u64,
+
+    /// Maximum delay (milliseconds). Default: 5000.
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+
+    /// Maximum transient retries after the initial planning call. Default: 3.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            base_delay_ms: default_base_delay_ms(),
+            max_delay_ms: default_max_delay_ms(),
+            max_retries: default_max_retries(),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Delay before transient planning retry `retry_num` (1-based).
+    ///
+    /// Retry 1 uses the base delay; each subsequent retry doubles the
+    /// previous delay, capped at `max_delay_ms`. Saturating arithmetic — a
+    /// huge `retry_num` returns the cap without panicking. Each retry is a
+    /// fresh `per_call_timeout_secs` budget, so one coordinator planning call
+    /// is bounded by `(max_retries + 1) × per_call_timeout_secs` plus the
+    /// cumulative backoff.
+    pub fn delay_for_retry(&self, retry_num: usize) -> std::time::Duration {
+        // Multiplier is 2^(retry_num - 1): retry 1 -> base, each subsequent doubles.
+        let exponent = retry_num.saturating_sub(1).min(128);
+        let multiplier = 1u128.checked_shl(exponent as u32).unwrap_or(u128::MAX);
+        let delay_ms = (self.base_delay_ms as u128)
+            .saturating_mul(multiplier)
+            .min(self.max_delay_ms as u128);
+        std::time::Duration::from_millis(u64::try_from(delay_ms).expect("capped u128 fits u64"))
+    }
+}
+
+// ============================================================================
 // Artifacts Sub-Config
 // ============================================================================
 
@@ -298,6 +362,9 @@ pub struct OrchestrationConfig {
     /// Timeout settings for LLM calls.
     pub timeouts: TimeoutsConfig,
 
+    /// Retry settings for the planning loop.
+    pub retry: RetryConfig,
+
     /// Artifact and persistence settings.
     pub artifacts: ArtifactsConfig,
 }
@@ -318,6 +385,7 @@ impl Default for OrchestrationConfig {
             duplicate_call_nudge_threshold: default_duplicate_call_nudge_threshold(),
             duplicate_call_block_threshold: default_duplicate_call_block_threshold(),
             timeouts: TimeoutsConfig::default(),
+            retry: RetryConfig::default(),
             artifacts: ArtifactsConfig::default(),
         }
     }
@@ -496,6 +564,8 @@ struct RawOrchestrationConfig {
     #[serde(default)]
     timeouts: Option<TimeoutsConfig>,
     #[serde(default)]
+    retry: Option<RetryConfig>,
+    #[serde(default)]
     artifacts: Option<ArtifactsConfig>,
     // Flat artifact fields (backward compat)
     #[serde(default, alias = "memory_path")]
@@ -522,6 +592,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
         let raw = RawOrchestrationConfig::deserialize(deserializer)?;
 
         let timeouts = raw.timeouts.unwrap_or_default();
+        let retry = raw.retry.unwrap_or_default();
 
         // Build artifacts: flat fields override sub-table defaults
         let mut artifacts = raw.artifacts.unwrap_or_default();
@@ -561,6 +632,7 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             duplicate_call_nudge_threshold: raw.duplicate_call_nudge_threshold,
             duplicate_call_block_threshold: raw.duplicate_call_block_threshold,
             timeouts,
+            retry,
             artifacts,
         })
     }
@@ -580,6 +652,18 @@ fn default_max_tools_per_worker() -> usize {
 
 fn default_per_call_timeout_secs() -> u64 {
     0
+}
+
+fn default_base_delay_ms() -> u64 {
+    500
+}
+
+fn default_max_delay_ms() -> u64 {
+    5000
+}
+
+fn default_max_retries() -> usize {
+    3
 }
 
 fn default_max_plan_parse_retries() -> usize {
@@ -1010,5 +1094,96 @@ mod tests {
         let config: OrchestrationConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.tool_output_artifact_threshold(), 100);
         assert_eq!(config.tool_output_duration_threshold_ms(), 2000);
+    }
+
+    #[test]
+    fn test_retry_defaults_when_absent() {
+        let toml = r#"
+            enabled = true
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.retry.base_delay_ms, 500);
+        assert_eq!(config.retry.max_delay_ms, 5000);
+        assert_eq!(config.retry.max_retries, 3);
+    }
+
+    #[test]
+    fn test_retry_full_custom_round_trips() {
+        let toml = r#"
+            enabled = true
+
+            [retry]
+            base_delay_ms = 250
+            max_delay_ms = 8000
+            max_retries = 5
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.retry.base_delay_ms, 250);
+        assert_eq!(config.retry.max_delay_ms, 8000);
+        assert_eq!(config.retry.max_retries, 5);
+    }
+
+    #[test]
+    fn test_retry_partial_uses_defaults_for_unset() {
+        let toml = r#"
+            enabled = true
+
+            [retry]
+            max_retries = 5
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.retry.base_delay_ms, 500);
+        assert_eq!(config.retry.max_delay_ms, 5000);
+        assert_eq!(config.retry.max_retries, 5);
+    }
+
+    #[test]
+    fn test_delay_for_retry_schedule() {
+        use std::time::Duration;
+        let config = RetryConfig::default();
+        assert_eq!(config.delay_for_retry(1), Duration::from_millis(500));
+        assert_eq!(config.delay_for_retry(2), Duration::from_millis(1000));
+        assert_eq!(config.delay_for_retry(3), Duration::from_millis(2000));
+        assert_eq!(config.delay_for_retry(4), Duration::from_millis(4000));
+        // Capped at max (5000).
+        assert_eq!(config.delay_for_retry(5), Duration::from_millis(5000));
+        // Huge retry_num does not panic and returns the cap.
+        assert_eq!(config.delay_for_retry(1000), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_retry_max_retries_zero_round_trips() {
+        let toml = r#"
+            enabled = true
+
+            [retry]
+            max_retries = 0
+        "#;
+        let config: OrchestrationConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.retry.max_retries, 0);
+    }
+
+    #[test]
+    fn test_delay_for_retry_base_zero_returns_zero() {
+        use std::time::Duration;
+        let config = RetryConfig {
+            base_delay_ms: 0,
+            max_delay_ms: 5000,
+            max_retries: 3,
+        };
+        assert_eq!(config.delay_for_retry(1), Duration::from_millis(0));
+        assert_eq!(config.delay_for_retry(10), Duration::from_millis(0));
+    }
+
+    #[test]
+    fn test_delay_for_retry_max_below_base_caps_at_max() {
+        use std::time::Duration;
+        let config = RetryConfig {
+            base_delay_ms: 500,
+            max_delay_ms: 200,
+            max_retries: 3,
+        };
+        // The cap wins even on the first retry.
+        assert_eq!(config.delay_for_retry(1), Duration::from_millis(200));
     }
 }
