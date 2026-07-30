@@ -54,6 +54,7 @@ mod persistence;
 pub(crate) mod persistence_wrapper;
 mod prompt_constants;
 mod prompt_journal;
+mod sink;
 mod stream_events;
 mod templates;
 pub mod tools;
@@ -73,6 +74,7 @@ pub use persistence::{
     build_session_context, load_session_manifests,
 };
 pub use persistence_wrapper::PersistenceWrapper;
+pub use sink::{BusEventSink, ChannelEventSink, RunEventSink};
 pub use stream_events::EventContext;
 pub use stream_events::OrchestrationStreamEvent;
 pub use stream_events::event_names;

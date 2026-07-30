@@ -24,6 +24,47 @@ impl FencingGeneration {
     }
 }
 
+impl From<FencingGeneration> for u64 {
+    fn from(generation: FencingGeneration) -> Self {
+        generation.0
+    }
+}
+
+/// Storage-boundary reconstruction: a decoded record is authoritative for
+/// the generation it carries. Live protocol code advances generations only
+/// through [`FencingGeneration::next`].
+impl From<u64> for FencingGeneration {
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// A lease duration that cannot be zero: a zero TTL would mint a lease
+/// already expired at acquisition, an ownership claim no fencing check can
+/// distinguish from a lost one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LeaseTtl(std::time::Duration);
+
+/// A zero duration was offered as a lease TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a lease ttl must be positive")]
+pub struct ZeroLeaseTtl;
+
+impl LeaseTtl {
+    pub fn new(ttl: std::time::Duration) -> Result<Self, ZeroLeaseTtl> {
+        if ttl.is_zero() {
+            Err(ZeroLeaseTtl)
+        } else {
+            Ok(Self(ttl))
+        }
+    }
+
+    #[must_use]
+    pub fn get(self) -> std::time::Duration {
+        self.0
+    }
+}
+
 /// Exclusive session ownership held by one [`super::AgentInstance`].
 ///
 /// `generation` is the fencing token issued to the holder; while the lease

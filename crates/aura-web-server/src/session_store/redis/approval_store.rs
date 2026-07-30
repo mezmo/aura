@@ -181,6 +181,15 @@ impl ApprovalStore for RedisApprovalStore {
             .transpose()
     }
 
+    #[expect(unused_variables, reason = "staged for #271: durable resolution")]
+    async fn resolve_durable(
+        &self,
+        id: &DecisionId,
+        decision: ApprovalDecision,
+    ) -> Result<aura::orchestration::park::WakeReason, ResolveError> {
+        todo!("staged for #271: durable resolution preserving the redis record")
+    }
+
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         self.take(id).await.map(|_| ())
     }

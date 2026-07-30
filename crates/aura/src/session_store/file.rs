@@ -177,6 +177,22 @@ impl ApprovalStore for FileApprovalStore {
         }
     }
 
+    async fn decision(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+        todo!("staged for #271: read back the decision recorded for {id} (P7-completion)")
+    }
+
+    #[expect(unused_variables, reason = "staged for #271: durable resolution")]
+    async fn resolve_durable(
+        &self,
+        id: &DecisionId,
+        decision: ApprovalDecision,
+    ) -> Result<crate::orchestration::park::WakeReason, ResolveError> {
+        todo!("staged for #271: durable resolution preserving the record file")
+    }
+
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
         let id = *id;
         self.blocking(move |dir| take_record(&dir, &id).map(|_| ()))

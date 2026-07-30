@@ -12,8 +12,11 @@ use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use std::sync::Arc;
+
 use crate::config::AgentRuntimeConfig;
 use crate::provider_agent::{StreamError, StreamItem};
+use crate::session_store::RunStore;
 use crate::streaming::StreamingAgent;
 
 use super::orchestrator::{
@@ -26,11 +29,26 @@ use super::orchestrator::{
 /// allocation and ensure MCP progress notifications route correctly.
 pub struct OrchestratorFactory {
     agent_config: AgentRuntimeConfig,
+    /// The durable-parking capability from the deployment's session store,
+    /// when it provides one. Handed to each lazily built `Orchestrator` the
+    /// same way `usage_state` is; `None` (the default) means quiescent
+    /// blocking cannot park and refuses fail-closed.
+    run_store: Option<Arc<dyn RunStore>>,
 }
 
 impl OrchestratorFactory {
     pub fn new(agent_config: AgentRuntimeConfig) -> Self {
-        Self { agent_config }
+        Self {
+            agent_config,
+            run_store: None,
+        }
+    }
+
+    /// Arm durable parking with the session store's run-store capability.
+    #[must_use]
+    pub fn with_run_store(mut self, run_store: Arc<dyn RunStore>) -> Self {
+        self.run_store = Some(run_store);
+        self
     }
 
     /// Spawn the background orchestration task and return its event stream.
@@ -52,6 +70,7 @@ impl OrchestratorFactory {
         outer_budget: Option<Duration>,
     ) -> BoxStream<'static, Result<StreamItem, StreamError>> {
         let agent_config = self.agent_config.clone();
+        let run_store = self.run_store.clone();
 
         // Create channel for orchestrator events
         let (event_tx, event_rx) =
@@ -73,6 +92,7 @@ impl OrchestratorFactory {
                 // are visible to the streaming handler (UsageState is Arc-backed).
                 orchestrator.usage_state = usage_state;
                 orchestrator.outer_budget = outer_budget;
+                orchestrator.run_store = run_store;
 
                 // Set MCP request ID for progress notification routing, and
                 // surface per-server connection status so degraded/unavailable
