@@ -1024,16 +1024,48 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// Ingress HMAC verification state for `POST /v1/approvals/{decision_id}`,
+/// injected by the router as an `Extension` layer. Loaded once at startup from
+/// the `AURA_HITL_WEBHOOK_SECRET*` environment; `None` means the feature is
+/// off and ingress behaves byte-identically to the unverified endpoint.
+#[derive(Clone)]
+pub struct IngressHmac(pub Option<aura::hitl::WebhookHmac>);
+
 /// Resolve a parked conversational approval by decision id.
 ///
 /// `POST /v1/approvals/{decision_id}` — the ingress endpoint for attended
 /// approval decisions. Accepts the same JSON body as the webhook response:
 /// `{ "approved": bool, "reason": "..." }`.
+///
+/// With an HMAC secret configured, the raw request body must verify against
+/// `X-Aura-Signature-256` / `X-Aura-Timestamp` (context
+/// `approval-decision:{decision_id}`) before anything is parsed or the
+/// approval registry is touched; failures get a uniform 401.
 pub async fn resolve_approval(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(IngressHmac(hmac)): axum::extract::Extension<IngressHmac>,
     axum::extract::Path(decision_id_str): axum::extract::Path<String>,
-    Json(body): Json<aura::hitl::ApprovalDecisionWire>,
+    request: axum::extract::Request,
 ) -> Response {
+    use axum::extract::FromRequest;
+
+    // Branch on the HMAC configuration BEFORE deciding how to consume the
+    // body, so the off state stays structurally identical to the
+    // pre-verification handler (no pre-buffering, stock extractor chain).
+    let body = match &hmac {
+        // Feature off: the stock `Json` extractor runs exactly as it did when
+        // it was the handler's extractor argument — same content-type check,
+        // same body limit, same rejection statuses and bodies.
+        None => match Json::<aura::hitl::ApprovalDecisionWire>::from_request(request, &()).await {
+            Ok(Json(body)) => body,
+            Err(rejection) => return rejection.into_response(),
+        },
+        Some(hmac) => match verify_approval_ingress(hmac, &decision_id_str, request).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        },
+    };
+
     let decision_id = match aura::hitl::DecisionId::parse(&decision_id_str) {
         Ok(id) => id,
         Err(_) => {
@@ -1067,6 +1099,97 @@ pub async fn resolve_approval(
 /// Generate a chat session ID (simple GUID)
 fn generate_chat_session_id() -> String {
     format!("cs_{}", Uuid::new_v4().simple())
+}
+
+/// The HMAC-ON ingress path for `resolve_approval`: buffer the raw bytes
+/// (under the default body limit), authorize them, then feed the verified
+/// bytes through the stock `Json` extractor.
+///
+/// EVERY pre-verification failure — missing/malformed headers, skew,
+/// signature mismatch, an unbuildable context, and body-limit exhaustion
+/// while buffering — maps to the same uniform 401; the real cause is logged
+/// server-side only. Post-verification JSON rejections (415/400/422) surface
+/// as-is: the request is already authenticated at that point.
+async fn verify_approval_ingress(
+    hmac: &aura::hitl::WebhookHmac,
+    decision_id_str: &str,
+    request: axum::extract::Request,
+) -> Result<aura::hitl::ApprovalDecisionWire, Response> {
+    use axum::extract::FromRequest;
+
+    // Raw bytes first: the signature covers the body exactly as received, so
+    // verification must run before any JSON parse. The `Bytes` extractor
+    // keeps the default body limit, so the HMAC never runs over an unbounded
+    // body.
+    let (parts, body) = request.into_parts();
+    let raw_request = axum::extract::Request::from_parts(parts.clone(), body);
+    let body = match Bytes::from_request(raw_request, &()).await {
+        Ok(bytes) => bytes,
+        Err(rejection) => {
+            tracing::warn!(
+                status = %rejection.status(),
+                "rejecting approval decision: could not buffer request body for verification"
+            );
+            return Err(unauthorized_response());
+        }
+    };
+
+    // Authorization runs before the path uuid is parsed; the signed context
+    // binds the raw path segment, so a captured signature cannot be re-aimed
+    // at another decision (A1 context binding). An id the context rejects
+    // cannot have been signed, so it is a verification failure like any other.
+    let context =
+        match aura::hitl::SigningContext::new(&format!("approval-decision:{decision_id_str}")) {
+            Ok(context) => context,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "rejecting approval decision: decision id is not a valid signing context"
+                );
+                return Err(unauthorized_response());
+            }
+        };
+    // First header value; a non-UTF-8 value counts as missing. Names are
+    // matched case-insensitively by HeaderMap.
+    let signature = parts
+        .headers
+        .get(aura::hitl::SIGNATURE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let timestamp = parts
+        .headers
+        .get(aura::hitl::TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let verified =
+        match aura::hitl::authorize_ingress(Some(hmac), &context, signature, timestamp, body) {
+            Ok(verified) => verified,
+            Err(err) => {
+                // Uniform 401 on the wire; the variant detail is log-only.
+                tracing::warn!(
+                    error = %err,
+                    "rejecting approval decision: webhook signature verification failed"
+                );
+                return Err(unauthorized_response());
+            }
+        };
+
+    // Feed the verified bytes back through the stock `Json` extractor so the
+    // 415/400/422 rejection behavior matches the off-state chain.
+    let request = axum::extract::Request::from_parts(parts, Body::from(verified.into_inner()));
+    match Json::<aura::hitl::ApprovalDecisionWire>::from_request(request, &()).await {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) => Err(rejection.into_response()),
+    }
+}
+
+/// The uniform 401 for every ingress verification failure: one wire shape
+/// regardless of which check failed (missing header, skew, mismatch, ...), so
+/// the response leaks nothing about the verification internals.
+fn unauthorized_response() -> Response {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "invalid or missing webhook signature",
+        "unauthorized",
+    )
 }
 
 fn error_response(
@@ -1964,11 +2087,19 @@ url = "http://127.0.0.1:9"
         }
 
         fn approval_router(state: Arc<AppState>) -> Router {
+            approval_router_with_hmac(state, None)
+        }
+
+        fn approval_router_with_hmac(
+            state: Arc<AppState>,
+            hmac: Option<aura::hitl::WebhookHmac>,
+        ) -> Router {
             Router::new()
                 .route(
                     "/v1/approvals/{decision_id}",
                     post(super::super::resolve_approval),
                 )
+                .layer(axum::extract::Extension(super::super::IngressHmac(hmac)))
                 .with_state(state)
         }
 
@@ -2069,6 +2200,291 @@ url = "http://127.0.0.1:9"
                     .unwrap()
                     .contains("invalid decision id")
             );
+        }
+
+        // Golden frame for the Json -> Bytes extractor swap: with no secret
+        // configured, the rejection statuses must match the stock `Json`
+        // extractor's behavior exactly.
+
+        #[tokio::test]
+        async fn resolve_wrong_content_type_returns_415() {
+            let app = approval_router(test_app_state());
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v1/approvals/{}",
+                            aura::hitl::DecisionId::generate()
+                        ))
+                        .header("content-type", "text/plain")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
+        #[tokio::test]
+        async fn resolve_unknown_field_returns_422() {
+            let app = approval_router(test_app_state());
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v1/approvals/{}",
+                            aura::hitl::DecisionId::generate()
+                        ))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            r#"{"approved": true, "extra_field": 1}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+
+        /// One byte past the default axum body limit (2 MB).
+        fn oversized_body() -> String {
+            "x".repeat(2 * 1024 * 1024 + 1)
+        }
+
+        #[tokio::test]
+        async fn off_path_oversized_wrong_content_type_returns_415() {
+            // Pre-change behavior: the stock `Json` extractor rejects on
+            // content-type BEFORE reading the body, so an oversized text/plain
+            // request gets 415, never a body-limit rejection. The off path
+            // must preserve that exactly.
+            let app = approval_router(test_app_state());
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v1/approvals/{}",
+                            aura::hitl::DecisionId::generate()
+                        ))
+                        .header("content-type", "text/plain")
+                        .body(axum::body::Body::from(oversized_body()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+            );
+        }
+
+        // --- HMAC-verified ingress (secret configured) ---
+
+        /// Loads a `WebhookHmac` through the only cross-crate constructor
+        /// (`load_from_env`) — a genuine env-path use, kept minimal per the
+        /// Gate A B3 arbitration: the process env is mutated exactly once per
+        /// test binary, inside the `OnceLock` initializer (which serializes
+        /// concurrent callers), and the result is cached. This is the only
+        /// env mutation in the aura-web-server test binary; keep it that way.
+        fn ingress_test_hmac() -> aura::hitl::WebhookHmac {
+            static HMAC: std::sync::OnceLock<aura::hitl::WebhookHmac> = std::sync::OnceLock::new();
+            HMAC.get_or_init(|| {
+                // SAFETY: the sole env mutation in this binary, executed once,
+                // serialized by the OnceLock initializer.
+                unsafe {
+                    std::env::set_var(
+                        "AURA_HITL_WEBHOOK_SECRET",
+                        "0123456789abcdef0123456789abcdef",
+                    );
+                }
+                let hmac = aura::hitl::WebhookHmac::load_from_env()
+                    .expect("valid test secret")
+                    .expect("secret is set");
+                // SAFETY: as above.
+                unsafe {
+                    std::env::remove_var("AURA_HITL_WEBHOOK_SECRET");
+                }
+                hmac
+            })
+            .clone()
+        }
+
+        async fn park_approval(
+            state: &Arc<AppState>,
+        ) -> (aura::hitl::DecisionId, aura::hitl::AwaitingDecision) {
+            let req = aura::hitl::ApprovalRequest {
+                version: aura::hitl::PROTOCOL_VERSION,
+                decision_id: aura::hitl::DecisionId::generate(),
+                request_id: "req-hmac".into(),
+                scope: aura::hitl::AgentScope::Single { session_id: None },
+                origin: aura::hitl::ApprovalOrigin::ConfigGate {
+                    matched_pattern: "test_*".into(),
+                },
+                items: vec![],
+            };
+            let decision_id = req.decision_id;
+            let handle = state
+                .pending_approvals
+                .register(req, Duration::from_secs(60))
+                .await;
+            (decision_id, handle)
+        }
+
+        fn signed_request(
+            hmac: &aura::hitl::WebhookHmac,
+            decision_id_path: &str,
+            body: &str,
+        ) -> axum::http::Request<axum::body::Body> {
+            let context =
+                aura::hitl::SigningContext::new(&format!("approval-decision:{decision_id_path}"))
+                    .unwrap();
+            let pairs = hmac.sign(&context, body.as_bytes()).unwrap().into_pairs();
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/approvals/{decision_id_path}"))
+                .header("content-type", "application/json");
+            for (name, value) in pairs {
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn signed_request_resolves_approval() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let (decision_id, handle) = park_approval(&state).await;
+            // Keep `state` alive past the response: the registry's wake
+            // channel lives in it.
+            let app = approval_router_with_hmac(state.clone(), Some(hmac.clone()));
+
+            let response = app
+                .oneshot(signed_request(
+                    &hmac,
+                    &decision_id.to_string(),
+                    r#"{"approved":true}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+
+            let cancel = aura::request_cancellation::RequestCancelToken::unbound();
+            assert_eq!(
+                handle.outcome(&cancel).await,
+                aura::hitl::ApprovalOutcome::Decided(aura::hitl::ApprovalDecision::Approved)
+            );
+        }
+
+        #[tokio::test]
+        async fn unsigned_request_gets_401_before_registry_is_touched() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let (decision_id, _handle) = park_approval(&state).await;
+            let app = approval_router_with_hmac(state.clone(), Some(hmac.clone()));
+
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/approvals/{decision_id}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"approved": true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+            // The 401 fired before the registry was touched: the approval is
+            // still pending and resolvable by a signed request.
+            let app = approval_router_with_hmac(state, Some(hmac.clone()));
+            let response = app
+                .oneshot(signed_request(
+                    &hmac,
+                    &decision_id.to_string(),
+                    r#"{"approved":true}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        }
+
+        #[tokio::test]
+        async fn tampered_body_gets_401() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let (decision_id, _handle) = park_approval(&state).await;
+            let app = approval_router_with_hmac(state, Some(hmac.clone()));
+
+            let mut request =
+                signed_request(&hmac, &decision_id.to_string(), r#"{"approved":true}"#);
+            *request.body_mut() = axum::body::Body::from(r#"{"approved":false}"#);
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn signature_for_other_decision_gets_401() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let (decision_id, _handle) = park_approval(&state).await;
+            let app = approval_router_with_hmac(state, Some(hmac.clone()));
+
+            // Sign for a different decision id, then aim it at the parked
+            // one: the A1 context binding must reject the re-aim.
+            let other = aura::hitl::DecisionId::generate();
+            let mut request = signed_request(&hmac, &other.to_string(), r#"{"approved":true}"#);
+            *request.uri_mut() = format!("/v1/approvals/{decision_id}").parse().unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn on_path_oversized_unsigned_gets_401() {
+            // With a secret configured, every pre-verification failure —
+            // including body-limit exhaustion while buffering — is the same
+            // uniform 401, so the rejection reveals nothing before auth.
+            let hmac = ingress_test_hmac();
+            let app = approval_router_with_hmac(test_app_state(), Some(hmac));
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v1/approvals/{}",
+                            aura::hitl::DecisionId::generate()
+                        ))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(oversized_body()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn missing_timestamp_header_gets_401() {
+            let hmac = ingress_test_hmac();
+            let state = test_app_state();
+            let (decision_id, _handle) = park_approval(&state).await;
+            let app = approval_router_with_hmac(state, Some(hmac.clone()));
+
+            let mut request =
+                signed_request(&hmac, &decision_id.to_string(), r#"{"approved":true}"#);
+            request.headers_mut().remove(aura::hitl::TIMESTAMP_HEADER);
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
         }
     }
 }

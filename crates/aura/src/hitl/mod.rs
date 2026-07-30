@@ -44,5 +44,12 @@ pub use decision::{
 pub use gate::HitlApprovalWrapper;
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 pub use registry::{ParkedApproval, PendingApprovals, ResolveError};
-pub use route::{ApprovalError, DecisionRoute, HitlRuntime, WebhookClient};
+pub use route::{
+    ApprovalError, DecisionRoute, HitlRuntime, PlaintextWebhookUrlError, WebhookClient,
+    validate_webhook_signing_config,
+};
+pub use signing::{
+    SIGNATURE_HEADER, SignedHeaders, SigningContext, TIMESTAMP_HEADER, VerificationError,
+    VerifiedBody, WebhookHmac, authorize_ingress,
+};
 pub use tool::{RequestApprovalArgs, RequestApprovalTool};

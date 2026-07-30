@@ -1,4 +1,4 @@
-# HITL webhook HMAC design — W3 typed-holes skeleton
+# HITL webhook HMAC design - W3 typed-holes skeleton
 
 This document is the design-panel input for card W3 (#399). It describes the
 HMAC-SHA256 root-of-trust module for the approval exchange. The accompanying
@@ -34,7 +34,7 @@ dotted field, or relaxing the context charset would break it.
 | `Tolerance` | Skew tolerance is between 1 and `MAX_TOLERANCE_SECS` (86400s). | Zero or an out-of-range tolerance cannot be constructed; `Tolerance::new` returns `ConfigError`. |
 | `SignedHeaders` | Egress headers are a matched pair from one signing operation. | Removing field accessors and consuming the pair via `into_pairs` makes mixing a signature and timestamp from different results deliberate work on raw strings, not a zero-effort default; it is atomic-use hygiene, not an unrepresentable state (a mismatched pair is a self-inflicted 401, no attacker leverage). |
 | `WebhookHmac` | Signing and verification exist only when a secret is configured. | The feature-off state is `Option<WebhookHmac>`; `sign`/`verify` are unreachable without one. |
-| `VerifiedBody` | Body bytes reach the deserializer only after authorization ran on exactly those bytes. | `VerifiedBody` wraps immutable `Bytes` (not a generic `AsRef<[u8]>`, whose slice could vary between reads) and has no public constructor but `authorize_ingress`, which consumes the body — so a caller cannot obtain the verified bytes without the authorization result, and the bytes are frozen at verification time (residual risk 7). |
+| `VerifiedBody` | Body bytes reach the deserializer only after authorization ran on exactly those bytes. | `VerifiedBody` wraps immutable `Bytes` (not a generic `AsRef<[u8]>`, whose slice could vary between reads). Its only public constructor is `authorize_ingress`, which consumes the body: a caller cannot obtain the verified bytes without the authorization result, and the bytes are frozen at verification time (residual risk 7). |
 | `ConfigError` / `ContextError` / `SigningError` / `ClockError` / `VerificationError` | Failures are classified precisely; no catch-all. | Each failure has a named, testable case; a misconfiguration cannot be silently read as feature-off. |
 
 ## 2. Visibility and seam table
@@ -43,8 +43,8 @@ dotted field, or relaxing the context charset would break it.
 |---|---|---|---|
 | `signing.rs` module | private (`mod signing;`) | Internal to `aura` crate | Re-export deferred until U(design) ratifies the surface (see §5). Rows below describe the post-re-export surface. |
 | `WebhookHmac::new` | `pub` | Constructor | Byte-oriented, flow-agnostic. Enforces the `MIN_SECRET_BYTES` (32) floor on primary and secondary; the floor lives here, not on the secret constructors, so the policy has one home. |
-| `WebhookHmac::load_from_env` | `pub` | Env loader | Thin HITL-named wrapper over `new`. Reads `AURA_HITL_WEBHOOK_SECRET`, `_SECONDARY`, and `AURA_HITL_WEBHOOK_TOLERANCE_SECS`. `Ok(None)` only when the primary is genuinely absent; a secondary-without-primary, empty/short primary, malformed/out-of-range tolerance, or non-Unicode value returns `Err`. **Startup logging contract**: `warn!` "HITL webhook HMAC verification DISABLED" on `Ok(None)`; `info!` on `Ok(Some)` naming secondary-present and tolerance, never key material. |
-| `WebhookHmac::sign` | `pub` | Egress signing | **Seam**: `route.rs:195-230` (`WebhookClient::request_approval`) serializes `ApprovalRequestWire` with `serde_json::to_vec`, calls `sign(&context, &body)` with context `approval-request:{decision_id}`, and attaches the two headers via `SignedHeaders::into_pairs`. |
+| `WebhookHmac::load_from_env` | `pub` | Env loader | Thin HITL-named wrapper over `new`. Reads `AURA_HITL_WEBHOOK_SECRET`, `_SECONDARY`, and `AURA_HITL_WEBHOOK_TOLERANCE_SECS`. `Ok(None)` only when the primary is absent from the environment altogether; a secondary-without-primary, empty/short primary, malformed/out-of-range tolerance, or non-Unicode value returns `Err`. **Startup logging contract**: `warn!` "HITL webhook HMAC verification DISABLED" on `Ok(None)`; `info!` on `Ok(Some)` naming secondary-present and tolerance, never key material. |
+| `WebhookHmac::sign` | `pub` | Egress signing | **Seam**: `route.rs:195-230` (`WebhookClient::request_approval`) serializes `ApprovalRequestWire` with `serde_json::to_vec` and calls `sign(&context, &body)` with context `approval-request:{decision_id}`; the two headers attach via `SignedHeaders::into_pairs`. |
 | `WebhookHmac::verify` | `pub(crate)` | Internal verification | Configured-path step called by `authorize_ingress`; not exposed. Evaluates primary then, if configured, secondary, so timing reveals only "did the primary sign this" to a key holder. |
 | `authorize_ingress` | `pub` | Ingress + response verification | **Seam (ingress)**: `handlers.rs:1032-1051` (`resolve_approval`) swaps its extractor to `Bytes`, calls `authorize_ingress` **before** parsing the path UUID, with context `approval-decision:{decision_id}`, then `serde_json::from_slice::<ApprovalDecisionWire>(verified.as_ref())`. **Seam (Route A response)**: `route.rs` verifies the webhook *response* body+headers with the same call and context before treating it as a decision (see §4). |
 | `VerifiedBody` | `pub` | Verified witness | Consumes an immutable `Bytes`; `as_ref`/`into_inner` expose the authorized bytes. Only `authorize_ingress` constructs it. |
@@ -60,11 +60,11 @@ dotted field, or relaxing the context charset would break it.
 
 ## 3. Named residual risks
 
-1. **Secret encoding — DECIDED.** Env var values are raw UTF-8 bytes used
+1. **Secret encoding - DECIDED.** Env var values are raw UTF-8 bytes used
    directly as HMAC key material. Operators generate at least 32 random bytes
    (`openssl rand -hex 32` yields a 64-char ASCII key, used as-is). Documented
    in `docs/hitl.md`; no base64/hex decoding step.
-2. **Unset vs empty primary — fail loud on empty.** Only a genuinely *unset*
+2. **Unset vs empty primary - fail loud on empty.** Only an *unset*
    `AURA_HITL_WEBHOOK_SECRET` yields `Ok(None)` (feature off, intentional). A
    var that is present but empty or whitespace-only is a misconfiguration, not
    a disable: `load_from_env` returns `Err(ConfigError::PrimaryTooShort {
@@ -72,7 +72,7 @@ dotted field, or relaxing the context charset would break it.
    precedent (`aura-config/src/session_store.rs:136`), because a silently
    disabled security control is the failure mode the vet flagged. The
    startup-log contract (§2) makes the disabled state greppable regardless.
-3. **Constant-time verification across both secrets — RESOLVED.** The
+3. **Constant-time verification across both secrets - RESOLVED.** The
    primary-then-secondary fallback distinguishes only "primary matched" (one
    HMAC) from "everything else" (both HMACs); "secondary matched" and "no
    match" share a timing class, so the observable requires already holding the
@@ -120,7 +120,7 @@ dotted field, or relaxing the context charset would break it.
    decision arrives as the HTTP *response* to AURA's signed POST. It is
    verified with the same `authorize_ingress` over the response body and its
    `X-Aura-*` headers, context `approval-decision:{decision_id}`, before being
-   treated as a decision. Additionally, `WebhookUrl` rejects `http://` when a
+   treated as a decision. `WebhookUrl` also rejects `http://` when a
    secret is configured (a plaintext response channel would defeat the point).
    Without this the card cannot claim "root of trust on both legs" for Route
    A.
@@ -180,3 +180,22 @@ Secrets are read once at startup, so rotation is a three-restart procedure:
    `_SECONDARY`, restart. The old key no longer verifies.
 
 Each step is a rolling restart; at no point is verification disabled.
+
+## 7. Test construction policy (Gate A B3)
+
+`std::env::set_var` is process-global, so tests must not mutate the
+environment while any other test in the same binary can read it.
+
+- Inside `aura`, tests build `WebhookHmac` from parts via the public
+  `WebhookHmac::new` (no environment involved). Only the `load_from_env`
+  tests in `signing.rs` touch the env — they exist to exercise exactly that
+  path — and they serialize behind the module's single `ENV_LOCK`.
+- `WebhookClient::new` deliberately does not read the environment; signing
+  is resolved in `HitlRuntime::from_config` (the production path). This
+  keeps every pre-existing `WebhookClient::new` test env-free.
+- `aura-web-server` cannot name the secret part types (the facade exports
+  only the DESIGN §5 set), so its ingress tests obtain one `WebhookHmac`
+  through `load_from_env` inside a `OnceLock` initializer: the env is
+  mutated exactly once per test binary, serialized by the `OnceLock`, and
+  the value is cached. That initializer must remain the only env mutation
+  in the aura-web-server test binary.
