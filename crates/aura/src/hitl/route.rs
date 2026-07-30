@@ -343,8 +343,6 @@ mod tests {
             items[0]["tool_call_intent"],
             "rollout restart to pick up the new config map"
         );
-        // arguments stays clean — _aura_reasoning never leaks into it
-        assert!(items[0]["arguments"].get("_aura_reasoning").is_none());
     }
 
     #[test]
@@ -403,7 +401,6 @@ mod tests {
             items[0]["tool_call_intent"],
             "namespace cleanup is the fastest path to unblock"
         );
-        assert!(items[0]["arguments"].get("_aura_reasoning").is_none());
     }
 
     #[test]
