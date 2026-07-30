@@ -202,17 +202,8 @@ pub(crate) fn build_webhook_client() -> reqwest::Client {
 /// a warning (matching `mcp_streamable_http.rs`).
 ///
 /// Opt-in only: nothing is forwarded unless the operator configures it.
-/// Resolved per request at agent-build time (orchestration resolves once
-/// before workers spawn).
-///
-/// NOTE (271 board, ADR decision 13): the 271 park/reify board adds header
-/// classification (`identity` vs `credential`) at park time. Unclassified
-/// headers default to credential (fail-closed) there — they refuse to park.
-/// That classification's only enforcement point is park time, which does not
-/// exist on main. This wave ships the plain `headers` / `headers_from_request`
-/// surface without classification; adding a classification key later is purely
-/// additive TOML, never a retrofit break. Forwarded headers are never
-/// persisted anywhere in this wave.
+/// Classification is deliberately absent from this surface — see
+/// [`apply_request_header_mappings`](crate::rig_builder::apply_request_header_mappings).
 fn resolve_webhook_headers(
     static_headers: &HashMap<String, String>,
     headers_from_request: &HashMap<String, String>,
@@ -221,12 +212,18 @@ fn resolve_webhook_headers(
     let empty = HashMap::new();
     let req_headers = req_headers.unwrap_or(&empty);
 
-    let mut resolved = static_headers.clone();
-    crate::rig_builder::apply_request_header_mappings(
+    let mut resolved: HashMap<String, String> = static_headers
+        .iter()
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    let resolved_count = crate::rig_builder::apply_request_header_mappings(
         &mut resolved,
         headers_from_request,
         req_headers,
     );
+    if resolved_count > 0 {
+        tracing::info!("Webhook route: resolved {resolved_count} header(s) from request");
+    }
 
     let mut header_map = HeaderMap::new();
     for (key, value) in &resolved {
@@ -253,11 +250,7 @@ fn resolve_webhook_headers(
 pub struct WebhookClient {
     client: reqwest::Client,
     url: WebhookUrl,
-    /// Operator-configured headers resolved at agent-build time: static
-    /// `headers` overlaid with `headers_from_request` values from the
-    /// inbound client request. Invalid header names/values were skipped
-    /// with a warning at resolution time. Empty when no headers are
-    /// configured, producing the same bare POST as before.
+    /// Resolved webhook headers.
     headers: HeaderMap,
 }
 
@@ -300,8 +293,7 @@ impl WebhookClient {
             .timeout(timeout);
 
         // Apply resolved operator-configured headers on top of the JSON body
-        // (which already set Content-Type). An empty map adds nothing, so the
-        // POST is byte-for-byte identical to the pre-header-forwarding path.
+        // (which already set Content-Type).
         for (name, value) in self.headers.iter() {
             builder = builder.header(name.clone(), value.clone());
         }
@@ -817,6 +809,29 @@ mod tests {
     }
 
     #[test]
+    fn webhook_headers_mixed_casing_static_and_dynamic_keys() {
+        // Static headers use "Authorization" (capitalized) while the
+        // headers_from_request outbound key uses "authorization" (lowercase).
+        // Both refer to the same HTTP header; the dynamic value must override
+        // the static fallback deterministically, not non-deterministically
+        // based on HashMap iteration order.
+        let static_headers = make_req_headers(&[("Authorization", "static-token")]);
+        let headers_from_request = make_req_headers(&[("authorization", "x-incoming-auth")]);
+        let req_headers = make_req_headers(&[("x-incoming-auth", "dynamic-token")]);
+
+        let header_map = super::resolve_webhook_headers(
+            &static_headers,
+            &headers_from_request,
+            Some(&req_headers),
+        );
+        assert_eq!(
+            header_map.get("authorization").unwrap(),
+            "dynamic-token",
+            "dynamic header must override static fallback regardless of key casing"
+        );
+    }
+
+    #[test]
     fn webhook_headers_invalid_skipped() {
         // Header name with a space is invalid per RFC 7230; the entry must
         // be skipped with a warning, not panic.
@@ -912,9 +927,8 @@ mod tests {
     #[test]
     fn webhook_headers_empty_config_produces_bare_post() {
         // Empty config (no static, no from_request, no req_headers) must
-        // produce an empty HeaderMap. With an empty HeaderMap, the
-        // request_approval loop does not execute, so the POST is
-        // byte-for-byte identical to the pre-header-forwarding path.
+        // produce an empty HeaderMap, so the header loop in request_approval
+        // adds nothing to the POST.
         let static_headers = std::collections::HashMap::new();
         let headers_from_request = std::collections::HashMap::new();
 
@@ -1060,7 +1074,7 @@ mod tests {
     async fn webhook_empty_config_sends_no_custom_headers() {
         let (port, mut rx) = spawn_capturing_webhook(1).await;
 
-        // Empty HeaderMap — same as the pre-header-forwarding path.
+        // Empty HeaderMap: the POST carries no custom headers.
         let client = super::WebhookClient::new_with_headers(
             super::build_webhook_client(),
             aura_config::WebhookUrl::new(format!("http://127.0.0.1:{port}")).unwrap(),
@@ -1085,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn webhook_empty_headers_match_bare_client_byte_for_byte() {
         // Empty configuration must produce a request byte-for-byte identical
-        // to the pre-header-forwarding path (`WebhookClient::new`). Here we
+        // to the bare constructor (`WebhookClient::new`). Here we
         // capture the COMPLETE raw request (headers AND body) from both
         // constructors run sequentially against the SAME mock server (so Host
         // and port are identical) and assert the captured request texts are
@@ -1105,7 +1119,7 @@ mod tests {
         // guarantees the body was actually captured.
         let decision_id = request.decision_id.to_string();
 
-        // Capture 1: the pre-header-forwarding constructor (no headers field).
+        // Capture 1: the bare constructor (no headers configured).
         let bare = super::DecisionRoute::Webhook {
             client: super::WebhookClient::new(super::build_webhook_client(), url.clone()),
             timeout: std::time::Duration::from_secs(5),

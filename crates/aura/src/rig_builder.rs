@@ -169,22 +169,6 @@ impl RigBuilder {
 /// headers, overlaying resolved values on top of `headers`. Static values
 /// already present in `headers` serve as fallback when the mapped request
 /// header is absent.
-///
-/// Returns the number of mappings that resolved a value from the request,
-/// counting both new inserts and overrides of an existing static header —
-/// not the change in `headers` length, which an override leaves unchanged.
-///
-/// HTTP header names are case-insensitive (RFC 7230): the inbound lookup
-/// lowercases both sides, so TOML config values using any casing match
-/// actix-web's lowercased header names.
-///
-/// NOTE (271 board, ADR decision 13): the 271 park/reify board adds header
-/// classification (`identity` vs `credential`) at park time. Unclassified
-/// headers default to credential (fail-closed) there — they refuse to park.
-/// That classification's only enforcement point is park time, which does not
-/// exist on main. This wave ships the plain `headers` / `headers_from_request`
-/// surface without classification; adding a classification key later is purely
-/// additive TOML. Forwarded headers are never persisted anywhere in this wave.
 pub(crate) fn apply_request_header_mappings(
     headers: &mut HashMap<String, String>,
     headers_from_request: &HashMap<String, String>,
@@ -198,7 +182,7 @@ pub(crate) fn apply_request_header_mappings(
             .find(|(k, _)| k.to_lowercase() == req_header_lower)
             .map(|(_, v)| v)
         {
-            headers.insert(header_key.clone(), value.clone());
+            headers.insert(header_key.to_lowercase(), value.clone());
             resolved += 1;
         }
     }
@@ -400,7 +384,7 @@ mod tests {
 
         let headers = get_server_headers(&config);
         assert_eq!(
-            headers.get("Authorization"),
+            headers.get("authorization"),
             Some(&"Token my-token".to_string()),
             "case-insensitive lookup should resolve lowercased request header"
         );

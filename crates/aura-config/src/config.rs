@@ -1151,13 +1151,10 @@ pub enum DecisionRouteConfig {
         url: WebhookUrl,
         #[serde(default = "default_webhook_timeout_secs")]
         timeout_secs: u64,
-        /// Static headers always sent on the webhook POST.
+        /// Static webhook headers.
         #[serde(default)]
         headers: HashMap<String, String>,
-        /// Opt-in mapping of outbound header name → inbound request header
-        /// name. Nothing is forwarded unless listed here; the operator owns
-        /// the risk. Static `headers` values serve as fallback when the
-        /// mapped request header is absent.
+        /// Outbound header name → inbound request header name mapping.
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
     },
