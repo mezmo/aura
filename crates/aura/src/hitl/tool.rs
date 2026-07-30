@@ -50,10 +50,8 @@ pub struct RequestApprovalArgs {
     /// Optional structured metadata for the reviewer.
     #[serde(default)]
     pub context: Option<Value>,
-    /// Captured from the model's `_aura_reasoning`. `skip_serializing`
-    /// keeps it OUT of `items[].arguments` (the strip invariant); the
-    /// tool moves it to `ApprovalItem.tool_call_intent`. Not required,
-    /// matching PersistenceWrapper's optional reasoning schema.
+    /// The model's reasoning for requesting approval. Advisory only — see
+    /// `ApprovalItem.tool_call_intent` for the digest-exclusion rule (R5).
     #[serde(default, rename = "_aura_reasoning", skip_serializing)]
     pub tool_call_intent: Option<String>,
 }
@@ -89,11 +87,11 @@ fn approval_outcome_to_tool_result(
     }
 }
 
-/// Normalize model reasoning into a `tool_call_intent`: empty or
-/// whitespace-only means absent (`None`), consistent with the config_gate
-/// reasoning filter (`.filter(|r| !r.trim().is_empty())`).
+/// Normalize model reasoning into a `tool_call_intent` via
+/// [`crate::tool_wrapper::non_blank`].
 fn normalize_tool_call_intent(raw: Option<&str>) -> Option<String> {
-    raw.filter(|r| !r.trim().is_empty()).map(str::to_string)
+    raw.and_then(crate::tool_wrapper::non_blank)
+        .map(str::to_string)
 }
 
 impl Tool for RequestApprovalTool {
@@ -136,7 +134,7 @@ impl Tool for RequestApprovalTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        // Empty/whitespace-only reasoning means absent, consistent with the config_gate path.
+        // Blank reasoning collapses to absent, consistent with the config_gate path.
         let tool_call_intent = normalize_tool_call_intent(args.tool_call_intent.as_deref());
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -283,12 +281,10 @@ mod tests {
     // --------------------------------------------------------------------
     // agent_requested path: drive `RequestApprovalTool::call` end-to-end
     // through a real `DecisionRoute::Conversational` and inspect the parked
-    // `ApprovalItem` the production call site builds. The round-3 tests only
-    // exercised `normalize_tool_call_intent` + a hand-built item, so reverting
-    // the call site (tool.rs `tool_call_intent,` -> `args.tool_call_intent.clone()`)
-    // left them green. These tests fail under that revert: the blank case
-    // asserts the parked item's `tool_call_intent` is `None`, which only holds
-    // when the production path normalizes `Some("")`/`Some("   ")` away.
+    // `ApprovalItem` the production call site builds. These pin the call
+    // site's normalization: the blank case asserts the parked item's
+    // `tool_call_intent` is `None`, which only holds when the production
+    // path normalizes `Some("")`/`Some("   ")` away.
     // --------------------------------------------------------------------
 
     /// Drive `RequestApprovalTool::call` through a real conversational route

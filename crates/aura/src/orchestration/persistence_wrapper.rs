@@ -26,7 +26,7 @@ use tokio::sync::{Mutex, Notify};
 use super::persistence::{ExecutionPersistence, ToolCallRecord};
 use crate::mcp_response::CallOutcome;
 use crate::tool_wrapper::{
-    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult,
+    ToolCallContext, ToolWrapper, TransformArgsResult, TransformOutputResult, non_blank,
 };
 
 /// The namespaced field name for reasoning (signals framework/internal field).
@@ -189,8 +189,8 @@ impl ToolWrapper for PersistenceWrapper {
 
     fn write_context(&self, extracted: Option<&Value>, ctx: &mut ToolCallContext) {
         // transform_args emits "reasoning": "" when the field was absent
-        // (it uses unwrap_or_default), so empty means absent.
-        if let Some(r) = find_field(extracted, "reasoning").filter(|r| !r.trim().is_empty()) {
+        // (it uses unwrap_or_default); non_blank collapses that to absent.
+        if let Some(r) = find_field(extracted, "reasoning").and_then(non_blank) {
             ctx.tool_call_intent = Some(r.to_string());
         }
     }
