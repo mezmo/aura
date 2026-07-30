@@ -61,7 +61,7 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
-use super::park::{ApprovalRef, NonEmpty, TaskExecutionOutcome, WaveOutcome};
+use super::park::{NonEmpty, TaskExecutionOutcome, WaveOutcome};
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::sink::{ChannelEventSink, RunEventSink};
@@ -69,6 +69,7 @@ use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
     IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
 };
+use crate::hitl::ApprovalRef;
 use crate::session_store::RunStore;
 
 // ============================================================================
