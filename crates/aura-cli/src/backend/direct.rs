@@ -91,6 +91,17 @@ impl DirectBackend {
             anyhow::bail!("No agent config found in {}", config_path);
         }
 
+        // Load the HITL webhook HMAC once at startup; a misconfiguration
+        // fails the CLI boot rather than the first approval request.
+        let hitl_webhook_hmac = aura::hitl::WebhookHmac::load_from_env()
+            .context("Invalid HITL webhook HMAC configuration")?;
+        for config in &configs {
+            if let Some(hitl) = &config.hitl {
+                aura::hitl::validate_webhook_signing_config(hitl, hitl_webhook_hmac.as_ref())
+                    .context("Invalid HITL webhook configuration")?;
+            }
+        }
+
         let app_state = Arc::new(AppState {
             configs: Arc::new(configs),
             tool_result_mode: ToolResultMode::Aura,
@@ -107,6 +118,7 @@ impl DirectBackend {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            hitl_webhook_hmac,
             session_store: Arc::new(InMemorySessionStore::new()),
         });
 
@@ -232,6 +244,7 @@ impl DirectBackend {
             default_agent: old.default_agent.clone(),
             additional_tools: additional_tools_factory(),
             pending_approvals: old.pending_approvals.clone(),
+            hitl_webhook_hmac: old.hitl_webhook_hmac.clone(),
             session_store: old.session_store.clone(),
         });
     }
@@ -465,6 +478,7 @@ mod tests {
             default_agent: None,
             additional_tools: additional_tools_factory(),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            hitl_webhook_hmac: None,
             session_store: Arc::new(InMemorySessionStore::new()),
         });
         DirectBackend {

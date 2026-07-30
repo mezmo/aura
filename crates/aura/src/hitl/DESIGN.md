@@ -44,9 +44,9 @@ dotted field, or relaxing the context charset would break it.
 | `signing.rs` module | private (`mod signing;`) | Internal to `aura` crate | Re-export deferred until U(design) ratifies the surface (see §5). Rows below describe the post-re-export surface. |
 | `WebhookHmac::new` | `pub` | Constructor | Byte-oriented, flow-agnostic. Enforces the `MIN_SECRET_BYTES` (32) floor on primary and secondary; the floor lives here, not on the secret constructors, so the policy has one home. |
 | `WebhookHmac::load_from_env` | `pub` | Env loader | Thin HITL-named wrapper over `new`. Reads `AURA_HITL_WEBHOOK_SECRET`, `_SECONDARY`, and `AURA_HITL_WEBHOOK_TOLERANCE_SECS`. `Ok(None)` only when the primary is absent from the environment altogether; a secondary-without-primary, empty/short primary, malformed/out-of-range tolerance, or non-Unicode value returns `Err`. **Startup logging contract**: `warn!` "HITL webhook HMAC verification DISABLED" on `Ok(None)`; `info!` on `Ok(Some)` naming secondary-present and tolerance, never key material. |
-| `WebhookHmac::sign` | `pub` | Egress signing | **Seam**: `route.rs:195-230` (`WebhookClient::request_approval`) serializes `ApprovalRequestWire` with `serde_json::to_vec` and calls `sign(&context, &body)` with context `approval-request:{decision_id}`; the two headers attach via `SignedHeaders::into_pairs`. |
+| `WebhookHmac::sign` | `pub` | Egress signing | **Seam**: `WebhookClient::request_approval` (`route.rs`) serializes `ApprovalRequestWire` with `serde_json::to_vec` and calls `sign(&context, &body)` with context `approval-request:{decision_id}`; the two headers attach via `SignedHeaders::into_pairs`. |
 | `WebhookHmac::verify` | `pub(crate)` | Internal verification | Configured-path step called by `authorize_ingress`; not exposed. Evaluates primary then, if configured, secondary, so timing reveals only "did the primary sign this" to a key holder. |
-| `authorize_ingress` | `pub` | Ingress + response verification | **Seam (ingress)**: `handlers.rs:1032-1051` (`resolve_approval`) swaps its extractor to `Bytes`, calls `authorize_ingress` **before** parsing the path UUID, with context `approval-decision:{decision_id}`, then `serde_json::from_slice::<ApprovalDecisionWire>(verified.as_ref())`. **Seam (Route A response)**: `route.rs` verifies the webhook *response* body+headers with the same call and context before treating it as a decision (see §4). |
+| `authorize_ingress` | `pub` | Ingress + response verification | **Seam (ingress)**: `resolve_approval` (`handlers.rs`) swaps its extractor to `Bytes`, calls `authorize_ingress` **before** parsing the path UUID, with context `approval-decision:{decision_id}`, then feeds the verified bytes through the stock `Json` extractor. **Seam (Route A response)**: `route.rs` verifies the webhook *response* body+headers with the same call and context before treating it as a decision (see §4). |
 | `VerifiedBody` | `pub` | Verified witness | Consumes an immutable `Bytes`; `as_ref`/`into_inner` expose the authorized bytes. Only `authorize_ingress` constructs it. |
 | `SignatureHeader::parse` | `pub` | Header parsing | Rejects anything not `sha256=<64 lowercase hex>`. |
 | `UnixTimestamp::parse` | `pub` | Header parsing | Rejects `+`, leading zeros, non-numeric. |
@@ -190,9 +190,10 @@ environment while any other test in the same binary can read it.
   `WebhookHmac::new` (no environment involved). Only the `load_from_env`
   tests in `signing.rs` touch the env (they exist to exercise exactly that
   path), and they serialize behind the module's single `ENV_LOCK`.
-- `WebhookClient::new` deliberately does not read the environment; signing
-  is resolved in `HitlRuntime::from_config` (the production path). This
-  keeps every pre-existing `WebhookClient::new` test env-free.
+- `WebhookClient::new` deliberately does not read the environment; the
+  binary entrypoints load signing once at startup and thread it into
+  `HitlRuntime::from_config` (the production path). This keeps
+  `WebhookClient::new` tests env-free.
 - `aura-web-server` cannot name the secret part types (the facade exports
   only the DESIGN §5 set), so its ingress tests obtain one `WebhookHmac`
   through `load_from_env` inside a `OnceLock` initializer: the env is

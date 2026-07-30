@@ -151,6 +151,7 @@ impl AgentExecutor for AuraAgentExecutor {
         let active_request_tracker = self.app_state.active_requests.clone();
         let task_store = self.task_store.clone();
         let pending_approvals = self.app_state.pending_approvals.clone();
+        let hitl_hmac = self.app_state.hitl_webhook_hmac.clone();
         let mut append_tracker: HashMap<(String, String, String), bool> = HashMap::new();
 
         Box::pin(async_stream::stream! {
@@ -181,7 +182,7 @@ impl AgentExecutor for AuraAgentExecutor {
 
             let request_id = format!("a2a_{}", task_id);
             let session_id = Some(context_id.clone());
-            let builder = RigBuilder::new(config, pending_approvals);
+            let builder = RigBuilder::new(config, pending_approvals).with_hitl_hmac(hitl_hmac);
             let agent = match builder
                 .build_streaming_agent_with_headers(
                     Some(&req_headers),
@@ -657,6 +658,7 @@ mod tests {
             active_requests: Arc::new(ActiveRequestTracker::default()),
             additional_tools: Arc::new(Vec::new),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
         });
         AuraAgentExecutor::new(app_state, SharedTaskStore::default())

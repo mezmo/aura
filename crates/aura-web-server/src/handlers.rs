@@ -190,11 +190,12 @@ async fn build_agent_for_request(
     client_tools: Option<&[ClientToolDefinition]>,
     request_id: String,
     session_id: String,
-    pending_approvals: aura::hitl::PendingApprovals,
+    data: &AppState,
 ) -> Result<Arc<aura::Agent>, PrepareError> {
     let client_tool_defs =
         client_tools.map(|tools| tools.iter().map(aura::builder::ClientTool::from).collect());
-    let builder = RigBuilder::new(config.clone(), pending_approvals);
+    let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
+        .with_hitl_hmac(data.hitl_webhook_hmac.clone());
     let agent = builder
         .build_agent(
             Some(req_headers),
@@ -289,7 +290,8 @@ pub async fn prepare_request(
     let streaming_agent: Arc<dyn StreamingAgent> = if config.orchestration_enabled() {
         // Orchestration path: build via streaming agent builder (returns Orchestrator).
         // Client tools are filtered per-coordinator/per-worker inside the orchestrator.
-        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone());
+        let builder = RigBuilder::new(config.clone(), data.pending_approvals.clone())
+            .with_hitl_hmac(data.hitl_webhook_hmac.clone());
         builder
             .build_streaming_agent_with_headers(
                 Some(req_headers_map),
@@ -317,7 +319,7 @@ pub async fn prepare_request(
             client_tools,
             request_id.clone(),
             chat_session_id.to_string(),
-            data.pending_approvals.clone(),
+            data,
         )
         .await? as Arc<dyn StreamingAgent>
     };
@@ -1024,10 +1026,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
-/// Ingress HMAC verification state for `POST /v1/approvals/{decision_id}`,
-/// injected by the router as an `Extension` layer. Loaded once at startup from
-/// the `AURA_HITL_WEBHOOK_SECRET*` environment; `None` means the feature is
-/// off and ingress behaves byte-identically to the unverified endpoint.
+/// HMAC verification state for `POST /v1/approvals/{decision_id}`.
 #[derive(Clone)]
 pub struct IngressHmac(pub Option<aura::hitl::WebhookHmac>);
 
@@ -1050,12 +1049,12 @@ pub async fn resolve_approval(
     use axum::extract::FromRequest;
 
     // Branch on the HMAC configuration BEFORE deciding how to consume the
-    // body, so the off state stays structurally identical to the
-    // pre-verification handler (no pre-buffering, stock extractor chain).
+    // body, so the off state keeps the stock extractor chain (no
+    // pre-buffering).
     let body = match &hmac {
-        // Feature off: the stock `Json` extractor runs exactly as it did when
-        // it was the handler's extractor argument — same content-type check,
-        // same body limit, same rejection statuses and bodies.
+        // Feature off: the stock `Json` extractor runs with its standard
+        // behavior — same content-type check, same body limit, same
+        // rejection statuses and bodies.
         None => match Json::<aura::hitl::ApprovalDecisionWire>::from_request(request, &()).await {
             Ok(Json(body)) => body,
             Err(rejection) => return rejection.into_response(),
@@ -1676,6 +1675,7 @@ mod tests {
             default_agent: None,
             additional_tools: Arc::new(Vec::new),
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
         })
     }
@@ -1749,6 +1749,7 @@ model = "gpt-4o"
             additional_tools: Arc::new(Vec::new),
             debug_provider_errors: false,
             pending_approvals: aura::hitl::PendingApprovals::new(),
+            hitl_webhook_hmac: None,
             session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
         })
     }
@@ -2082,6 +2083,7 @@ url = "http://127.0.0.1:9"
                 default_agent: None,
                 additional_tools: Arc::new(Vec::new),
                 pending_approvals: aura::hitl::PendingApprovals::new(),
+                hitl_webhook_hmac: None,
                 session_store: Arc::new(crate::session_store::InMemorySessionStore::new()),
             })
         }
@@ -2261,10 +2263,9 @@ url = "http://127.0.0.1:9"
 
         #[tokio::test]
         async fn off_path_oversized_wrong_content_type_returns_415() {
-            // Pre-change behavior: the stock `Json` extractor rejects on
-            // content-type BEFORE reading the body, so an oversized text/plain
-            // request gets 415, never a body-limit rejection. The off path
-            // must preserve that exactly.
+            // The stock `Json` extractor rejects on content-type BEFORE
+            // reading the body, so an oversized text/plain request gets 415,
+            // never a body-limit rejection. The off path must match.
             let app = approval_router(test_app_state());
             let response = app
                 .oneshot(
@@ -2289,11 +2290,7 @@ url = "http://127.0.0.1:9"
         // --- HMAC-verified ingress (secret configured) ---
 
         /// Loads a `WebhookHmac` through the only cross-crate constructor
-        /// (`load_from_env`) — a genuine env-path use, kept minimal per the
-        /// Gate A B3 arbitration: the process env is mutated exactly once per
-        /// test binary, inside the `OnceLock` initializer (which serializes
-        /// concurrent callers), and the result is cached. This is the only
-        /// env mutation in the aura-web-server test binary; keep it that way.
+        /// (`load_from_env`). Test-construction policy: aura/src/hitl/DESIGN.md §7.
         fn ingress_test_hmac() -> aura::hitl::WebhookHmac {
             static HMAC: std::sync::OnceLock<aura::hitl::WebhookHmac> = std::sync::OnceLock::new();
             HMAC.get_or_init(|| {

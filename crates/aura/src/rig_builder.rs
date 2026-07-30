@@ -20,6 +20,7 @@ use std::sync::Arc;
 pub struct RigBuilder {
     config: Config,
     pending_approvals: PendingApprovals,
+    hitl_hmac: Option<crate::hitl::WebhookHmac>,
 }
 
 impl RigBuilder {
@@ -27,7 +28,15 @@ impl RigBuilder {
         Self {
             config,
             pending_approvals,
+            hitl_hmac: None,
         }
+    }
+
+    /// Set the startup-loaded HITL webhook HMAC for the egress webhook route.
+    #[must_use]
+    pub fn with_hitl_hmac(mut self, hmac: Option<crate::hitl::WebhookHmac>) -> Self {
+        self.hitl_hmac = hmac;
+        self
     }
 
     /// Get the runtime [`AgentRuntimeConfig`] (mainly for tests/debugging).
@@ -67,11 +76,13 @@ impl RigBuilder {
             tools: self.config.tools.clone(),
             memory_dir: self.config.memory_dir.clone(),
             orchestration: self.config.orchestration.clone(),
-            hitl: self
-                .config
-                .hitl
-                .as_ref()
-                .map(|cfg| crate::hitl::HitlRuntime::from_config(cfg, &self.pending_approvals)),
+            hitl: self.config.hitl.as_ref().map(|cfg| {
+                crate::hitl::HitlRuntime::from_config(
+                    cfg,
+                    &self.pending_approvals,
+                    self.hitl_hmac.as_ref(),
+                )
+            }),
             ..Default::default()
         }
     }
