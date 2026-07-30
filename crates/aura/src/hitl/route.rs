@@ -40,9 +40,10 @@ pub struct HitlRuntime {
 impl HitlRuntime {
     /// Resolve the request-stable runtime from parsed `[hitl]` config: share the
     /// compiled globs and build the decision route once (the webhook client and
-    /// its connection pool are created here). This is the production
-    /// constructor path, and the only place HMAC signing is resolved from the
-    /// `AURA_HITL_WEBHOOK_SECRET*` environment.
+    /// its connection pool are created here).
+    ///
+    /// `hmac` is the startup-loaded webhook HMAC shared by every agent build;
+    /// `None` leaves the webhook route unsigned.
     ///
     /// `req_headers` is the inbound client request's HTTP headers, used to
     /// resolve `[hitl.route]` `headers_from_request` mappings. Pass `None`
@@ -51,6 +52,7 @@ impl HitlRuntime {
     pub fn from_config(
         config: &HitlConfig,
         pending_approvals: &PendingApprovals,
+        hmac: Option<&WebhookHmac>,
         req_headers: Option<&HashMap<String, String>>,
     ) -> Self {
         let route = match &config.route {
@@ -60,10 +62,9 @@ impl HitlRuntime {
                 headers,
                 headers_from_request,
             } => {
-                let signing = match WebhookHmac::load_from_env() {
-                    Ok(None) => EgressSigning::Disabled,
-                    Ok(Some(hmac)) => EgressSigning::Enabled(hmac),
-                    Err(e) => EgressSigning::Misconfigured(e.to_string()),
+                let signing = match hmac {
+                    None => EgressSigning::Disabled,
+                    Some(hmac) => EgressSigning::Enabled(hmac.clone()),
                 };
                 DecisionRoute::Webhook {
                     client: WebhookClient::with_headers_and_signing(
@@ -100,9 +101,7 @@ pub enum ApprovalError {
     BadStatus { status: u16 },
     #[error("approval webhook response parse error: {0}")]
     Parse(String),
-    /// The HMAC configuration is unusable (bad env values, or a plaintext
-    /// `http://` webhook URL with a secret configured). Fails closed on every
-    /// request rather than sending unsigned or trusting unverified responses.
+    /// An unusable webhook signing configuration, with the reason.
     #[error("approval webhook signing misconfigured: {0}")]
     Misconfigured(String),
     /// Egress signing failed (system clock unavailable).
@@ -269,17 +268,13 @@ fn resolve_webhook_headers(
     header_map
 }
 
-/// HMAC signing state for the webhook route, resolved once at client
-/// construction so a misconfiguration is diagnosed before the first request.
+/// HMAC signing state for the webhook route.
 enum EgressSigning {
-    /// No secret configured: requests go out unsigned and responses are
-    /// trusted, byte-identical to the pre-W3 behavior.
+    /// Unsigned egress.
     Disabled,
-    /// Secret configured: every egress POST is signed and every response body
-    /// must verify before it is treated as a decision.
+    /// Signed egress under the configured HMAC secret.
     Enabled(WebhookHmac),
-    /// The configuration is unusable; every request fails closed with
-    /// [`ApprovalError::Misconfigured`] instead of silently downgrading.
+    /// An unusable signing configuration, with the reason.
     Misconfigured(String),
 }
 
@@ -297,8 +292,7 @@ impl WebhookClient {
     /// Builds an unsigned client. Deliberately does NOT read the environment
     /// (so constructing one in a test never races env-mutating tests):
     /// production construction goes through [`HitlRuntime::from_config`],
-    /// which resolves HMAC signing from `AURA_HITL_WEBHOOK_SECRET*` and calls
-    /// `with_signing`.
+    /// which receives the startup-loaded HMAC and calls `with_signing`.
     #[must_use]
     pub fn new(client: reqwest::Client, url: WebhookUrl) -> Self {
         Self::with_headers_and_signing(client, url, HeaderMap::new(), EgressSigning::Disabled)
@@ -442,8 +436,7 @@ impl WebhookClient {
         }
     }
 
-    /// The pre-W3 unsigned round trip, preserved byte-identically for the
-    /// no-secret configuration.
+    /// Send the approval POST unsigned and trust the response.
     async fn request_approval_unsigned(
         &self,
         wire: &ApprovalRequestWire<'_>,
@@ -486,7 +479,7 @@ pub struct PlaintextWebhookUrlError {
 /// Boot-time guard: with an HMAC secret configured, a plaintext `http://`
 /// webhook URL must fail startup, not the first approval request. Call this
 /// for every `[hitl]` config once the secret has been loaded; the request-time
-/// `Misconfigured` rejection inside [`WebhookClient`] stays as defense in
+/// `Misconfigured` rejection inside [`WebhookClient`] acts as defense in
 /// depth for paths that skip startup validation.
 pub fn validate_webhook_signing_config(
     config: &HitlConfig,
@@ -1215,7 +1208,7 @@ mod tests {
             )
             .unwrap();
 
-            // No secret: http:// stays allowed (today's behavior).
+            // Without a secret, http:// is allowed.
             validate_webhook_signing_config(&webhook("http://approvals.example.com/aura"), None)
                 .unwrap();
 
@@ -1225,6 +1218,63 @@ mod tests {
                 route: aura_config::DecisionRouteConfig::Conversational { timeout_secs: 60 },
             };
             validate_webhook_signing_config(&conversational, Some(&hmac)).unwrap();
+        }
+
+        #[test]
+        fn from_config_threads_hmac_into_webhook_route() {
+            use super::super::{DecisionRoute, HitlRuntime};
+
+            let config = |url: &str| aura_config::HitlConfig {
+                require_approval: vec![],
+                route: aura_config::DecisionRouteConfig::Webhook {
+                    url: aura_config::WebhookUrl::new(url).unwrap(),
+                    timeout_secs: 300,
+                    headers: HashMap::new(),
+                    headers_from_request: HashMap::new(),
+                },
+            };
+            let pending = crate::hitl::PendingApprovals::new();
+            let hmac = test_hmac();
+
+            fn signing_of(runtime: &HitlRuntime) -> &EgressSigning {
+                match &*runtime.route {
+                    DecisionRoute::Webhook { client, .. } => &client.signing,
+                    DecisionRoute::Conversational { .. } => panic!("expected webhook route"),
+                }
+            }
+
+            let signed = HitlRuntime::from_config(
+                &config("https://approvals.example.com/aura"),
+                &pending,
+                Some(&hmac),
+                None,
+            );
+            assert!(
+                matches!(signing_of(&signed), EgressSigning::Enabled(_)),
+                "a threaded secret must produce signed egress"
+            );
+
+            let unsigned = HitlRuntime::from_config(
+                &config("http://approvals.example.com/aura"),
+                &pending,
+                None,
+                None,
+            );
+            assert!(
+                matches!(signing_of(&unsigned), EgressSigning::Disabled),
+                "no threaded secret must produce unsigned egress"
+            );
+
+            let plaintext = HitlRuntime::from_config(
+                &config("http://approvals.example.com/aura"),
+                &pending,
+                Some(&hmac),
+                None,
+            );
+            assert!(
+                matches!(signing_of(&plaintext), EgressSigning::Misconfigured(_)),
+                "plaintext http:// with a secret must fail closed"
+            );
         }
 
         #[tokio::test]
@@ -1242,7 +1292,7 @@ mod tests {
             let outcome = client
                 .request_approval(&test_request(decision_id), Duration::from_secs(5))
                 .await
-                .expect("unsigned round trip must keep working");
+                .expect("unsigned round trip succeeds");
             assert_eq!(
                 outcome,
                 ApprovalOutcome::Decided(ApprovalDecision::Approved)

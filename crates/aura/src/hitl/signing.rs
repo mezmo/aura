@@ -3,7 +3,7 @@
 //! Signs AURA's egress approval requests and verifies inbound decisions on
 //! both routes. The feature is opt-in via environment variables; with no
 //! secret configured the loader yields `None` and callers skip
-//! signing/verification entirely, leaving today's byte-identical behavior.
+//! signing/verification entirely.
 //!
 //! Header contract:
 //!   X-Aura-Signature-256: sha256=<64 lowercase hex chars>
@@ -46,7 +46,7 @@ pub const MIN_SECRET_BYTES: usize = 32;
 /// Maximum accepted skew tolerance, in seconds (one day).
 pub const MAX_TOLERANCE_SECS: u64 = 86_400;
 
-/// Primary HMAC secret. Can both sign egress and verify ingress.
+/// Primary HMAC secret.
 #[derive(Clone)]
 pub struct PrimarySecret(SecretBytes);
 
@@ -62,7 +62,7 @@ impl fmt::Debug for PrimarySecret {
     }
 }
 
-/// Secondary HMAC secret. Verifies ingress only; the type has no sign method.
+/// Secondary HMAC secret. The type has no sign method.
 #[derive(Clone)]
 pub struct SecondarySecret(SecretBytes);
 
@@ -176,8 +176,8 @@ impl AsRef<Signature> for SignatureHeader {
 /// A 32-byte HMAC-SHA256 signature tag.
 ///
 /// Deliberately has no `PartialEq`/`Eq` and no public byte accessor:
-/// comparison happens only inside `WebhookHmac::verify` via a constant-time
-/// primitive, so a non-constant-time `==` cannot be written against it.
+/// comparison is confined to the constant-time primitive inside this
+/// module, so a non-constant-time `==` cannot be written against it.
 #[derive(Debug, Clone)]
 pub struct Signature([u8; 32]);
 

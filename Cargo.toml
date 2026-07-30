@@ -70,6 +70,11 @@ config = { version = "0.14", features = ["toml"] }  # Alternative for custom han
 dotenvy = "0.15"
 regex = "1.11"
 
+# HMAC root of trust for HITL webhook signing/verification
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
+
 # Vector stores - pinned to exact version compatible with our rig-core 0.28.x fork
 rig-qdrant = "=0.1.34"
 qdrant-client = "1.14.0"

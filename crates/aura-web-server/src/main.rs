@@ -281,7 +281,9 @@ async fn run() -> std::io::Result<()> {
     info!("Session store backend: {}", session_store.backend());
 
     // HITL webhook HMAC (AURA_HITL_WEBHOOK_SECRET*): fail startup loud on a
-    // misconfiguration instead of silently serving unverified ingress.
+    // misconfiguration instead of silently serving unsigned, unverified
+    // traffic. One load serves both legs: egress signing via AppState,
+    // ingress verification via the IngressHmac extension.
     let ingress_hmac = aura::hitl::WebhookHmac::load_from_env().map_err(|e| {
         error!("Invalid HITL webhook HMAC configuration: {e}");
         std::io::Error::new(
@@ -324,6 +326,7 @@ async fn run() -> std::io::Result<()> {
             session_store.approvals(),
             session_store.bus(),
         ),
+        hitl_webhook_hmac: ingress_hmac.clone(),
         session_store: session_store.clone(),
     });
 

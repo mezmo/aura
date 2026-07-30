@@ -27,9 +27,9 @@ http = { workspace = true }
 url = "2"
 
 # HMAC root of trust for HITL webhook signing/verification (W3)
-hmac = "0.13"
-sha2 = "0.11"
-hex = "0.4"
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # Shared event types (lightweight, no agent/MCP deps)
 aura-events = { path = "../aura-events", features = ["rmcp-types"] }
