@@ -100,7 +100,7 @@ EOR
 # Install tools before source COPY so source changes keep this layer cached.
 FROM cook-debug AS test-tools
 
-USER root
+USER 0
 # cook-debug writes these paths as root.
 RUN chown -R 1000:1000 /usr/local/cargo /usr/src/app
 
@@ -128,7 +128,7 @@ EOR
 # Keep this setup in sync with runner.
 FROM test-tools AS test
 
-USER root
+USER 0
 RUN groupadd --gid 1000 aura && useradd --uid 1000 --gid aura --shell /bin/bash --create-home aura
 
 RUN <<EOR
@@ -142,7 +142,7 @@ EOR
 RUN npm install -g @modelcontextprotocol/server-everything@2026.1.26 \
   && command -v mcp-server-everything
 
-USER aura
+USER 1000
 
 # grcov reads llvm-tools' profdata. clippy rides this image's cook-debug
 # deps for CI lint; rustfmt stays runner-only (fmt-check doesn't compile,
@@ -214,13 +214,13 @@ RUN <<EOR
   set -e
   apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl
   rm -rf /var/lib/apt/lists/*
-  useradd -r -s /bin/false appuser
+  useradd -r -u 1000 -s /bin/false appuser
 EOR
 
 WORKDIR /app
 RUN mkdir -p /app/config /app/skills && chown -R appuser:appuser /app
 
-USER appuser
+USER 1000
 EXPOSE 3030
 
 ENV HOST=0.0.0.0
@@ -228,7 +228,7 @@ ENV PORT=3030
 ENV CONFIG_PATH=/app/config/config.toml
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3030/health || exit 1
+  CMD ["/bin/sh", "-c", "curl -f http://localhost:3030/health || exit 1"]
 
 CMD ["./aura-web-server"]
 

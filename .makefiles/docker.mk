@@ -4,6 +4,8 @@ $(BUILD_ENV):: $(DOCKER_ENV)
 
 WITH_DOCKER_ENV ?= true
 
+HADOLINT_VERSION ?= v2.15.0
+
 SED_INPLACE :=
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
@@ -25,7 +27,7 @@ clean-docker:
 
 .PHONY:lint-docker
 lint-docker: | $(REPORT_DIR)
-	docker run --rm -i hadolint/hadolint hadolint -f json - < Dockerfile > report/ci/hadolint.json; \
+	docker run --rm -i hadolint/hadolint:$(HADOLINT_VERSION) hadolint -f json - < Dockerfile > report/ci/hadolint.json; \
 	ret=$$? ; \
 	sed ${SED_INPLACE} 's/"file":"-"/"file":"Dockerfile"/g' report/ci/hadolint.json ; \
 	exit $$ret
