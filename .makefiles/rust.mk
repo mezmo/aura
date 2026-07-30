@@ -190,8 +190,18 @@ build-binaries-darwin: ## Build binaries for darwin (amd64 + arm64, PROFILE=rele
 	$(MAKE) build-binary-darwin-amd64 build-binary-darwin-arm64
 
 .PHONY: build-checksums
-build-checksums: ## Write sha256 checksums for the binaries in dist
-	cd $(DIST_DIR) && sha256sum aura-* > checksums.txt
+build-checksums: ## Write sha256 checksums for the release artifacts (binaries + any packages) in dist
+	@# The *.deb/*.rpm globs overlap aura-* (nfpm's rpm and web-server package
+	@# names also start with "aura-"), so sort -u is load-bearing: it collapses
+	@# the duplicate matches before hashing.
+	@cd $(DIST_DIR) && \
+		files=$$(ls aura-* *.deb *.rpm 2>/dev/null | sort -u); \
+		[ -n "$$files" ] || { echo "error: no release artifacts found in $(DIST_DIR)" >&2; exit 1; }; \
+		printf '%s\n' "$$files" | xargs sha256sum > checksums.txt
+
+.PHONY: build-packages
+build-packages: $(DIST_DIR) $(DOCKER_ENV) ## Build .deb/.rpm packages from the linux binaries in dist (PACKAGE_VERSION overrides the version)
+	$(RUN) ./scripts/build-packages.sh $(PACKAGE_VERSION)
 
 # Every binary a complete release must contain, across all platforms.
 EXPECTED_BINARIES := \
@@ -201,16 +211,14 @@ EXPECTED_BINARIES := \
 	aura-darwin-arm64 aura-web-server-darwin-arm64
 
 .PHONY: verify-binaries
-verify-binaries: build-checksums $(DOCKER_ENV) ## Verify every expected binary is present and checksummed correctly
+verify-binaries: $(DOCKER_ENV) ## Verify every expected binary is present, then smoke-test the runnable pair
 	@cd $(DIST_DIR) && \
 	for f in $(EXPECTED_BINARIES); do \
 		[ -f "$$f" ] || { echo "error: missing binary: $$f" >&2; exit 1; }; \
-		grep -q " $$f\$$" checksums.txt || { echo "error: $$f absent from checksums.txt" >&2; exit 1; }; \
 	done
-	cd $(DIST_DIR) && sha256sum -c checksums.txt
 	@# Execution smoke for the pair the runner container can actually run;
-	@# cross-arch artifacts are covered by presence + checksum only. The
-	@# chmod restores the executable bit, which stash/unstash can drop.
+	@# cross-arch artifacts are covered by presence only. The chmod restores
+	@# the executable bit, which stash/unstash can drop.
 	@if [ "$(ENABLE_DOCKER)" = "true" ]; then \
 		chmod +x $(DIST_DIR)/aura-linux-amd64 $(DIST_DIR)/aura-web-server-linux-amd64 && \
 		$(RUN) ./dist/aura-linux-amd64 --version && \
@@ -218,6 +226,12 @@ verify-binaries: build-checksums $(DOCKER_ENV) ## Verify every expected binary i
 	else \
 		echo "skipping execution smoke: runner container disabled"; \
 	fi
+
+.PHONY: release-artifacts
+release-artifacts: ## Assemble a complete release in dist/: verify binaries, build packages, write checksums
+	$(MAKE) verify-binaries
+	$(MAKE) build-packages
+	$(MAKE) build-checksums
 
 clean:: clean-dist
 
