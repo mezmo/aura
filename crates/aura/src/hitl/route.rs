@@ -279,7 +279,6 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["tool_name"], "shell_exec");
         assert_eq!(items[0]["arguments"]["cmd"], "ls -la");
-        // tool_call_intent is omitted when absent (never null on the wire)
         assert!(items[0].get("tool_call_intent").is_none());
     }
 
@@ -368,7 +367,6 @@ mod tests {
         let value =
             serde_json::to_value(ApprovalRequestWire::from(&request)).expect("serializable");
         let items = value["items"].as_array().expect("items array");
-        // omitted entirely when absent (never null)
         assert!(items[0].get("tool_call_intent").is_none());
     }
 

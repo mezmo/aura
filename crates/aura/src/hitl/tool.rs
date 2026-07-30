@@ -50,8 +50,7 @@ pub struct RequestApprovalArgs {
     /// Optional structured metadata for the reviewer.
     #[serde(default)]
     pub context: Option<Value>,
-    /// The model's reasoning for requesting approval. Advisory only — see
-    /// `ApprovalItem.tool_call_intent` for the digest-exclusion rule (R5).
+    /// The agent's reasoning for requesting approval.
     #[serde(default, rename = "_aura_reasoning", skip_serializing)]
     pub tool_call_intent: Option<String>,
 }

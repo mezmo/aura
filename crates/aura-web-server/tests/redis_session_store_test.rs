@@ -347,8 +347,6 @@ fn make_parked(request_id: &str, ttl: Duration) -> ParkedApproval {
             items: vec![ApprovalItem {
                 tool_name: "kubectl_delete".to_string(),
                 arguments: serde_json::json!({"pod": "web-1"}),
-                // Some(...), not None, so the round trip exercises the
-                // field's presence on the stored wire format.
                 tool_call_intent: Some("restarting to pick up the config change".to_string()),
             }],
         },

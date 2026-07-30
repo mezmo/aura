@@ -67,8 +67,7 @@ pub struct ToolCallContext {
     pub attempt: Option<usize>,
     /// Custom metadata that wrappers can use
     pub metadata: Option<Value>,
-    /// Model-authored reasoning for the pending tool call. Advisory only —
-    /// see `ApprovalItem.tool_call_intent` for the digest-exclusion rule (R5).
+    /// Agent's authored reasoning for the pending tool call.
     pub tool_call_intent: Option<String>,
 }
 

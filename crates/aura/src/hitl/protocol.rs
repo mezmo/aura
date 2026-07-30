@@ -46,11 +46,7 @@ pub struct ApprovalRequest {
 pub struct ApprovalItem {
     pub tool_name: String,
     pub arguments: Value,
-    /// Model-authored reasoning for this call. Advisory metadata only: the
-    /// digest binds `tool_name + arguments` (what runs); this field is what
-    /// the model *thought* and stays out of any binding computation — see
-    /// the 271 ADR addendum and DECISIONS-2026-07-28 ruling 5 (R5).
-    /// Structurally excluded as a sibling of `arguments`, not nested in it.
+    /// Agent's stated rationale for the tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_intent: Option<String>,
 }
