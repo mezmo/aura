@@ -39,8 +39,8 @@ mod teardown;
 mod tool;
 
 pub use decision::{
-    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, AwaitingDecision, CancelReason,
-    DecisionId, Timestamp,
+    AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, ApprovalRef, AwaitingDecision,
+    CancelReason, DecisionId, Timestamp,
 };
 pub use gate::{BlockedSignal, HitlApprovalWrapper};
 pub use protocol::{ApprovalDecisionWire, ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};

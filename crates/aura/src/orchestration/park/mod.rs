@@ -31,8 +31,8 @@ pub use ids::{AgentInstanceId, ChatSessionId, ConfigFingerprint, SessionId};
 pub use lease::{CasError, FencingGeneration, Lease, LeaseTtl, ZeroLeaseTtl};
 pub use non_empty::{EmptyNonEmpty, NonEmpty};
 pub use outcomes::{
-    ApprovalRef, BlockedAttempt, ExpiryNotAfterPark, ParkedRun, TaskExecutionOutcome,
-    ToolAttemptOutcome, WaveOutcome,
+    BlockedAttempt, ExpiryNotAfterPark, ParkedRun, TaskExecutionOutcome, ToolAttemptOutcome,
+    WaveOutcome,
 };
 pub use run_fsm::{
     IllegalTransition, ParkReason, ResumePoint, RunEvent, RunFailureCause, RunState, WakeReason,
