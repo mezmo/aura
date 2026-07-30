@@ -224,6 +224,15 @@ fn resolve_mcp_headers(
             }
         };
 
+        // Lowercase static header keys so mapped overrides (inserted under
+        // lowercased keys by `apply_request_header_mappings`) replace the
+        // static fallback rather than coexisting as a case-distinct entry.
+        let normalized: HashMap<String, String> = server_headers
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect();
+        *server_headers = normalized;
+
         // Resolve headers_from_request mappings using the incoming request
         // headers. Static TOML headers are already in server_headers; this
         // only overrides when the mapped request header is found. Count
@@ -421,6 +430,41 @@ mod tests {
         let resolved_none =
             apply_request_header_mappings(&mut headers, &miss_mappings, &HashMap::new());
         assert_eq!(resolved_none, 0, "absent request header must not count");
+    }
+
+    #[test]
+    fn headers_from_request_overrides_static_header_mixed_casing() {
+        // Static headers use "Authorization" (capitalized) while the
+        // headers_from_request outbound key uses "authorization" (lowercase).
+        // Both refer to the same HTTP header; the dynamic value must override
+        // the static fallback deterministically, not nondeterministically
+        // based on HashMap iteration order.
+        let mut static_headers = HashMap::new();
+        static_headers.insert("Authorization".to_string(), "static-token".to_string());
+        let mut headers_from_request = HashMap::new();
+        headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-incoming-auth".to_string(), "dynamic-token".to_string());
+
+        let mut config = make_agent_config(static_headers, headers_from_request);
+
+        resolve_mcp_headers(&mut config, Some(&req_headers));
+
+        let headers = get_server_headers(&config);
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"dynamic-token".to_string()),
+            "dynamic header must override static fallback regardless of key casing"
+        );
+        assert!(
+            headers.get("Authorization").is_none(),
+            "capitalized static key must not survive as a separate entry"
+        );
+        assert_eq!(
+            headers.len(),
+            1,
+            "exactly one entry after case-normalized override"
+        );
     }
 
     // ------------------------------------------------------------------
