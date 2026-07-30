@@ -67,11 +67,8 @@ pub struct ToolCallContext {
     pub attempt: Option<usize>,
     /// Custom metadata that wrappers can use
     pub metadata: Option<Value>,
-    /// Model-authored reasoning, captured pre-strip by
-    /// `PersistenceWrapper::transform_args`. ADVISORY ONLY — see
-    /// `ApprovalItem.tool_call_intent` for the digest-exclusion rule (R5).
-    /// Surfaces on the wire as `items[].tool_call_intent`, never inside
-    /// `arguments`.
+    /// Model-authored reasoning for the pending tool call. Advisory only —
+    /// see `ApprovalItem.tool_call_intent` for the digest-exclusion rule (R5).
     pub tool_call_intent: Option<String>,
 }
 
@@ -108,12 +105,11 @@ impl ToolCallContext {
         self.metadata = Some(metadata);
         self
     }
+}
 
-    /// Set the model-authored tool call intent (advisory).
-    pub fn with_tool_call_intent(mut self, intent: impl Into<String>) -> Self {
-        self.tool_call_intent = Some(intent.into());
-        self
-    }
+/// Blank (empty or whitespace-only) reasoning counts as absent.
+pub(crate) fn non_blank(s: &str) -> Option<&str> {
+    (!s.trim().is_empty()).then_some(s)
 }
 
 /// Result of argument transformation.
