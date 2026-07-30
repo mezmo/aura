@@ -87,7 +87,7 @@ dotted field, or relaxing the context charset would break it.
    conflicts (single-consumption). The fill also re-creates the `Json`
    extractor's 415 (wrong content-type) and 422 (bad/unknown-field) responses
    by hand and keeps `DefaultBodyLimit` so HMAC never runs over an unbounded
-   body — golden-frame tests for 415/422 land *before* the swap.
+   body; golden-frame tests for 415/422 land *before* the swap.
 6. **Secondary-secret lifecycle.** No API rotates or expires a secondary; it
    stays until the env var is unset and the process restarts. See the rotation
    runbook in §6.
@@ -116,7 +116,7 @@ dotted field, or relaxing the context charset would break it.
    of the *same* decision gets 404. That justification is flow-specific: a
    request-and-approvals resource model where a POST *creates* a record has no
    such protection and must re-derive replay handling per resource.
-3. **Route A response leg — IN SCOPE (Opus N2).** On the webhook route the
+3. **Route A response leg - IN SCOPE (Opus N2).** On the webhook route the
    decision arrives as the HTTP *response* to AURA's signed POST. It is
    verified with the same `authorize_ingress` over the response body and its
    `X-Aura-*` headers, context `approval-decision:{decision_id}`, before being
@@ -188,8 +188,8 @@ environment while any other test in the same binary can read it.
 
 - Inside `aura`, tests build `WebhookHmac` from parts via the public
   `WebhookHmac::new` (no environment involved). Only the `load_from_env`
-  tests in `signing.rs` touch the env — they exist to exercise exactly that
-  path — and they serialize behind the module's single `ENV_LOCK`.
+  tests in `signing.rs` touch the env (they exist to exercise exactly that
+  path), and they serialize behind the module's single `ENV_LOCK`.
 - `WebhookClient::new` deliberately does not read the environment; signing
   is resolved in `HitlRuntime::from_config` (the production path). This
   keeps every pre-existing `WebhookClient::new` test env-free.
