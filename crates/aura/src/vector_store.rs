@@ -34,6 +34,7 @@ pub struct VectorStoreManager {
     qdrant_store: Option<Arc<QdrantStoreKind>>,
     bedrock_kb_client: Option<Arc<aws_sdk_bedrockagentruntime::Client>>,
     bedrock_kb_id: Option<String>,
+    bedrock_kb_managed: bool,
     embedding_provider: String,
     embedding_model_name: String,
     pub context_prefix: Option<String>,
@@ -59,10 +60,17 @@ impl VectorStoreManager {
                 knowledge_base_id,
                 region,
                 profile,
+                managed,
             } => {
                 info!("Initializing vector store: bedrock_kb");
-                Self::create_bedrock_kb_store(config, knowledge_base_id, region, profile.as_deref())
-                    .await
+                Self::create_bedrock_kb_store(
+                    config,
+                    knowledge_base_id,
+                    region,
+                    profile.as_deref(),
+                    *managed,
+                )
+                .await
             }
         }
     }
@@ -190,6 +198,7 @@ impl VectorStoreManager {
             in_memory_store: Some(Arc::new(store)),
             bedrock_kb_client: None,
             bedrock_kb_id: None,
+            bedrock_kb_managed: false,
             embedding_provider: embedding.provider().to_string(),
             embedding_model_name: embedding.model().to_string(),
             context_prefix: config.context_prefix.clone(),
@@ -268,6 +277,7 @@ impl VectorStoreManager {
             in_memory_store: None,
             bedrock_kb_client: None,
             bedrock_kb_id: None,
+            bedrock_kb_managed: false,
             embedding_provider: embedding.provider().to_string(),
             embedding_model_name: embedding.model().to_string(),
             context_prefix: config.context_prefix.clone(),
@@ -280,6 +290,7 @@ impl VectorStoreManager {
         knowledge_base_id: &str,
         region: &str,
         profile: Option<&str>,
+        managed: bool,
     ) -> Result<Self, BuilderError> {
         info!("Creating Bedrock Knowledge Base store");
         info!("  Knowledge Base ID: {}", knowledge_base_id);
@@ -299,6 +310,7 @@ impl VectorStoreManager {
             in_memory_store: None,
             bedrock_kb_client: Some(Arc::new(client)),
             bedrock_kb_id: Some(knowledge_base_id.to_string()),
+            bedrock_kb_managed: managed,
             embedding_provider: "bedrock_kb".to_string(),
             embedding_model_name: "managed".to_string(),
             context_prefix: config.context_prefix.clone(),
@@ -413,14 +425,23 @@ impl VectorStoreManager {
             .text(query)
             .build();
 
-        let retrieval_config =
-            aws_sdk_bedrockagentruntime::types::KnowledgeBaseRetrievalConfiguration::builder()
-                .vector_search_configuration(
-                    aws_sdk_bedrockagentruntime::types::KnowledgeBaseVectorSearchConfiguration::builder()
-                        .number_of_results(limit as i32)
-                        .build(),
-                )
-                .build();
+        // Managed and classic KBs each reject the other's search configuration.
+        let retrieval_config_builder =
+            aws_sdk_bedrockagentruntime::types::KnowledgeBaseRetrievalConfiguration::builder();
+        let retrieval_config = if self.bedrock_kb_managed {
+            retrieval_config_builder.managed_search_configuration(
+                aws_sdk_bedrockagentruntime::types::ManagedSearchConfiguration::builder()
+                    .number_of_results(limit as i32)
+                    .build(),
+            )
+        } else {
+            retrieval_config_builder.vector_search_configuration(
+                aws_sdk_bedrockagentruntime::types::KnowledgeBaseVectorSearchConfiguration::builder()
+                    .number_of_results(limit as i32)
+                    .build(),
+            )
+        }
+        .build();
 
         let response = client
             .retrieve()
@@ -430,7 +451,12 @@ impl VectorStoreManager {
             .send()
             .await
             .map_err(|e| {
-                BuilderError::VectorStoreError(format!("Bedrock KB retrieve failed: {e}"))
+                // DisplayErrorContext surfaces service errors that SdkError's Display
+                // collapses to "service error".
+                BuilderError::VectorStoreError(format!(
+                    "Bedrock KB retrieve failed: {}",
+                    aws_smithy_types::error::display::DisplayErrorContext(&e)
+                ))
             })?;
 
         let results: Vec<SearchResult> = response

@@ -1256,10 +1256,42 @@ system_prompt = "Test"
                 knowledge_base_id,
                 region,
                 profile,
+                managed,
             } => {
                 assert_eq!(knowledge_base_id, "KB12345");
                 assert_eq!(region, "us-west-2");
                 assert_eq!(profile, &Some("my-profile".to_string()));
+                assert!(!managed);
+            }
+            _ => panic!("Expected BedrockKb vector store"),
+        }
+    }
+
+    #[test]
+    fn test_bedrock_kb_managed_flag_parsing() {
+        let config_str = r#"
+[agent.llm]
+provider = "bedrock"
+model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "us-east-1"
+
+[[vector_stores]]
+name = "managed_docs"
+type = "bedrock_kb"
+knowledge_base_id = "KB67890"
+region = "us-east-1"
+managed = true
+
+[agent]
+name = "Test"
+system_prompt = "Test"
+"#;
+        let config =
+            load_config_from_str(config_str).expect("Failed to parse managed bedrock_kb config");
+
+        match &config.vector_stores[0].store {
+            crate::config::VectorStoreType::BedrockKb { managed, .. } => {
+                assert!(managed);
             }
             _ => panic!("Expected BedrockKb vector store"),
         }

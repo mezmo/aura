@@ -649,6 +649,9 @@ pub enum VectorStoreType {
         region: String,
         #[serde(default)]
         profile: Option<String>,
+        /// Bedrock managed knowledge base (vs. classic vector-store-backed)
+        #[serde(default)]
+        managed: bool,
     },
 }
 

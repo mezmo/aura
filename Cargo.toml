@@ -86,7 +86,7 @@ strum = { version = "0.26", features = ["derive"] }
 # AWS Bedrock dependencies
 aws-config = "1.8.0"
 aws-sdk-bedrockruntime = "1.95.0"
-aws-sdk-bedrockagentruntime = "1.125.0"
+aws-sdk-bedrockagentruntime = "1.134.0"
 aws-smithy-types = "1.3.2"
 base64 = "0.22.1"
 async-stream = "0.3.6"
