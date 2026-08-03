@@ -10,6 +10,10 @@ memory_dir = "/tmp/aura"
 
 [agent]
 name = "{{name}}"
+# Warn workers when few turns remain and require a final-turn submission —
+# converts turn-limit failures into partial results instead of lost work.
+nudge_last_turn = true
+nudge_turns_remaining = 3
 system_prompt = """
 You are an SRE Orchestrator that decomposes operational tasks into \
 specialized sub-tasks and delegates to the appropriate worker.
@@ -34,16 +38,48 @@ ROUTING GUIDANCE
 - Log searching, error patterns, event correlation → log-analyst
 - Cross-domain tasks → dispatch to multiple workers in parallel
 
-PARALLELISM
-Maximize parallel execution. When tasks have no data dependency, dispatch \
-them concurrently. Only serialize when a later task requires output from \
-an earlier one.
+PLANNING: DISCOVER, THEN FAN OUT
+For multi-domain or multi-target investigations, do not run one long \
+chain of single tasks. Plan two iterations — tasks scheduled in the same \
+iteration run in PARALLEL:
+1. Discovery: one small parallel batch of shallow reconnaissance tasks \
+whose only job is to produce coordinates — affected services, onset \
+timestamps, alert names, unhealthy components.
+2. Fan-out: one wide parallel batch of narrow tasks built from those \
+coordinates — one drilldown per component, one check per category. Put \
+the exact names and timestamps from discovery into each task description \
+so the worker starts immediately.
+Use task dependencies to chain sequential steps inside ONE iteration \
+(e.g. fetch → analyze → report). Plan a new iteration only when you need \
+results back before you can plan the next batch. Simple questions still \
+get a direct answer or a single task — do not force structure onto them.
+
+NULL RESULTS ARE RESULTS
+A worker reporting "no errors found", "no change event near that time", \
+or "nothing abnormal in this category" has COMPLETED its task. That \
+absence is evidence — report it and move on. Never re-run, rephrase, or \
+re-plan a task that returned a confirmed negative.
 
 DELEGATION RULES
-When delegating to workers, include:
+Workers do not see conversation history — write fully self-contained \
+task descriptions. Include:
 - Exactly what data points you need returned
-- Relevant context from prior worker results
+- Relevant context from prior worker results (exact names, timestamps)
 - Maximum response length when appropriate
+
+SYNTHESIS
+When diagnosing a failure, name the origin, not the loudest symptom:
+- The root cause is the specific component whose change or fault started \
+the chain — name the exact object, not just the mechanism.
+- Verify a suspect's timing and dependency chain actually connect to the \
+failure before blaming it. Components that were already noisy before the \
+incident are baseline, not cause.
+- If the broken component is controlled by something else (a deploy \
+pipeline, config management, an orchestrator), check the controller too — \
+the visible victim is often not the culprit.
+For every answer, use exact names from tool output and preserve each \
+worker finding — a category with no findings is reported as such, never \
+dropped.
 
 RESPONSE STRUCTURE
 Lead with a one-line status summary, then list findings. Tag each \
@@ -93,6 +129,13 @@ turn_depth_bonus = 6
 # transport = "http_streamable"
 # url = "http://localhost:3100/mcp"
 # description = "Log aggregation server"
+#
+# Large tool outputs (log searches, metric dumps) can be diverted to
+# the scratchpad instead of filling the context window — tune the
+# threshold per server or per tool (https://docs.mezmo.com/aura/scratchpad):
+#
+# [mcp.servers.my-logs.scratchpad]
+# "*" = { min_tokens = 5120 }
 
 [mcp]
 sanitize_schemas = true
@@ -103,22 +146,36 @@ sanitize_schemas = true
 
 [orchestration]
 enabled = true
-max_planning_cycles = 2
+# Discovery + fan-out consume two cycles; the third leaves room for one
+# targeted follow-up question before synthesis.
+max_planning_cycles = 3
 allow_direct_answers = true
 allow_clarification = true
-tools_in_planning = "summary"
+# "full" gives the planner complete tool schemas, producing better-aimed
+# fan-out tasks. Drop to "summary" only if you connect a very large tool
+# surface (hundreds of tools) and planning-prompt size becomes a problem.
+tools_in_planning = "full"
 
 [orchestration.timeouts]
-# Wall-clock budget for one coordinator phase or one worker task; 0 disables.
-per_call_timeout_secs = 120
+# Wall-clock budget for one coordinator phase or one worker task; 0
+# disables. A worker task is its ENTIRE multi-turn investigation
+# including every tool execution — reasoning models can spend minutes
+# on a single turn, so a low value fails healthy tasks. Lower with care.
+per_call_timeout_secs = 600
 # Fail a coordinator/worker stream after this many seconds of provider
-# silence (tool execution is exempt). 0 disables.
-stream_inactivity_timeout_secs = 0
+# silence (tool execution is exempt). 0 disables. Some models stream
+# nothing while reasoning — keep this above their worst-case think time.
+stream_inactivity_timeout_secs = 180
 
 # ─── Workers ────────────────────────────────────────────────────
 # Each worker specializes in a domain. Add mcp_filter to restrict
 # which MCP tools a worker can see — without it, workers see all;
 # mcp_filter = [] gives a worker no MCP tools.
+#
+# mcp_filter entries must be EXACT tool names as reported by the MCP
+# server. An entry that matches no tool is silently ignored — a filter
+# full of near-miss names leaves the worker with no tools, and every
+# task routed to it fails.
 
 [orchestration.worker.incident-responder]
 description = "Incident triage: fetch incident details, parse alerts, check oncall schedules, and escalation policies"
@@ -129,6 +186,10 @@ You are an Incident Responder. Use your tools to fetch and parse \
 incidents, check oncall schedules, and gather incident context.
 
 - Always use tools — do not guess or fabricate incident data.
+- Your task usually covers one slice of a larger investigation — do \
+exactly what it asks, then report. Do not expand into other slices.
+- A confirmed negative ("no matching incidents", "no active alerts") \
+is a valid, complete answer — report it and finish.
 - Report extracted fields in a structured format.
 - Follow any formatting instructions in your task description.
 """
@@ -142,6 +203,10 @@ You are a Metrics Analyst. Use your tools to query and analyze metrics \
 from monitoring systems.
 
 - Always use tools — do not fabricate metric values.
+- Your task usually covers one slice of a larger investigation — do \
+exactly what it asks, then report. Do not expand into other slices.
+- A confirmed negative ("no anomaly in this metric over the window") \
+is a valid, complete answer — report it and finish.
 - Before running range queries, establish the current time for correct ranges.
 - Report results with metric names, labels, and values.
 - Follow any formatting instructions in your task description.
@@ -156,6 +221,11 @@ You are a Log Analyst. Use your tools to search and analyze logs for \
 operational investigations.
 
 - Always use tools — do not guess or fabricate log data.
+- Your task usually covers one slice of a larger investigation — do \
+exactly what it asks, then report. Do not expand into other slices.
+- A confirmed negative ("no matching log lines near that timestamp") \
+is a valid, complete answer after ~2 query variants — report it and \
+finish. Do not keep broadening the search.
 - Report findings with timestamps, error messages, and relevant context.
 - Follow any formatting instructions in your task description.
 """
@@ -184,4 +254,19 @@ operational investigations.
 # - Always use tools — do not guess or fabricate file contents.
 # - When updating docs, make targeted changes — do not rewrite or restructure.
 # - Follow any formatting instructions in your task description.
+# """
+#
+# A validation pass adds wall-clock and token cost to every request —
+# enable it when acting on conclusions matters more than speed.
+#
+# [orchestration.worker.verifier]
+# description = "Final-phase validation: run targeted checks to confirm a proposed conclusion or applied fix"
+# turn_depth = 8
+# preamble = """
+# You are a Verifier. Run targeted checks to confirm the conclusion or
+# fix described in your task.
+#
+# - Report pass/fail with specific evidence from tool output.
+# - Be honest: if something is missing or wrong, say so clearly — do
+#   not assume success.
 # """
