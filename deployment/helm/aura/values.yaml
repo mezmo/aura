@@ -61,9 +61,12 @@ server:
   # -- Default agent name or alias when multiple configs are loaded via config.configs.
   # Not required when only one configuration is loaded.
   defaultAgent: ""
-  # -- Command override (leave empty for default)
+  # -- The Aura image sets CMD to ./aura-web-server (no ENTRYPOINT).
+  # Helm maps command to ENTRYPOINT and args to CMD at runtime.
+  # Set command to ./aura-web-server when providing args.
+  # If args are specified without setting command, the pod will not start.
   command: ['./aura-web-server']
-  # -- Args override (leave empty for default)
+  # -- Args override (Overrides ENTRYPOINT ./aura-web-server from aura docker image)
   args: ['--verbose']
 
 # Streaming configuration
