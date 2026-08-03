@@ -46,12 +46,9 @@ spec:
           command:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- if .Values.server.args }}
+          {{- with .Values.server.args }}
           args:
-            {{- toYaml .Values.server.args | nindent 12 }}
-          {{- else }}
-          args:
-            - "--verbose"
+            {{- toYaml . | nindent 12 }}
           {{- end }}
           ports:
             - name: http

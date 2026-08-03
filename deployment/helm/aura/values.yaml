@@ -62,9 +62,9 @@ server:
   # Not required when only one configuration is loaded.
   defaultAgent: ""
   # -- Command override (leave empty for default)
-  command: []
-  # -- Args override (leave empty for default --verbose)
-  args: []
+  command: ['./aura-web-server']
+  # -- Args override (leave empty for default)
+  args: ['--verbose']
 
 # Streaming configuration
 streaming:
