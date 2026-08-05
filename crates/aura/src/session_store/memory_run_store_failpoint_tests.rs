@@ -169,7 +169,7 @@ async fn concurrent_parks_are_atomic_no_half_written_state() {
     // with a generation mismatch, and the winner's record is either observed
     // in full or not at all.
     let store = Arc::new(InMemoryRunStore::new());
-    let (session, generation, _holder) = seed_running(&*store).await;
+    let (session, generation, _holder) = seed_running(&store).await;
 
     let attempts: Vec<_> = (0..4)
         .map(|i| {
