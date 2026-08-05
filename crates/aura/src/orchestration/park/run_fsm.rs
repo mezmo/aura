@@ -111,8 +111,52 @@ impl RunState {
     /// non-human exit (`Expire`, `Fail`, `Cancel`) denies. `Parked` never
     /// reaches `Completed` directly. Terminals accept no event.
     pub fn apply(self, event: RunEvent) -> Result<RunState, IllegalTransition> {
-        let _ = event;
-        todo!("staged for #271 P-cards: run FSM transition")
+        match (self, event) {
+            (RunState::Created, RunEvent::Start { .. }) => Ok(RunState::Running),
+
+            (RunState::Running, RunEvent::Complete) => Ok(RunState::Completed),
+            (RunState::Running, RunEvent::Fail(cause)) => Ok(RunState::Failed { cause }),
+            (RunState::Running, RunEvent::Cancel) => Ok(RunState::Cancelled),
+
+            (
+                RunState::Parked {
+                    reason,
+                    parked_at,
+                    expires_at,
+                    checkpoint,
+                },
+                RunEvent::Reify(wake),
+            ) => {
+                let WakeReason::DecisionResolved { decision_id, .. } = wake;
+                let ParkReason::ApprovalsBlocked { decisions } = &reason;
+                if decisions.contains(&decision_id) {
+                    return Ok(RunState::Running);
+                }
+                Err(IllegalTransition {
+                    from: RunState::Parked {
+                        reason,
+                        parked_at,
+                        expires_at,
+                        checkpoint,
+                    },
+                    event: RunEvent::Reify(wake),
+                })
+            }
+
+            (RunState::Parked { .. }, RunEvent::Expire { summary }) => Ok(RunState::Failed {
+                cause: RunFailureCause::ParkExpired { summary },
+            }),
+
+            (RunState::Parked { .. }, RunEvent::Fail(cause)) => Ok(RunState::Failed { cause }),
+
+            (RunState::Parked { .. }, RunEvent::Cancel) => Ok(RunState::Failed {
+                cause: RunFailureCause::ExecutionFailed {
+                    summary: "cancelled while parked".to_string(),
+                },
+            }),
+
+            (from, event) => Err(IllegalTransition { from, event }),
+        }
     }
 
     /// True for `Completed`, `Failed`, and `Cancelled`.

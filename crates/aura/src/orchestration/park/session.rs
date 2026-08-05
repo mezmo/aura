@@ -71,8 +71,40 @@ impl SessionRecord {
         presented: FencingGeneration,
         event: RunEvent,
     ) -> Result<SessionRecord, CasError> {
-        let _ = (presented, event);
-        todo!("staged for #271 P-cards: fenced session CAS")
+        if presented != self.generation {
+            return Err(CasError::GenerationMismatch {
+                presented,
+                current: self.generation,
+            });
+        }
+
+        let start_run_id = if let RunEvent::Start { run_id } = &event {
+            Some(*run_id)
+        } else {
+            None
+        };
+
+        let SessionRecord {
+            session,
+            run_id,
+            state,
+            lease,
+            generation,
+        } = self;
+        let next_state = state.apply(event).map_err(CasError::Illegal)?;
+
+        let mut next = SessionRecord {
+            session,
+            run_id,
+            state: next_state,
+            lease,
+            generation: generation.next(),
+        };
+        if let Some(ref mut lease) = next.lease {
+            lease.generation = next.generation;
+        }
+        next.run_id = start_run_id.or(next.run_id);
+        Ok(next)
     }
 
     /// Park the running run, committing the checkpoint and the
@@ -91,8 +123,38 @@ impl SessionRecord {
         presented: FencingGeneration,
         commit: ParkCommit,
     ) -> Result<SessionRecord, CasError> {
-        let _ = (presented, commit);
-        todo!("staged for #271 P-cards: atomic park commit")
+        if presented != self.generation {
+            return Err(CasError::GenerationMismatch {
+                presented,
+                current: self.generation,
+            });
+        }
+
+        if !matches!(self.state, RunState::Running) {
+            return Err(CasError::StateMismatch {
+                actual: match self.state {
+                    RunState::Created => "Created",
+                    RunState::Running => "Running",
+                    RunState::Parked { .. } => "Parked",
+                    RunState::Completed => "Completed",
+                    RunState::Failed { .. } => "Failed",
+                    RunState::Cancelled => "Cancelled",
+                },
+            });
+        }
+
+        let mut next = self;
+        next.state = RunState::Parked {
+            reason: commit.reason,
+            parked_at: commit.parked_at,
+            expires_at: commit.expires_at,
+            checkpoint: Box::new(commit.checkpoint),
+        };
+        next.generation = next.generation.next();
+        if let Some(ref mut lease) = next.lease {
+            lease.generation = next.generation;
+        }
+        Ok(next)
     }
 }
 
