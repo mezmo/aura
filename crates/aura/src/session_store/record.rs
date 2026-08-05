@@ -418,10 +418,12 @@ pub fn decode_run_record(raw: &str) -> Result<SessionRecord, RunRecordError> {
     let version = value
         .get("version")
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
         .ok_or_else(|| RunRecordError::Malformed {
             reason: "missing or non-numeric version".to_string(),
         })?;
+    let version = u32::try_from(version).map_err(|_| RunRecordError::Malformed {
+        reason: "version out of u32 range".to_string(),
+    })?;
 
     match version {
         RUN_RECORD_VERSION => {
@@ -660,6 +662,18 @@ mod tests {
         };
         let err = AgentScope::try_from(scope).unwrap_err();
         assert!(err.reason.contains("not-a-uuid"));
+    }
+
+    /// A version tag that fits in JSON's `u64` but not in `u32` must not be
+    /// silently truncated into a known version.
+    #[test]
+    fn u64_version_outside_u32_range_is_rejected() {
+        let raw = r#"{"version":4294967297,"session":{"id":"sess-1","created_at":"2026-01-01T00:00:00Z"},"run_id":null,"state":"created","lease":null,"generation":1}"#;
+        let err = decode_run_record(raw).unwrap_err();
+        assert!(
+            matches!(err, RunRecordError::Malformed { .. }),
+            "expected malformed version, got {err:?}"
+        );
     }
 
     /// Pins each v1 wire copy to the domain serde derives at the byte
