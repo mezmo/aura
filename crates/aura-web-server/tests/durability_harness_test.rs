@@ -139,7 +139,7 @@ async fn durability_harness_redis_frames() {
     };
     let mcp_url = std::env::var(MCP_URL_ENV).unwrap_or_else(|_| DEFAULT_MCP_URL.to_string());
     let (mut transcript, mut red, mut server, events) =
-        drive_to_park(SessionStoreBackend::Redis, mcp_url, Some(redis_url)).await;
+        drive_to_park(SessionStoreBackend::Redis, mcp_url, Some(redis_url.clone())).await;
     let client = reqwest::Client::new();
 
     let session_id = extract_session_id(&events);
@@ -175,10 +175,34 @@ async fn durability_harness_redis_frames() {
     }
     transcript.push(approval_frame);
 
-    // Frame: publish_loss_wake_discovery — a decision published while the run
-    // was down should be discovered on restart and wake the parked run. Today
-    // there is no durable run to wake, so claiming the session fails.
+    // Frame: publish_loss_wake_discovery — kill the server again, publish an
+    // approval decision directly to the Redis event bus while the server is
+    // down, then restart and claim. Today there is no durable run to wake, so
+    // the claim fails; the frame goes green only when P7/P9 discover the
+    // decision and wake the parked run.
     let mut wake_frame = Frame::new("publish_loss_wake_discovery");
+    server
+        .stop()
+        .await
+        .expect("server stops for publish-loss test");
+    if let Some(id) = &decision_id {
+        match publish_decision_to_redis(&redis_url, id, true).await {
+            Ok(()) => {
+                wake_frame.record_state("publish_status", json!("ok"));
+            }
+            Err(e) => {
+                wake_frame.record_state("publish_error", json!(e.to_string()));
+                red.push("publish_loss_wake_discovery");
+            }
+        }
+    } else {
+        wake_frame.record_state("publish_error", json!("no decision_id captured"));
+        red.push("publish_loss_wake_discovery");
+    }
+    server
+        .start()
+        .await
+        .expect("server restarts after publish-loss");
     if let Some(id) = &session_id {
         let claim_url = format!("{}/v1/sessions/{}/claim", server.api_url(), id);
         match client.post(&claim_url).send().await {
@@ -221,7 +245,7 @@ async fn drive_to_park(
         memory_dir: memory_dir.clone(),
         port,
         backend,
-        redis_url,
+        redis_url: redis_url.clone(),
     };
 
     let mut server = AuraServerProcess::new(config).expect("server config writes");
@@ -242,7 +266,7 @@ async fn drive_to_park(
         "messages": [{"role": "user", "content": "Run the durability harness."}],
         "stream": true,
     });
-    let events = drive_to_approval(&client, &mut server, request_body).await;
+    let events = drive_to_approval(&client, &mut server, request_body, redis_url.as_ref()).await;
     let memory_dir = server.memory_dir().to_path_buf();
 
     // Frame: planning — the coordinator must emit a plan.
@@ -421,13 +445,15 @@ async fn drive_post_park_frames(
 }
 
 /// Open a streaming chat request, collect events until the first
-/// `aura.approval_requested`, wait a short beat for a `run_parked` event, then
-/// SIGKILL the server. The response is held open until the process dies, so
-/// the request teardown never runs and the approval record survives.
+/// `aura.approval_requested`, then wait for the approval record to be persisted
+/// in the backend before SIGKILL-ing the server. The response is held open
+/// until the process dies, so the request teardown never runs and the approval
+/// record survives.
 async fn drive_to_approval(
     client: &reqwest::Client,
     server: &mut AuraServerProcess,
     body: serde_json::Value,
+    redis_url: Option<&String>,
 ) -> Vec<SseEvent> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let url = format!("{}/v1/chat/completions", server.api_url());
@@ -437,26 +463,34 @@ async fn drive_to_approval(
     });
 
     let overall_deadline = Instant::now() + Duration::from_secs(20);
-    let park_wait = Duration::from_millis(1500);
+    let (kill_tx, mut kill_rx) = mpsc::unbounded_channel();
     let mut events = Vec::new();
-    let mut kill_after: Option<Instant> = None;
 
     loop {
-        let next_deadline = kill_after.unwrap_or(overall_deadline);
         tokio::select! {
-            _ = tokio::time::sleep_until(next_deadline) => {
-                if kill_after.is_some() {
-                    let _ = server.stop().await;
-                }
+            _ = tokio::time::sleep_until(overall_deadline) => break,
+            _ = kill_rx.recv() => {
+                let _ = server.stop().await;
                 break;
             }
             maybe = rx.recv() => {
                 match maybe {
                     Some(evt) => {
                         if evt.event_type.as_deref() == Some("aura.approval_requested")
-                            && kill_after.is_none()
+                            && let Some(id) = decision_id_from_event(&evt)
                         {
-                            kill_after = Some(Instant::now() + park_wait);
+                            let memory_dir = server.memory_dir().to_path_buf();
+                            let redis_url = redis_url.cloned();
+                            let kill_tx = kill_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = wait_for_approval_record(
+                                    &memory_dir,
+                                    &id,
+                                    redis_url.as_ref(),
+                                )
+                                .await;
+                                let _ = kill_tx.send(());
+                            });
                         }
                         events.push(evt);
                     }
@@ -559,13 +593,81 @@ fn extract_session_id(events: &[SseEvent]) -> Option<String> {
 fn extract_decision_id(events: &[SseEvent]) -> Option<String> {
     events.iter().find_map(|e| {
         if e.event_type.as_deref() == Some("aura.approval_requested") {
-            serde_json::from_str::<serde_json::Value>(&e.data)
-                .ok()
-                .and_then(|v| v.get("decision_id")?.as_str().map(|s| s.to_string()))
+            decision_id_from_event(e)
         } else {
             None
         }
     })
+}
+
+fn decision_id_from_event(event: &SseEvent) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&event.data)
+        .ok()
+        .and_then(|v| v.get("decision_id")?.as_str().map(|s| s.to_string()))
+}
+
+fn redis_key_prefix() -> String {
+    std::env::var("AURA_SESSION_STORE_PREFIX")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "aura".to_string())
+}
+
+/// Poll the backend until the approval record for `decision_id` is persisted,
+/// or until a generous timeout expires. This replaces the fixed post-approval
+/// sleep and removes the timing-flake class from the crash window.
+async fn wait_for_approval_record(
+    memory_dir: &std::path::Path,
+    decision_id: &str,
+    redis_url: Option<&String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let interval = Duration::from_millis(50);
+
+    if let Some(url) = redis_url {
+        let client = redis::Client::open(url.as_str())?;
+        let mut conn = client.get_connection_manager().await?;
+        let key = format!("{}:approval:{decision_id}", redis_key_prefix());
+        while Instant::now() < deadline {
+            let exists: bool = redis::AsyncCommands::exists(&mut conn, &key).await?;
+            if exists {
+                return Ok(());
+            }
+            tokio::time::sleep(interval).await;
+        }
+    } else {
+        let path = memory_dir
+            .join("approvals")
+            .join(format!("{decision_id}.json"));
+        while Instant::now() < deadline {
+            if path.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    Err("approval record did not appear within deadline".into())
+}
+
+/// Publish an approval decision directly to the Redis event bus channel that
+/// the server's `PendingApprovals` subscribes to. This simulates a decision
+/// event that is published while the server is down and would otherwise be lost.
+async fn publish_decision_to_redis(
+    redis_url: &str,
+    decision_id: &str,
+    approved: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open(redis_url)?;
+    let mut conn = client.get_connection_manager().await?;
+    let channel = format!("{}:bus:approval:{decision_id}", redis_key_prefix());
+    let payload = if approved {
+        r#"{"Approved":null}"#.to_string()
+    } else {
+        r#"{"Denied":{"reason":"harness test denial"}}"#.to_string()
+    };
+    let _: usize = redis::AsyncCommands::publish(&mut conn, channel, payload).await?;
+    Ok(())
 }
 
 async fn find_run_records(memory_dir: &std::path::Path) -> (Vec<PathBuf>, usize) {
