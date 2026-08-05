@@ -207,17 +207,18 @@ expression: snapshot
     },
     {
       "events": [],
-      "name": "approval_resolution_by_handle",
+      "name": "publish_loss_wake_discovery",
       "store_state": {
-        "resolve_status": 204
+        "claim_status": 404,
+        "durable_decision_state": "unrepresentable: resolve_durable is a staged hole",
+        "publish_subscribers": 0
       }
     },
     {
       "events": [],
-      "name": "publish_loss_wake_discovery",
+      "name": "approval_resolution_by_handle",
       "store_state": {
-        "claim_status": 404,
-        "publish_status": "ok"
+        "resolve_status": 204
       }
     }
   ]
