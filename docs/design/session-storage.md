@@ -346,7 +346,8 @@ TTL as a backstop so an abandoned parking pod's entry self-cleans.
     `subscribe` handler on **any** pod subscribes to it and relays frames to its own
     client. This is one-producer-to-many-subscribers **fan-out** across pods.
   - `a2a:cancel:{id}` — a `cancel` request landing on any pod publishes here; the owning
-    pod is subscribed and fires its local `CancellationToken`.
+    pod is subscribed, fires its local `CancellationToken`, and folds the resulting
+    terminal status into its execution stream so its own subscribers see the outcome.
   With the shared `TaskStore` and these two topics, **every** A2A flow — send, poll, list,
   history, stream, subscribe, cancel — is cross-pod. No session affinity is needed.
 
@@ -368,12 +369,17 @@ TTL as a backstop so an abandoned parking pod's entry self-cleans.
   state, and is lifetime-bounded so a dead owner cannot hang it indefinitely
   (clients resubscribe). A cancel always publishes the routed copy and then runs
   the local cancel: the pod that received the cancel writes the terminal status
-  to the shared store, the owning pod's listener only stops the execution.
-  Missing/terminal tasks stay `task_not_found` on subscribe, matching upstream
-  single-pod behavior. Terminal states are immutable in the Redis store (the
-  update script rejects writes to a terminal task), so an execution that misses
-  a routed cancel keeps running until it finishes but cannot record `Completed`
-  over the `Canceled` the cancelling pod wrote.
+  to the shared store, and the owning pod's listener both stops the execution and
+  yields the cancel's terminal status on the execution stream — stopping an
+  execution ends its stream with no terminal event, so without that its own
+  subscribers would see a bare close and could not tell a cancel from a dropped
+  connection. Missing/terminal tasks stay `task_not_found` on subscribe, matching
+  upstream single-pod behavior. Terminal states are immutable in the Redis store
+  (the update script rejects writes to a terminal task, and a rewrite of the state
+  already recorded is taken as the idempotent duplicate it is — both ends of a
+  routed cancel record the same `Canceled`), so an execution that misses a routed
+  cancel keeps running until it finishes but cannot record `Completed` over the
+  `Canceled` the cancelling pod wrote.
 
 ---
 
@@ -412,7 +418,8 @@ Notes:
   decision itself is not persisted, mirroring the in-memory store; it travels
   over the bus.)
 - Each task create/update is one Lua script covering the exists-check, `version`
-  bump, terminal-state gate (updates to a terminal task are rejected), record
+  bump, terminal-state gate (updates to a terminal task are rejected, except a
+  rewrite of the state already recorded, which leaves it alone), record
   write, and both index-set refreshes — atomically. `list` lazily prunes indexed
   ids whose task hash expired first and skips (without failing) records it cannot
   deserialize. The scripts touch the task key and its two index keys, so the

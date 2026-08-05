@@ -835,6 +835,62 @@ mod a2a_bridge {
             .expect("task in store");
         assert_eq!(stored.status.state, TaskState::Canceled);
     }
+
+    /// The executing instance's own subscribers must learn the outcome of a
+    /// cancel driven from elsewhere: stopping the execution ends its stream
+    /// with no terminal event, so without the routed cancel's status they see
+    /// only a bare close and cannot tell a cancel from a dropped connection.
+    #[tokio::test]
+    async fn cancel_on_other_instance_terminates_subscribers_on_the_executing_one() {
+        let config = test_config(60);
+        let (instance_a, _handles_a) = instance(&config).await;
+        let (instance_b, _handles_b) = instance(&config).await;
+        let params = ServiceParams::new();
+
+        instance_a
+            .send_message(&params, send_request("t3", "c3"))
+            .await
+            .expect("send succeeds");
+
+        let mut local = instance_a
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: "t3".to_string(),
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("subscribe on the executing instance succeeds");
+
+        instance_b
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t3".to_string(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("cancel on the non-executing instance succeeds");
+
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), local.next())
+                .await
+                .expect("frame within 5s")
+                .expect("stream stays open until a terminal frame")
+                .expect("frame ok");
+            match frame {
+                StreamResponse::StatusUpdate(update) if update.status.state.is_terminal() => {
+                    assert_eq!(update.status.state, TaskState::Canceled);
+                    break;
+                }
+                StreamResponse::Task(task) => assert!(!task.status.state.is_terminal()),
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Terminal states are immutable in the store: once a task is recorded
@@ -857,6 +913,34 @@ async fn update_of_terminal_task_is_rejected() {
         .await
         .expect_err("terminal task must reject updates");
     assert!(err.to_string().contains("terminal"), "{err}");
+
+    let got = tasks.get("t1").await.unwrap().unwrap();
+    assert_eq!(got.status.state, TaskState::Canceled);
+}
+
+/// Immutability rejects a *different* terminal state, not a second write of
+/// the one already recorded: both ends of a routed cancel record `Canceled`,
+/// and neither may see its write fail.
+#[tokio::test]
+async fn rewriting_the_recorded_terminal_state_is_accepted() {
+    let tasks = connect(&test_config(60)).await.tasks();
+    tasks
+        .create(make_task("t1", "c1", TaskState::Submitted))
+        .await
+        .unwrap();
+    let version = tasks
+        .update(make_task("t1", "c1", TaskState::Canceled))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tasks
+            .update(make_task("t1", "c1", TaskState::Canceled))
+            .await
+            .expect("re-recording the stored terminal state must succeed"),
+        version,
+        "the record is left as it was written"
+    );
 
     let got = tasks.get("t1").await.unwrap().unwrap();
     assert_eq!(got.status.state, TaskState::Canceled);

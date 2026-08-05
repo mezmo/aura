@@ -10,7 +10,9 @@
 //!   an instance serving a subscribe for a task it is not executing relays
 //!   them ([`relay_subscription`]).
 //! - [`cancel_topic`] — a cancel publishes here; the executing instance is
-//!   subscribed and drives its local cancel machinery.
+//!   subscribed, drives its local cancel machinery, and folds the resulting
+//!   terminal status into the execution stream so its own subscribers see the
+//!   same outcome relays do.
 //!
 //! Bus delivery is fire-and-forget end to end, and the store stays the source
 //! of truth: fan-out frames are sequence-numbered so a relay that misses one
@@ -18,10 +20,11 @@
 //! content, a relay converges through its periodic store poll (and is
 //! lifetime-bounded, so a dead executing instance cannot hang it forever),
 //! and the instance that received the cancel writes the terminal status
-//! itself, whether or not the routed cancel arrives. The Redis store rejects
-//! updates to terminal tasks, so an execution that misses a routed cancel
-//! can burn work until it finishes, but cannot overwrite the recorded
-//! `Canceled`.
+//! itself, whether or not the routed cancel arrives. Both ends of a routed
+//! cancel therefore record the same terminal status, which the store takes
+//! idempotently; a *different* terminal state is still rejected, so an
+//! execution that misses a routed cancel can burn work until it finishes but
+//! cannot overwrite the recorded `Canceled`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +36,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::warn;
 
@@ -93,11 +97,30 @@ impl<E: AgentExecutor> AgentExecutor for BusBridgedExecutor<E> {
         let events = self.inner.execute(ctx);
 
         Box::pin(async_stream::stream! {
-            let listener = spawn_cancel_listener(bus.clone(), inner, listener_ctx).await;
+            let (cancel_events, mut cancelled) = mpsc::unbounded_channel();
+            let listener =
+                spawn_cancel_listener(bus.clone(), inner, listener_ctx, cancel_events).await;
             let _stop_listener_on_drop = AbortOnDrop(listener);
             let mut events = publish_and_forward(bus, task_id, context_id, events);
-            while let Some(item) = events.next().await {
+            loop {
+                // A stopped execution says nothing more about its own outcome,
+                // so a routed cancel's frames outrank whatever is still
+                // draining out of it, and its terminal status ends the stream.
+                // They are not republished — the instance that received the
+                // cancel already puts that terminal frame on the fan-out topic
+                // for relays; this copy is for the subscribers attached here.
+                let (item, routed_cancel) = tokio::select! {
+                    biased;
+                    Some(item) = cancelled.recv() => (Some(item), true),
+                    item = events.next() => (item, false),
+                };
+                let Some(item) = item else { break };
+                let ends_stream =
+                    routed_cancel && matches!(&item, Ok(event) if is_terminal_event(event));
                 yield item;
+                if ends_stream {
+                    break;
+                }
             }
         })
     }
@@ -291,14 +314,17 @@ async fn publish_frame(bus: &dyn EventBus, topic: &str, seq: u64, event: &Stream
     }
 }
 
-/// Subscribe to the task's cancel topic and, on the first routed cancel,
-/// drive the inner executor's cancel to completion. Its events are discarded:
-/// the instance that received the cancel request writes the terminal status
-/// to the shared store, so this side only has to stop the execution.
+/// Subscribe to the task's cancel topic and, on the first routed cancel, drive
+/// the inner executor's cancel to completion, forwarding its events to `events`
+/// (until the execution stream that owns the receiver is gone). Stopping the
+/// execution leaves its stream ending without a terminal event, so forwarding
+/// the cancel's terminal status is what tells this instance's subscribers how
+/// the task ended.
 async fn spawn_cancel_listener<E: AgentExecutor>(
     bus: Arc<dyn EventBus>,
     inner: Arc<E>,
     ctx: ExecutorContext,
+    events: mpsc::UnboundedSender<Result<StreamResponse, A2AError>>,
 ) -> Option<AbortHandle> {
     let topic = cancel_topic(&ctx.task_id);
     match bus.subscribe(&topic).await {
@@ -306,7 +332,11 @@ async fn spawn_cancel_listener<E: AgentExecutor>(
             tokio::spawn(async move {
                 if requests.next().await.is_some() {
                     let mut cancelled = inner.cancel(ctx);
-                    while cancelled.next().await.is_some() {}
+                    while let Some(item) = cancelled.next().await {
+                        if events.send(item).is_err() {
+                            break;
+                        }
+                    }
                 }
             })
             .abort_handle(),
@@ -600,6 +630,63 @@ mod tests {
 
         let stored = store.get("t2").await.unwrap().expect("task in store");
         assert_eq!(stored.status.state, TaskState::Canceled);
+    }
+
+    /// A cancel routed from elsewhere stops the execution, whose stream then
+    /// ends with no terminal event of its own — the subscribers attached to it
+    /// still have to learn the outcome rather than seeing a bare close.
+    #[tokio::test]
+    async fn cancel_on_other_instance_terminates_local_subscribers() {
+        let store = SharedTaskStore::from_store(Arc::new(InMemoryTaskStore::new()));
+        let bus = Arc::new(InMemoryEventBus::new());
+        let (instance_a, _handles_a) = instance(&store, &bus);
+        let (instance_b, _handles_b) = instance(&store, &bus);
+        let params = ServiceParams::new();
+
+        instance_a
+            .send_message(&params, send_request("t8", "c8"))
+            .await
+            .expect("send succeeds");
+
+        let mut local = instance_a
+            .subscribe_to_task(
+                &params,
+                SubscribeToTaskRequest {
+                    id: "t8".to_string(),
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("subscribe on the executing instance succeeds");
+
+        instance_b
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t8".to_string(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .expect("cancel on the non-executing instance succeeds");
+
+        loop {
+            match next_frame(&mut local).await {
+                StreamResponse::StatusUpdate(update) if update.status.state.is_terminal() => {
+                    assert_eq!(update.status.state, TaskState::Canceled);
+                    break;
+                }
+                StreamResponse::Task(task) => assert!(!task.status.state.is_terminal()),
+                _ => {}
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), local.next())
+                .await
+                .expect("stream ends after the terminal frame")
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -122,12 +122,36 @@ impl RedisTaskStore {
             .await
             .map_err(store_err)?;
         match version {
-            -1 => Err(A2AError::invalid_request(format!(
+            -1 => self.resolve_terminal_write(task).await,
+            0 => Ok(None),
+            v => Ok(Some(v as u64)),
+        }
+    }
+
+    /// Answer a write the script refused because the record is already
+    /// terminal. Re-recording the state that is already stored is a duplicate
+    /// of an outcome two instances both write (a routed cancel is recorded by
+    /// the instance that received it and by the one executing the task), so it
+    /// leaves the record alone and reports its unchanged version; any other
+    /// state is the conflict the script exists to reject.
+    async fn resolve_terminal_write(&self, task: &Task) -> Result<Option<u64>, A2AError> {
+        let mut conn = self.conn.clone();
+        let (stored, version): (Option<String>, Option<u64>) = redis::pipe()
+            .hget(self.task_key(&task.id), "task")
+            .hget(self.task_key(&task.id), "version")
+            .query_async(&mut conn)
+            .await
+            .map_err(store_err)?;
+
+        let stored = stored.map(|json| parse_task(&json)).transpose()?;
+        match (stored, version) {
+            (Some(stored), Some(version)) if stored.status.state == task.status.state => {
+                Ok(Some(version))
+            }
+            _ => Err(A2AError::invalid_request(format!(
                 "task {} is terminal and cannot be updated",
                 task.id
             ))),
-            0 => Ok(None),
-            v => Ok(Some(v as u64)),
         }
     }
 
