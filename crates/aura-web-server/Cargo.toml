@@ -82,6 +82,10 @@ integration-scratchpad = []  # scratchpad_test
 # `AURA_TEST_REDIS_URL` in tests/redis_session_store_test.rs)
 integration-session-store = ["session-store-redis", "aura/test-support"]  # redis_session_store_test
 
+# Durability harness for park/reify HITL frames (needs live Redis/Valkey and
+# the mock MCP server; see tests/durability_harness_test.rs)
+integration-durability = ["session-store-redis", "aura/test-support"]
+
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { workspace = true }
@@ -95,3 +99,6 @@ aura-events = { path = "../aura-events" }
 tower = "0.5"
 http-body-util = "0.1"
 tempfile = "3"
+insta = { version = "1", features = ["json"] }
+portpicker = "0.1"
+glob = "0.3"

@@ -1,0 +1,245 @@
+---
+source: crates/aura-web-server/tests/durability_harness_test.rs
+expression: snapshot
+---
+{
+  "frames": [
+    {
+      "events": [],
+      "name": "start",
+      "store_state": {
+        "health_body": {
+          "a2a_server": {
+            "version": "1.0"
+          },
+          "aura_version": "0.1.14",
+          "session_store": {
+            "backend": "redis",
+            "ping": {
+              "latency_ms": 0,
+              "ok": true
+            }
+          },
+          "status": "healthy",
+          "timestamp": "<timestamp>"
+        },
+        "health_status": 200
+      }
+    },
+    {
+      "events": [
+        {
+          "model": "ollama/aura-stub",
+          "session_id": "<id>",
+          "trace_id": "2"
+        },
+        {
+          "servers": [
+            {
+              "server_name": "mock",
+              "status": "connected",
+              "tools_count": 7,
+              "transport": "http_streamable"
+            }
+          ],
+          "session_id": "<id>",
+          "trace_id": "2"
+        },
+        {
+          "agent_id": "coordinator",
+          "goal": "Exercise the HITL gate",
+          "planning_response": "One worker task calls the gated tool.",
+          "routing_mode": "routed",
+          "routing_rationale": "The query requires a gated tool execution.",
+          "session_id": "<id>",
+          "tasks": [
+            "Call the gated mock_tool"
+          ],
+          "trace_id": "2"
+        },
+        {
+          "agent_id": "coordinator",
+          "description": "Call the gated mock_tool",
+          "orchestrator_id": "<id>",
+          "session_id": "<id>",
+          "task_id": 0,
+          "trace_id": "2",
+          "worker_id": "<id>"
+        },
+        {
+          "agent_id": "coordinator",
+          "arguments": {
+            "message": "exercise the HITL gate"
+          },
+          "session_id": "<id>",
+          "task_id": 0,
+          "tool_call_id": "<id>",
+          "tool_name": "mock_tool",
+          "trace_id": "2",
+          "worker_id": "<id>"
+        },
+        {
+          "decision_id": "<id>",
+          "origin": {
+            "kind": "config_gate",
+            "matched_pattern": "mock_tool"
+          },
+          "scope": {
+            "kind": "worker",
+            "run_id": "<id>",
+            "session_id": "<id>",
+            "task_id": 0,
+            "worker": "gated"
+          },
+          "tool_name": "mock_tool"
+        },
+        {
+          "arguments": {
+            "message": "exercise the HITL gate"
+          },
+          "decision_id": "<id>",
+          "expires_at": "<timestamp>",
+          "origin": {
+            "kind": "config_gate",
+            "matched_pattern": "mock_tool"
+          },
+          "scope": {
+            "kind": "worker",
+            "run_id": "<id>",
+            "session_id": "<id>",
+            "task_id": 0,
+            "worker": "gated"
+          },
+          "tool_name": "mock_tool"
+        }
+      ],
+      "name": "planning",
+      "store_state": {}
+    },
+    {
+      "events": [
+        {
+          "agent_id": "coordinator",
+          "description": "Call the gated mock_tool",
+          "orchestrator_id": "<id>",
+          "session_id": "<id>",
+          "task_id": 0,
+          "trace_id": "2",
+          "worker_id": "<id>"
+        },
+        {
+          "agent_id": "coordinator",
+          "arguments": {
+            "message": "exercise the HITL gate"
+          },
+          "session_id": "<id>",
+          "task_id": 0,
+          "tool_call_id": "<id>",
+          "tool_name": "mock_tool",
+          "trace_id": "2",
+          "worker_id": "<id>"
+        }
+      ],
+      "name": "worker_execution",
+      "store_state": {}
+    },
+    {
+      "events": [
+        {
+          "decision_id": "<id>",
+          "origin": {
+            "kind": "config_gate",
+            "matched_pattern": "mock_tool"
+          },
+          "scope": {
+            "kind": "worker",
+            "run_id": "<id>",
+            "session_id": "<id>",
+            "task_id": 0,
+            "worker": "gated"
+          },
+          "tool_name": "mock_tool"
+        },
+        {
+          "arguments": {
+            "message": "exercise the HITL gate"
+          },
+          "decision_id": "<id>",
+          "expires_at": "<timestamp>",
+          "origin": {
+            "kind": "config_gate",
+            "matched_pattern": "mock_tool"
+          },
+          "scope": {
+            "kind": "worker",
+            "run_id": "<id>",
+            "session_id": "<id>",
+            "task_id": 0,
+            "worker": "gated"
+          },
+          "tool_name": "mock_tool"
+        }
+      ],
+      "name": "park_at_quiescence",
+      "store_state": {}
+    },
+    {
+      "events": [],
+      "name": "checkpoint_commit_crash",
+      "store_state": {
+        "checkpoint_dir_exists": false
+      }
+    },
+    {
+      "events": [],
+      "name": "process_restart",
+      "store_state": {
+        "health_body": {
+          "a2a_server": {
+            "version": "1.0"
+          },
+          "aura_version": "0.1.14",
+          "session_store": {
+            "backend": "redis",
+            "ping": {
+              "latency_ms": 0,
+              "ok": true
+            }
+          },
+          "status": "healthy",
+          "timestamp": "<timestamp>"
+        },
+        "health_status": 200
+      }
+    },
+    {
+      "events": [],
+      "name": "approval_by_handle",
+      "store_state": {
+        "approval_file_count": 0,
+        "decision_id_present": true,
+        "resolve_status": 204
+      }
+    },
+    {
+      "events": [],
+      "name": "dispatch_claim_crash",
+      "store_state": {}
+    },
+    {
+      "events": [],
+      "name": "headless_reify",
+      "store_state": {}
+    },
+    {
+      "events": [],
+      "name": "completion",
+      "store_state": {}
+    },
+    {
+      "events": [],
+      "name": "retrieval_by_handle",
+      "store_state": {}
+    }
+  ]
+}
