@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 use crate::orchestration::park::{
-    AgentInstanceId, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, SessionId,
+    AgentInstanceId, CasError, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, SessionId,
     SessionRecord, WakeReason,
 };
 
@@ -90,10 +90,6 @@ impl ApprovalStore for InMemoryApprovalStore {
 pub struct InMemoryRunStore {
     // `std::sync::Mutex`: every operation is a synchronous map op; nothing
     // awaits while holding the lock.
-    #[expect(
-        dead_code,
-        reason = "staged for #271: read by the in-memory RunStore fill"
-    )]
     records: Mutex<BTreeMap<SessionId, SessionRecord>>,
 }
 
@@ -106,81 +102,153 @@ impl InMemoryRunStore {
 
 #[async_trait]
 impl RunStore for InMemoryRunStore {
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: in-memory session record create"
-    )]
     async fn create(&self, record: SessionRecord) -> Result<(), RunStoreError> {
-        todo!("staged for #271: in-memory session record create")
+        let mut records = self.records.lock().expect("run store lock poisoned");
+        if records.contains_key(&record.session.id) {
+            return Err(RunStoreError::SessionExists {
+                session: record.session.id,
+            });
+        }
+        records.insert(record.session.id, record);
+        Ok(())
     }
 
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: in-memory session record load"
-    )]
     async fn load(&self, session: SessionId) -> Result<Option<SessionRecord>, RunStoreError> {
-        todo!("staged for #271: in-memory session record load")
+        let records = self.records.lock().expect("run store lock poisoned");
+        Ok(records.get(&session).cloned())
     }
 
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: in-memory CAS lease acquire"
-    )]
     async fn acquire_lease(
         &self,
         session: SessionId,
         holder: AgentInstanceId,
         ttl: LeaseTtl,
     ) -> Result<Lease, RunStoreError> {
-        todo!("staged for #271: in-memory CAS lease acquire")
+        let mut records = self.records.lock().expect("run store lock poisoned");
+        let record = records
+            .get_mut(&session)
+            .ok_or(RunStoreError::UnknownSession { session })?;
+
+        let now = chrono::Utc::now();
+        if let Some(ref lease) = record.lease
+            && lease.expires_at > now
+        {
+            return Err(RunStoreError::LeaseHeld {
+                holder: lease.holder,
+                expires_at: lease.expires_at,
+            });
+        }
+
+        let next_generation = record.generation.next();
+        let expires_at = now
+            + chrono::Duration::from_std(ttl.get()).expect("positive ttl fits in chrono duration");
+        let lease = Lease {
+            holder,
+            acquired_at: now,
+            heartbeat_at: now,
+            expires_at,
+            generation: next_generation,
+        };
+        record.lease = Some(lease.clone());
+        record.generation = next_generation;
+        Ok(lease)
     }
 
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: in-memory lease heartbeat"
-    )]
     async fn heartbeat_lease(
         &self,
         session: SessionId,
         generation: FencingGeneration,
         ttl: LeaseTtl,
     ) -> Result<Lease, RunStoreError> {
-        todo!("staged for #271: in-memory lease heartbeat")
+        let mut records = self.records.lock().expect("run store lock poisoned");
+        let record = records
+            .get_mut(&session)
+            .ok_or(RunStoreError::UnknownSession { session })?;
+
+        if generation != record.generation {
+            return Err(RunStoreError::Cas(CasError::GenerationMismatch {
+                presented: generation,
+                current: record.generation,
+            }));
+        }
+
+        let lease = record
+            .lease
+            .as_ref()
+            .ok_or(RunStoreError::Cas(CasError::StateMismatch {
+                actual: "unleased",
+            }))?;
+        let now = chrono::Utc::now();
+        let expires_at = now
+            + chrono::Duration::from_std(ttl.get()).expect("positive ttl fits in chrono duration");
+        let renewed = Lease {
+            holder: lease.holder,
+            acquired_at: lease.acquired_at,
+            heartbeat_at: now,
+            expires_at,
+            generation,
+        };
+        record.lease = Some(renewed.clone());
+        Ok(renewed)
     }
 
-    #[expect(unused_variables, reason = "staged for #271: in-memory lease release")]
     async fn release_lease(
         &self,
         session: SessionId,
         generation: FencingGeneration,
     ) -> Result<(), RunStoreError> {
-        todo!("staged for #271: in-memory lease release")
+        let mut records = self.records.lock().expect("run store lock poisoned");
+        let record = records
+            .get_mut(&session)
+            .ok_or(RunStoreError::UnknownSession { session })?;
+
+        if generation != record.generation {
+            return Err(RunStoreError::Cas(CasError::GenerationMismatch {
+                presented: generation,
+                current: record.generation,
+            }));
+        }
+
+        record.lease = None;
+        Ok(())
     }
 
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: in-memory fenced run event"
-    )]
     async fn apply(
         &self,
         session: SessionId,
         presented: FencingGeneration,
         event: RunEvent,
     ) -> Result<SessionRecord, RunStoreError> {
-        todo!("staged for #271: in-memory fenced run event")
+        let mut records = self.records.lock().expect("run store lock poisoned");
+        let record = records
+            .get(&session)
+            .ok_or(RunStoreError::UnknownSession { session })?;
+
+        let next = record
+            .clone()
+            .apply(presented, event)
+            .map_err(RunStoreError::Cas)?;
+        records.insert(session, next.clone());
+        Ok(next)
     }
 
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: in-memory atomic park commit"
-    )]
     async fn park(
         &self,
         session: SessionId,
         presented: FencingGeneration,
         commit: ParkCommit,
     ) -> Result<SessionRecord, RunStoreError> {
-        todo!("staged for #271: in-memory atomic park commit")
+        let mut records = self.records.lock().expect("run store lock poisoned");
+        let record = records
+            .get(&session)
+            .ok_or(RunStoreError::UnknownSession { session })?;
+
+        let next = record
+            .clone()
+            .park(presented, commit)
+            .map_err(RunStoreError::Cas)?;
+        records.insert(session, next.clone());
+        Ok(next)
     }
 }
 

@@ -18,6 +18,9 @@ mod file;
 mod memory;
 mod record;
 
+#[cfg(test)]
+mod memory_run_store_failpoint_tests;
+
 use std::pin::Pin;
 use std::time::Duration;
 

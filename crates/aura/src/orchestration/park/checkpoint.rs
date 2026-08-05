@@ -110,7 +110,7 @@ impl CheckpointEnvelope {
 
     /// Encode for storage.
     pub fn to_json(&self) -> Result<String, CheckpointCodecError> {
-        todo!("staged for #271 P-cards: checkpoint encode")
+        serde_json::to_string(self).map_err(|e| CheckpointCodecError::Serde(e.to_string()))
     }
 
     /// Decode from storage, rejecting schema versions newer than
@@ -118,8 +118,22 @@ impl CheckpointEnvelope {
     /// does not know (rolling upgrades can park on new pods and reap on old
     /// ones).
     pub fn from_json(raw: &str) -> Result<Self, CheckpointCodecError> {
-        let _ = raw;
-        todo!("staged for #271 P-cards: checkpoint decode + version gate")
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| CheckpointCodecError::Serde(e.to_string()))?;
+        let schema_version = value
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .ok_or_else(|| {
+                CheckpointCodecError::Serde("missing or non-numeric schema_version".to_string())
+            })?;
+        if schema_version > CHECKPOINT_SCHEMA_VERSION {
+            return Err(CheckpointCodecError::UnknownSchemaVersion {
+                found: schema_version,
+                supported: CHECKPOINT_SCHEMA_VERSION,
+            });
+        }
+        serde_json::from_value(value).map_err(|e| CheckpointCodecError::Serde(e.to_string()))
     }
 }
 
