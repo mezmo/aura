@@ -2801,6 +2801,7 @@ mod park_teardown_tests {
             items: vec![ApprovalItem {
                 tool_name: "test_tool".to_string(),
                 arguments: serde_json::json!({}),
+                tool_call_intent: None,
             }],
         }
     }
