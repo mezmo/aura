@@ -216,7 +216,8 @@ expression: snapshot
       "events": [],
       "name": "publish_loss_wake_discovery",
       "store_state": {
-        "claim_status": 404
+        "claim_status": 404,
+        "publish_status": "ok"
       }
     }
   ]
