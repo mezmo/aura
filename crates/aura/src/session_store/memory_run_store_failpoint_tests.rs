@@ -18,33 +18,46 @@ use crate::orchestration::park::{
 };
 use crate::session_store::{InMemoryRunStore, RunStore, RunStoreError};
 
+const RUN_ID: &str = "018f9d2e-7c3a-7000-8000-000000000271";
+
 fn lease_ttl() -> LeaseTtl {
     LeaseTtl::new(Duration::from_secs(60)).expect("positive ttl")
 }
 
-fn running_record() -> SessionRecord {
-    let generation = FencingGeneration::INITIAL.next();
+fn created_record() -> SessionRecord {
     SessionRecord {
         session: Session {
             id: SessionId::generate(),
             chat_session_id: Some(ChatSessionId::new("cs_failpoint")),
             created_at: Utc::now(),
         },
-        run_id: Some(
-            "018f9d2e-7c3a-7000-8000-000000000271"
-                .parse()
-                .expect("valid uuid"),
-        ),
-        state: RunState::Running,
-        lease: Some(Lease {
-            holder: AgentInstanceId::generate(),
-            acquired_at: Utc::now(),
-            heartbeat_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::seconds(60),
-            generation,
-        }),
-        generation,
+        run_id: None,
+        state: RunState::Created,
+        lease: None,
+        generation: FencingGeneration::INITIAL,
     }
+}
+
+async fn seed_running(store: &InMemoryRunStore) -> (SessionId, FencingGeneration, AgentInstanceId) {
+    let record = created_record();
+    let session = record.session.id;
+    let holder = AgentInstanceId::generate();
+    store.create(record).await.expect("create succeeds");
+    let lease = store
+        .acquire_lease(session, holder, lease_ttl())
+        .await
+        .expect("acquire succeeds");
+    let next = store
+        .apply(
+            session,
+            lease.generation,
+            RunEvent::Start {
+                run_id: RUN_ID.parse().expect("valid uuid"),
+            },
+        )
+        .await
+        .expect("start succeeds");
+    (session, next.generation, holder)
 }
 
 fn park_commit() -> ParkCommit {
@@ -58,16 +71,44 @@ fn park_commit() -> ParkCommit {
     }
 }
 
+fn expired_lease(generation: FencingGeneration) -> Lease {
+    Lease {
+        holder: AgentInstanceId::generate(),
+        acquired_at: Utc::now(),
+        heartbeat_at: Utc::now(),
+        expires_at: Utc::now() - chrono::Duration::seconds(1),
+        generation,
+    }
+}
+
+#[tokio::test]
+async fn create_rejects_non_created_state() {
+    let store = InMemoryRunStore::new();
+    let mut record = created_record();
+    record.state = RunState::Running;
+    record.run_id = Some(RUN_ID.parse().expect("valid uuid"));
+    let session = record.session.id;
+
+    let err = store
+        .create(record)
+        .await
+        .expect_err("non-Created create is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch {
+            actual: "non-Created"
+        })
+    ));
+    assert!(store.load(session).await.expect("load succeeds").is_none());
+}
+
 #[tokio::test]
 async fn rejected_park_leaves_record_untouched() {
     // A stale or otherwise rejected CAS is the in-store equivalent of a crash
     // before the commit window closes: the stored record must remain exactly
     // what it was.
     let store = InMemoryRunStore::new();
-    let record = running_record();
-    let session = record.session.id;
-    let original_generation = record.generation;
-    store.create(record).await.expect("create succeeds");
+    let (session, original_generation, _holder) = seed_running(&store).await;
 
     let stale = FencingGeneration::INITIAL;
     let err = store
@@ -92,10 +133,7 @@ async fn rejected_park_leaves_record_untouched() {
 #[tokio::test]
 async fn successful_park_records_a_fully_formed_parked_state() {
     let store = InMemoryRunStore::new();
-    let record = running_record();
-    let session = record.session.id;
-    let before = record.generation;
-    store.create(record).await.expect("create succeeds");
+    let (session, before, _holder) = seed_running(&store).await;
 
     let commit = park_commit();
     let next = store
@@ -131,10 +169,7 @@ async fn concurrent_parks_are_atomic_no_half_written_state() {
     // with a generation mismatch, and the winner's record is either observed
     // in full or not at all.
     let store = Arc::new(InMemoryRunStore::new());
-    let record = running_record();
-    let session = record.session.id;
-    let generation = record.generation;
-    store.create(record).await.expect("create succeeds");
+    let (session, generation, _holder) = seed_running(&*store).await;
 
     let attempts: Vec<_> = (0..4)
         .map(|i| {
@@ -186,10 +221,7 @@ async fn lease_acquire_is_a_fenced_cas() {
     // A live lease held by another instance blocks a second claim; an expired
     // lease transfers ownership and advances the fencing generation.
     let store = InMemoryRunStore::new();
-    let record = running_record();
-    let session = record.session.id;
-    let first_holder = record.lease.as_ref().unwrap().holder;
-    store.create(record).await.expect("create succeeds");
+    let (session, _generation, first_holder) = seed_running(&store).await;
 
     let second_holder = AgentInstanceId::generate();
     let err = store
@@ -206,18 +238,13 @@ async fn lease_acquire_is_a_fenced_cas() {
 
     // A record whose lease is already expired transfers to a new holder and
     // advances the fencing generation.
-    let mut expired = running_record();
-    expired.session.id = SessionId::generate();
+    let mut expired = created_record();
     let expired_session = expired.session.id;
-    expired.lease.as_mut().unwrap().expires_at = Utc::now() - chrono::Duration::seconds(1);
+    let before = FencingGeneration::INITIAL.next();
+    expired.generation = before;
+    expired.lease = Some(expired_lease(before));
     store.create(expired).await.expect("create succeeds");
 
-    let before = store
-        .load(expired_session)
-        .await
-        .unwrap()
-        .unwrap()
-        .generation;
     let lease = store
         .acquire_lease(expired_session, second_holder, lease_ttl())
         .await
@@ -235,10 +262,9 @@ async fn stale_generation_write_is_rejected() {
     // After a successful claim, a writer presenting the old generation must
     // be rejected, even if it once held the lease.
     let store = InMemoryRunStore::new();
-    let mut record = running_record();
+    let record = created_record();
     let session = record.session.id;
     let old_generation = record.generation;
-    record.lease = None;
     store.create(record).await.expect("create succeeds");
 
     let new_holder = AgentInstanceId::generate();
@@ -248,11 +274,121 @@ async fn stale_generation_write_is_rejected() {
         .expect("claim succeeds");
 
     let err = store
-        .apply(session, old_generation, RunEvent::Complete)
+        .apply(
+            session,
+            old_generation,
+            RunEvent::Start {
+                run_id: RUN_ID.parse().expect("valid uuid"),
+            },
+        )
         .await
         .expect_err("stale generation is rejected");
     assert!(matches!(
         err,
         RunStoreError::Cas(CasError::GenerationMismatch { .. })
+    ));
+}
+
+#[tokio::test]
+async fn heartbeat_rejects_expired_lease() {
+    let store = InMemoryRunStore::new();
+    let mut record = created_record();
+    let generation = FencingGeneration::INITIAL.next();
+    record.generation = generation;
+    record.lease = Some(expired_lease(generation));
+    let session = record.session.id;
+    store.create(record).await.expect("create succeeds");
+
+    let err = store
+        .heartbeat_lease(session, generation, lease_ttl())
+        .await
+        .expect_err("expired lease heartbeat is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch { actual: "expired" })
+    ));
+}
+
+#[tokio::test]
+async fn apply_rejects_expired_lease() {
+    let store = InMemoryRunStore::new();
+    let mut record = created_record();
+    let generation = FencingGeneration::INITIAL.next();
+    record.generation = generation;
+    record.lease = Some(expired_lease(generation));
+    let session = record.session.id;
+    store.create(record).await.expect("create succeeds");
+
+    let err = store
+        .apply(session, generation, RunEvent::Complete)
+        .await
+        .expect_err("expired lease apply is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch { actual: "expired" })
+    ));
+}
+
+#[tokio::test]
+async fn park_rejects_expired_lease() {
+    let store = InMemoryRunStore::new();
+    let mut record = created_record();
+    let generation = FencingGeneration::INITIAL.next();
+    record.generation = generation;
+    record.lease = Some(expired_lease(generation));
+    let session = record.session.id;
+    store.create(record).await.expect("create succeeds");
+
+    let err = store
+        .park(session, generation, park_commit())
+        .await
+        .expect_err("expired lease park is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch { actual: "expired" })
+    ));
+}
+
+#[tokio::test]
+async fn mutation_rejects_released_lease() {
+    let store = InMemoryRunStore::new();
+    let record = created_record();
+    let session = record.session.id;
+    let holder = AgentInstanceId::generate();
+    store.create(record).await.expect("create succeeds");
+    let lease = store
+        .acquire_lease(session, holder, lease_ttl())
+        .await
+        .expect("acquire succeeds");
+    store
+        .release_lease(session, lease.generation)
+        .await
+        .expect("release succeeds");
+
+    let err = store
+        .apply(session, lease.generation, RunEvent::Complete)
+        .await
+        .expect_err("released lease apply is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch { actual: "unleased" })
+    ));
+
+    let err = store
+        .park(session, lease.generation, park_commit())
+        .await
+        .expect_err("released lease park is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch { actual: "unleased" })
+    ));
+
+    let err = store
+        .heartbeat_lease(session, lease.generation, lease_ttl())
+        .await
+        .expect_err("released lease heartbeat is rejected");
+    assert!(matches!(
+        err,
+        RunStoreError::Cas(CasError::StateMismatch { actual: "unleased" })
     ));
 }
