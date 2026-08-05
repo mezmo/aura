@@ -21,8 +21,8 @@ use std::sync::Arc;
 use a2a_server::{InMemoryTaskStore, TaskStore};
 use async_trait::async_trait;
 use aura::session_store::{
-    ApprovalStore, EventBus, FileApprovalStore, InMemoryApprovalStore, InMemoryEventBus,
-    InMemoryRunStore, RunStore, SessionStoreError,
+    ApprovalStore, EventBus, FileApprovalStore, FileRunStore, InMemoryApprovalStore,
+    InMemoryEventBus, InMemoryRunStore, RunStore, SessionStoreError,
 };
 use aura_config::{FileSessionStoreConfig, SessionStoreBackend, SessionStoreConfig};
 
@@ -158,10 +158,11 @@ impl SessionStore for InMemorySessionStore {
     }
 }
 
-/// Durable approvals under a filesystem root, alongside the process-local bus
-/// and A2A task store.
+/// Durable approvals and run records under a filesystem root, alongside the
+/// process-local bus and A2A task store.
 pub struct FileSessionStore {
     approvals: Arc<FileApprovalStore>,
+    runs: Arc<FileRunStore>,
     tasks: Arc<InMemoryTaskStore>,
     bus: Arc<InMemoryEventBus>,
 }
@@ -171,6 +172,7 @@ impl FileSessionStore {
     pub async fn open(config: &FileSessionStoreConfig) -> Result<Self, SessionStoreError> {
         Ok(Self {
             approvals: Arc::new(FileApprovalStore::open(config.root.clone()).await?),
+            runs: Arc::new(FileRunStore::open(config.root.clone()).await?),
             tasks: Arc::new(InMemoryTaskStore::new()),
             bus: Arc::new(InMemoryEventBus::new()),
         })
@@ -193,6 +195,10 @@ impl SessionStore for FileSessionStore {
 
     fn bus(&self) -> Arc<dyn EventBus> {
         self.bus.clone()
+    }
+
+    fn runs(&self) -> Option<Arc<dyn RunStore>> {
+        Some(self.runs.clone())
     }
 
     async fn ping(&self) -> Result<(), SessionStoreError> {
