@@ -400,24 +400,42 @@ impl TryFrom<LeaseV1Wire> for park::Lease {
 }
 
 /// Encode a record for storage at [`RUN_RECORD_VERSION`].
-#[expect(
-    unused_variables,
-    reason = "staged for #271: versioned run record encode"
-)]
 pub fn encode_run_record(record: &SessionRecord) -> Result<String, RunRecordError> {
-    todo!("staged for #271: versioned run record encode")
+    serde_json::to_string(&RunRecordV1::from(record)).map_err(|e| RunRecordError::Malformed {
+        reason: e.to_string(),
+    })
 }
 
 /// Decode a stored record, dispatching on its inline version tag before any
 /// body field is interpreted; an unknown version is refused, never guessed
 /// at. One decoder per version, each upcasting into the current
 /// [`SessionRecord`].
-#[expect(
-    unused_variables,
-    reason = "staged for #271: versioned run record decode"
-)]
 pub fn decode_run_record(raw: &str) -> Result<SessionRecord, RunRecordError> {
-    todo!("staged for #271: versioned run record decode + refusal gate")
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| RunRecordError::Malformed {
+            reason: e.to_string(),
+        })?;
+    let version = value
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .ok_or_else(|| RunRecordError::Malformed {
+            reason: "missing or non-numeric version".to_string(),
+        })?;
+
+    match version {
+        RUN_RECORD_VERSION => {
+            let wire: RunRecordV1 =
+                serde_json::from_value(value).map_err(|e| RunRecordError::Malformed {
+                    reason: e.to_string(),
+                })?;
+            SessionRecord::try_from(wire)
+        }
+        other => Err(RunRecordError::UnknownVersion {
+            found: other,
+            supported: RUN_RECORD_VERSION,
+        }),
+    }
 }
 
 impl From<&ParkedApproval> for ParkedApprovalRecord {

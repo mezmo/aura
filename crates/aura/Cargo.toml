@@ -72,6 +72,9 @@ tiktoken-rs = "0.9.1"
 # Exact local Gemini tokenizer (embeds the Gemma 3 SentencePiece model)
 gemini-tokenizer = "0.2.0"
 
+# POSIX advisory file locking for the file-backed run store
+fs4 = "0.12"
+
 [features]
 default = ["otel"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tonic"]

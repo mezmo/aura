@@ -34,7 +34,7 @@ use crate::orchestration::park::{
     SessionRecord, WakeReason,
 };
 
-pub use file::FileApprovalStore;
+pub use file::{FileApprovalStore, FileRunStore};
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus, InMemoryRunStore};
 pub use record::{
     DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, RUN_RECORD_VERSION,
