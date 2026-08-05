@@ -488,33 +488,47 @@ fn create_record(dir: &Path, record: &SessionRecord) -> Result<(), RunStoreError
     }
 
     let path = run_record_path(dir, &record.session.id);
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(RunStoreError::SessionExists {
-                session: record.session.id,
-            });
-        }
-        Err(e) => {
-            return Err(io_err("create", &path, &e).into());
-        }
-    };
+    let lock_path = run_record_lock_path(dir, &record.session.id);
 
-    file.lock_exclusive().map_err(|e| {
+    // Serialize every operation on this session through the stable sidecar
+    // lockfile. A concurrent mutator that also takes this lock cannot enter
+    // its critical section while the record is being created, and no reader
+    // can see the target path until the write is complete.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&lock_path)
+        .map_err(|e| io_err("open", &lock_path, &e))?;
+
+    lock.lock_exclusive().map_err(|e| {
         RunStoreError::Store(SessionStoreError::Request {
-            reason: format!("cannot lock {}: {e}", path.display()),
+            reason: format!("cannot lock {}: {e}", lock_path.display()),
         })
     })?;
 
+    // Write the complete payload to a uniquely named temp file and flush it
+    // before any reader can see the path. Cleanup the temp file on error so
+    // interrupted creates do not leave debris.
     let payload = encode_run_record(record)?;
-    file.write_all(payload.as_bytes())
-        .map_err(|e| io_err("write", &path, &e))?;
-    file.sync_all().map_err(|e| io_err("sync", &path, &e))?;
-    drop(file);
+    let staged = dir.join(format!("{}.{}.tmp", record.session.id, Uuid::now_v7()));
+    write_synced(&staged, payload.as_bytes()).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })?;
+
+    // Verify the target does not already exist while holding the lock, then
+    // atomically publish the fully-written record and commit the directory
+    // entry. A concurrent reader sees either nothing or the whole record.
+    if path.exists() {
+        let _ = fs::remove_file(&staged);
+        return Err(RunStoreError::SessionExists {
+            session: record.session.id,
+        });
+    }
+
+    fs::rename(&staged, &path).map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        io_err("commit", &path, &e)
+    })?;
     sync_dir(dir).map_err(Into::into)
 }
 
@@ -1570,6 +1584,109 @@ mod tests {
         assert!(matches!(new_record.state, RunState::Running));
 
         create_flag(root, CHILD_INODE_DONE_FLAG);
+    }
+
+    /// `create` must serialize on the same stable sidecar lock that `mutate`
+    /// uses, and it must not publish the record path until the payload is fully
+    /// written. A second process that enters `mutate` while `create` is in
+    /// progress blocks on the lock; it never sees an empty or partial record
+    /// file.
+    #[tokio::test]
+    async fn create_uses_stable_sidecar_lock_and_publishes_complete_record() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileRunStore::open(root.path()).await.unwrap();
+        let session = SessionId::generate();
+        let mut record = created_record();
+        record.session.id = session;
+
+        let child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "session_store::file::tests::child_holds_sidecar_lock_during_parent_create",
+            ])
+            .env(CHILD_ROOT_ENV, root.path())
+            .env(CHILD_SESSION_ENV, session.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the child test process");
+
+        wait_for_flag(root.path(), "create-lock-held.flag");
+
+        // Announce that we are about to call create, so the child can verify
+        // the record path is not visible while we are blocked on the lock.
+        create_flag(root.path(), "parent-will-create.flag");
+
+        // This blocks until the child releases the sidecar lock.
+        store
+            .create(record)
+            .await
+            .expect("create succeeds after the child releases the lock");
+
+        create_flag(root.path(), "create-done.flag");
+
+        let output = child.wait_with_output().expect("reap the child process");
+        assert!(
+            output.status.success(),
+            "the child process must exit cleanly: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let loaded = store.load(session).await.unwrap().expect("record exists");
+        assert_eq!(loaded.session.id, session);
+        assert!(matches!(loaded.state, RunState::Created));
+    }
+
+    /// The child half of [`create_uses_stable_sidecar_lock_and_publishes_complete_record`]:
+    /// holds the sidecar lock before the parent creates, verifies the record
+    /// file is not published while the parent waits, then releases the lock
+    /// and confirms the parent published a complete record.
+    #[tokio::test]
+    #[ignore = "spawned as a child process by create_uses_stable_sidecar_lock_and_publishes_complete_record"]
+    async fn child_holds_sidecar_lock_during_parent_create() {
+        use fs4::fs_std::FileExt;
+
+        let root = std::env::var(CHILD_ROOT_ENV).expect("the parent sets the store root");
+        let session: SessionId = SessionId::parse(
+            &std::env::var(CHILD_SESSION_ENV).expect("the parent sets the session id"),
+        )
+        .expect("valid session id");
+
+        let root = Path::new(&root);
+        let runs_dir = root.join(super::RUNS_DIR);
+        let record_path = super::run_record_path(&runs_dir, &session);
+        let lock_path = super::run_record_lock_path(&runs_dir, &session);
+
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&lock_path)
+            .expect("open the sidecar lockfile");
+        lock.lock_exclusive()
+            .expect("hold the sidecar lock before the parent creates");
+
+        create_flag(root, "create-lock-held.flag");
+
+        // Wait until the parent is about to create; while we still hold the
+        // lock, the record file must not be visible.
+        wait_for_flag(root, "parent-will-create.flag");
+        assert!(
+            !record_path.exists(),
+            "record must not be published while the parent waits on the sidecar lock"
+        );
+
+        create_flag(root, "lock-released.flag");
+        drop(lock);
+
+        // Wait for the parent to finish creating, then confirm the record is
+        // present and decodes cleanly.
+        wait_for_flag(root, "create-done.flag");
+        let raw = fs::read_to_string(&record_path).expect("read the created record");
+        let loaded = super::decode_run_record(&raw).expect("record must be valid JSON");
+        assert_eq!(loaded.session.id, session);
+        assert!(matches!(loaded.state, RunState::Created));
     }
 }
 
