@@ -31,7 +31,7 @@ expression: snapshot
         {
           "model": "ollama/aura-stub",
           "session_id": "<id>",
-          "trace_id": "2"
+          "trace_id": "<id>"
         },
         {
           "servers": [
@@ -43,7 +43,7 @@ expression: snapshot
             }
           ],
           "session_id": "<id>",
-          "trace_id": "2"
+          "trace_id": "<id>"
         },
         {
           "agent_id": "coordinator",
@@ -55,7 +55,7 @@ expression: snapshot
           "tasks": [
             "Call the gated mock_tool"
           ],
-          "trace_id": "2"
+          "trace_id": "<id>"
         },
         {
           "agent_id": "coordinator",
@@ -63,7 +63,7 @@ expression: snapshot
           "orchestrator_id": "<id>",
           "session_id": "<id>",
           "task_id": 0,
-          "trace_id": "2",
+          "trace_id": "<id>",
           "worker_id": "<id>"
         },
         {
@@ -75,7 +75,7 @@ expression: snapshot
           "task_id": 0,
           "tool_call_id": "<id>",
           "tool_name": "mock_tool",
-          "trace_id": "2",
+          "trace_id": "<id>",
           "worker_id": "<id>"
         },
         {
@@ -124,7 +124,7 @@ expression: snapshot
           "orchestrator_id": "<id>",
           "session_id": "<id>",
           "task_id": 0,
-          "trace_id": "2",
+          "trace_id": "<id>",
           "worker_id": "<id>"
         },
         {
@@ -136,7 +136,7 @@ expression: snapshot
           "task_id": 0,
           "tool_call_id": "<id>",
           "tool_name": "mock_tool",
-          "trace_id": "2",
+          "trace_id": "<id>",
           "worker_id": "<id>"
         }
       ],
@@ -185,13 +185,6 @@ expression: snapshot
     },
     {
       "events": [],
-      "name": "checkpoint_commit_crash",
-      "store_state": {
-        "checkpoint_dir_exists": false
-      }
-    },
-    {
-      "events": [],
       "name": "process_restart",
       "store_state": {
         "health_body": {
@@ -214,32 +207,17 @@ expression: snapshot
     },
     {
       "events": [],
-      "name": "approval_by_handle",
+      "name": "approval_resolution_by_handle",
       "store_state": {
-        "approval_file_count": 0,
-        "decision_id_present": true,
         "resolve_status": 204
       }
     },
     {
       "events": [],
-      "name": "dispatch_claim_crash",
-      "store_state": {}
-    },
-    {
-      "events": [],
-      "name": "headless_reify",
-      "store_state": {}
-    },
-    {
-      "events": [],
-      "name": "completion",
-      "store_state": {}
-    },
-    {
-      "events": [],
-      "name": "retrieval_by_handle",
-      "store_state": {}
+      "name": "publish_loss_wake_discovery",
+      "store_state": {
+        "claim_status": 404
+      }
     }
   ]
 }

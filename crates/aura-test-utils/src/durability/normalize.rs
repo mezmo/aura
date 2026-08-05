@@ -1,11 +1,23 @@
 //! Scrub nondeterministic values from captured SSE events and store state.
 
+use std::path::Path;
+
 use regex::Regex;
 use serde_json::Value;
 
-/// Replace run/session/approval IDs, timestamps, durations, and host/port
-/// addresses with stable placeholders.
-pub fn scrub_nondeterminism(value: &mut Value) {
+/// Replace run/session/approval IDs, timestamps, durations, host/port addresses,
+/// and filesystem paths with stable placeholders.
+pub fn scrub_nondeterminism(value: &mut Value, memory_dir: &Path) {
+    let memory_dir_str = memory_dir.to_string_lossy().to_string();
+    let cs_re = Regex::new(r"cs_[0-9a-fA-F]{16,}").expect("cs regex compiles");
+    let uuid_re = Regex::new(
+        r"(^|[^0-9A-Za-z-])([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})([^0-9A-Za-z-]|$)",
+    )
+    .expect("uuid regex compiles");
+    scrub_value(value, &memory_dir_str, &cs_re, &uuid_re);
+}
+
+fn scrub_value(value: &mut Value, memory_dir: &str, cs_re: &Regex, uuid_re: &Regex) {
     match value {
         Value::Object(map) => {
             for (key, val) in map.iter_mut() {
@@ -23,19 +35,35 @@ pub fn scrub_nondeterminism(value: &mut Value) {
                     if let Value::String(s) = val {
                         *s = scrub_url(s);
                     }
+                } else if let Value::String(s) = val {
+                    *s = scrub_path_string(s, memory_dir, cs_re, uuid_re);
                 } else {
-                    scrub_nondeterminism(val);
+                    scrub_value(val, memory_dir, cs_re, uuid_re);
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                scrub_nondeterminism(item);
+                scrub_value(item, memory_dir, cs_re, uuid_re);
             }
+        }
+        Value::String(s) => {
+            *s = scrub_path_string(s, memory_dir, cs_re, uuid_re);
         }
         _ => {}
     }
 }
+
+fn scrub_path_string(s: &str, memory_dir: &str, cs_re: &Regex, uuid_re: &Regex) -> String {
+    let mut out = s.to_string();
+    if out.contains(memory_dir) {
+        out = out.replace(memory_dir, "<memory_dir>");
+    }
+    out = cs_re.replace_all(&out, "<session>").to_string();
+    out = uuid_re.replace_all(&out, "${1}<run>${3}").to_string();
+    out
+}
+
 fn is_id_key(key: &str) -> bool {
     matches!(
         key,
@@ -45,6 +73,8 @@ fn is_id_key(key: &str) -> bool {
             | "decision_id"
             | "request_id"
             | "tool_call_id"
+            | "tool_id"
+            | "trace_id"
             | "orchestrator_id"
             | "worker_id"
             | "task_id"

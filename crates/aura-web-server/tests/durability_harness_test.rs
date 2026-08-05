@@ -10,8 +10,13 @@
 //! make test-integration-durability-local
 //! ```
 //!
-//! Or directly (set `INSTA_UPDATE=always` the first time to generate the
-//! golden snapshots):
+//! To intentionally regenerate the golden snapshots:
+//!
+//! ```text
+//! make test-integration-durability-bless
+//! ```
+//!
+//! Or directly (set `INSTA_UPDATE=always` to generate snapshots the first time):
 //!
 //! ```text
 //! INSTA_UPDATE=always cargo test -p aura-web-server --features integration-durability --test durability_harness_test
@@ -22,6 +27,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use aura_test_utils::durability::{
@@ -38,8 +44,88 @@ const REDIS_URL_ENV: &str = "AURA_TEST_REDIS_URL";
 #[tokio::test(flavor = "multi_thread")]
 async fn durability_harness_file_frames() {
     let mcp_url = std::env::var(MCP_URL_ENV).unwrap_or_else(|_| DEFAULT_MCP_URL.to_string());
-    let (transcript, red, mut server) = run_harness(SessionStoreBackend::File, mcp_url, None).await;
-    finish(transcript, red, &mut server).await;
+    let (mut transcript, mut red, mut server, events) =
+        drive_to_park(SessionStoreBackend::File, mcp_url, None).await;
+    let client = reqwest::Client::new();
+
+    let session_id = extract_session_id(&events);
+    let decision_id = extract_decision_id(&events);
+
+    // Frame: checkpoint_commit_crash — kill the server at the park window,
+    // restart, and assert that no decodable run record exists. Orchestration
+    // artifacts (plan.json, etc.) do not count; only files that decode as a
+    // SessionRecord via decode_run_record are run records.
+    let mut checkpoint_frame = Frame::new("checkpoint_commit_crash");
+    let memory_dir = server.memory_dir().to_path_buf();
+    let (run_records, artifact_count) = find_run_records(&memory_dir).await;
+    let approval_files: Vec<PathBuf> =
+        glob::glob(&format!("{}/approvals/*.json", memory_dir.display()))
+            .expect("approval glob")
+            .filter_map(Result::ok)
+            .collect();
+    checkpoint_frame.record_state("memory_dir", json!(memory_dir.display().to_string()));
+    checkpoint_frame.record_state("run_record_count", json!(run_records.len()));
+    checkpoint_frame.record_state("artifact_count", json!(artifact_count));
+    checkpoint_frame.record_state("approval_file_count", json!(approval_files.len()));
+    checkpoint_frame.record_state(
+        "run_record_paths",
+        json!(
+            run_records
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        ),
+    );
+    if run_records.is_empty() {
+        red.push("checkpoint_commit_crash");
+    }
+    transcript.push(checkpoint_frame);
+
+    // Frame: process_restart — real process boundary (the previous kill already
+    // stopped the process; restart it and confirm it is healthy).
+    let mut restart_frame = Frame::new("process_restart");
+    server.restart().await.expect("server restarts after crash");
+    record_health(&client, &server, &mut restart_frame).await;
+    transcript.push(restart_frame);
+
+    // Frame: approval_resolution_by_handle — the parked approval must be
+    // resolvable by its decision id after restart. This is honestly green
+    // today because the conversational approval record survives a SIGKILL.
+    let mut approval_frame = Frame::new("approval_resolution_by_handle");
+    if let Some(id) = &decision_id {
+        let resolve_url = format!("{}/v1/approvals/{}", server.api_url(), id);
+        let resolve_body = json!({"approved": true});
+        match client.post(&resolve_url).json(&resolve_body).send().await {
+            Ok(resp) => {
+                approval_frame.record_state("resolve_status", json!(resp.status().as_u16()));
+                if resp.status() != reqwest::StatusCode::NO_CONTENT {
+                    red.push("approval_resolution_by_handle");
+                }
+            }
+            Err(e) => {
+                approval_frame.record_state("resolve_error", json!(e.to_string()));
+                red.push("approval_resolution_by_handle");
+            }
+        }
+    } else {
+        approval_frame.record_state("resolve_error", json!("no decision_id captured"));
+        red.push("approval_resolution_by_handle");
+    }
+    transcript.push(approval_frame);
+
+    // Remaining frames exercise the post-park surface. Each one drives the
+    // expected V1 endpoint and fails today because the endpoint/behavior does
+    // not exist.
+    drive_post_park_frames(
+        &client,
+        &server,
+        session_id.as_deref(),
+        &mut transcript,
+        &mut red,
+    )
+    .await;
+
+    finish("file_frames", transcript, red, &mut server).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -52,16 +138,79 @@ async fn durability_harness_redis_frames() {
         }
     };
     let mcp_url = std::env::var(MCP_URL_ENV).unwrap_or_else(|_| DEFAULT_MCP_URL.to_string());
-    let (transcript, red, mut server) =
-        run_harness(SessionStoreBackend::Redis, mcp_url, Some(redis_url)).await;
-    finish(transcript, red, &mut server).await;
+    let (mut transcript, mut red, mut server, events) =
+        drive_to_park(SessionStoreBackend::Redis, mcp_url, Some(redis_url)).await;
+    let client = reqwest::Client::new();
+
+    let session_id = extract_session_id(&events);
+    let decision_id = extract_decision_id(&events);
+
+    // Frame: process_restart — real process boundary with the Redis backend.
+    let mut restart_frame = Frame::new("process_restart");
+    server.restart().await.expect("server restarts after crash");
+    record_health(&client, &server, &mut restart_frame).await;
+    transcript.push(restart_frame);
+
+    // Frame: approval_resolution_by_handle — the Redis-backed approval record
+    // survives process death and resolves by handle.
+    let mut approval_frame = Frame::new("approval_resolution_by_handle");
+    if let Some(id) = &decision_id {
+        let resolve_url = format!("{}/v1/approvals/{}", server.api_url(), id);
+        let resolve_body = json!({"approved": true});
+        match client.post(&resolve_url).json(&resolve_body).send().await {
+            Ok(resp) => {
+                approval_frame.record_state("resolve_status", json!(resp.status().as_u16()));
+                if resp.status() != reqwest::StatusCode::NO_CONTENT {
+                    red.push("approval_resolution_by_handle");
+                }
+            }
+            Err(e) => {
+                approval_frame.record_state("resolve_error", json!(e.to_string()));
+                red.push("approval_resolution_by_handle");
+            }
+        }
+    } else {
+        approval_frame.record_state("resolve_error", json!("no decision_id captured"));
+        red.push("approval_resolution_by_handle");
+    }
+    transcript.push(approval_frame);
+
+    // Frame: publish_loss_wake_discovery — a decision published while the run
+    // was down should be discovered on restart and wake the parked run. Today
+    // there is no durable run to wake, so claiming the session fails.
+    let mut wake_frame = Frame::new("publish_loss_wake_discovery");
+    if let Some(id) = &session_id {
+        let claim_url = format!("{}/v1/sessions/{}/claim", server.api_url(), id);
+        match client.post(&claim_url).send().await {
+            Ok(resp) => {
+                wake_frame.record_state("claim_status", json!(resp.status().as_u16()));
+                if !resp.status().is_success() {
+                    red.push("publish_loss_wake_discovery");
+                }
+            }
+            Err(e) => {
+                wake_frame.record_state("claim_error", json!(e.to_string()));
+                red.push("publish_loss_wake_discovery");
+            }
+        }
+    } else {
+        wake_frame.record_state("claim_error", json!("no session_id captured"));
+        red.push("publish_loss_wake_discovery");
+    }
+    transcript.push(wake_frame);
+
+    finish("redis_frames", transcript, red, &mut server).await;
 }
 
-async fn run_harness(
+/// Drive a run up to the first HITL approval request, kill the server at the
+/// park window, and return the captured events. The approval record is left
+/// in the backend because the crash prevents the request teardown from
+/// cancelling it.
+async fn drive_to_park(
     backend: SessionStoreBackend,
     mcp_url: String,
     redis_url: Option<String>,
-) -> (FrameTranscript, RedFrames, AuraServerProcess) {
+) -> (FrameTranscript, RedFrames, AuraServerProcess, Vec<SseEvent>) {
     let stub = StubLlm::start().await;
     let memory_dir = tempfile::tempdir().expect("temp memory dir").keep();
 
@@ -87,33 +236,24 @@ async fn run_harness(
     record_health(&client, &server, &mut start_frame).await;
     transcript.push(start_frame);
 
-    // Frame: planning — drive the run until the first plan is created.
-    let chat_url = format!("{}/v1/chat/completions", server.api_url());
+    // Drive the run until the approval request, then crash the server.
     let request_body = json!({
         "model": "durability",
         "messages": [{"role": "user", "content": "Run the durability harness."}],
         "stream": true,
     });
+    let events = drive_to_approval(&client, &mut server, request_body).await;
+    let memory_dir = server.memory_dir().to_path_buf();
 
-    let events =
-        match collect_sse_events(&client, &chat_url, request_body, Duration::from_secs(15)).await {
-            Ok(events) => events,
-            Err(_e) => {
-                red.push("planning");
-                transcript.push(Frame::new("planning"));
-                return (transcript, red, server);
-            }
-        };
-
+    // Frame: planning — the coordinator must emit a plan.
     let mut planning_frame = Frame::new("planning");
     for evt in &events {
         if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&evt.data) {
-            scrub_nondeterminism(&mut value);
+            scrub_nondeterminism(&mut value, &memory_dir);
             planning_frame.push_event(value);
         }
     }
-    let plan_created = has_event(&events, "aura.orchestrator.plan_created");
-    if !plan_created {
+    if !has_event(&events, "aura.orchestrator.plan_created") {
         red.push("planning");
     }
     transcript.push(planning_frame);
@@ -125,117 +265,261 @@ async fn run_harness(
             || evt.event_type.as_deref() == Some("aura.orchestrator.tool_call_started"))
             && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&evt.data)
         {
-            scrub_nondeterminism(&mut value);
+            scrub_nondeterminism(&mut value, &memory_dir);
             worker_frame.push_event(value);
         }
     }
-    let task_started = has_event(&events, "aura.orchestrator.task_started");
-    if !task_started {
+    if !has_event(&events, "aura.orchestrator.task_started") {
         red.push("worker_execution");
     }
     transcript.push(worker_frame);
 
     // Frame: park_at_quiescence — after the approval is requested, the run
-    // must durably park (emit an orchestrator.run_parked event) within a short
-    // window. Production does not wire run_store_for_parking, so this frame is
-    // red.
+    // must durably park (emit an orchestrator.run_parked event). Production
+    // does not wire run_store_for_parking, so this frame is red.
     let mut park_frame = Frame::new("park_at_quiescence");
     for evt in &events {
         if (evt.event_type.as_deref() == Some("aura.approval_requested")
             || evt.event_type.as_deref() == Some("aura.approval_pending"))
             && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&evt.data)
         {
-            scrub_nondeterminism(&mut value);
+            scrub_nondeterminism(&mut value, &memory_dir);
             park_frame.push_event(value);
         }
     }
     let approval_requested = has_event(&events, "aura.approval_requested");
-    let run_parked = events.iter().any(|e| {
-        e.data.contains("orchestrator.run_parked")
-            || e.event_type.as_deref() == Some("aura.orchestrator.run_parked")
-    });
+    let run_parked = events
+        .iter()
+        .any(|e| e.event_type.as_deref() == Some("aura.orchestrator.run_parked"));
     if !approval_requested || !run_parked {
         red.push("park_at_quiescence");
     }
     transcript.push(park_frame);
 
-    // Disconnect the client. With durable parking absent, the conversational
-    // route tears down its parked approvals.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    (transcript, red, server, events)
+}
 
-    // Frame: checkpoint_commit_crash — no checkpoint marker exists.
-    let mut checkpoint_frame = Frame::new("checkpoint_commit_crash");
-    let checkpoint_dir = memory_dir.join("checkpoints");
-    checkpoint_frame.record_state("checkpoint_dir_exists", json!(checkpoint_dir.is_dir()));
-    if !checkpoint_dir.is_dir() {
-        red.push("checkpoint_commit_crash");
-    }
-    transcript.push(checkpoint_frame);
-
-    // Frame: process_restart — stop and restart the server.
-    let mut restart_frame = Frame::new("process_restart");
-    server.stop().await.expect("server stops");
-    server.restart().await.expect("server restarts");
-    record_health(&client, &server, &mut restart_frame).await;
-    transcript.push(restart_frame);
-
-    // Frame: approval_by_handle — the parked approval should be resolvable by
-    // its decision id after restart. Because the run did not durably park, the
-    // approval was torn down with the request, so this frame is red.
-    let mut approval_frame = Frame::new("approval_by_handle");
-    let decision_id = events.iter().find_map(|e| {
-        if e.event_type.as_deref() == Some("aura.approval_requested") {
-            serde_json::from_str::<serde_json::Value>(&e.data)
-                .ok()
-                .and_then(|v| v.get("decision_id")?.as_str().map(|s| s.to_string()))
-        } else {
-            None
-        }
-    });
-    approval_frame.record_state("decision_id_present", json!(decision_id.is_some()));
-
-    if let Some(id) = decision_id {
-        let resolve_url = format!("{}/v1/approvals/{}", server.api_url(), id);
-        let resolve_body = json!({"approved": true});
-        match client.post(&resolve_url).json(&resolve_body).send().await {
+/// Post-park frames that exercise the expected durable-park surface. Each
+/// frame drives a V1 endpoint; today they return 404 or otherwise fail
+/// because the production behavior is not implemented.
+async fn drive_post_park_frames(
+    client: &reqwest::Client,
+    server: &AuraServerProcess,
+    session_id: Option<&str>,
+    transcript: &mut FrameTranscript,
+    red: &mut RedFrames,
+) {
+    // Frame: dispatch_claim_crash — after approval, the run should claim its
+    // lease and dispatch the blocked worker. Today the claim endpoint does not
+    // exist.
+    let mut dispatch_frame = Frame::new("dispatch_claim_crash");
+    if let Some(id) = session_id {
+        let claim_url = format!("{}/v1/sessions/{}/claim", server.api_url(), id);
+        match client.post(&claim_url).send().await {
             Ok(resp) => {
-                approval_frame.record_state("resolve_status", json!(resp.status().as_u16()));
-                if resp.status() != reqwest::StatusCode::NO_CONTENT {
-                    red.push("approval_by_handle");
+                dispatch_frame.record_state("claim_status", json!(resp.status().as_u16()));
+                if !resp.status().is_success() {
+                    red.push("dispatch_claim_crash");
                 }
             }
             Err(e) => {
-                approval_frame.record_state("resolve_error", json!(e.to_string()));
-                red.push("approval_by_handle");
+                dispatch_frame.record_state("claim_error", json!(e.to_string()));
+                red.push("dispatch_claim_crash");
             }
         }
     } else {
-        red.push("approval_by_handle");
+        dispatch_frame.record_state("claim_error", json!("no session_id captured"));
+        red.push("dispatch_claim_crash");
+    }
+    transcript.push(dispatch_frame);
+
+    // Frame: headless_reify — a headless request should be able to reify the
+    // parked session. Today the reify endpoint does not exist.
+    let mut reify_frame = Frame::new("headless_reify");
+    if let Some(id) = session_id {
+        let reify_url = format!("{}/v1/sessions/{}/reify", server.api_url(), id);
+        match client.post(&reify_url).send().await {
+            Ok(resp) => {
+                reify_frame.record_state("reify_status", json!(resp.status().as_u16()));
+                if !resp.status().is_success() {
+                    red.push("headless_reify");
+                }
+            }
+            Err(e) => {
+                reify_frame.record_state("reify_error", json!(e.to_string()));
+                red.push("headless_reify");
+            }
+        }
+    } else {
+        reify_frame.record_state("reify_error", json!("no session_id captured"));
+        red.push("headless_reify");
+    }
+    transcript.push(reify_frame);
+
+    // Frame: completion — the run should eventually complete. Today there is
+    // no session status endpoint to poll.
+    let mut completion_frame = Frame::new("completion");
+    if let Some(id) = session_id {
+        let status_url = format!("{}/v1/sessions/{}", server.api_url(), id);
+        match client.get(&status_url).send().await {
+            Ok(resp) => {
+                completion_frame.record_state("status_status", json!(resp.status().as_u16()));
+                let completed = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.get("status")
+                            .and_then(|s| s.as_str().map(|s| s == "completed"))
+                    })
+                    .unwrap_or(false);
+                completion_frame.record_state("status_completed", json!(completed));
+                if !completed {
+                    red.push("completion");
+                }
+            }
+            Err(e) => {
+                completion_frame.record_state("status_error", json!(e.to_string()));
+                red.push("completion");
+            }
+        }
+    } else {
+        completion_frame.record_state("status_error", json!("no session_id captured"));
+        red.push("completion");
+    }
+    transcript.push(completion_frame);
+
+    // Frame: retrieval_by_handle — the run should be retrievable by its
+    // session handle. Today the retrieval endpoint does not exist.
+    let mut retrieval_frame = Frame::new("retrieval_by_handle");
+    if let Some(id) = session_id {
+        let retrieve_url = format!("{}/v1/sessions/{}", server.api_url(), id);
+        match client.get(&retrieve_url).send().await {
+            Ok(resp) => {
+                retrieval_frame.record_state("retrieve_status", json!(resp.status().as_u16()));
+                let has_run = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .map(|body| body.get("run_id").is_some())
+                    .unwrap_or(false);
+                retrieval_frame.record_state("has_run_id", json!(has_run));
+                if !has_run {
+                    red.push("retrieval_by_handle");
+                }
+            }
+            Err(e) => {
+                retrieval_frame.record_state("retrieve_error", json!(e.to_string()));
+                red.push("retrieval_by_handle");
+            }
+        }
+    } else {
+        retrieval_frame.record_state("retrieve_error", json!("no session_id captured"));
+        red.push("retrieval_by_handle");
+    }
+    transcript.push(retrieval_frame);
+}
+
+/// Open a streaming chat request, collect events until the first
+/// `aura.approval_requested`, wait a short beat for a `run_parked` event, then
+/// SIGKILL the server. The response is held open until the process dies, so
+/// the request teardown never runs and the approval record survives.
+async fn drive_to_approval(
+    client: &reqwest::Client,
+    server: &mut AuraServerProcess,
+    body: serde_json::Value,
+) -> Vec<SseEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let url = format!("{}/v1/chat/completions", server.api_url());
+    let client = client.clone();
+    let handle = tokio::spawn(async move {
+        let _ = sse_collect(client, url, body, tx).await;
+    });
+
+    let overall_deadline = Instant::now() + Duration::from_secs(20);
+    let park_wait = Duration::from_millis(1500);
+    let mut events = Vec::new();
+    let mut kill_after: Option<Instant> = None;
+
+    loop {
+        let next_deadline = kill_after.unwrap_or(overall_deadline);
+        tokio::select! {
+            _ = tokio::time::sleep_until(next_deadline) => {
+                if kill_after.is_some() {
+                    let _ = server.stop().await;
+                }
+                break;
+            }
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(evt) => {
+                        if evt.event_type.as_deref() == Some("aura.approval_requested")
+                            && kill_after.is_none()
+                        {
+                            kill_after = Some(Instant::now() + park_wait);
+                        }
+                        events.push(evt);
+                    }
+                    None => break,
+                }
+            }
+        }
     }
 
-    // Also record the file-store approval count as a secondary signal.
-    let approval_files: Vec<PathBuf> =
-        glob::glob(&format!("{}/approvals/*.json", memory_dir.display()))
-            .expect("approval glob")
-            .filter_map(Result::ok)
-            .collect();
-    approval_frame.record_state("approval_file_count", json!(approval_files.len()));
-    transcript.push(approval_frame);
+    // Drain any events that arrived between the kill and connection close.
+    while let Ok(Some(evt)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        events.push(evt);
+    }
+    let _ = handle.await;
+    events
+}
 
-    // Remaining frames depend on durable park/reify, which is unimplemented.
-    red.push("dispatch_claim_crash");
-    red.push("headless_reify");
-    red.push("completion");
-    red.push("retrieval_by_handle");
+async fn sse_collect(
+    client: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+    tx: mpsc::UnboundedSender<SseEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut response = client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(25))
+        .send()
+        .await?;
 
-    // Record the remaining frames as empty placeholders so the transcript
-    // captures the full acceptance surface.
-    transcript.push(Frame::new("dispatch_claim_crash"));
-    transcript.push(Frame::new("headless_reify"));
-    transcript.push(Frame::new("completion"));
-    transcript.push(Frame::new("retrieval_by_handle"));
+    let mut buf: Vec<u8> = Vec::new();
+    let mut current_event_type: Option<String> = None;
 
-    (transcript, red, server)
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes).trim_end().to_string();
+                    if line.is_empty() {
+                        current_event_type = None;
+                        continue;
+                    }
+                    if let Some(event) = line.strip_prefix("event: ") {
+                        current_event_type = Some(event.to_string());
+                    } else if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            return Ok(());
+                        }
+                        let _ = tx.send(SseEvent {
+                            event_type: current_event_type.take(),
+                            data: data.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    Ok(())
 }
 
 async fn record_health(client: &reqwest::Client, server: &AuraServerProcess, frame: &mut Frame) {
@@ -260,74 +544,68 @@ fn has_event(events: &[SseEvent], event_type: &str) -> bool {
         .any(|e| e.event_type.as_deref() == Some(event_type))
 }
 
-async fn collect_sse_events(
-    client: &reqwest::Client,
-    url: &str,
-    body: serde_json::Value,
-    timeout: Duration,
-) -> Result<Vec<SseEvent>, Box<dyn std::error::Error>> {
-    let mut response = client
-        .post(url)
-        .json(&body)
-        .timeout(timeout + Duration::from_secs(5))
-        .send()
-        .await?;
-
-    let deadline = Instant::now() + timeout;
-    let mut events = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut current_event_type: Option<String> = None;
-
-    loop {
-        match tokio::time::timeout_at(deadline, response.chunk()).await {
-            Ok(Ok(Some(chunk))) => {
-                buf.extend_from_slice(&chunk);
-                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line_bytes).trim_end().to_string();
-                    if line.is_empty() {
-                        current_event_type = None;
-                        continue;
-                    }
-                    if let Some(event) = line.strip_prefix("event: ") {
-                        current_event_type = Some(event.to_string());
-                    } else if let Some(data) = line.strip_prefix("data: ") {
-                        if data == "[DONE]" {
-                            return Ok(events);
-                        }
-                        events.push(SseEvent {
-                            event_type: current_event_type.take(),
-                            data: data.to_string(),
-                        });
-                    }
-                }
-            }
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => break,
+fn extract_session_id(events: &[SseEvent]) -> Option<String> {
+    events.iter().find_map(|e| {
+        if e.event_type.as_deref() == Some("aura.session_info") {
+            serde_json::from_str::<serde_json::Value>(&e.data)
+                .ok()
+                .and_then(|v| v.get("session_id")?.as_str().map(|s| s.to_string()))
+        } else {
+            None
         }
-    }
-
-    // Drain any trailing line without a newline.
-    if !buf.is_empty() {
-        let line = String::from_utf8_lossy(&buf).trim_end().to_string();
-        if let Some(data) = line.strip_prefix("data: ")
-            && data != "[DONE]"
-        {
-            events.push(SseEvent {
-                event_type: current_event_type.take(),
-                data: data.to_string(),
-            });
-        }
-    }
-
-    Ok(events)
+    })
 }
 
-async fn finish(transcript: FrameTranscript, red: RedFrames, server: &mut AuraServerProcess) {
+fn extract_decision_id(events: &[SseEvent]) -> Option<String> {
+    events.iter().find_map(|e| {
+        if e.event_type.as_deref() == Some("aura.approval_requested") {
+            serde_json::from_str::<serde_json::Value>(&e.data)
+                .ok()
+                .and_then(|v| v.get("decision_id")?.as_str().map(|s| s.to_string()))
+        } else {
+            None
+        }
+    })
+}
+
+async fn find_run_records(memory_dir: &std::path::Path) -> (Vec<PathBuf>, usize) {
+    let pattern = format!("{}/**/*.json", memory_dir.display());
+    let candidates: Vec<PathBuf> = glob::glob(&pattern)
+        .expect("glob pattern is valid")
+        .filter_map(Result::ok)
+        .filter(|p| !p.starts_with(memory_dir.join("approvals")))
+        .collect();
+
+    let mut records = Vec::new();
+    for candidate in &candidates {
+        if let Ok(raw) = tokio::fs::read_to_string(candidate).await {
+            // decode_run_record is a staged production hole today (it is
+            // currently `todo!()`), so every candidate panics. Treat a panic as
+            // not-a-run-record; once P5/P13 land the real codec and durable run
+            // records, this will succeed for real records and the frame will
+            // sharpen without any test edit.
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                aura::session_store::decode_run_record(&raw)
+            }));
+            if let Ok(Ok(_)) = decoded {
+                records.push(candidate.clone());
+            }
+        }
+    }
+
+    let artifact_count = candidates.len().saturating_sub(records.len());
+    (records, artifact_count)
+}
+
+async fn finish(
+    snapshot_name: &str,
+    transcript: FrameTranscript,
+    red: RedFrames,
+    server: &mut AuraServerProcess,
+) {
     let mut snapshot = transcript.to_snapshot();
-    scrub_nondeterminism(&mut snapshot);
-    insta::assert_json_snapshot!(snapshot);
+    scrub_nondeterminism(&mut snapshot, server.memory_dir());
+    insta::assert_json_snapshot!(snapshot_name, snapshot);
 
     let _ = server.stop().await;
 
