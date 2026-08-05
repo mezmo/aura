@@ -43,8 +43,15 @@ async fn test_a2a_agent_card() {
           "url": format!("{}/a2a/v1/rpc", AURA_SERVER),
           "protocolBinding": "JSONRPC",
           "protocolVersion": "1.0"
+        },
+        {
+          "url": format!("{}/", AURA_SERVER),
+          "protocolBinding": "JSONRPC",
+          "protocolVersion": "0.3"
         }
       ],
+      "url": format!("{}/", AURA_SERVER),
+      "preferredTransport": "JSONRPC",
       "capabilities": { "streaming": true, "pushNotifications": false },
       "defaultInputModes": ["text/plain"],
       "defaultOutputModes": ["text/plain"],
@@ -378,6 +385,129 @@ async fn test_rpc_a2a_tool_invocation_returns_task() {
         request_text,
         text.as_str().unwrap(),
         "Part 'text' does not match request"
+    );
+}
+
+// validates the A2A v0.3 JSON-RPC binding served at the root: this is the exact
+// request shape a v0.3 client (e.g. kagent) sends to a bare service address, and
+// the response must come back in v0.3 spellings ('kind' tags, kebab-case state).
+#[tokio::test]
+async fn test_legacy_v0_3_rpc_at_root_returns_task() {
+    let rpc_message_id = format!("{}", uuid::Uuid::new_v4());
+    let message_id = format!("{}", uuid::Uuid::new_v4());
+    let request_text = format!(
+        "Call the slow_task tool immediately with message_id='{}' and duration_seconds=10. \
+            Do not say anything else, just call the tool.",
+        message_id
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/", AURA_SERVER))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": rpc_message_id,
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "kind": "message",
+                    "messageId": message_id,
+                    "role": "user",
+                    "parts": [{
+                        "kind": "text",
+                        "text": request_text
+                    }]
+                }
+            }
+        }))
+        .timeout(TEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request - is aura-web-server running? {}", e))
+        .unwrap();
+
+    assert_eq!(response.status(), 200, "v0.3 errors ride in the envelope");
+
+    let body = response.text().await.expect("Failed to read response");
+    println!("v0.3 rpc response body: {}", body);
+    let response_body: Value = serde_json::from_str(&body).expect("Response was not valid JSON");
+
+    assert!(
+        response_body.get("error").is_none(),
+        "expected a result, got error: {}",
+        response_body["error"]
+    );
+    assert_eq!(response_body["jsonrpc"].as_str().unwrap(), "2.0");
+    assert_eq!(response_body["id"].as_str().unwrap(), rpc_message_id);
+
+    // v0.3 returns the task directly under 'result', not wrapped in a 'task' key.
+    let task = response_body
+        .get("result")
+        .expect("Response did not contain 'result' field");
+    assert_eq!(task["kind"].as_str().unwrap(), "task");
+    assert!(task["id"].is_string(), "Task 'id' field is not a string");
+    assert!(
+        task["contextId"].is_string(),
+        "Task 'contextId' field is not a string"
+    );
+    assert_eq!(
+        task["status"]["state"].as_str().unwrap(),
+        "working",
+        "state should use the v0.3 kebab-case spelling"
+    );
+
+    let history = task["history"]
+        .as_array()
+        .expect("Task did not contain a 'history' array");
+    let first_message = history.first().expect("'history' array is empty");
+    assert_eq!(first_message["kind"].as_str().unwrap(), "message");
+    assert_eq!(first_message["messageId"].as_str().unwrap(), message_id);
+    assert_eq!(
+        first_message["role"].as_str().unwrap(),
+        "user",
+        "role should use the v0.3 lowercase spelling"
+    );
+
+    let first_part = first_message["parts"]
+        .as_array()
+        .expect("History message missing 'parts'")
+        .first()
+        .expect("'parts' array is empty");
+    assert_eq!(first_part["kind"].as_str().unwrap(), "text");
+    assert_eq!(first_part["text"].as_str().unwrap(), request_text);
+}
+
+// validates that the v1.0 JSON-RPC method names are not accepted at the v0.3 root
+// binding, and vice versa - the two bindings speak different wires
+#[tokio::test]
+async fn test_legacy_v0_3_root_rejects_v1_method_names() {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/", AURA_SERVER))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "SendMessage",
+            "params": {}
+        }))
+        .timeout(TEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request - is aura-web-server running? {}", e))
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    let body = response.text().await.expect("Failed to read response");
+    let response_body: Value = serde_json::from_str(&body).expect("Response was not valid JSON");
+
+    assert_eq!(
+        response_body["error"]["code"].as_i64().unwrap(),
+        -32601,
+        "expected method-not-found, got: {}",
+        body
     );
 }
 

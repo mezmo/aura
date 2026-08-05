@@ -1,4 +1,3 @@
-use a2a_server::StaticAgentCard;
 use aura_config::load_config;
 use axum::Json;
 use axum::extract::{Request, State};
@@ -16,7 +15,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 
 use aura_web_server::a2a::{
-    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore,
+    AuraAgentExecutor, AuraRequestHandler, BusBridgedExecutor, SharedTaskStore, agent_card_router,
+    legacy_jsonrpc_router,
 };
 use aura_web_server::handlers;
 use aura_web_server::session_store::{SessionStore, build_session_store};
@@ -459,6 +459,7 @@ async fn run() -> std::io::Result<()> {
     // A2A server:
     // JSON-RPC at /a2a/v1/rpc
     // REST at /a2a/v1/message:send, /a2a/v1/tasks/
+    // v0.3 JSON-RPC at /
     // Agent card at /.well-known/agent-card.json
     let app = if args.enable_a2a {
         let task_store = SharedTaskStore::from_store(session_store.tasks());
@@ -473,14 +474,14 @@ async fn run() -> std::io::Result<()> {
             task_store,
             session_store.bus(),
         ));
-        let card_producer = Arc::new(StaticAgentCard::new(agent_card));
         let a2a_router = Router::new()
             .nest(
                 "/a2a/v1/rpc",
                 a2a_server::jsonrpc::jsonrpc_router(a2a_handler.clone()),
             )
+            .merge(legacy_jsonrpc_router(a2a_handler.clone()))
             .nest("/a2a/v1", a2a_server::rest::rest_router(a2a_handler))
-            .merge(a2a_server::agent_card::agent_card_router(card_producer))
+            .merge(agent_card_router(agent_card))
             .layer(tower_http::timeout::TimeoutLayer::with_status_code(
                 axum::http::StatusCode::REQUEST_TIMEOUT,
                 std::time::Duration::from_secs(120),

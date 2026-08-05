@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Level, event};
 
 use crate::{
-    a2a::SharedTaskStore,
+    a2a::{LEGACY_PROTOCOL_VERSION, SharedTaskStore},
     types::{ActiveRequestGuard, AppState},
 };
 
@@ -104,6 +104,14 @@ impl AuraAgentExecutor {
             supported_interfaces: vec![
                 AgentInterface::new(format!("{base}/a2a/v1"), TRANSPORT_PROTOCOL_HTTP_JSON),
                 AgentInterface::new(format!("{base}/a2a/v1/rpc"), TRANSPORT_PROTOCOL_JSONRPC),
+                // v0.3 clients address an agent by a single base URL, so the
+                // legacy binding is advertised at the root (see `a2a::legacy`).
+                AgentInterface {
+                    url: format!("{base}/"),
+                    protocol_binding: TRANSPORT_PROTOCOL_JSONRPC.to_string(),
+                    protocol_version: LEGACY_PROTOCOL_VERSION.to_string(),
+                    tenant: None,
+                },
             ],
             skills: vec![AgentSkill {
                 id: "chat".to_owned(),
