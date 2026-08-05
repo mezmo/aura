@@ -262,3 +262,42 @@ test-integration-session-store-local: $(REPORT_DIR) ## Start an ephemeral Valkey
 	test_exit=$$?; \
 	docker stop $(VALKEY_TEST_NAME) >/dev/null 2>&1 || true; \
 	exit $$test_exit
+
+# --- Durability harness (park/reify HITL frames) ---
+# Reuses the ephemeral-Valkey pattern from the session-store target and adds
+# the mock MCP container. The harness is expected to fail red at the first
+# unimplemented production hole.
+
+DURABILITY_MCP_IMAGE ?= mezmo/aura-mock-mcp:latest
+DURABILITY_MCP_NAME ?= aura-durability-mock-mcp
+DURABILITY_MCP_PORT ?= 9999
+DURABILITY_VALKEY_IMAGE ?= valkey/valkey:8
+DURABILITY_VALKEY_NAME ?= aura-durability-valkey
+DURABILITY_VALKEY_PORT ?= 16380
+
+.PHONY:test-integration-durability-local
+test-integration-durability-local: $(REPORT_DIR) ## Start mock MCP + ephemeral Valkey, run the durability harness, then cleanup
+	@echo "Starting mock MCP and ephemeral Valkey for durability harness..."
+	@docker rm -f $(DURABILITY_MCP_NAME) $(DURABILITY_VALKEY_NAME) >/dev/null 2>&1 || true
+	@docker run --rm -d --name $(DURABILITY_MCP_NAME) -p $(DURABILITY_MCP_PORT):9999 $(DURABILITY_MCP_IMAGE)
+	@docker run --rm -d --name $(DURABILITY_VALKEY_NAME) -p $(DURABILITY_VALKEY_PORT):6379 $(DURABILITY_VALKEY_IMAGE)
+	@timeout=30; until curl -sf http://127.0.0.1:$(DURABILITY_MCP_PORT)/mcp -X POST -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}},"id":1}' >/dev/null; do \
+		timeout=$$((timeout - 1)); \
+		if [ $$timeout -le 0 ]; then echo "❌ Timeout waiting for mock MCP"; docker stop $(DURABILITY_MCP_NAME) $(DURABILITY_VALKEY_NAME) >/dev/null 2>&1; exit 1; fi; \
+		sleep 1; \
+	done
+	@timeout=30; until docker exec $(DURABILITY_VALKEY_NAME) valkey-cli ping >/dev/null 2>&1; do \
+		timeout=$$((timeout - 1)); \
+		if [ $$timeout -le 0 ]; then echo "❌ Timeout waiting for Valkey"; docker stop $(DURABILITY_MCP_NAME) $(DURABILITY_VALKEY_NAME) >/dev/null 2>&1; exit 1; fi; \
+		sleep 1; \
+	done
+	@echo "✅ Infra is ready; building aura-web-server binary and running durability harness..."
+	@trap 'docker stop $(DURABILITY_MCP_NAME) $(DURABILITY_VALKEY_NAME) >/dev/null 2>&1; exit 130' INT TERM; \
+	cargo build --bin aura-web-server --features session-store-redis && \
+	AURA_TEST_MCP_URL=http://127.0.0.1:$(DURABILITY_MCP_PORT)/mcp \
+	AURA_TEST_REDIS_URL=redis://127.0.0.1:$(DURABILITY_VALKEY_PORT) \
+	INSTA_UPDATE=always \
+	cargo test --package aura-web-server --features integration-durability --test durability_harness_test --no-fail-fast -- --test-threads=1; \
+	test_exit=$$?; \
+	docker stop $(DURABILITY_MCP_NAME) $(DURABILITY_VALKEY_NAME) >/dev/null 2>&1 || true; \
+	exit $$test_exit
