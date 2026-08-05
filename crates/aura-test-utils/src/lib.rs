@@ -1,5 +1,6 @@
 //! Shared test utilities for aura integration tests.
 
+pub mod durability;
 pub mod sse;
 
 use std::future::Future;

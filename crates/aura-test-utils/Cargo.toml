@@ -9,3 +9,9 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+axum = { version = "0.8", features = ["json"] }
+tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+async-stream = { workspace = true }
+regex = { workspace = true }
+uuid = { workspace = true }
