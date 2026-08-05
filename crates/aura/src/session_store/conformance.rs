@@ -25,8 +25,13 @@ use crate::hitl::{
     PROTOCOL_VERSION, ParkedApproval, ResolveError,
 };
 use crate::orchestration::TaskIdentity;
+use crate::orchestration::park::{
+    AgentInstanceId, CasError, ChatSessionId, CheckpointEnvelope, FencingGeneration, LeaseTtl,
+    NonEmpty, ParkCommit, ParkReason, RunCheckpoint, RunEvent, RunState, Session,
+    SessionId as ParkSessionId, SessionRecord,
+};
 
-use super::{ApprovalStore, EventBus, ParkedApprovalRecord, Subscription};
+use super::{ApprovalStore, EventBus, ParkedApprovalRecord, RunStore, RunStoreError, Subscription};
 
 /// How long a row waits for a published payload before calling it lost.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -114,6 +119,93 @@ pub async fn assert_event_bus_conformance(bus: Arc<dyn EventBus>) {
         topics_are_isolated(bus.as_ref()).await,
     );
     assert_all_passed("EventBus", &failures);
+}
+
+/// Assert `store` satisfies the [`RunStore`] contract, panicking with every
+/// failing row.
+pub async fn assert_run_store_conformance(store: Arc<dyn RunStore>) {
+    let mut failures = Vec::new();
+    record(
+        &mut failures,
+        "create_then_load_returns_record",
+        create_then_load_returns_record(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "load_of_unknown_session_is_none",
+        load_of_unknown_session_is_none(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "create_of_existing_session_is_session_exists",
+        create_of_existing_session_is_session_exists(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "create_requires_created_state",
+        create_requires_created_state(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "acquire_lease_on_created_record_succeeds",
+        acquire_lease_on_created_record_succeeds(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "acquire_lease_on_unknown_session_fails",
+        acquire_lease_on_unknown_session_fails(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "acquire_lease_on_live_lease_fails",
+        acquire_lease_on_live_lease_fails(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "heartbeat_lease_extends_lease",
+        heartbeat_lease_extends_lease(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "heartbeat_lease_stale_generation_fails",
+        heartbeat_lease_stale_generation_fails(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "release_lease_makes_record_unleased",
+        release_lease_makes_record_unleased(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "apply_with_live_lease_advances_state",
+        apply_with_live_lease_advances_state(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "apply_stale_generation_fails",
+        apply_stale_generation_fails(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "apply_without_lease_fails",
+        apply_without_lease_fails(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "park_commits_parked_state",
+        park_commits_parked_state(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "park_stale_generation_fails",
+        park_stale_generation_fails(store.as_ref()).await,
+    );
+    record(
+        &mut failures,
+        "park_outside_running_fails",
+        park_outside_running_fails(store.as_ref()).await,
+    );
+    assert_all_passed("RunStore", &failures);
 }
 
 /// Keep a row's name with its failure, so the report names every contract that
@@ -379,6 +471,429 @@ async fn topics_are_isolated(bus: &dyn EventBus) -> Result<()> {
         "a subscriber must only receive its own topic's payloads",
     );
     Ok(())
+}
+
+// --- RunStore rows ---
+
+async fn create_then_load_returns_record(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record.clone()).await?;
+
+    let loaded = store
+        .load(session)
+        .await?
+        .ok_or_else(|| anyhow!("a created record must be loadable"))?;
+    ensure!(
+        loaded == record,
+        "the loaded record differs from the created one"
+    );
+    Ok(())
+}
+
+async fn load_of_unknown_session_is_none(store: &dyn RunStore) -> Result<()> {
+    let missing = store.load(ParkSessionId::generate()).await?;
+    ensure!(
+        missing.is_none(),
+        "an uncreated session must load as absent"
+    );
+    Ok(())
+}
+
+async fn create_of_existing_session_is_session_exists(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let duplicate = record_with_session(session);
+    let outcome = store.create(duplicate).await;
+    ensure!(
+        outcome == Err(RunStoreError::SessionExists { session }),
+        "creating an existing session must report SessionExists, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn create_requires_created_state(store: &dyn RunStore) -> Result<()> {
+    let mut record = created_record();
+    record.state = RunState::Running;
+    let outcome = store.create(record).await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::StateMismatch { .. }))
+        ),
+        "creating a non-Created record must report StateMismatch, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn acquire_lease_on_created_record_succeeds(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    ensure!(
+        lease.generation > FencingGeneration::INITIAL,
+        "acquire must advance the fencing generation"
+    );
+
+    let loaded = store.load(session).await?.unwrap();
+    ensure!(
+        loaded.generation == lease.generation,
+        "the record generation must match the issued lease generation"
+    );
+    ensure!(
+        loaded.lease.as_ref().map(|l| l.generation) == Some(lease.generation),
+        "the stored lease generation must match the returned lease"
+    );
+    Ok(())
+}
+
+async fn acquire_lease_on_unknown_session_fails(store: &dyn RunStore) -> Result<()> {
+    let outcome = store
+        .acquire_lease(
+            ParkSessionId::generate(),
+            AgentInstanceId::generate(),
+            lease_ttl(),
+        )
+        .await;
+    ensure!(
+        matches!(outcome, Err(RunStoreError::UnknownSession { .. })),
+        "acquire on an unknown session must report UnknownSession, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn acquire_lease_on_live_lease_fails(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let first = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let second = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await;
+    ensure!(
+        matches!(
+            second,
+            Err(RunStoreError::LeaseHeld {
+                holder,
+                ..
+            }) if holder == first.holder
+        ),
+        "acquire on a live lease must report LeaseHeld, got {second:?}"
+    );
+    Ok(())
+}
+
+async fn heartbeat_lease_extends_lease(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let renewed = store
+        .heartbeat_lease(session, lease.generation, lease_ttl())
+        .await?;
+    ensure!(
+        renewed.heartbeat_at >= lease.heartbeat_at,
+        "heartbeat must advance heartbeat_at"
+    );
+    ensure!(
+        renewed.expires_at >= lease.expires_at,
+        "heartbeat must not shorten the lease"
+    );
+    Ok(())
+}
+
+async fn heartbeat_lease_stale_generation_fails(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let stale = FencingGeneration::INITIAL;
+    let outcome = store.heartbeat_lease(session, stale, lease_ttl()).await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::GenerationMismatch { .. }))
+        ),
+        "heartbeat with a stale generation must report GenerationMismatch, got {outcome:?}"
+    );
+
+    store.release_lease(session, lease.generation).await?;
+    let outcome = store
+        .heartbeat_lease(session, lease.generation, lease_ttl())
+        .await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::StateMismatch { .. }))
+        ),
+        "heartbeat after release must report StateMismatch, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn release_lease_makes_record_unleased(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    store.release_lease(session, lease.generation).await?;
+
+    let loaded = store.load(session).await?.unwrap();
+    ensure!(loaded.lease.is_none(), "release must clear the lease");
+    ensure!(
+        loaded.generation == lease.generation,
+        "release must not advance the generation"
+    );
+    Ok(())
+}
+
+async fn apply_with_live_lease_advances_state(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let run_id = run_id();
+    let next = store
+        .apply(session, lease.generation, RunEvent::Start { run_id })
+        .await?;
+    ensure!(
+        next.state == RunState::Running,
+        "Start must advance the state to Running"
+    );
+    ensure!(next.run_id == Some(run_id), "Start must bind the run id");
+    ensure!(
+        next.generation > lease.generation,
+        "apply must advance the generation"
+    );
+    Ok(())
+}
+
+async fn apply_stale_generation_fails(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let outcome = store
+        .apply(
+            session,
+            FencingGeneration::INITIAL,
+            RunEvent::Start { run_id: run_id() },
+        )
+        .await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::GenerationMismatch { .. }))
+        ),
+        "apply with a stale generation must report GenerationMismatch, got {outcome:?}"
+    );
+
+    let next = store
+        .apply(
+            session,
+            lease.generation,
+            RunEvent::Start { run_id: run_id() },
+        )
+        .await?;
+    let outcome = store
+        .apply(session, lease.generation, RunEvent::Complete)
+        .await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::GenerationMismatch { .. }))
+        ),
+        "apply with the pre-advance generation must report GenerationMismatch, got {outcome:?}"
+    );
+
+    let outcome = store
+        .apply(session, next.generation, RunEvent::Complete)
+        .await;
+    ensure!(
+        outcome.is_ok(),
+        "apply with the current generation must succeed, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn apply_without_lease_fails(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let outcome = store
+        .apply(
+            session,
+            FencingGeneration::INITIAL,
+            RunEvent::Start { run_id: run_id() },
+        )
+        .await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::StateMismatch { .. }))
+                | Err(RunStoreError::Cas(CasError::GenerationMismatch { .. }))
+        ),
+        "apply without a held lease must be rejected, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn park_commits_parked_state(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let running = store
+        .apply(
+            session,
+            lease.generation,
+            RunEvent::Start { run_id: run_id() },
+        )
+        .await?;
+
+    let commit = park_commit();
+    let next = store
+        .park(session, running.generation, commit.clone())
+        .await?;
+    ensure!(
+        matches!(next.state, RunState::Parked { .. }),
+        "park must advance the state to Parked"
+    );
+
+    let loaded = store.load(session).await?.unwrap();
+    ensure!(
+        matches!(
+            loaded.state,
+            RunState::Parked {
+                reason: ParkReason::ApprovalsBlocked { .. },
+                ..
+            }
+        ),
+        "the stored record must carry the parked state"
+    );
+    Ok(())
+}
+
+async fn park_stale_generation_fails(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let running = store
+        .apply(
+            session,
+            lease.generation,
+            RunEvent::Start { run_id: run_id() },
+        )
+        .await?;
+
+    let outcome = store
+        .park(session, FencingGeneration::INITIAL, park_commit())
+        .await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::GenerationMismatch { .. }))
+        ),
+        "park with a stale generation must report GenerationMismatch, got {outcome:?}"
+    );
+
+    let outcome = store.park(session, running.generation, park_commit()).await;
+    ensure!(
+        outcome.is_ok(),
+        "park with the current generation must succeed, got {outcome:?}"
+    );
+    Ok(())
+}
+
+async fn park_outside_running_fails(store: &dyn RunStore) -> Result<()> {
+    let record = created_record();
+    let session = record.session.id;
+    store.create(record).await?;
+
+    let lease = store
+        .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+        .await?;
+    let outcome = store.park(session, lease.generation, park_commit()).await;
+    ensure!(
+        matches!(
+            outcome,
+            Err(RunStoreError::Cas(CasError::StateMismatch { .. }))
+        ),
+        "park outside Running must report StateMismatch, got {outcome:?}"
+    );
+    Ok(())
+}
+
+fn created_record() -> SessionRecord {
+    record_with_session(ParkSessionId::generate())
+}
+
+fn record_with_session(session: ParkSessionId) -> SessionRecord {
+    SessionRecord {
+        session: Session {
+            id: session,
+            chat_session_id: Some(ChatSessionId::new("cs_conformance")),
+            created_at: chrono::Utc::now(),
+        },
+        run_id: None,
+        state: RunState::Created,
+        lease: None,
+        generation: FencingGeneration::INITIAL,
+    }
+}
+
+fn lease_ttl() -> LeaseTtl {
+    LeaseTtl::new(Duration::from_secs(5)).expect("positive ttl")
+}
+
+fn run_id() -> crate::RunId {
+    "018f9d2e-7c3a-7000-8000-000000000271"
+        .parse()
+        .expect("valid run id")
+}
+
+fn park_commit() -> ParkCommit {
+    ParkCommit {
+        checkpoint: CheckpointEnvelope::new(RunCheckpoint::test_minimal()),
+        reason: ParkReason::ApprovalsBlocked {
+            decisions: NonEmpty::new(vec![DecisionId::generate()]).expect("non-empty"),
+        },
+        parked_at: chrono::Utc::now(),
+        expires_at: chrono::Utc::now() + chrono::Duration::seconds(300),
+    }
 }
 
 // --- Row fixtures ---

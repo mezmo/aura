@@ -383,6 +383,11 @@ mod tests {
         conformance::assert_event_bus_conformance(Arc::new(InMemoryEventBus::new())).await;
     }
 
+    #[tokio::test]
+    async fn conforms_to_the_run_store_contract() {
+        conformance::assert_run_store_conformance(Arc::new(InMemoryRunStore::new())).await;
+    }
+
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
         ParkedApproval {
