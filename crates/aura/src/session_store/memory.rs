@@ -10,8 +10,8 @@ use tokio::sync::broadcast;
 
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
 use crate::orchestration::park::{
-    AgentInstanceId, CasError, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, SessionId,
-    SessionRecord, WakeReason,
+    AgentInstanceId, CasError, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, RunState,
+    SessionId, SessionRecord, WakeReason,
 };
 
 use super::{ApprovalStore, EventBus, RunStore, RunStoreError, SessionStoreError, Subscription};
@@ -130,6 +130,39 @@ impl InMemoryRunStore {
     }
 }
 
+/// Verify the record has a live lease whose generation matches the
+/// presented fencing token. Every mutation except `acquire_lease` and
+/// `release_lease` must pass this guard: once a lease expires or is
+/// released, the old token cannot mutate the record.
+fn require_live_lease(
+    record: &SessionRecord,
+    presented: FencingGeneration,
+) -> Result<&Lease, RunStoreError> {
+    if presented != record.generation {
+        return Err(RunStoreError::Cas(CasError::GenerationMismatch {
+            presented,
+            current: record.generation,
+        }));
+    }
+    let Some(lease) = record.lease.as_ref() else {
+        return Err(RunStoreError::Cas(CasError::StateMismatch {
+            actual: "unleased",
+        }));
+    };
+    if lease.generation != presented {
+        return Err(RunStoreError::Cas(CasError::GenerationMismatch {
+            presented,
+            current: lease.generation,
+        }));
+    }
+    if lease.expires_at <= chrono::Utc::now() {
+        return Err(RunStoreError::Cas(CasError::StateMismatch {
+            actual: "expired",
+        }));
+    }
+    Ok(lease)
+}
+
 #[async_trait]
 impl RunStore for InMemoryRunStore {
     async fn create(&self, record: SessionRecord) -> Result<(), RunStoreError> {
@@ -138,6 +171,11 @@ impl RunStore for InMemoryRunStore {
             return Err(RunStoreError::SessionExists {
                 session: record.session.id,
             });
+        }
+        if !matches!(record.state, RunState::Created) {
+            return Err(RunStoreError::Cas(CasError::StateMismatch {
+                actual: "non-Created",
+            }));
         }
         records.insert(record.session.id, record);
         Ok(())
@@ -195,25 +233,17 @@ impl RunStore for InMemoryRunStore {
             .get_mut(&session)
             .ok_or(RunStoreError::UnknownSession { session })?;
 
-        if generation != record.generation {
-            return Err(RunStoreError::Cas(CasError::GenerationMismatch {
-                presented: generation,
-                current: record.generation,
-            }));
-        }
+        let (holder, acquired_at) = {
+            let lease = require_live_lease(record, generation)?;
+            (lease.holder, lease.acquired_at)
+        };
 
-        let lease = record
-            .lease
-            .as_ref()
-            .ok_or(RunStoreError::Cas(CasError::StateMismatch {
-                actual: "unleased",
-            }))?;
         let now = chrono::Utc::now();
         let expires_at = now
             + chrono::Duration::from_std(ttl.get()).expect("positive ttl fits in chrono duration");
         let renewed = Lease {
-            holder: lease.holder,
-            acquired_at: lease.acquired_at,
+            holder,
+            acquired_at,
             heartbeat_at: now,
             expires_at,
             generation,
@@ -254,6 +284,7 @@ impl RunStore for InMemoryRunStore {
             .get(&session)
             .ok_or(RunStoreError::UnknownSession { session })?;
 
+        require_live_lease(record, presented)?;
         let next = record
             .clone()
             .apply(presented, event)
@@ -273,6 +304,7 @@ impl RunStore for InMemoryRunStore {
             .get(&session)
             .ok_or(RunStoreError::UnknownSession { session })?;
 
+        require_live_lease(record, presented)?;
         let next = record
             .clone()
             .park(presented, commit)
