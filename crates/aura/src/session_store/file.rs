@@ -34,13 +34,15 @@
 //! # Run-store atomicity
 //!
 //! The run store implements compare-and-swap on a single session record. The
-//! chosen atomicity strategy is **POSIX advisory file locking** on the record
-//! file itself, not a separate lockfile. `fs4` acquires an exclusive `flock`
-//! around the read-modify-write critical section, so only one process can
-//! mutate a session at a time. Inside that section a new record is written to a
-//! uniquely named temporary file and renamed over the record path, giving the
-//! usual crash-atomic "old or new, never torn" guarantee. The directory is
-//! synced after the rename so the new entry survives a host crash.
+//! chosen atomicity strategy is a **stable POSIX advisory lockfile** alongside
+//! the record file (`{session_id}.lock`). `fs4` acquires an exclusive `flock`
+//! on that lockfile around the read-modify-write critical section, so only one
+//! process can mutate a session at a time. The lockfile is never renamed, so
+//! waiters always synchronize on the same inode even as the record file is
+//! atomically replaced beneath it. Inside the critical section a new record is
+//! written to a uniquely named temporary file and renamed over the record path,
+//! giving the usual crash-atomic "old or new, never torn" guarantee. The
+//! directory is synced after the rename so the new entry survives a host crash.
 //!
 //! `flock` is per-process on Unix, so it does not by itself serialize tasks
 //! within the same process. An in-process `std::sync::Mutex` guards the store,
@@ -49,12 +51,10 @@
 //! all its run-store operations, and the filesystem lock serializes across
 //! processes.
 //!
-//! This is a lockfile-based strategy in the sense that the record file is the
-//! lock; rename is used only for the durable commit of each write. The lease
-//! itself is the fencing authority: a stale generation is rejected inside the
-//! locked critical section before any write happens. Two processes over one
-//! root therefore cannot corrupt the record, because the lock serializes
-//! access and the generation check fences stale writers.
+//! The lease itself is the fencing authority: a stale generation is rejected
+//! inside the locked critical section before any write happens. Two processes
+//! over one root therefore cannot corrupt the record, because the lock
+//! serializes access and the generation check fences stale writers.
 //!
 //! POSIX only. Committing a directory entry needs `fsync` on a directory
 //! handle, which Windows does not offer, so [`FileApprovalStore::open`] and
@@ -469,6 +469,10 @@ fn run_record_path(dir: &Path, session: &SessionId) -> PathBuf {
     dir.join(format!("{session}.json"))
 }
 
+fn run_record_lock_path(dir: &Path, session: &SessionId) -> PathBuf {
+    dir.join(format!("{session}.lock"))
+}
+
 fn create_record(dir: &Path, record: &SessionRecord) -> Result<(), RunStoreError> {
     if !matches!(record.state, RunState::Created) {
         return Err(RunStoreError::Cas(CasError::StateMismatch {
@@ -553,25 +557,32 @@ fn mutate<T>(
     f: impl FnOnce(&mut SessionRecord) -> Result<T, RunStoreError>,
 ) -> Result<T, RunStoreError> {
     let path = run_record_path(dir, &session);
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                RunStoreError::UnknownSession { session }
-            } else {
-                io_err("open", &path, &e).into()
-            }
-        })?;
+    let lock_path = run_record_lock_path(dir, &session);
 
-    file.lock_exclusive().map_err(|e| {
+    // The critical section is guarded by a stable sidecar lockfile, not by the
+    // record file itself. Renaming the record file would replace its inode, so
+    // a waiter that opened the pre-rename file could end up locking the old,
+    // unlinked inode and miss the new state. The lockfile is never renamed, so
+    // every process serializes on the same inode.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&lock_path)
+        .map_err(|e| io_err("open", &lock_path, &e))?;
+
+    lock.lock_exclusive().map_err(|e| {
         RunStoreError::Store(SessionStoreError::Request {
-            reason: format!("cannot lock {}: {e}", path.display()),
+            reason: format!("cannot lock {}: {e}", lock_path.display()),
         })
     })?;
 
-    let raw = fs::read_to_string(&path).map_err(|e| io_err("read", &path, &e))?;
+    let raw = fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            RunStoreError::UnknownSession { session }
+        } else {
+            io_err("read", &path, &e).into()
+        }
+    })?;
     let mut record = decode_run_record(&raw)?;
     let result = f(&mut record)?;
     write_run_record(dir, &path, &record)?;
@@ -790,7 +801,7 @@ fn io_err(action: &str, path: &Path, e: &io::Error) -> SessionStoreError {
 /// POSIX-only; the contract for windows is pinned in `windows_tests`.
 #[cfg(all(test, not(windows)))]
 mod tests {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
     use std::process::{Command, Stdio};
 
     use super::*;
@@ -828,6 +839,18 @@ mod tests {
     const CHILD_ACQUIRED_FLAG: &str = "child-acquired.flag";
     /// Prefixes the line the child prints once it has parked a run.
     const CHILD_PARKED: &str = "parked-session=";
+    /// Names the session id the child half of the inode-rename race test
+    /// should operate on.
+    const CHILD_INODE_SESSION_ENV: &str = "AURA_TEST_FILE_RUN_STORE_INODE_SESSION";
+    /// Names the fencing generation the child half of the inode-rename race
+    /// test opened the record under.
+    const CHILD_INODE_OLD_GEN_ENV: &str = "AURA_TEST_FILE_RUN_STORE_INODE_OLD_GEN";
+    /// File the child half of the inode-rename race test creates once it has
+    /// opened the pre-rename record file.
+    const CHILD_INODE_OPENED_FLAG: &str = "inode-opened.flag";
+    /// File the child half of the inode-rename race test creates once it has
+    /// verified the post-rename state.
+    const CHILD_INODE_DONE_FLAG: &str = "inode-done.flag";
 
     fn parked(request_id: &str) -> ParkedApproval {
         let now = chrono::Utc::now();
@@ -1388,6 +1411,158 @@ mod tests {
             .await
             .expect("apply with the fresh generation succeeds");
         create_flag(Path::new(&root), "applied.flag");
+    }
+
+    /// A waiter that opened the record file before a rename must still see the
+    /// new state once it acquires the stable sidecar lock, not the old content
+    /// of the now-unlinked inode it originally opened.
+    #[tokio::test]
+    async fn sidecar_lock_synchronizes_across_record_renames() {
+        let root = tempfile::tempdir().unwrap();
+        let store = FileRunStore::open(root.path()).await.unwrap();
+        let session = SessionId::generate();
+        let mut record = created_record();
+        record.session.id = session;
+        store.create(record).await.unwrap();
+
+        let lease = store
+            .acquire_lease(session, AgentInstanceId::generate(), lease_ttl())
+            .await
+            .unwrap();
+        let old_generation = lease.generation;
+
+        let child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "session_store::file::tests::child_waits_on_sidecar_lock_after_opening_record",
+            ])
+            .env(CHILD_ROOT_ENV, root.path())
+            .env(CHILD_INODE_SESSION_ENV, session.to_string())
+            .env(
+                CHILD_INODE_OLD_GEN_ENV,
+                u64::from(old_generation).to_string(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the child test process");
+
+        wait_for_flag(root.path(), CHILD_INODE_OPENED_FLAG);
+
+        store
+            .apply(
+                session,
+                old_generation,
+                RunEvent::Start { run_id: run_id() },
+            )
+            .await
+            .expect("parent apply succeeds while the child waits on the sidecar lock");
+
+        wait_for_flag(root.path(), CHILD_INODE_DONE_FLAG);
+        let output = child.wait_with_output().expect("reap the child process");
+        assert!(
+            output.status.success(),
+            "the child process must exit cleanly: stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let final_record = store.load(session).await.unwrap().expect("record exists");
+        assert_eq!(
+            final_record.generation,
+            old_generation.next(),
+            "the parent apply must advance the generation coherently"
+        );
+        assert!(matches!(final_record.state, RunState::Running));
+    }
+
+    /// The child half of [`sidecar_lock_synchronizes_across_record_renames`]:
+    /// opens the pre-rename record file, waits on the sidecar lock while the
+    /// parent mutates the record, then proves it observes the post-rename state
+    /// after acquiring the lock.
+    #[tokio::test]
+    #[ignore = "spawned as a child process by sidecar_lock_synchronizes_across_record_renames"]
+    async fn child_waits_on_sidecar_lock_after_opening_record() {
+        use fs4::fs_std::FileExt;
+
+        let root = std::env::var(CHILD_ROOT_ENV).expect("the parent sets the store root");
+        let session: SessionId = SessionId::parse(
+            &std::env::var(CHILD_INODE_SESSION_ENV).expect("the parent sets the session id"),
+        )
+        .expect("valid session id");
+        let old_generation: FencingGeneration = std::env::var(CHILD_INODE_OLD_GEN_ENV)
+            .expect("the parent sets the old generation")
+            .parse::<u64>()
+            .expect("valid generation")
+            .into();
+
+        let root = Path::new(&root);
+        let runs_dir = root.join(super::RUNS_DIR);
+        let record_path = super::run_record_path(&runs_dir, &session);
+        let mut old_inode = fs::OpenOptions::new()
+            .read(true)
+            .open(&record_path)
+            .expect("open the pre-rename record file");
+
+        create_flag(root, CHILD_INODE_OPENED_FLAG);
+
+        let lock_path = super::run_record_lock_path(&runs_dir, &session);
+        let mut lock = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&lock_path)
+            .expect("open the sidecar lockfile");
+
+        // Wait until the parent has actually taken the sidecar lock, so the
+        // next exclusive lock blocks until the rename is complete. If this
+        // process grabs the lock first, drop it and retry.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => {
+                    drop(lock);
+                    if std::time::Instant::now() > deadline {
+                        panic!("parent never took the sidecar lock");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    lock = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&lock_path)
+                        .expect("reopen the sidecar lockfile");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("try_lock_exclusive failed: {e}"),
+            }
+        }
+
+        lock.lock_exclusive()
+            .expect("acquire the sidecar lock after the parent releases it");
+
+        old_inode
+            .seek(SeekFrom::Start(0))
+            .expect("rewind the pre-rename inode");
+        let mut old_raw = String::new();
+        old_inode
+            .read_to_string(&mut old_raw)
+            .expect("read the pre-rename inode");
+        let old_record = super::decode_run_record(&old_raw).expect("decode pre-rename record");
+        assert_eq!(
+            old_record.generation, old_generation,
+            "the unlinked inode must still hold the pre-rename state"
+        );
+
+        let new_raw = fs::read_to_string(&record_path).expect("read the post-rename record path");
+        let new_record = super::decode_run_record(&new_raw).expect("decode post-rename record");
+        assert_eq!(
+            new_record.generation,
+            old_generation.next(),
+            "the sidecar lock must expose the post-rename state, not the old one"
+        );
+        assert!(matches!(new_record.state, RunState::Running));
+
+        create_flag(root, CHILD_INODE_DONE_FLAG);
     }
 }
 
