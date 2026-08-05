@@ -44,8 +44,17 @@ const REDIS_URL_ENV: &str = "AURA_TEST_REDIS_URL";
 #[tokio::test(flavor = "multi_thread")]
 async fn durability_harness_file_frames() {
     let mcp_url = std::env::var(MCP_URL_ENV).unwrap_or_else(|_| DEFAULT_MCP_URL.to_string());
-    let (mut transcript, mut red, mut server, events) =
+    let (mut transcript, mut red, mut server, events, setup_failure) =
         drive_to_park(SessionStoreBackend::File, mcp_url, None).await;
+
+    if let Some(err) = setup_failure {
+        let mut frame = Frame::new("harness_setup_failure");
+        frame.record_state("error", json!(err));
+        transcript.push(frame);
+        finish("file_frames", transcript, red, &mut server).await;
+        return;
+    }
+
     let client = reqwest::Client::new();
 
     let session_id = extract_session_id(&events);
@@ -138,8 +147,17 @@ async fn durability_harness_redis_frames() {
         }
     };
     let mcp_url = std::env::var(MCP_URL_ENV).unwrap_or_else(|_| DEFAULT_MCP_URL.to_string());
-    let (mut transcript, mut red, mut server, events) =
+    let (mut transcript, mut red, mut server, events, setup_failure) =
         drive_to_park(SessionStoreBackend::Redis, mcp_url, Some(redis_url.clone())).await;
+
+    if let Some(err) = setup_failure {
+        let mut frame = Frame::new("harness_setup_failure");
+        frame.record_state("error", json!(err));
+        transcript.push(frame);
+        finish("redis_frames", transcript, red, &mut server).await;
+        return;
+    }
+
     let client = reqwest::Client::new();
 
     let session_id = extract_session_id(&events);
@@ -150,6 +168,61 @@ async fn durability_harness_redis_frames() {
     server.restart().await.expect("server restarts after crash");
     record_health(&client, &server, &mut restart_frame).await;
     transcript.push(restart_frame);
+
+    // Frame: publish_loss_wake_discovery — the approval is still parked (not
+    // resolved yet). Kill the server again and publish the decision directly to
+    // the Redis event bus while it is down. Redis drops the message because no
+    // subscriber is connected; that is the lost-publish fact the frame records.
+    // The durable decision state that a real resolve_durable would persist is a
+    // staged hole, so the frame names that gap. After restart the server must
+    // discover the decision from the store and wake the parked run; today the
+    // store-based discovery path does not exist, so the claim fails.
+    let mut wake_frame = Frame::new("publish_loss_wake_discovery");
+    server
+        .stop()
+        .await
+        .expect("server stops for publish-loss test");
+    if let Some(id) = &decision_id {
+        match publish_decision_to_redis(&redis_url, id, true).await {
+            Ok(subscribers) => {
+                wake_frame.record_state("publish_subscribers", json!(subscribers));
+            }
+            Err(e) => {
+                wake_frame.record_state("publish_error", json!(e.to_string()));
+                red.push("publish_loss_wake_discovery");
+            }
+        }
+    } else {
+        wake_frame.record_state("publish_error", json!("no decision_id captured"));
+        red.push("publish_loss_wake_discovery");
+    }
+    wake_frame.record_state(
+        "durable_decision_state",
+        json!("unrepresentable: resolve_durable is a staged hole"),
+    );
+    server
+        .start()
+        .await
+        .expect("server restarts after publish-loss");
+    if let Some(id) = &session_id {
+        let claim_url = format!("{}/v1/sessions/{}/claim", server.api_url(), id);
+        match client.post(&claim_url).send().await {
+            Ok(resp) => {
+                wake_frame.record_state("claim_status", json!(resp.status().as_u16()));
+                if !resp.status().is_success() {
+                    red.push("publish_loss_wake_discovery");
+                }
+            }
+            Err(e) => {
+                wake_frame.record_state("claim_error", json!(e.to_string()));
+                red.push("publish_loss_wake_discovery");
+            }
+        }
+    } else {
+        wake_frame.record_state("claim_error", json!("no session_id captured"));
+        red.push("publish_loss_wake_discovery");
+    }
+    transcript.push(wake_frame);
 
     // Frame: approval_resolution_by_handle — the Redis-backed approval record
     // survives process death and resolves by handle.
@@ -175,54 +248,6 @@ async fn durability_harness_redis_frames() {
     }
     transcript.push(approval_frame);
 
-    // Frame: publish_loss_wake_discovery — kill the server again, publish an
-    // approval decision directly to the Redis event bus while the server is
-    // down, then restart and claim. Today there is no durable run to wake, so
-    // the claim fails; the frame goes green only when P7/P9 discover the
-    // decision and wake the parked run.
-    let mut wake_frame = Frame::new("publish_loss_wake_discovery");
-    server
-        .stop()
-        .await
-        .expect("server stops for publish-loss test");
-    if let Some(id) = &decision_id {
-        match publish_decision_to_redis(&redis_url, id, true).await {
-            Ok(()) => {
-                wake_frame.record_state("publish_status", json!("ok"));
-            }
-            Err(e) => {
-                wake_frame.record_state("publish_error", json!(e.to_string()));
-                red.push("publish_loss_wake_discovery");
-            }
-        }
-    } else {
-        wake_frame.record_state("publish_error", json!("no decision_id captured"));
-        red.push("publish_loss_wake_discovery");
-    }
-    server
-        .start()
-        .await
-        .expect("server restarts after publish-loss");
-    if let Some(id) = &session_id {
-        let claim_url = format!("{}/v1/sessions/{}/claim", server.api_url(), id);
-        match client.post(&claim_url).send().await {
-            Ok(resp) => {
-                wake_frame.record_state("claim_status", json!(resp.status().as_u16()));
-                if !resp.status().is_success() {
-                    red.push("publish_loss_wake_discovery");
-                }
-            }
-            Err(e) => {
-                wake_frame.record_state("claim_error", json!(e.to_string()));
-                red.push("publish_loss_wake_discovery");
-            }
-        }
-    } else {
-        wake_frame.record_state("claim_error", json!("no session_id captured"));
-        red.push("publish_loss_wake_discovery");
-    }
-    transcript.push(wake_frame);
-
     finish("redis_frames", transcript, red, &mut server).await;
 }
 
@@ -234,7 +259,13 @@ async fn drive_to_park(
     backend: SessionStoreBackend,
     mcp_url: String,
     redis_url: Option<String>,
-) -> (FrameTranscript, RedFrames, AuraServerProcess, Vec<SseEvent>) {
+) -> (
+    FrameTranscript,
+    RedFrames,
+    AuraServerProcess,
+    Vec<SseEvent>,
+    Option<String>,
+) {
     let stub = StubLlm::start().await;
     let memory_dir = tempfile::tempdir().expect("temp memory dir").keep();
 
@@ -266,7 +297,8 @@ async fn drive_to_park(
         "messages": [{"role": "user", "content": "Run the durability harness."}],
         "stream": true,
     });
-    let events = drive_to_approval(&client, &mut server, request_body, redis_url.as_ref()).await;
+    let (events, setup_failure) =
+        drive_to_approval(&client, &mut server, request_body, redis_url.as_ref()).await;
     let memory_dir = server.memory_dir().to_path_buf();
 
     // Frame: planning — the coordinator must emit a plan.
@@ -320,7 +352,7 @@ async fn drive_to_park(
     }
     transcript.push(park_frame);
 
-    (transcript, red, server, events)
+    (transcript, red, server, events, setup_failure)
 }
 
 /// Post-park frames that exercise the expected durable-park surface. Each
@@ -449,12 +481,16 @@ async fn drive_post_park_frames(
 /// in the backend before SIGKILL-ing the server. The response is held open
 /// until the process dies, so the request teardown never runs and the approval
 /// record survives.
+///
+/// Returns the collected events and an optional harness-setup failure message.
+/// A setup failure means the crash window was never reached, which is
+/// distinguishable from a product-red frame in the output.
 async fn drive_to_approval(
     client: &reqwest::Client,
     server: &mut AuraServerProcess,
     body: serde_json::Value,
     redis_url: Option<&String>,
-) -> Vec<SseEvent> {
+) -> (Vec<SseEvent>, Option<String>) {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let url = format!("{}/v1/chat/completions", server.api_url());
     let client = client.clone();
@@ -464,13 +500,21 @@ async fn drive_to_approval(
 
     let overall_deadline = Instant::now() + Duration::from_secs(20);
     let (kill_tx, mut kill_rx) = mpsc::unbounded_channel();
+    let (fail_tx, mut fail_rx) = mpsc::unbounded_channel();
     let mut events = Vec::new();
+    let mut setup_failure: Option<String> = None;
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(overall_deadline) => break,
             _ = kill_rx.recv() => {
                 let _ = server.stop().await;
+                break;
+            }
+            maybe_fail = fail_rx.recv() => {
+                if let Some(err) = maybe_fail {
+                    setup_failure = Some(err);
+                }
                 break;
             }
             maybe = rx.recv() => {
@@ -482,14 +526,22 @@ async fn drive_to_approval(
                             let memory_dir = server.memory_dir().to_path_buf();
                             let redis_url = redis_url.cloned();
                             let kill_tx = kill_tx.clone();
+                            let fail_tx = fail_tx.clone();
                             tokio::spawn(async move {
-                                let _ = wait_for_approval_record(
+                                match wait_for_approval_record(
                                     &memory_dir,
                                     &id,
                                     redis_url.as_ref(),
                                 )
-                                .await;
-                                let _ = kill_tx.send(());
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let _ = kill_tx.send(());
+                                    }
+                                    Err(e) => {
+                                        let _ = fail_tx.send(e.to_string());
+                                    }
+                                }
                             });
                         }
                         events.push(evt);
@@ -505,7 +557,7 @@ async fn drive_to_approval(
         events.push(evt);
     }
     let _ = handle.await;
-    events
+    (events, setup_failure)
 }
 
 async fn sse_collect(
@@ -657,7 +709,7 @@ async fn publish_decision_to_redis(
     redis_url: &str,
     decision_id: &str,
     approved: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<usize, Box<dyn std::error::Error>> {
     let client = redis::Client::open(redis_url)?;
     let mut conn = client.get_connection_manager().await?;
     let channel = format!("{}:bus:approval:{decision_id}", redis_key_prefix());
@@ -666,8 +718,8 @@ async fn publish_decision_to_redis(
     } else {
         r#"{"Denied":{"reason":"harness test denial"}}"#.to_string()
     };
-    let _: usize = redis::AsyncCommands::publish(&mut conn, channel, payload).await?;
-    Ok(())
+    let subscribers: usize = redis::AsyncCommands::publish(&mut conn, channel, payload).await?;
+    Ok(subscribers)
 }
 
 async fn find_run_records(memory_dir: &std::path::Path) -> (Vec<PathBuf>, usize) {
@@ -705,11 +757,19 @@ async fn finish(
     red: RedFrames,
     server: &mut AuraServerProcess,
 ) {
+    let has_harness_failure = transcript
+        .frames()
+        .iter()
+        .any(|f| f.name == "harness_setup_failure");
     let mut snapshot = transcript.to_snapshot();
     scrub_nondeterminism(&mut snapshot, server.memory_dir());
     insta::assert_json_snapshot!(snapshot_name, snapshot);
 
     let _ = server.stop().await;
+
+    if has_harness_failure {
+        panic!("harness setup failure (see harness_setup_failure frame in snapshot)");
+    }
 
     if !red.is_empty() {
         panic!("{}", render_red_frames(&red));
