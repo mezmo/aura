@@ -407,6 +407,7 @@ fn parked(request_id: &str, scope: AgentScope) -> ParkedApproval {
             items: vec![ApprovalItem {
                 tool_name: "conformance_tool".to_string(),
                 arguments: serde_json::json!({"nested": {"b": 2, "a": [1, "two"]}}),
+                tool_call_intent: None,
             }],
         },
         registered_at: now,
