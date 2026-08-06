@@ -94,6 +94,7 @@ impl OrchestratorFactory {
                 orchestrator.usage_state = usage_state;
                 orchestrator.outer_budget = outer_budget;
                 orchestrator.run_store = run_store;
+                orchestrator.request_id = request_id.clone();
 
                 // Wire the durable session id and fencing generation so commit_quiescent_park
                 // can perform the park CAS. Failures here are non-fatal: park will refuse
