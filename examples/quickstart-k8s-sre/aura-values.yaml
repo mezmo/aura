@@ -46,6 +46,18 @@ config:
     [mcp]
     sanitize_schemas = true
 
+    # Large tool outputs (log searches, metric dumps) can be diverted to
+    # the scratchpad instead of filling the context window — tune the
+    # threshold per server or per tool (https://docs.mezmo.com/aura/scratchpad)
+    [agent.scratchpad]
+    enabled = true
+    # Fraction of the context window reserved for reasoning and output.
+    context_safety_margin = 0.20
+    # Ceiling on what a single scratchpad read returns.
+    max_extraction_tokens = 10_000
+    # Extra turns on top of turn_depth to pay for scratchpad exploration.
+    turn_depth_bonus = 6
+
     # Kubernetes MCP — cluster inspection tools
     # Service name and port from: oci://ghcr.io/containers/charts/kubernetes-mcp-server
     [mcp.servers.kubernetes]
@@ -53,12 +65,21 @@ config:
     url = "http://kubernetes-mcp-server:8080/mcp"
     description = "Kubernetes cluster operations: pods, deployments, services, nodes, logs, events"
 
+    # Per-tool scratchpad thresholds. * is a wildcard matching all tools on this MCP
+    # server. Output above min_tokens goes to the scratchpad instead of context window.
+    [mcp.servers.kubernetes.scratchpad]
+    "*" = { min_tokens = 5120 }
+
     # Prometheus MCP — metrics and alerting tools
     # Service name and port from: oci://ghcr.io/pab1it0/charts/prometheus-mcp-server
     [mcp.servers.prometheus]
     transport = "http_streamable"
     url = "http://prometheus-mcp-server:8080/mcp"
     description = "Prometheus metrics queries, alerts, and targets"
+
+    # Same configuration as [mcp.servers.kubernetes.scratchpad].
+    [mcp.servers.prometheus.scratchpad]
+    "*" = { min_tokens = 5120 }
 
     [agent]
     name = "Kubernetes SRE Agent"
@@ -81,7 +102,7 @@ config:
     provider = "openai"
     api_key = "{{ env.OPENAI_API_KEY }}"
     model = "gpt-5.4-mini"
-    max_tokens = 4096
+    context_window = 200_000
 
     # ── Orchestration ────────────────────────────────────────────────
 
