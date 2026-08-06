@@ -178,7 +178,9 @@ impl PendingApprovals {
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
-        self.0.store.resolve(id, decision.clone()).await?;
+        // Preserve the record for park-restart replay; wake reason discarded
+        // here since the bus publish is the wake mechanism.
+        let _wake = self.0.store.resolve_durable(id, decision.clone()).await?;
         let payload = serde_json::to_vec(&decision).expect("ApprovalDecision serializes to JSON");
         if let Err(err) = self
             .0
@@ -420,7 +422,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_twice_returns_not_found_on_second() {
+    async fn resolve_is_idempotent_with_durable_store() {
+        // resolve_durable preserves the record, so a second resolve on the same
+        // id also succeeds rather than returning NotFound.
         let registry = PendingApprovals::new();
         let req = test_request("req-3");
         let id = req.decision_id;
@@ -430,10 +434,10 @@ mod tests {
             .resolve(&id, ApprovalDecision::Approved)
             .await
             .expect("first resolve succeeds");
-        assert_eq!(
-            registry.resolve(&id, ApprovalDecision::Approved).await,
-            Err(ResolveError::NotFound)
-        );
+        registry
+            .resolve(&id, ApprovalDecision::Approved)
+            .await
+            .expect("second resolve is idempotent: record persists for park-restart replay");
     }
 
     #[tokio::test]

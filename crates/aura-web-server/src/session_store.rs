@@ -71,14 +71,12 @@ pub struct MissingRunStore {
 /// out the backend's [`RunStore`] or refuses, naming the missing capability
 /// and the identity [`SessionStore::backend`] reports. Never a silent
 /// fallback.
-#[expect(
-    unused_variables,
-    reason = "staged for #271: durable-parking preflight"
-)]
 pub fn run_store_for_parking(
     store: &dyn SessionStore,
 ) -> Result<Arc<dyn RunStore>, MissingRunStore> {
-    todo!("staged for #271: durable-parking preflight")
+    store.runs().ok_or_else(|| MissingRunStore {
+        backend: store.backend(),
+    })
 }
 
 /// Construct the configured backend. Fails fast on an unwritable file root, an

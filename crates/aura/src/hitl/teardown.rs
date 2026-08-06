@@ -23,10 +23,6 @@ enum OwnershipPhase {
     /// Default: teardown deletes the request's approvals.
     RequestOwned,
     /// A park commit took ownership; teardown must leave approvals in place.
-    #[expect(
-        dead_code,
-        reason = "staged for #271: constructed by the ownership transfer"
-    )]
     SessionOwned,
     /// A teardown half already began deleting; a transfer can no longer
     /// preserve the approvals.
@@ -89,7 +85,16 @@ impl ApprovalOwnership {
     /// respect to both teardown halves: after `Ok`, neither half deletes.
     /// Must complete before the park-induced stream closure.
     pub fn transfer_to_session(&self) -> Result<(), TeardownUnderway> {
-        todo!("staged for #271: park-commit ownership transfer")
+        let mut phase = self.0.lock().expect("approval ownership lock poisoned");
+        match *phase {
+            OwnershipPhase::RequestOwned => {
+                *phase = OwnershipPhase::SessionOwned;
+                Ok(())
+            }
+            OwnershipPhase::TearingDown => Err(TeardownUnderway),
+            // Already transferred; idempotent.
+            OwnershipPhase::SessionOwned => Ok(()),
+        }
     }
 
     /// A teardown half asks whether it may delete the request's approvals.
@@ -103,9 +108,7 @@ impl ApprovalOwnership {
                 *phase = OwnershipPhase::TearingDown;
                 true
             }
-            OwnershipPhase::SessionOwned => {
-                todo!("staged for #271: session-owned teardown leaves approvals in place")
-            }
+            OwnershipPhase::SessionOwned => false,
         }
     }
 }

@@ -6,10 +6,11 @@
 //!
 //! | Path                                  | Contents                            |
 //! | ------------------------------------- | ----------------------------------- |
-//! | `{root}/approvals/{decision_id}.json` | one [`ParkedApprovalRecord`]        |
-//! | `{root}/approvals/*.tmp`              | an interrupted write, ignored       |
-//! | `{root}/approvals/*.taken`            | an interrupted take, ignored        |
-//! | `{root}/approvals/*.probe`            | an interrupted open check, ignored    |
+//! | `{root}/approvals/{decision_id}.json`    | one [`ParkedApprovalRecord`]        |
+//! | `{root}/approvals/{decision_id}.decided` | durable [`WakeReason`] sidecar      |
+//! | `{root}/approvals/*.tmp`                 | an interrupted write, ignored       |
+//! | `{root}/approvals/*.taken`               | an interrupted take, ignored        |
+//! | `{root}/approvals/*.probe`               | an interrupted open check, ignored  |
 //! | `{root}/runs/{session_id}.json`       | one [`SessionRecord`]               |
 //! | `{root}/runs/*.tmp`                   | an interrupted write, ignored       |
 //!
@@ -74,7 +75,7 @@ use uuid::Uuid;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 use crate::orchestration::park::{
     AgentInstanceId, CasError, FencingGeneration, Lease, LeaseTtl, ParkCommit, RunEvent, RunState,
-    SessionId, SessionRecord,
+    SessionId, SessionRecord, WakeReason,
 };
 
 use super::{
@@ -86,6 +87,9 @@ use super::{
 const APPROVALS_DIR: &str = "approvals";
 const RECORD_EXTENSION: &str = "json";
 const TAKEN_EXTENSION: &str = "taken";
+/// Extension for durable decision sidecars; distinct from `.json` so
+/// `record_paths` does not pick them up as approval records.
+const DECIDED_EXTENSION: &str = "decided";
 #[cfg(not(windows))]
 const PROBE_EXTENSION: &str = "probe";
 /// Non-empty, so the probe's file sync has bytes to flush.
@@ -222,13 +226,39 @@ impl ApprovalStore for FileApprovalStore {
         todo!("staged for #271: read back the decision recorded for {id} (P7-completion)")
     }
 
-    #[expect(unused_variables, reason = "staged for #271: durable resolution")]
     async fn resolve_durable(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
-    ) -> Result<crate::orchestration::park::WakeReason, ResolveError> {
-        todo!("staged for #271: durable resolution preserving the record file")
+        _decision: ApprovalDecision,
+    ) -> Result<WakeReason, ResolveError> {
+        let id = *id;
+        let resolved_at = chrono::Utc::now();
+        match self
+            .blocking(move |dir| {
+                // Check the record exists without consuming it.
+                let path = record_path(&dir, &id);
+                match fs::metadata(&path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(io_err("metadata", &path, &e)),
+                    Ok(_) => {}
+                }
+                // Write the wake reason durably so a restarted process can replay it.
+                let wake = WakeReason::DecisionResolved {
+                    decision_id: id,
+                    resolved_at,
+                };
+                let sidecar = dir.join(format!("{id}.{DECIDED_EXTENSION}"));
+                let payload = serde_json::to_vec(&wake).expect("wake reason serializes to JSON");
+                write_synced(&sidecar, &payload)?;
+                sync_dir(&dir)?;
+                Ok(Some(wake))
+            })
+            .await
+        {
+            Ok(Some(wake)) => Ok(wake),
+            Ok(None) => Err(ResolveError::NotFound),
+            Err(err) => Err(ResolveError::Store(err)),
+        }
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
