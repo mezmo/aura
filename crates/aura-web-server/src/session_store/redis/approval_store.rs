@@ -4,11 +4,12 @@
 //!
 //! Key schema (all under the configured `key_prefix`, default `aura`):
 //!
-//! | Key                                    | Type                 | Purpose                  |
-//! | -------------------------------------- | -------------------- | ------------------------ |
-//! | `{p}:approval:{decision_id}`           | string (record JSON) | parked approval record   |
-//! | `{p}:approval:decision:{decision_id}`  | string (record JSON) | recorded decision        |
-//! | `{p}:approval:req:{request_id}`        | set of decision ids  | `cancel_request` fan-out |
+//! | Key                                    | Type                 | Purpose                        |
+//! | -------------------------------------- | -------------------- | ------------------------------ |
+//! | `{p}:approval:{decision_id}`           | string (record JSON) | parked approval record         |
+//! | `{p}:approval:decision:{decision_id}`  | string (record JSON) | recorded decision              |
+//! | `{p}:approval:decided:{decision_id}`   | string (JSON)        | durable wake reason (24 h TTL) |
+//! | `{p}:approval:req:{request_id}`        | set of decision ids  | `cancel_request` fan-out       |
 //!
 //! Approval records carry a TTL derived from the approval's `expires_at`, so
 //! abandoned entries self-clean; the parking instance's await remains the
@@ -55,6 +56,11 @@ static RESOLVE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| {
     )
 });
 
+/// TTL for durable decision sidecars (`decided` keys). Generous enough to
+/// outlast any practical approval window; these are replay aids, not primary
+/// state.
+const DECIDED_KEY_TTL_SECS: u64 = 86_400;
+
 pub struct RedisApprovalStore {
     conn: ConnectionManager,
     key_prefix: String,
@@ -78,6 +84,10 @@ impl RedisApprovalStore {
 
     fn req_key(&self, request_id: &str) -> String {
         format!("{}:approval:req:{request_id}", self.key_prefix)
+    }
+
+    fn decided_key(&self, decision_id: &str) -> String {
+        format!("{}:approval:decided:{decision_id}", self.key_prefix)
     }
 
     /// Atomically take the record (`GETDEL`), pruning the request index
@@ -181,13 +191,40 @@ impl ApprovalStore for RedisApprovalStore {
             .transpose()
     }
 
-    #[expect(unused_variables, reason = "staged for #271: durable resolution")]
     async fn resolve_durable(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        _decision: ApprovalDecision,
     ) -> Result<aura::orchestration::park::WakeReason, ResolveError> {
-        todo!("staged for #271: durable resolution preserving the redis record")
+        use aura::orchestration::park::WakeReason;
+
+        let mut conn = self.conn.clone();
+        let approval_key = self.approval_key(&id.to_string());
+
+        // Check the record exists without consuming it.
+        let exists: bool = conn
+            .exists(&approval_key)
+            .await
+            .map_err(|e| ResolveError::Store(request_err(e)))?;
+        if !exists {
+            return Err(ResolveError::NotFound);
+        }
+
+        let resolved_at = chrono::Utc::now();
+        let wake = WakeReason::DecisionResolved {
+            decision_id: *id,
+            resolved_at,
+        };
+        let payload = serde_json::to_string(&wake).expect("wake reason serializes to JSON");
+
+        // Persist the decision so a restarted process can replay the wake.
+        let decided_key = self.decided_key(&id.to_string());
+        let _: () = conn
+            .set_ex(&decided_key, payload, DECIDED_KEY_TTL_SECS)
+            .await
+            .map_err(|e| ResolveError::Store(request_err(e)))?;
+
+        Ok(wake)
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
