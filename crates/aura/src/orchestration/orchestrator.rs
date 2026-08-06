@@ -63,7 +63,7 @@ use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
 use super::park::{
     ApprovalOriginSnapshot, ArgsDigest, BlockedTaskBinding, ChatSessionId, CheckpointEnvelope,
-    ConfigFingerprint, DecisionConsumption, NonEmpty, ParkCommit, ParkReason,
+    ConfigFingerprint, DecisionConsumption, FencingGeneration, NonEmpty, ParkCommit, ParkReason,
     ParkedApprovalSnapshot, ResumePoint, RunCheckpoint, SessionId, TaskExecutionOutcome,
     WaveOutcome,
 };
@@ -421,6 +421,12 @@ pub struct Orchestrator {
     /// `usage_state`.
     pub(super) run_store: Option<Arc<dyn RunStore>>,
 
+    /// The durable session id from the run-store session created at run start.
+    pub(super) session_id: Option<SessionId>,
+
+    /// The fencing generation from the lease acquired at run start.
+    pub(super) fencing_generation: Option<FencingGeneration>,
+
     /// The approval store, for drain-time decision reconciliation.
     /// `None` when the deployment has no durable parking capability, matching
     /// `run_store`.
@@ -600,6 +606,8 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             run_store: None,
+            session_id: None,
+            fencing_generation: None,
             approval_store: None,
             request_id: String::new(),
             hitl_registry: None,
@@ -3215,8 +3223,6 @@ Assign tasks to the worker whose tools best match the required operations."#,
         iteration: usize,
         timings: IterationTimings,
     ) -> Result<IterationOutcome, StreamError> {
-        let _ = sink;
-
         // A. Fail-closed on missing run store (ADR addendum B).
         let run_store = match &self.run_store {
             Some(s) => Arc::clone(s),
@@ -3284,9 +3290,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .parse::<RunId>()
             .map_err(|e| StreamError::from(format!("invalid run id: {e}")))?;
 
-        // TODO(P7): the durable session id should be the one claimed at run
-        // start, not a freshly generated placeholder.
-        let session_id = SessionId::generate();
+        let session_id = match self.session_id {
+            Some(id) => id,
+            None => {
+                return Err(StreamError::from(
+                    "durable park requires a session id; arm the run store at run start",
+                ));
+            }
+        };
+        let generation = match self.fencing_generation {
+            Some(g) => g,
+            None => {
+                return Err(StreamError::from(
+                    "durable park requires a fencing generation; acquire a lease at run start",
+                ));
+            }
+        };
         let chat_session_id = self
             .agent_config
             .session_id
@@ -3327,11 +3346,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
         };
 
         // D. CAS `Running -> Parked` through the run store.
-        // BLOCKED: the orchestrator does not yet hold the durable session id or
-        // the fencing generation from a claimed lease. A previous P-card must
-        // create the session record and acquire its lease at run start; without
-        // that wiring we cannot perform the `Running -> Parked` CAS.
-        let _ = (run_store, park_commit, session_id);
+        run_store
+            .park(session_id, generation, park_commit)
+            .await
+            .map_err(|e| StreamError::from(format!("run store park failed: {e}")))?;
 
         // E. Transfer approval ownership from request scope to session scope
         // (ADR decision 10). Even though the CAS above is blocked, the request
@@ -3341,12 +3359,18 @@ Assign tasks to the worker whose tools best match the required operations."#,
         }
 
         // F. Emit the `Parked` frame post-CAS (ADR decision 15).
-        // BLOCKED: the CAS in step D cannot complete without session/generation
-        // wiring, so the parked frame cannot be emitted.
+        sink.emit(OrchestratorEvent::Parked {
+            session_id: session_id.to_string(),
+            approvals: blocked_on
+                .iter()
+                .map(|a| a.decision_id.to_string())
+                .collect(),
+            parked_at: now.to_rfc3339(),
+            expires_at: expires_at.to_rfc3339(),
+        })
+        .await;
 
-        Err(StreamError::from(
-            "atomic park commit blocked: durable session id and fencing generation are not yet wired through the orchestrator lifecycle",
-        ))
+        Ok(IterationOutcome::Parked)
     }
 
     /// Build a [`ParkedApprovalSnapshot`] from an in-process [`ApprovalRef`]
@@ -4270,7 +4294,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     previous_context = pc;
                     planning_ms = next_planning_ms;
                 }
-                IterationOutcome::Parked(_) => break String::new(),
+                IterationOutcome::Parked => break String::new(),
             }
         };
 
