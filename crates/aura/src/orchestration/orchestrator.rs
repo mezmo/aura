@@ -67,7 +67,7 @@ use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::sink::{ChannelEventSink, RunEventSink};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
-    IterationTimings, Plan, PlanningResponse, TaskIdentity, TaskState, TaskStatus,
+    IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
 };
 use crate::hitl::ApprovalRef;
 use crate::session_store::RunStore;
@@ -2973,10 +2973,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .tasks
             .iter()
             .filter_map(|task| match &task.state {
-                TaskState::Blocked { decision_id } => Some(ApprovalRef {
-                    decision_id: *decision_id,
-                    task: TaskIdentity::new(task.id, task.worker.clone()),
-                }),
+                TaskState::Blocked { approval } => Some(approval.clone()),
                 _ => None,
             })
             .collect();
