@@ -61,13 +61,18 @@ impl ApprovalStore for InMemoryApprovalStore {
         }
     }
 
-    #[expect(unused_variables, reason = "staged for #271: durable resolution")]
     async fn resolve_durable(
         &self,
         id: &DecisionId,
-        decision: ApprovalDecision,
+        _decision: ApprovalDecision,
     ) -> Result<WakeReason, ResolveError> {
-        todo!("staged for #271: durable resolution preserving the parked entry")
+        if !self.lock().contains_key(id) {
+            return Err(ResolveError::NotFound);
+        }
+        Ok(WakeReason::DecisionResolved {
+            decision_id: id.clone(),
+            resolved_at: chrono::Utc::now(),
+        })
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
