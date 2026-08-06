@@ -57,6 +57,11 @@ pub(crate) fn filter_chat_models(models: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Model prefixes excluded from the fallback shortlist because they are
+/// reasoning models incompatible with function tools on /v1/chat/completions
+/// (issue #511). The operator can still type any model id manually.
+const BLOCKED_FALLBACK_PREFIXES: &[&str] = &["gpt-5.6"];
+
 /// Version key for natural ("human") ordering of model ids: the sequence of
 /// digit runs parsed as integers (`gpt-5.6` → `[5, 6]`, `o3` → `[3]`). Compared
 /// lexicographically, a higher key means a newer model within a family.
@@ -140,7 +145,10 @@ pub(crate) fn rank_shortlist(provider: Provider, models: &[String]) -> Vec<Strin
     }
 
     if shortlist.is_empty() {
-        let mut fallback = chat;
+        let mut fallback = chat
+            .into_iter()
+            .filter(|m| !BLOCKED_FALLBACK_PREFIXES.iter().any(|p| m.starts_with(p)))
+            .collect::<Vec<_>>();
         fallback.sort_by(|a, b| {
             natural_key(b)
                 .cmp(&natural_key(a))
@@ -231,26 +239,21 @@ mod tests {
             "o4-mini",
             "gpt-4.1",
             "gpt-5.5",
+            "gpt-5.5-mini",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
-            "gpt-5.6-terra-2026-07-09", // dated snapshot of a recommended id
-            "gpt-5.6-luna",
             "text-embedding-3-small",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-        // Only the recommended gpt-5.6 flavors are shown, best-first per
-        // `family_roots` (terra default), and the clean id wins over its dated
-        // snapshot. gpt-5.5 / o-series / 4o / 3.5 are dropped.
+        // Only the recommended gpt-5.5 family is shown, best-first per
+        // `family_roots`. The base id wins over `-mini`. gpt-5.6-* /
+        // o-series / 4o / 3.5 are dropped.
         assert_eq!(
             rank_shortlist(Provider::OpenAI, &models),
-            vec![
-                "gpt-5.6-terra".to_string(),
-                "gpt-5.6-sol".to_string(),
-                "gpt-5.6-luna".to_string(),
-            ]
+            vec!["gpt-5.5".to_string()]
         );
     }
 
@@ -301,5 +304,16 @@ mod tests {
         let shortlist = rank_shortlist(Provider::OpenAI, &models);
         assert!(shortlist.contains(&"weird-model".to_string()));
         assert!(shortlist.contains(&"another-thing".to_string()));
+    }
+
+    #[test]
+    fn rank_shortlist_fallback_drops_incompatible_reasoning_models() {
+        let models: Vec<String> = ["gpt-5.6-terra", "gpt-5.4", "gpt-5.2"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shortlist = rank_shortlist(Provider::OpenAI, &models);
+        assert!(shortlist.contains(&"gpt-5.4".to_string()));
+        assert!(!shortlist.contains(&"gpt-5.6-terra".to_string()));
     }
 }

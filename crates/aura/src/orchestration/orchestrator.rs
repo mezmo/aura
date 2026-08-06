@@ -2343,6 +2343,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 api_key,
                 model,
                 base_url,
+                reasoning_effort,
                 ..
             } => {
                 let mut cb =
@@ -2355,11 +2356,22 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     .map_err(|e| format!("Failed to build OpenAI coordinator: {}", e))?
                     .completions_api()
                     .completion_model(model);
+                let mut combined_params: Option<serde_json::Value> = None;
+                if let Some(effort) = reasoning_effort {
+                    combined_params =
+                        Some(serde_json::json!({"reasoning_effort": effort.to_string()}));
+                }
+                if let Some(params) = &additional_params {
+                    combined_params = Some(match combined_params {
+                        Some(existing) => crate::builder::merge_json(existing, params.clone()),
+                        None => params.clone(),
+                    });
+                }
                 Ok(ProviderAgent::OpenAI(Self::build_agent_with_tools(
                     cm,
                     preamble,
                     temperature,
-                    additional_params,
+                    combined_params,
                     max_tokens,
                     tools,
                 )))

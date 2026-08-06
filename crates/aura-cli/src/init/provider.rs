@@ -78,9 +78,10 @@ pub(crate) fn default_key_env(provider: Provider) -> Option<&'static str> {
 /// editorial choice — keep them current as providers ship new flagships.
 pub(crate) fn family_roots(provider: Provider) -> &'static [&'static str] {
     match provider {
-        // GPT-5.6 ships as three flavors; `terra` (balanced) is the default —
-        // `sol` is the pricier frontier tier, `luna` the cheapest.
-        Provider::OpenAI => &["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"],
+        // gpt-5.5 is the recommended default. gpt-5.6-* models are reasoning
+        // models that reject function tools on /v1/chat/completions unless
+        // reasoning_effort is set to "none" (issue #511).
+        Provider::OpenAI => &["gpt-5.5"],
         Provider::Anthropic => &["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5"],
         Provider::Gemini => &["gemini-3.5-flash", "gemini-3.1-pro"],
         // Uncurated providers (and bedrock, which has no list endpoint).

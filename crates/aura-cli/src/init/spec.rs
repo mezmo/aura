@@ -504,7 +504,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.provider, Provider::OpenAI);
-        assert_eq!(spec.model, "gpt-5.6-terra");
+        assert_eq!(spec.model, "gpt-5.5");
         assert_eq!(
             spec.api_key,
             Some(ApiKeySource::EnvVar("OPENAI_API_KEY".to_string()))
