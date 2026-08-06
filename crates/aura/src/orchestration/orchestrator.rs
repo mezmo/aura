@@ -67,7 +67,7 @@ use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::sink::{ChannelEventSink, RunEventSink};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
-    IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
+    IterationTimings, Plan, PlanningResponse, TaskIdentity, TaskState, TaskStatus,
 };
 use crate::hitl::ApprovalRef;
 use crate::session_store::RunStore;
@@ -3238,12 +3238,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Classify a drained wave whose ready frontier is empty and that holds
     /// at least one decision-blocked task (ADR 2026-07-21, decision 1),
     /// reconciling decisions that arrived during the drain (decision 8).
-    #[expect(
-        unused_variables,
-        reason = "staged for #271: quiescent-drain classification"
-    )]
     fn classify_blocked_drain(plan: &Plan) -> WaveOutcome {
-        todo!("staged for #271: quiescent-drain classification")
+        let approvals: Vec<ApprovalRef> = plan
+            .tasks
+            .iter()
+            .filter_map(|task| match &task.state {
+                TaskState::Blocked { decision_id } => Some(ApprovalRef {
+                    decision_id: *decision_id,
+                    task: TaskIdentity::new(task.id, task.worker.clone()),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        match NonEmpty::new(approvals) {
+            Ok(on) => WaveOutcome::Blocked { on },
+            Err(_) => WaveOutcome::Continue,
+        }
     }
 
     /// Commit the quiescent park: reconcile drain-time decisions, transfer
@@ -3252,13 +3263,33 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// parked frame through `sink` (ADR 2026-07-21, decisions 7, 8, 10, 15).
     /// Without a run store this refuses fail-closed, naming the missing
     /// capability — never a silent fallback to in-request parking.
-    #[expect(unused_variables, reason = "staged for #271: atomic park commit")]
     async fn commit_quiescent_park(
         &self,
         blocked_on: NonEmpty<ApprovalRef>,
         sink: &dyn RunEventSink,
     ) -> Result<IterationOutcome, StreamError> {
-        todo!("staged for #271: atomic park commit at the quiescent boundary")
+        // Drain-time decision reconciliation (decision 8) requires an
+        // approval-store lookup. Orchestrator has no direct approval_store or
+        // pending_approvals field; this is a stop-and-report item for #271.
+        let _ = blocked_on;
+        let _ = sink;
+
+        // Fail-closed when the deployment has no durable run store.
+        if self.run_store.is_none() {
+            return Err(StreamError::from(
+                "durable park requires a run store capability; none configured",
+            ));
+        }
+
+        // The remaining park commit is blocked on missing wiring:
+        // - RunCheckpoint has no production constructor and this method's
+        //   signature does not receive plan/conversation state.
+        // - Orchestrator has no request_resource_guard / pending_approvals
+        //   handle to transfer approval ownership before the SSE response closes.
+        // - OrchestratorEvent has no Parked variant to emit the park frame.
+        Err(StreamError::from(
+            "atomic park commit blocked: missing RunCheckpoint constructor, approval ownership handle, and OrchestratorEvent::Parked variant",
+        ))
     }
 
     /// Collect failed tasks from this iteration into failure records.
