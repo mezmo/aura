@@ -91,8 +91,9 @@ pub trait ApprovalStore: Send + Sync {
     /// destroying the parked entry (ADR 2026-07-21, decision 8): the entry
     /// and the returned wake reason survive until a claim consumes them.
     /// At-most-once consumption moves out of resolution and into the
-    /// dispatch FSM's digest-bound claim; resolving an already-resolved or
-    /// unknown decision is [`ResolveError::NotFound`].
+    /// dispatch FSM's digest-bound claim. Resolution is idempotent: a second
+    /// call on an already-resolved id returns `Ok` (the entry is still
+    /// present). An unknown or removed id returns [`ResolveError::NotFound`].
     async fn resolve_durable(
         &self,
         id: &DecisionId,
