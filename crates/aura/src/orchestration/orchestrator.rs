@@ -61,15 +61,20 @@ use super::tools::{InspectToolParamsTool, ListToolsTool, ReadArtifactTool};
 
 use super::config::OrchestrationConfig;
 use super::events::OrchestratorEvent;
-use super::park::{NonEmpty, TaskExecutionOutcome, WaveOutcome};
+use super::park::{
+    ApprovalOriginSnapshot, ArgsDigest, BlockedTaskBinding, ChatSessionId, CheckpointEnvelope,
+    ConfigFingerprint, DecisionConsumption, NonEmpty, ParkCommit, ParkReason,
+    ParkedApprovalSnapshot, ResumePoint, RunCheckpoint, SessionId, TaskExecutionOutcome,
+    WaveOutcome,
+};
 use super::persistence::ExecutionPersistence;
 use super::prompt_journal::{JournalPhase, PromptJournal};
 use super::sink::{ChannelEventSink, RunEventSink};
 use super::types::{
     FailedTaskRecord, FailureCategory, FailureSummary, IterationContext, IterationOutcome,
-    IterationTimings, Plan, PlanningResponse, TaskState, TaskStatus,
+    IterationTimings, Plan, PlanningResponse, RunId, TaskState, TaskStatus,
 };
-use crate::hitl::ApprovalRef;
+use crate::hitl::{ApprovalItem, ApprovalOrigin, ApprovalRef, ParkedApproval};
 use crate::session_store::RunStore;
 
 // ============================================================================
@@ -3292,33 +3297,193 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// parked frame through `sink` (ADR 2026-07-21, decisions 7, 8, 10, 15).
     /// Without a run store this refuses fail-closed, naming the missing
     /// capability — never a silent fallback to in-request parking.
+    #[expect(clippy::too_many_arguments, reason = "checkpoint needs every slice")]
     async fn commit_quiescent_park(
         &self,
         blocked_on: NonEmpty<ApprovalRef>,
         sink: &dyn RunEventSink,
+        plan: &Plan,
+        coordinator_conversation: &[rig::completion::Message],
+        query: &str,
+        chat_history: &[rig::completion::Message],
+        iteration: usize,
+        timings: IterationTimings,
     ) -> Result<IterationOutcome, StreamError> {
-        // Drain-time decision reconciliation (decision 8) requires an
-        // approval-store lookup. Orchestrator has no direct approval_store or
-        // pending_approvals field; this is a stop-and-report item for #271.
-        let _ = blocked_on;
         let _ = sink;
 
-        // Fail-closed when the deployment has no durable run store.
-        if self.run_store.is_none() {
-            return Err(StreamError::from(
-                "durable park requires a run store capability; none configured",
-            ));
+        // A. Fail-closed on missing run store (ADR addendum B).
+        let run_store = match &self.run_store {
+            Some(s) => Arc::clone(s),
+            None => {
+                return Err(StreamError::from(
+                    "durable park requires a run store; configure one or disable HITL gating",
+                ));
+            }
+        };
+
+        // B. Reconcile drain-time decisions (ADR decision 8).
+        // TODO(P7): ApprovalStore exposes no `is_resolved`/`decision` accessor;
+        // add drain-time reconciliation once `resolve_durable` wake reasons are
+        // queryable.
+
+        // C. Build the checkpoint.
+        let now = chrono::Utc::now();
+        // TODO(P7): replace with `self.config.park_timeout_secs()` once the
+        // orchestration config surface adds it.
+        let park_timeout_secs: i64 = 3600;
+        let expires_at = now + chrono::Duration::seconds(park_timeout_secs);
+
+        let blocked_bindings: Vec<BlockedTaskBinding> = blocked_on
+            .iter()
+            .map(|a| BlockedTaskBinding {
+                task: a.task.clone(),
+                decision_id: a.decision_id,
+            })
+            .collect();
+
+        // Approval snapshots are built from the durable approval record so the
+        // checkpoint carries the tool name, arguments, and digest the dispatch
+        // FSM will bind on reify.
+        let mut approvals: Vec<ParkedApprovalSnapshot> = Vec::new();
+        if let Some(store) = &self.approval_store {
+            for approval in blocked_on.iter() {
+                match store.get(&approval.decision_id).await {
+                    Ok(Some(parked)) => {
+                        approvals.push(Self::parked_approval_snapshot(approval, &parked));
+                    }
+                    Ok(None) => {
+                        // The approval was resolved/removed while we drained.
+                        // Decision 8 says we should continue instead of parking;
+                        // this is the best-effort signal available today.
+                        return Ok(IterationOutcome::Continue {
+                            new_plan: plan.clone(),
+                            previous_context: None,
+                            planning_ms: 0,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(StreamError::from(format!(
+                            "approval store lookup failed during park: {e}"
+                        )));
+                    }
+                }
+            }
         }
 
-        // The remaining park commit is blocked on missing wiring:
-        // - RunCheckpoint has no production constructor and this method's
-        //   signature does not receive plan/conversation state.
-        // - Orchestrator has no request_resource_guard / pending_approvals
-        //   handle to transfer approval ownership before the SSE response closes.
-        // - OrchestratorEvent has no Parked variant to emit the park frame.
+        let run_id = self
+            .persistence
+            .lock()
+            .await
+            .run_id()
+            .parse::<RunId>()
+            .map_err(|e| StreamError::from(format!("invalid run id: {e}")))?;
+
+        // TODO(P7): the durable session id should be the one claimed at run
+        // start, not a freshly generated placeholder.
+        let session_id = SessionId::generate();
+        let chat_session_id = self
+            .agent_config
+            .session_id
+            .as_ref()
+            .map(|s| ChatSessionId::new(s.as_str()));
+
+        let checkpoint = RunCheckpoint::new(
+            run_id,
+            session_id,
+            chat_session_id,
+            ConfigFingerprint::new(""),
+            query.to_owned(),
+            chat_history.to_owned(),
+            coordinator_conversation.to_owned(),
+            plan.clone(),
+            blocked_bindings,
+            approvals,
+            Vec::new(),
+            ResumePoint::WaveBoundary {
+                iteration: iteration as u32,
+            },
+            Vec::new(),
+            Vec::new(),
+            iteration as u32,
+            timings,
+        );
+        let envelope = CheckpointEnvelope::new(checkpoint);
+        let park_commit = ParkCommit {
+            checkpoint: envelope,
+            reason: ParkReason::ApprovalsBlocked {
+                decisions: NonEmpty::new(
+                    blocked_on.iter().map(|a| a.decision_id).collect::<Vec<_>>(),
+                )
+                .expect("blocked_on is non-empty"),
+            },
+            parked_at: now,
+            expires_at,
+        };
+
+        // D. CAS `Running -> Parked` through the run store.
+        // BLOCKED: the orchestrator does not yet hold the durable session id or
+        // the fencing generation from a claimed lease. A previous P-card must
+        // create the session record and acquire its lease at run start; without
+        // that wiring we cannot perform the `Running -> Parked` CAS.
+        let _ = (run_store, park_commit, session_id);
+
+        // E. Transfer approval ownership from request scope to session scope
+        // (ADR decision 10). Even though the CAS above is blocked, the request
+        // is ending, so drop process-local wake handles now.
+        if let Some(registry) = &self.hitl_registry {
+            registry.cancel_request_local(&self.request_id);
+        }
+
+        // F. Emit the `Parked` frame post-CAS (ADR decision 15).
+        // BLOCKED: the CAS in step D cannot complete without session/generation
+        // wiring, so the parked frame cannot be emitted.
+
         Err(StreamError::from(
-            "atomic park commit blocked: missing RunCheckpoint constructor, approval ownership handle, and OrchestratorEvent::Parked variant",
+            "atomic park commit blocked: durable session id and fencing generation are not yet wired through the orchestrator lifecycle",
         ))
+    }
+
+    /// Build a [`ParkedApprovalSnapshot`] from an in-process [`ApprovalRef`]
+    /// and its durable [`ParkedApproval`] record.
+    fn parked_approval_snapshot(
+        approval: &ApprovalRef,
+        parked: &ParkedApproval,
+    ) -> ParkedApprovalSnapshot {
+        let request = &parked.request;
+        let item = request
+            .items
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ApprovalItem {
+                tool_name: String::new(),
+                arguments: serde_json::Value::Null,
+                tool_call_intent: None,
+            });
+        let arguments = item.arguments;
+        let args_digest = ArgsDigest::compute(&arguments);
+        let origin = match &request.origin {
+            ApprovalOrigin::ConfigGate {
+                matched_pattern, ..
+            } => ApprovalOriginSnapshot::ConfigGate {
+                matched_pattern: matched_pattern.clone(),
+            },
+            ApprovalOrigin::AgentRequested { reason, .. } => {
+                ApprovalOriginSnapshot::AgentRequested {
+                    reason: reason.clone(),
+                }
+            }
+        };
+        ParkedApprovalSnapshot {
+            decision_id: approval.decision_id,
+            task: approval.task.clone(),
+            tool_name: item.tool_name,
+            arguments,
+            args_digest,
+            origin,
+            registered_at: parked.registered_at,
+            expires_at: parked.expires_at,
+            decision: DecisionConsumption::Pending,
+        }
     }
 
     /// Collect failed tasks from this iteration into failure records.
@@ -4307,7 +4472,24 @@ Assign tasks to the worker whose tools best match the required operations."#,
             }
         };
         if let WaveOutcome::Blocked { on } = drain {
-            return self.commit_quiescent_park(on, sink).await;
+            let park_timings = IterationTimings {
+                planning_ms,
+                execution_ms: execution_start.elapsed().as_millis() as u64,
+                task_compute_ms,
+                tool_ms: 0,
+            };
+            return self
+                .commit_quiescent_park(
+                    on,
+                    sink,
+                    &plan,
+                    &coordinator_state.conversation,
+                    query,
+                    chat_history,
+                    iteration,
+                    park_timings,
+                )
+                .await;
         }
         let new_failure_start = failure_history.len();
         failure_history.extend(Self::collect_iteration_failures(&plan, iteration));
