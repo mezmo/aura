@@ -7,6 +7,7 @@
 //! all and cannot reach execution by construction.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::hitl::Timestamp;
 
@@ -21,8 +22,29 @@ pub struct ArgsDigest(String);
 impl ArgsDigest {
     /// Canonicalize (RFC 8785) and hash the arguments.
     pub fn compute(args: &serde_json::Value) -> Self {
-        let _ = args;
-        todo!("staged for #271 P-cards: JCS canonicalization + SHA-256")
+        fn sort_keys(v: &serde_json::Value) -> serde_json::Value {
+            match v {
+                serde_json::Value::Object(map) => {
+                    let mut pairs: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                    pairs.sort_by_key(|(k, _)| k.as_str());
+                    let sorted: serde_json::Map<String, serde_json::Value> = pairs
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), sort_keys(v)))
+                        .collect();
+                    serde_json::Value::Object(sorted)
+                }
+                serde_json::Value::Array(arr) => {
+                    serde_json::Value::Array(arr.iter().map(sort_keys).collect())
+                }
+                other => other.clone(),
+            }
+        }
+
+        let canonical = sort_keys(args);
+        let serialized =
+            serde_json::to_string(&canonical).expect("JSON value is always serializable");
+        let hash = Sha256::digest(serialized.as_bytes());
+        ArgsDigest(hash.iter().map(|b| format!("{b:02x}")).collect())
     }
 
     pub fn as_str(&self) -> &str {
@@ -119,8 +141,46 @@ impl DispatchState {
     /// binding is consumed by at most one dispatcher; `Executed` and
     /// `ExecutionUnknown` accept no event.
     pub fn apply(&self, event: DispatchEvent, bound: &ArgsDigest) -> Result<Self, DispatchError> {
-        let _ = (event, bound);
-        todo!("staged for #271 P-cards: dispatch consumption FSM")
+        match self {
+            DispatchState::Unclaimed => match event {
+                DispatchEvent::Claim {
+                    generation,
+                    presented,
+                    at,
+                } => {
+                    if &presented != bound {
+                        return Err(DispatchError::DigestMismatch {
+                            bound: bound.clone(),
+                            presented,
+                        });
+                    }
+                    Ok(DispatchState::Claimed {
+                        generation,
+                        claimed_at: at,
+                    })
+                }
+                event => Err(DispatchError::Illegal {
+                    from: self.clone(),
+                    event,
+                }),
+            },
+            DispatchState::Claimed { .. } => match event {
+                DispatchEvent::ConfirmExecuted { at } => {
+                    Ok(DispatchState::Executed { executed_at: at })
+                }
+                DispatchEvent::LoseDispatcher { at } => {
+                    Ok(DispatchState::ExecutionUnknown { claimed_at: at })
+                }
+                event => Err(DispatchError::Illegal {
+                    from: self.clone(),
+                    event,
+                }),
+            },
+            from => Err(DispatchError::Illegal {
+                from: from.clone(),
+                event,
+            }),
+        }
     }
 }
 
