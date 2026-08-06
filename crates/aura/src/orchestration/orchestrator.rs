@@ -415,6 +415,23 @@ pub struct Orchestrator {
     /// Assigned by `OrchestratorFactory` after construction, like
     /// `usage_state`.
     pub(super) run_store: Option<Arc<dyn RunStore>>,
+
+    /// The approval store, for drain-time decision reconciliation.
+    /// `None` when the deployment has no durable parking capability, matching
+    /// `run_store`.
+    #[allow(dead_code)]
+    pub(super) approval_store: Option<Arc<dyn crate::session_store::ApprovalStore>>,
+
+    /// The active request ID for ownership-transfer teardown.
+    /// Set by the factory; empty string when running headless.
+    #[allow(dead_code)]
+    pub(super) request_id: String,
+
+    /// HITL registry handle for transferring approval ownership before the
+    /// SSE stream closes. `None` when the deployment has no conversational
+    /// approval capability.
+    #[allow(dead_code)]
+    pub(super) hitl_registry: Option<crate::hitl::PendingApprovals>,
 }
 
 /// Stream context for reasoning attribution in `stream_and_forward`.
@@ -585,6 +602,9 @@ impl Orchestrator {
             usage_state: crate::UsageState::new(),
             outer_budget: None,
             run_store: None,
+            approval_store: None,
+            request_id: String::new(),
+            hitl_registry: None,
         })
     }
 

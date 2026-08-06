@@ -174,4 +174,17 @@ pub enum OrchestratorEvent {
         /// The tool result (output string or error message; truncated to Option in SSE)
         result: String,
     },
+    /// The run has parked durably: the CAS `Running -> Parked` succeeded
+    /// and the SSE stream will close. The run can be reified by presenting
+    /// the session handle.
+    Parked {
+        /// Session handle for reifying the parked run.
+        session_id: String,
+        /// Decision IDs that blocked the run, for SSE display.
+        approvals: Vec<String>,
+        /// ISO-8601 timestamp when the park committed.
+        parked_at: String,
+        /// ISO-8601 timestamp when the parked run expires if unclaimed.
+        expires_at: String,
+    },
 }
