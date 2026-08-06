@@ -4658,7 +4658,10 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     ));
                 }
                 TaskState::Blocked { .. } => {
-                    todo!("staged for #271: decision-blocked task in the raw-results fallback")
+                    out.push_str(&format!(
+                        "## Task {}: {}\n\n(blocked — waiting for approval)\n\n",
+                        t.id, t.description
+                    ));
                 }
             }
         }
