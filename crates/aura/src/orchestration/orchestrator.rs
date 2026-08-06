@@ -2884,11 +2884,23 @@ Assign tasks to the worker whose tools best match the required operations."#,
             {
                 task_compute_ms += duration_ms;
                 match result {
-                    #[expect(unused_variables, reason = "staged for #271: blocked task entry")]
                     Ok(TaskExecutionOutcome::Blocked(approval)) => {
-                        todo!(
-                            "staged for #271: blocked task enters TaskState::Blocked and the wave drains around it"
-                        )
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.blocked(approval.clone());
+                        }
+                        sink.emit(OrchestratorEvent::TaskCompleted {
+                            task_id,
+                            success: false,
+                            duration_ms,
+                            orchestrator_id: self.orchestrator_id.clone(),
+                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                            result: format!(
+                                "blocked — waiting for approval {}",
+                                approval.decision_id
+                            ),
+                        })
+                        .await;
+                        tracing::info!("Task {} blocked — waiting for approval", task_id);
                     }
                     Ok(TaskExecutionOutcome::Failed { error, category }) => {
                         if let Some(t) = plan.get_task_mut(task_id) {
