@@ -100,6 +100,48 @@ pub enum CheckpointCodecError {
     Serde(String),
 }
 
+impl RunCheckpoint {
+    /// Build a checkpoint from the current run state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        run_id: RunId,
+        session_id: SessionId,
+        chat_session_id: Option<ChatSessionId>,
+        config_fingerprint: ConfigFingerprint,
+        original_query: String,
+        external_history: Vec<Message>,
+        coordinator_conversation: Vec<Message>,
+        plan: Plan,
+        blocked: Vec<BlockedTaskBinding>,
+        approvals: Vec<ParkedApprovalSnapshot>,
+        wake_reasons: Vec<WakeReason>,
+        resume_point: ResumePoint,
+        identity_headers: Vec<IdentityHeader>,
+        pod_local_refs: Vec<PodLocalRef>,
+        iteration: u32,
+        timings: IterationTimings,
+    ) -> Self {
+        Self {
+            run_id,
+            session_id,
+            chat_session_id,
+            config_fingerprint,
+            original_query,
+            external_history,
+            coordinator_conversation,
+            plan,
+            blocked,
+            approvals,
+            wake_reasons,
+            resume_point,
+            identity_headers,
+            pod_local_refs,
+            iteration,
+            timings,
+        }
+    }
+}
+
 impl CheckpointEnvelope {
     pub fn new(checkpoint: RunCheckpoint) -> Self {
         Self {

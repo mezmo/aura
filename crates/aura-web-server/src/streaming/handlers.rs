@@ -1376,6 +1376,25 @@ fn handle_orchestrator_event(
                 event_context,
             )
         }
+        OrchestratorEvent::Parked {
+            session_id,
+            approvals,
+            parked_at,
+            expires_at,
+        } => {
+            tracing::debug!(
+                "Orchestrator: run parked (session_id={}) with {} approvals",
+                session_id,
+                approvals.len()
+            );
+            OrchestrationStreamEvent::parked(
+                session_id.clone(),
+                approvals.clone(),
+                parked_at.clone(),
+                expires_at.clone(),
+                event_context,
+            )
+        }
     };
 
     vec![Bytes::from(sse_event.format_sse())]

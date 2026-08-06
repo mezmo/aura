@@ -80,6 +80,7 @@ pub mod event_names {
     pub const TOOL_CALL_COMPLETED: &str = "aura.orchestrator.tool_call_completed";
     pub const PHASE_STARTED: &str = "aura.orchestrator.phase_started";
     pub const PHASE_COMPLETED: &str = "aura.orchestrator.phase_completed";
+    pub const PARKED: &str = "aura.orchestrator.parked";
 }
 
 /// SSE events specific to orchestration mode.
@@ -225,6 +226,16 @@ pub enum OrchestrationStreamEvent {
         #[serde(flatten)]
         context: EventContext,
     },
+    /// Emitted after a quiescent run commits `Running -> Parked`; the SSE
+    /// stream closes and the run can be reified by presenting the session handle.
+    Parked {
+        session_id: String,
+        approvals: Vec<String>,
+        parked_at: String,
+        expires_at: String,
+        #[serde(flatten)]
+        context: EventContext,
+    },
 }
 
 impl OrchestrationStreamEvent {
@@ -244,6 +255,7 @@ impl OrchestrationStreamEvent {
             Self::ToolCallCompleted { .. } => event_names::TOOL_CALL_COMPLETED,
             Self::PhaseStarted { .. } => event_names::PHASE_STARTED,
             Self::PhaseCompleted { .. } => event_names::PHASE_COMPLETED,
+            Self::Parked { .. } => event_names::PARKED,
         }
     }
 
@@ -455,6 +467,22 @@ impl OrchestrationStreamEvent {
             label: label.into(),
             continuation,
             orchestrator_id: orchestrator_id.into(),
+            context,
+        }
+    }
+
+    pub fn parked(
+        session_id: impl Into<String>,
+        approvals: Vec<String>,
+        parked_at: impl Into<String>,
+        expires_at: impl Into<String>,
+        context: EventContext,
+    ) -> Self {
+        Self::Parked {
+            session_id: session_id.into(),
+            approvals,
+            parked_at: parked_at.into(),
+            expires_at: expires_at.into(),
             context,
         }
     }
