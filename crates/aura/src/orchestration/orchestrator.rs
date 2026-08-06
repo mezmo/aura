@@ -421,27 +421,19 @@ pub struct Orchestrator {
     /// `usage_state`.
     pub(super) run_store: Option<Arc<dyn RunStore>>,
 
-    /// The durable session id from the run-store session created at run start.
+    /// Durable session identity for park-store operations.
     pub(super) session_id: Option<SessionId>,
 
-    /// The fencing generation from the lease acquired at run start.
+    /// Fencing token for run-store lease mutations.
     pub(super) fencing_generation: Option<FencingGeneration>,
 
-    /// The approval store, for drain-time decision reconciliation.
-    /// `None` when the deployment has no durable parking capability, matching
-    /// `run_store`.
-    #[allow(dead_code)]
+    /// Approval store for drain-time decision reconciliation.
     pub(super) approval_store: Option<Arc<dyn crate::session_store::ApprovalStore>>,
 
-    /// The active request ID for ownership-transfer teardown.
-    /// Set by the factory; empty string when running headless.
-    #[allow(dead_code)]
+    /// Active request ID for ownership-transfer teardown.
     pub(super) request_id: String,
 
-    /// HITL registry handle for transferring approval ownership before the
-    /// SSE stream closes. `None` when the deployment has no conversational
-    /// approval capability.
-    #[allow(dead_code)]
+    /// HITL registry for approval ownership transfer.
     pub(super) hitl_registry: Option<crate::hitl::PendingApprovals>,
 }
 
@@ -3257,6 +3249,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
         // checkpoint carries the tool name, arguments, and digest the dispatch
         // FSM will bind on reify.
         let mut approvals: Vec<ParkedApprovalSnapshot> = Vec::new();
+        // TODO(P7): wire approval_store from factory so snapshots are populated.
         if let Some(store) = &self.approval_store {
             for approval in blocked_on.iter() {
                 match store.get(&approval.decision_id).await {
@@ -3290,22 +3283,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .parse::<RunId>()
             .map_err(|e| StreamError::from(format!("invalid run id: {e}")))?;
 
-        let session_id = match self.session_id {
-            Some(id) => id,
-            None => {
-                return Err(StreamError::from(
-                    "durable park requires a session id; arm the run store at run start",
-                ));
-            }
-        };
-        let generation = match self.fencing_generation {
-            Some(g) => g,
-            None => {
-                return Err(StreamError::from(
-                    "durable park requires a fencing generation; acquire a lease at run start",
-                ));
-            }
-        };
+        let session_id = self.session_id.ok_or_else(|| {
+            StreamError::from("durable park requires a session id; arm the run store at run start")
+        })?;
+        let generation = self.fencing_generation.ok_or_else(|| {
+            StreamError::from(
+                "durable park requires a fencing generation; acquire a lease at run start",
+            )
+        })?;
         let chat_session_id = self
             .agent_config
             .session_id
@@ -3316,7 +3301,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
             run_id,
             session_id,
             chat_session_id,
-            ConfigFingerprint::new(""),
+            ConfigFingerprint::new(""), // TODO(P7): derive from config surface
             query.to_owned(),
             chat_history.to_owned(),
             coordinator_conversation.to_owned(),
@@ -3352,8 +3337,9 @@ Assign tasks to the worker whose tools best match the required operations."#,
             .map_err(|e| StreamError::from(format!("run store park failed: {e}")))?;
 
         // E. Transfer approval ownership from request scope to session scope
-        // (ADR decision 10). Even though the CAS above is blocked, the request
-        // is ending, so drop process-local wake handles now.
+        // (ADR decision 10). The CAS committed the park; drop process-local
+        // wake handles before the stream closes.
+        // TODO(P7): wire hitl_registry from factory so ownership transfer fires.
         if let Some(registry) = &self.hitl_registry {
             registry.cancel_request_local(&self.request_id);
         }
