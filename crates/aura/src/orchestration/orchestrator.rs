@@ -3046,9 +3046,30 @@ Assign tasks to the worker whose tools best match the required operations."#,
                             "staged for #271: blocked task enters TaskState::Blocked and the wave drains around it"
                         )
                     }
-                    #[expect(unused_variables, reason = "staged for #271: typed failure entry")]
                     Ok(TaskExecutionOutcome::Failed { error, category }) => {
-                        todo!("staged for #271: typed worker failure recorded on the task")
+                        if let Some(t) = plan.get_task_mut(task_id) {
+                            t.fail(error.clone(), category);
+                        }
+                        sink.emit(OrchestratorEvent::TaskCompleted {
+                            task_id,
+                            success: false,
+                            duration_ms,
+                            orchestrator_id: self.orchestrator_id.clone(),
+                            worker_id: worker_name.clone().unwrap_or(self.orchestrator_id.clone()),
+                            result: error.clone(),
+                        })
+                        .await;
+                        let worker_label = worker_name.as_deref().unwrap_or("generic");
+                        let (task_preview, _) = safe_truncate(&task_desc, 100);
+                        tracing::warn!(
+                            "Worker '{}' failed task {} after {}ms ({}): {}. Task was: {}",
+                            worker_label,
+                            task_id,
+                            duration_ms,
+                            category,
+                            error,
+                            task_preview
+                        );
                     }
                     Ok(TaskExecutionOutcome::Complete {
                         result,
@@ -3583,12 +3604,21 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// 11) — never a stringified failure.
     ///
     /// [`ToolAttemptOutcome::Blocked`]: super::park::ToolAttemptOutcome::Blocked
-    #[expect(unused_variables, reason = "staged for #271: blocked attempt outcome")]
     fn attempt_blocked(
         &self,
         blocked: super::park::ToolAttemptOutcome,
     ) -> Result<TaskExecutionOutcome, StreamError> {
-        todo!("staged for #271: ToolAttemptOutcome::Blocked -> TaskExecutionOutcome::Blocked")
+        match blocked {
+            super::park::ToolAttemptOutcome::Blocked(blocked) => {
+                Ok(TaskExecutionOutcome::Blocked(blocked.into_approval()))
+            }
+            // The caller only routes a durably-parked gate hit here; the other
+            // attempt outcomes flow through the normal result path.
+            super::park::ToolAttemptOutcome::Completed { .. }
+            | super::park::ToolAttemptOutcome::Failed { .. } => {
+                unreachable!("attempt_blocked only receives a durably-parked gate outcome")
+            }
+        }
     }
 
     /// Persist a single worker execution attempt to the journal and persistence store.
@@ -3680,9 +3710,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                         }
                     }
                     TaskState::Running => "▶ running".to_string(),
-                    TaskState::Blocked { .. } => {
-                        todo!("staged for #271: decision-blocked task in the execution summary")
-                    }
+                    TaskState::Blocked { .. } => "⏸ waiting for approval".to_string(),
                 };
                 format!("Task {}: {} [{}]", t.id, t.description, status_detail)
             })
@@ -4017,12 +4045,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                     previous_context = pc;
                     planning_ms = next_planning_ms;
                 }
-                #[expect(unused_variables, reason = "staged for #271: parked loop exit")]
-                IterationOutcome::Parked(parked) => {
-                    todo!(
-                        "staged for #271: a parked run leaves the loop without a final answer (frame already emitted post-CAS)"
-                    )
-                }
+                IterationOutcome::Parked(_) => break String::new(),
             }
         };
 
