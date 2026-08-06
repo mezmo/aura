@@ -10,6 +10,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::hitl::ApprovalRef;
+
 /// Maximum nesting depth for step structures.
 /// Depth 0 = top-level steps list, depth 1 = inside a parallel group,
 /// depth 2 = sub-chain inside a parallel group. No deeper nesting allowed.
@@ -465,6 +467,11 @@ impl Task {
             category,
         };
     }
+
+    /// Transition the task from Running to Blocked on a durable approval gate.
+    pub fn blocked(&mut self, approval: ApprovalRef) {
+        self.state = TaskState::Blocked { approval };
+    }
 }
 
 /// Status of a task in the execution plan.
@@ -533,7 +540,7 @@ pub enum TaskState {
     /// `Pending` plus a `BlockedTaskBinding`, and this variant is
     /// reconstructed from the binding (ADR 2026-07-21, decision 3).
     Blocked {
-        decision_id: crate::hitl::DecisionId,
+        approval: ApprovalRef,
     },
 }
 
