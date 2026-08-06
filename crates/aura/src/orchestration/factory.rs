@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::stream::{self, BoxStream};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -93,6 +94,45 @@ impl OrchestratorFactory {
                 orchestrator.usage_state = usage_state;
                 orchestrator.outer_budget = outer_budget;
                 orchestrator.run_store = run_store;
+
+                // Wire the durable session id and fencing generation so commit_quiescent_park
+                // can perform the park CAS. Failures here are non-fatal: park will refuse
+                // fail-closed at call time rather than aborting the entire run.
+                if let Some(ref store) = orchestrator.run_store {
+                    let sid = crate::orchestration::park::SessionId::generate();
+                    let instance_id = crate::orchestration::park::AgentInstanceId::generate();
+                    let ttl = crate::orchestration::park::LeaseTtl::new(
+                        std::time::Duration::from_secs(3600),
+                    )
+                    .expect("3600 s is nonzero");
+                    let record = crate::orchestration::park::SessionRecord {
+                        session: crate::orchestration::park::Session {
+                            id: sid,
+                            chat_session_id: None,
+                            created_at: Utc::now(),
+                        },
+                        run_id: None,
+                        state: crate::orchestration::park::RunState::Created,
+                        lease: None,
+                        generation: crate::orchestration::park::FencingGeneration::INITIAL,
+                    };
+                    match store.create(record).await {
+                        Ok(()) => match store.acquire_lease(sid, instance_id, ttl).await {
+                            Ok(lease) => {
+                                orchestrator.session_id = Some(sid);
+                                orchestrator.fencing_generation = Some(lease.generation);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to acquire run-store lease at run start: {e}"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("failed to create run-store session at run start: {e}");
+                        }
+                    }
+                }
 
                 // Set MCP request ID for progress notification routing, and
                 // surface per-server connection status so degraded/unavailable

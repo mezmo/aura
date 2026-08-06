@@ -1135,11 +1135,9 @@ pub(crate) enum IterationOutcome {
         /// Wall-clock of the continuation-decision call that produced `new_plan`.
         planning_ms: u64,
     },
-    /// The iteration drained to quiescence on blocked tasks and the run
-    /// committed its park: the loop ends without a final answer, and the
-    /// parked run outlives the request that started it.
-    #[expect(dead_code, reason = "constructed by the quiescent park commit (#271)")]
-    Parked(super::park::ParkedRun),
+    /// The run committed a durable park; the SSE stream closes after the
+    /// `Parked` event is emitted.
+    Parked,
 }
 
 #[cfg(test)]
