@@ -617,6 +617,15 @@ impl McpServerConfig {
             McpServerConfig::Sse { scratchpad, .. } => scratchpad,
         }
     }
+
+    /// Get the per-tool scratchpad thresholds for this server, mutably.
+    pub fn scratchpad_mut(&mut self) -> &mut HashMap<String, ScratchpadToolEntry> {
+        match self {
+            McpServerConfig::Stdio { scratchpad, .. } => scratchpad,
+            McpServerConfig::HttpStreamable { scratchpad, .. } => scratchpad,
+            McpServerConfig::Sse { scratchpad, .. } => scratchpad,
+        }
+    }
 }
 
 /// Vector store configuration (in-memory, Qdrant, and Bedrock KB)

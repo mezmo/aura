@@ -1,5 +1,6 @@
 //! Guided `/mcp add` flow: pick a catalog or custom server, collect
-//! credentials with masked input, write the config + `.env`.
+//! credentials with masked input, enable scratchpad interception for the
+//! server's tool outputs, write the config + `.env`.
 //!
 //! Standalone mode only, and deliberately deterministic: no LLM ever
 //! sees a credential.
@@ -9,6 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+use aura_config::ScratchpadToolEntry;
 use aura_config::config::McpServerConfig;
 
 use super::catalog::{CATALOG, CatalogEntry, Template};
@@ -119,9 +121,11 @@ fn drive(ctx: &mut CommandContext, config_path: &Path) -> WizardEnd {
         Some(entry) => collect_catalog(ctx, entry, config_path),
         None => collect_custom(ctx, config_path),
     };
-    let Some(collected) = collected else {
+    let Some(mut collected) = collected else {
         return WizardEnd::Aborted;
     };
+
+    enable_scratchpad(config_path, &mut collected.server);
 
     let new_secrets: Vec<(String, String)> = collected
         .secrets
@@ -348,6 +352,44 @@ fn verify_server(
     })
 }
 
+/// The `"*"` entry is written even when `[agent.scratchpad]` is off — it
+/// is inert until scratchpad's prerequisites are met.
+fn enable_scratchpad(config_path: &Path, server: &mut McpServerConfig) {
+    let entry = ScratchpadToolEntry::default();
+    let min_tokens = entry.min_tokens;
+    server.scratchpad_mut().insert("*".to_string(), entry);
+    if agent_scratchpad_enabled(config_path) {
+        println!(
+            "\nTool outputs over {min_tokens} tokens will be diverted to the \
+             scratchpad instead of the context window."
+        );
+    } else {
+        println!(
+            "\nScratchpad interception is configured for this server's tool \
+             outputs (over {min_tokens} tokens), but stays inactive until the \
+             config also sets `[agent.scratchpad] enabled = true`, a top-level \
+             `memory_dir`, and `[agent.llm].context_window`. \
+             See https://docs.mezmo.com/aura/scratchpad"
+        );
+    }
+}
+
+/// Best-effort parse of the config file; unreadable or malformed is `None`.
+fn read_config_doc(config_path: &Path) -> Option<toml_edit::DocumentMut> {
+    fs::read_to_string(config_path).ok()?.parse().ok()
+}
+
+fn agent_scratchpad_enabled(config_path: &Path) -> bool {
+    let Some(doc) = read_config_doc(config_path) else {
+        return false;
+    };
+    doc.get("agent")
+        .and_then(|agent| agent.get("scratchpad"))
+        .and_then(|scratchpad| scratchpad.get("enabled"))
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false)
+}
+
 /// Offer per-worker access to a freshly verified server: workers without
 /// an `mcp_filter` already see it (omitted = every tool) and get a
 /// lockdown choice; workers with one don't and get an append-style grant.
@@ -460,13 +502,10 @@ fn print_allowlist_hint(config_path: &Path, server: &str) {
 }
 
 /// `(worker, mcp_filter)` pairs from the config file; empty unless
-/// orchestration is enabled (or on any parse problem — a convenience
-/// step, not a gate). `None` = no `mcp_filter` key.
+/// orchestration is enabled — a convenience step, not a gate. `None` =
+/// no `mcp_filter` key.
 fn orchestrated_workers(config_path: &Path) -> Vec<(String, Option<Vec<String>>)> {
-    let Ok(content) = fs::read_to_string(config_path) else {
-        return Vec::new();
-    };
-    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+    let Some(doc) = read_config_doc(config_path) else {
         return Vec::new();
     };
     let Some(orchestration) = doc.get("orchestration") else {
@@ -848,13 +887,8 @@ fn ask_server_name(
     Some(name)
 }
 
-/// Best-effort check whether `[mcp.servers.<name>]` already exists; a
-/// malformed config reads as "absent" here and fails properly at write time.
 fn config_has_server(config_path: &Path, name: &str) -> bool {
-    let Ok(content) = fs::read_to_string(config_path) else {
-        return false;
-    };
-    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
+    let Some(doc) = read_config_doc(config_path) else {
         return false;
     };
     doc.get("mcp")
@@ -1289,6 +1323,45 @@ mod tests {
 
         fs::write(&path, base.replace("%E%", "false")).unwrap();
         assert!(orchestrated_workers(&path).is_empty());
+    }
+
+    #[test]
+    fn reads_agent_scratchpad_enabled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        fs::write(
+            &path,
+            "[agent]\nname = \"a\"\n\n[agent.scratchpad]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(agent_scratchpad_enabled(&path));
+
+        fs::write(
+            &path,
+            "[agent]\nname = \"a\"\n\n[agent.scratchpad]\nenabled = false\n",
+        )
+        .unwrap();
+        assert!(!agent_scratchpad_enabled(&path));
+
+        fs::write(&path, "[agent]\nname = \"a\"\n").unwrap();
+        assert!(!agent_scratchpad_enabled(&path));
+
+        assert!(!agent_scratchpad_enabled(&dir.path().join("missing.toml")));
+    }
+
+    #[test]
+    fn scratchpad_wildcard_entry_renders_into_server_config() {
+        let mut server = http_streamable(
+            "https://mcp.example.com/mcp".to_string(),
+            HashMap::new(),
+            "",
+        );
+        server
+            .scratchpad_mut()
+            .insert("*".to_string(), ScratchpadToolEntry::default());
+        let rendered = aura_config::writer::upsert_mcp_server_in_str("", "srv", &server).unwrap();
+        assert!(rendered.contains("min_tokens = 5120"), "{rendered}");
     }
 
     #[test]

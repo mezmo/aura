@@ -420,6 +420,28 @@ url = "https://old.example.com/mcp"
     }
 
     #[test]
+    fn round_trips_scratchpad_entries_through_loader() {
+        let server = McpServerConfig::Stdio {
+            cmd: vec!["npx".to_owned(), "-y".to_owned(), "some-mcp".to_owned()],
+            args: vec![],
+            env: HashMap::new(),
+            description: None,
+            scratchpad: HashMap::from([(
+                "*".to_owned(),
+                crate::ScratchpadToolEntry { min_tokens: 5120 },
+            )]),
+        };
+        let updated = upsert_mcp_server_in_str(BASE_CONFIG, "srv", &server).unwrap();
+        let config = load_config_from_str(&updated).expect("written config must parse");
+        let parsed = &config.mcp.expect("mcp table present").servers["srv"];
+        assert_eq!(
+            parsed.scratchpad().get("*").map(|e| e.min_tokens),
+            Some(5120),
+            "wildcard scratchpad entry must survive the round trip:\n{updated}"
+        );
+    }
+
+    #[test]
     fn round_trips_nonempty_maps_through_loader() {
         let server = McpServerConfig::HttpStreamable {
             url: "https://mcp.example.com/mcp".to_owned(),
