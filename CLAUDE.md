@@ -166,8 +166,16 @@ Confirmed sequential as of Rig 0.28: the streaming handler `.await`s each tool c
 make build                  # Build release binary
 cargo test --workspace      # Run all tests (the `make test` hook is empty)
 make docker-build           # Build Docker image
-make lint                   # Run clippy + fmt check
+make lint                   # Run clippy + fmt check (fmt uses cargo +nightly)
+make ci                     # Bundle: fmt-check + lint (test hook is empty)
 ```
+
+**Before committing, run `cargo +nightly fmt --check`, `cargo clippy
+--workspace`, and `cargo test --workspace`.** After committing, run
+`make lint-commits` to verify the commit message. fmt runs under
+`cargo +nightly` (see `.makefiles/rust.mk`), so use `cargo +nightly fmt
+--check` — not `cargo fmt` — to match CI. See `CONTRIBUTING.md` for the
+full workflow.
 
 ## Code Comment Conventions
 
