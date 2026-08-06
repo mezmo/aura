@@ -12,7 +12,7 @@ use aura_config::GlobPattern;
 use rig::tool::ToolError;
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
+use super::decision::{AgentScope, ApprovalOrigin, ApprovalRef, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
 use super::route::{ApprovalError, DecisionRoute, GateDecision};
 use crate::orchestration::park::ToolAttemptOutcome;
@@ -104,13 +104,24 @@ impl HitlApprovalWrapper {
     /// [`PreCallOutcome::Blocked`] and returns it THROUGH
     /// [`BlockedSignal::deposit`], which stores its projection and hands the
     /// outcome back — the side channel and the wrapper-chain value are one.
-    #[expect(unused_variables, reason = "staged for #271: durable gate park")]
     fn park_instead_of_awaiting(
         &self,
         request: ApprovalRequest,
         signal: &BlockedSignal,
     ) -> Result<PreCallOutcome, ToolError> {
-        todo!("staged for #271: durable gate park -> ToolAttemptOutcome::Blocked")
+        let task = match request.scope {
+            AgentScope::Worker { task, .. } => task,
+            _ => {
+                return Err(ToolError::ToolCallError(
+                    "durable park requires worker scope".to_string().into(),
+                ));
+            }
+        };
+        let approval_ref = ApprovalRef {
+            decision_id: request.decision_id,
+            task,
+        };
+        Ok(signal.deposit(PreCallOutcome::Blocked(approval_ref)))
     }
 
     /// First configured glob that matches `tool_name`, never gating the
