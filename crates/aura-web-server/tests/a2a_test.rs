@@ -762,8 +762,9 @@ async fn test_sequential_tasks_share_context() {
         .and_then(|v| v.as_str())
         .expect("First task did not contain 'contextId' field");
 
-    // Wait for task 1 to complete so its full history (tool call, tool result,
-    // assistant response) is persisted in the task store before task 2 starts.
+    // Wait for task 1 to complete so its prompt and its artifacts — which is
+    // where the assistant's answer lives — are in the task store before task 2
+    // starts building history for the context.
     let poll_interval = Duration::from_millis(500);
     let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
     loop {
@@ -954,6 +955,174 @@ async fn test_sequential_tasks_share_context() {
         expected_uuid,
         part_text
     );
+}
+
+// Sibling of test_sequential_tasks_share_context covering the other half of the
+// exchange: that a follow-up sees the agent's own prior answer.
+//
+// The recalled secret reaches the conversation only through the first task's
+// assistant turn — it is absent from every user message, and the header that
+// carried it is not sent with the follow-up, so the tool cannot surface it a
+// second time. The follow-up is additionally asserted to have called no tool at
+// all, leaving the assistant turn as the sole possible source.
+#[tokio::test]
+async fn test_sequential_tasks_share_the_assistant_turn() {
+    let client = reqwest::Client::new();
+    let secret = format!("aura-secret-{}", uuid::Uuid::new_v4());
+
+    let task1 = send_a2a_message(
+        &client,
+        json!({
+            "messageId": format!("{}", uuid::Uuid::new_v4()),
+            "role": "ROLE_USER",
+            "parts": [{"text": "Call the echo_headers tool. Then reply with only the \
+                value of the x-test-header1 header from its output, and nothing else."}]
+        }),
+        &[("X-Test-Header1", secret.as_str())],
+    )
+    .await;
+    let context_id = task1
+        .get("contextId")
+        .and_then(|v| v.as_str())
+        .expect("First task did not contain 'contextId' field")
+        .to_owned();
+    let task1_id = task1
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("First task did not contain 'id' field")
+        .to_owned();
+
+    let completed1 = poll_until_completed(&client, &task1_id).await;
+    let answer1 = final_info_text(&completed1);
+    // Guards the test itself: without this the follow-up would have nothing to
+    // recall and the assertion below could never distinguish the two halves.
+    assert!(
+        answer1.contains(&secret),
+        "First task did not report the forwarded header value '{secret}': {answer1}"
+    );
+
+    // No X-Test-Header1 this time — echo_headers cannot hand the secret over again.
+    let task2 = send_a2a_message(
+        &client,
+        json!({
+            "messageId": format!("{}", uuid::Uuid::new_v4()),
+            "contextId": context_id,
+            "role": "ROLE_USER",
+            "parts": [{"text": "Without calling any tools, repeat the exact value you \
+                reported in your previous reply. Answer with only that value."}]
+        }),
+        &[],
+    )
+    .await;
+    let task2_id = task2
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("Second task did not contain 'id' field")
+        .to_owned();
+
+    let completed2 = poll_until_completed(&client, &task2_id).await;
+
+    let tool_calls: Vec<&str> = completed2
+        .artifacts
+        .iter()
+        .flatten()
+        .map(|a| a.artifact_id.as_str())
+        .filter(|id| id.starts_with("tool_call_"))
+        .collect();
+    assert!(
+        tool_calls.is_empty(),
+        "Follow-up called tools ({tool_calls:?}), so the recalled value could have come \
+         from somewhere other than the prior assistant turn"
+    );
+
+    let answer2 = final_info_text(&completed2);
+    assert!(
+        answer2.contains(&secret),
+        "Follow-up did not recall the prior assistant turn's value '{secret}': {answer2}"
+    );
+}
+
+// Sends `message` to message:send with the given extra headers and returns the
+// queued task object.
+async fn send_a2a_message(
+    client: &reqwest::Client,
+    message: Value,
+    headers: &[(&str, &str)],
+) -> Value {
+    let mut request = client
+        .post(format!("{}/a2a/v1/message:send", AURA_SERVER))
+        .header("Content-Type", "application/json")
+        .header("A2A-Version", "1.0");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+
+    let body = request
+        .json(&json!({ "message": message }))
+        .timeout(TEST_TIMEOUT)
+        .send()
+        .await
+        .expect("Failed to send request - is aura-web-server running?")
+        .text()
+        .await
+        .expect("Failed to read response");
+
+    println!("Task response body: {}", body);
+    serde_json::from_str::<Value>(&body)
+        .expect("Response was not valid JSON")
+        .get("task")
+        .expect("Response did not contain 'task' field")
+        .clone()
+}
+
+async fn poll_until_completed(client: &reqwest::Client, task_id: &str) -> Task {
+    let poll_interval = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Task {task_id} did not reach TASK_STATE_COMPLETED within timeout"
+        );
+
+        let body = client
+            .get(format!("{}/a2a/v1/tasks/{}", AURA_SERVER, task_id))
+            .header("A2A-Version", "1.0")
+            .timeout(TEST_TIMEOUT)
+            .send()
+            .await
+            .expect("Failed to poll task status")
+            .text()
+            .await
+            .expect("Failed to read poll response");
+
+        let polled: Task = serde_json::from_str(&body).expect("Poll response was not valid JSON");
+        match polled.status.state {
+            TaskState::Completed => return polled,
+            TaskState::Failed | TaskState::Canceled => {
+                panic!(
+                    "Task {task_id} ended in unexpected state: {:?}",
+                    polled.status.state
+                )
+            }
+            _ => tokio::time::sleep(poll_interval).await,
+        }
+    }
+}
+
+fn final_info_text(task: &Task) -> String {
+    task.artifacts
+        .iter()
+        .flatten()
+        .find(|a| a.name.as_deref() == Some("Final Info"))
+        .expect("Completed task has no 'Final Info' artifact")
+        .parts
+        .iter()
+        .find_map(|p| match &p.content {
+            PartContent::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("'Final Info' artifact has no text part")
 }
 
 // validates the input content to the package also forwards appropriate headers

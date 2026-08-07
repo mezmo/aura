@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,6 +23,12 @@ use crate::{
 };
 
 const PLAIN_TEXT: &str = "text/plain";
+
+/// Artifact id of the assistant's reply text, one part per streamed chunk.
+const RESPONSE_ARTIFACT_ID: &str = "response";
+
+/// Artifact id of the assistant's complete reply and the turn's token usage.
+const FINAL_ARTIFACT_ID: &str = "final";
 
 pub struct AuraAgentExecutor {
     app_state: Arc<AppState>,
@@ -250,15 +255,14 @@ impl AgentExecutor for AuraAgentExecutor {
                     Ok(StreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
                         event!(Level::DEBUG, request_id, t, "stream content received");
 
-                        const ARTIFACT_ID: &str = "response";
-                        let append = append_tracker.entry((task_id.clone(), context_id.clone(), ARTIFACT_ID.to_owned()))
+                        let append = append_tracker.entry((task_id.clone(), context_id.clone(), RESPONSE_ARTIFACT_ID.to_owned()))
                             .and_modify(|e| *e = true)
                             .or_insert(false);
 
                         event!(Level::DEBUG, request_id, "response returned and should be appended: {}", *append);
 
                         let artifact = Artifact {
-                            artifact_id: ARTIFACT_ID.to_owned(),
+                            artifact_id: RESPONSE_ARTIFACT_ID.to_owned(),
                             name: Some("Response".to_owned()),
                             description: None,
                             parts: vec![Part::text(t)],
@@ -377,13 +381,12 @@ impl AgentExecutor for AuraAgentExecutor {
                         event!(Level::DEBUG, request_id, "reasoning delta");
                     }
                     Ok(StreamItem::Final(final_info)) => {
-                        const ARTIFACT_ID: &str = "final";
-                        let append = append_tracker.entry((task_id.clone(), context_id.clone(), ARTIFACT_ID.to_owned()))
+                        let append = append_tracker.entry((task_id.clone(), context_id.clone(), FINAL_ARTIFACT_ID.to_owned()))
                             .and_modify(|e| *e = true)
                             .or_insert(false);
 
                         let artifact = Artifact {
-                            artifact_id: ARTIFACT_ID.to_owned(),
+                            artifact_id: FINAL_ARTIFACT_ID.to_owned(),
                             name: Some("Final Info".into()),
                             description: None,
                             parts: vec![Part::text(final_info.content)],
@@ -551,9 +554,9 @@ async fn get_history_for_context(
     task_store: SharedTaskStore,
     request_id: &str,
     context_id: &str,
-    task_id: &String,
+    task_id: &str,
 ) -> Result<Vec<aura::Message>, A2AError> {
-    let mut task_history: Vec<a2a::Task> = Vec::new();
+    let mut tasks: Vec<a2a::Task> = Vec::new();
 
     let mut next_page_token: Option<String> = None;
     loop {
@@ -564,11 +567,12 @@ async fn get_history_for_context(
             "processing history for context"
         );
 
-        let loop_history = task_store
+        let page = task_store
             .list(&ListTasksRequest {
                 context_id: Some(context_id.into()),
                 history_length: None, // get all history in one shot
-                include_artifacts: Some(false),
+                // The assistant turn is rebuilt from the artifacts (see `task_turns`).
+                include_artifacts: Some(true),
                 page_size: Some(1000), // override the default of 50
                 page_token: next_page_token,
                 status: None,
@@ -582,30 +586,75 @@ async fn get_history_for_context(
             request_id,
             context_id,
             "found {} tasks, continue token '{}'",
-            loop_history.tasks.len(),
-            loop_history.next_page_token
+            page.tasks.len(),
+            page.next_page_token
         );
-        task_history.extend(loop_history.tasks);
+        tasks.extend(page.tasks);
 
-        if !loop_history.next_page_token.is_empty() {
-            next_page_token = Some(loop_history.next_page_token);
+        if !page.next_page_token.is_empty() {
+            next_page_token = Some(page.next_page_token);
         } else {
             break;
         }
     }
 
-    // keep all other tasks and sort by descending
-    task_history.retain(|t| t.id != *task_id && t.history.clone().is_some_and(|h| !h.is_empty()));
-    task_history.sort_by_key(|t| Reverse(t.status.timestamp));
+    // Skip the task being executed: its only recorded turn is the prompt this
+    // call is about to send. Everything else replays oldest exchange first.
+    tasks.retain(|t| t.id != task_id);
+    tasks.sort_by_key(|t| t.status.timestamp);
 
-    let chat_history: Vec<aura::Message> = task_history
-        .into_iter()
-        .flat_map(|t| t.history.unwrap())
-        .filter_map(|m| convert_a2a_msg_to_aura(&m))
-        .collect();
+    let chat_history: Vec<aura::Message> = tasks.iter().flat_map(task_turns).collect();
 
     event!(Level::DEBUG, request_id, context_id, chat_history = ?chat_history, "determined this following history to use");
     Ok(chat_history)
+}
+
+/// One task's conversation turns, oldest first.
+///
+/// The request handler records only the prompt in `Task::history`; the agent's
+/// reply is streamed out as artifacts and never written back. So the assistant
+/// turn is rebuilt from the text the client saw — the streamed
+/// [`RESPONSE_ARTIFACT_ID`] chunks, or [`FINAL_ARTIFACT_ID`] for a task whose
+/// reply only arrived as a final response. A task that already carries an
+/// agent message in `history` is taken at its word instead.
+fn task_turns(task: &a2a::Task) -> Vec<aura::Message> {
+    let recorded = task.history.as_deref().unwrap_or_default();
+    let mut turns: Vec<aura::Message> = recorded
+        .iter()
+        .filter_map(convert_a2a_msg_to_aura)
+        .collect();
+
+    if !recorded.iter().any(|m| matches!(m.role, Role::Agent))
+        && let Some(answer) = assistant_answer(task)
+    {
+        turns.push(aura::Message::assistant(&answer));
+    }
+
+    turns
+}
+
+/// The assistant text a task produced, or `None` if it produced none.
+fn assistant_answer(task: &a2a::Task) -> Option<String> {
+    let artifacts = task.artifacts.as_deref()?;
+
+    // Parts of one artifact are fragments of a single message — streamed mid-word,
+    // so they concatenate with no separator.
+    let joined = |artifact_id: &str| {
+        artifacts
+            .iter()
+            .filter(|a| a.artifact_id == artifact_id)
+            .flat_map(|a| a.parts.iter())
+            .filter_map(|p| match &p.content {
+                PartContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+    };
+
+    [RESPONSE_ARTIFACT_ID, FINAL_ARTIFACT_ID]
+        .into_iter()
+        .map(joined)
+        .find(|text| !text.trim().is_empty())
 }
 
 fn convert_a2a_msg_to_aura(msg: &a2a::Message) -> Option<aura::Message> {
@@ -759,5 +808,203 @@ mod tests {
         );
         let result = ex.resolve_config(Some("B"));
         assert_eq!(result.map(|c| c.agent.name), Some("B".to_owned()));
+    }
+
+    fn at(secs: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::from_timestamp(secs, 0)
+    }
+
+    fn artifact(artifact_id: &str, chunks: &[&str]) -> Artifact {
+        Artifact {
+            artifact_id: artifact_id.to_owned(),
+            name: None,
+            description: None,
+            parts: chunks.iter().map(|c| Part::text(*c)).collect(),
+            metadata: None,
+            extensions: None,
+        }
+    }
+
+    /// A completed task shaped like one the executor produces: the prompt in
+    /// `history`, the reply only in artifacts.
+    fn completed_task(id: &str, prompt: &str, artifacts: Vec<Artifact>, secs: i64) -> a2a::Task {
+        a2a::Task {
+            id: id.to_owned(),
+            context_id: "ctx".to_owned(),
+            status: TaskStatus {
+                state: TaskState::Completed,
+                message: None,
+                timestamp: at(secs),
+            },
+            artifacts: Some(artifacts),
+            history: Some(vec![Message::new(Role::User, vec![Part::text(prompt)])]),
+            metadata: None,
+        }
+    }
+
+    /// The turn as `(role, text)`, so assertions read as the conversation does.
+    fn turn(message: &aura::Message) -> (&'static str, String) {
+        match message {
+            aura::Message::User { content } => (
+                "user",
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        aura::UserContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            aura::Message::Assistant { content, .. } => (
+                "assistant",
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        aura::AssistantContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn turns(messages: &[aura::Message]) -> Vec<(&'static str, String)> {
+        messages.iter().map(turn).collect()
+    }
+
+    async fn history_of(tasks: Vec<a2a::Task>, executing: &str) -> Vec<aura::Message> {
+        let store = SharedTaskStore::default();
+        for task in tasks {
+            store.create(task).await.expect("task created");
+        }
+        get_history_for_context(store, "req", "ctx", executing)
+            .await
+            .expect("history built")
+    }
+
+    #[tokio::test]
+    async fn history_carries_the_assistant_turn_from_streamed_artifacts() {
+        let history = history_of(
+            vec![completed_task(
+                "t1",
+                "how many sentences?",
+                vec![
+                    artifact(RESPONSE_ARTIFACT_ID, &["Three ", "sen", "tences."]),
+                    artifact(FINAL_ARTIFACT_ID, &["Three sentences."]),
+                ],
+                10,
+            )],
+            "t2",
+        )
+        .await;
+
+        assert_eq!(
+            turns(&history),
+            vec![
+                ("user", "how many sentences?".to_owned()),
+                ("assistant", "Three sentences.".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_falls_back_to_the_final_artifact() {
+        let history = history_of(
+            vec![completed_task(
+                "t1",
+                "hi",
+                vec![
+                    artifact(RESPONSE_ARTIFACT_ID, &[]),
+                    artifact(FINAL_ARTIFACT_ID, &["hello"]),
+                ],
+                10,
+            )],
+            "t2",
+        )
+        .await;
+
+        assert_eq!(
+            turns(&history),
+            vec![("user", "hi".to_owned()), ("assistant", "hello".to_owned()),]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_ignores_non_response_artifacts() {
+        let history = history_of(
+            vec![completed_task(
+                "t1",
+                "call the tool",
+                vec![
+                    artifact("tool_call_1", &["Tool was called: mock_tool"]),
+                    artifact("reasoning_1", &["thinking about it"]),
+                ],
+                10,
+            )],
+            "t2",
+        )
+        .await;
+
+        assert_eq!(turns(&history), vec![("user", "call the tool".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn history_replays_exchanges_oldest_first() {
+        let history = history_of(
+            vec![
+                completed_task("t2", "second", vec![artifact("final", &["two"])], 20),
+                completed_task("t1", "first", vec![artifact("final", &["one"])], 10),
+            ],
+            "t3",
+        )
+        .await;
+
+        assert_eq!(
+            turns(&history),
+            vec![
+                ("user", "first".to_owned()),
+                ("assistant", "one".to_owned()),
+                ("user", "second".to_owned()),
+                ("assistant", "two".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_skips_the_executing_task() {
+        let history = history_of(
+            vec![
+                completed_task("t1", "first", vec![artifact("final", &["one"])], 10),
+                completed_task("t2", "second", vec![], 20),
+            ],
+            "t2",
+        )
+        .await;
+
+        assert_eq!(
+            turns(&history),
+            vec![
+                ("user", "first".to_owned()),
+                ("assistant", "one".to_owned()),
+            ]
+        );
+    }
+
+    /// A store that records the agent turn in `history` must not have it
+    /// duplicated from the artifacts.
+    #[tokio::test]
+    async fn history_prefers_a_recorded_agent_message() {
+        let mut task = completed_task("t1", "hi", vec![artifact("final", &["hello"])], 10);
+        task.history
+            .as_mut()
+            .unwrap()
+            .push(Message::new(Role::Agent, vec![Part::text("hello")]));
+
+        let history = history_of(vec![task], "t2").await;
+
+        assert_eq!(
+            turns(&history),
+            vec![("user", "hi".to_owned()), ("assistant", "hello".to_owned()),]
+        );
     }
 }
