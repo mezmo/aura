@@ -1,5 +1,5 @@
 use termimad::crossterm::style::{Attribute, Color};
-use termimad::{MadSkin, StyledChar};
+use termimad::{CompositeKind, FmtLine, FmtText, MadSkin, StyledChar};
 
 use crate::theme::{Theme, theme};
 
@@ -62,6 +62,23 @@ fn make_skin() -> MadSkin {
     skin_from_theme(theme())
 }
 
+/// Clamp code-block padding to the render width. termimad justifies every
+/// code line to the block's widest line *before* hard-wrapping, so wrapped
+/// chunks (and short lines) in a block wider than the terminal keep a
+/// spacing wider than the terminal and render as rows of background-colored
+/// spaces that wrap again. Capping the spacing keeps the block a solid
+/// `width`-wide rectangle.
+fn clamp_code_block_padding(text: &mut FmtText<'_, '_>, width: usize) {
+    for line in &mut text.lines {
+        if let FmtLine::Normal(fc) = line
+            && matches!(fc.kind, CompositeKind::Code)
+            && let Some(spacing) = &mut fc.spacing
+        {
+            spacing.width = spacing.width.min(width);
+        }
+    }
+}
+
 /// Render markdown text to stdout using termimad, with a left indent on each line
 /// so the body aligns with the text after the "● " marker.
 pub fn render_markdown(text: &str) {
@@ -70,7 +87,9 @@ pub fn render_markdown(text: &str) {
     let width = crossterm::terminal::size()
         .map(|(w, _)| (w as usize).saturating_sub(INDENT.len() + RIGHT_MARGIN))
         .unwrap_or(78);
-    let rendered = format!("{}", skin.text(trimmed, Some(width)));
+    let mut fmt_text = skin.text(trimmed, Some(width));
+    clamp_code_block_padding(&mut fmt_text, width);
+    let rendered = format!("{fmt_text}");
     for line in rendered.lines() {
         println!("{INDENT}{line}");
     }
@@ -134,5 +153,54 @@ issues by routing work to specialized agents for incidents, metrics, and logs.";
         // "routing" is never split.
         assert!(lines.iter().all(|l| !l.ends_with("routin")));
         assert!(lines.iter().any(|l| l.contains("routing")));
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for n in chars.by_ref() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Regression test for [`clamp_code_block_padding`].
+    #[test]
+    fn code_block_wider_than_terminal_is_clamped_to_render_width() {
+        let long = "x".repeat(300);
+        let md = format!("```text\nshort line\n{long}\n```\n");
+        let skin = make_skin();
+        let width = 80;
+
+        let mut fmt_text = skin.text(&md, Some(width));
+        clamp_code_block_padding(&mut fmt_text, width);
+
+        let rendered = format!("{fmt_text}");
+        for line in rendered.lines() {
+            let visible = strip_ansi(line);
+            assert!(
+                UnicodeWidthStr::width(visible.as_str()) <= width,
+                "code line renders wider than terminal: {} cols",
+                UnicodeWidthStr::width(visible.as_str())
+            );
+        }
+        // The long line still wraps into full-width chunks rather than
+        // being truncated.
+        assert!(
+            rendered
+                .lines()
+                .filter(|l| strip_ansi(l).contains('x'))
+                .count()
+                >= 4,
+            "300-char line should wrap across multiple rows"
+        );
     }
 }
