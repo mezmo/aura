@@ -326,8 +326,8 @@ pub static NORMAL: Theme = Theme {
     markdown_bg: Color::Reset,
     diff_bg: Color::Reset,
     user_echo_bg: Color::DarkGrey,
-    inline_code_bg: BABY_BLUE,
-    code_block_bg: BABY_BLUE,
+    inline_code_bg: Color::DarkGrey,
+    code_block_bg: Color::DarkGrey,
     shimmer_base: Color::Reset,
     task_palette: TASK_PALETTE_NORMAL,
 };
