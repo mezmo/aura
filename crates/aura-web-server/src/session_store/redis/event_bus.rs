@@ -11,8 +11,8 @@
 //!
 //! Redis pub/sub is fire-and-forget: payloads published while a subscriber's
 //! instance is reconnecting are lost, and a slow subscriber that overflows its
-//! [`TOPIC_CAPACITY`] buffer skips missed payloads. Callers own the backstop —
-//! a parked approval that misses its wake fails closed at its timeout.
+//! [`TOPIC_CAPACITY`] buffer skips missed payloads. Callers own the recovery
+//! path for lost payloads (see `aura::hitl::registry` for the approval wake's).
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

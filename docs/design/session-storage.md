@@ -209,9 +209,15 @@ pub trait ApprovalStore: Send + Sync {
 
     /// Record a terminal decision and remove the parked entry, atomically.
     /// Returns `NotFound` if unknown / already resolved / expired — preserving
-    /// today's at-most-once semantics.
+    /// today's at-most-once semantics. The recorded decision stays readable
+    /// via `decision()` until at least the approval's expiry, so the parking
+    /// pod can recover a decision whose bus wake was lost (#474).
     async fn resolve(&self, id: &DecisionId, decision: ApprovalDecision)
         -> Result<(), ResolveError>;
+
+    /// Look up the decision recorded for an already-resolved approval.
+    async fn decision(&self, id: &DecisionId)
+        -> Result<Option<ApprovalDecision>, SessionStoreError>;
 
     /// Remove a parked entry (timeout / cancellation).
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;
@@ -318,7 +324,8 @@ Changes:
   `Arc<dyn EventBus>`.
 - `register()` now (a) inserts the local `oneshot` as today **and** (b)
   `approvals.register(parked)` + `bus.subscribe("approval:{id}")`, with a small task that
-  fires the local `oneshot` when the bus yields a decision.
+  fires the local `oneshot` when the bus yields a decision — or when its periodic store
+  poll finds one recorded, the durable fallback for a lost publish.
 - The `POST /v1/approvals/{id}` handler calls `approvals.resolve()` then
   `bus.publish("approval:{id}", decision)`. It no longer needs the parked entry to be
   local — it may run on any pod.
@@ -397,6 +404,7 @@ default `aura`), so multiple AURA deployments can share a cluster.
 | Key / channel                     | Type                                  | Purpose                                | TTL                      |
 | --------------------------------- | ------------------------------------- | -------------------------------------- | ------------------------ |
 | `{p}:approval:{decision_id}`      | string (JSON `ParkedApprovalRecord`)  | parked approval record                 | `expires_at`             |
+| `{p}:approval:decision:{decision_id}` | string (JSON `DecisionRecord`)    | durable record of the resolution       | parked remainder + margin |
 | `{p}:approval:req:{request_id}`   | set of `decision_id`                  | `cancel_request` fan-out               | record TTL + margin      |
 | `{p}:bus:approval:{decision_id}`  | pub/sub channel                       | wake the parking pod with the decision | —                        |
 | `{p}:a2a:task:{task_id}`          | hash (`version`, `task` as JSON)      | A2A task record + version counter      | configurable (e.g. 24h)  |
@@ -412,11 +420,14 @@ Notes:
   stable field/tag names. The domain types stay unserializable so no wire can
   leak Rust variant names; the SSE/webhook DTOs (`hitl::events`) and the storage
   record are separately-owned projections.
-- `resolve` is a single atomic `GETDEL`: exactly one resolver takes the record and
-  every later attempt sees `NotFound`, matching today's `remove`-on-resolve
-  at-most-once semantics. (Simpler than the Lua/`MULTI` originally sketched — the
-  decision itself is not persisted, mirroring the in-memory store; it travels
-  over the bus.)
+- `resolve` is one Lua script covering the claim and the decision write
+  atomically: it takes the parked record and, only if one existed, stores the
+  `DecisionRecord` under `{p}:approval:decision:{id}`. Exactly one resolver
+  takes the record and every later attempt sees `NotFound`; a consumed parked
+  entry always leaves a recoverable decision behind, so neither a lost publish
+  nor a resolver crash between claim and publish can lose a granted approval
+  (#474). The decision record's TTL keeps a margin past the parked record's
+  remaining TTL, covering the parking pod's deadline-backstop read.
 - Each task create/update is one Lua script covering the exists-check, `version`
   bump, terminal-state gate (updates to a terminal task are rejected, except a
   rewrite of the state already recorded, which leaves it alone), record
@@ -561,10 +572,12 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
 ## 13. Open questions
 
 - **Bus reliability for wake.** Redis pub/sub is fire-and-forget; if the parking pod
-  briefly disconnects it can miss the decision. The store TTL + await timeout make this
-  fail-closed (safe) but a missed wake wastes the timeout window. Redis **Streams**
-  (consumer read-after-write) would make the wake reliable at some complexity cost —
-  decide per-subsystem.
+  briefly disconnects it can miss the decision. The bus is only the low-latency path:
+  `resolve` records the decision durably, the parking pod's wake task polls the store
+  as fallback, and the await's deadline backstop reads the store once more before
+  failing closed — a lost wake costs at most one poll interval, not the timeout
+  window. Redis **Streams** (consumer read-after-write) could still replace the
+  poll's latency bound for other subsystems — decide per-subsystem.
 - **At-most-once resolve across pods** must be enforced in the store (the atomic
   `GETDEL`), not in application code, since two `POST /v1/approvals/{id}` could race on
   different pods.
@@ -575,13 +588,10 @@ phases 2 and 3 are independent and can land in either order; phase 4 needs both.
   timeout. With a networked backend (phase 3), consider short-circuiting to an immediate
   terminal outcome (or failing the gate) instead of emitting `Pending` for a dead park.
 - **Resolve atomicity across store + bus.** `PendingApprovals::resolve` records the
-  decision in the store, then publishes the wake. In-memory, both futures complete on
-  their first poll, so the pair runs without a yield point and cannot be interrupted.
-  With a networked backend, the resolving request can be dropped between the two calls
-  (client disconnect mid-await) — decision consumed, wake never published, parked side
-  fails closed at its timeout. Phase 3 accepts and documents this window (the Redis bus
-  module doc): pub/sub is fire-and-forget end to end, and the fail-closed timeout is the
-  single backstop for every lost-wake path.
+  decision in the store, then publishes the wake. The store write is the durable step
+  (claim + decision record in one atomic script); a resolving request dropped between
+  the two calls loses only the publish, and the parking side recovers the recorded
+  decision through its store poll (#474).
 - **Teardown latency behind store I/O.** The request `Drop` guard cancels wake handles
   synchronously (`cancel_request_local`), but the spawned cleanup task awaits
   `ApprovalStore::cancel_request` before `RequestCancellation::unregister` and the

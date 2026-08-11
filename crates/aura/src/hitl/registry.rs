@@ -8,17 +8,20 @@
 //!
 //! State is split along the serialization boundary:
 //!
-//! - the [`ParkedApproval`] record lives in an [`ApprovalStore`], and the
-//!   decision travels over an [`EventBus`] topic, so with a shared backend a
-//!   decision can be resolved by any process; while
+//! - the [`ParkedApproval`] record and the resolved decision live in an
+//!   [`ApprovalStore`] (the durable carrier), and the decision also travels
+//!   over an [`EventBus`] topic (the low-latency wake), so with a shared
+//!   backend a decision can be resolved by any process and survives a lost
+//!   publish; while
 //! - the `oneshot` wake handle that resumes the suspended tool call is
 //!   inherently process-local and stays in this registry's in-RAM map, fired
-//!   by a per-approval bus subscription.
+//!   by a per-approval task listening on the bus and polling the store.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
@@ -38,6 +41,10 @@ fn approval_topic(id: &DecisionId) -> String {
     format!("approval:{id}")
 }
 
+/// How often a parked approval's wake task falls back to reading the store
+/// for a recorded decision.
+const DECISION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The cross-request registry of parked conversational approvals. A `Clone`
 /// newtype over an `Arc`.
 #[derive(Clone)]
@@ -51,20 +58,18 @@ struct PendingApprovalsInner {
     wakes: Mutex<BTreeMap<DecisionId, WakeEntry>>,
 }
 
-/// The process-local half of one parked approval: its wake handle and bus
-/// subscription.
+/// The process-local half of one parked approval: its wake handle and wake
+/// task.
 struct WakeEntry {
     request_id: String,
     wake: oneshot::Sender<ApprovalDecision>,
-    subscription: Option<AbortHandle>,
+    wake_task: AbortHandle,
 }
 
 impl WakeEntry {
-    /// Stop the bus-subscription task.
-    fn abort_subscription(&self) {
-        if let Some(subscription) = &self.subscription {
-            subscription.abort();
-        }
+    /// Stop the wake task (bus listener + store poll).
+    fn abort_wake_task(&self) {
+        self.wake_task.abort();
     }
 }
 
@@ -110,8 +115,10 @@ impl PendingApprovals {
 
     /// Park an approval, returning the await handle.
     ///
-    /// Store or bus faults do not fail registration: the call parks anyway,
-    /// cannot be resolved, and fails closed at its timeout.
+    /// Store or bus faults do not fail registration: the call parks anyway.
+    /// An unpersisted park cannot be resolved and fails closed at its
+    /// timeout; a park whose subscription failed still resolves through the
+    /// wake task's store poll.
     #[must_use]
     pub async fn register(&self, request: ApprovalRequest, timeout: Duration) -> AwaitingDecision {
         let id = request.decision_id;
@@ -127,32 +134,32 @@ impl PendingApprovals {
 
         // Subscribe before the store insert: once `store.register` returns,
         // any process may resolve and publish, and the wake must already be
-        // listening for the decision.
+        // listening for the decision. A failed subscription still parks a
+        // wakeable approval — the wake task's store poll remains as the
+        // (slower) carrier.
         let subscription = match self.0.bus.subscribe(&approval_topic(&id)).await {
-            Ok(decisions) => {
-                let inner = Arc::downgrade(&self.0);
-                // Instrument with the registering request's span so the wake
-                // (and any decode warning) lands in the parked call's trace.
-                let task = tracing::Instrument::instrument(
-                    wake_on_decision(inner, id, decisions),
-                    tracing::Span::current(),
-                );
-                Some(tokio::spawn(task).abort_handle())
-            }
+            Ok(decisions) => Some(decisions),
             Err(err) => {
                 warn!(
                     decision_id = %id, error = %err,
-                    "approval wake subscription failed; the parked call cannot be woken and will fail closed",
+                    "approval wake subscription failed; decision delivery falls back to store polling",
                 );
                 None
             }
         };
+        // Instrument with the registering request's span so the wake (and any
+        // decode warning) lands in the parked call's trace.
+        let task = tracing::Instrument::instrument(
+            wake_on_decision(Arc::downgrade(&self.0), id, subscription),
+            tracing::Span::current(),
+        );
+        let wake_task = tokio::spawn(task).abort_handle();
         self.0.wakes.lock().expect("registry lock poisoned").insert(
             id,
             WakeEntry {
                 request_id,
                 wake: tx,
-                subscription,
+                wake_task,
             },
         );
         if let Err(err) = self.0.store.register(parked).await {
@@ -164,9 +171,9 @@ impl PendingApprovals {
         AwaitingDecision::new(id, rx, Instant::now() + timeout)
     }
 
-    /// Resolve a parked approval: record the decision in the store (at most
-    /// once per `DecisionId`) and publish it on the bus, waking the parked
-    /// await wherever it lives.
+    /// Resolve a parked approval: durably record the decision in the store
+    /// (at most once per `DecisionId`) and publish it on the bus, waking the
+    /// parked await wherever it lives.
     pub async fn resolve(
         &self,
         id: &DecisionId,
@@ -180,11 +187,24 @@ impl PendingApprovals {
             .publish(&approval_topic(id), payload.into())
             .await
         {
-            // The decision is recorded but the wake may be lost; the parked
-            // await times out and fails closed.
+            // Only the fast path is lost: the parking side recovers the
+            // recorded decision from the store poll.
             warn!(decision_id = %id, error = %err, "approval decision publish failed");
         }
         Ok(())
+    }
+
+    /// The durably recorded decision for an already-resolved approval, if
+    /// any. A store fault reads as "no recorded decision" (logged), so
+    /// callers keep their fail-closed shape.
+    pub async fn recorded_decision(&self, id: &DecisionId) -> Option<ApprovalDecision> {
+        match self.0.store.decision(id).await {
+            Ok(decision) => decision,
+            Err(err) => {
+                warn!(decision_id = %id, error = %err, "recorded approval decision lookup failed");
+                None
+            }
+        }
     }
 
     /// Expire a parked approval after timeout/cancellation so later ingress
@@ -197,7 +217,7 @@ impl PendingApprovals {
             .expect("registry lock poisoned")
             .remove(id)
         {
-            entry.abort_subscription();
+            entry.abort_wake_task();
         }
         if let Err(err) = self.0.store.remove(id).await {
             warn!(decision_id = %id, error = %err, "parked approval removal failed");
@@ -214,7 +234,7 @@ impl PendingApprovals {
             .expect("registry lock poisoned")
             .retain(|_, entry| {
                 if entry.request_id == request_id {
-                    entry.abort_subscription();
+                    entry.abort_wake_task();
                     false
                 } else {
                     true
@@ -238,24 +258,56 @@ impl Default for PendingApprovals {
     }
 }
 
-/// Wait for a decision on one approval's bus topic and fire its local wake
-/// handle. One short-lived task per parked approval; ends after the first
-/// decision, when aborted (entry removed without a decision), or when the bus
-/// closes the topic.
+/// Wait for one approval's decision and fire its local wake handle. The
+/// decision arrives over the approval's bus topic (fast path) or, every
+/// [`DECISION_POLL_INTERVAL`], from the store's recorded decision — the
+/// durable fallback that recovers a lost publish. One short-lived task per
+/// parked approval; ends after the first decision or when aborted (entry
+/// removed without a decision).
 async fn wake_on_decision(
     inner: Weak<PendingApprovalsInner>,
     id: DecisionId,
-    mut decisions: Subscription,
+    mut decisions: Option<Subscription>,
 ) {
-    while let Some(payload) = decisions.next().await {
-        let decision = match serde_json::from_slice::<ApprovalDecision>(&payload) {
-            Ok(decision) => decision,
-            Err(err) => {
-                warn!(
-                    decision_id = %id, error = %err,
-                    "undecodable approval decision payload ignored",
-                );
-                continue;
+    let mut poll = tokio::time::interval_at(
+        Instant::now() + DECISION_POLL_INTERVAL,
+        DECISION_POLL_INTERVAL,
+    );
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let decision = tokio::select! {
+            payload = subscription_next(&mut decisions) => match payload {
+                Some(payload) => match serde_json::from_slice::<ApprovalDecision>(&payload) {
+                    Ok(decision) => decision,
+                    Err(err) => {
+                        warn!(
+                            decision_id = %id, error = %err,
+                            "undecodable approval decision payload ignored",
+                        );
+                        continue;
+                    }
+                },
+                // The bus closed the topic; the store poll carries on alone.
+                None => {
+                    decisions = None;
+                    continue;
+                }
+            },
+            _ = poll.tick() => {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                match inner.store.decision(&id).await {
+                    Ok(Some(decision)) => decision,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        warn!(
+                            decision_id = %id, error = %err,
+                            "approval decision store poll failed",
+                        );
+                        continue;
+                    }
+                }
             }
         };
         let Some(inner) = inner.upgrade() else {
@@ -270,6 +322,15 @@ async fn wake_on_decision(
             let _ = entry.wake.send(decision);
         }
         return;
+    }
+}
+
+/// Next bus payload, pending forever without a subscription (the poll arm is
+/// then the only wake source).
+async fn subscription_next(subscription: &mut Option<Subscription>) -> Option<Bytes> {
+    match subscription {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -510,6 +571,101 @@ mod tests {
         assert_eq!(delta, chrono::Duration::from_std(timeout).unwrap());
         assert!(parked.registered_at >= before);
         assert!(parked.registered_at <= after);
+    }
+
+    /// Bus double whose `publish` drops every payload: the pub/sub loss
+    /// window, or a resolver crash between the store write and the publish.
+    struct LossyBus(InMemoryEventBus);
+
+    #[async_trait::async_trait]
+    impl EventBus for LossyBus {
+        async fn publish(&self, _topic: &str, _payload: Bytes) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn subscribe(&self, topic: &str) -> Result<Subscription, SessionStoreError> {
+            self.0.subscribe(topic).await
+        }
+    }
+
+    /// Bus double that cannot subscribe at all.
+    struct DeafBus;
+
+    #[async_trait::async_trait]
+    impl EventBus for DeafBus {
+        async fn publish(&self, _topic: &str, _payload: Bytes) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn subscribe(&self, _topic: &str) -> Result<Subscription, SessionStoreError> {
+            Err(SessionStoreError::Request {
+                reason: "subscriptions unavailable".to_string(),
+            })
+        }
+    }
+
+    /// The #474 shape: the decision is durably recorded but its wake publish
+    /// is lost. The parked await recovers the decision from the store within
+    /// the poll interval instead of failing closed at its timeout.
+    #[tokio::test(start_paused = true)]
+    async fn lost_wake_publish_is_recovered_from_the_store() {
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(LossyBus(InMemoryEventBus::new()));
+        let parker = PendingApprovals::with_backend(store.clone(), bus.clone());
+        let resolver = PendingApprovals::with_backend(store, bus);
+        let cancel = RequestCancelToken::unbound();
+
+        let req = test_request("req-lost-wake");
+        let id = req.decision_id;
+        let started = Instant::now();
+        let handle = parker.register(req, Duration::from_secs(60)).await;
+
+        resolver
+            .resolve(&id, ApprovalDecision::Approved)
+            .await
+            .expect("resolve succeeds");
+
+        assert_eq!(
+            handle.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Approved)
+        );
+        assert!(
+            started.elapsed() <= DECISION_POLL_INTERVAL,
+            "the decision must arrive via the store poll, not the timeout; took {:?}",
+            started.elapsed(),
+        );
+    }
+
+    /// A failed wake subscription still parks a wakeable approval: the store
+    /// poll is the only carrier, and the decision arrives through it.
+    #[tokio::test(start_paused = true)]
+    async fn failed_subscription_still_wakes_via_store_poll() {
+        let registry = PendingApprovals::with_backend(
+            Arc::new(InMemoryApprovalStore::new()),
+            Arc::new(DeafBus),
+        );
+        let cancel = RequestCancelToken::unbound();
+
+        let req = test_request("req-deaf");
+        let id = req.decision_id;
+        let handle = registry.register(req, Duration::from_secs(60)).await;
+
+        registry
+            .resolve(
+                &id,
+                ApprovalDecision::Denied {
+                    reason: Some("nope".into()),
+                },
+            )
+            .await
+            .expect("resolve succeeds");
+
+        assert_eq!(
+            handle.outcome(&cancel).await,
+            ApprovalOutcome::Decided(ApprovalDecision::Denied {
+                reason: Some("nope".into())
+            })
+        );
     }
 
     /// The cross-instance seam: two registries (as two instances) sharing one store and

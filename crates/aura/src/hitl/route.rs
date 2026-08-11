@@ -161,12 +161,22 @@ impl DecisionRoute {
                 )
                 .await;
 
-                let outcome = handle.outcome(cancel).await;
+                let mut outcome = handle.outcome(cancel).await;
                 if matches!(
                     outcome,
                     ApprovalOutcome::TimedOut { .. } | ApprovalOutcome::Cancelled(_)
                 ) {
                     registry.remove(&decision_id).await;
+                }
+                // The deadline backstop consults the store before failing
+                // closed: a decision durably recorded but whose wake was lost
+                // (down to the final poll gap) still takes effect.
+                // Cancellation deliberately does not — a disconnected request
+                // must not execute a buffered approval.
+                if matches!(outcome, ApprovalOutcome::TimedOut { .. })
+                    && let Some(decision) = registry.recorded_decision(&decision_id).await
+                {
+                    outcome = ApprovalOutcome::Decided(decision);
                 }
 
                 let completed_event =
@@ -831,6 +841,72 @@ mod tests {
             Err(ResolveError::NotFound),
             "late decisions for timed-out approvals must be rejected as expired",
         );
+    }
+
+    /// A decision durably recorded whose wake never arrives still takes
+    /// effect at the deadline backstop instead of failing closed. The route
+    /// timeout sits below the wake task's poll interval, so only the
+    /// backstop can observe the recorded decision.
+    #[tokio::test(start_paused = true)]
+    async fn conversational_timeout_backstop_recovers_recorded_decision() {
+        use crate::session_store::{
+            ApprovalStore, EventBus, InMemoryApprovalStore, InMemoryEventBus, SessionStoreError,
+            Subscription,
+        };
+        use std::sync::Arc;
+
+        /// Bus double whose `publish` drops every payload.
+        struct LossyBus(InMemoryEventBus);
+
+        #[async_trait::async_trait]
+        impl EventBus for LossyBus {
+            async fn publish(
+                &self,
+                _topic: &str,
+                _payload: bytes::Bytes,
+            ) -> Result<(), SessionStoreError> {
+                Ok(())
+            }
+
+            async fn subscribe(&self, topic: &str) -> Result<Subscription, SessionStoreError> {
+                self.0.subscribe(topic).await
+            }
+        }
+
+        let store: Arc<dyn ApprovalStore> = Arc::new(InMemoryApprovalStore::new());
+        let bus: Arc<dyn EventBus> = Arc::new(LossyBus(InMemoryEventBus::new()));
+        let registry = PendingApprovals::with_backend(store, bus);
+        let route = DecisionRoute::Conversational {
+            registry: registry.clone(),
+            timeout: Duration::from_secs(2),
+        };
+        let request = single_request(
+            "conv-req-backstop",
+            ApprovalOrigin::AgentRequested {
+                reason: "test".into(),
+            },
+        );
+        let decision_id = request.decision_id;
+        let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+        let decide_handle = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { route.decide(request, &cancel).await }
+        });
+
+        loop {
+            tokio::task::yield_now().await;
+            if registry
+                .resolve(&decision_id, ApprovalDecision::Approved)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        let result = decide_handle.await.unwrap().unwrap();
+        assert_eq!(result, ApprovalOutcome::Decided(ApprovalDecision::Approved));
     }
 
     #[tokio::test(start_paused = true)]

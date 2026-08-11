@@ -8,19 +8,30 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
+use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError, Timestamp};
 
 use super::{ApprovalStore, EventBus, SessionStoreError, Subscription};
 
 /// Buffered payloads per topic before slow subscribers start lagging.
 const TOPIC_CAPACITY: usize = 64;
 
+/// How long a recorded decision stays readable past its approval's expiry.
+const DECISION_RETENTION_MARGIN_SECS: i64 = 60;
+
+/// A recorded decision and the instant its entry may be dropped.
+struct DecidedEntry {
+    decision: ApprovalDecision,
+    keep_until: Timestamp,
+}
+
 /// The parked-approval registry as a plain map.
 #[derive(Default)]
 pub struct InMemoryApprovalStore {
-    // `std::sync::Mutex`: every operation is a synchronous map op; nothing
-    // awaits while holding the lock.
+    // `std::sync::Mutex` (both maps): every operation is a synchronous map
+    // op; nothing awaits while holding a lock, and the locks are never
+    // held together.
     entries: Mutex<BTreeMap<DecisionId, ParkedApproval>>,
+    decided: Mutex<BTreeMap<DecisionId, DecidedEntry>>,
 }
 
 impl InMemoryApprovalStore {
@@ -31,6 +42,15 @@ impl InMemoryApprovalStore {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<DecisionId, ParkedApproval>> {
         self.entries.lock().expect("approval store lock poisoned")
+    }
+
+    /// Lock the decided map, dropping entries past their retention window (the
+    /// in-memory stand-in for a networked backend's TTL).
+    fn lock_decided(&self) -> std::sync::MutexGuard<'_, BTreeMap<DecisionId, DecidedEntry>> {
+        let mut decided = self.decided.lock().expect("approval store lock poisoned");
+        let now = chrono::Utc::now();
+        decided.retain(|_, entry| entry.keep_until > now);
+        decided
     }
 }
 
@@ -48,13 +68,26 @@ impl ApprovalStore for InMemoryApprovalStore {
     async fn resolve(
         &self,
         id: &DecisionId,
-        _decision: ApprovalDecision,
+        decision: ApprovalDecision,
     ) -> Result<(), ResolveError> {
         // Removal under the lock is the at-most-once guarantee.
-        match self.lock().remove(id) {
-            Some(_) => Ok(()),
-            None => Err(ResolveError::NotFound),
-        }
+        let parked = self.lock().remove(id).ok_or(ResolveError::NotFound)?;
+        self.lock_decided().insert(
+            *id,
+            DecidedEntry {
+                decision,
+                keep_until: parked.expires_at
+                    + chrono::Duration::seconds(DECISION_RETENTION_MARGIN_SECS),
+            },
+        );
+        Ok(())
+    }
+
+    async fn decision(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ApprovalDecision>, SessionStoreError> {
+        Ok(self.lock_decided().get(id).map(|e| e.decision.clone()))
     }
 
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError> {
@@ -196,6 +229,45 @@ mod tests {
             store.resolve(&id, ApprovalDecision::Approved).await,
             Err(ResolveError::NotFound),
         );
+    }
+
+    #[tokio::test]
+    async fn approval_store_resolve_records_readable_decision() {
+        let store = InMemoryApprovalStore::new();
+        let entry = parked("req-durable");
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+
+        let denied = ApprovalDecision::Denied {
+            reason: Some("not safe".into()),
+        };
+        store.resolve(&id, denied.clone()).await.unwrap();
+
+        assert_eq!(store.decision(&id).await.unwrap(), Some(denied.clone()));
+        // The recorded decision survives the (rejected) second resolve.
+        assert_eq!(
+            store.resolve(&id, ApprovalDecision::Approved).await,
+            Err(ResolveError::NotFound)
+        );
+        assert_eq!(store.decision(&id).await.unwrap(), Some(denied));
+        assert_eq!(store.decision(&DecisionId::generate()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn recorded_decision_is_pruned_after_retention_window() {
+        let store = InMemoryApprovalStore::new();
+        let mut entry = parked("req-prune");
+        // Expired long enough ago that the retention margin is already past.
+        entry.expires_at =
+            chrono::Utc::now() - chrono::Duration::seconds(2 * DECISION_RETENTION_MARGIN_SECS);
+        let id = entry.request.decision_id;
+        store.register(entry).await.unwrap();
+        store
+            .resolve(&id, ApprovalDecision::Approved)
+            .await
+            .unwrap();
+
+        assert_eq!(store.decision(&id).await.unwrap(), None);
     }
 
     #[tokio::test]

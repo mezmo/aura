@@ -21,7 +21,7 @@ use futures::Stream;
 use crate::hitl::{ApprovalDecision, DecisionId, ParkedApproval, ResolveError};
 
 pub use memory::{InMemoryApprovalStore, InMemoryEventBus};
-pub use record::{InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
+pub use record::{DecisionRecord, InvalidRecord, OriginRecord, ParkedApprovalRecord, ScopeRecord};
 
 /// A fault in the backing session-store/bus backend.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -60,12 +60,21 @@ pub trait ApprovalStore: Send + Sync {
     async fn get(&self, id: &DecisionId) -> Result<Option<ParkedApproval>, SessionStoreError>;
 
     /// Record a terminal decision and remove the parked entry, atomically —
-    /// at-most-once resolution is enforced here, in the store.
+    /// at-most-once resolution is enforced here, in the store. The recorded
+    /// decision must stay readable via [`Self::decision`] until at least the
+    /// approval's `expires_at`, so the parking process can recover a decision
+    /// whose bus wake was lost.
     async fn resolve(
         &self,
         id: &DecisionId,
         decision: ApprovalDecision,
     ) -> Result<(), ResolveError>;
+
+    /// Look up the decision recorded for an already-resolved approval.
+    async fn decision(
+        &self,
+        id: &DecisionId,
+    ) -> Result<Option<ApprovalDecision>, SessionStoreError>;
 
     /// Remove a parked entry.
     async fn remove(&self, id: &DecisionId) -> Result<(), SessionStoreError>;

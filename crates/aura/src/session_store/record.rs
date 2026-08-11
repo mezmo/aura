@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::SessionId;
 use crate::hitl::{
-    AgentScope, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId, ParkedApproval,
-    Timestamp,
+    AgentScope, ApprovalDecision, ApprovalItem, ApprovalOrigin, ApprovalRequest, DecisionId,
+    ParkedApproval, Timestamp,
 };
 use crate::orchestration::{RunId, TaskIdentity};
 
@@ -59,6 +59,43 @@ pub enum ScopeRecord {
 pub enum OriginRecord {
     ConfigGate { matched_pattern: String },
     AgentRequested { reason: String },
+}
+
+/// Storage form of a recorded [`ApprovalDecision`]: the durable record that a
+/// resolution happened, what it was, and when. Same flat `approved`/`reason`
+/// shape as the webhook wire (`hitl::protocol::ApprovalDecisionWire`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    pub approved: bool,
+    pub reason: Option<String>,
+    pub decided_at: Timestamp,
+}
+
+/// Stamps `decided_at` with the conversion (i.e. resolve) time.
+impl From<&ApprovalDecision> for DecisionRecord {
+    fn from(decision: &ApprovalDecision) -> Self {
+        let (approved, reason) = match decision {
+            ApprovalDecision::Approved => (true, None),
+            ApprovalDecision::Denied { reason } => (false, reason.clone()),
+        };
+        Self {
+            approved,
+            reason,
+            decided_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl From<DecisionRecord> for ApprovalDecision {
+    fn from(record: DecisionRecord) -> Self {
+        if record.approved {
+            ApprovalDecision::Approved
+        } else {
+            ApprovalDecision::Denied {
+                reason: record.reason,
+            }
+        }
+    }
 }
 
 /// A stored approval record whose contents cannot be restored to the domain.

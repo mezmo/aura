@@ -416,6 +416,60 @@ async fn approval_concurrent_resolves_have_exactly_one_winner() {
     );
 }
 
+/// A resolution leaves a durable decision record readable from any instance
+/// (issue #474), and the (rejected) second resolve does not disturb it.
+#[tokio::test]
+async fn approval_resolve_records_decision_readable_cross_instance() {
+    let config = test_config(60);
+    let instance_a = connect(&config).await.approvals();
+    let instance_b = connect(&config).await.approvals();
+
+    let parked = make_parked("req-durable", Duration::from_secs(60));
+    let id = parked.request.decision_id;
+    instance_a.register(parked).await.unwrap();
+
+    let denied = ApprovalDecision::Denied {
+        reason: Some("not now".to_string()),
+    };
+    instance_b.resolve(&id, denied.clone()).await.unwrap();
+
+    assert_eq!(
+        instance_a.decision(&id).await.unwrap(),
+        Some(denied.clone())
+    );
+    assert_eq!(
+        instance_a.resolve(&id, ApprovalDecision::Approved).await,
+        Err(ResolveError::NotFound)
+    );
+    assert_eq!(instance_a.decision(&id).await.unwrap(), Some(denied));
+    assert_eq!(
+        instance_a.decision(&DecisionId::generate()).await.unwrap(),
+        None
+    );
+}
+
+/// The decision record's TTL keeps a margin past the parked record's, so the
+/// parking instance's deadline backstop can still read a decision that
+/// arrived just before expiry.
+#[tokio::test]
+async fn decision_record_outlives_parked_record_ttl() {
+    let approvals = connect(&test_config(60)).await.approvals();
+    let parked = make_parked("req-margin", Duration::from_secs(1));
+    let id = parked.request.decision_id;
+    approvals.register(parked).await.unwrap();
+    approvals
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+
+    assert_eq!(
+        approvals.decision(&id).await.unwrap(),
+        Some(ApprovalDecision::Approved)
+    );
+}
+
 #[tokio::test]
 async fn approval_remove_makes_resolve_not_found() {
     let approvals = connect(&test_config(60)).await.approvals();
@@ -595,6 +649,39 @@ async fn approval_parked_on_one_instance_wakes_when_resolved_on_another() {
     let outcome = tokio::time::timeout(Duration::from_secs(5), handle.outcome(&cancel))
         .await
         .expect("wake must arrive well before the approval timeout");
+    assert_eq!(
+        outcome,
+        ApprovalOutcome::Decided(ApprovalDecision::Approved)
+    );
+}
+
+/// The issue #474 repro over live Redis: the decision lands in the store but
+/// no wake is ever published (a suppressed wake channel, or a resolver crash
+/// after the claim). The parking instance's store poll recovers the decision
+/// well before the approval timeout instead of failing closed.
+#[tokio::test]
+async fn store_only_resolve_wakes_parking_instance_via_poll() {
+    let config = test_config(60);
+    let store_a = connect(&config).await;
+    let store_b = connect(&config).await;
+    let parker = PendingApprovals::with_backend(store_a.approvals(), store_a.bus());
+    let cancel = RequestCancelToken::unbound();
+
+    let parked = make_parked("req-poll", Duration::from_secs(60));
+    let request = parked.request;
+    let id = request.decision_id;
+    let handle = parker.register(request, Duration::from_secs(60)).await;
+
+    // Resolve against the store alone — no registry, no publish.
+    store_b
+        .approvals()
+        .resolve(&id, ApprovalDecision::Approved)
+        .await
+        .expect("store resolve succeeds");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(15), handle.outcome(&cancel))
+        .await
+        .expect("store poll must deliver the decision well before the 60s timeout");
     assert_eq!(
         outcome,
         ApprovalOutcome::Decided(ApprovalDecision::Approved)
