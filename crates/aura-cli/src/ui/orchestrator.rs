@@ -17,7 +17,7 @@ use crate::theme::{AuraStyle, Themed};
 
 use super::state::{
     ACTIVE_ORCH_TOOLS, AGENT_REASONING, AGENT_REASONING_SEQ, EXPANDED_OUTPUT, ORCH_LAST_TOOL_LINES,
-    ORCH_SCROLLBACK_COUNTER, PROGRESS_TOKEN_TO_TOOL_ID, lock_term, term_size,
+    ORCH_SCROLLBACK_COUNTER, ORCH_TASK_TREE_END, PROGRESS_TOKEN_TO_TOOL_ID, lock_term, term_size,
 };
 
 // Tree connector prefixes for tool calls under tasks
@@ -27,13 +27,18 @@ pub(crate) const TREE_END_BULLET: &str = "└─ ";
 pub(crate) const TREE_END_DURATION: &str = "   ";
 
 /// Tracks an in-flight orchestrator tool call for live duration display.
+/// Line numbers are atomic so a tree-gap insertion above the entry can
+/// renumber them while the animation thread holds the `Arc`.
 pub struct ActiveOrchTool {
     pub tool_id: String,
     pub task_id: String,
     pub tool_display: String,
     pub start_time: Instant,
-    pub bullet_line_num: u32,
-    pub duration_line_num: u32,
+    pub bullet_line_num: std::sync::atomic::AtomicU32,
+    pub duration_line_num: std::sync::atomic::AtomicU32,
+    /// Coordinator-owned call rendered at the top level: bullet at column 0,
+    /// no tree connectors, outside any task tree.
+    pub top_level: bool,
     /// `true` when content (fields tree at register, or result lines at
     /// finalize) was printed below the duration line in expanded mode. Used
     /// at finalize time so the in-place duration overwrite keeps the right
@@ -91,14 +96,116 @@ pub(crate) fn visual_row_count(text: &str) -> u32 {
     }
 }
 
-/// Register an in-flight orchestrator tool call.
+/// Rows were inserted mid-scrollback: every tracked row number at or below
+/// `at` moved down by `by`. Callers that keep their own absolute row records
+/// (task headers, live reasoning bodies) must apply the same shift.
+pub struct TreeShift {
+    pub at: u32,
+    pub by: u32,
+}
+
+/// Record the tree anchor for a task: one past its last committed tree row.
+/// New entries for the task print here (via a tree gap) when later tasks'
+/// rows have landed below. Call right after the task header commits.
+pub fn note_orch_task_tree_end(task_id: &str) {
+    let total = ORCH_SCROLLBACK_COUNTER.load(Ordering::Relaxed);
+    if let Ok(mut guard) = ORCH_TASK_TREE_END.lock() {
+        guard.insert(task_id.to_string(), total);
+    }
+}
+
+/// Scrollback line where a new `rows`-row tree entry for `task_id` must
+/// print to sit directly under the task's previous row. `None` means append
+/// at the bottom instead: the task is already bottom-most (the common,
+/// sequential case), it has no recorded anchor, the anchor has scrolled
+/// off-screen, or the entry is too tall for the blank region the erased
+/// input frame provides.
+fn tree_gap_line_for(task_id: &str, rows: u32) -> Option<u32> {
+    let at = ORCH_TASK_TREE_END.lock().ok()?.get(task_id).copied()?;
+    let total = ORCH_SCROLLBACK_COUNTER.load(Ordering::Relaxed);
+    if at >= total {
+        return None;
+    }
+    let (_, th) = term_size();
+    if rows > 3 || (total - at) + rows >= th as u32 {
+        return None;
+    }
+    Some(at)
+}
+
+/// Open a `rows`-row gap at scrollback line `at`: rows from `at` down shift
+/// toward the blank region the erased input frame left at the screen
+/// bottom. Leaves the cursor at the gap's first row; the caller prints
+/// exactly `rows` visual rows there and then calls `commit_tree_gap`.
+/// Caller must hold the term lock with the cursor at the scrollback bottom
+/// (the position `erase_input_frame` leaves it in).
+fn open_tree_gap(at: u32, rows: u32) {
+    let total = ORCH_SCROLLBACK_COUNTER.load(Ordering::Relaxed);
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        cursor::MoveUp((total - at) as u16),
+        cursor::MoveToColumn(0)
+    );
+    print!("\x1b[{rows}L");
+    let _ = stdout.flush();
+}
+
+/// Return the cursor to the (new) scrollback bottom and renumber every
+/// statically-tracked row at or below the gap. The caller's own records are
+/// renumbered by propagating the returned `TreeShift`; the freshly printed
+/// entry's rows are recorded after this call, so they are never shifted.
+fn commit_tree_gap(shift: &TreeShift) {
+    let total = ORCH_SCROLLBACK_COUNTER.load(Ordering::Relaxed);
+    let mut stdout = io::stdout();
+    let _ = execute!(
+        stdout,
+        cursor::MoveDown((total - shift.at) as u16),
+        cursor::MoveToColumn(0)
+    );
+    let _ = stdout.flush();
+    if let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock() {
+        for info in guard.values_mut() {
+            if info.bullet_line_num >= shift.at {
+                info.bullet_line_num += shift.by;
+            }
+            if info.duration_line_num >= shift.at {
+                info.duration_line_num += shift.by;
+            }
+        }
+    }
+    if let Ok(tools) = ACTIVE_ORCH_TOOLS.lock() {
+        for tool in tools.iter() {
+            let b = tool.bullet_line_num.load(Ordering::Relaxed);
+            if b >= shift.at {
+                tool.bullet_line_num.store(b + shift.by, Ordering::Relaxed);
+            }
+            let d = tool.duration_line_num.load(Ordering::Relaxed);
+            if d >= shift.at {
+                tool.duration_line_num
+                    .store(d + shift.by, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Ok(mut guard) = ORCH_TASK_TREE_END.lock() {
+        for end in guard.values_mut() {
+            if *end >= shift.at {
+                *end += shift.by;
+            }
+        }
+    }
+    ORCH_SCROLLBACK_COUNTER.fetch_add(shift.by, Ordering::Relaxed);
+}
+
+/// Register an in-flight orchestrator tool call. Returns the shift applied
+/// when the entry printed into a tree gap (see [`TreeShift`]).
 pub fn register_orch_tool(
     tool_id: &str,
     task_id: &str,
     tool_display: &str,
     start_time: Instant,
     fields: &BTreeMap<String, serde_json::Value>,
-) {
+) -> Option<TreeShift> {
     upgrade_last_tool_to_mid(task_id);
 
     // Count visual rows (not logical printlns) so the cursor math in
@@ -106,30 +213,55 @@ pub fn register_orch_tool(
     // right row when a long bullet/value wraps.
     let bullet_text = format!("{}● {}", TREE_END_BULLET, tool_display);
     let bullet_rows = visual_row_count(&bullet_text);
-    let bullet_line = ORCH_SCROLLBACK_COUNTER.fetch_add(bullet_rows, Ordering::Relaxed);
-    println!(
-        "{}{} {}",
-        TREE_END_BULLET.themed(AuraStyle::Connector),
-        "●".themed(AuraStyle::Muted),
-        tool_display.themed(AuraStyle::Primary),
-    );
     let running_text = format_orch_running(start_time);
     let has_content_below = EXPANDED_OUTPUT.load(Ordering::Relaxed) && !fields.is_empty();
     let dur_connector = if has_content_below { "├─" } else { "⎿" };
     let duration_text = format!("{}{} {}", TREE_END_DURATION, dur_connector, running_text);
     let duration_rows = visual_row_count(&duration_text);
-    let duration_line = ORCH_SCROLLBACK_COUNTER.fetch_add(duration_rows, Ordering::Relaxed);
-    println!(
-        "{}{} {}",
-        TREE_END_DURATION,
-        dur_connector.themed(AuraStyle::Connector),
-        running_text.as_str().themed(AuraStyle::Muted),
-    );
+    let entry_rows = bullet_rows + duration_rows;
 
-    // In expanded mode, print the fields tree below the duration line
-    if has_content_below {
-        print_fields_tree_indented_live(fields, TREE_END_DURATION);
-    }
+    let print_entry = || {
+        println!(
+            "{}{} {}",
+            TREE_END_BULLET.themed(AuraStyle::Connector),
+            "●".themed(AuraStyle::Muted),
+            tool_display.themed(AuraStyle::Primary),
+        );
+        println!(
+            "{}{} {}",
+            TREE_END_DURATION,
+            dur_connector.themed(AuraStyle::Connector),
+            running_text.as_str().themed(AuraStyle::Muted),
+        );
+    };
+
+    // Grouped placement: print directly under the task's previous row when
+    // other tasks' entries have landed below it. Expanded mode always
+    // appends — its fields tree and result blocks are variable-height.
+    let gap = if has_content_below {
+        None
+    } else {
+        tree_gap_line_for(task_id, entry_rows)
+    };
+    let (bullet_line, duration_line, shift) = if let Some(at) = gap {
+        open_tree_gap(at, entry_rows);
+        print_entry();
+        let shift = TreeShift { at, by: entry_rows };
+        // Renumbers the task's own tree-end anchor along with everything
+        // below the gap, leaving it one past the new entry.
+        commit_tree_gap(&shift);
+        (at, at + bullet_rows, Some(shift))
+    } else {
+        let bullet_line = ORCH_SCROLLBACK_COUNTER.fetch_add(bullet_rows, Ordering::Relaxed);
+        let duration_line = ORCH_SCROLLBACK_COUNTER.fetch_add(duration_rows, Ordering::Relaxed);
+        print_entry();
+        // In expanded mode, print the fields tree below the duration line
+        if has_content_below {
+            print_fields_tree_indented_live(fields, TREE_END_DURATION);
+        }
+        note_orch_task_tree_end(task_id);
+        (bullet_line, duration_line, None)
+    };
 
     if let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock() {
         guard.insert(
@@ -138,7 +270,7 @@ pub fn register_orch_tool(
                 bullet_line_num: bullet_line,
                 duration_line_num: duration_line,
                 tool_display: tool_display.to_string(),
-                duration_text: running_text,
+                duration_text: running_text.clone(),
                 has_content_below,
             },
         );
@@ -148,8 +280,58 @@ pub fn register_orch_tool(
         task_id: task_id.to_string(),
         tool_display: tool_display.to_string(),
         start_time,
-        bullet_line_num: bullet_line,
-        duration_line_num: duration_line,
+        bullet_line_num: std::sync::atomic::AtomicU32::new(bullet_line),
+        duration_line_num: std::sync::atomic::AtomicU32::new(duration_line),
+        top_level: false,
+        has_content_below,
+        progress_message: Mutex::new(None),
+    });
+    if let Ok(mut guard) = ACTIVE_ORCH_TOOLS.lock() {
+        guard.push(tool);
+    }
+    shift
+}
+
+/// Register an in-flight coordinator tool call, rendered at the top level:
+/// `● Display` at column 0 with a bare `⎿ running …` line, no tree
+/// connectors. Appends at the scrollback bottom and joins no task tree — no
+/// connector upgrades, no tree anchor.
+pub fn register_orch_top_level_tool(
+    tool_id: &str,
+    tool_display: &str,
+    start_time: Instant,
+    fields: &BTreeMap<String, serde_json::Value>,
+) {
+    let bullet_text = format!("● {}", tool_display);
+    let bullet_rows = visual_row_count(&bullet_text);
+    let bullet_line = ORCH_SCROLLBACK_COUNTER.fetch_add(bullet_rows, Ordering::Relaxed);
+    println!(
+        "{} {}",
+        "●".themed(AuraStyle::Muted),
+        tool_display.themed(AuraStyle::Primary),
+    );
+    let running_text = format_orch_running(start_time);
+    let has_content_below = EXPANDED_OUTPUT.load(Ordering::Relaxed) && !fields.is_empty();
+    let dur_connector = if has_content_below { "├─" } else { "⎿" };
+    let duration_text = format!("{} {}", dur_connector, running_text);
+    let duration_rows = visual_row_count(&duration_text);
+    let duration_line = ORCH_SCROLLBACK_COUNTER.fetch_add(duration_rows, Ordering::Relaxed);
+    println!(
+        "{} {}",
+        dur_connector.themed(AuraStyle::Connector),
+        running_text.as_str().themed(AuraStyle::Muted),
+    );
+    if has_content_below {
+        print_fields_tree_indented_live(fields, "");
+    }
+    let tool = std::sync::Arc::new(ActiveOrchTool {
+        tool_id: tool_id.to_string(),
+        task_id: String::new(),
+        tool_display: tool_display.to_string(),
+        start_time,
+        bullet_line_num: std::sync::atomic::AtomicU32::new(bullet_line),
+        duration_line_num: std::sync::atomic::AtomicU32::new(duration_line),
+        top_level: true,
         has_content_below,
         progress_message: Mutex::new(None),
     });
@@ -170,34 +352,64 @@ pub fn register_orch_tool(
 /// `on_lines(bullet_line_num, body_line_num)` runs while the orchestrator
 /// state lock is held — the caller should record the line numbers into its
 /// own `LiveReasoning` state without doing additional terminal I/O.
-pub fn register_orch_reasoning_in_tree(task_id: &str, on_lines: impl FnOnce(u32, u32)) {
+pub fn register_orch_reasoning_in_tree(
+    task_id: &str,
+    worker_id: &str,
+    on_lines: impl FnOnce(u32, u32),
+) -> Option<TreeShift> {
     upgrade_last_tool_to_mid(task_id);
 
-    let display = "Reasoning";
+    // Concurrent tasks interleave their tree entries in scrollback, so the
+    // label names the worker to keep each reasoning row attributable. The
+    // bullet takes the task color immediately — unlike tool entries there
+    // is no finalize step to recolor it later.
+    let display = if worker_id.is_empty() {
+        "Reasoning".to_string()
+    } else {
+        format!("Reasoning - {worker_id}")
+    };
+    let bullet_color = crate::ui::state::task_color_for(task_id);
     let bullet_text = format!("{}● {}", TREE_END_BULLET, display);
     let bullet_rows = visual_row_count(&bullet_text);
-    let bullet_line = ORCH_SCROLLBACK_COUNTER.fetch_add(bullet_rows, Ordering::Relaxed);
-    println!(
-        "{}{} {}",
-        TREE_END_BULLET.themed(AuraStyle::Connector),
-        "●".themed(AuraStyle::Muted),
-        display.themed(AuraStyle::Primary),
-    );
-
-    // Initial body row: empty. The reasoning callback will rewrite this
-    // in-place as chunks arrive.
     let body_text = format!("{}⎿ ", TREE_END_DURATION);
     let body_rows = visual_row_count(&body_text);
-    let body_line = ORCH_SCROLLBACK_COUNTER.fetch_add(body_rows, Ordering::Relaxed);
-    println!(
-        "{}{} ",
-        TREE_END_DURATION.themed(AuraStyle::Connector),
-        "⎿".themed(AuraStyle::Connector),
-    );
+    let entry_rows = bullet_rows + body_rows;
+
+    // Prints the bullet row plus an initial empty body row; the reasoning
+    // callback rewrites the body in-place as chunks arrive.
+    let print_entry = || {
+        println!(
+            "{}{} {}",
+            TREE_END_BULLET.themed(AuraStyle::Connector),
+            "●".with(bullet_color),
+            display.as_str().themed(AuraStyle::Primary),
+        );
+        println!(
+            "{}{} ",
+            TREE_END_DURATION.themed(AuraStyle::Connector),
+            "⎿".themed(AuraStyle::Connector),
+        );
+    };
+
+    // Grouped placement: print directly under the task's previous row when
+    // other tasks' entries have landed below it.
+    let (bullet_line, body_line, shift) = if let Some(at) = tree_gap_line_for(task_id, entry_rows) {
+        open_tree_gap(at, entry_rows);
+        print_entry();
+        let shift = TreeShift { at, by: entry_rows };
+        commit_tree_gap(&shift);
+        (at, at + bullet_rows, Some(shift))
+    } else {
+        let bullet_line = ORCH_SCROLLBACK_COUNTER.fetch_add(bullet_rows, Ordering::Relaxed);
+        let body_line = ORCH_SCROLLBACK_COUNTER.fetch_add(body_rows, Ordering::Relaxed);
+        print_entry();
+        note_orch_task_tree_end(task_id);
+        (bullet_line, body_line, None)
+    };
 
     // Insert into the per-task "last entry" map so the next tool registration
     // upgrades reasoning's `└─` to `├─`. We mirror tool semantics: the
-    // `tool_display` we record is just "Reasoning" (used by
+    // `tool_display` we record is the label (used by
     // `upgrade_last_tool_to_mid` to repaint the bullet line), and
     // `duration_text` stays empty initially (the reasoning callback owns
     // updating it as content streams in).
@@ -215,6 +427,7 @@ pub fn register_orch_reasoning_in_tree(task_id: &str, on_lines: impl FnOnce(u32,
     }
 
     on_lines(bullet_line, body_line);
+    shift
 }
 
 /// Update the recorded `duration_text` of the last entry under a task so
@@ -311,10 +524,16 @@ pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Optio
     let ms = duration_ms.unwrap_or_else(|| tool.start_time.elapsed().as_millis() as u64);
     let dur_str = format_orch_duration_ms(ms);
     let total_scrollback = ORCH_SCROLLBACK_COUNTER.load(Ordering::Relaxed);
-    let bullet_color = crate::ui::state::task_color_for(&tool.task_id);
+    let bullet_color = crate::ui::state::task_color_for(if tool.top_level {
+        "__orchestrator__"
+    } else {
+        &tool.task_id
+    });
 
-    let bullet_up = total_scrollback.saturating_sub(tool.bullet_line_num);
-    let duration_up = total_scrollback.saturating_sub(tool.duration_line_num);
+    let tool_bullet_line = tool.bullet_line_num.load(Ordering::Relaxed);
+    let tool_duration_line = tool.duration_line_num.load(Ordering::Relaxed);
+    let bullet_up = total_scrollback.saturating_sub(tool_bullet_line);
+    let duration_up = total_scrollback.saturating_sub(tool_duration_line);
 
     let (_, th) = term_size();
     let on_screen = bullet_up < th as u32 && duration_up < th as u32;
@@ -322,12 +541,14 @@ pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Optio
     let is_last = if let Ok(guard) = ORCH_LAST_TOOL_LINES.lock() {
         guard
             .get(&tool.task_id)
-            .map(|info| info.bullet_line_num == tool.bullet_line_num)
+            .map(|info| info.bullet_line_num == tool_bullet_line)
             .unwrap_or(false)
     } else {
         false
     };
-    let (b_prefix, d_prefix) = if is_last {
+    let (b_prefix, d_prefix) = if tool.top_level {
+        ("", "")
+    } else if is_last {
         (TREE_END_BULLET, TREE_END_DURATION)
     } else {
         (TREE_MID_BULLET, TREE_MID_DURATION)
@@ -384,21 +605,26 @@ pub fn finalize_orch_tool(tool_id: &str, duration_ms: Option<u64>, result: Optio
     }
 
     // Append the tool result as indented lines under the fields tree.
-    // Indented with TREE_END_DURATION (`   `) to match the live fields-tree
-    // indent emitted at register time. Tracks visual rows (not printlns)
-    // so a wrapped result line doesn't desync the cursor math for the next
-    // tool's `register_orch_tool`.
+    // Indented to match the live fields-tree indent emitted at register
+    // time (none for top-level coordinator calls). Tracks visual rows (not
+    // printlns) so a wrapped result line doesn't desync the cursor math for
+    // the next tool's `register_orch_tool`.
     if let Some(text) = result_text
         && expanded
     {
+        let indent = if tool.top_level {
+            ""
+        } else {
+            TREE_END_DURATION
+        };
         let normalized = crate::tools::normalize_tool_result_text(text);
         println!();
         ORCH_SCROLLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
         for line in normalized.lines() {
-            let line_text = format!("{}  {}", TREE_END_DURATION, line);
+            let line_text = format!("{}  {}", indent, line);
             println!(
                 "{}  {}",
-                TREE_END_DURATION.themed(AuraStyle::Connector),
+                indent.themed(AuraStyle::Connector),
                 line.themed(AuraStyle::Muted),
             );
             ORCH_SCROLLBACK_COUNTER.fetch_add(visual_row_count(&line_text), Ordering::Relaxed);
@@ -482,6 +708,9 @@ pub fn reset_orch_tools() {
     if let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock() {
         guard.clear();
     }
+    if let Ok(mut guard) = ORCH_TASK_TREE_END.lock() {
+        guard.clear();
+    }
     if let Ok(mut guard) = PROGRESS_TOKEN_TO_TOOL_ID.lock() {
         guard.clear();
     }
@@ -491,6 +720,9 @@ pub fn reset_orch_tools() {
 /// Clean up last-tool tracking for a completed task.
 pub fn clear_orch_task_tools(task_id: &str) {
     if let Ok(mut guard) = ORCH_LAST_TOOL_LINES.lock() {
+        guard.remove(task_id);
+    }
+    if let Ok(mut guard) = ORCH_TASK_TREE_END.lock() {
         guard.remove(task_id);
     }
 }

@@ -129,6 +129,11 @@ pub(crate) static ORCH_LAST_TOOL_LINES: std::sync::LazyLock<
     Mutex<std::collections::HashMap<String, OrchLastToolInfo>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Per-task scrollback line one past the task's last tree row.
+pub(crate) static ORCH_TASK_TREE_END: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, u32>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 /// Maps an MCP `progress_token` (canonical JSON repr) to the `tool_id` it
 /// belongs to. Populated from `aura.tool_start` events; consulted when an
 /// `aura.progress` arrives so the message can be rendered on the matching

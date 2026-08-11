@@ -283,16 +283,21 @@ fn open_top_level_reasoning_block(state: &mut LiveReasoning, agent_id: &str) {
 /// (via `register_orch_reasoning_in_tree`) and registers this entry in
 /// `ORCH_LAST_TOOL_LINES` so the next tool call can upgrade reasoning's
 /// connector in turn. Caller must already hold `lock_term()`.
-fn open_worker_reasoning_block(state: &mut LiveReasoning, task_id: &str) {
+fn open_worker_reasoning_block(
+    state: &mut LiveReasoning,
+    task_id: &str,
+    worker_id: &str,
+) -> Option<crate::ui::orchestrator::TreeShift> {
     crate::ui::orchestrator::register_orch_reasoning_in_tree(
         task_id,
+        worker_id,
         |bullet_line_num, body_line_num| {
             state.body_line_num = body_line_num;
             state.body_line_text = String::new();
             state.started = true;
             let _ = bullet_line_num;
         },
-    );
+    )
 }
 
 /// Apply a chunk of content to the currently-open live block.
@@ -444,6 +449,48 @@ fn flush_live_reasoning(state: &Arc<Mutex<Option<LiveReasoning>>>) -> bool {
         return false;
     }
     let was_top_level = !s.is_worker;
+    persist_reasoning_display_event(s);
+    was_top_level
+}
+
+/// Live worker reasoning blocks, one per concurrently-executing task.
+/// Keyed by `task_id` so interleaved deltas from same-wave workers each
+/// update their own tree row instead of contending for a single block.
+type LiveWorkerReasoningMap = Arc<Mutex<std::collections::HashMap<String, LiveReasoning>>>;
+
+/// Close one task's live worker reasoning block, persisting it as a
+/// `DisplayEvent::Reasoning`. No terminal output happens here — the body
+/// row already lives in scrollback at its recorded line.
+fn flush_worker_reasoning_for_task(map: &LiveWorkerReasoningMap, task_id: &str) {
+    let Some(s) = map.lock().ok().and_then(|mut g| g.remove(task_id)) else {
+        return;
+    };
+    if s.combined.is_empty() {
+        return;
+    }
+    persist_reasoning_display_event(s);
+}
+
+/// Close every live worker reasoning block (end of stream, or an event —
+/// e.g. an approval prompt — that takes over the terminal).
+fn flush_all_worker_reasoning(map: &LiveWorkerReasoningMap) {
+    let mut states: Vec<(String, LiveReasoning)> = match map.lock() {
+        Ok(mut g) => g.drain().collect(),
+        Err(_) => return,
+    };
+    // HashMap drain order is arbitrary; sort by task id so replay order is
+    // deterministic.
+    states.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (_, s) in states {
+        if !s.combined.is_empty() {
+            persist_reasoning_display_event(s);
+        }
+    }
+}
+
+/// Record a closed reasoning block as a `DisplayEvent::Reasoning` for
+/// replay/resume, with `content` holding the full accumulated text.
+fn persist_reasoning_display_event(s: LiveReasoning) {
     let mut fields = s.fields;
     fields.insert(
         "content".to_string(),
@@ -454,7 +501,6 @@ fn flush_live_reasoning(state: &Arc<Mutex<Option<LiveReasoning>>>) -> bool {
         agent_id: s.agent_id,
         fields,
     });
-    was_top_level
 }
 
 /// Orchestrator events that actually `println!` scrollback content.
@@ -903,6 +949,12 @@ pub fn run_repl(
                 // `aura.progress` messages.
                 let live_reasoning: Arc<Mutex<Option<LiveReasoning>>> = Arc::new(Mutex::new(None));
 
+                // Per-task live worker reasoning blocks — concurrent same-wave
+                // workers each stream into their own tree row.
+                let live_worker_reasoning: LiveWorkerReasoningMap =
+                    Arc::new(Mutex::new(std::collections::HashMap::new()));
+                let worker_reasoning_seen = Arc::new(AtomicBool::new(false));
+
                 let (anim, stop_flag) = WaveAnimation::start(
                     "Thinking",
                     vec![],
@@ -1053,6 +1105,8 @@ pub fn run_repl(
                             pending_args: pending_args.clone(),
                             turn_events: turn_events.clone(),
                             live_reasoning: live_reasoning.clone(),
+                            live_worker_reasoning: live_worker_reasoning.clone(),
+                            worker_reasoning_seen: worker_reasoning_seen.clone(),
                             stop_flag: stop_flag.clone(),
                             anim_cleared: anim_cleared.clone(),
                             cancel: cancel_flag.clone(),
@@ -1076,10 +1130,11 @@ pub fn run_repl(
                             .await
                     });
 
-                    // Close any live reasoning block left open by the stream
+                    // Close any live reasoning blocks left open by the stream
                     // (e.g., reasoning was the last thing the model emitted
                     // before the stream ended without a usage/tool event).
                     flush_live_reasoning(&live_reasoning);
+                    flush_all_worker_reasoning(&live_worker_reasoning);
 
                     // Check for cancellation
                     if cancel_flag.load(Ordering::Relaxed) {
@@ -2091,6 +2146,10 @@ struct ReplStreamHandler {
         Arc<Mutex<std::collections::HashMap<String, BTreeMap<String, serde_json::Value>>>>,
     turn_events: Arc<Mutex<Vec<DisplayEvent>>>,
     live_reasoning: Arc<Mutex<Option<LiveReasoning>>>,
+    live_worker_reasoning: LiveWorkerReasoningMap,
+    /// Set once the stream delivers an `aura.orchestrator.worker_reasoning`
+    /// event; gates dropping the per-delta `aura.reasoning` worker mirror.
+    worker_reasoning_seen: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     anim_cleared: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -2108,6 +2167,141 @@ struct ReplStreamHandler {
     /// `PendingApprovals::resolve()` instead of an HTTP POST.
     #[cfg(feature = "standalone-cli")]
     pending_approvals: Option<aura::hitl::PendingApprovals>,
+}
+
+impl ReplStreamHandler {
+    /// Renumber handler-owned row records (task headers, live reasoning
+    /// bodies) after a tree-gap insertion moved rows at/below `shift.at`
+    /// down. The statically-tracked records were already renumbered by
+    /// `commit_tree_gap`.
+    fn apply_tree_shift(&self, shift: &crate::ui::orchestrator::TreeShift) {
+        if let Ok(mut os) = self.orch_state.lock() {
+            for info in os.tasks.values_mut() {
+                if info.header_line_num >= shift.at {
+                    info.header_line_num += shift.by;
+                }
+            }
+        }
+        if let Ok(mut guard) = self.live_worker_reasoning.lock() {
+            for state in guard.values_mut() {
+                if state.body_line_num >= shift.at {
+                    state.body_line_num += shift.by;
+                }
+            }
+        }
+        if let Ok(mut guard) = self.live_reasoning.lock()
+            && let Some(state) = guard.as_mut()
+            && state.body_line_num >= shift.at
+        {
+            state.body_line_num += shift.by;
+        }
+    }
+
+    /// Apply one `aura.orchestrator.worker_reasoning` delta to its task's
+    /// live block, opening the block (a `└─ ● Reasoning` tree entry with an
+    /// in-place-updated body row) on the task's first chunk. Concurrent
+    /// tasks each own an entry in `live_worker_reasoning`, so interleaved
+    /// deltas update separate rows instead of tearing down a shared block.
+    fn on_worker_reasoning(&mut self, val: &serde_json::Value) {
+        let content = val.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            return;
+        }
+        let task_id = match val.get("task_id") {
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => return,
+        };
+        let worker_id = val
+            .get("worker_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let need_init = match self.live_worker_reasoning.lock() {
+            Ok(g) => !g.contains_key(&task_id),
+            Err(_) => return,
+        };
+        if need_init {
+            // A live top-level block assumes nothing prints below its body
+            // rows (its extension path appends at the scrollback bottom) —
+            // close it before this block prints tree rows.
+            flush_live_reasoning(&self.live_reasoning);
+
+            // Same stop-anim/erase-frame dance as `on_reasoning`: opening
+            // the block prints scrollback rows.
+            let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
+                if let Some((ptw_anim, _)) = guard.take() {
+                    ptw_anim.finish();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !had_ptw && !self.anim_cleared.load(Ordering::Relaxed) {
+                stop_and_clear_animation(&self.stop_flag);
+                self.anim_cleared.store(true, Ordering::Relaxed);
+            }
+
+            let fields: BTreeMap<String, serde_json::Value> = match val.as_object() {
+                Some(obj) => obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                None => BTreeMap::new(),
+            };
+            let mut new_state = LiveReasoning {
+                agent_id: worker_id.clone(),
+                parent_agent_id: Some("coordinator".to_string()),
+                task_id: Some(task_id.clone()),
+                combined: String::new(),
+                fields,
+                started: false,
+                body_line_num: 0,
+                body_line_text: String::new(),
+                body_visual_rows: 1,
+                is_worker: true,
+            };
+            let tree_shift = {
+                let _term = lock_term();
+                erase_input_frame();
+                open_worker_reasoning_block(&mut new_state, &task_id, &worker_id)
+            };
+            // The new block's own rows carry post-gap numbers; shifting the
+            // map before inserting it renumbers only the other tasks' rows.
+            if let Some(shift) = tree_shift {
+                self.apply_tree_shift(&shift);
+            }
+            let (wave_anim, wave_stop) = {
+                let _term = lock_term();
+                WaveAnimation::start(
+                    "Thinking",
+                    vec![],
+                    self.input_buf.clone(),
+                    Some(self.cancel.clone()),
+                )
+            };
+            if let Ok(mut guard) = self.post_tool_wave.lock() {
+                *guard = Some((wave_anim, wave_stop));
+            }
+            prepare_input_line(&self.input_buf, Some(&self.cancel));
+            self.anim_cleared.store(false, Ordering::Relaxed);
+            if let Ok(mut guard) = self.live_worker_reasoning.lock() {
+                guard.insert(task_id.clone(), new_state);
+            }
+        }
+
+        if let Ok(mut guard) = self.live_worker_reasoning.lock() {
+            let Some(state) = guard.get_mut(&task_id) else {
+                return;
+            };
+            let _term = lock_term();
+            apply_reasoning_chunk(state, content);
+            // Keep `ORCH_LAST_TOOL_LINES` in sync so the next tool's
+            // connector upgrade redraws the body with the latest content.
+            let body = worker_reasoning_body_for_terminal(&state.body_line_text);
+            crate::ui::orchestrator::update_orch_last_tool_duration_text(&task_id, &body);
+        }
+    }
 }
 
 impl StreamHandler for ReplStreamHandler {
@@ -2227,6 +2421,16 @@ impl StreamHandler for ReplStreamHandler {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        // Worker deltas (parent_agent_id set) are rendered per-task from
+        // `aura.orchestrator.worker_reasoning`, which precedes this mirror
+        // on the wire and carries the task_id that demultiplexes concurrent
+        // workers. Drop the mirror so each delta renders once. A server
+        // that emits only the mirror never sets the flag, and the legacy
+        // single-block path below still renders its worker reasoning.
+        if parent_agent_id.is_some() && self.worker_reasoning_seen.load(Ordering::Relaxed) {
+            return;
+        }
+
         // Switching agents closes the previous block.
         let agent_changed = match self.live_reasoning.lock() {
             Ok(g) => g.as_ref().is_some_and(|s| s.agent_id != agent_id),
@@ -2296,15 +2500,19 @@ impl StreamHandler for ReplStreamHandler {
                 body_visual_rows: 1,
                 is_worker: effective_worker,
             };
-            {
+            let tree_shift = {
                 let _term = lock_term();
                 erase_input_frame();
                 if effective_worker {
                     let tid = task_id.as_deref().unwrap_or("");
-                    open_worker_reasoning_block(&mut new_state, tid);
+                    open_worker_reasoning_block(&mut new_state, tid, agent_id)
                 } else {
                     open_top_level_reasoning_block(&mut new_state, agent_id);
+                    None
                 }
+            };
+            if let Some(shift) = tree_shift {
+                self.apply_tree_shift(&shift);
             }
             // Restart the Thinking spinner so it
             // stays visible while reasoning chunks
@@ -2636,16 +2844,16 @@ impl StreamHandler for ReplStreamHandler {
             return;
         }
 
-        // The server emits `aura.orchestrator.worker_reasoning`
-        // alongside every `aura.reasoning` delta from a
-        // worker. We already render the reasoning via
-        // the dedicated `on_reasoning` path (which has
-        // the worker's agent_id and richer correlation
-        // context), and processing the orch mirror here
-        // would call `erase_input_frame` mid-stream and
-        // corrupt the running `● Reasoning - <agent>`
-        // block. Drop it before any frame work runs.
+        // Worker reasoning deltas carry the `task_id` that demultiplexes
+        // concurrent same-wave workers, so orchestrated runs render from
+        // this event (each task streams into its own tree row) and
+        // `on_reasoning` drops the per-delta `aura.reasoning` mirror the
+        // server emits right after it. Handled above the frame machinery:
+        // chunks after a block's first are in-place row rewrites that must
+        // not disturb the input frame.
         if event_name == event_names::WORKER_REASONING {
+            self.worker_reasoning_seen.store(true, Ordering::Relaxed);
+            self.on_worker_reasoning(val);
             return;
         }
 
@@ -2800,6 +3008,7 @@ impl StreamHandler for ReplStreamHandler {
                     );
                     crate::ui::prompt::increment_orch_scrollback();
                     // No blank line – tool calls follow directly
+                    crate::ui::orchestrator::note_orch_task_tree_end(&task_id);
                     if let Ok(mut os) = self.orch_state.lock() {
                         os.tasks.insert(
                             task_id.clone(),
@@ -2822,6 +3031,10 @@ impl StreamHandler for ReplStreamHandler {
                     let tool_initiator_id = get_str(val, "tool_initiator_id");
                     let tool_call_id = get_str(val, "tool_call_id");
                     let task_id_str = get_str(val, "task_id");
+                    // This task's reasoning stretch is over — close its live
+                    // block (other tasks' blocks keep streaming) so the
+                    // DisplayEvent lands before the tool's in replay order.
+                    flush_worker_reasoning_for_task(&self.live_worker_reasoning, &task_id_str);
                     let display_name = snake_to_pascal_case(&tool_name);
                     let args_obj = parse_args(val);
                     let args_summary = args_obj.as_ref()
@@ -2874,13 +3087,27 @@ impl StreamHandler for ReplStreamHandler {
                     } else {
                         &tool_initiator_id
                     };
-                    crate::ui::prompt::register_orch_tool(
-                        match_id,
-                        &task_id_str,
-                        &tool_display,
-                        std::time::Instant::now(),
-                        &fields,
-                    );
+                    // Coordinator-owned calls (worker "main") belong to no
+                    // task: render at the top level, outside any task tree.
+                    if get_str(val, "worker_id") == "main" {
+                        crate::ui::orchestrator::register_orch_top_level_tool(
+                            match_id,
+                            &tool_display,
+                            std::time::Instant::now(),
+                            &fields,
+                        );
+                    } else {
+                        let tree_shift = crate::ui::prompt::register_orch_tool(
+                            match_id,
+                            &task_id_str,
+                            &tool_display,
+                            std::time::Instant::now(),
+                            &fields,
+                        );
+                        if let Some(shift) = tree_shift {
+                            self.apply_tree_shift(&shift);
+                        }
+                    }
                     // Track tool under its task
                     if let Ok(mut os) = self.orch_state.lock() {
                         if let Some(task) = os.tasks.get_mut(&task_id_str) {
@@ -2927,6 +3154,7 @@ impl StreamHandler for ReplStreamHandler {
                     let worker_id = get_str(val, "worker_id");
                     let task_id = get_str(val, "task_id");
                     let result = get_str(val, "result");
+                    flush_worker_reasoning_for_task(&self.live_worker_reasoning, &task_id);
                     // Look up task info and overwrite the header line in-place
                     let task_info = if let Ok(mut os) = self.orch_state.lock() {
                         os.tasks.remove(&task_id)
@@ -3072,6 +3300,7 @@ impl StreamHandler for ReplStreamHandler {
 
     fn on_approval_pending(&mut self, pending: &aura_events::ApprovalPending) {
         flush_live_reasoning(&self.live_reasoning);
+        flush_all_worker_reasoning(&self.live_worker_reasoning);
 
         // Stop animation — same dance as on_tool_complete / on_orchestrator_event.
         let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {
@@ -3271,6 +3500,7 @@ impl StreamHandler for ReplStreamHandler {
 
     fn on_approval_completed(&mut self, completed: &aura_events::ApprovalCompleted) {
         flush_live_reasoning(&self.live_reasoning);
+        flush_all_worker_reasoning(&self.live_worker_reasoning);
 
         // Stop animation.
         let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {

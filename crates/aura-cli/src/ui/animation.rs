@@ -369,18 +369,22 @@ impl WaveAnimation {
                             let mut stdout = io::stdout();
                             let last_tool_map = ORCH_LAST_TOOL_LINES.lock().ok();
                             for tool in tools.iter() {
-                                let bullet_up = (total_sb + 3).saturating_sub(tool.bullet_line_num);
-                                let duration_up =
-                                    (total_sb + 3).saturating_sub(tool.duration_line_num);
+                                let tool_bullet_line = tool.bullet_line_num.load(Ordering::Relaxed);
+                                let tool_duration_line =
+                                    tool.duration_line_num.load(Ordering::Relaxed);
+                                let bullet_up = (total_sb + 3).saturating_sub(tool_bullet_line);
+                                let duration_up = (total_sb + 3).saturating_sub(tool_duration_line);
                                 if bullet_up >= th as u32 || duration_up >= th as u32 {
                                     continue;
                                 }
                                 let is_last = last_tool_map
                                     .as_ref()
                                     .and_then(|m| m.get(&tool.task_id))
-                                    .map(|info| info.bullet_line_num == tool.bullet_line_num)
+                                    .map(|info| info.bullet_line_num == tool_bullet_line)
                                     .unwrap_or(false);
-                                let (b_prefix, d_prefix) = if is_last {
+                                let (b_prefix, d_prefix) = if tool.top_level {
+                                    ("", "")
+                                } else if is_last {
                                     (
                                         super::orchestrator::TREE_END_BULLET,
                                         super::orchestrator::TREE_END_DURATION,

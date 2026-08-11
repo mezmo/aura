@@ -351,6 +351,11 @@ pub fn replay_event_log_global() {
                         DisplayEvent::OrchestratorToolCallStarted {
                             tool_name, fields, ..
                         } => {
+                            // Coordinator-owned calls (worker "main") render
+                            // at the top level, not inside a task tree.
+                            if fields.get("worker_id").and_then(|v| v.as_str()) == Some("main") {
+                                break;
+                            }
                             let dn = snake_to_pascal_case(tool_name);
                             let args = format_orch_args_summary(fields);
                             entries.push(TaskEntry::Tool {
@@ -387,7 +392,7 @@ pub fn replay_event_log_global() {
                             content,
                             agent_id,
                             fields,
-                        } if agent_id == worker_id => {
+                        } if reasoning_event_matches_task(fields, agent_id, task_id, worker_id) => {
                             entries.push(TaskEntry::Reasoning {
                                 content: content.clone(),
                                 fields: fields.clone(),
@@ -507,11 +512,16 @@ pub fn replay_event_log_global() {
                             content,
                             fields: reasoning_fields,
                         } => {
+                            let label = if worker_id.is_empty() {
+                                "Reasoning".to_string()
+                            } else {
+                                format!("Reasoning - {worker_id}")
+                            };
                             println!(
                                 "{}{} {}",
                                 b_prefix.themed(AuraStyle::Connector),
                                 "●".with(bc),
-                                "Reasoning".themed(AuraStyle::Primary),
+                                label.as_str().themed(AuraStyle::Primary),
                             );
                             // Worker reasoning body is a single line in the
                             // live display; flatten whitespace and truncate
@@ -543,7 +553,44 @@ pub fn replay_event_log_global() {
                 println!();
                 i = j;
             }
-            DisplayEvent::OrchestratorToolCallStarted { .. } => {
+            DisplayEvent::OrchestratorToolCallStarted {
+                tool_name, fields, ..
+            } => {
+                // Coordinator-owned calls (worker "main") render at the top
+                // level; task-owned calls are rendered by the task walk above.
+                if fields.get("worker_id").and_then(|v| v.as_str()) == Some("main") {
+                    let dn = snake_to_pascal_case(tool_name);
+                    let args = format_orch_args_summary(fields);
+                    let call_id = fields.get("tool_call_id").and_then(|v| v.as_str());
+                    let duration_ms = events[i + 1..].iter().find_map(|e| match e {
+                        DisplayEvent::OrchestratorToolCallCompleted {
+                            duration_ms,
+                            fields: cf,
+                            ..
+                        } if call_id.is_none()
+                            || cf.get("tool_call_id").and_then(|v| v.as_str()) == call_id =>
+                        {
+                            *duration_ms
+                        }
+                        _ => None,
+                    });
+                    let bc = task_color_for("__orchestrator__");
+                    println!(
+                        "{} {}",
+                        "●".with(bc),
+                        format!("{dn}({args})").as_str().themed(AuraStyle::Primary),
+                    );
+                    if let Some(ms) = duration_ms {
+                        println!(
+                            "{} {}",
+                            "⎿".themed(AuraStyle::Connector),
+                            format!("completed in {}", format_orch_duration_ms(ms))
+                                .as_str()
+                                .themed(AuraStyle::Muted),
+                        );
+                    }
+                    println!();
+                }
                 i += 1;
             }
             DisplayEvent::OrchestratorToolCallCompleted { .. } => {
@@ -692,6 +739,23 @@ fn format_orch_args_summary(fields: &BTreeMap<String, serde_json::Value>) -> Str
             .collect::<Vec<_>>()
             .join(", "),
         None => String::new(),
+    }
+}
+
+/// A flushed reasoning block belongs to a task when its persisted `task_id`
+/// field matches. Blocks without one (single-agent runs, or servers that
+/// emit only the `aura.reasoning` worker mirror) fall back to matching the
+/// task's worker id.
+fn reasoning_event_matches_task(
+    fields: &BTreeMap<String, serde_json::Value>,
+    agent_id: &str,
+    task_id: &str,
+    worker_id: &str,
+) -> bool {
+    match fields.get("task_id") {
+        Some(serde_json::Value::Number(n)) => n.to_string() == task_id,
+        Some(serde_json::Value::String(s)) => s == task_id,
+        _ => agent_id == worker_id,
     }
 }
 
