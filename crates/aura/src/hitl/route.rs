@@ -131,6 +131,11 @@ pub enum DecisionRoute {
 impl DecisionRoute {
     /// Obtain a decision for `request`, applying the shared semantics (deadline,
     /// fail-closed mapping, event emission) in one place.
+    ///
+    /// Both surfaces await this inline from the gated call's `execute_tool`
+    /// span, so stamping the decision id on the current span here — ahead of
+    /// the route split and of any outcome — correlates the approval with the
+    /// execution it gates on either route, decided or not.
     pub async fn decide(
         &self,
         request: ApprovalRequest,
@@ -140,6 +145,12 @@ impl DecisionRoute {
         let request_id = request.request_id.clone();
         let decision_id = request.decision_id;
         let scope = request.scope.clone();
+
+        crate::logging::set_span_attribute(
+            &tracing::Span::current(),
+            crate::logging::ATTR_DECISION_ID,
+            decision_id.to_string(),
+        );
 
         match self {
             Self::Conversational { registry, timeout } => {

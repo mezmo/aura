@@ -416,6 +416,25 @@ already reach the client ungated (`streaming/handlers.rs:848-855`), because the
 attended prompt and the decision record are protocol rather than optional
 telemetry.
 
+## Trace correlation
+
+`DecisionRoute::decide` stamps the request's `decision_id` on the current span,
+which is the gated call's Rig `execute_tool` span: both surfaces await `decide`
+inline, and `WrappedTool` carries that span across the approval gate into the
+inner tool. One stamp, ahead of the route split, gives every approval-gated
+execution the id the payload and the lifecycle events carry:
+
+```text
+execute_tool
+  decision_id = "019f…"
+  └── mcp.tool_call
+        status = OK | ERROR
+```
+
+A trace consumer joins the approval to the result of the action it released
+without a second reporting channel. Ungated calls never reach `decide`, so they
+carry no `decision_id`.
+
 ## Orchestration behavior
 
 Workers share the parent's request id, so `approval_pending` events from a parked

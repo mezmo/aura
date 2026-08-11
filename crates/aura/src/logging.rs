@@ -131,6 +131,12 @@ pub const ATTR_TOOL_RESULT: &str = "tool.result";
 pub const ATTR_TOOL_RESULT_LENGTH: &str = "tool.result.length";
 pub const ATTR_TOOL_CANCELLED: &str = "tool.cancelled";
 
+// HITL attribute (used by `hitl::route`)
+
+/// Handle of the human approval decision gating a tool call — the same
+/// `decision_id` the approval payload and lifecycle events carry.
+pub const ATTR_DECISION_ID: &str = "decision_id";
+
 // --- Content recording configuration ---
 
 static RECORD_CONTENT: AtomicBool = AtomicBool::new(false);
