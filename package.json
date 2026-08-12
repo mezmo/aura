@@ -19,7 +19,8 @@
   "scripts": {
     "commitlint": "commitlint-mzm --format=pretty",
     "release": "semantic-release",
-    "release:dry": "semantic-release --no-ci --dry-run --branches=${BRANCH_NAME:-main}"
+    "release:dry": "semantic-release --no-ci --dry-run --branches=${BRANCH_NAME:-main}",
+    "release:version": "node scripts/next-version.mjs"
   },
   "repository": {
     "type": "git",

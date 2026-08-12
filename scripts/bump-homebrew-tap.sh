@@ -53,7 +53,7 @@ git clone --depth 1 "${CLONE_URL}" "${WORKDIR}/tap"
 cd "${WORKDIR}/tap"
 
 for f in Formula/*.rb; do
-  awk -v ver="${VERSION}" -v ck="${CHECKSUMS}" -v have="${HAVE_CHECKSUMS}" '
+  awk -v ver="${VERSION}" -v ck="${CHECKSUMS}" -v have="${HAVE_CHECKSUMS}" -v dry="${DRY_RUN}" '
     BEGIN { if (have) while ((getline l < ck) > 0) { n = split(l, a, /  +/); sums[a[2]] = a[1] } }
     /^[[:space:]]*version "/ { sub(/"[^"]+"/, "\"" ver "\""); print; next }
     /^[[:space:]]*url "/ {
@@ -61,7 +61,10 @@ for f in Formula/*.rb; do
     }
     pend != "" && /sha256 "/ {
       if (!have) { pend = ""; print; next }
-      if (!(pend in sums)) { print "error: no checksum for " pend > "/dev/stderr"; exit 2 }
+      if (!(pend in sums)) {
+        if (dry) { print "warning: no checksum for " pend " (dry run — leaving hash)" > "/dev/stderr"; pend = ""; print; next }
+        print "error: no checksum for " pend > "/dev/stderr"; exit 2
+      }
       sub(/"[0-9a-f]+"/, "\"" sums[pend] "\""); pend = ""; print; next
     }
     { print }

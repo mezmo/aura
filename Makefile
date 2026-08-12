@@ -41,6 +41,9 @@ RUNNER_TOOLCHAIN_ENV := -e CARGO_HOME=/home/aura/.cargo -e RUSTUP_HOME=/home/aur
 # Compiler-cache passthrough, gated on the CI toggle so local $(RUN) is
 # unchanged. Bare -e copies AWS values from the host environment.
 SCCACHE_RUN_ENV = $(if $(AURA_RUSTC_WRAPPER),-e RUSTC_WRAPPER=$(AURA_RUSTC_WRAPPER) -e SCCACHE_BUCKET -e SCCACHE_REGION -e SCCACHE_S3_KEY_PREFIX -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY,)
+# Cloudsmith values for publish-packages, gated on the key so local $(RUN) is
+# unchanged. Bare -e copies them from the host environment.
+CLOUDSMITH_RUN_ENV = $(if $(CLOUDSMITH_API_KEY),-e CLOUDSMITH_API_KEY -e CLOUDSMITH_REPO -e CLOUDSMITH_DISTRO,) $(if $(DRY_RUN),-e DRY_RUN,)
 # Native (non-Docker) builds run cargo directly in this process's environment,
 # so translate the AURA_RUSTC_WRAPPER toggle into the RUSTC_WRAPPER cargo reads.
 # The SCCACHE_* and AWS values are inherited from the host env alongside it.
@@ -50,7 +53,7 @@ ifneq ($(AURA_RUSTC_WRAPPER),)
 RUSTC_WRAPPER := $(AURA_RUSTC_WRAPPER)
 endif
 endif
-RUNNER_CMD = $(DOCKER_RUN) --env-file=$(DOCKER_ENV) $(RUNNER_TOOLCHAIN_ENV) $(SCCACHE_RUN_ENV) $(if $(filter true, $(IS_CI)), ,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
+RUNNER_CMD = $(DOCKER_RUN) --env-file=$(DOCKER_ENV) $(RUNNER_TOOLCHAIN_ENV) $(SCCACHE_RUN_ENV) $(CLOUDSMITH_RUN_ENV) $(if $(filter true, $(IS_CI)), ,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 RUNNER_NO_ENV_CMD = $(DOCKER_RUN) $(if $(filter true, $(IS_CI)),,-t) -v $(PWD):/home/aura $(AURA_RUNNER_IMAGE)
 DOCKER_RUN_BUILD_ENV := $(RUNNER_CMD)
 BUILD_SLUG := $(call slugify, $(BUILD_TAG))

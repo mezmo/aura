@@ -10,6 +10,10 @@ def RELEASE_CREDENTIALS = [
      credentialsId: 'github-app-key-mezmo-aura',
      passwordVariable: 'GITHUB_TOKEN',
      usernameVariable: 'GITHUB_APP'
+   ),
+   string(
+     credentialsId: 'cloudsmith-api-key',
+     variable: 'CLOUDSMITH_API_KEY'
    )
 ]
 
@@ -319,46 +323,82 @@ pipeline {
           }
         }
 
-        // Cheap release preview: confirms commits parse and a version
-        // computes, with no image build (that happens at main Release).
-        stage('Release Dry Run') {
-          when {
-            beforeAgent true
-            not {
-              expression { CURRENT_BRANCH == DEFAULT_BRANCH }
-            }
-          }
-
-          agent {
-            node {
-              label 'ec2-fleet-oss'
-              customWorkspace("/tmp/workspace/${BUILD_SLUG}-dryrun")
-            }
-          }
-
-          tools {
-            nodejs 'NodeJS 24'
-          }
-
-          environment {
-            GIT_BRANCH = "${CURRENT_BRANCH}"
-            BRANCH_NAME = "${CURRENT_BRANCH}"
-            CHANGE_ID = ''
-            ENABLE_DOCKER = 'false'
-          }
-
-          steps {
-            // package-lock=false in .npmrc means npm ci cannot be used.
-            sh 'npm install'
-            sh "git checkout -B ${CURRENT_BRANCH}"
-            withReport('Release Test', "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer")
-          }
-        }
       }
 
       post {
         always {
           sh 'make test-integration-down'
+        }
+      }
+    }
+
+    // Release preview: confirms commits parse, a version computes, and the
+    // package publish authenticates. Sequential, because it rewrites crate
+    // versions in the workspace the test lane also builds in.
+    stage('Release Dry Run') {
+      when {
+        beforeAgent true
+        not {
+          anyOf {
+            changelog '\\[skip ci\\]'
+            expression { CURRENT_BRANCH == DEFAULT_BRANCH }
+          }
+        }
+      }
+
+      environment {
+        GIT_BRANCH = "${CURRENT_BRANCH}"
+        BRANCH_NAME = "${CURRENT_BRANCH}"
+        SCCACHE_BUCKET = "${BUILD_CACHE_BUCKET}"
+        SCCACHE_REGION = "${BUILD_CACHE_REGION}"
+        SCCACHE_S3_KEY_PREFIX = 'aura/sccache/'
+      }
+
+      steps {
+        script {
+          // This stage commits and rewrites crate versions in the workspace
+          // that later stages build from, so the tree is restored once the dry
+          // run is done with it.
+          def startSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+          try {
+            sh "git checkout -B ${CURRENT_BRANCH}"
+
+            // A breaking empty commit guarantees a version is computed, so the
+            // verify path runs on every change request.
+            sh "git commit --allow-empty -m 'feat!: exercise the release dry run' -m 'BREAKING CHANGE: forced bump'"
+
+            def nextVersion = sh(
+              script: "npm run --silent release:version 'file://${env.WORKSPACE}'",
+              returnStdout: true
+            ).trim()
+            if (!nextVersion) {
+              error('Release dry run computed no version')
+            }
+            echo "Release dry run version: ${nextVersion}"
+
+            sh "./scripts/set-version.sh ${nextVersion}"
+
+            // One arch, so verifyReleaseCmd has a real package to dry-run push.
+            withCredentials([
+              aws(
+                credentialsId: 'oss-aws-build-cache',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+              )
+            ]) {
+              withEnv(['AURA_RUSTC_WRAPPER=sccache']) {
+                sh 'make build-binary-linux-amd64'
+              }
+            }
+
+            sh "ARCHS=amd64 make build-packages"
+
+            withCredentials(RELEASE_CREDENTIALS) {
+              withReport('Release Test', "npm run release:dry -- --repository-url=file://${env.WORKSPACE} --plugins @semantic-release/commit-analyzer @semantic-release/exec")
+            }
+          } finally {
+            sh "git reset --hard ${startSha}"
+          }
         }
       }
     }
@@ -411,16 +451,12 @@ pipeline {
       stages {
         stage('Compute Release Version') {
           steps {
-            withCredentials(RELEASE_CREDENTIALS) {
-              script {
-                try {
-                  sh 'npm run release:dry -- --plugins @semantic-release/commit-analyzer @semantic-release/exec'
-                  env.NEXT_RELEASE_VERSION = fileExists('.next-release-version') ? readFile('.next-release-version').trim() : ''
-                } finally {
-                  sh 'rm -f .next-release-version'
-                }
-                echo env.NEXT_RELEASE_VERSION ? "Release version: ${env.NEXT_RELEASE_VERSION}" : 'No release version determined; skipping build'
-              }
+            script {
+              env.NEXT_RELEASE_VERSION = sh(
+                script: 'npm run --silent release:version',
+                returnStdout: true
+              ).trim()
+              echo env.NEXT_RELEASE_VERSION ? "Release version: ${env.NEXT_RELEASE_VERSION}" : 'No release version determined; skipping build'
             }
           }
         }

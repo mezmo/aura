@@ -14,6 +14,7 @@
 
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="Apache License, Version 2.0"></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-green" alt="Model Context Protocol compatible"></a>
+  <a href="https://cloudsmith.com"><img src="https://img.shields.io/badge/OSS%20hosting%20by-cloudsmith-blue?logo=cloudsmith" alt="OSS hosting by Cloudsmith"></a>
 </div>
 
 Connect your stack through guided setup, and AURA's preconfigured team of agents starts investigating incidents using the models you already rely on. From there, customize existing agents or add new ones to fit your infrastructure and SRE workflows.
@@ -118,6 +119,10 @@ Through compatible [MCP](https://modelcontextprotocol.io) servers, AURA agents c
 ## Community
 
 Join the [AURA Slack community](https://mezmo.com/r/slack-aura) to ask questions, share what you are building, and help shape the roadmap.
+
+## Package Hosting
+
+Package repository hosting is graciously provided by [Cloudsmith](https://cloudsmith.com), the only fully hosted, cloud-native, universal package management solution — letting your organization create, store, and share packages in any format, to any place, with total confidence.
 
 ## License
 

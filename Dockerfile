@@ -21,6 +21,11 @@ ARG NFPM_VERSION=2.47.0
 ARG NFPM_SHA256_AMD64=0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
 ARG NFPM_SHA256_ARM64=1c0f5f2999b9a974bfb04fdb0cc3306096de530ac5dbb25d739cc5f5219c919c
 
+# The cloudsmith CLI publishes the .deb/.rpm packages.
+ARG CLOUDSMITH_VERSION=1.21.0
+ARG CLOUDSMITH_SHA256_AMD64=e3729f8fc58e44ae9f7f50af197ab9d99b4b70551b7cbe83cf423d58aadc390b
+ARG CLOUDSMITH_SHA256_ARM64=50c3fd0d7486eb9577bd713240c04f3d9d75a9da424ea944a51b105e13e15901
+
 ### 000 Chef
 FROM lukemathwalker/cargo-chef:latest-rust-1.95@sha256:00c3c07c51d092325df88f0df2d626cd4302e12933f179ba154509cc314d6c2a AS chef
 
@@ -158,6 +163,28 @@ RUN <<EOR
   tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
   rm /tmp/nfpm.tar.gz /tmp/nfpm.tar.gz.sha256
   nfpm --version
+EOR
+
+# A PyInstaller bundle: the executable resolves its payload beside its real
+# path, so the directory is unpacked whole and only the entrypoint linked.
+ARG CLOUDSMITH_VERSION
+ARG CLOUDSMITH_SHA256_AMD64
+ARG CLOUDSMITH_SHA256_ARM64
+RUN <<EOR
+  set -e
+  case "$(uname -m)" in
+    x86_64)  cs_arch=x86_64;  cs_sha=${CLOUDSMITH_SHA256_AMD64};;
+    aarch64) cs_arch=aarch64; cs_sha=${CLOUDSMITH_SHA256_ARM64};;
+    *) echo "unsupported build arch: $(uname -m)" >&2; exit 1;;
+  esac
+  curl -fsSL -o /tmp/cloudsmith.tar.gz "https://github.com/cloudsmith-io/cloudsmith-cli/releases/download/v${CLOUDSMITH_VERSION}/cloudsmith-${CLOUDSMITH_VERSION}-linux-${cs_arch}-gnu.tar.gz"
+  printf '%s  /tmp/cloudsmith.tar.gz\n' "${cs_sha}" > /tmp/cloudsmith.tar.gz.sha256
+  sha256sum -c /tmp/cloudsmith.tar.gz.sha256
+  mkdir -p /opt/cloudsmith
+  tar -xzf /tmp/cloudsmith.tar.gz --strip-components=1 -C /opt/cloudsmith
+  ln -s /opt/cloudsmith/cloudsmith /usr/local/bin/cloudsmith
+  rm /tmp/cloudsmith.tar.gz /tmp/cloudsmith.tar.gz.sha256
+  cloudsmith --version
 EOR
 
 COPY --from=sccache-dl /usr/local/bin/sccache /usr/local/bin/sccache

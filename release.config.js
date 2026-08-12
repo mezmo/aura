@@ -45,8 +45,10 @@ module.exports = {
   dockerTags,
   // https://github.com/semantic-release/exec
   prepareCmd: `./scripts/set-version.sh \${nextRelease.version}`,
-  verifyReleaseCmd: `echo \${nextRelease.version} > .next-release-version && ./scripts/bump-homebrew-tap.sh --dry-run \${nextRelease.version}`,
-  successCmd: `./scripts/bump-homebrew-tap.sh \${nextRelease.version}`,
+  // The dry-run push needs the packages already in dist/, so a release dry run
+  // has to be preceded by `make build-packages`.
+  verifyReleaseCmd: `./scripts/bump-homebrew-tap.sh --dry-run \${nextRelease.version} && DRY_RUN=1 make publish-packages`,
+  successCmd: `./scripts/bump-homebrew-tap.sh \${nextRelease.version} && make publish-packages`,
   // https://github.com/esatterwhite/semantic-release-docker
   dockerProject: 'mezmo',
   dockerImage: 'aura',
@@ -63,4 +65,5 @@ module.exports = {
   plugins: plugins
 }
 
-console.dir(module.exports, {depth: 10})
+// stderr, so a caller reading a version off stdout is not fed the config.
+console.error(require('node:util').inspect(module.exports, {depth: 10}))

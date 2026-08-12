@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install AURA binaries from GitHub Releases.
+# Install AURA from the package repository or from GitHub Releases.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/mezmo/aura/main/scripts/install.sh | bash
@@ -15,8 +15,12 @@
 # "auto" prefers a native package (deb, then rpm) when the matching package
 # manager is present and it can install as root without an interactive prompt
 # (already root, or passwordless sudo); otherwise it falls back to Homebrew and
-# finally a direct binary download. "deb" and "rpm" force a system package and
-# install to /usr/bin, escalating with sudo if needed.
+# finally a direct binary download. "deb" and "rpm" register the AURA package
+# repository and install through apt/dnf/yum/zypper, escalating with sudo if
+# needed, so later upgrades come from the package manager.
+#
+# AURA_REQUIRE_CHECKSUM and AURA_CHECKSUMS apply to the "direct" method only;
+# package installs are verified by the repository's GPG signatures instead.
 
 set -euo pipefail
 
@@ -30,9 +34,17 @@ REQUIRE_CHECKSUM="${AURA_REQUIRE_CHECKSUM:-1}"
 INSTALL_METHOD="${AURA_INSTALL_METHOD:-auto}"
 BASE_URL="https://github.com/${REPO}/releases"
 
-# RPM release field baked into the package asset names; mirrors nfpm's default
-# in scripts/build-packages.sh (which does not set `release`).
-RPM_RELEASE=1
+# Package repository, and the fingerprint-named URL of its signing key.
+PACKAGE_REPO_URL="https://dl.cloudsmith.io/public/${REPO}"
+PACKAGE_KEY_URL="${PACKAGE_REPO_URL}/gpg.05C8AD333177EB1F.key"
+APT_SOURCE_FILE="/etc/apt/sources.list.d/mezmo-aura.list"
+APT_KEYRING_DIR="/usr/share/keyrings"
+YUM_REPO_FILE="/etc/yum.repos.d/mezmo-aura.repo"
+ZYPP_REPO_FILE="/etc/zypp/repos.d/mezmo-aura.repo"
+
+# Apt source suite used when the host's own is not indexed.
+DEB_FALLBACK_DISTRO="debian"
+DEB_FALLBACK_CODENAME="bookworm"
 
 case "${COMPONENT}" in
     all|server|cli) ;;
@@ -100,11 +112,23 @@ hard_available() {
     esac
 }
 
+# A repository install needs a resolving package manager, not bare dpkg or rpm.
 package_manager_present() {
     case "$1" in
-        deb) command -v dpkg >/dev/null 2>&1 ;;
-        rpm) command -v rpm >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 ;;
+        deb) command -v apt-get >/dev/null 2>&1 ;;
+        rpm) [[ -n "$(rpm_manager)" ]] ;;
     esac
+}
+
+# The RPM-family package manager to drive, preferring the distribution's native tool.
+rpm_manager() {
+    local manager
+    for manager in zypper dnf microdnf yum; do
+        if command -v "${manager}" >/dev/null 2>&1; then
+            printf '%s' "${manager}"
+            return
+        fi
+    done
 }
 
 # Whether we can run an install command as root non-interactively.
@@ -201,70 +225,189 @@ install_via_package() {
     fi
 
     detect_downloader
-    resolve_version
 
-    echo "Installing AURA ${VERSION} (${OS}/${ARCH}) via ${format} package(s)"
+    local pin=""
+    [[ "${VERSION}" != latest ]] && pin=" ${VERSION}"
+    echo "Installing AURA${pin} (${OS}/${ARCH}) from the ${format} package repository"
 
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf "${tmpdir}"' EXIT
+    case "${format}" in
+        deb) register_deb_repo "${sudo}" || return 1 ;;
+        rpm) register_rpm_repo "${sudo}" || return 1 ;;
+    esac
 
-    fetch_checksums "${tmpdir}"
-
-    # Download and verify every package before installing any, so a mid-way
-    # failure leaves nothing installed.
-    local target asset paths=()
-    for target in $(targets); do
-        asset="$(package_asset "${format}" "${target}")"
-        fetch_asset "${tmpdir}" "${asset}" || return 1
-        paths+=("${tmpdir}/${asset}")
-    done
-
-    install_packages "${format}" "${sudo}" "${paths[@]}"
+    install_from_repo "${format}" "${sudo}" || return 1
 
     echo ""
-    echo "Installed AURA ${VERSION} to /usr/bin"
+    echo "Installed AURA to /usr/bin"
+    echo "Upgrades now come from your package manager."
 }
 
-# Release asset filename for one package, mirroring nfpm's output names in
-# scripts/build-packages.sh (deb uses the Debian arch, rpm the RPM arch).
-package_asset() {
-    local format="$1" name="$2"
-    case "${format}" in
-        deb) printf '%s_%s_%s.deb' "${name}" "${VERSION}" "${ARCH}" ;;
-        rpm) printf '%s-%s-%s.%s.rpm' "${name}" "${VERSION}" "${RPM_RELEASE}" "$(rpm_arch)" ;;
+# Installs the signing key and echoes its path for signed-by, which accepts
+# either a dearmored keyring or an ASCII-armored key.
+install_apt_key() {
+    local sudo="$1" armored keyring
+    armored="$(mktemp)"
+    if ! fetch "${armored}" "${PACKAGE_KEY_URL}"; then
+        rm -f "${armored}"
+        echo "Error: failed to fetch the repository signing key from ${PACKAGE_KEY_URL}" >&2
+        return 1
+    fi
+
+    ${sudo} mkdir -p "${APT_KEYRING_DIR}"
+    if command -v gpg >/dev/null 2>&1; then
+        keyring="${APT_KEYRING_DIR}/mezmo-aura-archive-keyring.gpg"
+        gpg --dearmor <"${armored}" | ${sudo} tee "${keyring}" >/dev/null
+    else
+        keyring="${APT_KEYRING_DIR}/mezmo-aura-archive-keyring.asc"
+        ${sudo} tee "${keyring}" <"${armored}" >/dev/null
+    fi
+    rm -f "${armored}"
+    ${sudo} chmod 0644 "${keyring}"
+
+    printf '%s' "${keyring}"
+}
+
+# HTTPS needs TLS trust and, on apt older than 1.5, a separate transport.
+ensure_apt_transport() {
+    local sudo="$1" missing=()
+    [[ -e /etc/ssl/certs/ca-certificates.crt ]] || missing+=("ca-certificates")
+    [[ -e /usr/lib/apt/methods/https ]] || missing+=("apt-transport-https")
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    echo "  Installing apt prerequisites: ${missing[*]}"
+    # Unscoped: these come from the distribution's own repositories.
+    ${sudo} apt-get update -qq || true
+    if ! ${sudo} apt-get install -y "${missing[@]}"; then
+        echo "Error: could not install ${missing[*]}; install them and re-run." >&2
+        return 1
+    fi
+}
+
+register_deb_repo() {
+    local sudo="$1" distro codename keyring
+    ensure_apt_transport "${sudo}" || return 1
+
+    read -r distro codename <<<"$(deb_suite)"
+
+    keyring="$(install_apt_key "${sudo}")" || return 1
+
+    echo "  Configuring ${APT_SOURCE_FILE} for ${distro} ${codename}"
+    printf 'deb [signed-by=%s] %s/deb/%s %s main\n' \
+        "${keyring}" "${PACKAGE_REPO_URL}" "${distro}" "${codename}" \
+        | ${sudo} tee "${APT_SOURCE_FILE}" >/dev/null
+    ${sudo} chmod 0644 "${APT_SOURCE_FILE}"
+
+    # Refresh only this source, so an unrelated broken entry cannot fail the install.
+    ${sudo} apt-get update \
+        -o Dir::Etc::sourcelist="${APT_SOURCE_FILE}" \
+        -o Dir::Etc::sourceparts="-" \
+        -o APT::Get::List-Cleanup="0"
+}
+
+# The distro and codename for the apt source, derived from /etc/os-release.
+deb_suite() {
+    local id="" codename="" ubuntu_codename="" id_like=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-}"
+        codename="${VERSION_CODENAME:-}"
+        ubuntu_codename="${UBUNTU_CODENAME:-}"
+        id_like="${ID_LIKE:-}"
+    fi
+
+    local distro="" suite=""
+    if [[ "${id}" == debian || "${id}" == ubuntu ]] && [[ -n "${codename}" ]]; then
+        distro="${id}"
+        suite="${codename}"
+    elif [[ -n "${ubuntu_codename}" ]]; then
+        distro="ubuntu"
+        suite="${ubuntu_codename}"
+    elif [[ -n "${codename}" && "${id_like}" == *ubuntu* ]]; then
+        distro="ubuntu"
+        suite="${codename}"
+    elif [[ -n "${codename}" && "${id_like}" == *debian* ]]; then
+        distro="debian"
+        suite="${codename}"
+    fi
+
+    if [[ -z "${distro}" ]]; then
+        echo "Note: could not detect the distribution; using ${DEB_FALLBACK_DISTRO} ${DEB_FALLBACK_CODENAME} (packages are identical)." >&2
+        printf '%s %s' "${DEB_FALLBACK_DISTRO}" "${DEB_FALLBACK_CODENAME}"
+        return
+    fi
+
+    if url_missing "${PACKAGE_REPO_URL}/deb/${distro}/dists/${suite}/Release"; then
+        echo "Note: ${distro} ${suite} is not indexed; using ${DEB_FALLBACK_DISTRO} ${DEB_FALLBACK_CODENAME} (packages are identical)." >&2
+        printf '%s %s' "${DEB_FALLBACK_DISTRO}" "${DEB_FALLBACK_CODENAME}"
+        return
+    fi
+
+    printf '%s %s' "${distro}" "${suite}"
+}
+
+register_rpm_repo() {
+    local sudo="$1" manager repo_file
+    manager="$(rpm_manager)"
+    repo_file="$(rpm_repo_file "${manager}")"
+
+    echo "  Configuring ${repo_file} for ${manager}"
+    ${sudo} mkdir -p "$(dirname "${repo_file}")"
+    ${sudo} tee "${repo_file}" >/dev/null <<EOF
+[mezmo-aura]
+name=mezmo-aura
+baseurl=${PACKAGE_REPO_URL}/rpm/any-distro/any-version/\$basearch
+repo_gpgcheck=1
+gpgcheck=1
+enabled=1
+autorefresh=1
+gpgkey=${PACKAGE_KEY_URL}
+sslverify=1
+metadata_expire=300
+type=rpm-md
+EOF
+    ${sudo} chmod 0644 "${repo_file}"
+
+    # zypper would otherwise prompt to trust the key and hang a piped install.
+    if [[ "${manager}" == zypper ]]; then
+        ${sudo} zypper --gpg-auto-import-keys --non-interactive refresh mezmo-aura
+    fi
+}
+
+# zypper keeps its repositories outside the yum tree.
+rpm_repo_file() {
+    case "$1" in
+        zypper) printf '%s' "${ZYPP_REPO_FILE}" ;;
+        *)      printf '%s' "${YUM_REPO_FILE}" ;;
     esac
 }
 
-rpm_arch() {
-    case "${ARCH}" in
-        amd64) echo "x86_64" ;;
-        arm64) echo "aarch64" ;;
+install_from_repo() {
+    local format="$1" sudo="$2" manager target
+    case "${format}" in
+        deb) manager="apt-get" ;;
+        rpm) manager="$(rpm_manager)" ;;
+    esac
+
+    local packages=()
+    for target in $(targets); do
+        packages+=("$(package_spec "${manager}" "${target}")")
+    done
+
+    case "${manager}" in
+        apt-get) ${sudo} apt-get install -y "${packages[@]}" ;;
+        zypper)  ${sudo} zypper --non-interactive install "${packages[@]}" ;;
+        *)       ${sudo} "${manager}" install -y "${packages[@]}" ;;
     esac
 }
 
-install_packages() {
-    local format="$1" sudo="$2"
-    shift 2
-    case "${format}" in
-        deb)
-            if ! command -v dpkg >/dev/null 2>&1; then
-                echo "Error: dpkg not found; cannot install .deb packages." >&2
-                exit 1
-            fi
-            ${sudo} dpkg -i "$@"
-            ;;
-        rpm)
-            if command -v dnf >/dev/null 2>&1; then
-                ${sudo} dnf install -y "$@"
-            elif command -v yum >/dev/null 2>&1; then
-                ${sudo} yum install -y "$@"
-            elif command -v rpm >/dev/null 2>&1; then
-                ${sudo} rpm -Uvh "$@"
-            else
-                echo "Error: need dnf, yum, or rpm to install .rpm packages." >&2
-                exit 1
-            fi
-            ;;
+# Version-pinned package name: apt and zypper take name=version, dnf name-version.
+package_spec() {
+    local manager="$1" name="$2"
+    [[ "${VERSION}" == latest ]] && { printf '%s' "${name}"; return; }
+    case "${manager}" in
+        apt-get|zypper) printf '%s=%s' "${name}" "${VERSION}" ;;
+        *)              printf '%s-%s' "${name}" "${VERSION}" ;;
     esac
 }
 
@@ -320,6 +463,23 @@ fetch() {
     case "${DOWNLOADER}" in
         curl) curl -fsSL --connect-timeout 10 --retry 3 -o "${dest}" "${url}" ;;
         wget) wget -q --timeout=10 --tries=3 -O "${dest}" "${url}" ;;
+    esac
+}
+
+# True only when the server reports the URL absent; a transport failure is not
+# a negative answer.
+url_missing() {
+    local url="$1" status rc=0
+    case "${DOWNLOADER}" in
+        curl)
+            status="$(curl -sIL --connect-timeout 10 -o /dev/null -w '%{http_code}' "${url}" 2>/dev/null)"
+            [[ "${status}" == 404 ]]
+            ;;
+        wget)
+            # wget exits 8 when the server answered with an error status.
+            wget -q --spider --timeout=10 --tries=1 "${url}" 2>/dev/null || rc=$?
+            [[ "${rc}" -eq 8 ]]
+            ;;
     esac
 }
 

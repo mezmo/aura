@@ -234,9 +234,15 @@ build-checksums: ## Write sha256 checksums for the release artifacts (binaries +
 		[ -n "$$files" ] || { echo "error: no release artifacts found in $(DIST_DIR)" >&2; exit 1; }; \
 		printf '%s\n' "$$files" | xargs sha256sum > checksums.txt
 
+# ARCHS and PACKAGERS reach the script through env, which $(RUN) does not carry
+# into the container on its own.
 .PHONY: build-packages
 build-packages: $(DIST_DIR) $(DOCKER_ENV) ## Build .deb/.rpm packages from the linux binaries in dist (PACKAGE_VERSION overrides the version)
-	$(RUN) ./scripts/build-packages.sh $(PACKAGE_VERSION)
+	$(RUN) env ARCHS="$(ARCHS)" PACKAGERS="$(PACKAGERS)" ./scripts/build-packages.sh $(PACKAGE_VERSION)
+
+.PHONY: publish-packages
+publish-packages: $(DOCKER_ENV) ## Publish the .deb/.rpm packages in dist to Cloudsmith (requires CLOUDSMITH_API_KEY)
+	$(RUN) env PACKAGERS="$(PACKAGERS)" ./scripts/publish-packages.sh
 
 # Every binary a complete release must contain, across all platforms.
 EXPECTED_BINARIES := \
