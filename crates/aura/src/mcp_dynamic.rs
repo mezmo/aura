@@ -6,6 +6,9 @@ use rig::tool::{Tool as RigTool, ToolError};
 use rmcp::model::Tool as McpTool;
 use serde_json::Value;
 
+use crate::approver_headers::{
+    McpTransportKind, current_approver_overrides, ensure_transport_delivers_overrides,
+};
 use crate::mcp_streamable_http::McpClient;
 use crate::mcp_tool_execution::execute_mcp_tool;
 
@@ -16,14 +19,29 @@ pub struct McpToolAdaptor {
     #[allow(dead_code)]
     server_name: String,
     client: Arc<McpClient>,
+    /// Which transport this adaptor fronts, tagged at construction. The
+    /// approver-override path fails closed on transports that cannot
+    /// deliver per-request headers.
+    transport_kind: McpTransportKind,
 }
 
 impl McpToolAdaptor {
-    pub fn new(tool: McpTool, server_name: String, client: Arc<McpClient>) -> Self {
+    /// `transport_kind` must name the transport `client` actually fronts;
+    /// the type cannot enforce it because one `McpClient` serves all three
+    /// transports. Construction sites are the three `add_all_tools`
+    /// branches in `builder.rs`; a mistag bypasses the stdio fail-closed
+    /// check.
+    pub fn new(
+        tool: McpTool,
+        server_name: String,
+        client: Arc<McpClient>,
+        transport_kind: McpTransportKind,
+    ) -> Self {
         Self {
             tool,
             server_name,
             client,
+            transport_kind,
         }
     }
 }
@@ -71,10 +89,22 @@ impl RigTool for McpToolAdaptor {
     ) -> Pin<Box<dyn Future<Output = Result<Self::Output, Self::Error>> + Send + Sync + '_>> {
         let tool_name = self.tool.name.clone();
         let client = self.client.clone();
+        let transport_kind = self.transport_kind;
 
         Box::pin(async move {
+            // Approver header overrides for this call, if the HITL gate
+            // captured any. Unscoped reads yield `None` (wrapper-less
+            // agents).
+            let approver_overrides = current_approver_overrides();
+            if let Some(overrides) = &approver_overrides {
+                // Fail closed before dispatch when the transport cannot
+                // deliver per-request headers.
+                ensure_transport_delivers_overrides(transport_kind, overrides)
+                    .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
+            }
+
             // Use shared execution function for consistent logging and error handling
-            execute_mcp_tool(&client, &tool_name, args).await
+            execute_mcp_tool(&client, &tool_name, args, approver_overrides).await
         })
     }
 }

@@ -861,6 +861,7 @@ impl Agent {
                             mcp_tool.clone(),
                             server_name.clone(),
                             Arc::clone(&client_arc),
+                            crate::approver_headers::McpTransportKind::StreamableHttp,
                         );
 
                         // Wrap with tool_wrapper if configured
@@ -894,6 +895,7 @@ impl Agent {
                             mcp_tool.clone(),
                             server_name.clone(),
                             Arc::clone(&client_arc),
+                            crate::approver_headers::McpTransportKind::Sse,
                         );
 
                         builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);
@@ -970,6 +972,7 @@ impl Agent {
                             mcp_tool.clone(),
                             server_name.clone(),
                             Arc::clone(&client_arc),
+                            crate::approver_headers::McpTransportKind::Stdio,
                         );
 
                         builder_state = Self::add_mcp_tool(builder_state, tool_adaptor, config);

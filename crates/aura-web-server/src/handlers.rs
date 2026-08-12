@@ -1309,6 +1309,7 @@ mod tests {
             timeout_secs: 300,
             headers: std::collections::HashMap::new(),
             headers_from_request: std::collections::HashMap::new(),
+            tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
         });
         let req = chat_request_with_stream(None);
 

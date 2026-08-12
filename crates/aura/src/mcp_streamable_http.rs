@@ -23,9 +23,26 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::approver_headers::ApproverHeaders;
 use crate::mcp_progress::ProgressEnabledHandler;
 use crate::mcp_response::extract_tool_result;
 use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
+
+/// Build the CallTool request, attaching approver header overrides as a
+/// request extension when present. The extension rides on this one
+/// request value through the transport worker and is never serialized to
+/// the wire, so one-call scoping is structural. Every `call_tool*` variant
+/// constructs its request here.
+fn call_tool_request(
+    request_param: CallToolRequestParam,
+    approver_overrides: Option<ApproverHeaders>,
+) -> ClientRequest {
+    let mut request = Request::new(request_param);
+    if let Some(overrides) = approver_overrides {
+        request.extensions.insert(overrides);
+    }
+    ClientRequest::CallToolRequest(request)
+}
 
 const CANCEL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -241,6 +258,7 @@ impl McpClient {
         &self,
         tool_name: &str,
         arguments: HashMap<String, Value>,
+        approver_overrides: Option<ApproverHeaders>,
     ) -> Result<String> {
         if let Some(http_request_id) = self.get_current_request().await {
             info!(
@@ -248,7 +266,7 @@ impl McpClient {
                 tool_name, http_request_id
             );
             return self
-                .call_tool_tracked(tool_name, arguments, &http_request_id)
+                .call_tool_tracked(tool_name, arguments, &http_request_id, approver_overrides)
                 .await;
         }
 
@@ -264,11 +282,25 @@ impl McpClient {
             arguments: Some(args_map),
         };
 
-        match self.client.call_tool(request_param).await {
-            Ok(result) => {
+        // Constructed explicitly (not rmcp's convenience `call_tool`) so
+        // this branch shares the one request-construction site that
+        // accepts the override extension; same shape as the tracked
+        // branch, minus tracking.
+        let handle = self
+            .client
+            .send_cancellable_request(
+                call_tool_request(request_param, approver_overrides),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .context("Failed to send tool call request")?;
+
+        match handle.await_response().await {
+            Ok(rmcp::model::ServerResult::CallToolResult(result)) => {
                 debug!("Tool '{}' executed successfully", tool_name);
                 extract_tool_result(result, tool_name).map(|outcome| outcome.into_prefixed_string())
             }
+            Ok(_) => Err(anyhow::anyhow!("Unexpected response type for tool call")),
             Err(err) => {
                 error!("Failed to execute tool '{}': {}", tool_name, err);
                 Err(anyhow::anyhow!("Tool execution failed: {}", err))
@@ -281,6 +313,7 @@ impl McpClient {
         &self,
         tool_name: &str,
         arguments: HashMap<String, Value>,
+        approver_overrides: Option<ApproverHeaders>,
     ) -> Result<(String, mpsc::Receiver<ProgressNotificationParam>)> {
         debug!(
             "Calling tool '{}' with progress tracking, args: {:?}",
@@ -296,7 +329,7 @@ impl McpClient {
         let handle = self
             .client
             .send_cancellable_request(
-                ClientRequest::CallToolRequest(Request::new(request_param)),
+                call_tool_request(request_param, approver_overrides),
                 PeerRequestOptions::no_options(),
             )
             .await
@@ -356,6 +389,7 @@ impl McpClient {
         tool_name: &str,
         arguments: HashMap<String, Value>,
         cancel_token: tokio_util::sync::CancellationToken,
+        approver_overrides: Option<ApproverHeaders>,
     ) -> Result<String> {
         use rmcp::model::{CancelledNotification, CancelledNotificationParam};
 
@@ -373,7 +407,7 @@ impl McpClient {
         let handle = self
             .client
             .send_cancellable_request(
-                ClientRequest::CallToolRequest(Request::new(request_param)),
+                call_tool_request(request_param, approver_overrides),
                 PeerRequestOptions::no_options(),
             )
             .await
@@ -431,6 +465,7 @@ impl McpClient {
         tool_name: &str,
         arguments: HashMap<String, Value>,
         http_request_id: &str,
+        approver_overrides: Option<ApproverHeaders>,
     ) -> Result<String> {
         debug!(
             "Calling tool '{}' with tracking (http_request_id={})",
@@ -445,7 +480,7 @@ impl McpClient {
         let handle = self
             .client
             .send_cancellable_request(
-                ClientRequest::CallToolRequest(Request::new(request_param)),
+                call_tool_request(request_param, approver_overrides),
                 PeerRequestOptions::no_options(),
             )
             .await

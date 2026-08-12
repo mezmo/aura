@@ -95,11 +95,12 @@ fn record_tool_call_result(span: &tracing::Span, result: &Result<String, anyhow:
 /// 2. Response preview for large outputs
 /// 3. Standardized error handling
 /// 4. Per-request cancellation support (when executed within a cancellation context)
-#[tracing::instrument(name = "mcp.tool_call", skip(client, args), fields(tool.name = %tool_name, server.url = %client.server_url()))]
+#[tracing::instrument(name = "mcp.tool_call", skip(client, args, approver_overrides), fields(tool.name = %tool_name, server.url = %client.server_url()))]
 pub async fn execute_mcp_tool(
     client: &McpClient,
     tool_name: &str,
     args: Value,
+    approver_overrides: Option<crate::approver_headers::ApproverHeaders>,
 ) -> Result<String, ToolError> {
     let span = tracing::Span::current();
 
@@ -127,7 +128,7 @@ pub async fn execute_mcp_tool(
         _ => HashMap::new(),
     };
 
-    let result = call_http_tool_cancellable(client, tool_name, args_map).await;
+    let result = call_http_tool_cancellable(client, tool_name, args_map, approver_overrides).await;
 
     // OTel: record result attributes
     record_tool_call_result(&span, &result);

@@ -12,9 +12,9 @@ use aura_config::GlobPattern;
 use rig::tool::ToolError;
 use serde_json::Value;
 
-use super::decision::{AgentScope, ApprovalDecision, ApprovalOrigin, ApprovalOutcome, DecisionId};
+use super::decision::{AgentScope, ApprovalOrigin, DecisionId};
 use super::protocol::{ApprovalItem, ApprovalRequest, PROTOCOL_VERSION};
-use super::route::{ApprovalError, DecisionRoute};
+use super::route::{ApprovalError, DecisionRoute, GateDecision};
 use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
 
 /// Gates matching tool calls behind an approval decision.
@@ -71,7 +71,7 @@ impl ToolWrapper for HitlApprovalWrapper {
         ctx: &ToolCallContext,
     ) -> Result<PreCallOutcome, ToolError> {
         let Some(matched) = self.matched_pattern(&ctx.tool_name) else {
-            return Ok(PreCallOutcome::Proceed);
+            return Ok(PreCallOutcome::Proceed { overrides: None });
         };
         let request = ApprovalRequest {
             version: PROTOCOL_VERSION,
@@ -90,27 +90,26 @@ impl ToolWrapper for HitlApprovalWrapper {
         let cancel =
             crate::request_cancellation::RequestCancellation::token_for_id(&self.request_id)
                 .unwrap_or_else(crate::request_cancellation::RequestCancelToken::unbound);
-        approval_result_to_pre_call(self.route.decide(request, &cancel).await)
+        approval_result_to_pre_call(self.route.decide_for_gate(request, &cancel).await)
     }
 }
 
+/// Map a gate-scoped decision to a pre-call outcome.
 fn approval_result_to_pre_call(
-    result: Result<ApprovalOutcome, ApprovalError>,
+    result: Result<GateDecision, ApprovalError>,
 ) -> Result<PreCallOutcome, ToolError> {
     match result {
-        Ok(ApprovalOutcome::Decided(ApprovalDecision::Approved)) => Ok(PreCallOutcome::Proceed),
-        Ok(ApprovalOutcome::Decided(ApprovalDecision::Denied { reason })) => {
-            Ok(PreCallOutcome::ShortCircuit {
-                output: format!(
-                    "Tool call blocked by human approval denial: {}. Do not execute this action.",
-                    reason.unwrap_or_else(|| "no reason provided".to_string())
-                ),
-            })
-        }
-        Ok(ApprovalOutcome::TimedOut { .. }) => Err(ToolError::ToolCallError(
+        Ok(GateDecision::Approved { overrides }) => Ok(PreCallOutcome::Proceed { overrides }),
+        Ok(GateDecision::Denied { reason }) => Ok(PreCallOutcome::ShortCircuit {
+            output: format!(
+                "Tool call blocked by human approval denial: {}. Do not execute this action.",
+                reason.unwrap_or_else(|| "no reason provided".to_string())
+            ),
+        }),
+        Ok(GateDecision::TimedOut { .. }) => Err(ToolError::ToolCallError(
             "tool call denied: approval timed out".to_string().into(),
         )),
-        Ok(ApprovalOutcome::Cancelled(_)) => Err(ToolError::ToolCallError(
+        Ok(GateDecision::Cancelled(_)) => Err(ToolError::ToolCallError(
             "tool call denied: approval cancelled".to_string().into(),
         )),
         Err(e) => Err(ToolError::ToolCallError(
@@ -185,19 +184,17 @@ mod tests {
     #[test]
     fn approval_result_mapping_proceeds_only_on_approval() {
         assert_eq!(
-            approval_result_to_pre_call(Ok(ApprovalOutcome::Decided(ApprovalDecision::Approved)))
-                .unwrap(),
-            PreCallOutcome::Proceed
+            approval_result_to_pre_call(Ok(GateDecision::Approved { overrides: None })).unwrap(),
+            PreCallOutcome::Proceed { overrides: None }
         );
     }
 
     #[test]
     fn approval_result_mapping_denial_is_feedback_not_error() {
-        let outcome =
-            approval_result_to_pre_call(Ok(ApprovalOutcome::Decided(ApprovalDecision::Denied {
-                reason: Some("too risky".to_string()),
-            })))
-            .unwrap();
+        let outcome = approval_result_to_pre_call(Ok(GateDecision::Denied {
+            reason: Some("too risky".to_string()),
+        }))
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -210,25 +207,24 @@ mod tests {
 
     #[test]
     fn approval_result_mapping_timeout_cancel_and_channel_fault_are_errors() {
-        let timed_out = approval_result_to_pre_call(Ok(ApprovalOutcome::TimedOut {
+        let timed_out = approval_result_to_pre_call(Ok(GateDecision::TimedOut {
             waited: Duration::from_secs(1),
         }))
         .unwrap_err()
         .to_string();
         assert!(timed_out.contains("approval timed out"));
 
-        let cancelled = approval_result_to_pre_call(Ok(ApprovalOutcome::Cancelled(
+        let cancelled = approval_result_to_pre_call(Ok(GateDecision::Cancelled(
             CancelReason::ClientDisconnected,
         )))
         .unwrap_err()
         .to_string();
         assert!(cancelled.contains("approval cancelled"));
 
-        let sender_dropped = approval_result_to_pre_call(Ok(ApprovalOutcome::Cancelled(
-            CancelReason::SenderDropped,
-        )))
-        .unwrap_err()
-        .to_string();
+        let sender_dropped =
+            approval_result_to_pre_call(Ok(GateDecision::Cancelled(CancelReason::SenderDropped)))
+                .unwrap_err()
+                .to_string();
         assert!(sender_dropped.contains("approval cancelled"));
 
         let channel_fault =

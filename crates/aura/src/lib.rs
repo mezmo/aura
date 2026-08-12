@@ -6,6 +6,7 @@
 //! programmatically.
 
 pub mod approval_event_broker;
+pub mod approver_headers;
 pub mod bedrock_embedding;
 pub mod builder;
 pub mod config;

@@ -518,7 +518,8 @@ impl ProbeDispatcher for McpProbeDispatcher {
             .resolve(tool_name)
             .ok_or(ProbeSampleError::UnknownTool)?;
         let args = serde_json::Value::Object(probe.args().clone());
-        Ok(execute_mcp_tool(client, tool_name, args).await?)
+        // Probes are liveness checks and never carry approver identity.
+        Ok(execute_mcp_tool(client, tool_name, args, None).await?)
     }
 }
 

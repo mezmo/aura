@@ -138,8 +138,9 @@ pub async fn call_http_tool_cancellable(
     client: &McpClient,
     tool_name: &str,
     args: HashMap<String, Value>,
+    approver_overrides: Option<crate::approver_headers::ApproverHeaders>,
 ) -> Result<String> {
-    client.call_tool(tool_name, args).await
+    client.call_tool(tool_name, args, approver_overrides).await
 }
 
 #[cfg(test)]

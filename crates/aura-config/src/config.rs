@@ -1,3 +1,4 @@
+use crate::error::ConfigError;
 use crate::lenient_bool;
 use crate::lenient_int;
 use crate::orchestration::OrchestrationConfig;
@@ -1055,6 +1056,7 @@ mod tests {
                 timeout_secs: 300,
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 0).is_none());
@@ -1086,6 +1088,7 @@ mod tests {
                 timeout_secs: 30,
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
         assert!(hitl_timeout_conflict_warning(&hitl, 60).is_none());
@@ -1100,6 +1103,7 @@ mod tests {
                 timeout_secs: 60,
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1116,6 +1120,7 @@ mod tests {
                 timeout_secs: 120,
                 headers: HashMap::new(),
                 headers_from_request: HashMap::new(),
+                tool_headers_from_response: ToolHeaderMappings::default(),
             },
         };
         let msg = hitl_timeout_conflict_warning(&hitl, 60).unwrap();
@@ -1176,13 +1181,96 @@ url = "https://approvals.example.com/decide"
             DecisionRouteConfig::Webhook {
                 headers,
                 headers_from_request,
+                tool_headers_from_response,
                 ..
             } => {
                 assert!(headers.is_empty());
                 assert!(headers_from_request.is_empty());
+                assert!(tool_headers_from_response.is_empty());
             }
             other => panic!("expected Webhook route, got {:?}", other),
         }
+    }
+
+    /// A non-empty `tool_headers_from_response` map is deployable config.
+    /// It is validated at parse, outbound names lowercased, and the binary
+    /// carries it without consuming it.
+    #[test]
+    fn hitl_webhook_tool_headers_from_response_parses_validated() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = { "Authorization" = "x-approver-token" }
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => {
+                assert_eq!(
+                    tool_headers_from_response.get("authorization"),
+                    Some("x-approver-token"),
+                    "outbound names are lowercased at parse"
+                );
+                assert!(tool_headers_from_response.get("Authorization").is_none());
+            }
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
+    /// Reserved transport-owned names are rejected at parse.
+    #[test]
+    fn hitl_webhook_tool_headers_reserved_name_rejected() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = { "Content-Type" = "x-anything" }
+"#;
+        let err = toml::from_str::<HitlConfig>(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("reserved transport header"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A syntactically invalid header name on either side is rejected at
+    /// parse.
+    #[test]
+    fn hitl_webhook_tool_headers_invalid_name_rejected() {
+        for bad in [
+            [("bad header".to_string(), "x-ok".to_string())],
+            [("x-ok".to_string(), "bad value name\n".to_string())],
+        ] {
+            let raw: HashMap<String, String> = bad.into_iter().collect();
+            let err = ToolHeaderMappings::try_from(raw).unwrap_err().to_string();
+            assert!(
+                err.contains("not a valid http header name"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// Two spellings that collide after lowercasing are rejected at parse.
+    #[test]
+    fn hitl_webhook_tool_headers_duplicate_after_lowercase_rejected() {
+        let raw: HashMap<String, String> = [
+            ("Authorization".to_string(), "x-a".to_string()),
+            ("authorization".to_string(), "x-b".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let err = ToolHeaderMappings::try_from(raw).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate tool header override"),
+            "unexpected error: {err}"
+        );
     }
 }
 
@@ -1227,7 +1315,100 @@ pub enum DecisionRouteConfig {
         /// Outbound header name → inbound request header name mapping.
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
+        /// Outbound MCP header name → webhook approval-response header name.
+        /// Non-empty opts gated calls into approver identity forwarding.
+        /// Validated at parse (see [`ToolHeaderMappings`]); the validated
+        /// map is carried but not consumed until capture wiring lands.
+        #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
+        tool_headers_from_response: ToolHeaderMappings,
     },
+}
+
+/// Transport-owned header names a `tool_headers_from_response` mapping may
+/// never override: corrupting these breaks MCP framing or session routing.
+pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
+    "content-type",
+    "accept",
+    "mcp-session-id",
+    "host",
+    "content-length",
+    "transfer-encoding",
+];
+
+/// Validated `tool_headers_from_response` mapping: outbound MCP header
+/// name → webhook approval-response header name, both sides lowercased
+/// at parse so an override always replaces the frozen default header.
+/// Syntactically invalid header names, duplicates after lowercasing, and
+/// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`])
+/// are rejected at construction, so downstream code never holds an
+/// unvalidated map.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ToolHeaderMappings(HashMap<String, String>);
+
+impl ToolHeaderMappings {
+    /// True when no mapping is configured (the legacy, feature-off state).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The response header name mapped to `outbound_name` (lowercased), if
+    /// one is configured.
+    #[must_use]
+    pub fn get(&self, outbound_name: &str) -> Option<&str> {
+        self.0.get(outbound_name).map(String::as_str)
+    }
+
+    /// Iterate `(outbound_name, response_header_name)` pairs; outbound names
+    /// are lowercased.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
+impl TryFrom<HashMap<String, String>> for ToolHeaderMappings {
+    type Error = ConfigError;
+
+    /// The one validation site: lowercase-normalize outbound names, reject
+    /// syntactically invalid header names on either side, reject duplicates
+    /// after normalization, reject reserved transport-owned names.
+    /// Implemented (not a typed hole) because deserialization is reachable
+    /// through deployable config, where a hole would panic.
+    fn try_from(raw: HashMap<String, String>) -> Result<Self, Self::Error> {
+        let mut normalized: HashMap<String, String> = HashMap::with_capacity(raw.len());
+        for (name, response_name) in raw {
+            let lowered = name.to_lowercase();
+            if http::header::HeaderName::from_bytes(lowered.as_bytes()).is_err() {
+                return Err(ConfigError::InvalidToolHeaderName { name: lowered });
+            }
+            let response_lowered = response_name.to_lowercase();
+            if http::header::HeaderName::from_bytes(response_lowered.as_bytes()).is_err() {
+                return Err(ConfigError::InvalidToolHeaderName {
+                    name: response_lowered,
+                });
+            }
+            if RESERVED_TOOL_HEADER_NAMES.contains(&lowered.as_str()) {
+                return Err(ConfigError::ReservedToolHeaderOverride { name: lowered });
+            }
+            if normalized
+                .insert(lowered.clone(), response_lowered)
+                .is_some()
+            {
+                return Err(ConfigError::DuplicateToolHeaderOverride { name: lowered });
+            }
+        }
+        Ok(Self(normalized))
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolHeaderMappings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = HashMap::<String, String>::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 fn default_conversational_timeout_secs() -> u64 {
@@ -1240,8 +1421,8 @@ fn default_webhook_timeout_secs() -> u64 {
 
 /// A validated webhook URL.
 ///
-/// NOTE (skeleton): validation is a minimal scheme check; aura-config has no
-/// URL-parsing crate today, so a full parse is a hole-fill decision.
+/// Validation is a minimal scheme check; aura-config has no URL-parsing
+/// crate today, so a full parse is deferred.
 #[derive(Debug, Clone)]
 pub struct WebhookUrl(String);
 

@@ -158,8 +158,13 @@ pub struct TransformOutputResult {
 /// Result of an async pre-call gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreCallOutcome {
-    /// Continue to the wrapped tool.
-    Proceed,
+    /// Continue to the wrapped tool, optionally carrying approver header
+    /// overrides captured at approval. `None` everywhere except an approved
+    /// config-gated call whose webhook response carried the configured
+    /// identity headers.
+    Proceed {
+        overrides: Option<crate::approver_headers::ApproverHeaders>,
+    },
     /// Skip the wrapped tool and return this output as a successful tool result.
     ShortCircuit { output: String },
 }
@@ -327,7 +332,7 @@ pub trait ToolWrapper: Send + Sync {
         _args: &Value,
         _ctx: &ToolCallContext,
     ) -> Result<PreCallOutcome, ToolError> {
-        Ok(PreCallOutcome::Proceed)
+        Ok(PreCallOutcome::Proceed { overrides: None })
     }
 
     /// Async hook called after tool completion (success or failure).
@@ -505,8 +510,13 @@ where
                 Ok(r) => r,
                 Err(join_error) => Err(ToolError::ToolCallError(join_error.into())),
             };
-            match pre_call_result {
-                Ok(PreCallOutcome::Proceed) => {}
+            let approver_overrides = match pre_call_result {
+                // Approver overrides are scoped into the task-local inside
+                // the inner-call spawn below — task-locals do not cross a
+                // spawn, the value is known here after pre_call, and a
+                // demanded override silently degrading to None would
+                // proceed under cached identity, which is fail-open.
+                Ok(PreCallOutcome::Proceed { overrides }) => overrides,
                 Ok(PreCallOutcome::ShortCircuit { output }) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -547,7 +557,7 @@ where
 
                     return Err(pre_call_error);
                 }
-            }
+            };
 
             // Call inner tool (spawn to handle non-Sync futures).
             // Propagate the current span so mcp.tool_call nests under execute_tool.
@@ -555,7 +565,9 @@ where
             let args_clone = clean_args.clone();
             let tool_span = tracing::Span::current();
             let result_handle = tokio::spawn(tracing::Instrument::instrument(
-                async move { inner_clone.call(args_clone).await },
+                crate::approver_headers::APPROVER_OVERRIDES.scope(approver_overrides, async move {
+                    inner_clone.call(args_clone).await
+                }),
                 tool_span,
             ));
 
@@ -705,13 +717,28 @@ impl ToolWrapper for ComposedWrapper {
         // Forward to each wrapper in order, short-circuiting on the first
         // non-proceed outcome. Without this, a composed gate (e.g. HITL) would
         // silently inherit the no-op default and never run.
+        //
+        // At most one wrapper may produce approver overrides. Identity is
+        // never chosen by wrapper order, so a second producer is a
+        // deterministic error in release and debug alike, not last-wins.
+        let mut overrides: Option<crate::approver_headers::ApproverHeaders> = None;
         for wrapper in &self.wrappers {
             match wrapper.pre_call(args, ctx).await? {
-                PreCallOutcome::Proceed => {}
+                PreCallOutcome::Proceed {
+                    overrides: produced,
+                } => match (overrides.is_some(), produced) {
+                    (true, Some(_)) => {
+                        return Err(ToolError::ToolCallError(Box::new(
+                            crate::approver_headers::OverrideApplicationError::DoubleOverride,
+                        )));
+                    }
+                    (false, Some(produced)) => overrides = Some(produced),
+                    (_, None) => {}
+                },
                 outcome @ PreCallOutcome::ShortCircuit { .. } => return Ok(outcome),
             }
         }
-        Ok(PreCallOutcome::Proceed)
+        Ok(PreCallOutcome::Proceed { overrides })
     }
 
     fn transform_output(
@@ -1041,7 +1068,7 @@ mod tests {
                 _c: &ToolCallContext,
             ) -> Result<PreCallOutcome, ToolError> {
                 self.0.store(true, Ordering::SeqCst);
-                Ok(PreCallOutcome::Proceed)
+                Ok(PreCallOutcome::Proceed { overrides: None })
             }
         }
 

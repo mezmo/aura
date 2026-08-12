@@ -30,7 +30,7 @@ async fn test_mcp_progress_notifications_received() {
     .collect();
 
     let (result, mut progress_rx) = match client
-        .call_tool_with_progress("task_with_progress", args)
+        .call_tool_with_progress("task_with_progress", args, None)
         .await
     {
         Ok(r) => r,
@@ -122,7 +122,7 @@ async fn test_call_tool_without_progress_still_works() {
             .into_iter()
             .collect();
 
-    let result = match client.call_tool("mock_tool", args).await {
+    let result = match client.call_tool("mock_tool", args, None).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Tool call failed: {}", e);

@@ -43,10 +43,18 @@ impl Transport<RoleClient> for SseTransport {
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
         let client = self.http_client.clone();
         let uri = self.message_endpoint.clone();
+        // Approver header overrides ride the request's extensions;
+        // never serialized into the JSON body below.
+        let approver_overrides = crate::approver_headers::extract_from_client_message(&item);
         async move {
-            let response = client
-                .post(uri.as_str())
-                .json(&item)
+            // Per-request override headers beat the client's frozen
+            // `default_headers` for exactly this request. Applied last,
+            // after `.json` sets the transport's content-type.
+            let mut request_builder = client.post(uri.as_str()).json(&item);
+            if let Some(overrides) = approver_overrides {
+                request_builder = overrides.apply_to(request_builder);
+            }
+            let response = request_builder
                 .send()
                 .await
                 .map_err(SseTransportError::Http)?;

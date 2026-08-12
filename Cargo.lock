@@ -305,6 +305,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "globset",
+ "http 1.4.0",
  "regex",
  "serde",
  "serde_json",

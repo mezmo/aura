@@ -183,6 +183,12 @@ impl StreamableHttpClient for CustomHttpClient {
     > {
         use rmcp::transport::common::http_header::{HEADER_SESSION_ID, JSON_MIME_TYPE};
 
+        // Approver header overrides ride the request's extensions: present
+        // only on the one gated call whose approval captured them, and
+        // never serialized into the JSON body below (the rmcp serializer
+        // emits only `_meta`).
+        let approver_overrides = crate::approver_headers::extract_from_client_message(&message);
+
         let mut request_builder = self
             .client
             .post(uri.as_ref())
@@ -201,8 +207,17 @@ impl StreamableHttpClient for CustomHttpClient {
             request_builder = request_builder.header(HEADER_SESSION_ID, session_id.as_ref());
         }
 
+        // Per-request override headers beat the client's frozen
+        // `default_headers` for exactly this request. Applied last, after
+        // every transport-owned header above; reserved names are
+        // additionally rejected at config parse, so framing and session
+        // routing stay intact.
+        let mut request_builder = request_builder.json(&message);
+        if let Some(overrides) = approver_overrides {
+            request_builder = overrides.apply_to(request_builder);
+        }
+
         let response = request_builder
-            .json(&message)
             .send()
             .await
             .map_err(rmcp::transport::streamable_http_client::StreamableHttpError::Client)?;
@@ -1189,7 +1204,7 @@ impl McpManager {
                     tool_name
                 );
                 return client
-                    .call_tool(tool_name, args_map)
+                    .call_tool(tool_name, args_map, None)
                     .await
                     .map_err(|e| format!("Tool execution failed: {}", e));
             }
@@ -1202,7 +1217,7 @@ impl McpManager {
             {
                 info!("Executing fallback tool '{}' via SSE", tool_name);
                 return client
-                    .call_tool(tool_name, args_map)
+                    .call_tool(tool_name, args_map, None)
                     .await
                     .map_err(|e| format!("Tool execution failed: {}", e));
             }
@@ -1215,7 +1230,7 @@ impl McpManager {
             {
                 info!("Executing fallback tool '{}' via STDIO", tool_name);
                 return client
-                    .call_tool(tool_name, args_map)
+                    .call_tool(tool_name, args_map, None)
                     .await
                     .map_err(|e| format!("Tool execution failed: {}", e));
             }
@@ -1297,7 +1312,11 @@ macro_rules! create_mcp_tool_struct {
 
                 debug!("  Arguments: {:?}", arguments);
 
-                match self.client.call_tool(&self.tool_name, arguments).await {
+                match self
+                    .client
+                    .call_tool(&self.tool_name, arguments, None)
+                    .await
+                {
                     Ok(response) => {
                         debug!("  Response: {}", response);
                         let response_summary = if response.len() > 200 {
@@ -1398,7 +1417,11 @@ impl RigTool for StreamableHttpMcpTool {
         debug!("  Arguments: {:?}", arguments);
 
         // Call the streamable HTTP client
-        match self.client.call_tool(&self.tool_name, arguments).await {
+        match self
+            .client
+            .call_tool(&self.tool_name, arguments, None)
+            .await
+        {
             Ok(result) => {
                 debug!("  Tool execution successful");
                 let response_summary = if result.len() > 200 {
@@ -1556,7 +1579,7 @@ impl RigTool for FallbackHttpMcpTool {
         // Call the streamable HTTP client using the original tool name
         match self
             .client
-            .call_tool(&self.original_tool_name, arguments)
+            .call_tool(&self.original_tool_name, arguments, None)
             .await
         {
             Ok(result) => {

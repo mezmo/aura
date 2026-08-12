@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aura_config::{DecisionRouteConfig, GlobPattern, HitlConfig, WebhookUrl};
+use aura_config::{DecisionRouteConfig, GlobPattern, HitlConfig, ToolHeaderMappings, WebhookUrl};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::decision::{ApprovalDecision, ApprovalOutcome};
@@ -61,6 +61,7 @@ impl HitlRuntime {
                 timeout_secs,
                 headers,
                 headers_from_request,
+                tool_headers_from_response,
             } => {
                 let signing = match hmac {
                     None => EgressSigning::Disabled,
@@ -72,6 +73,7 @@ impl HitlRuntime {
                         url.clone(),
                         resolve_webhook_headers(headers, headers_from_request, req_headers),
                         signing,
+                        tool_headers_from_response.clone(),
                     ),
                     timeout: Duration::from_secs(*timeout_secs),
                 }
@@ -112,9 +114,76 @@ pub enum ApprovalError {
     /// ingress). The decision inside is untrusted and discarded.
     #[error("approval webhook response failed signature verification: {0}")]
     ResponseUnverified(String),
+    /// Approver identity capture failed closed: the approved response was
+    /// missing mapped headers. Names only, never values; the message is
+    /// the event-level audit signal. Wraps only the capture kind, so
+    /// application-time failures cannot be mislabeled as capture failures.
+    #[error("{0}")]
+    CaptureFailed(#[from] crate::approver_headers::CaptureError),
+}
+
+/// A decision as seen by the config gate.
+///
+/// An enum, not a product type: only the [`GateDecision::Approved`] variant
+/// can carry approver header overrides, so a denied, timed-out, or
+/// cancelled decision holding credentials is unrepresentable. Only
+/// [`DecisionRoute::decide_for_gate`] produces it, so the route-wide
+/// [`ApprovalOutcome`] consumed by the `request_approval` tool stays
+/// unit-shaped and that surface never holds approver credentials.
+#[derive(Debug)]
+pub enum GateDecision {
+    /// Approved; the only variant that may carry captured overrides.
+    Approved {
+        overrides: Option<crate::approver_headers::ApproverHeaders>,
+    },
+    Denied {
+        reason: Option<String>,
+    },
+    TimedOut {
+        waited: Duration,
+    },
+    Cancelled(super::decision::CancelReason),
+}
+
+impl GateDecision {
+    /// Total mapping from a route outcome, carrying no overrides: the shape
+    /// every conversational decision and every webhook decision without
+    /// captured identity produces.
+    pub(crate) fn without_overrides(outcome: ApprovalOutcome) -> Self {
+        match outcome {
+            ApprovalOutcome::Decided(ApprovalDecision::Approved) => {
+                Self::Approved { overrides: None }
+            }
+            ApprovalOutcome::Decided(ApprovalDecision::Denied { reason }) => {
+                Self::Denied { reason }
+            }
+            ApprovalOutcome::TimedOut { waited } => Self::TimedOut { waited },
+            ApprovalOutcome::Cancelled(reason) => Self::Cancelled(reason),
+        }
+    }
+
+    /// Event-projection of the decision. Identity material never enters
+    /// events; a projection method, unlike a product type, cannot
+    /// construct a denied-with-overrides state.
+    fn to_outcome(&self) -> ApprovalOutcome {
+        match self {
+            Self::Approved { .. } => ApprovalOutcome::Decided(ApprovalDecision::Approved),
+            Self::Denied { reason } => ApprovalOutcome::Decided(ApprovalDecision::Denied {
+                reason: reason.clone(),
+            }),
+            Self::TimedOut { waited } => ApprovalOutcome::TimedOut { waited: *waited },
+            Self::Cancelled(reason) => ApprovalOutcome::Cancelled(*reason),
+        }
+    }
 }
 
 /// Where an approval decision comes from. Fixed per deployment by config.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "built once per request and held behind Arc, never copied; \
+              boxing the webhook client would churn every construction site \
+              for no runtime benefit"
+)]
 pub enum DecisionRoute {
     /// Attended: park in-process, decision returns via `POST /v1/approvals/{id}`.
     Conversational {
@@ -129,6 +198,62 @@ pub enum DecisionRoute {
 }
 
 impl DecisionRoute {
+    /// Obtain a decision for a config-gated call, carrying any captured
+    /// approver header overrides on the approved arm.
+    ///
+    /// The webhook arm goes through the capture-bearing client seam
+    /// ([`WebhookClient::request_approval_for_gate`]), which owns the HTTP
+    /// response, so capture is filled there without signature changes;
+    /// its event choreography mirrors [`Self::decide`]'s webhook arm. The
+    /// conversational arm delegates to [`Self::decide`]: that route has no
+    /// distinct identity source and never captures.
+    pub async fn decide_for_gate(
+        &self,
+        request: ApprovalRequest,
+        cancel: &crate::request_cancellation::RequestCancelToken,
+    ) -> Result<GateDecision, ApprovalError> {
+        match self {
+            Self::Conversational { .. } => {
+                let outcome = self.decide(request, cancel).await?;
+                Ok(GateDecision::without_overrides(outcome))
+            }
+            Self::Webhook { client, timeout } => {
+                let started = Instant::now();
+                let request_id = request.request_id.clone();
+                let decision_id = request.decision_id;
+                let scope = request.scope.clone();
+
+                approval_event_broker::publish(
+                    &request_id,
+                    ApprovalLifecycleEvent::Requested((&request).into()),
+                )
+                .await;
+
+                let result = client.request_approval_for_gate(&request, *timeout).await;
+                let completed = match &result {
+                    Ok(decision) => events::completed(
+                        decision_id,
+                        &decision.to_outcome(),
+                        &scope,
+                        started.elapsed(),
+                    ),
+                    Err(err) => events::completed_error(
+                        decision_id,
+                        err.to_string(),
+                        &scope,
+                        started.elapsed(),
+                    ),
+                };
+                approval_event_broker::publish(
+                    &request_id,
+                    ApprovalLifecycleEvent::Completed(completed),
+                )
+                .await;
+                result
+            }
+        }
+    }
+
     /// Obtain a decision for `request`, applying the shared semantics (deadline,
     /// fail-closed mapping, event emission) in one place.
     pub async fn decide(
@@ -295,6 +420,13 @@ pub struct WebhookClient {
     /// Resolved webhook headers.
     headers: HeaderMap,
     signing: EgressSigning,
+    /// Validated `tool_headers_from_response` mappings. Read only by the
+    /// gate-scoped path; empty means no capture is configured.
+    #[expect(
+        dead_code,
+        reason = "request_approval_for_gate reads this when capture wiring lands"
+    )]
+    tool_header_mappings: ToolHeaderMappings,
 }
 
 impl WebhookClient {
@@ -304,14 +436,26 @@ impl WebhookClient {
     /// which receives the startup-loaded HMAC and calls `with_signing`.
     #[must_use]
     pub fn new(client: reqwest::Client, url: WebhookUrl) -> Self {
-        Self::with_headers_and_signing(client, url, HeaderMap::new(), EgressSigning::Disabled)
+        Self::with_headers_and_signing(
+            client,
+            url,
+            HeaderMap::new(),
+            EgressSigning::Disabled,
+            ToolHeaderMappings::default(),
+        )
     }
 
     /// Create a webhook client with resolved operator-configured headers
     /// applied to every approval POST.
     #[must_use]
     pub fn new_with_headers(client: reqwest::Client, url: WebhookUrl, headers: HeaderMap) -> Self {
-        Self::with_headers_and_signing(client, url, headers, EgressSigning::Disabled)
+        Self::with_headers_and_signing(
+            client,
+            url,
+            headers,
+            EgressSigning::Disabled,
+            ToolHeaderMappings::default(),
+        )
     }
 
     fn with_headers_and_signing(
@@ -319,6 +463,7 @@ impl WebhookClient {
         url: WebhookUrl,
         headers: HeaderMap,
         signing: EgressSigning,
+        tool_header_mappings: ToolHeaderMappings,
     ) -> Self {
         // A plaintext response channel would defeat response-leg verification,
         // so http:// with a secret configured is itself a misconfiguration
@@ -345,7 +490,24 @@ impl WebhookClient {
             url,
             headers,
             signing,
+            tool_header_mappings,
         }
+    }
+
+    /// Gate-scoped approval request: the config-gate path through the
+    /// webhook. This method owns the HTTP response, so capture is filled
+    /// here — mapped approval-response headers resolved per
+    /// `tool_header_mappings`, fail closed on missing — with no further
+    /// signature change. Until capture wiring lands, every decision
+    /// carries no overrides. The route-wide [`Self::request_approval`]
+    /// path serves `request_approval` and never captures.
+    pub(crate) async fn request_approval_for_gate(
+        &self,
+        request: &ApprovalRequest,
+        timeout: Duration,
+    ) -> Result<GateDecision, ApprovalError> {
+        let outcome = self.request_approval(request, timeout).await?;
+        Ok(GateDecision::without_overrides(outcome))
     }
 
     /// Apply operator-configured headers to a request builder. Called before
@@ -1106,6 +1268,7 @@ mod tests {
                 url: aura_config::WebhookUrl::new(url).unwrap(),
                 headers: HeaderMap::new(),
                 signing: EgressSigning::Enabled(hmac),
+                tool_header_mappings: aura_config::ToolHeaderMappings::default(),
             }
         }
 
@@ -1208,6 +1371,7 @@ mod tests {
                 aura_config::WebhookUrl::new("http://approvals.example.com/aura").unwrap(),
                 HeaderMap::new(),
                 EgressSigning::Enabled(test_hmac()),
+                aura_config::ToolHeaderMappings::default(),
             );
             let err = client
                 .request_approval(
@@ -1233,6 +1397,7 @@ mod tests {
                     timeout_secs: 300,
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
                 },
             };
             let hmac = test_hmac();
@@ -1275,6 +1440,7 @@ mod tests {
                     timeout_secs: 300,
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
+                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
                 },
             };
             let pending = crate::hitl::PendingApprovals::new();
@@ -1332,6 +1498,7 @@ mod tests {
                 aura_config::WebhookUrl::new(&url).unwrap(),
                 HeaderMap::new(),
                 EgressSigning::Disabled,
+                aura_config::ToolHeaderMappings::default(),
             );
             let outcome = client
                 .request_approval(&test_request(decision_id), Duration::from_secs(5))
