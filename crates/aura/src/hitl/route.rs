@@ -494,14 +494,13 @@ fn resolve_webhook_headers(
     header_map
 }
 
-/// The webhook route's egress signing state, plus the fail-closed state an
-/// unusable route configuration lands in.
+/// HMAC signing state for the webhook route.
 enum EgressSigning {
     /// Unsigned egress.
     Disabled,
     /// Signed egress under the configured HMAC secret.
     Enabled(WebhookHmac),
-    /// An unusable route configuration, with the reason.
+    /// An unusable signing configuration, with the reason.
     Misconfigured(String),
 }
 
@@ -579,36 +578,36 @@ impl WebhookClient {
         signing: EgressSigning,
         tool_header_mappings: ToolHeaderMappings,
     ) -> Self {
-        // Two ways a plaintext url makes the route unusable, both fail closed
-        // for the life of the client. A plaintext response channel defeats
-        // response-leg verification, so http:// with a secret configured is
-        // itself a misconfiguration (DESIGN.md §4, Route A). Captured
-        // approver headers are credentials the gated call then presents as
-        // identity, so carrying them back over cleartext exposes them to the
-        // network whether or not the decision itself is signed. Neither check
-        // exempts loopback: the url is operator config, not a test fixture.
-        let signing = if url.as_str().starts_with("http://") {
-            match signing {
-                EgressSigning::Enabled(_) => EgressSigning::Misconfigured(format!(
+        // A plaintext response channel would defeat response-leg verification,
+        // so http:// with a secret configured is itself a misconfiguration
+        // (DESIGN.md §4, Route A).
+        let signing = match signing {
+            EgressSigning::Enabled(_) if url.as_str().starts_with("http://") => {
+                EgressSigning::Misconfigured(format!(
                     "webhook url {} uses plaintext http:// while an HMAC secret is configured; \
                      use https://",
                     url.as_str()
-                )),
-                _ if !tool_header_mappings.is_empty() => EgressSigning::Misconfigured(format!(
-                    "webhook url {} uses plaintext http:// while tool_headers_from_response is \
-                     configured; use https://",
-                    url.as_str()
-                )),
-                other => other,
+                ))
             }
-        } else {
-            signing
+            other => other,
         };
         if let EgressSigning::Misconfigured(reason) = &signing {
             tracing::error!(
                 reason,
-                "HITL webhook route misconfigured; every approval request on this route \
+                "HITL webhook HMAC misconfigured; every approval request on this route \
                  will fail closed"
+            );
+        }
+        // Capture over cleartext stays usable — TLS is often terminated ahead
+        // of this process (trusted gateway, service-to-service), which the url
+        // alone cannot distinguish from an exposed hop — but it is never
+        // silent.
+        if !tool_header_mappings.is_empty() && !url.as_str().starts_with("https://") {
+            tracing::warn!(
+                url = url.as_str(),
+                "HITL webhook route captures approver response headers over cleartext http, so \
+                 this route's tool_headers_from_response values are readable by any network \
+                 observer; intended for trusted-gateway or service-to-service deployments"
             );
         }
         Self {
@@ -1785,11 +1784,12 @@ mod tests {
             );
         }
 
-        /// Captured approver headers are credentials travelling back from the
-        /// approver, so a cleartext approval channel must fail closed for
-        /// them on its own — with no HMAC secret anywhere in the config.
+        /// Capture does not require https: TLS may be terminated ahead of the
+        /// process (trusted gateway, service-to-service), so a cleartext url
+        /// with mappings builds a usable unsigned route. Only the HMAC-secret
+        /// rule rejects plaintext, and it is unchanged by capture.
         #[test]
-        fn from_config_rejects_capture_over_plaintext_url() {
+        fn from_config_allows_capture_over_plaintext_url() {
             use super::super::HitlRuntime;
 
             let pending = crate::hitl::PendingApprovals::new();
@@ -1800,13 +1800,10 @@ mod tests {
                 None,
                 None,
             );
-            match signing_of(&plaintext) {
-                EgressSigning::Misconfigured(reason) => assert!(
-                    reason.contains("tool_headers_from_response"),
-                    "the reason must name the capture config: {reason}"
-                ),
-                _ => panic!("plaintext http:// with capture must fail closed"),
-            }
+            assert!(
+                matches!(signing_of(&plaintext), EgressSigning::Disabled),
+                "plaintext http:// with capture and no secret must stay usable"
+            );
 
             let secure = HitlRuntime::from_config(
                 &webhook_config("https://approvals.example.com/aura", user_mapping()),
@@ -1819,8 +1816,6 @@ mod tests {
                 "https:// with capture and no secret is a usable unsigned route"
             );
 
-            // Without capture configured, plaintext stays allowed for an
-            // unsigned route — this guard adds no new restriction there.
             let legacy = HitlRuntime::from_config(
                 &webhook_config(
                     "http://approvals.example.com/aura",
@@ -1830,7 +1825,72 @@ mod tests {
                 None,
                 None,
             );
-            assert!(matches!(signing_of(&legacy), EgressSigning::Disabled));
+            assert!(
+                matches!(signing_of(&legacy), EgressSigning::Disabled),
+                "plaintext http:// without capture is unchanged"
+            );
+
+            // The HMAC-secret rule is the one that still rejects plaintext,
+            // and capture being configured does not soften it.
+            let signed_plaintext = HitlRuntime::from_config(
+                &webhook_config("http://approvals.example.com/aura", user_mapping()),
+                &pending,
+                Some(&test_hmac()),
+                None,
+            );
+            assert!(
+                matches!(
+                    signing_of(&signed_plaintext),
+                    EgressSigning::Misconfigured(_)
+                ),
+                "plaintext http:// with a secret must still fail closed"
+            );
+        }
+
+        /// Cleartext capture is allowed but never silent: constructing the
+        /// route warns, naming the risk and the url.
+        #[test]
+        fn capture_over_plaintext_url_warns_at_construction() {
+            use std::sync::Arc;
+
+            let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+
+            let pending = crate::hitl::PendingApprovals::new();
+            tracing::subscriber::with_default(subscriber, || {
+                let _ = super::super::HitlRuntime::from_config(
+                    &webhook_config("http://approvals.example.com/aura", user_mapping()),
+                    &pending,
+                    None,
+                    None,
+                );
+                // An https route with the same mappings must stay quiet, so
+                // the warning is attributable to the cleartext url alone.
+                let _ = super::super::HitlRuntime::from_config(
+                    &webhook_config("https://approvals.example.com/aura", user_mapping()),
+                    &pending,
+                    None,
+                    None,
+                );
+            });
+
+            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+            assert!(
+                log.contains("cleartext http"),
+                "the warning must name the risk, got log: {log}"
+            );
+            assert!(
+                log.contains("http://approvals.example.com/aura"),
+                "the warning must name the url, got log: {log}"
+            );
+            assert!(
+                !log.contains("https://approvals.example.com/aura"),
+                "an https route must not warn, got log: {log}"
+            );
         }
 
         #[tokio::test]
