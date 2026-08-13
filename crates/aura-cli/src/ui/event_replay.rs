@@ -708,36 +708,10 @@ fn parse_orch_arguments(
 
 fn format_orch_args_summary(fields: &BTreeMap<String, serde_json::Value>) -> String {
     match parse_orch_arguments(fields) {
-        Some(obj) => obj
-            .iter()
-            .filter(|(k, v)| {
-                !k.starts_with('_')
-                    && !matches!(v, serde_json::Value::Null)
-                    && !matches!(v, serde_json::Value::String(s) if s.is_empty() || s == "null")
-            })
-            .take(3)
-            .map(|(k, v)| {
-                let val_str = match v {
-                    serde_json::Value::String(s) => {
-                        if s.len() > 20 {
-                            format!("\"{}...\"", &s[..17])
-                        } else {
-                            format!("\"{s}\"")
-                        }
-                    }
-                    other => {
-                        let s = other.to_string();
-                        if s.len() > 20 {
-                            format!("{}...", &s[..17])
-                        } else {
-                            s
-                        }
-                    }
-                };
-                format!("{k}: {val_str}")
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
+        Some(obj) => {
+            let args: BTreeMap<String, serde_json::Value> = obj.into_iter().collect();
+            crate::tools::format_args_summary(&args)
+        }
         None => String::new(),
     }
 }

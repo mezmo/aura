@@ -275,16 +275,22 @@ fn format_arg_value(value: &serde_json::Value) -> String {
 }
 
 /// Format up to 3 args as `key: "val", key: 50`-style string for a tool label.
-/// Filters out keys starting with `_` and null/empty/"null" values; truncates
-/// string values longer than 20 chars to `"<17 chars>..."`. Used to mirror the
-/// orchestrator-style tool-call summary in single-agent rendering.
+/// Skips `_`-prefixed keys and null/empty values; string args are listed first
+/// so they survive the cap. Long string values are truncated.
 pub fn format_args_summary(args: &std::collections::BTreeMap<String, serde_json::Value>) -> String {
-    args.iter()
+    let (strings, others): (Vec<_>, Vec<_>) = args
+        .iter()
         .filter(|(k, v)| {
             !k.starts_with('_')
                 && !matches!(v, serde_json::Value::Null)
                 && !matches!(v, serde_json::Value::String(s) if s.is_empty() || s == "null")
+                && !matches!(v, serde_json::Value::Array(a) if a.is_empty())
+                && !matches!(v, serde_json::Value::Object(o) if o.is_empty())
         })
+        .partition(|(_, v)| matches!(v, serde_json::Value::String(_)));
+    strings
+        .into_iter()
+        .chain(others)
         .take(3)
         .map(|(k, v)| {
             let val_str = match v {
@@ -374,6 +380,40 @@ pub fn normalize_tool_result_text(text: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // format_args_summary
+    // -----------------------------------------------------------------------
+
+    fn args_from_json(json: &str) -> std::collections::BTreeMap<String, serde_json::Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn args_summary_strings_survive_the_cap() {
+        let args = args_from_json(
+            r#"{"label_filters":["a"],"limit":5,"min_score":0.5,"query":"circuit breaker"}"#,
+        );
+        assert_eq!(
+            format_args_summary(&args),
+            r#"query: "circuit breaker", label_filters: ["a"], limit: 5"#
+        );
+    }
+
+    #[test]
+    fn args_summary_drops_empty_collections() {
+        let args = args_from_json(r#"{"label_filters":[],"opts":{},"limit":5,"query":"q"}"#);
+        assert_eq!(format_args_summary(&args), r#"query: "q", limit: 5"#);
+    }
+
+    #[test]
+    fn args_summary_truncates_long_strings() {
+        let args = args_from_json(r#"{"query":"a query well beyond twenty characters"}"#);
+        assert_eq!(
+            format_args_summary(&args),
+            r#"query: "a query well beyo...""#
+        );
+    }
 
     // -----------------------------------------------------------------------
     // format_tool_call_display
