@@ -925,7 +925,7 @@ const SESSION_HISTORY_TEMPLATE: &str = include_str!("../prompts/session_history.
 /// order), and returns their manifests sorted by recorded timestamp
 /// descending. Creation order and completion-timestamp order diverge only
 /// for overlapping runs of one session. A session containing any
-/// non-canonical-v7 run dir (e.g. pre-e689c79e UUIDv4 names) falls back to
+/// non-canonical-v7 run dir (e.g. a UUIDv4 name) falls back to
 /// reading every manifest and selecting by completion timestamp.
 pub async fn load_session_manifests(
     base_path: &Path,
@@ -941,8 +941,8 @@ pub async fn load_session_manifests(
     };
 
     // Collect candidate run dirs first, newest first, so manifest reads can
-    // stop at `limit` instead of reading every prior run. Run IDs are UUIDv7
-    // (since e689c79e), so lexicographic order is creation order (the same
+    // stop at `limit` instead of reading every prior run. Run IDs are UUIDv7,
+    // so lexicographic order is creation order (the same
     // invariant prune_session_runs relies on).
     let mut run_dirs: Vec<String> = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
@@ -959,8 +959,8 @@ pub async fn load_session_manifests(
     }
     run_dirs.sort_unstable_by(|a, b| b.cmp(a));
 
-    // Sessions created before the v7 switch hold UUIDv4 run dirs, and v4
-    // names have no chronology — a v4 starting with 'f' would outrank every
+    // UUIDv4 run dir names carry no chronology — a v4 starting with 'f'
+    // would outrank every
     // v7 starting with '0' and starve recent runs out of the limit. If any
     // candidate is not a canonical (lowercase hyphenated) v7 name — parse
     // alone also accepts braced/URN/uppercase forms whose string order is
