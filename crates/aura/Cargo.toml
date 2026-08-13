@@ -55,6 +55,7 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Vector stores - Qdrant support
@@ -73,7 +74,7 @@ gemini-tokenizer = "0.2.0"
 
 [features]
 default = ["otel"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tonic"]
 # Integration test umbrella (mirrors aura-web-server pattern)
 integration = ["integration-stdio"]
 integration-stdio = []

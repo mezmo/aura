@@ -77,6 +77,14 @@
 //! `mcp_tool_execution.rs`), not on Rig's `execute_tool` parent.  This is
 //! intentional: `mcp.tool_call` is the canonical TOOL span for Phoenix.
 //!
+//! ## Transport
+//!
+//! Spans are exported over OTLP/gRPC.  An `https://` endpoint is served with
+//! the platform's native root certificates; `http://` connects in plaintext.
+//! `OTEL_EXPORTER_OTLP_HEADERS` (comma-separated `key=value` pairs) is read by
+//! the OTLP exporter and attached as gRPC metadata on every export, which is
+//! how an authenticating proxy in front of the collector gets its credentials.
+//!
 //! ## Content recording
 //!
 //! When `OTEL_RECORD_CONTENT=true`, prompt/completion text and tool
@@ -270,23 +278,46 @@ fn ensure_aura_config_warnings(filter: EnvFilter) -> EnvFilter {
 // OTel provider / layer / filter (only when feature = "otel")
 // ---------------------------------------------------------------------------
 
+/// Whether an OTLP endpoint URL selects TLS.
+///
+/// Scheme comparison is case-insensitive because URI schemes are.
+#[cfg(feature = "otel")]
+fn endpoint_uses_tls(endpoint: &str) -> bool {
+    endpoint.trim().to_ascii_lowercase().starts_with("https://")
+}
+
 /// Try to build an OpenTelemetry `TracerProvider` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 ///
 /// Stores the provider in `TRACER_PROVIDER` for later shutdown and returns it.
 /// Returns `None` when the env var is absent.
+///
+/// An `https://` endpoint is given a `ClientTlsConfig` using the platform's
+/// native root store; tonic refuses to connect to an `https://` URI when no
+/// TLS config was attached, so this must be set before `build()`. The
+/// signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence
+/// here, matching the precedence the exporter itself applies when it
+/// resolves the endpoint.
 ///
 /// Public so binaries that compose their own subscriber stack (e.g.
 /// `aura` in standalone mode) can register the provider before attaching
 /// an `OpenTelemetryLayer`. Subsequent calls reuse the cached provider.
 #[cfg(feature = "otel")]
 pub fn init_otel_provider() -> Option<&'static TracerProvider> {
+    use opentelemetry_otlp::WithTonicConfig;
+
     // Presence check only — the OTLP exporter reads the endpoint value itself
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
 
-    let otlp_exporter = match opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .build()
-    {
+    let signal_endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+    let effective_endpoint = signal_endpoint.as_deref().unwrap_or(&endpoint);
+
+    let mut builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
+    if endpoint_uses_tls(effective_endpoint) {
+        builder =
+            builder.with_tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots());
+    }
+
+    let otlp_exporter = match builder.build() {
         Ok(exporter) => exporter,
         Err(e) => {
             eprintln!(
@@ -809,5 +840,14 @@ mod tests {
         }))
         .unwrap();
         assert!(llm_invocation_parameters(&llm).is_none());
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn tls_selected_only_for_https_endpoints() {
+        assert!(endpoint_uses_tls("https://otel.example.com:443"));
+        assert!(endpoint_uses_tls("  HTTPS://otel.example.com:443  "));
+        assert!(!endpoint_uses_tls("http://localhost:4317"));
+        assert!(!endpoint_uses_tls("localhost:4317"));
     }
 }
