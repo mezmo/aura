@@ -478,19 +478,20 @@ runtime that drives the request loop. `main` flushes via
 `aura::logging::shutdown_tracer()` before the runtime drops so trailing
 spans aren't lost.
 
-An `https://` endpoint is connected over TLS using the platform's native root
-certificates; `http://` connects in plaintext. Combined with
-`OTEL_EXPORTER_OTLP_HEADERS`, that covers a collector sitting behind an
-authenticating proxy.
+Two wire protocols are supported, selected by `OTEL_EXPORTER_OTLP_PROTOCOL`:
+`grpc` (the default) and `http/protobuf`.
+With HTTP `/v1/traces` is appended to `OTEL_EXPORTER_OTLP_ENDPOINT`.
+(Use `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` if you need an explicit path).
 
 Other relevant OTel env vars (read by the `aura` crate, unchanged from the
 server):
 
 | Variable                                | Purpose                                                                                              |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`           | OTLP collector endpoint (gRPC). When unset, no OTel layer is installed even in standalone mode.      |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`           | OTLP collector endpoint. When unset, no OTel layer is installed even in standalone mode.             |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`    | Traces-specific endpoint; takes precedence over the generic one.                                     |
-| `OTEL_EXPORTER_OTLP_HEADERS`            | Comma-separated `key=value` pairs sent as gRPC metadata (e.g. proxy auth credentials).               |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`           | `grpc` (default) or `http/protobuf`. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` takes precedence.          |
+| `OTEL_EXPORTER_OTLP_HEADERS`            | Comma-separated `key=value` pairs sent as gRPC metadata / HTTP headers (e.g. proxy auth).            |
 | `OTEL_SERVICE_NAME`                     | Resource attribute (defaults to `aura`).                                                             |
 | `OTEL_LOG_LEVEL`                        | Override the OTel layer's filter. Default captures `aura=trace`, `aura_cli=info`, and rig spans.     |
 | `OTEL_RECORD_CONTENT`                   | When `true`, prompt/completion/tool args/results are recorded as span attributes.                    |

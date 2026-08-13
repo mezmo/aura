@@ -8,6 +8,11 @@
 //! When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, all tracing spans are
 //! automatically exported as OpenTelemetry spans via the OTLP exporter.
 //!
+//! `OTEL_EXPORTER_OTLP_PROTOCOL` selects the wire protocol: `grpc` (the
+//! default) or `http/protobuf`.  Either way an `https://` endpoint is served
+//! with the platform's native root certificates and `http://` connects in
+//! plaintext.
+//!
 //! ## Per-layer filtering
 //!
 //! The console (fmt) layer uses the same filter as before (controlled by
@@ -76,14 +81,6 @@
 //! Tool errors are only recorded on the `mcp.tool_call` child span (by
 //! `mcp_tool_execution.rs`), not on Rig's `execute_tool` parent.  This is
 //! intentional: `mcp.tool_call` is the canonical TOOL span for Phoenix.
-//!
-//! ## Transport
-//!
-//! Spans are exported over OTLP/gRPC.  An `https://` endpoint is served with
-//! the platform's native root certificates; `http://` connects in plaintext.
-//! `OTEL_EXPORTER_OTLP_HEADERS` (comma-separated `key=value` pairs) is read by
-//! the OTLP exporter and attached as gRPC metadata on every export, which is
-//! how an authenticating proxy in front of the collector gets its credentials.
 //!
 //! ## Content recording
 //!
@@ -286,43 +283,116 @@ fn endpoint_uses_tls(endpoint: &str) -> bool {
     endpoint.trim().to_ascii_lowercase().starts_with("https://")
 }
 
+/// Wire protocol carrying spans to the collector.
+#[cfg(feature = "otel")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtlpProtocol {
+    Grpc,
+    HttpProtobuf,
+}
+
+/// Parse an OTLP protocol from its spec spelling.
+///
+/// `http/json` is deliberately unrecognised: the exporter is built without
+/// the `http-json` feature, so accepting the name would promise a transport
+/// that cannot be constructed.
+#[cfg(feature = "otel")]
+fn parse_otlp_protocol(value: &str) -> Option<OtlpProtocol> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "grpc" => Some(OtlpProtocol::Grpc),
+        "http/protobuf" => Some(OtlpProtocol::HttpProtobuf),
+        _ => None,
+    }
+}
+
+/// Resolve the export protocol from the environment, defaulting to gRPC.
+///
+/// `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` wins over the generic
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`. An unrecognised value warns and falls back
+/// rather than dropping traces silently.
+#[cfg(feature = "otel")]
+fn resolve_otlp_protocol() -> OtlpProtocol {
+    let configured = std::env::var("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL"))
+        .ok();
+
+    match configured {
+        None => OtlpProtocol::Grpc,
+        Some(value) => parse_otlp_protocol(&value).unwrap_or_else(|| {
+            eprintln!(
+                "WARNING: unsupported OTLP protocol '{value}' — falling back to grpc. \
+                 Supported values: grpc, http/protobuf."
+            );
+            OtlpProtocol::Grpc
+        }),
+    }
+}
+
+/// Build the gRPC span exporter.
+///
+/// An `https://` endpoint is given a `ClientTlsConfig` using the platform's
+/// native root store; tonic refuses to connect to an `https://` URI when no
+/// TLS config was attached, so this must be set before `build()`.
+#[cfg(feature = "otel")]
+fn build_grpc_span_exporter(
+    endpoint: &str,
+) -> Result<opentelemetry_otlp::SpanExporter, opentelemetry::trace::TraceError> {
+    use opentelemetry_otlp::WithTonicConfig;
+
+    let mut builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
+    if endpoint_uses_tls(endpoint) {
+        builder =
+            builder.with_tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots());
+    }
+    builder.build()
+}
+
+/// Build the HTTP/protobuf span exporter.
+///
+/// TLS needs no configuration here — the reqwest client the exporter
+/// defaults to carries its own rustls stack and root certificates. The
+/// exporter appends `/v1/traces` to a generic `OTEL_EXPORTER_OTLP_ENDPOINT`
+/// and uses `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` verbatim.
+#[cfg(feature = "otel")]
+fn build_http_span_exporter()
+-> Result<opentelemetry_otlp::SpanExporter, opentelemetry::trace::TraceError> {
+    opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .build()
+}
+
 /// Try to build an OpenTelemetry `TracerProvider` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 ///
 /// Stores the provider in `TRACER_PROVIDER` for later shutdown and returns it.
 /// Returns `None` when the env var is absent.
 ///
-/// An `https://` endpoint is given a `ClientTlsConfig` using the platform's
-/// native root store; tonic refuses to connect to an `https://` URI when no
-/// TLS config was attached, so this must be set before `build()`. The
-/// signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence
-/// here, matching the precedence the exporter itself applies when it
-/// resolves the endpoint.
+/// The signal-specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` takes precedence
+/// when deciding whether the gRPC transport needs TLS, matching the
+/// precedence the exporter itself applies when it resolves the endpoint.
 ///
 /// Public so binaries that compose their own subscriber stack (e.g.
 /// `aura` in standalone mode) can register the provider before attaching
 /// an `OpenTelemetryLayer`. Subsequent calls reuse the cached provider.
 #[cfg(feature = "otel")]
 pub fn init_otel_provider() -> Option<&'static TracerProvider> {
-    use opentelemetry_otlp::WithTonicConfig;
-
     // Presence check only — the OTLP exporter reads the endpoint value itself
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
 
     let signal_endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
     let effective_endpoint = signal_endpoint.as_deref().unwrap_or(&endpoint);
 
-    let mut builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
-    if endpoint_uses_tls(effective_endpoint) {
-        builder =
-            builder.with_tls_config(tonic::transport::ClientTlsConfig::new().with_native_roots());
-    }
+    let protocol = resolve_otlp_protocol();
+    let build_result = match protocol {
+        OtlpProtocol::Grpc => build_grpc_span_exporter(effective_endpoint),
+        OtlpProtocol::HttpProtobuf => build_http_span_exporter(),
+    };
 
-    let otlp_exporter = match builder.build() {
+    let otlp_exporter = match build_result {
         Ok(exporter) => exporter,
         Err(e) => {
             eprintln!(
                 "WARNING: OTEL_EXPORTER_OTLP_ENDPOINT is set ({endpoint}) but the OTLP \
-                 exporter failed to initialize: {e}. Traces will NOT be exported."
+                 {protocol:?} exporter failed to initialize: {e}. Traces will NOT be exported."
             );
             return None;
         }
@@ -849,5 +919,18 @@ mod tests {
         assert!(endpoint_uses_tls("  HTTPS://otel.example.com:443  "));
         assert!(!endpoint_uses_tls("http://localhost:4317"));
         assert!(!endpoint_uses_tls("localhost:4317"));
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn protocol_names_parse() {
+        assert_eq!(parse_otlp_protocol("grpc"), Some(OtlpProtocol::Grpc));
+        assert_eq!(
+            parse_otlp_protocol(" HTTP/PROTOBUF "),
+            Some(OtlpProtocol::HttpProtobuf)
+        );
+        // Unsupported: no http-json feature, so the name must not be accepted.
+        assert_eq!(parse_otlp_protocol("http/json"), None);
+        assert_eq!(parse_otlp_protocol("https"), None);
     }
 }
