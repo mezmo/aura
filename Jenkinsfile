@@ -450,10 +450,15 @@ pipeline {
 
       stages {
         stage('Compute Release Version') {
+          environment {
+            GIT_BRANCH = "${CURRENT_BRANCH}"
+            BRANCH_NAME = "${CURRENT_BRANCH}"
+          }
+
           steps {
             script {
               env.NEXT_RELEASE_VERSION = sh(
-                script: 'npm run --silent release:version',
+                script: "npm run --silent release:version 'file://${env.WORKSPACE}'",
                 returnStdout: true
               ).trim()
               echo env.NEXT_RELEASE_VERSION ? "Release version: ${env.NEXT_RELEASE_VERSION}" : 'No release version determined; skipping build'
