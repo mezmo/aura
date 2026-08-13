@@ -7,7 +7,7 @@
 //! request-extension side-channel).
 
 use aura_config::ToolHeaderMappings;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName};
 
 /// Validated approver identity headers captured from one approved webhook
 /// response.
@@ -31,25 +31,39 @@ impl ApproverHeaders {
     ///
     /// Every outbound name in `mapping` must resolve to a present response
     /// header or the whole capture fails closed; nothing is silently
-    /// dropped.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled when capture wiring lands"
-    )]
-    #[expect(
-        dead_code,
-        reason = "filled when the webhook client's gate path wires capture"
-    )]
+    /// dropped. Response lookup is case-insensitive and takes the first
+    /// value of a multi-valued header, matching how the route reads the
+    /// signature headers off the same response. The missing names in the
+    /// error are sorted so a given failure always reports them in one
+    /// order.
     pub(crate) fn from_captured(
         mapping: &ToolHeaderMappings,
         response_headers: &HeaderMap,
     ) -> Result<Self, CaptureError> {
-        todo!("resolve mapped response headers, fail closed on missing")
+        let mut headers = HeaderMap::new();
+        let mut missing = Vec::new();
+        for (outbound, response_name) in mapping.iter() {
+            match response_headers.get(response_name) {
+                Some(value) => {
+                    // The outbound name is a validated lowercase header name
+                    // by construction of `ToolHeaderMappings`.
+                    let name = HeaderName::from_bytes(outbound.as_bytes())
+                        .expect("outbound names validated at config parse");
+                    headers.insert(name, value.clone());
+                }
+                None => missing.push(outbound.to_owned()),
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            return Err(CaptureError::MissingHeaders { names: missing });
+        }
+        Ok(Self { headers })
     }
 
     /// The captured outbound header names (never values), lowercased.
     pub fn captured_names(&self) -> impl Iterator<Item = &str> {
-        self.headers.keys().map(reqwest::header::HeaderName::as_str)
+        self.headers.keys().map(HeaderName::as_str)
     }
 
     /// Apply the overrides to an outbound request builder as per-request
@@ -183,7 +197,102 @@ pub(crate) fn current_approver_overrides() -> Option<ApproverHeaders> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use reqwest::header::HeaderValue;
+
     use super::*;
+
+    fn mappings(pairs: &[(&str, &str)]) -> ToolHeaderMappings {
+        let raw: HashMap<String, String> = pairs
+            .iter()
+            .map(|(outbound, response)| ((*outbound).to_owned(), (*response).to_owned()))
+            .collect();
+        ToolHeaderMappings::try_from(raw).expect("test mappings are valid config")
+    }
+
+    fn response(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// Capture rekeys the response value under the configured outbound name,
+    /// carrying the value through unchanged.
+    #[test]
+    fn captures_response_value_under_outbound_name() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "x-approver-id")]),
+            &response(&[("x-approver-id", "alice")]),
+        )
+        .expect("a present mapped header captures");
+
+        assert_eq!(
+            captured.captured_names().collect::<Vec<_>>(),
+            vec!["x-forwarded-user"]
+        );
+        assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
+        assert!(captured.headers.get("x-approver-id").is_none());
+    }
+
+    /// A webhook is free to spell its response header any way, and so is
+    /// the operator configuring the mapping; neither spelling has to match
+    /// the other's case.
+    #[test]
+    fn response_lookup_is_case_insensitive() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "X-Approver-Id")]),
+            &response(&[("X-APPROVER-ID", "alice")]),
+        )
+        .expect("response header casing must not defeat capture");
+
+        assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
+    }
+
+    /// A response may repeat a header. Capture takes the first value, as the
+    /// route's own header reads do, and exactly one value lands under the
+    /// outbound name — a second approver identity cannot ride along.
+    #[test]
+    fn repeated_response_header_captures_only_the_first_value() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "x-approver-id")]),
+            &response(&[("x-approver-id", "alice"), ("x-approver-id", "mallory")]),
+        )
+        .expect("a repeated mapped header still captures");
+
+        assert_eq!(captured.headers.get("x-forwarded-user").unwrap(), "alice");
+        assert_eq!(
+            captured.headers.get_all("x-forwarded-user").iter().count(),
+            1
+        );
+    }
+
+    /// Every missing name is reported at once, sorted, so one failing
+    /// response always produces the same audit string.
+    #[test]
+    fn missing_names_are_all_reported_and_sorted() {
+        let err = ApproverHeaders::from_captured(
+            &mappings(&[
+                ("x-forwarded-user", "x-approver-id"),
+                ("authorization", "x-approver-token"),
+                ("x-tenant", "x-approver-tenant"),
+            ]),
+            &response(&[("x-approver-tenant", "acme")]),
+        )
+        .expect_err("a partial capture must fail closed");
+
+        assert_eq!(
+            err,
+            CaptureError::MissingHeaders {
+                names: vec!["authorization".to_owned(), "x-forwarded-user".to_owned()],
+            }
+        );
+    }
 
     /// Every adaptor call outside a task-local scope (wrapper-less agents)
     /// must read `None`, never panic.

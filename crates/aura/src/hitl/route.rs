@@ -232,9 +232,9 @@ impl DecisionRoute {
     /// gates on either route, decided or not.
     ///
     /// The webhook arm goes through the capture-bearing client seam
-    /// ([`WebhookClient::request_approval_for_gate`]), which owns the HTTP
-    /// response, so capture is filled there without signature changes;
-    /// its event choreography mirrors [`Self::decide`]'s webhook arm. The
+    /// ([`WebhookClient::request_approval_for_gate`]), the only path that
+    /// reads approver identity off an approval response; its event
+    /// choreography mirrors [`Self::decide`]'s webhook arm. The
     /// conversational arm delegates to the unstamped [`Self::decide_inner`]
     /// (not [`Self::decide`], which would stamp a second time on this span):
     /// that route has no distinct identity source and never captures.
@@ -261,7 +261,27 @@ impl DecisionRoute {
                 )
                 .await;
 
-                let result = client.request_approval_for_gate(&request, *timeout).await;
+                // Cancellation is checked in two phases, both failing closed:
+                // the round trip races the cancel token, and whatever the
+                // race returns is rechecked against the token before it
+                // becomes this arm's decision — so a disconnect landing just
+                // as the decision arrives is caught too, and a cancelled call
+                // captures nothing. The completed event is derived after both
+                // phases, so the event and the returned decision always agree.
+                let raced = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    decision = client.request_approval_for_gate(&request, *timeout) => Some(decision),
+                };
+                let result = match raced {
+                    Some(decision) if !cancel.is_cancelled() => decision,
+                    _ => {
+                        tracing::warn!(%decision_id, "approval cancelled: client disconnected");
+                        Ok(GateDecision::Cancelled(
+                            super::decision::CancelReason::ClientDisconnected,
+                        ))
+                    }
+                };
                 let completed = match &result {
                     Ok(decision) => events::completed(
                         decision_id,
@@ -374,7 +394,25 @@ impl DecisionRoute {
                 )
                 .await;
 
-                let result = client.request_approval(&request, *timeout).await;
+                // Two-phase, as on the gate path: race the round trip against
+                // the cancel token, then recheck the token before the raced
+                // outcome becomes this arm's outcome. The completed event is
+                // derived after both phases, so the event and the returned
+                // outcome always agree.
+                let raced = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    outcome = client.request_approval(&request, *timeout) => Some(outcome),
+                };
+                let result = match raced {
+                    Some(outcome) if !cancel.is_cancelled() => outcome,
+                    _ => {
+                        tracing::warn!(%decision_id, "approval cancelled: client disconnected");
+                        Ok(ApprovalOutcome::Cancelled(
+                            super::decision::CancelReason::ClientDisconnected,
+                        ))
+                    }
+                };
                 let completed = match &result {
                     Ok(outcome) => {
                         events::completed(decision_id, outcome, &scope, started.elapsed())
@@ -456,13 +494,14 @@ fn resolve_webhook_headers(
     header_map
 }
 
-/// HMAC signing state for the webhook route.
+/// The webhook route's egress signing state, plus the fail-closed state an
+/// unusable route configuration lands in.
 enum EgressSigning {
     /// Unsigned egress.
     Disabled,
     /// Signed egress under the configured HMAC secret.
     Enabled(WebhookHmac),
-    /// An unusable signing configuration, with the reason.
+    /// An unusable route configuration, with the reason.
     Misconfigured(String),
 }
 
@@ -473,13 +512,35 @@ pub struct WebhookClient {
     /// Resolved webhook headers.
     headers: HeaderMap,
     signing: EgressSigning,
-    /// Validated `tool_headers_from_response` mappings. Read only by the
-    /// gate-scoped path; empty means no capture is configured.
-    #[expect(
-        dead_code,
-        reason = "request_approval_for_gate reads this when capture wiring lands"
-    )]
+    /// Validated `tool_headers_from_response` mappings; empty means approver
+    /// identity capture is not configured.
     tool_header_mappings: ToolHeaderMappings,
+}
+
+/// One webhook round trip's answer, with the HTTP response headers it
+/// arrived alongside.
+///
+/// Only the decided arm carries headers: a timed-out round trip has no
+/// response to read them from, so headers-without-a-decision is
+/// unrepresentable.
+enum WebhookReply {
+    Decided {
+        decision: ApprovalDecision,
+        response_headers: HeaderMap,
+    },
+    TimedOut {
+        waited: Duration,
+    },
+}
+
+impl WebhookReply {
+    /// Project to the route-wide outcome, dropping the response headers.
+    fn into_outcome(self) -> ApprovalOutcome {
+        match self {
+            Self::Decided { decision, .. } => ApprovalOutcome::Decided(decision),
+            Self::TimedOut { waited } => ApprovalOutcome::TimedOut { waited },
+        }
+    }
 }
 
 impl WebhookClient {
@@ -518,23 +579,35 @@ impl WebhookClient {
         signing: EgressSigning,
         tool_header_mappings: ToolHeaderMappings,
     ) -> Self {
-        // A plaintext response channel would defeat response-leg verification,
-        // so http:// with a secret configured is itself a misconfiguration
-        // (DESIGN.md §4, Route A).
-        let signing = match signing {
-            EgressSigning::Enabled(_) if url.as_str().starts_with("http://") => {
-                EgressSigning::Misconfigured(format!(
+        // Two ways a plaintext url makes the route unusable, both fail closed
+        // for the life of the client. A plaintext response channel defeats
+        // response-leg verification, so http:// with a secret configured is
+        // itself a misconfiguration (DESIGN.md §4, Route A). Captured
+        // approver headers are credentials the gated call then presents as
+        // identity, so carrying them back over cleartext exposes them to the
+        // network whether or not the decision itself is signed. Neither check
+        // exempts loopback: the url is operator config, not a test fixture.
+        let signing = if url.as_str().starts_with("http://") {
+            match signing {
+                EgressSigning::Enabled(_) => EgressSigning::Misconfigured(format!(
                     "webhook url {} uses plaintext http:// while an HMAC secret is configured; \
                      use https://",
                     url.as_str()
-                ))
+                )),
+                _ if !tool_header_mappings.is_empty() => EgressSigning::Misconfigured(format!(
+                    "webhook url {} uses plaintext http:// while tool_headers_from_response is \
+                     configured; use https://",
+                    url.as_str()
+                )),
+                other => other,
             }
-            other => other,
+        } else {
+            signing
         };
         if let EgressSigning::Misconfigured(reason) = &signing {
             tracing::error!(
                 reason,
-                "HITL webhook HMAC misconfigured; every approval request on this route \
+                "HITL webhook route misconfigured; every approval request on this route \
                  will fail closed"
             );
         }
@@ -548,19 +621,41 @@ impl WebhookClient {
     }
 
     /// Gate-scoped approval request: the config-gate path through the
-    /// webhook. This method owns the HTTP response, so capture is filled
-    /// here — mapped approval-response headers resolved per
-    /// `tool_header_mappings`, fail closed on missing — with no further
-    /// signature change. Until capture wiring lands, every decision
-    /// carries no overrides. The route-wide [`Self::request_approval`]
-    /// path serves `request_approval` and never captures.
+    /// webhook.
+    ///
+    /// Runs the round trip through [`Self::request_approval_with_headers`]
+    /// and captures approver identity from the reply's response headers on
+    /// the approved arm only, and only when `tool_header_mappings` is
+    /// non-empty — so overrides are `Some` exactly when capture is
+    /// configured and every mapped header resolved, and `None` otherwise.
+    /// A capture that cannot complete fails closed as
+    /// [`ApprovalError::CaptureFailed`] rather than approving without the
+    /// identity the operator demanded. Every other reply projects through
+    /// [`GateDecision::without_overrides`]. The route-wide
+    /// [`Self::request_approval`] path serves the agent-callable approval
+    /// tool and never captures.
     pub(crate) async fn request_approval_for_gate(
         &self,
         request: &ApprovalRequest,
         timeout: Duration,
     ) -> Result<GateDecision, ApprovalError> {
-        let outcome = self.request_approval(request, timeout).await?;
-        Ok(GateDecision::without_overrides(outcome))
+        match self.request_approval_with_headers(request, timeout).await? {
+            WebhookReply::Decided {
+                decision: ApprovalDecision::Approved,
+                response_headers,
+            } => {
+                let overrides = if self.tool_header_mappings.is_empty() {
+                    None
+                } else {
+                    Some(crate::approver_headers::ApproverHeaders::from_captured(
+                        &self.tool_header_mappings,
+                        &response_headers,
+                    )?)
+                };
+                Ok(GateDecision::Approved { overrides })
+            }
+            other => Ok(GateDecision::without_overrides(other.into_outcome())),
+        }
     }
 
     /// Apply operator-configured headers to a request builder. Called before
@@ -575,16 +670,34 @@ impl WebhookClient {
         builder
     }
 
-    /// POST the request and resolve a decision, failing closed on timeout or
-    /// transport/parse error. With a secret configured the POST carries the
-    /// `X-Aura-*` signature headers (context `approval-request:{decision_id}`)
-    /// and the HTTP response must verify under
-    /// `approval-decision:{decision_id}` before its body is parsed.
+    /// Resolve a decision without its response headers: the route-wide path,
+    /// which never captures approver identity.
     async fn request_approval(
         &self,
         request: &ApprovalRequest,
         timeout: Duration,
     ) -> Result<ApprovalOutcome, ApprovalError> {
+        Ok(self
+            .request_approval_with_headers(request, timeout)
+            .await?
+            .into_outcome())
+    }
+
+    /// POST the request and resolve a decision, failing closed on timeout or
+    /// transport/parse error. With a secret configured the POST carries the
+    /// `X-Aura-*` signature headers (context `approval-request:{decision_id}`)
+    /// and the HTTP response must verify under
+    /// `approval-decision:{decision_id}` before its body is parsed.
+    ///
+    /// The reply carries the response headers, cloned off the response
+    /// before its body is consumed. On the signed path they reach a caller
+    /// only inside a [`WebhookReply::Decided`], which is built after
+    /// verification and parse both succeed.
+    async fn request_approval_with_headers(
+        &self,
+        request: &ApprovalRequest,
+        timeout: Duration,
+    ) -> Result<WebhookReply, ApprovalError> {
         let hmac = match &self.signing {
             EgressSigning::Misconfigured(reason) => {
                 return Err(ApprovalError::Misconfigured(reason.clone()));
@@ -618,7 +731,7 @@ impl WebhookClient {
             post = post.header(name, value);
         }
         match post.body(body).timeout(timeout).send().await {
-            Err(e) if e.is_timeout() => Ok(ApprovalOutcome::TimedOut { waited: timeout }),
+            Err(e) if e.is_timeout() => Ok(WebhookReply::TimedOut { waited: timeout }),
             Err(e) => Err(ApprovalError::Transport(e.to_string())),
             Ok(resp) => {
                 let status = resp.status();
@@ -632,12 +745,15 @@ impl WebhookClient {
                 // ingress before any parse.
                 let signature = header_value(resp.headers(), super::signing::SIGNATURE_HEADER);
                 let timestamp = header_value(resp.headers(), super::signing::TIMESTAMP_HEADER);
+                // Cloned here because `bytes()` consumes the response; the
+                // clone is inert until a verified parse builds `Decided`.
+                let response_headers = resp.headers().clone();
                 let body = match resp.bytes().await {
                     Ok(body) => body,
                     // A timeout firing mid-body download is still a timeout, not
                     // a transport fault — keep the classification honest.
                     Err(e) if e.is_timeout() => {
-                        return Ok(ApprovalOutcome::TimedOut { waited: timeout });
+                        return Ok(WebhookReply::TimedOut { waited: timeout });
                     }
                     Err(e) => return Err(ApprovalError::Transport(e.to_string())),
                 };
@@ -653,7 +769,10 @@ impl WebhookClient {
                 )
                 .map_err(|e| ApprovalError::ResponseUnverified(e.to_string()))?;
                 match serde_json::from_slice::<ApprovalDecisionWire>(verified.as_ref()) {
-                    Ok(wire) => Ok(ApprovalOutcome::Decided(ApprovalDecision::from(wire))),
+                    Ok(wire) => Ok(WebhookReply::Decided {
+                        decision: ApprovalDecision::from(wire),
+                        response_headers,
+                    }),
                     Err(e) => Err(ApprovalError::Parse(e.to_string())),
                 }
             }
@@ -665,12 +784,12 @@ impl WebhookClient {
         &self,
         wire: &ApprovalRequestWire<'_>,
         timeout: Duration,
-    ) -> Result<ApprovalOutcome, ApprovalError> {
+    ) -> Result<WebhookReply, ApprovalError> {
         let builder = self
             .apply_operator_headers(self.client.post(self.url.as_str()).json(wire))
             .timeout(timeout);
         match builder.send().await {
-            Err(e) if e.is_timeout() => Ok(ApprovalOutcome::TimedOut { waited: timeout }),
+            Err(e) if e.is_timeout() => Ok(WebhookReply::TimedOut { waited: timeout }),
             Err(e) => Err(ApprovalError::Transport(e.to_string())),
             Ok(resp) => {
                 let status = resp.status();
@@ -679,11 +798,16 @@ impl WebhookClient {
                         status: status.as_u16(),
                     });
                 }
+                // Cloned here because `json()` consumes the response.
+                let response_headers = resp.headers().clone();
                 match resp.json::<ApprovalDecisionWire>().await {
-                    Ok(wire) => Ok(ApprovalOutcome::Decided(ApprovalDecision::from(wire))),
+                    Ok(wire) => Ok(WebhookReply::Decided {
+                        decision: ApprovalDecision::from(wire),
+                        response_headers,
+                    }),
                     // A timeout firing mid-body download is still a timeout, not a
                     // parse fault — keep the error-vs-decision classification honest.
-                    Err(e) if e.is_timeout() => Ok(ApprovalOutcome::TimedOut { waited: timeout }),
+                    Err(e) if e.is_timeout() => Ok(WebhookReply::TimedOut { waited: timeout }),
                     Err(e) => Err(ApprovalError::Parse(e.to_string())),
                 }
             }
@@ -1206,7 +1330,7 @@ mod tests {
         use tokio::net::TcpListener;
 
         use super::super::super::decision::{
-            AgentScope, ApprovalDecision, ApprovalOrigin, DecisionId,
+            AgentScope, ApprovalDecision, ApprovalOrigin, CancelReason, DecisionId,
         };
         use super::super::super::protocol::{ApprovalRequest, PROTOCOL_VERSION};
         use super::super::super::signing::{
@@ -1214,8 +1338,10 @@ mod tests {
             WebhookHmac, authorize_ingress,
         };
         use super::super::{
-            ApprovalError, ApprovalOutcome, EgressSigning, WebhookClient, build_webhook_client,
+            ApprovalError, ApprovalOutcome, EgressSigning, GateDecision, WebhookClient,
+            build_webhook_client,
         };
+        use crate::approver_headers::CaptureError;
 
         fn test_hmac() -> WebhookHmac {
             WebhookHmac::new(
@@ -1260,6 +1386,44 @@ mod tests {
             response_headers: Vec<(String, String)>,
             response_body: String,
         ) -> (String, tokio::sync::oneshot::Receiver<ReceivedRequest>) {
+            one_shot_receiver_with_status("200 OK", response_headers, response_body).await
+        }
+
+        /// [`one_shot_receiver`] with the response status line chosen by the
+        /// caller, for the non-2xx path.
+        async fn one_shot_receiver_with_status(
+            status: &'static str,
+            response_headers: Vec<(String, String)>,
+            response_body: String,
+        ) -> (String, tokio::sync::oneshot::Receiver<ReceivedRequest>) {
+            one_shot_receiver_cancelling_after_read(status, response_headers, response_body, None)
+                .await
+        }
+
+        /// [`one_shot_receiver`] that fires `cancel_after_read` once it has
+        /// the whole request and before it writes a byte of the response, so
+        /// the caller meets a cancelled token and an arriving approval at the
+        /// same time.
+        async fn cancelling_receiver(
+            cancel: crate::request_cancellation::RequestCancelToken,
+            response_headers: Vec<(String, String)>,
+            response_body: String,
+        ) -> (String, tokio::sync::oneshot::Receiver<ReceivedRequest>) {
+            one_shot_receiver_cancelling_after_read(
+                "200 OK",
+                response_headers,
+                response_body,
+                Some(cancel),
+            )
+            .await
+        }
+
+        async fn one_shot_receiver_cancelling_after_read(
+            status: &'static str,
+            response_headers: Vec<(String, String)>,
+            response_body: String,
+            cancel_after_read: Option<crate::request_cancellation::RequestCancelToken>,
+        ) -> (String, tokio::sync::oneshot::Receiver<ReceivedRequest>) {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1295,8 +1459,12 @@ mod tests {
                     body.extend_from_slice(&chunk[..n]);
                 }
 
+                if let Some(cancel) = cancel_after_read {
+                    cancel.cancel();
+                }
+
                 let mut response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n",
                     response_body.len()
                 );
@@ -1305,24 +1473,85 @@ mod tests {
                 }
                 response.push_str("\r\n");
                 response.push_str(&response_body);
-                socket.write_all(response.as_bytes()).await.unwrap();
+                // A cancelling caller may already have dropped the connection,
+                // so a failed reply is not a test failure; every test that
+                // cares asserts on what the client resolved to.
+                socket.write_all(response.as_bytes()).await.ok();
                 socket.shutdown().await.ok();
                 tx.send(ReceivedRequest { headers, body }).ok();
             });
             (url, rx)
         }
 
-        /// Builds a signing-enabled client directly against a loopback
-        /// `http://` receiver. Bypasses the https-only policy deliberately:
-        /// the policy is exercised by `http_url_with_secret_fails_closed`.
-        fn loopback_signed_client(url: &str, hmac: WebhookHmac) -> WebhookClient {
+        /// A receiver that accepts one connection, signals over the returned
+        /// channel that it has, and then never answers — so the caller's own
+        /// timeout or cancellation is what resolves the round trip. Awaiting
+        /// the signal before acting proves the round trip is in flight. The
+        /// spawned task holds the accepted socket open for the life of the
+        /// test; closing it would surface as a transport error instead.
+        async fn stalled_receiver() -> (String, tokio::sync::oneshot::Receiver<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _socket = listener.accept().await.unwrap();
+                accepted_tx.send(()).ok();
+                std::future::pending::<()>().await;
+            });
+            (url, accepted_rx)
+        }
+
+        /// Builds a client directly against a loopback `http://` receiver.
+        /// Bypasses the https-only policy deliberately: the policy is
+        /// exercised by `http_url_with_secret_fails_closed`.
+        fn loopback_client(
+            url: &str,
+            signing: EgressSigning,
+            tool_header_mappings: aura_config::ToolHeaderMappings,
+        ) -> WebhookClient {
             WebhookClient {
                 client: build_webhook_client(),
                 url: aura_config::WebhookUrl::new(url).unwrap(),
                 headers: HeaderMap::new(),
-                signing: EgressSigning::Enabled(hmac),
-                tool_header_mappings: aura_config::ToolHeaderMappings::default(),
+                signing,
+                tool_header_mappings,
             }
+        }
+
+        fn loopback_signed_client(url: &str, hmac: WebhookHmac) -> WebhookClient {
+            loopback_client(
+                url,
+                EgressSigning::Enabled(hmac),
+                aura_config::ToolHeaderMappings::default(),
+            )
+        }
+
+        fn mappings(pairs: &[(&str, &str)]) -> aura_config::ToolHeaderMappings {
+            let raw: HashMap<String, String> = pairs
+                .iter()
+                .map(|(outbound, response)| ((*outbound).to_owned(), (*response).to_owned()))
+                .collect();
+            aura_config::ToolHeaderMappings::try_from(raw).expect("test mappings are valid config")
+        }
+
+        /// The one mapping every gate test below configures.
+        fn user_mapping() -> aura_config::ToolHeaderMappings {
+            mappings(&[("x-forwarded-user", "x-approver-id")])
+        }
+
+        /// Sign `body` under the approval-decision context for `decision_id`,
+        /// as a webhook answering that decision must.
+        fn signed_response_headers(
+            hmac: &WebhookHmac,
+            decision_id: DecisionId,
+            body: &str,
+        ) -> Vec<(String, String)> {
+            let context = SigningContext::new(&format!("approval-decision:{decision_id}")).unwrap();
+            hmac.sign(&context, body.as_bytes())
+                .unwrap()
+                .into_pairs()
+                .map(|(name, value)| (name.to_string(), value))
+                .to_vec()
         }
 
         #[tokio::test]
@@ -1443,16 +1672,8 @@ mod tests {
         fn boot_validation_rejects_plaintext_url_only_with_secret() {
             use super::super::validate_webhook_signing_config;
 
-            let webhook = |url: &str| aura_config::HitlConfig {
-                require_approval: vec![],
-                route: aura_config::DecisionRouteConfig::Webhook {
-                    url: aura_config::WebhookUrl::new(url).unwrap(),
-                    timeout_secs: 300,
-                    headers: HashMap::new(),
-                    headers_from_request: HashMap::new(),
-                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
-                },
-            };
+            let webhook =
+                |url: &str| webhook_config(url, aura_config::ToolHeaderMappings::default());
             let hmac = test_hmac();
 
             // Secret + http:// fails at boot.
@@ -1482,29 +1703,39 @@ mod tests {
             validate_webhook_signing_config(&conversational, Some(&hmac)).unwrap();
         }
 
-        #[test]
-        fn from_config_threads_hmac_into_webhook_route() {
-            use super::super::{DecisionRoute, HitlRuntime};
-
-            let config = |url: &str| aura_config::HitlConfig {
+        fn webhook_config(
+            url: &str,
+            tool_headers_from_response: aura_config::ToolHeaderMappings,
+        ) -> aura_config::HitlConfig {
+            aura_config::HitlConfig {
                 require_approval: vec![],
                 route: aura_config::DecisionRouteConfig::Webhook {
                     url: aura_config::WebhookUrl::new(url).unwrap(),
                     timeout_secs: 300,
                     headers: HashMap::new(),
                     headers_from_request: HashMap::new(),
-                    tool_headers_from_response: aura_config::ToolHeaderMappings::default(),
+                    tool_headers_from_response,
                 },
-            };
-            let pending = crate::hitl::PendingApprovals::new();
-            let hmac = test_hmac();
+            }
+        }
 
-            fn signing_of(runtime: &HitlRuntime) -> &EgressSigning {
-                match &*runtime.route {
-                    DecisionRoute::Webhook { client, .. } => &client.signing,
-                    DecisionRoute::Conversational { .. } => panic!("expected webhook route"),
+        fn signing_of(runtime: &super::super::HitlRuntime) -> &EgressSigning {
+            match &*runtime.route {
+                super::super::DecisionRoute::Webhook { client, .. } => &client.signing,
+                super::super::DecisionRoute::Conversational { .. } => {
+                    panic!("expected webhook route")
                 }
             }
+        }
+
+        #[test]
+        fn from_config_threads_hmac_into_webhook_route() {
+            use super::super::HitlRuntime;
+
+            let config =
+                |url: &str| webhook_config(url, aura_config::ToolHeaderMappings::default());
+            let pending = crate::hitl::PendingApprovals::new();
+            let hmac = test_hmac();
 
             let signed = HitlRuntime::from_config(
                 &config("https://approvals.example.com/aura"),
@@ -1540,6 +1771,54 @@ mod tests {
             );
         }
 
+        /// Captured approver headers are credentials travelling back from the
+        /// approver, so a cleartext approval channel must fail closed for
+        /// them on its own — with no HMAC secret anywhere in the config.
+        #[test]
+        fn from_config_rejects_capture_over_plaintext_url() {
+            use super::super::HitlRuntime;
+
+            let pending = crate::hitl::PendingApprovals::new();
+
+            let plaintext = HitlRuntime::from_config(
+                &webhook_config("http://approvals.example.com/aura", user_mapping()),
+                &pending,
+                None,
+                None,
+            );
+            match signing_of(&plaintext) {
+                EgressSigning::Misconfigured(reason) => assert!(
+                    reason.contains("tool_headers_from_response"),
+                    "the reason must name the capture config: {reason}"
+                ),
+                _ => panic!("plaintext http:// with capture must fail closed"),
+            }
+
+            let secure = HitlRuntime::from_config(
+                &webhook_config("https://approvals.example.com/aura", user_mapping()),
+                &pending,
+                None,
+                None,
+            );
+            assert!(
+                matches!(signing_of(&secure), EgressSigning::Disabled),
+                "https:// with capture and no secret is a usable unsigned route"
+            );
+
+            // Without capture configured, plaintext stays allowed for an
+            // unsigned route — this guard adds no new restriction there.
+            let legacy = HitlRuntime::from_config(
+                &webhook_config(
+                    "http://approvals.example.com/aura",
+                    aura_config::ToolHeaderMappings::default(),
+                ),
+                &pending,
+                None,
+                None,
+            );
+            assert!(matches!(signing_of(&legacy), EgressSigning::Disabled));
+        }
+
         #[tokio::test]
         async fn no_secret_sends_unsigned_and_trusts_response() {
             let decision_id = DecisionId::generate();
@@ -1568,6 +1847,321 @@ mod tests {
                 "no secret configured must mean no signature header"
             );
             assert!(received.header(TIMESTAMP_HEADER).is_none());
+        }
+
+        #[tokio::test]
+        async fn unsigned_gate_approved_captures_mapped_headers() {
+            let (url, _received) = one_shot_receiver(
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+
+            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
+            let decision = client
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("unsigned gate round trip succeeds");
+
+            match decision {
+                GateDecision::Approved {
+                    overrides: Some(overrides),
+                } => assert_eq!(
+                    overrides.captured_names().collect::<Vec<_>>(),
+                    vec!["x-forwarded-user"]
+                ),
+                other => panic!("expected Approved carrying overrides, got {other:?}"),
+            }
+        }
+
+        /// Capture composes with the response-leg signature check: the same
+        /// response both verifies and yields identity.
+        #[tokio::test]
+        async fn signed_gate_approved_captures_mapped_headers() {
+            let hmac = test_hmac();
+            let decision_id = DecisionId::generate();
+            let response_body = r#"{"approved":true}"#.to_owned();
+
+            let mut response_headers = signed_response_headers(&hmac, decision_id, &response_body);
+            response_headers.push(("x-approver-id".to_owned(), "alice".to_owned()));
+            let (url, received) = one_shot_receiver(response_headers, response_body).await;
+
+            let client = loopback_client(&url, EgressSigning::Enabled(hmac), user_mapping());
+            let decision = client
+                .request_approval_for_gate(&test_request(decision_id), Duration::from_secs(5))
+                .await
+                .expect("signed gate round trip succeeds");
+
+            match decision {
+                GateDecision::Approved {
+                    overrides: Some(overrides),
+                } => assert_eq!(
+                    overrides.captured_names().collect::<Vec<_>>(),
+                    vec!["x-forwarded-user"]
+                ),
+                other => panic!("expected Approved carrying overrides, got {other:?}"),
+            }
+
+            let received = received.await.unwrap();
+            assert!(
+                received.header(SIGNATURE_HEADER).is_some(),
+                "the gate path must still sign its egress POST"
+            );
+        }
+
+        /// An approval that does not carry the demanded identity is not an
+        /// approval: no partial override survives.
+        #[tokio::test]
+        async fn gate_approved_missing_mapped_header_fails_closed() {
+            let (url, _received) =
+                one_shot_receiver(vec![], r#"{"approved":true}"#.to_owned()).await;
+
+            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
+            let err = client
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("a missing mapped header must fail the approval closed");
+
+            match &err {
+                ApprovalError::CaptureFailed(CaptureError::MissingHeaders { names }) => {
+                    assert_eq!(names, &["x-forwarded-user".to_owned()]);
+                }
+                other => panic!("expected CaptureFailed, got {other:?}"),
+            }
+            assert!(
+                err.to_string().contains("x-forwarded-user"),
+                "the audit message must name the missing header: {err}"
+            );
+        }
+
+        /// A denial short-circuits before capture, so the same response that
+        /// would fail an approval closed is a clean `Denied` here.
+        #[tokio::test]
+        async fn gate_denied_response_ignores_missing_mapped_header() {
+            let (url, _received) = one_shot_receiver(
+                vec![],
+                r#"{"approved":false,"reason":"not today"}"#.to_owned(),
+            )
+            .await;
+
+            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
+            let decision = client
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("a denial is a decision, not a capture failure");
+
+            assert!(
+                matches!(decision, GateDecision::Denied { reason } if reason.as_deref() == Some("not today")),
+                "expected Denied"
+            );
+        }
+
+        /// With no mapping configured, a response header that happens to
+        /// match one is not identity: `Approved` carries no override object
+        /// at all rather than an empty one.
+        #[tokio::test]
+        async fn gate_empty_mapping_yields_no_overrides() {
+            let (url, _received) = one_shot_receiver(
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+
+            let client = loopback_client(
+                &url,
+                EgressSigning::Disabled,
+                aura_config::ToolHeaderMappings::default(),
+            );
+            let decision = client
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("unsigned gate round trip succeeds");
+
+            assert!(
+                matches!(decision, GateDecision::Approved { overrides: None }),
+                "expected Approved without overrides, got {decision:?}"
+            );
+        }
+
+        /// The remaining loopback-matrix rows on the gate path: with capture
+        /// configured, none of them reaches an `Approved` decision, so no
+        /// override object can exist.
+        #[tokio::test]
+        async fn gate_non_happy_responses_yield_no_overrides() {
+            // Non-2xx.
+            let (url, _received) = one_shot_receiver_with_status(
+                "503 Service Unavailable",
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+            let err = loopback_client(&url, EgressSigning::Disabled, user_mapping())
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("a non-2xx response is a channel fault");
+            assert!(matches!(err, ApprovalError::BadStatus { status: 503 }));
+
+            // Malformed body.
+            let (url, _received) = one_shot_receiver(
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                "not json".to_owned(),
+            )
+            .await;
+            let err = loopback_client(&url, EgressSigning::Disabled, user_mapping())
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("an unparsable body is a channel fault");
+            assert!(matches!(err, ApprovalError::Parse(_)));
+
+            // Response-leg HMAC failure: an approved, identity-bearing body
+            // that is not signed must not become an approval.
+            let (url, _received) = one_shot_receiver(
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+            let err = loopback_client(&url, EgressSigning::Enabled(test_hmac()), user_mapping())
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("an unverified response must not become an approval");
+            assert!(matches!(err, ApprovalError::ResponseUnverified(_)));
+        }
+
+        /// A round trip the webhook never answers times out, and a timeout
+        /// is not an approval.
+        #[tokio::test]
+        async fn gate_timeout_yields_no_overrides() {
+            let (url, _accepted) = stalled_receiver().await;
+
+            let decision = loopback_client(&url, EgressSigning::Disabled, user_mapping())
+                .request_approval_for_gate(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_millis(200),
+                )
+                .await
+                .expect("a timeout is an outcome, not a channel fault");
+
+            assert!(
+                matches!(decision, GateDecision::TimedOut { .. }),
+                "expected TimedOut, got {decision:?}"
+            );
+        }
+
+        /// Cancelling a round trip the receiver has already accepted — so it
+        /// is provably in flight — resolves the gate's webhook arm without
+        /// waiting out its timeout, and the cancelled decision carries no
+        /// override.
+        #[tokio::test]
+        async fn webhook_gate_cancellation_short_circuits_the_round_trip() {
+            let (url, accepted) = stalled_receiver().await;
+            let route = super::super::DecisionRoute::Webhook {
+                client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                timeout: Duration::from_secs(300),
+            };
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+            let (decision, ()) = tokio::join!(
+                route.decide_for_gate(test_request(DecisionId::generate()), &cancel),
+                async {
+                    accepted
+                        .await
+                        .expect("the round trip must reach the receiver first");
+                    cancel.cancel();
+                }
+            );
+
+            let decision = decision.expect("cancellation is an outcome, not a channel fault");
+            assert!(
+                matches!(
+                    decision,
+                    GateDecision::Cancelled(CancelReason::ClientDisconnected)
+                ),
+                "expected Cancelled, got {decision:?}"
+            );
+        }
+
+        /// The route-wide path honours the same token.
+        #[tokio::test]
+        async fn webhook_route_cancellation_short_circuits_the_round_trip() {
+            let (url, accepted) = stalled_receiver().await;
+            let route = super::super::DecisionRoute::Webhook {
+                client: loopback_client(
+                    &url,
+                    EgressSigning::Disabled,
+                    aura_config::ToolHeaderMappings::default(),
+                ),
+                timeout: Duration::from_secs(300),
+            };
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+
+            let (outcome, ()) = tokio::join!(
+                route.decide(test_request(DecisionId::generate()), &cancel),
+                async {
+                    accepted
+                        .await
+                        .expect("the round trip must reach the receiver first");
+                    cancel.cancel();
+                }
+            );
+
+            assert_eq!(
+                outcome.expect("cancellation is an outcome, not a channel fault"),
+                ApprovalOutcome::Cancelled(CancelReason::ClientDisconnected)
+            );
+        }
+
+        /// Cancellation beats an approval that is already on the wire: the
+        /// receiver cancels the token before writing an approved,
+        /// identity-bearing response, so the decision and the disconnect are
+        /// both live. Whichever the race sees first, the recheck makes
+        /// `Cancelled` the answer and no override object is produced.
+        #[tokio::test]
+        async fn webhook_gate_cancellation_beats_a_ready_approval() {
+            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+            let (url, _received) = cancelling_receiver(
+                cancel.clone(),
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+            let route = super::super::DecisionRoute::Webhook {
+                client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                timeout: Duration::from_secs(300),
+            };
+
+            let decision = route
+                .decide_for_gate(test_request(DecisionId::generate()), &cancel)
+                .await
+                .expect("cancellation is an outcome, not a channel fault");
+
+            assert!(
+                matches!(
+                    decision,
+                    GateDecision::Cancelled(CancelReason::ClientDisconnected)
+                ),
+                "expected Cancelled to win over the ready approval, got {decision:?}"
+            );
         }
     }
 

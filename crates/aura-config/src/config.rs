@@ -1222,6 +1222,59 @@ tool_headers_from_response = { "Authorization" = "x-approver-token" }
         }
     }
 
+    /// An explicitly empty map is the same feature-off state as an absent
+    /// one, and survives a serialize round trip as an absent key.
+    #[test]
+    fn hitl_webhook_tool_headers_empty_map_is_feature_off() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = {}
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match &hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => assert!(tool_headers_from_response.is_empty()),
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+        let round_tripped = toml::to_string(&hitl).unwrap();
+        assert!(
+            !round_tripped.contains("tool_headers_from_response"),
+            "an empty map must not be emitted: {round_tripped}"
+        );
+    }
+
+    /// Both sides of a mapping are lowercased through the real TOML
+    /// deserialization path, so a config spelled in header case resolves the
+    /// same as one spelled in wire case.
+    #[test]
+    fn hitl_webhook_tool_headers_response_name_lowercased() {
+        let toml = r#"
+require_approval = ["kubectl_*"]
+
+[route]
+mode = "webhook"
+url = "https://approvals.example.com/decide"
+tool_headers_from_response = { "X-Forwarded-User" = "X-Approver-Id" }
+"#;
+        let hitl: HitlConfig = toml::from_str(toml).unwrap();
+        match hitl.route {
+            DecisionRouteConfig::Webhook {
+                tool_headers_from_response,
+                ..
+            } => assert_eq!(
+                tool_headers_from_response.iter().collect::<Vec<_>>(),
+                vec![("x-forwarded-user", "x-approver-id")]
+            ),
+            other => panic!("expected Webhook route, got {:?}", other),
+        }
+    }
+
     /// Reserved transport-owned names are rejected at parse.
     #[test]
     fn hitl_webhook_tool_headers_reserved_name_rejected() {
