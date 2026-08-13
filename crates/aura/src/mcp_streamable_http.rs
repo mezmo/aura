@@ -33,7 +33,7 @@ use crate::tool_event_broker::{peek_tool_call_id, publish_tool_start};
 /// request value through the transport worker and is never serialized to
 /// the wire, so one-call scoping is structural. Every `call_tool*` variant
 /// constructs its request here.
-fn call_tool_request(
+pub(crate) fn call_tool_request(
     request_param: CallToolRequestParam,
     approver_overrides: Option<ApproverHeaders>,
 ) -> ClientRequest {
@@ -635,8 +635,14 @@ impl McpClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::sync::Mutex;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
     use super::*;
+    use crate::approver_headers::tests::captured_overrides;
 
     #[tokio::test]
     async fn test_in_flight_requests_tracking() {
@@ -649,5 +655,438 @@ mod tests {
 
         tracker.remove(http_id, &mcp_id).await;
         assert_eq!(tracker.get_all(http_id).await.len(), 0);
+    }
+
+    /// One HTTP request the server received, kept whole so a test can ask
+    /// both what rode in the headers and what rode in the body.
+    #[derive(Clone)]
+    pub(crate) struct RecordedRequest {
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl RecordedRequest {
+        /// Every value sent under `name`, in arrival order. A test that asks
+        /// for the count is asking whether an override replaced a header or
+        /// merely joined it.
+        pub(crate) fn header_values(&self, name: &str) -> Vec<&str> {
+            self.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+                .collect()
+        }
+
+        pub(crate) fn body_text(&self) -> String {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+
+        /// The JSON-RPC method this request carried, or `None` for a body
+        /// that is not a JSON-RPC message.
+        fn rpc_method(&self) -> Option<String> {
+            serde_json::from_slice::<Value>(&self.body)
+                .ok()?
+                .get("method")?
+                .as_str()
+                .map(str::to_owned)
+        }
+
+        /// The tool this request asked the server to run, for correlating a
+        /// recorded request back to the call that produced it.
+        pub(crate) fn called_tool(&self) -> Option<String> {
+            serde_json::from_slice::<Value>(&self.body)
+                .ok()?
+                .get("params")?
+                .get("name")?
+                .as_str()
+                .map(str::to_owned)
+        }
+    }
+
+    /// A loopback MCP server over streamable HTTP that answers the handshake
+    /// and every tool call, and keeps each request it received.
+    ///
+    /// It exists so a test can watch what actually reaches the wire: the
+    /// approver override is applied deep inside the transport, after rmcp's
+    /// worker has taken the request value, so nothing short of the received
+    /// request proves it arrived — or, for the calls that must not carry it,
+    /// that it did not.
+    pub(crate) struct RecordingMcpServer {
+        pub(crate) url: String,
+        received: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+
+    impl RecordingMcpServer {
+        pub(crate) async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&received);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    let sink = Arc::clone(&sink);
+                    tokio::spawn(serve_one_request(socket, sink));
+                }
+            });
+            Self { url, received }
+        }
+
+        /// Snapshot of every `tools/call` the server received, oldest first.
+        pub(crate) fn tool_calls(&self) -> Vec<RecordedRequest> {
+            self.received
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.rpc_method().as_deref() == Some("tools/call"))
+                .cloned()
+                .collect()
+        }
+
+        /// The handshake request, which no approval has gated and which must
+        /// therefore carry only the identity the client was built with.
+        pub(crate) fn initialize(&self) -> RecordedRequest {
+            self.received
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.rpc_method().as_deref() == Some("initialize"))
+                .cloned()
+                .expect("the client completed a handshake")
+        }
+    }
+
+    /// The session id the handshake hands back, echoed by the client on every
+    /// later request.
+    const SESSION_ID: &str = "recording-session";
+
+    /// Read one HTTP request off `socket`, record it, answer it, and close.
+    /// Answering `connection: close` keeps the framing to one request per
+    /// connection, so the reader never has to unpick a keep-alive stream.
+    async fn serve_one_request(mut socket: TcpStream, sink: Arc<Mutex<Vec<RecordedRequest>>>) {
+        let mut buf = Vec::new();
+        let head_end = loop {
+            let mut chunk = [0u8; 4096];
+            let Ok(n) = socket.read(&mut chunk).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap_or_default().to_owned();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+            .collect();
+        let content_length: usize = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = buf[head_end + 4..].to_vec();
+        while body.len() < content_length {
+            let mut chunk = [0u8; 4096];
+            let Ok(n) = socket.read(&mut chunk).await else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+
+        let http_method = request_line.split_whitespace().next().unwrap_or_default();
+        let (status, extra_headers, payload) = match http_method {
+            // rmcp opens a server-to-client stream once it has a session; 405
+            // is the documented "this server has none", which the worker
+            // absorbs instead of failing the connection.
+            "GET" => ("405 Method Not Allowed", Vec::new(), String::new()),
+            "DELETE" => ("202 Accepted", Vec::new(), String::new()),
+            _ => reply_to_rpc(&body),
+        };
+
+        sink.lock().unwrap().push(RecordedRequest { headers, body });
+
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n",
+            payload.len()
+        );
+        if !payload.is_empty() {
+            response.push_str("content-type: application/json\r\n");
+        }
+        for (name, value) in extra_headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(&payload);
+        socket.write_all(response.as_bytes()).await.ok();
+        socket.shutdown().await.ok();
+    }
+
+    /// Answer a JSON-RPC POST: a result for a request, a bare ack for a
+    /// notification.
+    fn reply_to_rpc(body: &[u8]) -> (&'static str, Vec<(String, String)>, String) {
+        let Ok(message) = serde_json::from_slice::<Value>(body) else {
+            return ("400 Bad Request", Vec::new(), String::new());
+        };
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(id) = message
+            .get("id")
+            .cloned()
+            .and_then(|id| serde_json::from_value::<RequestId>(id).ok())
+        else {
+            return ("202 Accepted", Vec::new(), String::new());
+        };
+
+        let result = match method.as_str() {
+            "initialize" => {
+                rmcp::model::ServerResult::InitializeResult(rmcp::model::InitializeResult::default())
+            }
+            "tools/call" => rmcp::model::ServerResult::CallToolResult(
+                rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text("ok")]),
+            ),
+            _ => rmcp::model::ServerResult::empty(()),
+        };
+        let payload =
+            serde_json::to_string(&rmcp::model::ServerJsonRpcMessage::response(result, id))
+                .expect("server result serializes");
+        let extra_headers = if method == "initialize" {
+            vec![("mcp-session-id".to_owned(), SESSION_ID.to_owned())]
+        } else {
+            Vec::new()
+        };
+        ("200 OK", extra_headers, payload)
+    }
+
+    /// The identity frozen into the client at build time, standing in for the
+    /// original requester's forwarded headers.
+    fn requester_headers() -> HashMap<String, String> {
+        HashMap::from([("authorization".to_owned(), "Bearer requester".to_owned())])
+    }
+
+    fn no_args() -> HashMap<String, Value> {
+        HashMap::new()
+    }
+
+    /// The override rides exactly the call it was captured for: the gated
+    /// call carries it, and the very next call on the same client — the one
+    /// no approval unblocked — is back to the client's own identity.
+    #[tokio::test]
+    async fn override_rides_one_call_and_no_later_one() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        client
+            .call_tool(
+                "gated",
+                no_args(),
+                Some(captured_overrides("x-forwarded-user", "alice")),
+            )
+            .await
+            .expect("the gated call succeeds");
+        client
+            .call_tool("ungated", no_args(), None)
+            .await
+            .expect("the ungated call succeeds");
+
+        let calls = server.tool_calls();
+        assert_eq!(calls.len(), 2, "both calls reached the server");
+        assert_eq!(calls[0].header_values("x-forwarded-user"), vec!["alice"]);
+        assert!(
+            calls[1].header_values("x-forwarded-user").is_empty(),
+            "the approver's identity must not persist onto the next call",
+        );
+    }
+
+    /// The override never becomes part of the message: it rides the request
+    /// value as an extension, and the serializer emits no trace of it.
+    #[tokio::test]
+    async fn override_never_reaches_the_json_body() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        client
+            .call_tool(
+                "gated",
+                no_args(),
+                Some(captured_overrides("x-forwarded-user", "alice")),
+            )
+            .await
+            .expect("the gated call succeeds");
+
+        let body = server.tool_calls()[0].body_text();
+        assert!(!body.contains("x-forwarded-user"), "body was: {body}");
+        assert!(!body.contains("alice"), "body was: {body}");
+    }
+
+    /// The whole point of the frozen-header problem: the approver's value must
+    /// stand in place of the requester's on the gated call, not beside it.
+    #[tokio::test]
+    async fn override_replaces_the_clients_frozen_identity_for_that_call_only() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        client
+            .call_tool(
+                "gated",
+                no_args(),
+                Some(captured_overrides("authorization", "Bearer approver")),
+            )
+            .await
+            .expect("the gated call succeeds");
+        client
+            .call_tool("ungated", no_args(), None)
+            .await
+            .expect("the ungated call succeeds");
+
+        let calls = server.tool_calls();
+        assert_eq!(
+            calls[0].header_values("authorization"),
+            vec!["Bearer approver"],
+            "the requester's identity must be replaced, not joined",
+        );
+        assert_eq!(
+            calls[1].header_values("authorization"),
+            vec!["Bearer requester"],
+        );
+        assert_eq!(
+            server.initialize().header_values("authorization"),
+            vec!["Bearer requester"],
+            "the handshake predates any approval",
+        );
+    }
+
+    /// Two gated calls in flight on one client keep their own identities.
+    /// Scoping is structural — each override rides its own request value —
+    /// and this is the test that would catch a regression to shared state.
+    #[tokio::test]
+    async fn concurrent_gated_calls_keep_their_own_identity() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        let (first, second) = tokio::join!(
+            client.call_tool(
+                "for_alice",
+                no_args(),
+                Some(captured_overrides("x-forwarded-user", "alice")),
+            ),
+            client.call_tool(
+                "for_bob",
+                no_args(),
+                Some(captured_overrides("x-forwarded-user", "bob")),
+            ),
+        );
+        first.expect("alice's call succeeds");
+        second.expect("bob's call succeeds");
+
+        let calls = server.tool_calls();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            let expected = match call.called_tool().as_deref() {
+                Some("for_alice") => "alice",
+                Some("for_bob") => "bob",
+                other => panic!("unexpected tool call {other:?}"),
+            };
+            assert_eq!(call.header_values("x-forwarded-user"), vec![expected]);
+        }
+    }
+
+    /// The tracked branch is the one production takes under the web server;
+    /// it must deliver identity the same way the untracked branch does.
+    #[tokio::test]
+    async fn tracked_call_carries_the_override_like_the_untracked_one() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        client
+            .call_tool_tracked(
+                "gated",
+                no_args(),
+                "http-req-1",
+                Some(captured_overrides("x-forwarded-user", "alice")),
+            )
+            .await
+            .expect("the tracked gated call succeeds");
+
+        assert_eq!(
+            server.tool_calls()[0].header_values("x-forwarded-user"),
+            vec!["alice"],
+        );
+    }
+
+    /// `set_current_request` selects the tracked branch, so this is the same
+    /// entry point a gated call takes in the server and the branch choice must
+    /// not decide whether identity is delivered.
+    #[tokio::test]
+    async fn call_tool_delivers_the_override_on_either_branch() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        client
+            .call_tool(
+                "untracked",
+                no_args(),
+                Some(captured_overrides("x-forwarded-user", "alice")),
+            )
+            .await
+            .expect("the untracked call succeeds");
+
+        client.set_current_request("http-req-1").await;
+        client
+            .call_tool(
+                "tracked",
+                no_args(),
+                Some(captured_overrides("x-forwarded-user", "bob")),
+            )
+            .await
+            .expect("the tracked call succeeds");
+
+        let calls = server.tool_calls();
+        assert_eq!(calls[0].header_values("x-forwarded-user"), vec!["alice"]);
+        assert_eq!(calls[1].header_values("x-forwarded-user"), vec!["bob"]);
+    }
+
+    /// A call no approval gated must reach the server carrying nothing extra —
+    /// neither an override header nor a stale one from an earlier call.
+    #[tokio::test]
+    async fn ungated_call_carries_no_override() {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), &requester_headers())
+            .await
+            .expect("the loopback server completes the handshake");
+
+        client
+            .call_tool("ungated", no_args(), None)
+            .await
+            .expect("the ungated call succeeds");
+
+        let call = &server.tool_calls()[0];
+        assert!(call.header_values("x-forwarded-user").is_empty());
+        assert_eq!(
+            call.header_values("authorization"),
+            vec!["Bearer requester"]
+        );
     }
 }
