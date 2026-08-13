@@ -37,8 +37,12 @@ How to build, test, and navigate the AURA codebase. For the contribution process
 4. Run the web server:
 
    ```bash
-   cargo run --bin aura-web-server
+   cargo run --bin aura -- webserver
    ```
+
+   `aura` is the only executable AURA ships: interactive CLI by default, web
+   server behind `webserver`. The separate `aura-web-server` binary is a
+   deprecated shim.
 
 ## Project Structure
 
@@ -46,7 +50,7 @@ How to build, test, and navigate the AURA codebase. For the contribution process
 aura/
 ├── crates/
 │   ├── aura/                # Core agent builder library and orchestration
-│   ├── aura-cli/            # Interactive terminal client (HTTP + standalone modes)
+│   ├── aura-cli/            # The `aura` binary: interactive client + `webserver` mode
 │   ├── aura-config/         # TOML parser and config loader
 │   ├── aura-events/         # Shared SSE event types (lightweight, no agent deps)
 │   ├── aura-telemetry/      # Anonymous CLI telemetry (see https://docs.mezmo.com/aura/telemetry)
@@ -168,8 +172,8 @@ AURA separates concerns across crates:
 - `aura`: runtime agent building, MCP integration, orchestration, and vector workflows.
 - `aura-config`: typed TOML parsing and validation.
 - `aura-events`: shared SSE event types (`AuraStreamEvent`, `OrchestrationStreamEvent`) — lightweight, no agent dependencies.
-- `aura-web-server`: OpenAI-compatible REST/SSE serving layer.
-- `aura-cli`: interactive terminal client with HTTP and standalone modes.
+- `aura-web-server`: OpenAI-compatible REST/SSE serving layer and the shared server entry point.
+- `aura-cli`: the shipped `aura` binary — interactive terminal client, plus `webserver` mode.
 
 This separation means:
 

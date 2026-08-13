@@ -8,7 +8,7 @@
 #   export DD_APPLICATION_KEY="..."
 #
 # Usage:
-#   CONFIG_PATH=examples/complete/incident-response-datadog.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/complete/incident-response-datadog.toml cargo run --bin aura -- webserver
 
 [mcp]
 sanitize_schemas = true

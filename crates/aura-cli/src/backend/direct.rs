@@ -81,7 +81,7 @@ impl DirectBackend {
                  Standalone mode needs a TOML agent config. To get started:\n  \
                  • run `{prog} init` to generate one in the current directory\n  \
                  • pass `--config <path>` to point at an existing config file or directory\n  \
-                 • set `--api-url <url>` (or AURA_API_URL) to connect to a running aura-web-server instead"
+                 • set `--api-url <url>` (or AURA_API_URL) to connect to a running AURA web server instead"
             );
         }
 

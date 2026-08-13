@@ -7,6 +7,20 @@ pub enum Command {
     /// provider and model against the provider's live model list, and writes
     /// a minimal config.toml.
     Init(crate::init::InitArgs),
+
+    /// Run the OpenAI-compatible web server instead of the interactive CLI.
+    ///
+    /// Every following argument belongs to the server; run
+    /// `aura webserver --help` for the full list.
+    #[cfg(feature = "webserver")]
+    // Help is disabled here so `-h`/`--help` fall through to the server's own
+    // parser rather than printing this thin passthrough signature.
+    #[command(disable_help_flag = true)]
+    Webserver {
+        /// Web-server options; see `aura webserver --help`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
 }
 
 /// Aura CLI — interactive chat completions REPL
@@ -86,7 +100,7 @@ pub struct Args {
     pub enable_final_response_summary: Option<bool>,
 
     /// Run in standalone mode — builds agents in-process from TOML config
-    /// instead of connecting to an aura-web-server over HTTP. This is the
+    /// instead of connecting to an AURA web server over HTTP. This is the
     /// default when --api-url is not provided. Mutually exclusive with the
     /// --api-url flag, but overrides the AURA_API_URL env var.
     #[cfg(feature = "standalone-cli")]
@@ -124,8 +138,12 @@ pub struct Args {
 #[cfg(not(feature = "standalone-cli"))]
 pub fn check_standalone_flag() {
     // Let clap handle --help / --version and subcommands before we error
-    let pass_through = std::env::args()
-        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V" | "init"));
+    let pass_through = std::env::args().any(|a| {
+        matches!(
+            a.as_str(),
+            "--help" | "-h" | "--version" | "-V" | "init" | "webserver"
+        )
+    });
     if pass_through {
         return;
     }
@@ -143,7 +161,7 @@ pub fn check_standalone_flag() {
             "error: {flag} requires the standalone-cli feature\n\n\
              This build of aura is HTTP-only and cannot load agent configs \
              directly. Standalone mode (the default) is not available.\n\n\
-             Pass --api-url to connect to an aura-web-server over HTTP, or \
+             Pass --api-url to connect to an AURA web server over HTTP, or \
              rebuild with the standalone-cli feature (enabled by default)."
         );
         std::process::exit(2);
@@ -160,7 +178,7 @@ pub fn check_standalone_flag() {
             "error: --api-url is required (standalone mode unavailable)\n\n\
              This build of aura was compiled without the standalone-cli \
              feature, so it cannot run agents in-process. Provide --api-url \
-             to connect to an aura-web-server, or rebuild with the default \
+             to connect to an AURA web server, or rebuild with the default \
              features to enable standalone mode."
         );
         std::process::exit(2);

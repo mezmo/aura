@@ -26,12 +26,12 @@ All major features complete:
 cargo build --release
 
 # Start web server (default config.toml)
-cargo run --bin aura-web-server
+cargo run --bin aura -- webserver
 
 # Start with orchestration config
-CONFIG_PATH=configs/example-math-orchestration.toml AURA_CUSTOM_EVENTS=true cargo run --bin aura-web-server
+CONFIG_PATH=configs/example-math-orchestration.toml AURA_CUSTOM_EVENTS=true cargo run --bin aura -- webserver
 
-# Build and run CLI (HTTP mode — connects to aura-web-server)
+# Build and run CLI (HTTP mode — connects to a running `aura webserver`)
 cargo run -p aura-cli -- --api-url http://localhost:8080
 
 # Build and run CLI (standalone mode — no server needed, default when --api-url absent)
@@ -49,10 +49,10 @@ make test-integration-sre-orchestration-local      # SRE orchestration integrati
 aura/
 ├── crates/
 │   ├── aura/                 # Core library (agent builder + orchestration)
-│   ├── aura-cli/             # Interactive terminal client (HTTP + standalone modes)
+│   ├── aura-cli/             # The `aura` binary: interactive client + `webserver` mode
 │   ├── aura-config/          # TOML parsing and configuration
 │   ├── aura-events/          # Shared SSE event types (lightweight, no agent deps)
-│   ├── aura-web-server/      # OpenAI-compatible API
+│   ├── aura-web-server/      # OpenAI-compatible API + shared server entry point
 │   └── aura-test-utils/      # Shared testing utilities
 ├── compose/                  # Docker Compose (integration + orchestration overlays)
 ├── configs/                  # Integration test and example configurations
@@ -95,6 +95,11 @@ aura/
 - Dependency-aware multi-wave execution with iterative re-planning (`max_planning_cycles`)
 - Three-way routing: direct answer, orchestrated plan, clarification
 - `aura.orchestrator.*` SSE events for real-time visibility (see https://docs.mezmo.com/aura/streaming-api-guide)
+
+### Unified Binary
+- `aura` is the only shipped executable: interactive client by default, web server behind `aura webserver`
+- `webserver` is a clap subcommand whose trailing args go straight to `aura_web_server::server::{parse_args, serve}`, which then owns the process
+- `aura-web-server` is a deprecated shim that delegates to `server::serve`. To retire it: drop the `[[bin]]`, `tests/deprecation_shim.rs`, the dist artifacts in `.makefiles/rust.mk`, the nfpm entry in `scripts/build-packages.sh`, and the Dockerfile release copy
 
 ### CLI (`aura-cli`)
 - Interactive terminal client with REPL, one-shot mode, and conversation persistence
