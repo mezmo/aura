@@ -149,11 +149,15 @@ pub const ATTR_TOOL_RESULT: &str = "tool.result";
 pub const ATTR_TOOL_RESULT_LENGTH: &str = "tool.result.length";
 pub const ATTR_TOOL_CANCELLED: &str = "tool.cancelled";
 
-// HITL attribute (used by `hitl::route`)
+// HITL attributes (used by `hitl::route` and `mcp_tool_execution`)
 
 /// Handle of the human approval decision gating a tool call — the same
 /// `decision_id` the approval payload and lifecycle events carry.
 pub const ATTR_DECISION_ID: &str = "decision_id";
+
+/// Comma-separated, sorted outbound header NAMES an approver override
+/// applied to a gated MCP call — never their values.
+pub const ATTR_APPLIED_HEADERS: &str = "applied_headers";
 
 // --- Content recording configuration ---
 

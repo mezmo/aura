@@ -598,18 +598,9 @@ impl WebhookClient {
                  will fail closed"
             );
         }
-        // Capture over cleartext stays usable — TLS is often terminated ahead
-        // of this process (trusted gateway, service-to-service), which the url
-        // alone cannot distinguish from an exposed hop — but it is never
-        // silent.
-        if !tool_header_mappings.is_empty() && !url.as_str().starts_with("https://") {
-            tracing::warn!(
-                url = url.as_str(),
-                "HITL webhook route captures approver response headers over cleartext http, so \
-                 this route's tool_headers_from_response values are readable by any network \
-                 observer; intended for trusted-gateway or service-to-service deployments"
-            );
-        }
+        // The cleartext-capture warning does not live here: `HitlRuntime::from_config`
+        // (and so this constructor) runs once per request, not once at startup.
+        // `warn_on_cleartext_capture` below is the boot-time seam for it.
         Self {
             client,
             url,
@@ -842,6 +833,51 @@ pub fn validate_webhook_signing_config(
             })
         }
         DecisionRouteConfig::Webhook { .. } | DecisionRouteConfig::Conversational { .. } => Ok(()),
+    }
+}
+
+/// Boot-time warning: a webhook route with `tool_headers_from_response`
+/// configured over plain `http://` is usable (`validate_webhook_signing_config`
+/// above covers the one case that still fails closed, an HMAC secret over
+/// plaintext) but exposes captured approver credentials to any network
+/// observer between here and the webhook. Call this once per `[hitl]`
+/// config at startup, alongside `validate_webhook_signing_config` — never
+/// from [`WebhookClient`] construction, which runs fresh per request via
+/// `HitlRuntime::from_config` and would turn one misconfiguration into a
+/// warning per chat request.
+pub fn warn_on_cleartext_capture(config: &HitlConfig) {
+    let DecisionRouteConfig::Webhook {
+        url,
+        tool_headers_from_response,
+        ..
+    } = &config.route
+    else {
+        return;
+    };
+    if tool_headers_from_response.is_empty() || url.as_str().starts_with("https://") {
+        return;
+    }
+    tracing::warn!(
+        origin = %redact_to_origin(url.as_str()),
+        "HITL webhook route captures approver response headers over cleartext http, so \
+         this route's tool_headers_from_response values are readable by any network \
+         observer; intended for trusted-gateway or service-to-service deployments"
+    );
+}
+
+/// `scheme://host[:port]` of `url`, dropping userinfo, path, query, and
+/// fragment — the parts of a webhook URL a log line must never carry,
+/// since a webhook URL may embed a token in any of them.
+fn redact_to_origin(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if scheme.is_empty() {
+        host_port.to_string()
+    } else {
+        format!("{scheme}://{host_port}")
     }
 }
 
@@ -1833,10 +1869,13 @@ mod tests {
             );
         }
 
-        /// Cleartext capture is allowed but never silent: constructing the
-        /// route warns, naming the risk and the url.
+        /// Construction (`HitlRuntime::from_config`, and so `WebhookClient`
+        /// construction) runs once per chat request, not once at startup —
+        /// so it must never warn on cleartext capture itself, or every
+        /// request on the route would repeat the warning.
+        /// [`warn_on_cleartext_capture`] is the boot-time seam for it.
         #[test]
-        fn capture_over_plaintext_url_warns_at_construction() {
+        fn capture_over_plaintext_url_stays_silent_at_construction() {
             use std::sync::Arc;
 
             let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
@@ -1854,14 +1893,37 @@ mod tests {
                     None,
                     None,
                 );
-                // An https route with the same mappings must stay quiet, so
-                // the warning is attributable to the cleartext url alone.
-                let _ = super::super::HitlRuntime::from_config(
-                    &webhook_config("https://approvals.example.com/aura", user_mapping()),
-                    &pending,
-                    None,
-                    None,
-                );
+            });
+
+            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+            assert!(log.is_empty(), "construction must not log, got: {log}");
+        }
+
+        /// The boot-time warning names the risk and the webhook's origin,
+        /// but never the userinfo, path, or query a webhook URL may carry —
+        /// any of which can hold a secret. An https route with the same
+        /// mappings stays quiet, so the warning is attributable to the
+        /// cleartext scheme alone.
+        #[test]
+        fn warn_on_cleartext_capture_warns_once_and_redacts_the_url() {
+            use std::sync::Arc;
+
+            let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+
+            tracing::subscriber::with_default(subscriber, || {
+                super::super::warn_on_cleartext_capture(&webhook_config(
+                    "http://token:secret@approvals.example.com:8443/aura/hook?key=shh",
+                    user_mapping(),
+                ));
+                super::super::warn_on_cleartext_capture(&webhook_config(
+                    "https://approvals.example.com/aura",
+                    user_mapping(),
+                ));
             });
 
             let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
@@ -1870,12 +1932,46 @@ mod tests {
                 "the warning must name the risk, got log: {log}"
             );
             assert!(
-                log.contains("http://approvals.example.com/aura"),
-                "the warning must name the url, got log: {log}"
+                log.contains("http://approvals.example.com:8443"),
+                "the warning must name the origin, got log: {log}"
             );
+            for secret in ["token", "secret", "aura/hook", "key=shh"] {
+                assert!(
+                    !log.contains(secret),
+                    "the warning must never carry userinfo, path, or query, got: {log}"
+                );
+            }
             assert!(
-                !log.contains("https://approvals.example.com/aura"),
+                !log.contains("https://approvals.example.com"),
                 "an https route must not warn, got log: {log}"
+            );
+        }
+
+        /// An absent or empty `tool_headers_from_response` map is the
+        /// legacy path: no capture, so no exposure to warn about, over
+        /// either scheme.
+        #[test]
+        fn warn_on_cleartext_capture_is_quiet_with_no_map() {
+            use std::sync::Arc;
+
+            let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+
+            tracing::subscriber::with_default(subscriber, || {
+                super::super::warn_on_cleartext_capture(&webhook_config(
+                    "http://approvals.example.com/aura",
+                    aura_config::ToolHeaderMappings::default(),
+                ));
+            });
+
+            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
+            assert!(
+                log.is_empty(),
+                "no map means nothing to warn about, got: {log}"
             );
         }
 

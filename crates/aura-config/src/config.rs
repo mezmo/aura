@@ -1374,8 +1374,7 @@ pub enum DecisionRouteConfig {
         headers_from_request: HashMap<String, String>,
         /// Outbound MCP header name → webhook approval-response header name.
         /// Non-empty opts gated calls into approver identity forwarding.
-        /// Validated at parse (see [`ToolHeaderMappings`]); the validated
-        /// map is carried but not consumed until capture wiring lands.
+        /// Validated at parse; see [`ToolHeaderMappings`].
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
     },

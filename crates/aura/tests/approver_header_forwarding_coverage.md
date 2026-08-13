@@ -72,8 +72,10 @@ a defect in this document, not an implicit exclusion.
 | Capture rekeys a response header under the configured outbound name | `approver_headers::tests::captures_response_value_under_outbound_name` | |
 | Capture reads response headers case-insensitively | `approver_headers::tests::response_lookup_is_case_insensitive` | |
 | A repeated response header yields exactly one captured value | `approver_headers::tests::repeated_response_header_captures_only_the_first_value` | |
-| A partial capture fails and names every missing header | `approver_headers::tests::missing_names_are_all_reported_and_sorted` | |
+| A partial capture fails and names every missing header | `approver_headers::tests::missing_names_are_all_reported_and_sorted` | Also pins the exact Display text: every missing name present, no captured value |
 | An adaptor call outside any scope reads no overrides | `approver_headers::tests::unscoped_read_yields_none` | Agents with no wrapper are a live path, not an edge case |
+| A gated call carrying an override stamps its header names, sorted and joined, on the execution span | `mcp_tool_execution::tests::applied_headers_span::gated_call_stamps_the_applied_header_names_never_values` | Also asserts the captured value never lands on the span |
+| An ungated call's execution span carries no `applied_headers` attribute | `mcp_tool_execution::tests::applied_headers_span::ungated_call_records_no_applied_headers` | |
 
 ## Exclusions
 
