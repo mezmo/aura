@@ -283,12 +283,26 @@ mod tests {
                 self.spans().iter().any(|span| span.name == name)
             }
 
+            /// The single `key` attribute on the span named `name`, or `None`
+            /// if the span carries no such attribute. Panics if the span
+            /// carries more than one — a double-stamp regression would
+            /// otherwise pass unnoticed, since `find` would silently return
+            /// only the first entry.
             fn attribute(&self, name: &str, key: &str) -> Option<String> {
-                self.spans()
+                let spans = self.spans();
+                let span = spans.iter().find(|span| span.name == name)?;
+                let matches: Vec<_> = span
+                    .attributes
                     .iter()
-                    .find(|span| span.name == name)
-                    .and_then(|span| span.attributes.iter().find(|kv| kv.key.as_str() == key))
-                    .map(|kv| kv.value.to_string())
+                    .filter(|kv| kv.key.as_str() == key)
+                    .collect();
+                assert!(
+                    matches.len() <= 1,
+                    "span {name:?} must carry at most one {key} attribute, found {}: \
+                     a regression is double-stamping the same span",
+                    matches.len(),
+                );
+                matches.first().map(|kv| kv.value.to_string())
             }
         }
 

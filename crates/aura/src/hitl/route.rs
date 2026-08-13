@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use aura_config::{DecisionRouteConfig, GlobPattern, HitlConfig, ToolHeaderMappings, WebhookUrl};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
-use super::decision::{ApprovalDecision, ApprovalOutcome};
+use super::decision::{ApprovalDecision, ApprovalOutcome, DecisionId};
 use super::events;
 use super::protocol::{ApprovalDecisionWire, ApprovalRequest, ApprovalRequestWire};
 use super::registry::PendingApprovals;
@@ -197,24 +197,56 @@ pub enum DecisionRoute {
     },
 }
 
+/// Stamp `decision_id` on the current tracing span
+/// (`crate::logging::set_span_attribute`, a documented no-op without the
+/// `otel` feature).
+///
+/// Called from both [`DecisionRoute::decide_for_gate`] and
+/// [`DecisionRoute::decide`] — the two public entry points, since neither
+/// reaches the other on every path: the gate's webhook arm resolves through
+/// the client seam without ever calling `decide`, and the agent-callable
+/// `request_approval` tool calls `decide` directly, bypassing the gate
+/// entirely. Each entry point stamps exactly once: `decide_for_gate`'s
+/// conversational arm reaches the shared decision logic through the
+/// unstamped [`DecisionRoute::decide_inner`] rather than through `decide`,
+/// so nesting never produces a second stamp on the same span.
+/// `set_span_attribute` appends rather than overwrites by key, so a second
+/// stamp would add a duplicate attribute entry rather than update the
+/// existing one — this is the failure mode the single-stamp invariant
+/// avoids.
+fn stamp_decision_id(decision_id: DecisionId) {
+    crate::logging::set_span_attribute(
+        &tracing::Span::current(),
+        crate::logging::ATTR_DECISION_ID,
+        decision_id.to_string(),
+    );
+}
+
 impl DecisionRoute {
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
+    ///
+    /// The gate awaits this inline from the gated call's `execute_tool`
+    /// span, so stamping the decision id here — ahead of the route split
+    /// and of any outcome — correlates the approval with the execution it
+    /// gates on either route, decided or not.
     ///
     /// The webhook arm goes through the capture-bearing client seam
     /// ([`WebhookClient::request_approval_for_gate`]), which owns the HTTP
     /// response, so capture is filled there without signature changes;
     /// its event choreography mirrors [`Self::decide`]'s webhook arm. The
-    /// conversational arm delegates to [`Self::decide`]: that route has no
-    /// distinct identity source and never captures.
+    /// conversational arm delegates to the unstamped [`Self::decide_inner`]
+    /// (not [`Self::decide`], which would stamp a second time on this span):
+    /// that route has no distinct identity source and never captures.
     pub async fn decide_for_gate(
         &self,
         request: ApprovalRequest,
         cancel: &crate::request_cancellation::RequestCancelToken,
     ) -> Result<GateDecision, ApprovalError> {
+        stamp_decision_id(request.decision_id);
         match self {
             Self::Conversational { .. } => {
-                let outcome = self.decide(request, cancel).await?;
+                let outcome = self.decide_inner(request, cancel).await?;
                 Ok(GateDecision::without_overrides(outcome))
             }
             Self::Webhook { client, timeout } => {
@@ -222,14 +254,6 @@ impl DecisionRoute {
                 let request_id = request.request_id.clone();
                 let decision_id = request.decision_id;
                 let scope = request.scope.clone();
-
-                // Mirrors the stamp at the top of `decide`: ahead of any
-                // outcome, so the correlation holds on either route.
-                crate::logging::set_span_attribute(
-                    &tracing::Span::current(),
-                    crate::logging::ATTR_DECISION_ID,
-                    decision_id.to_string(),
-                );
 
                 approval_event_broker::publish(
                     &request_id,
@@ -262,14 +286,30 @@ impl DecisionRoute {
         }
     }
 
-    /// Obtain a decision for `request`, applying the shared semantics (deadline,
-    /// fail-closed mapping, event emission) in one place.
+    /// Obtain a decision for `request`.
     ///
-    /// Both surfaces await this inline from the gated call's `execute_tool`
-    /// span, so stamping the decision id on the current span here — ahead of
-    /// the route split and of any outcome — correlates the approval with the
-    /// execution it gates on either route, decided or not.
+    /// The agent-callable `request_approval` tool awaits this directly on
+    /// its own `execute_tool` span, never through [`Self::decide_for_gate`],
+    /// so this entry point stamps the decision id on the current span
+    /// before delegating to [`Self::decide_inner`] for the shared decision
+    /// logic (deadline, fail-closed mapping, event emission).
     pub async fn decide(
+        &self,
+        request: ApprovalRequest,
+        cancel: &crate::request_cancellation::RequestCancelToken,
+    ) -> Result<ApprovalOutcome, ApprovalError> {
+        stamp_decision_id(request.decision_id);
+        self.decide_inner(request, cancel).await
+    }
+
+    /// Obtain a decision for `request`, applying the shared semantics
+    /// (deadline, fail-closed mapping, event emission) in one place.
+    ///
+    /// Does not stamp the current span: both callers — [`Self::decide`] and
+    /// the conversational arm of [`Self::decide_for_gate`] — have already
+    /// stamped it on their own entry, so stamping here too would duplicate
+    /// the attribute on the same span.
+    async fn decide_inner(
         &self,
         request: ApprovalRequest,
         cancel: &crate::request_cancellation::RequestCancelToken,
@@ -278,12 +318,6 @@ impl DecisionRoute {
         let request_id = request.request_id.clone();
         let decision_id = request.decision_id;
         let scope = request.scope.clone();
-
-        crate::logging::set_span_attribute(
-            &tracing::Span::current(),
-            crate::logging::ATTR_DECISION_ID,
-            decision_id.to_string(),
-        );
 
         match self {
             Self::Conversational { registry, timeout } => {

@@ -418,11 +418,18 @@ telemetry.
 
 ## Trace correlation
 
-`DecisionRoute::decide` stamps the request's `decision_id` on the current span,
-which is the gated call's Rig `execute_tool` span: both surfaces await `decide`
-inline, and `WrappedTool` carries that span across the approval gate into the
-inner tool. One stamp, ahead of the route split, gives every approval-gated
-execution the id the payload and the lifecycle events carry:
+`DecisionRoute::decide_for_gate` and `DecisionRoute::decide` each stamp the
+request's `decision_id` on the current span, ahead of their own route split
+and of any outcome: the config gate awaits `decide_for_gate` inline from the
+gated call's Rig `execute_tool` span, and `WrappedTool` carries that span
+across the approval gate into the inner tool; the agent-callable
+`request_approval` tool awaits `decide` directly on its own `execute_tool`
+span instead of going through the gate. Neither entry point is reached
+through the other on every route — `decide_for_gate`'s webhook arm never
+calls `decide`, and `request_approval` never calls `decide_for_gate` — so
+each stamps independently rather than relying on the other to have done it.
+Stamping ahead of the split gives every approval-gated execution the id the
+payload and the lifecycle events carry:
 
 ```text
 execute_tool
@@ -431,9 +438,13 @@ execute_tool
         status = OK | ERROR
 ```
 
-A trace consumer joins the approval to the result of the action it released
-without a second reporting channel. Ungated calls never reach `decide`, so they
-carry no `decision_id`.
+On the config-gate surface, this is the gated action's own span — the approval
+joins the result of the action it released on one span, without a second
+reporting channel. On the agent-callable surface, the stamp lands on
+`request_approval`'s own execution span instead: it correlates the approval
+decision to that tool call, not to whatever separate tool call the agent goes
+on to make once the decision comes back approved. Ungated calls never reach
+`decide_for_gate` or `decide`, so they carry no `decision_id`.
 
 ## Orchestration behavior
 
