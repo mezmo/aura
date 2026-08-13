@@ -191,6 +191,94 @@ fn resolve_message_endpoint(
 mod tests {
     use super::*;
 
+    mod approver_overrides {
+        use rmcp::model::{CallToolRequestParam, ClientJsonRpcMessage, RequestId};
+
+        use super::*;
+        use crate::approver_headers::{ApproverHeaders, tests::captured_overrides};
+        use crate::mcp_streamable_http::call_tool_request;
+        use crate::mcp_streamable_http::tests::RecordingMcpServer;
+
+        /// An SSE transport aimed at `endpoint`, carrying the same frozen
+        /// identity a configured client would hold. Built by hand because
+        /// `connect` needs a live SSE stream and the send path is what is
+        /// under test.
+        fn transport_to(endpoint: &str) -> SseTransport {
+            let mut frozen = HeaderMap::new();
+            frozen.insert(
+                "authorization",
+                HeaderValue::from_static("Bearer requester"),
+            );
+            SseTransport {
+                http_client: reqwest::Client::builder()
+                    .default_headers(frozen)
+                    .build()
+                    .unwrap(),
+                message_endpoint: url::Url::parse(endpoint).unwrap(),
+                stream: None,
+            }
+        }
+
+        fn call_message(tool: &str, overrides: Option<ApproverHeaders>) -> ClientJsonRpcMessage {
+            ClientJsonRpcMessage::request(
+                call_tool_request(
+                    CallToolRequestParam {
+                        name: tool.to_owned().into(),
+                        arguments: None,
+                    },
+                    overrides,
+                ),
+                RequestId::Number(1),
+            )
+        }
+
+        /// The SSE send path reads the same extension the streamable-HTTP path
+        /// does: the override replaces the frozen identity on that one POST,
+        /// arrives once, and never appears in the JSON body.
+        #[tokio::test]
+        async fn send_applies_the_override_to_the_post_and_not_the_body() {
+            let server = RecordingMcpServer::start().await;
+            let mut transport = transport_to(&server.url);
+
+            transport
+                .send(call_message(
+                    "gated",
+                    Some(captured_overrides("authorization", "Bearer approver")),
+                ))
+                .await
+                .expect("the loopback server accepts the post");
+
+            let calls = server.tool_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].header_values("authorization"),
+                vec!["Bearer approver"],
+                "the requester's identity must be replaced, not joined",
+            );
+            let body = calls[0].body_text();
+            assert!(!body.contains("authorization"), "body was: {body}");
+            assert!(!body.contains("approver"), "body was: {body}");
+        }
+
+        /// A message with no extension leaves the client's own identity in
+        /// place, so an ungated call on an SSE server is unaffected.
+        #[tokio::test]
+        async fn send_without_an_extension_keeps_the_frozen_identity() {
+            let server = RecordingMcpServer::start().await;
+            let mut transport = transport_to(&server.url);
+
+            transport
+                .send(call_message("ungated", None))
+                .await
+                .expect("the loopback server accepts the post");
+
+            assert_eq!(
+                server.tool_calls()[0].header_values("authorization"),
+                vec!["Bearer requester"],
+            );
+        }
+    }
+
     #[test]
     fn test_resolve_message_endpoint_query_only() {
         let base = url::Url::parse("https://localhost/sse").unwrap();

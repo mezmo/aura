@@ -196,6 +196,47 @@ mod tests {
         );
     }
 
+    /// The mapping is the only path from an approval's captured identity to
+    /// the call it released; a `Proceed` that dropped the overrides would
+    /// send the gated call under the requester's identity instead.
+    #[test]
+    fn approval_result_mapping_carries_captured_overrides_into_the_call() {
+        let captured = crate::approver_headers::tests::captured_overrides("authorization", "tok");
+
+        assert_eq!(
+            approval_result_to_pre_call(Ok(GateDecision::Approved {
+                overrides: Some(captured.clone()),
+            }))
+            .unwrap(),
+            PreCallOutcome::Proceed {
+                overrides: Some(captured)
+            },
+        );
+    }
+
+    /// No decision other than approval may carry identity forward: a denial,
+    /// a timeout, a cancellation and a channel fault all stop the call, so
+    /// there is nothing to apply.
+    #[test]
+    fn only_an_approval_yields_a_proceed() {
+        for result in [
+            Ok(GateDecision::Denied { reason: None }),
+            Ok(GateDecision::TimedOut {
+                waited: Duration::from_secs(1),
+            }),
+            Ok(GateDecision::Cancelled(CancelReason::ClientDisconnected)),
+            Err(ApprovalError::BadStatus { status: 500 }),
+        ] {
+            assert!(
+                !matches!(
+                    approval_result_to_pre_call(result),
+                    Ok(PreCallOutcome::Proceed { .. })
+                ),
+                "an undecided or refused approval must never proceed",
+            );
+        }
+    }
+
     #[test]
     fn approval_result_mapping_denial_is_feedback_not_error() {
         let outcome = approval_result_to_pre_call(Ok(GateDecision::Denied {

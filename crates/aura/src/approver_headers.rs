@@ -69,12 +69,15 @@ impl ApproverHeaders {
     /// Apply the overrides to an outbound request builder as per-request
     /// headers, which override the client's frozen `default_headers` for
     /// that one request only.
-    #[expect(
-        unused_variables,
-        reason = "todo!() body; filled when gate-to-wire wiring lands"
-    )]
+    ///
+    /// Whole-map application, not pair-by-pair: `RequestBuilder::header`
+    /// appends, so a name the builder already carries would end up sent
+    /// twice — the approver's identity beside the requester's. Passing the
+    /// map replaces per name, which is the discipline the lowercased keys
+    /// were established for. Default headers need no such care: `reqwest`
+    /// fills them in only where the request left the name vacant.
     pub(crate) fn apply_to(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        todo!("per-request .header(k, v) for each captured pair")
+        builder.headers(self.headers.clone())
     }
 }
 
@@ -142,15 +145,20 @@ pub enum McpTransportKind {
 
 /// Fail closed when `kind` cannot deliver per-call header overrides.
 /// Called at the execution seam only when overrides exist.
-#[expect(
-    unused_variables,
-    reason = "todo!() body; filled when gate-to-wire wiring lands"
-)]
+///
+/// The transport alone decides. An override value carrying no pairs is not
+/// "no override": the caller reached here because identity was demanded, and
+/// a transport with no per-call header channel cannot honor that demand
+/// whatever the configured map turned out to hold.
 pub(crate) fn ensure_transport_delivers_overrides(
     kind: McpTransportKind,
-    overrides: &ApproverHeaders,
+    _overrides: &ApproverHeaders,
 ) -> Result<(), OverrideApplicationError> {
-    todo!("stdio rejects overrides; http and sse accept")
+    match kind {
+        // Both HTTP send paths read the extension and apply the overrides.
+        McpTransportKind::StreamableHttp | McpTransportKind::Sse => Ok(()),
+        McpTransportKind::Stdio => Err(OverrideApplicationError::TransportUnsupported { kind }),
+    }
 }
 
 /// Extract approver overrides from an outbound client message, if the one
@@ -196,12 +204,25 @@ pub(crate) fn current_approver_overrides() -> Option<ApproverHeaders> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use reqwest::header::HeaderValue;
 
     use super::*;
+
+    /// One captured override pair, for the seam tests that need a value of
+    /// this type without restating the capture plumbing. Construction goes
+    /// through the real capture path so a test can never hold overrides the
+    /// production path could not have produced.
+    pub(crate) fn captured_overrides(outbound: &str, value: &str) -> ApproverHeaders {
+        const RESPONSE_NAME: &str = "x-approver-source";
+        ApproverHeaders::from_captured(
+            &mappings(&[(outbound, RESPONSE_NAME)]),
+            &response(&[(RESPONSE_NAME, value)]),
+        )
+        .expect("the mapped header is present")
+    }
 
     fn mappings(pairs: &[(&str, &str)]) -> ToolHeaderMappings {
         let raw: HashMap<String, String> = pairs
@@ -291,6 +312,114 @@ mod tests {
             CaptureError::MissingHeaders {
                 names: vec!["authorization".to_owned(), "x-forwarded-user".to_owned()],
             }
+        );
+    }
+
+    /// Every captured pair lands on the request the builder produces, under
+    /// the outbound name.
+    #[test]
+    fn apply_to_sets_every_captured_pair_on_the_request() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[
+                ("x-forwarded-user", "x-approver-id"),
+                ("x-tenant", "x-approver-tenant"),
+            ]),
+            &response(&[("x-approver-id", "alice"), ("x-approver-tenant", "acme")]),
+        )
+        .expect("both mapped headers capture");
+
+        let request = captured
+            .apply_to(reqwest::Client::new().post("http://127.0.0.1:9/"))
+            .build()
+            .expect("the override headers are valid");
+
+        assert_eq!(request.headers().get("x-forwarded-user").unwrap(), "alice");
+        assert_eq!(request.headers().get("x-tenant").unwrap(), "acme");
+    }
+
+    /// The override REPLACES a same-named header already on the builder rather
+    /// than coexisting with it. Two identities on one request is the failure
+    /// mode this guards: `reqwest`'s per-header setter appends, so applying
+    /// pair-by-pair would leave the original value in place beside the
+    /// approver's.
+    #[test]
+    fn apply_to_replaces_a_header_already_on_the_builder() {
+        let captured = ApproverHeaders::from_captured(
+            &mappings(&[("authorization", "x-approver-token")]),
+            &response(&[("x-approver-token", "Bearer approver")]),
+        )
+        .expect("the mapped header captures");
+
+        let request = captured
+            .apply_to(
+                reqwest::Client::new()
+                    .post("http://127.0.0.1:9/")
+                    .header("authorization", "Bearer requester"),
+            )
+            .build()
+            .expect("the override headers are valid");
+
+        assert_eq!(
+            request.headers().get_all("authorization").iter().count(),
+            1,
+            "the requester's identity must not ride along beside the approver's",
+        );
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer approver",
+        );
+    }
+
+    fn any_overrides() -> ApproverHeaders {
+        ApproverHeaders::from_captured(
+            &mappings(&[("x-forwarded-user", "x-approver-id")]),
+            &response(&[("x-approver-id", "alice")]),
+        )
+        .expect("test overrides capture")
+    }
+
+    /// Stdio has no per-call header channel, so a call that demands identity
+    /// cannot be delivered and must not proceed under the cached one.
+    #[test]
+    fn stdio_transport_refuses_overrides() {
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::Stdio, &any_overrides()),
+            Err(OverrideApplicationError::TransportUnsupported {
+                kind: McpTransportKind::Stdio
+            }),
+        );
+    }
+
+    /// Both HTTP transports read the extension on their send path, so both
+    /// can deliver.
+    #[test]
+    fn http_transports_accept_overrides() {
+        let overrides = any_overrides();
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::StreamableHttp, &overrides),
+            Ok(()),
+        );
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::Sse, &overrides),
+            Ok(()),
+        );
+    }
+
+    /// The check keys off the transport alone. An override value with no pairs
+    /// is not "no override": identity was demanded, the configured map decided
+    /// what that means, and a transport that cannot carry headers still cannot
+    /// honor the demand.
+    #[test]
+    fn stdio_refuses_even_an_empty_override_set() {
+        let empty = ApproverHeaders::from_captured(&mappings(&[]), &HeaderMap::new())
+            .expect("an empty mapping captures nothing and succeeds");
+        assert_eq!(empty.captured_names().count(), 0);
+
+        assert_eq!(
+            ensure_transport_delivers_overrides(McpTransportKind::Stdio, &empty),
+            Err(OverrideApplicationError::TransportUnsupported {
+                kind: McpTransportKind::Stdio
+            }),
         );
     }
 
