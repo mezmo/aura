@@ -313,6 +313,17 @@ pub(crate) mod tests {
                 names: vec!["authorization".to_owned(), "x-forwarded-user".to_owned()],
             }
         );
+
+        // The event-level audit signal: the Display text names every missing
+        // header and carries no value, including the one response value that
+        // did arrive (for the header that was present).
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "approver identity capture failed: response missing mapped headers \
+             [\"authorization\", \"x-forwarded-user\"]"
+        );
+        assert!(!message.contains("acme"), "message was: {message}");
     }
 
     /// Every captured pair lands on the request the builder produces, under
