@@ -13,7 +13,7 @@
 #       -e PROMETHEUS_MCP_BIND_PORT=8082 -p 8082:8082 ghcr.io/pab1it0/prometheus-mcp-server:latest
 #
 # Usage:
-#   CONFIG_PATH=examples/complete/kubernetes-sre-orchestrated-multi-model.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/complete/kubernetes-sre-orchestrated-multi-model.toml cargo run --bin aura -- webserver
 
 [agent]
 name = "Kubernetes SRE Agent (Orchestrated)"

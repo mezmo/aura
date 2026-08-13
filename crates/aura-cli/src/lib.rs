@@ -12,6 +12,8 @@ pub mod repl;
 pub mod theme;
 pub mod tools;
 pub mod ui;
+#[cfg(feature = "webserver")]
+pub mod webserver;
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;

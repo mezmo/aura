@@ -17,9 +17,9 @@ restricting network egress, reviewing approval policy, and backing up systems a
 tool can change. Treat data returned by logs, runbooks, vector stores, webpages,
 and MCP servers as untrusted model input.
 
-`aura-web-server` does not provide end-user authentication or identity-aware
-RBAC for its OpenAI-compatible API. Bind it to a private interface or place it
-behind an authenticated TLS gateway or service mesh.
+The web server (`aura webserver`) does not provide end-user authentication or
+identity-aware RBAC for its OpenAI-compatible API. Bind it to a private
+interface or place it behind an authenticated TLS gateway or service mesh.
 
 An air-gapped deployment requires every enabled network dependency to be local
 or disabled. This includes model providers, MCP and RAG services, approval

@@ -16,8 +16,15 @@ name = "aura"
 path = "src/main.rs"
 
 [features]
-default = ["standalone-cli"]
-standalone-cli = ["dep:aura", "dep:aura-config", "dep:aura-web-server", "dep:bytes", "dep:tokio-stream", "dep:tokio-util"]
+default = ["standalone-cli", "webserver"]
+standalone-cli = ["webserver", "dep:aura", "dep:aura-config", "dep:bytes", "dep:tokio-stream", "dep:tokio-util"]
+
+# Web-server mode (`aura webserver`). `otel` matches the tracing surface the
+# server has always shipped with.
+webserver = ["dep:aura-web-server", "aura-web-server/otel"]
+
+# Redis/Valkey session-store backend for web-server mode (`AURA_SESSION_STORE=redis`).
+session-store-redis = ["webserver", "aura-web-server/session-store-redis"]
 
 [dependencies]
 tokio = { workspace = true }

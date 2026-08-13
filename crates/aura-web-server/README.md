@@ -27,7 +27,7 @@ To run the pieces manually instead:
 AURA_ENABLE_A2A=true \
 AURA_SERVER_URL=http://localhost:8080 \
 CONFIG_PATH=crates/aura-web-server/tests/test-config.toml \
-  cargo run --bin aura-web-server
+  cargo run --bin aura -- webserver
 
 # 2. Run tests (in another terminal). The test files are feature-gated,
 # so a --features flag is required; without one, zero tests run.

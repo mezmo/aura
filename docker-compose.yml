@@ -5,7 +5,8 @@ services:
     pull_policy: always
     container_name: aura
     command:
-      - ./aura-web-server
+      - ./aura
+      - webserver
       - --verbose
     ports:
       - "8080:8080"

@@ -7,7 +7,7 @@
 #   export MEZMO_API_KEY="..."
 #
 # Usage:
-#   CONFIG_PATH=examples/complete/incident-response-mezmo.toml cargo run --bin aura-web-server
+#   CONFIG_PATH=examples/complete/incident-response-mezmo.toml cargo run --bin aura -- webserver
 
 [mcp]
 sanitize_schemas = true

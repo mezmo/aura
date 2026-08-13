@@ -20,7 +20,14 @@ The binary will be at `target/release/aura`.
 
 ### Run it
 
-#### HTTP mode (connect to an aura-web-server)
+`aura` is AURA's only executable. It runs the interactive client by default and
+the web server behind `webserver` (see `aura webserver --help`):
+
+```bash
+aura webserver --config config.toml --port 8080
+```
+
+#### HTTP mode (connect to a running `aura webserver`)
 
 ```bash
 # Using environment variables
@@ -75,7 +82,7 @@ It will:
 - **Verify & list models**: it queries the provider's live model list and shows a short, curated shortlist (newest per family — pick by number, accept the default, or type any id). For Ollama it lists whatever you have installed.
 - **Write** `config.toml`, plus a `.env` **only when you enter a new key** that isn't already in your environment. The `.env` holds a secret — add it to your `.gitignore`.
 
-`aura-web-server` and the standalone CLI load `.env` automatically at startup, so a config generated here runs as-is.
+Both the web server and the standalone CLI load `.env` automatically at startup, so a config generated here runs as-is.
 
 ### Flags
 

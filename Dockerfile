@@ -285,15 +285,15 @@ WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
-RUN cargo build --workspace --bin aura-web-server
+RUN cargo build --workspace --bin aura
 
 ### 010 Cook-release
 FROM core AS cook-release
 WORKDIR /usr/src/app
 COPY --from=planner /usr/src/app/recipe.json recipe.json
 ENV CARGO_TARGET_DIR=/usr/src/app/target
-RUN cargo chef cook --release --bin aura-web-server --recipe-path recipe.json \
- && cargo chef cook --release -p aura-cli --bin aura --recipe-path recipe.json
+RUN cargo chef cook --release -p aura-cli --bin aura --recipe-path recipe.json \
+ && cargo chef cook --release --bin aura-web-server --recipe-path recipe.json
 
 ### 011 Release-build
 # Source changes only recompile workspace crates.
@@ -304,8 +304,8 @@ COPY crates/ ./crates/
 
 RUN <<EOR
   set -e
-  cargo build --release --bin aura-web-server
   cargo build --release -p aura-cli --bin aura
+  cargo build --release --bin aura-web-server
 EOR
 
 ### 012 Runtime
@@ -332,18 +332,19 @@ ENV CONFIG_PATH=/app/config/config.toml
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD ["/bin/sh", "-c", "curl -f http://localhost:3030/health || exit 1"]
 
-CMD ["./aura-web-server"]
+CMD ["./aura", "webserver"]
 
 ### 013 Server
 # Integration-lane server image (debug profile).
 FROM runtime AS server
 
-COPY --from=debug-build /usr/src/app/target/debug/aura-web-server /app/
+COPY --from=debug-build /usr/src/app/target/debug/aura /app/
 
 ### 014 Release
 # Published image. Must stay the final stage: the feature-build and
-# post-merge publish lanes build the default target.
+# post-merge publish lanes build the default target. aura-web-server is the
+# deprecated shim, carried until it is retired.
 FROM runtime AS release
 
-COPY --from=release-build /usr/src/app/target/release/aura-web-server /app/
 COPY --from=release-build /usr/src/app/target/release/aura /app/
+COPY --from=release-build /usr/src/app/target/release/aura-web-server /app/

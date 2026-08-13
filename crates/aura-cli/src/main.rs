@@ -18,8 +18,13 @@ fn main() -> Result<()> {
 
     // Subcommands run before any backend/REPL setup (and before the tokio
     // runtime exists — init uses blocking HTTP for model discovery).
-    if let Some(aura_cli::cli::Command::Init(init_args)) = &args.command {
-        return aura_cli::init::run_init(init_args);
+    match &args.command {
+        Some(aura_cli::cli::Command::Init(init_args)) => {
+            return aura_cli::init::run_init(init_args);
+        }
+        #[cfg(feature = "webserver")]
+        Some(aura_cli::cli::Command::Webserver { args }) => return aura_cli::webserver::run(args),
+        None => {}
     }
 
     // Load .env so a config's {{ env.* }} references resolve without manual

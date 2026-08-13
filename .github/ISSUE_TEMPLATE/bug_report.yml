@@ -27,7 +27,7 @@ body:
         - A configuration file that uses XYZ model
 
         **Steps**
-        1. Start`aura-web-server` with config file
+        1. Start the server with `aura webserver` and a config file
         2. Connect to server with AURA CLI 
         3. Enter the /model command
         4. [BUG]  Expect to see a list of models but no models are listed

@@ -11,10 +11,9 @@ image:
   tag: "latest"
   pullPolicy: IfNotPresent
 
-# The mezmo/aura image ships both binaries: the server (default CMD,
-# ./aura-web-server) and the CLI (./aura). The chart already runs the server by
-# default, so no command/args override is needed here — step 5 execs the bundled
-# CLI into this same pod.
+# The mezmo/aura image ships one binary: ./aura webserver (the default CMD)
+# serves, ./aura runs the CLI. The chart serves by default, so no command/args
+# override belongs here.
 server:
   httpPort: 8080
   loglevel: info

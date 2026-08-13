@@ -33,8 +33,8 @@ HOMEPAGE="https://github.com/mezmo/aura"
 # (dist/<basename>-linux-<arch>) and names the installed executable
 # (/usr/bin/<basename>).
 PACKAGES=(
-    "aura|aura|AURA interactive terminal client for chat completions with tool execution"
-    "aura-web-server|aura-web-server|AURA OpenAI-compatible web server for composing Rig.rs AI agents with MCP tools and RAG pipelines"
+    "aura|aura|AURA agent platform: interactive terminal client and OpenAI-compatible web server (aura webserver)"
+    "aura-web-server|aura-web-server|Deprecated compatibility shim for the AURA web server; use the aura package and run aura webserver"
 )
 
 resolve_version() {
