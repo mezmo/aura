@@ -404,7 +404,10 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
         )
     })?;
     // With a secret configured, a plaintext webhook URL fails at boot rather
-    // than on the first approval request.
+    // than on the first approval request. Cleartext response-header capture
+    // (a usable, unsigned configuration) warns here too, once per config —
+    // not from `WebhookClient` construction, which runs fresh on every
+    // request that builds an agent.
     for config in configs_arc.iter() {
         if let Some(hitl) = &config.hitl {
             aura::hitl::validate_webhook_signing_config(hitl, ingress_hmac.as_ref()).map_err(
@@ -416,6 +419,7 @@ async fn run(args: ServerArgs) -> std::io::Result<()> {
                     )
                 },
             )?;
+            aura::hitl::warn_on_cleartext_capture(hitl);
         }
     }
 
