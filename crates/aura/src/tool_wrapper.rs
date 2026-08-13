@@ -1141,4 +1141,77 @@ mod tests {
             "wrappers after the first rejection must not run"
         );
     }
+
+    /// Composition is a value-loss seam: it builds its own `Proceed`, so the
+    /// gate's captured identity survives only if aggregation carries it.
+    mod composed_overrides {
+        use super::*;
+        use crate::approver_headers::tests::captured_overrides;
+
+        struct Produces(&'static str);
+
+        #[async_trait]
+        impl ToolWrapper for Produces {
+            async fn pre_call(
+                &self,
+                _a: &Value,
+                _c: &ToolCallContext,
+            ) -> Result<PreCallOutcome, ToolError> {
+                Ok(PreCallOutcome::Proceed {
+                    overrides: Some(captured_overrides("x-forwarded-user", self.0)),
+                })
+            }
+        }
+
+        struct Passive;
+
+        #[async_trait]
+        impl ToolWrapper for Passive {
+            async fn pre_call(
+                &self,
+                _a: &Value,
+                _c: &ToolCallContext,
+            ) -> Result<PreCallOutcome, ToolError> {
+                Ok(PreCallOutcome::Proceed { overrides: None })
+            }
+        }
+
+        async fn compose(wrappers: Vec<Arc<dyn ToolWrapper>>) -> Result<PreCallOutcome, ToolError> {
+            ComposedWrapper::new(wrappers)
+                .pre_call(&serde_json::json!({}), &ToolCallContext::new("t"))
+                .await
+        }
+
+        #[tokio::test]
+        async fn the_single_producers_identity_survives_its_passive_neighbours() {
+            let outcome = compose(vec![
+                Arc::new(Passive),
+                Arc::new(Produces("alice")),
+                Arc::new(Passive),
+            ])
+            .await
+            .expect("one producer composes cleanly");
+
+            assert_eq!(
+                outcome,
+                PreCallOutcome::Proceed {
+                    overrides: Some(captured_overrides("x-forwarded-user", "alice")),
+                },
+            );
+        }
+
+        /// Two producers would make wrapper order decide whose identity the
+        /// call runs under. The call fails instead.
+        #[tokio::test]
+        async fn two_producers_fail_the_call_rather_than_pick_one() {
+            let error = compose(vec![Arc::new(Produces("alice")), Arc::new(Produces("bob"))])
+                .await
+                .expect_err("two producers must not resolve to either identity");
+
+            assert!(
+                error.to_string().contains("conflicting approver identity"),
+                "the error must name the conflict, got: {error}",
+            );
+        }
+    }
 }

@@ -1968,6 +1968,171 @@ mod tests {
         scratchpad::ContextBudget::new(128_000, 0.20, 0, counter)
     }
 
+    /// Tool composition is where each MCP adaptor learns which transport it
+    /// fronts. Both the single-agent path and the orchestration worker path
+    /// reach it through `add_all_tools`, so what that function tags decides
+    /// whether a gated call can deliver approver identity or must refuse.
+    mod transport_tagging {
+        use std::collections::HashMap;
+
+        use rig::completion::{CompletionError, CompletionRequest, CompletionResponse};
+        use serde_json::json;
+
+        use super::*;
+        use crate::approver_headers::tests::captured_overrides;
+        use crate::mcp::McpManager;
+        use crate::mcp_streamable_http::McpClient;
+        use crate::mcp_streamable_http::tests::RecordingMcpServer;
+        use crate::tool_wrapper::{PreCallOutcome, ToolCallContext, ToolWrapper};
+
+        /// A completion model that exists only to satisfy the builder's type
+        /// parameter. Composition never prompts it.
+        #[derive(Clone)]
+        struct UnpromptedModel;
+
+        impl rig::completion::CompletionModel for UnpromptedModel {
+            type Response = ();
+            type StreamingResponse = ();
+            type Client = ();
+
+            fn make(_client: &Self::Client, _model: impl Into<String>) -> Self {
+                Self
+            }
+
+            async fn completion(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
+                unreachable!("tool composition never prompts the model")
+            }
+
+            async fn stream(
+                &self,
+                _request: CompletionRequest,
+            ) -> Result<
+                rig::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+                CompletionError,
+            > {
+                unreachable!("tool composition never prompts the model")
+            }
+        }
+
+        /// Stands in for the HITL gate: every call it wraps arrives carrying
+        /// approver identity, which is what makes the transport tag decide the
+        /// outcome.
+        struct AlwaysOverrides;
+
+        #[async_trait]
+        impl ToolWrapper for AlwaysOverrides {
+            async fn pre_call(
+                &self,
+                _args: &serde_json::Value,
+                _ctx: &ToolCallContext,
+            ) -> Result<PreCallOutcome, rig::tool::ToolError> {
+                Ok(PreCallOutcome::Proceed {
+                    overrides: Some(captured_overrides("x-forwarded-user", "alice")),
+                })
+            }
+        }
+
+        fn declared_tool(name: &str) -> rmcp::model::Tool {
+            rmcp::model::Tool::new(
+                name.to_owned(),
+                "test tool".to_owned(),
+                Arc::new(serde_json::Map::new()),
+            )
+        }
+
+        /// A manager offering the same tool name on each of the three
+        /// transports, all backed by `server` — so the only thing that can
+        /// distinguish them downstream is the tag composition gives them.
+        async fn manager_serving_all_transports(server: &RecordingMcpServer) -> McpManager {
+            let connect = async || {
+                McpClient::new(server.url.clone(), &HashMap::new())
+                    .await
+                    .expect("the loopback server completes the handshake")
+            };
+            McpManager {
+                server_info: HashMap::new(),
+                streamable_clients: HashMap::from([("http".to_owned(), connect().await)]),
+                streamable_tools: HashMap::from([(
+                    "http".to_owned(),
+                    vec![declared_tool("http_tool")],
+                )]),
+                sse_clients: HashMap::from([("sse".to_owned(), connect().await)]),
+                sse_tools: HashMap::from([("sse".to_owned(), vec![declared_tool("sse_tool")])]),
+                stdio_clients: HashMap::from([("stdio".to_owned(), connect().await)]),
+                stdio_tools: HashMap::from([(
+                    "stdio".to_owned(),
+                    vec![declared_tool("stdio_tool")],
+                )]),
+                sanitize_schemas: false,
+            }
+        }
+
+        /// Compose an agent the way a request does — gate wrapper included —
+        /// over a manager whose tools span all three transports.
+        async fn compose_agent(server: &RecordingMcpServer) -> rig::agent::Agent<UnpromptedModel> {
+            let config = AgentRuntimeConfig {
+                tool_wrapper: Some(Arc::new(AlwaysOverrides)),
+                ..Default::default()
+            };
+            let manager = Some(Arc::new(manager_serving_all_transports(server).await));
+            let state = BuilderState::Initial(rig::agent::AgentBuilder::new(UnpromptedModel));
+            Agent::add_all_tools(state, &config, &manager, Vec::new())
+                .await
+                .expect("composition succeeds")
+                .build()
+        }
+
+        /// The stdio branch must tag its adaptors `Stdio`, or a gated stdio
+        /// call would silently run under the requester's cached identity.
+        #[tokio::test]
+        async fn stdio_tools_are_tagged_so_a_gated_call_fails_closed() {
+            let server = RecordingMcpServer::start().await;
+            let agent = compose_agent(&server).await;
+
+            let error = agent
+                .tool_server_handle
+                .call_tool("stdio_tool", &json!({}).to_string())
+                .await
+                .expect_err("a gated stdio call must fail closed");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot deliver approver identity"),
+                "the error must name the reason, got: {error}",
+            );
+            assert!(
+                server.tool_calls().is_empty(),
+                "the refused call must not reach any server",
+            );
+        }
+
+        /// The two HTTP branches must tag adaptors that can carry identity, so
+        /// the same gated call reaches the wire wearing the approver's header.
+        #[tokio::test]
+        async fn http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity() {
+            let server = RecordingMcpServer::start().await;
+            let agent = compose_agent(&server).await;
+
+            for tool in ["http_tool", "sse_tool"] {
+                agent
+                    .tool_server_handle
+                    .call_tool(tool, &json!({}).to_string())
+                    .await
+                    .unwrap_or_else(|e| panic!("a gated {tool} call proceeds: {e}"));
+            }
+
+            let calls = server.tool_calls();
+            assert_eq!(calls.len(), 2);
+            for call in calls {
+                assert_eq!(call.header_values("x-forwarded-user"), vec!["alice"]);
+            }
+        }
+    }
+
     #[test]
     fn scratchpad_usage_event_returns_none_when_no_activity() {
         let b = budget();
