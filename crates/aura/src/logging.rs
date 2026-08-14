@@ -115,6 +115,9 @@ pub const ATTR_LLM_TOKEN_COMPLETION: &str = "llm.token_count.completion";
 pub const ATTR_LLM_TOKEN_TOTAL: &str = "llm.token_count.total";
 /// Completion tokens spent generating tool call JSON (subset of completion).
 pub const ATTR_LLM_TOKEN_TOOL_COMPLETION: &str = "llm.token_count.tool_completion";
+/// Assembled system prompt sent to the provider (preamble + skill catalog,
+/// etc.), as an OTel GenAI array of typed parts.
+pub const ATTR_GEN_AI_SYSTEM_INSTRUCTIONS: &str = "gen_ai.system_instructions";
 
 pub const ATTR_INPUT_MIME_TYPE: &str = "input.mime_type";
 pub const ATTR_INPUT_LENGTH: &str = "input.length";
@@ -147,6 +150,13 @@ static CONTENT_MAX_LENGTH: AtomicUsize = AtomicUsize::new(1000);
 /// Controlled by `OTEL_RECORD_CONTENT` env var (default `false`).
 pub fn should_record_content() -> bool {
     RECORD_CONTENT.load(Ordering::Relaxed)
+}
+
+/// Force content recording on/off for a test, returning the previous value
+/// so the test can restore it.
+#[cfg(test)]
+pub(crate) fn set_record_content_for_tests(v: bool) -> bool {
+    RECORD_CONTENT.swap(v, Ordering::Relaxed)
 }
 
 /// Maximum byte length for content span attributes.
@@ -524,6 +534,36 @@ pub fn set_output_attributes(span: &tracing::Span, _text: &str) {
     let _ = span;
 }
 
+/// Serialize a system prompt as a single-part OTel GenAI system-instructions
+/// array.
+///
+/// Truncation applies to the prompt text *before* serialization: truncating
+/// the finished JSON would cut mid-string and leave a value the exporter
+/// cannot parse back into a message.
+#[cfg(any(feature = "otel", test))]
+fn system_instructions_json(text: &str) -> String {
+    serde_json::json!([{ "type": "text", "content": truncate_for_otel(text) }]).to_string()
+}
+
+/// Record the assembled system prompt on a span as an OTel GenAI
+/// system-instructions parts array, subject to the same content gate and
+/// truncation as every other captured content attribute.
+#[cfg(feature = "otel")]
+pub fn set_system_prompt_attribute(span: &tracing::Span, text: &str) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    if should_record_content() {
+        span.set_attribute(
+            ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+            system_instructions_json(text),
+        );
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn set_system_prompt_attribute(span: &tracing::Span, _text: &str) {
+    let _ = span;
+}
+
 /// Force-flush all pending spans to the OTLP exporter.
 ///
 /// The `BatchSpanProcessor` buffers spans and exports on a timer (default 5 s)
@@ -591,3 +631,39 @@ pub async fn shutdown_tracer() {
 
 #[cfg(not(feature = "otel"))]
 pub async fn shutdown_tracer() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A prompt longer than `OTEL_CONTENT_MAX_LENGTH` must still serialize to
+    /// valid JSON — truncating the finished JSON instead of the content would
+    /// cut mid-string and leave the exporter unable to parse it back.
+    #[test]
+    fn system_instructions_json_stays_valid_when_truncated() {
+        let long_prompt = "x".repeat(content_max_length() * 2);
+        let json = system_instructions_json(&long_prompt);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("truncated system instructions must be valid JSON");
+
+        let parts = parsed.as_array().expect("expected a parts array");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+
+        let content = parts[0]["content"].as_str().unwrap();
+        assert!(
+            content.len() < long_prompt.len(),
+            "content was not truncated"
+        );
+        assert!(content.starts_with("xxx"));
+    }
+
+    /// Content shorter than the limit round-trips unchanged.
+    #[test]
+    fn system_instructions_json_preserves_short_content() {
+        let json = system_instructions_json("You are a helpful assistant.");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed[0]["content"], "You are a helpful assistant.");
+    }
+}

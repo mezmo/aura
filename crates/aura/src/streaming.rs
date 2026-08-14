@@ -152,4 +152,14 @@ pub trait StreamingAgent: Send + Sync {
     fn is_orchestration(&self) -> bool {
         false
     }
+
+    /// The assembled system prompt sent to the provider, if this agent has a
+    /// single static one.
+    ///
+    /// Defaults to `None` for implementors that have no single static prompt:
+    /// the orchestrator builds a distinct preamble per coordinator/worker
+    /// phase, so there is nothing to report at the agent level.
+    fn system_prompt(&self) -> Option<&str> {
+        None
+    }
 }

@@ -896,15 +896,11 @@ impl Orchestrator {
         );
 
         // Capture preamble before config is consumed by builder
-        let preamble = if self.prompt_journal.is_some() {
-            worker_config
-                .preamble_override
-                .as_deref()
-                .unwrap_or("")
-                .to_string()
-        } else {
-            String::new()
-        };
+        let preamble = worker_config
+            .preamble_override
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
 
         // Build worker agent using shared MCP connections.
         // Client-side tools are not supported in orchestration mode and are
@@ -925,6 +921,7 @@ impl Orchestrator {
                 .map(|sp| sp.budget.clone()),
             client_tool_names: Default::default(),
             turn_nudge,
+            system_prompt: preamble.clone(),
         };
 
         Ok(AgentWithPreamble {
@@ -1467,6 +1464,11 @@ impl Orchestrator {
         let mut final_prompt: Option<String> = None;
         let mut final_response: Option<String> = None;
         let planning_start = Instant::now();
+
+        crate::logging::set_system_prompt_attribute(
+            &tracing::Span::current(),
+            &coordinator_state.preamble,
+        );
 
         for attempt in 1..=max_correction_attempts {
             // Clear any stale routing decision
@@ -2319,6 +2321,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 scratchpad_budget: None,
                 client_tool_names: Default::default(),
                 turn_nudge: None,
+                system_prompt: preamble.clone(),
             },
             preamble,
             escalation_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3095,6 +3098,15 @@ Assign tasks to the worker whose tools best match the required operations."#,
                 escalation_flag,
                 submit_result_decision,
             } = self.create_worker(task_id, attempt, *worker_name).await?;
+
+            // Retries rebuild the same preamble, and `set_attribute` appends
+            // rather than replaces, so record it once per worker span.
+            if attempt == 1 {
+                crate::logging::set_system_prompt_attribute(
+                    &tracing::Span::current(),
+                    &worker_preamble,
+                );
+            }
 
             // Build prompt for this attempt
             let (prompt, history) = if attempt == 1 {

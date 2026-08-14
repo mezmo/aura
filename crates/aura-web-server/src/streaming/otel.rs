@@ -30,6 +30,8 @@ pub struct StreamOtelContext {
     pub message_count: usize,
     pub usage_state: UsageState,
     pub response_content: ResponseContent,
+    /// Assembled system prompt sent to the provider.
+    pub system_prompt: Option<String>,
     /// True when the streaming agent is an orchestrator. Orchestration emits
     /// per-phase LLM spans (`orchestration.planning`, `orchestration.worker`,
     /// `orchestration.synthesis`, `orchestration.evaluation`) that each carry
@@ -46,6 +48,9 @@ impl StreamOtelContext {
         let span = tracing::Span::current();
         aura::logging::set_llm_identifiers(&span, &self.provider, &self.model);
         aura::logging::set_input_attributes(&span, &self.query);
+        if let Some(system_prompt) = &self.system_prompt {
+            aura::logging::set_system_prompt_attribute(&span, system_prompt);
+        }
         aura::logging::set_span_attribute(&span, "http.request_id", self.request_id.clone());
         aura::logging::set_span_attribute(&span, "session.id", self.session_id.clone());
         if !self.identity_id.is_empty() {

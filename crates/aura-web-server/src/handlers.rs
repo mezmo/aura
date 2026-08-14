@@ -553,6 +553,7 @@ pub async fn execute_completion(
         message_count: config.message_count,
         usage_state: usage_state.clone(),
         response_content: config.response_content,
+        system_prompt: streaming_agent.system_prompt().map(str::to_string),
         is_orchestration: streaming_agent.is_orchestration(),
     };
     otel_ctx.record_input();

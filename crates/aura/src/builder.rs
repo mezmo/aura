@@ -148,6 +148,9 @@ pub struct Agent {
     pub(crate) client_tool_names: HashSet<String>,
     /// Turn-limit nudge state shared with this agent's `TurnNudgeWrapper`.
     pub(crate) turn_nudge: Option<Arc<crate::turn_nudge::TurnNudgeState>>,
+    /// Assembled system prompt handed to the provider builder
+    /// (preamble + skill catalog, etc.).
+    pub(crate) system_prompt: String,
 }
 
 impl Agent {
@@ -783,6 +786,7 @@ impl Agent {
             scratchpad_budget: agent_scratchpad_budget,
             client_tool_names,
             turn_nudge,
+            system_prompt,
         })
     }
 
@@ -1133,7 +1137,13 @@ impl Agent {
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
         let span = tracing::Span::current();
-        record_input_attributes(&span, self.inner.provider_name(), &self.model, query);
+        record_input_attributes(
+            &span,
+            self.inner.provider_name(),
+            &self.model,
+            query,
+            &self.system_prompt,
+        );
 
         let stream = self.stream_prompt(query).await;
         let result = self.collect_stream_response(stream).await;
@@ -1152,7 +1162,13 @@ impl Agent {
     ) -> Result<crate::provider_agent::CompletionResponse, Box<dyn std::error::Error + Send + Sync>>
     {
         let span = tracing::Span::current();
-        record_input_attributes(&span, self.inner.provider_name(), &self.model, query);
+        record_input_attributes(
+            &span,
+            self.inner.provider_name(),
+            &self.model,
+            query,
+            &self.system_prompt,
+        );
 
         let stream = self.stream_chat(query, chat_history).await;
         let result = self.collect_stream_response(stream).await;
@@ -1526,9 +1542,11 @@ impl Agent {
 //   The stream is returned to the HTTP handler which sends it back as SSE.
 //   The LLM output is not available until the stream is fully consumed
 //   inside a `tokio::spawn` block, so these helpers are NOT used. Instead,
-//   input/output attributes are recorded in the web server's spawned task
-//   via `StreamOtelContext::record_input()` / `StreamOtelContext::record_output()`
-//   on the `agent.stream` span (see `aura-web-server/src/handlers.rs`).
+//   input/output attributes (including the system prompt, sourced from
+//   `StreamingAgent::system_prompt()`) are recorded in the web server's
+//   spawned task via `StreamOtelContext::record_input()` /
+//   `StreamOtelContext::record_output()` on the `agent.stream` span (see
+//   `aura-web-server/src/handlers.rs`).
 //
 // If you change attribute names here, update the streaming path too.
 // Canonical attribute name constants live in `logging.rs`.
@@ -1538,9 +1556,16 @@ impl Agent {
 ///
 /// Uses `OpenTelemetrySpanExt::set_attribute` to bypass the tracing
 /// `Filtered::on_record` path which doesn't propagate to the OTel layer.
-fn record_input_attributes(span: &tracing::Span, provider_name: &str, model: &str, query: &str) {
+fn record_input_attributes(
+    span: &tracing::Span,
+    provider_name: &str,
+    model: &str,
+    query: &str,
+    system_prompt: &str,
+) {
     crate::logging::set_llm_identifiers(span, provider_name, model);
     crate::logging::set_input_attributes(span, query);
+    crate::logging::set_system_prompt_attribute(span, system_prompt);
 }
 
 /// Record completion result fields (usage, content, status) on the span via OTel API.
@@ -1641,6 +1666,10 @@ impl StreamingAgent for Agent {
             .as_ref()
             .map(|m| m.server_status_snapshot())
             .unwrap_or_default()
+    }
+
+    fn system_prompt(&self) -> Option<&str> {
+        Some(&self.system_prompt)
     }
 }
 

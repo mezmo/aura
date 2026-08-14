@@ -20,8 +20,9 @@
 //! [OpenInference]: https://github.com/Arize-ai/openinference/tree/main/spec
 
 use crate::logging::{
-    ATTR_INPUT_VALUE, ATTR_LLM_MODEL_NAME, ATTR_LLM_SYSTEM, ATTR_LLM_TOKEN_COMPLETION,
-    ATTR_LLM_TOKEN_PROMPT, ATTR_OUTPUT_VALUE, ATTR_TOOL_NAME, ATTR_TOOL_PARAMETERS,
+    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS, ATTR_INPUT_VALUE, ATTR_LLM_MODEL_NAME, ATTR_LLM_SYSTEM,
+    ATTR_LLM_TOKEN_COMPLETION, ATTR_LLM_TOKEN_PROMPT, ATTR_OUTPUT_VALUE, ATTR_TOOL_NAME,
+    ATTR_TOOL_PARAMETERS,
 };
 use futures::future::BoxFuture;
 use opentelemetry::{KeyValue, StringValue, Value};
@@ -141,7 +142,11 @@ fn transform_span(mut span: SpanData) -> SpanData {
     let mut deferred_turn_prompt: Option<String> = None;
     let mut deferred_response: Option<String> = None;
     let mut deferred_reasoning: Option<String> = None;
-    let mut has_input_messages = false;
+    // Input messages are assembled after the loop so system instructions can
+    // lead them; span attributes iterate in arbitrary order, so emitting any
+    // of them inline would fix indices before the rest are known.
+    let mut deferred_system_instructions: Vec<String> = Vec::new();
+    let mut deferred_input_messages: Vec<ParsedMessage> = Vec::new();
 
     for kv in &span.attributes {
         let key = kv.key.as_str();
@@ -174,15 +179,19 @@ fn transform_span(mut span: SpanData) -> SpanData {
             "gen_ai.turn.response" if kind == "CHAIN" || kind == "LLM" => {
                 deferred_response = Some(kv.value.to_string());
             }
+            // The system prompt has no OpenInference attribute of its own, so
+            // it becomes leading `system` entries in `llm.input_messages`.
+            // Ungated by span kind: Aura records it on `agent.stream` (AGENT)
+            // and the `orchestration.*` (CHAIN/AGENT) spans, never on an LLM one.
+            ATTR_GEN_AI_SYSTEM_INSTRUCTIONS => {
+                deferred_system_instructions = parse_system_instructions(&kv.value.to_string());
+            }
             // Expand structured messages for LLM spans
             "gen_ai.input.messages" if kind == "LLM" => {
-                let before = extra_attrs.len();
-                expand_messages(
-                    &kv.value.to_string(),
-                    "llm.input_messages",
-                    &mut extra_attrs,
-                );
-                has_input_messages = extra_attrs.len() > before;
+                deferred_input_messages = parse_json_value(&kv.value.to_string())
+                    .as_ref()
+                    .and_then(parse_messages)
+                    .unwrap_or_default();
             }
             "gen_ai.output.messages" if kind == "LLM" => {
                 expand_messages(
@@ -219,12 +228,28 @@ fn transform_span(mut span: SpanData) -> SpanData {
         }
     }
 
+    // `gen_ai.input.messages` wins over the `gen_ai.turn.prompt` backfill;
+    // either way the system instructions lead.
+    let mut input_messages: Vec<ParsedMessage> = deferred_system_instructions
+        .into_iter()
+        .map(|content| ParsedMessage {
+            role: "system".to_owned(),
+            content,
+        })
+        .collect();
+    let has_system_messages = !input_messages.is_empty();
+
     if let Some(prompt) = deferred_turn_prompt {
         let normalized = normalize_turn_prompt(&prompt);
         extra_attrs.push(KeyValue::new(ATTR_INPUT_VALUE, normalized.input_value));
-        if kind == "LLM" && !has_input_messages {
-            emit_messages("llm.input_messages", &normalized.messages, &mut extra_attrs);
+        if kind == "LLM" && deferred_input_messages.is_empty() {
+            deferred_input_messages = normalized.messages;
         }
+    }
+    input_messages.append(&mut deferred_input_messages);
+
+    if kind == "LLM" || has_system_messages {
+        emit_messages("llm.input_messages", &input_messages, &mut extra_attrs);
     }
 
     // For LLM spans: emit structured llm.output_messages (Phoenix Output Messages tab)
@@ -412,6 +437,46 @@ fn parse_messages(value: &serde_json::Value) -> Option<Vec<ParsedMessage>> {
         serde_json::Value::Object(_) => parse_message(value).map(|message| vec![message]),
         _ => None,
     }
+}
+
+/// Decode a `gen_ai.system_instructions` value into one string per part.
+///
+/// The OTel GenAI shape is an array of typed parts
+/// (`[{"type":"text","content":"..."}]`). Rig instead records the preamble as
+/// a bare string, so that form is accepted as a single part. Unparseable
+/// values yield no parts rather than a malformed message.
+///
+/// Note these parts key their text on `content`, unlike the `text` key that
+/// [`parse_message_content`] handles for `gen_ai.input.messages` parts.
+fn parse_system_instructions(raw: &str) -> Vec<String> {
+    let Some(value) = parse_json_value(raw) else {
+        // Not JSON at all — a bare, unquoted preamble.
+        return vec![raw.to_owned()];
+    };
+    match value {
+        serde_json::Value::Array(parts) => {
+            parts.iter().filter_map(parse_instruction_part).collect()
+        }
+        serde_json::Value::Object(_) => parse_instruction_part(&value).into_iter().collect(),
+        serde_json::Value::String(text) => vec![text],
+        _ => Vec::new(),
+    }
+}
+
+/// Extract the text of a single system-instruction part, accepting both the
+/// GenAI `content` key and a `text` key, or a bare string element.
+fn parse_instruction_part(value: &serde_json::Value) -> Option<String> {
+    if let serde_json::Value::String(text) = value {
+        return Some(text.clone());
+    }
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+        return None;
+    }
+    value
+        .get("content")
+        .or_else(|| value.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 /// Extract role and content from a single `{"role":"...","content":"..."}` object.
@@ -871,6 +936,197 @@ mod tests {
                 .map(|kv| kv.key.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Build a GenAI system-instructions parts array from the given texts.
+    fn system_instructions(parts: &[&str]) -> String {
+        let parts: Vec<_> = parts
+            .iter()
+            .map(|content| serde_json::json!({ "type": "text", "content": content }))
+            .collect();
+        serde_json::Value::Array(parts).to_string()
+    }
+
+    /// A single instruction part becomes a leading `system` message, and the
+    /// raw GenAI key is stripped like every other translated `gen_ai.*` key.
+    /// AGENT kind matters: Aura records the prompt on non-LLM spans.
+    #[test]
+    fn test_system_instructions_translate_to_input_messages() {
+        let span = make_span(
+            "agent.stream",
+            vec![
+                KeyValue::new("gen_ai.system", "openai"),
+                KeyValue::new(
+                    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+                    system_instructions(&["You are a helpful assistant."]),
+                ),
+            ],
+        );
+        let result = transform_span(span);
+
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "system"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            "You are a helpful assistant."
+        );
+        assert!(
+            find_attr(&result, ATTR_GEN_AI_SYSTEM_INSTRUCTIONS).is_none(),
+            "the raw GenAI key must be stripped after translation"
+        );
+    }
+
+    /// Each part becomes its own `system` message rather than being joined.
+    #[test]
+    fn test_system_instructions_emit_one_message_per_part() {
+        let span = make_span(
+            "agent.stream",
+            vec![KeyValue::new(
+                ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+                system_instructions(&[
+                    "You are a language translator.",
+                    "Your mission is to translate text in English to French.",
+                ]),
+            )],
+        );
+        let result = transform_span(span);
+
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            "You are a language translator."
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.1.message.role")
+                .unwrap()
+                .to_string(),
+            "system"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.1.message.content")
+                .unwrap()
+                .to_string(),
+            "Your mission is to translate text in English to French."
+        );
+    }
+
+    /// System instructions lead; existing `gen_ai.input.messages` entries keep
+    /// their order and content, shifted after them.
+    #[test]
+    fn test_system_instructions_prepend_without_erasing_input_messages() {
+        let messages = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
+        let span = make_span(
+            "chat",
+            vec![
+                KeyValue::new(
+                    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+                    system_instructions(&["You are terse."]),
+                ),
+                KeyValue::new("gen_ai.input.messages", messages),
+            ],
+        );
+        let result = transform_span(span);
+
+        let roles_and_contents: Vec<(String, String)> = (0..3)
+            .map(|i| {
+                (
+                    find_attr(&result, &format!("llm.input_messages.{i}.message.role"))
+                        .unwrap()
+                        .to_string(),
+                    find_attr(&result, &format!("llm.input_messages.{i}.message.content"))
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            roles_and_contents,
+            vec![
+                ("system".to_owned(), "You are terse.".to_owned()),
+                ("user".to_owned(), "hello".to_owned()),
+                ("assistant".to_owned(), "hi".to_owned()),
+            ]
+        );
+    }
+
+    /// The `gen_ai.turn.prompt` backfill still applies when structured input
+    /// messages are absent, with the system instructions ahead of it.
+    #[test]
+    fn test_system_instructions_precede_turn_prompt_backfill() {
+        let prompt = r#"[{"role":"user","content":"what is 23 times 87"}]"#;
+        let span = make_span(
+            "agent.turn",
+            vec![
+                KeyValue::new(
+                    ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+                    system_instructions(&["You are a calculator."]),
+                ),
+                KeyValue::new("gen_ai.turn.prompt", prompt),
+            ],
+        );
+        let result = transform_span(span);
+
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "system"
+        );
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.1.message.content")
+                .unwrap()
+                .to_string(),
+            "what is 23 times 87"
+        );
+        // input.value stays the user prompt, not the system instructions.
+        assert_eq!(
+            find_attr(&result, ATTR_INPUT_VALUE).unwrap().to_string(),
+            "what is 23 times 87"
+        );
+    }
+
+    /// Rig records the preamble as a bare string rather than a parts array.
+    #[test]
+    fn test_system_instructions_accept_bare_string() {
+        let span = make_span(
+            "agent.stream",
+            vec![KeyValue::new(
+                ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+                "You are a helpful assistant.",
+            )],
+        );
+        let result = transform_span(span);
+
+        assert_eq!(
+            find_attr(&result, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            "You are a helpful assistant."
+        );
+    }
+
+    /// A parts array carrying no usable text yields no messages.
+    #[test]
+    fn test_system_instructions_unusable_parts_emit_nothing() {
+        let span = make_span(
+            "agent.stream",
+            vec![KeyValue::new(
+                ATTR_GEN_AI_SYSTEM_INSTRUCTIONS,
+                r#"[{"type":"image","url":"http://example.com/x.png"}]"#,
+            )],
+        );
+        let result = transform_span(span);
+
+        assert!(find_attr(&result, "llm.input_messages.0.message.role").is_none());
+        assert!(find_attr(&result, ATTR_GEN_AI_SYSTEM_INSTRUCTIONS).is_none());
     }
 
     #[test]
@@ -1511,5 +1767,59 @@ mod pipeline_tests {
             find_attr(chat, "llm.token_count.completion").is_none(),
             "llm.token_count.completion should NOT be present (field was Empty and never recorded)"
         );
+    }
+
+    // -- Pipeline test: system prompt attribute recording + content gating -
+
+    /// `set_system_prompt_attribute` toggles on `crate::logging::RECORD_CONTENT`,
+    /// a process-global flag — both branches run sequentially in one test
+    /// (rather than two `#[test]` fns) so concurrently-run tests can't race
+    /// on the shared flag.
+    #[test]
+    fn test_pipeline_system_prompt_attribute() {
+        let previous = crate::logging::set_record_content_for_tests(true);
+
+        let (subscriber, memory) = build_pipeline();
+        let system_prompt = "You are a helpful assistant with access to tools.";
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("agent.stream");
+            let _guard = span.enter();
+            crate::logging::set_system_prompt_attribute(&tracing::Span::current(), system_prompt);
+        });
+        let spans = collect_spans(&memory);
+        let recorded = find_span_by_name(&spans, "agent.stream");
+        assert_eq!(
+            find_attr(recorded, "llm.input_messages.0.message.role")
+                .unwrap()
+                .to_string(),
+            "system"
+        );
+        assert_eq!(
+            find_attr(recorded, "llm.input_messages.0.message.content")
+                .unwrap()
+                .to_string(),
+            system_prompt
+        );
+        assert!(
+            find_attr(recorded, ATTR_GEN_AI_SYSTEM_INSTRUCTIONS).is_none(),
+            "the raw GenAI key must be stripped after translation"
+        );
+
+        crate::logging::set_record_content_for_tests(false);
+
+        let (subscriber, memory) = build_pipeline();
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("agent.stream");
+            let _guard = span.enter();
+            crate::logging::set_system_prompt_attribute(&tracing::Span::current(), system_prompt);
+        });
+        let spans = collect_spans(&memory);
+        let recorded = find_span_by_name(&spans, "agent.stream");
+        assert!(
+            find_attr(recorded, "llm.input_messages.0.message.role").is_none(),
+            "must not be recorded when content recording is disabled"
+        );
+
+        crate::logging::set_record_content_for_tests(previous);
     }
 }
