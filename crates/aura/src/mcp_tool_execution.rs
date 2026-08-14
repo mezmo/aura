@@ -44,8 +44,7 @@ fn record_tool_call_input(span: &tracing::Span, args: &Value) {
 }
 
 /// Record the outbound header NAMES an approver override applies to this
-/// call, sorted and comma-joined, never the values. Absent from the span
-/// when the call carries no override.
+/// call, sorted and comma-joined, never the values.
 fn record_applied_headers(
     span: &tracing::Span,
     overrides: &crate::approver_headers::ApproverHeaders,
@@ -290,8 +289,8 @@ mod tests {
     /// captured override's header NAMES, never their values, and an
     /// ungated call's span carries neither.
     ///
-    /// Gated on `otel` — without the feature `set_span_attribute` is a
-    /// documented no-op and there is no span data to assert against.
+    /// Gated on `otel`: without the feature there is no span data to
+    /// assert against.
     #[cfg(feature = "otel")]
     mod applied_headers_span {
         use std::sync::{Arc, Mutex, MutexGuard};
@@ -352,8 +351,7 @@ mod tests {
             /// The single `key` attribute on the span named `name`, or `None`
             /// if the span carries no such attribute. Panics if the span
             /// carries more than one — a double-stamp regression would
-            /// otherwise pass unnoticed, since `find` would silently return
-            /// only the first entry.
+            /// otherwise pass with only the first entry.
             fn attribute(&self, name: &str, key: &str) -> Option<String> {
                 let spans = self.spans();
                 let span = spans.iter().find(|span| span.name == name)?;

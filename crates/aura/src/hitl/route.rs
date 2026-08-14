@@ -197,23 +197,12 @@ pub enum DecisionRoute {
     },
 }
 
-/// Stamp `decision_id` on the current tracing span
-/// (`crate::logging::set_span_attribute`, a documented no-op without the
-/// `otel` feature).
+/// Stamp `decision_id` on the current tracing span.
 ///
-/// Called from both [`DecisionRoute::decide_for_gate`] and
-/// [`DecisionRoute::decide`] — the two public entry points, since neither
-/// reaches the other on every path: the gate's webhook arm resolves through
-/// the client seam without ever calling `decide`, and the agent-callable
-/// `request_approval` tool calls `decide` directly, bypassing the gate
-/// entirely. Each entry point stamps exactly once: `decide_for_gate`'s
-/// conversational arm reaches the shared decision logic through the
-/// unstamped [`DecisionRoute::decide_inner`] rather than through `decide`,
-/// so nesting never produces a second stamp on the same span.
-/// `set_span_attribute` appends rather than overwrites by key, so a second
-/// stamp would add a duplicate attribute entry rather than update the
-/// existing one — this is the failure mode the single-stamp invariant
-/// avoids.
+/// `set_span_attribute` appends rather than overwrites by key, so one span
+/// stamped twice would carry a duplicate attribute entry. The entry points
+/// stamp once each and delegate through the unstamped
+/// [`DecisionRoute::decide_inner`].
 fn stamp_decision_id(decision_id: DecisionId) {
     crate::logging::set_span_attribute(
         &tracing::Span::current(),
@@ -226,18 +215,11 @@ impl DecisionRoute {
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
     ///
-    /// The gate awaits this inline from the gated call's `execute_tool`
-    /// span, so stamping the decision id here — ahead of the route split
-    /// and of any outcome — correlates the approval with the execution it
-    /// gates on either route, decided or not.
-    ///
     /// The webhook arm goes through the capture-bearing client seam
     /// ([`WebhookClient::request_approval_for_gate`]), the only path that
-    /// reads approver identity off an approval response; its event
-    /// choreography mirrors [`Self::decide`]'s webhook arm. The
-    /// conversational arm delegates to the unstamped [`Self::decide_inner`]
-    /// (not [`Self::decide`], which would stamp a second time on this span):
-    /// that route has no distinct identity source and never captures.
+    /// reads approver identity off an approval response. The conversational
+    /// arm delegates to the unstamped [`Self::decide_inner`]: that route has
+    /// no distinct identity source and never captures.
     pub async fn decide_for_gate(
         &self,
         request: ApprovalRequest,
@@ -261,13 +243,10 @@ impl DecisionRoute {
                 )
                 .await;
 
-                // Cancellation is checked in two phases, both failing closed:
-                // the round trip races the cancel token, and whatever the
-                // race returns is rechecked against the token before it
-                // becomes this arm's decision — so a disconnect landing just
-                // as the decision arrives is caught too, and a cancelled call
-                // captures nothing. The completed event is derived after both
-                // phases, so the event and the returned decision always agree.
+                // Two phases, both failing closed: the round trip races the
+                // cancel token, and the result is rechecked against the token
+                // before it becomes this arm's decision, so a disconnect
+                // landing just as the decision arrives is caught too.
                 let raced = tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
@@ -306,13 +285,8 @@ impl DecisionRoute {
         }
     }
 
-    /// Obtain a decision for `request`.
-    ///
-    /// The agent-callable `request_approval` tool awaits this directly on
-    /// its own `execute_tool` span, never through [`Self::decide_for_gate`],
-    /// so this entry point stamps the decision id on the current span
-    /// before delegating to [`Self::decide_inner`] for the shared decision
-    /// logic (deadline, fail-closed mapping, event emission).
+    /// Obtain a decision for `request`, stamping the decision id on the
+    /// current span before delegating to [`Self::decide_inner`].
     pub async fn decide(
         &self,
         request: ApprovalRequest,
@@ -325,10 +299,7 @@ impl DecisionRoute {
     /// Obtain a decision for `request`, applying the shared semantics
     /// (deadline, fail-closed mapping, event emission) in one place.
     ///
-    /// Does not stamp the current span: both callers — [`Self::decide`] and
-    /// the conversational arm of [`Self::decide_for_gate`] — have already
-    /// stamped it on their own entry, so stamping here too would duplicate
-    /// the attribute on the same span.
+    /// Does not stamp: both callers stamp on their own entry.
     async fn decide_inner(
         &self,
         request: ApprovalRequest,
@@ -394,11 +365,7 @@ impl DecisionRoute {
                 )
                 .await;
 
-                // Two-phase, as on the gate path: race the round trip against
-                // the cancel token, then recheck the token before the raced
-                // outcome becomes this arm's outcome. The completed event is
-                // derived after both phases, so the event and the returned
-                // outcome always agree.
+                // Two-phase, as on the gate path.
                 let raced = tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
@@ -511,16 +478,14 @@ pub struct WebhookClient {
     /// Resolved webhook headers.
     headers: HeaderMap,
     signing: EgressSigning,
-    /// Validated `tool_headers_from_response` mappings; empty means approver
-    /// identity capture is not configured.
+    /// Validated `tool_headers_from_response` mappings.
     tool_header_mappings: ToolHeaderMappings,
 }
 
 /// One webhook round trip's answer, with the HTTP response headers it
 /// arrived alongside.
 ///
-/// Only the decided arm carries headers: a timed-out round trip has no
-/// response to read them from, so headers-without-a-decision is
+/// Only the decided arm carries headers, so headers-without-a-decision is
 /// unrepresentable.
 enum WebhookReply {
     Decided {
@@ -598,9 +563,8 @@ impl WebhookClient {
                  will fail closed"
             );
         }
-        // The cleartext-capture warning does not live here: `HitlRuntime::from_config`
-        // (and so this constructor) runs once per request, not once at startup.
-        // `warn_on_cleartext_capture` below is the boot-time seam for it.
+        // The cleartext-capture warning lives at the boot-time seam, not
+        // here: see [`warn_on_cleartext_capture`].
         Self {
             client,
             url,
@@ -611,19 +575,8 @@ impl WebhookClient {
     }
 
     /// Gate-scoped approval request: the config-gate path through the
-    /// webhook.
-    ///
-    /// Runs the round trip through [`Self::request_approval_with_headers`]
-    /// and captures approver identity from the reply's response headers on
-    /// the approved arm only, and only when `tool_header_mappings` is
-    /// non-empty — so overrides are `Some` exactly when capture is
-    /// configured and every mapped header resolved, and `None` otherwise.
-    /// A capture that cannot complete fails closed as
-    /// [`ApprovalError::CaptureFailed`] rather than approving without the
-    /// identity the operator demanded. Every other reply projects through
-    /// [`GateDecision::without_overrides`]. The route-wide
-    /// [`Self::request_approval`] path serves the agent-callable approval
-    /// tool and never captures.
+    /// webhook, capturing approver identity from the reply's response
+    /// headers on the approved arm only.
     pub(crate) async fn request_approval_for_gate(
         &self,
         request: &ApprovalRequest,
@@ -735,8 +688,7 @@ impl WebhookClient {
                 // ingress before any parse.
                 let signature = header_value(resp.headers(), super::signing::SIGNATURE_HEADER);
                 let timestamp = header_value(resp.headers(), super::signing::TIMESTAMP_HEADER);
-                // Cloned here because `bytes()` consumes the response; the
-                // clone is inert until a verified parse builds `Decided`.
+                // Cloned here because `bytes()` consumes the response.
                 let response_headers = resp.headers().clone();
                 let body = match resp.bytes().await {
                     Ok(body) => body,
@@ -836,13 +788,10 @@ pub fn validate_webhook_signing_config(
     }
 }
 
-/// Boot-time warning: a webhook route with `tool_headers_from_response`
-/// configured over plain `http://` is usable (`validate_webhook_signing_config`
-/// above covers the one case that still fails closed, an HMAC secret over
-/// plaintext) but exposes captured approver credentials to any network
-/// observer between here and the webhook. Call this once per `[hitl]`
-/// config at startup, alongside `validate_webhook_signing_config` — never
-/// from [`WebhookClient`] construction, which runs fresh per request via
+/// Boot-time warning for a webhook route that captures approver response
+/// headers over plain `http://`. Call this once per `[hitl]` config at
+/// startup, alongside `validate_webhook_signing_config`. Do not call from
+/// [`WebhookClient`] construction: that runs fresh per request via
 /// `HitlRuntime::from_config` and would turn one misconfiguration into a
 /// warning per chat request.
 pub fn warn_on_cleartext_capture(config: &HitlConfig) {

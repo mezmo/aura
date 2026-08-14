@@ -285,8 +285,8 @@ mod tests {
     /// Trace correlation: a gated call's `execute_tool` span carries the
     /// `decision_id` of the approval that gated it.
     ///
-    /// Gated on `otel` — without the feature `set_span_attribute` is a
-    /// documented no-op and there is no span data to assert against.
+    /// Gated on `otel`: without the feature there is no span data to
+    /// assert against.
     #[cfg(feature = "otel")]
     mod decision_id_span {
         use std::future::Future;
@@ -327,8 +327,7 @@ mod tests {
             /// The single `key` attribute on the span named `name`, or `None`
             /// if the span carries no such attribute. Panics if the span
             /// carries more than one — a double-stamp regression would
-            /// otherwise pass unnoticed, since `find` would silently return
-            /// only the first entry.
+            /// otherwise pass with only the first entry.
             fn attribute(&self, name: &str, key: &str) -> Option<String> {
                 let spans = self.spans();
                 let span = spans.iter().find(|span| span.name == name)?;
