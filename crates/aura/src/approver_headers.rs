@@ -19,23 +19,18 @@ use reqwest::header::{HeaderMap, HeaderName};
 /// producer.
 #[derive(Clone)]
 pub struct ApproverHeaders {
-    /// The validated override pairs, keys lowercased so an override replaces
-    /// the frozen default header rather than coexisting with it. The keys
-    /// are also the audit surface (names only); no separate name list
-    /// exists to fall out of sync.
+    /// The validated override pairs, keys lowercased. The keys are also the
+    /// audit surface (names only); no separate name list exists to fall out
+    /// of sync.
     headers: HeaderMap,
 }
 
 impl ApproverHeaders {
     /// Capture and validate approver headers from an approval response.
     ///
-    /// Every outbound name in `mapping` must resolve to a present response
-    /// header or the whole capture fails closed; nothing is silently
-    /// dropped. Response lookup is case-insensitive and takes the first
-    /// value of a multi-valued header, matching how the route reads the
-    /// signature headers off the same response. The missing names in the
-    /// error are sorted so a given failure always reports them in one
-    /// order.
+    /// Response lookup is case-insensitive and takes the first value of a
+    /// multi-valued header, matching how the route reads the signature
+    /// headers off the same response.
     pub(crate) fn from_captured(
         mapping: &ToolHeaderMappings,
         response_headers: &HeaderMap,
