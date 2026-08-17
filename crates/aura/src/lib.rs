@@ -42,6 +42,8 @@ pub mod stream_events;
 pub mod streaming;
 pub mod streaming_request_hook;
 pub(crate) mod string_utils;
+#[cfg(all(test, feature = "otel"))]
+pub(crate) mod test_span_capture;
 pub mod tool_call_observer;
 pub mod tool_error_detection;
 pub mod tool_event_broker;
