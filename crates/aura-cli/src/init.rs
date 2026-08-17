@@ -132,6 +132,25 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
         name,
     } = resolve_output(args, &mut prompter)?;
 
+    // Reducing a name to a filename is lossy, so two distinct agents can point
+    // at one file. `--force` authorises replacing the agent that was asked
+    // for; it must not silently destroy a different one that happens to
+    // reduce the same way. Checked ahead of the overwrite prompt because
+    // `--force` does not excuse it.
+    if scope == Scope::Global
+        && let Some(existing) = existing_agent_name(&output)
+        && existing != name
+    {
+        bail!(
+            "{} already holds a different agent, `{existing}`.\n\
+             `{name}` and `{existing}` reduce to the same filename, so installing \
+             here would replace it.\n\
+             Choose a name that differs by more than punctuation, or pass --output \
+             to place this config yourself.",
+            output.display()
+        );
+    }
+
     // Resolve an existing config before asking anything else: prompt to
     // overwrite (interactive) or fail fast with --force guidance
     // (non-interactive).
@@ -322,6 +341,23 @@ fn global_config_path(agents_dir: &Path, name: &str) -> PathBuf {
     agents_dir.join(format!("{}.toml", sanitize_filename(name)))
 }
 
+/// Agent name declared by the config at `path`.
+///
+/// Read leniently through a plain TOML parse rather than the real loader,
+/// which would resolve `{{ env.* }}` references and reject a config whose
+/// keys are absent from this environment. A file that cannot be read or
+/// parsed yields `None` — an unreadable neighbour should not block an
+/// install the overwrite prompt already covers.
+fn existing_agent_name(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let parsed: toml::Value = text.parse().ok()?;
+    parsed
+        .get("agent")?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Reduce an agent name to a safe single filename component, so a name
 /// carrying path separators or `..` cannot escape `~/.aura/agents/`.
 fn sanitize_filename(name: &str) -> String {
@@ -433,6 +469,40 @@ mod tests {
     fn agent_name_becomes_the_global_filename() {
         assert_eq!(sanitize_filename("reviewer"), "reviewer");
         assert_eq!(sanitize_filename("sre agent"), "sre-agent");
+    }
+
+    #[test]
+    fn existing_agent_name_reads_a_generated_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("a.toml");
+        let spec = test_support::resolve(&args()).unwrap();
+        std::fs::write(&path, render_config(&spec)).unwrap();
+        // Read without resolving `{{ env.* }}`, which the real loader would.
+        assert_eq!(existing_agent_name(&path).as_deref(), Some("assistant"));
+    }
+
+    #[test]
+    fn existing_agent_name_tolerates_unreadable_and_unparsable_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(existing_agent_name(&tmp.path().join("missing.toml")), None);
+
+        let junk = tmp.path().join("junk.toml");
+        std::fs::write(&junk, "this is not toml {{{").unwrap();
+        assert_eq!(existing_agent_name(&junk), None);
+
+        let no_agent = tmp.path().join("no-agent.toml");
+        std::fs::write(&no_agent, "[other]\nkey = 1\n").unwrap();
+        assert_eq!(existing_agent_name(&no_agent), None);
+    }
+
+    #[test]
+    fn distinct_names_still_reduce_to_one_filename() {
+        // The mapping is lossy by design; `run_init` refuses the collision
+        // rather than letting one agent overwrite the other.
+        assert_eq!(
+            global_config_path(Path::new("/agents"), "sre agent"),
+            global_config_path(Path::new("/agents"), "sre-agent")
+        );
     }
 
     #[test]
