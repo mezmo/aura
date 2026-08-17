@@ -62,10 +62,10 @@ a defect in this document, not an implicit exclusion.
 | An override replaces the client's frozen header on the wire | `mcp_streamable_http::tests::override_replaces_the_clients_frozen_identity_for_that_call_only` | Also asserts the handshake kept the original identity |
 | The override rides exactly one call | `mcp_streamable_http::tests::override_rides_one_call_and_no_later_one` | The next call on the same client carries none |
 | Concurrent gated calls keep their own identities | `mcp_streamable_http::tests::concurrent_gated_calls_keep_their_own_identity` | Correlated by the tool name in each recorded body |
-| An ungated call carries no override | `mcp_streamable_http::tests::ungated_call_carries_no_override` | |
+| An ungated call carries no override | `mcp_streamable_http::tests::override_rides_one_call_and_no_later_one`, `mcp_streamable_http::tests::override_replaces_the_clients_frozen_identity_for_that_call_only` | Asserted as the second, ungated call of each test — the stronger post-gated-call (staleness) context |
 | The override never reaches the JSON body | `mcp_streamable_http::tests::override_never_reaches_the_json_body` | The extension is dropped by the serializer, which is what keeps it off the wire as data |
 | The untracked call path delivers the override | `mcp_streamable_http::tests::override_rides_one_call_and_no_later_one` | This path builds its request explicitly rather than delegating to the client library |
-| The tracked call path delivers the override | `mcp_streamable_http::tests::tracked_call_carries_the_override_like_the_untracked_one` | |
+| The tracked call path delivers the override | `mcp_streamable_http::tests::call_tool_delivers_the_override_on_either_branch` | Reaches `call_tool_tracked` through the public `call_tool` dispatch, the route production takes under the web server |
 | Both paths behave alike on one client | `mcp_streamable_http::tests::call_tool_delivers_the_override_on_either_branch` | Which path a call takes must not decide whether identity is delivered |
 | The SSE send path applies the override once and keeps it out of the body | `mcp_sse::tests::approver_overrides::send_applies_the_override_to_the_post_and_not_the_body` | Exercises the transport's send directly |
 | The SSE send path leaves an ungated message alone | `mcp_sse::tests::approver_overrides::send_without_an_extension_keeps_the_frozen_identity` | |

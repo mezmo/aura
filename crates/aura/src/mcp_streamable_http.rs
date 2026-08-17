@@ -832,9 +832,7 @@ pub(crate) mod tests {
     /// Answer a JSON-RPC POST: a result for a request, a bare ack for a
     /// notification.
     fn reply_to_rpc(body: &[u8]) -> (&'static str, Vec<(String, String)>, String) {
-        let Ok(message) = serde_json::from_slice::<Value>(body) else {
-            return ("400 Bad Request", Vec::new(), String::new());
-        };
+        let message = serde_json::from_slice::<Value>(body).expect("client sends valid JSON-RPC");
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -855,7 +853,7 @@ pub(crate) mod tests {
             "tools/call" => rmcp::model::ServerResult::CallToolResult(
                 rmcp::model::CallToolResult::success(vec![rmcp::model::Content::text("ok")]),
             ),
-            _ => rmcp::model::ServerResult::empty(()),
+            other => panic!("unexpected rpc method {other:?}"),
         };
         let payload =
             serde_json::to_string(&rmcp::model::ServerJsonRpcMessage::response(result, id))
@@ -1009,31 +1007,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The tracked branch is the one production takes under the web server;
-    /// it must deliver identity the same way the untracked branch does.
-    #[tokio::test]
-    async fn tracked_call_carries_the_override_like_the_untracked_one() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
-
-        client
-            .call_tool_tracked(
-                "gated",
-                no_args(),
-                "http-req-1",
-                Some(captured_overrides("x-forwarded-user", "alice")),
-            )
-            .await
-            .expect("the tracked gated call succeeds");
-
-        assert_eq!(
-            server.tool_calls()[0].header_values("x-forwarded-user"),
-            vec!["alice"],
-        );
-    }
-
     /// `set_current_request` selects the tracked branch, so this is the same
     /// entry point a gated call takes in the server and the branch choice must
     /// not decide whether identity is delivered.
@@ -1066,27 +1039,5 @@ pub(crate) mod tests {
         let calls = server.tool_calls();
         assert_eq!(calls[0].header_values("x-forwarded-user"), vec!["alice"]);
         assert_eq!(calls[1].header_values("x-forwarded-user"), vec!["bob"]);
-    }
-
-    /// A call no approval gated must reach the server carrying nothing extra —
-    /// neither an override header nor a stale one from an earlier call.
-    #[tokio::test]
-    async fn ungated_call_carries_no_override() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
-
-        client
-            .call_tool("ungated", no_args(), None)
-            .await
-            .expect("the ungated call succeeds");
-
-        let call = &server.tool_calls()[0];
-        assert!(call.header_values("x-forwarded-user").is_empty());
-        assert_eq!(
-            call.header_values("authorization"),
-            vec!["Bearer requester"]
-        );
     }
 }
