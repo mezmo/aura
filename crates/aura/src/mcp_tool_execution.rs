@@ -293,89 +293,17 @@ mod tests {
     /// assert against.
     #[cfg(feature = "otel")]
     mod applied_headers_span {
-        use std::sync::{Arc, Mutex, MutexGuard};
 
-        use futures::future::BoxFuture;
         use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+
         use opentelemetry_sdk::trace::TracerProvider;
         use serde_json::json;
         use tracing_subscriber::layer::SubscriberExt;
 
-        use aura_config::ToolHeaderMappings;
-        use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue};
-
         use super::*;
         use crate::logging::ATTR_APPLIED_HEADERS;
         use crate::mcp_streamable_http::tests::RecordingMcpServer;
-
-        /// Captured overrides for `pairs`, given in whatever order the
-        /// caller likes — the loopback response headers are keyed
-        /// `x-response-<outbound>` so the capture step (case-insensitive
-        /// lookup by mapped name) is exercised the same way production
-        /// capture is, rather than hand-building the type directly.
-        fn captured_overrides_for(
-            pairs: &[(&str, &str)],
-        ) -> crate::approver_headers::ApproverHeaders {
-            let mapping: std::collections::HashMap<String, String> = pairs
-                .iter()
-                .map(|(outbound, _)| (outbound.to_string(), format!("x-response-{outbound}")))
-                .collect();
-            let mut response = ReqwestHeaderMap::new();
-            for (outbound, value) in pairs {
-                response.insert(
-                    HeaderName::from_bytes(format!("x-response-{outbound}").as_bytes()).unwrap(),
-                    HeaderValue::from_str(value).unwrap(),
-                );
-            }
-            crate::approver_headers::ApproverHeaders::from_captured(
-                &ToolHeaderMappings::try_from(mapping).expect("test mapping is valid config"),
-                &response,
-            )
-            .expect("every mapped header is present")
-        }
-
-        /// Spans the test subscriber has exported.
-        #[derive(Debug, Clone, Default)]
-        struct CapturedSpans(Arc<Mutex<Vec<SpanData>>>);
-
-        impl CapturedSpans {
-            fn spans(&self) -> MutexGuard<'_, Vec<SpanData>> {
-                self.0.lock().expect("captured spans mutex")
-            }
-
-            fn contains(&self, name: &str) -> bool {
-                self.spans().iter().any(|span| span.name == name)
-            }
-
-            /// The single `key` attribute on the span named `name`, or `None`
-            /// if the span carries no such attribute. Panics if the span
-            /// carries more than one — a double-stamp regression would
-            /// otherwise pass with only the first entry.
-            fn attribute(&self, name: &str, key: &str) -> Option<String> {
-                let spans = self.spans();
-                let span = spans.iter().find(|span| span.name == name)?;
-                let matches: Vec<_> = span
-                    .attributes
-                    .iter()
-                    .filter(|kv| kv.key.as_str() == key)
-                    .collect();
-                assert!(
-                    matches.len() <= 1,
-                    "span {name:?} must carry at most one {key} attribute, found {}: \
-                     a regression is double-stamping the same span",
-                    matches.len(),
-                );
-                matches.first().map(|kv| kv.value.to_string())
-            }
-        }
-
-        impl SpanExporter for CapturedSpans {
-            fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
-                self.spans().extend(batch);
-                Box::pin(std::future::ready(Ok(())))
-            }
-        }
+        use crate::test_span_capture::CapturedSpans;
 
         /// Run `execute_mcp_tool` under a subscriber that exports to memory,
         /// returning the `applied_headers` attribute its `mcp.tool_call`
@@ -417,7 +345,7 @@ mod tests {
                 .await
                 .expect("the loopback server completes the handshake");
 
-            let overrides = captured_overrides_for(&[
+            let overrides = crate::approver_headers::tests::captured_overrides_multi(&[
                 ("x-tenant", "acme"),
                 ("authorization", "Bearer approver-secret"),
             ]);
