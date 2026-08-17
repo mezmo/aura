@@ -51,9 +51,9 @@ a defect in this document, not an implicit exclusion.
 | Streamable-HTTP tools are tagged as able to deliver | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | |
 | SSE tools are tagged as able to deliver | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | |
 | Stdio tools are tagged as unable to deliver | `builder::tests::transport_tagging::stdio_tools_are_tagged_so_a_gated_call_fails_closed` | A mistag here would run a gated call under the cached identity |
-| Stdio adaptor refuses a gated call before anything is dispatched | `mcp_dynamic::tests::stdio_adaptor_refuses_a_gated_call_before_dispatch` | Asserts the server saw nothing, not only that the call errored |
-| Stdio adaptor runs an ungated call untouched | `mcp_dynamic::tests::stdio_adaptor_runs_an_ungated_call` | |
-| Adaptor reads the scoped overrides and threads them to the client | `mcp_dynamic::tests::http_adaptor_forwards_the_scoped_override` | |
+| Stdio adaptor refuses a gated call before anything is dispatched | `builder::tests::transport_tagging::stdio_tools_are_tagged_so_a_gated_call_fails_closed` | Asserts the recording server saw nothing, not only that the call errored |
+| Stdio adaptor runs an ungated call untouched | `mcp_dynamic::tests::stdio_adaptor_runs_an_ungated_call` | The fail-open complement: no override means no transport check |
+| Adaptor reads the scoped overrides and threads them to the client | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | Exercises the wrapper, the spawn, the adaptor read and the wire in one call |
 | Transport check accepts both HTTP transports | `approver_headers::tests::http_transports_accept_overrides` | |
 | Transport check refuses stdio | `approver_headers::tests::stdio_transport_refuses_overrides` | |
 | Transport check refuses stdio for an override set with no pairs | `approver_headers::tests::stdio_refuses_even_an_empty_override_set` | Existence of an override value, not its size, is what the check keys off |
