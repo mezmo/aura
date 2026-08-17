@@ -219,6 +219,31 @@ pub(crate) mod tests {
         .expect("the mapped header is present")
     }
 
+    /// Captured overrides for several pairs at once, each mapped from its
+    /// own `x-response-<outbound>` response header, given in whatever order
+    /// the caller likes. Construction goes through the real capture path,
+    /// so a test can never hold overrides the production path could not
+    /// have produced.
+    #[cfg(feature = "otel")]
+    pub(crate) fn captured_overrides_multi(pairs: &[(&str, &str)]) -> ApproverHeaders {
+        let response_names: Vec<String> = pairs
+            .iter()
+            .map(|(outbound, _)| format!("x-response-{outbound}"))
+            .collect();
+        let mapping: Vec<(&str, &str)> = pairs
+            .iter()
+            .zip(&response_names)
+            .map(|((outbound, _), name)| (*outbound, name.as_str()))
+            .collect();
+        let response_pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .zip(&response_names)
+            .map(|((_, value), name)| (name.as_str(), *value))
+            .collect();
+        ApproverHeaders::from_captured(&mappings(&mapping), &response(&response_pairs))
+            .expect("every mapped header is present")
+    }
+
     fn mappings(pairs: &[(&str, &str)]) -> ToolHeaderMappings {
         let raw: HashMap<String, String> = pairs
             .iter()
