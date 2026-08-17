@@ -6,33 +6,23 @@
 //! a real gated MCP call, over the actual `/v1/chat/completions` path —
 //! everything the unit suites cover only seam by seam.
 //!
-//! # Why this suite runs its own server
-//!
-//! `header_forwarding_tests.rs` shares one already-running `aura-web-server`
-//! and one `test-config.toml` with every other `integration-*` suite. A
-//! `require_approval` glob on `echo_headers` would gate every call that
-//! shared server makes to the tool, including that suite's — there is no way
-//! to scope `[hitl]` to a subset of calls on one running config. So each
-//! test here builds its own `aura-web-server` child process against its own
-//! generated config, on its own port, and tears it down when the test ends.
-//! All instances share the one `mock-mcp` fixture `header_forwarding_tests.rs`
-//! already depends on.
+//! Each test builds its own `aura-web-server` child process against its own
+//! generated config: the shared server behind `header_forwarding_tests.rs`
+//! cannot carry `[hitl]` gating, because a `require_approval` glob would
+//! gate every suite's calls to the same tool. All instances share the one
+//! `mock-mcp` fixture `header_forwarding_tests.rs` already depends on.
 //!
 //! # Run recipe
 //!
-//! 1. Start the shared MCP fixture (the same one `header_forwarding_tests.rs`
-//!    needs): `docker compose -f compose/base.yml -f compose/dev.yml up -d
-//!    mock-mcp`. Its FastMCP server must be reachable at
-//!    `${MCP_MOCK_HOST:-127.0.0.1}:9999`.
+//! 1. Start the shared MCP fixture: `docker compose -f compose/base.yml -f
+//!    compose/dev.yml up -d mock-mcp` (FastMCP at
+//!    `${MCP_MOCK_HOST:-127.0.0.1}:9999`).
 //! 2. Export `OPENAI_API_KEY` (each generated config resolves
 //!    `{{ env.OPENAI_API_KEY }}`, exactly like `test-config.toml`).
 //! 3. `cargo test -p aura-web-server --features integration-hitl-header-forwarding`.
 //!    Cargo builds `aura-web-server` as a side effect (via
 //!    `CARGO_BIN_EXE_aura-web-server`); each test spawns it fresh, waits on
 //!    `/health`, drives one chat completion, and kills it on drop.
-//!
-//! No docker image, compose overlay, or Makefile target is needed beyond
-//! step 1's existing `mock-mcp` service.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -445,6 +435,14 @@ fn assistant_text(response_json: &Value) -> &str {
         .expect("response carries assistant message content")
 }
 
+/// The `echo_headers` JSON blob out of a chat response's assistant prose,
+/// with `context` naming what the calling test expected, so a miss names
+/// both the expectation and what the assistant actually said.
+fn headers_from_response(response_json: &Value, context: &str) -> Value {
+    let text = assistant_text(response_json);
+    extract_json_object(text).unwrap_or_else(|| panic!("{context}; got: {text:?}"))
+}
+
 /// The first `{...}` JSON object embedded in `text`, if any — mirrors
 /// `header_forwarding_tests.rs`'s extraction of the `echo_headers` JSON blob
 /// out of the model's prose.
@@ -493,12 +491,10 @@ async fn override_forwarded_to_the_gated_call() {
         "Call the echo_headers tool now and reply with only its raw JSON output.",
     )
     .await;
-    let headers = extract_json_object(assistant_text(&response)).unwrap_or_else(|| {
-        panic!(
-            "the assistant relays the echo_headers JSON output; got: {:?}",
-            assistant_text(&response)
-        )
-    });
+    let headers = headers_from_response(
+        &response,
+        "the assistant relays the echo_headers JSON output",
+    );
 
     assert_eq!(
         headers.get("authorization").and_then(Value::as_str),
@@ -601,12 +597,10 @@ async fn approval_with_no_configured_map_proceeds_with_no_override() {
         "Call the echo_headers tool now and reply with only its raw JSON output.",
     )
     .await;
-    let headers = extract_json_object(assistant_text(&response)).unwrap_or_else(|| {
-        panic!(
-            "an approval with no map still proceeds and echoes the real headers; got: {:?}",
-            assistant_text(&response)
-        )
-    });
+    let headers = headers_from_response(
+        &response,
+        "an approval with no map still proceeds and echoes the real headers",
+    );
 
     assert_eq!(
         headers.get("authorization").and_then(Value::as_str),
@@ -639,12 +633,10 @@ async fn a_tool_the_glob_does_not_match_is_unaffected() {
         "Call the echo_headers tool now and reply with only its raw JSON output.",
     )
     .await;
-    let headers = extract_json_object(assistant_text(&response)).unwrap_or_else(|| {
-        panic!(
-            "a tool the glob does not match runs with no approval step at all; got: {:?}",
-            assistant_text(&response)
-        )
-    });
+    let headers = headers_from_response(
+        &response,
+        "a tool the glob does not match runs with no approval step at all",
+    );
 
     assert_eq!(
         headers.get("authorization").and_then(Value::as_str),
