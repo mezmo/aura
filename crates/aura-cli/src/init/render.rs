@@ -101,18 +101,24 @@ pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, scope: Scope) -> S
     };
 
     // A global config is already on the search path, so the only thing left is
-    // to run `aura`. A local one has to be run from its own directory.
+    // to run `aura`. Locally, only the well-known filename is discovered — any
+    // other name has to be named on the command line, or the printed command
+    // would load something else or nothing at all.
+    let discoverable = config_path
+        .file_name()
+        .is_some_and(|n| n == std::ffi::OsStr::new(crate::agent_config::CWD_CONFIG_FILENAME));
     let run = match scope {
         Scope::Global => {
             "  2. Run `aura` from any directory — it finds this config automatically".to_string()
         }
-        Scope::Local => config_path
+        Scope::Local if discoverable => config_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map_or_else(
                 || "  2. aura".to_string(),
                 |d| format!("  2. cd {} && aura", d.display()),
             ),
+        Scope::Local => format!("  2. aura --config {}", config_path.display()),
     };
 
     format!(
@@ -225,6 +231,16 @@ mod tests {
     fn next_steps_cds_into_config_dir() {
         let s = next_steps(Path::new("proj/config.toml"), false, Scope::Local);
         assert!(s.contains("cd proj && aura"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_names_a_config_bare_aura_would_not_find() {
+        // Only `config.toml` is discovered in the working directory, so the
+        // printed command has to point at anything else explicitly.
+        for path in ["myagent.toml", "proj/myagent.toml"] {
+            let s = next_steps(Path::new(path), false, Scope::Local);
+            assert!(s.contains(&format!("aura --config {path}")), "got: {s}");
+        }
     }
 
     #[test]
