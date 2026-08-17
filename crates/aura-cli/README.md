@@ -119,7 +119,7 @@ Both the web server and the standalone CLI load `.env` automatically at startup,
 
 #### One `.env` per directory, not per agent
 
-The `.env` is written **beside** the config, and exactly one is loaded — the resolved config's. Agents installed side by side therefore share it, which matters most in `~/.aura/agents/`:
+The `.env` is written **beside** the config. At startup the CLI loads up to two: the working directory's `.env` first, then the one beside whichever config was resolved. Loading never overwrites, so on any variable both define the working directory wins, and a shell `export` beats both. Agents installed side by side share the `.env` in their directory, which matters most in `~/.aura/agents/`:
 
 ```
 ~/.aura/agents/
