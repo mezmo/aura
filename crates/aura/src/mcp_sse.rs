@@ -233,10 +233,11 @@ mod tests {
         }
 
         /// The SSE send path reads the same extension the streamable-HTTP path
-        /// does: the override replaces the frozen identity on that one POST,
-        /// arrives once, and never appears in the JSON body.
+        /// does: an override replaces the frozen identity on exactly that one
+        /// POST, arrives once, and never appears in the JSON body — and a
+        /// message with no extension leaves the client's identity in place.
         #[tokio::test]
-        async fn send_applies_the_override_to_the_post_and_not_the_body() {
+        async fn send_applies_the_override_to_that_post_alone() {
             let server = RecordingMcpServer::start().await;
             let mut transport = transport_to(&server.url);
 
@@ -248,33 +249,26 @@ mod tests {
                 .await
                 .expect("the loopback server accepts the post");
 
-            let calls = server.tool_calls();
-            assert_eq!(calls.len(), 1);
+            let gated = &server.tool_calls()[0];
             assert_eq!(
-                calls[0].header_values("authorization"),
+                gated.header_values("authorization"),
                 vec!["Bearer approver"],
                 "the requester's identity must be replaced, not joined",
             );
-            let body = calls[0].body_text();
+            let body = gated.body_text();
             assert!(!body.contains("authorization"), "body was: {body}");
             assert!(!body.contains("approver"), "body was: {body}");
-        }
-
-        /// A message with no extension leaves the client's own identity in
-        /// place, so an ungated call on an SSE server is unaffected.
-        #[tokio::test]
-        async fn send_without_an_extension_keeps_the_frozen_identity() {
-            let server = RecordingMcpServer::start().await;
-            let mut transport = transport_to(&server.url);
 
             transport
                 .send(call_message("ungated", None))
                 .await
-                .expect("the loopback server accepts the post");
+                .expect("the loopback server accepts the second post");
 
+            let ungated = &server.tool_calls()[1];
             assert_eq!(
-                server.tool_calls()[0].header_values("authorization"),
+                ungated.header_values("authorization"),
                 vec!["Bearer requester"],
+                "the next ungated message keeps the frozen identity",
             );
         }
     }
