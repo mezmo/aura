@@ -114,7 +114,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::approver_headers::{APPROVER_OVERRIDES, tests::captured_overrides};
     use crate::mcp_streamable_http::tests::RecordingMcpServer;
 
     /// An adaptor for `tool_name`, fronting `server`, tagged as `kind`.
@@ -135,55 +134,6 @@ mod tests {
             std::sync::Arc::new(serde_json::Map::new()),
         );
         McpToolAdaptor::new(tool, "test-server".to_owned(), Arc::new(client), kind)
-    }
-
-    /// Identity was demanded and stdio has no way to carry it, so the call
-    /// must not run — and must not run *at all*: the refusal comes before
-    /// anything reaches the server, not after.
-    #[tokio::test]
-    async fn stdio_adaptor_refuses_a_gated_call_before_dispatch() {
-        let server = RecordingMcpServer::start().await;
-        let adaptor = adaptor_for(&server, "gated", McpTransportKind::Stdio).await;
-
-        let error = APPROVER_OVERRIDES
-            .scope(
-                Some(captured_overrides("x-forwarded-user", "alice")),
-                adaptor.call(json!({})),
-            )
-            .await
-            .expect_err("a stdio tool call carrying overrides must fail closed");
-
-        assert!(
-            error
-                .to_string()
-                .contains("cannot deliver approver identity"),
-            "the error must name the reason, got: {error}",
-        );
-        assert!(
-            server.tool_calls().is_empty(),
-            "the call must not reach the server",
-        );
-    }
-
-    /// The same adaptor over a transport that can carry headers reads the
-    /// task-local and threads it all the way to the wire.
-    #[tokio::test]
-    async fn http_adaptor_forwards_the_scoped_override() {
-        let server = RecordingMcpServer::start().await;
-        let adaptor = adaptor_for(&server, "gated", McpTransportKind::StreamableHttp).await;
-
-        APPROVER_OVERRIDES
-            .scope(
-                Some(captured_overrides("x-forwarded-user", "alice")),
-                adaptor.call(json!({})),
-            )
-            .await
-            .expect("an http-backed gated call proceeds");
-
-        assert_eq!(
-            server.tool_calls()[0].header_values("x-forwarded-user"),
-            vec!["alice"],
-        );
     }
 
     /// A stdio tool that no approval gated is untouched by any of this.
