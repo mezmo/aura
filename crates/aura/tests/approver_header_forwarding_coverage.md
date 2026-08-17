@@ -44,6 +44,7 @@ a defect in this document, not an implicit exclusion.
 |---|---|---|
 | Approved decision carrying overrides maps to a proceed that keeps them | `hitl::gate::tests::approval_result_mapping_carries_captured_overrides_into_the_call` | The only path from a decision to the call it released |
 | Approved decision without overrides maps to a proceed without them | `hitl::gate::tests::approval_result_mapping_proceeds_only_on_approval` | |
+| The agent-callable `request_approval` surface never captures identity | `hitl::route::tests::webhook_signing::route_wide_approval_discards_identity_headers` | An approved, identity-bearing response under a non-empty mapping resolves to a plain decision; the outcome type has no override channel |
 | Denial, timeout, cancellation and channel fault never proceed | `hitl::gate::tests::approval_result_mapping_denial_is_feedback_not_error`, `hitl::gate::tests::approval_result_mapping_timeout_cancel_and_channel_fault_are_errors` | Denial maps to feedback, the rest to errors — neither is a proceed, so nothing may be applied |
 | Composition keeps the one producer's overrides across passive wrappers | `tool_wrapper::tests::composed_overrides::the_single_producers_identity_survives_its_passive_neighbours` | Composition builds a fresh outcome, so this is a value-loss seam |
 | Two producing wrappers fail the call | `tool_wrapper::tests::composed_overrides::two_producers_fail_the_call_rather_than_pick_one` | Wrapper order must never decide identity |
