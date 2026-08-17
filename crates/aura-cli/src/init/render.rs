@@ -51,6 +51,15 @@ pub(crate) fn render_env(env_var: &str, value: &str) -> String {
     )
 }
 
+/// Value currently bound to `env_var` in a `.env`, matched the same way
+/// [`merge_env`] decides which line to replace.
+pub(crate) fn env_value<'a>(existing: &'a str, env_var: &str) -> Option<&'a str> {
+    existing.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix(env_var)?;
+        Some(rest.trim_start().strip_prefix('=')?.trim())
+    })
+}
+
 /// Merge a new key into an existing `.env`: replace the line if the key
 /// already exists, otherwise append it.
 pub(crate) fn merge_env(existing: &str, env_var: &str, value: &str) -> String {
@@ -207,6 +216,19 @@ mod tests {
         let env = merge_env(existing, "OPENAI_API_KEY", "sk-new");
         assert!(env.contains("GITHUB_TOKEN=ghp_abc"));
         assert!(env.contains("OPENAI_API_KEY=sk-new"));
+    }
+
+    #[test]
+    fn env_value_reads_the_line_merge_env_would_replace() {
+        let existing = "GITHUB_TOKEN=ghp_abc\n  OPENAI_API_KEY = sk-old \n";
+        assert_eq!(env_value(existing, "OPENAI_API_KEY"), Some("sk-old"));
+        assert_eq!(env_value(existing, "ANTHROPIC_API_KEY"), None);
+    }
+
+    #[test]
+    fn env_value_does_not_match_a_longer_variable_name() {
+        let existing = "OPENAI_API_KEY_STAGING=sk-staging\n";
+        assert_eq!(env_value(existing, "OPENAI_API_KEY"), None);
     }
 
     #[test]

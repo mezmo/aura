@@ -110,6 +110,23 @@ It will:
 
 `aura-web-server` and the standalone CLI load `.env` automatically at startup, so a config generated here runs as-is.
 
+#### One `.env` per directory, not per agent
+
+The `.env` is written **beside** the config, and exactly one is loaded — the resolved config's. Agents installed side by side therefore share it, which matters most in `~/.aura/agents/`:
+
+```
+~/.aura/agents/
+├── .env              ← shared by every agent below
+├── assistant.toml    ← api_key = "{{ env.OPENAI_API_KEY }}"
+└── reviewer.toml     ← api_key = "{{ env.OPENAI_API_KEY }}"
+```
+
+Because a config references a key *by variable name*, two agents naming the same variable resolve to the same key. Installing the second with a different key replaces the value and re-points the first as well; `init` warns when it is about to do that. To give an agent its own credential, give it its own variable:
+
+```bash
+aura init --global --name work --api-key-env OPENAI_API_KEY_WORK
+```
+
 ### Flags
 
 | Flag | Description |
