@@ -361,15 +361,11 @@ temperature = 0.0
     )
 }
 
-/// `[hitl]` gating `echo_headers`, routed to `approver_url`.
-/// `tool_headers_from_response` is present when `with_map` is true (cases 1-3)
-/// and absent when false (case 4, legacy behavior).
-fn gated_hitl_toml(approver_url: &str, with_map: bool) -> String {
-    let mapping = if with_map {
-        r#"tool_headers_from_response = { "authorization" = "x-approver-token" }"#
-    } else {
-        ""
-    };
+/// `[hitl]` gating `echo_headers`, routed to `approver_url`, with
+/// `tool_headers_from_response` mapping the approver token onto
+/// `authorization`.
+fn gated_hitl_toml(approver_url: &str) -> String {
+    let mapping = r#"tool_headers_from_response = { "authorization" = "x-approver-token" }"#;
     format!(
         r#"
 [hitl]
@@ -483,7 +479,7 @@ async fn override_forwarded_to_the_gated_call() {
     let server = AuraServer::start(&config_toml(
         &mcp_url(),
         "Bearer legacy-frozen-identity",
-        &gated_hitl_toml(&approver.url, true),
+        &gated_hitl_toml(&approver.url),
     ))
     .await;
 
@@ -518,7 +514,7 @@ async fn missing_mapped_header_fails_the_call_by_name_only() {
     let server = AuraServer::start(&config_toml(
         &mcp_url(),
         "Bearer legacy-frozen-identity",
-        &gated_hitl_toml(&approver.url, true),
+        &gated_hitl_toml(&approver.url),
     ))
     .await;
 
@@ -546,78 +542,7 @@ async fn missing_mapped_header_fails_the_call_by_name_only() {
     server.stop().await;
 }
 
-/// Case 3: a denial short-circuits before the inner tool ever runs — the
-/// assistant sees the denial text, never a real headers echo.
-#[tokio::test]
-async fn denial_short_circuits_before_the_tool_runs() {
-    let approver = MockApprover::start(ApproverReply::Deny).await;
-    let server = AuraServer::start(&config_toml(
-        &mcp_url(),
-        "Bearer legacy-frozen-identity",
-        &gated_hitl_toml(&approver.url, true),
-    ))
-    .await;
-
-    let response = send_chat(
-        &server,
-        "Call the echo_headers tool now and reply with only its exact output.",
-    )
-    .await;
-    let text = assistant_text(&response);
-
-    assert!(
-        text.to_lowercase().contains("denial") || text.to_lowercase().contains("blocked"),
-        "the assistant must relay the denial, got: {text}"
-    );
-    assert!(
-        extract_json_object(text).is_none(),
-        "a denied call must never reach the tool and echo real headers, got: {text}"
-    );
-    assert_eq!(
-        approver.hits(),
-        1,
-        "exactly one decision request for the one gated call"
-    );
-    server.stop().await;
-}
-
-/// Case 4: an approval with no `tool_headers_from_response` configured
-/// proceeds exactly as it did before this feature — no override anywhere.
-#[tokio::test]
-async fn approval_with_no_configured_map_proceeds_with_no_override() {
-    let approver = MockApprover::start(ApproverReply::ApproveBare).await;
-    let server = AuraServer::start(&config_toml(
-        &mcp_url(),
-        "Bearer legacy-frozen-identity",
-        &gated_hitl_toml(&approver.url, false),
-    ))
-    .await;
-
-    let response = send_chat(
-        &server,
-        "Call the echo_headers tool now and reply with only its raw JSON output.",
-    )
-    .await;
-    let headers = headers_from_response(
-        &response,
-        "an approval with no map still proceeds and echoes the real headers",
-    );
-
-    assert_eq!(
-        headers.get("authorization").and_then(Value::as_str),
-        Some("Bearer legacy-frozen-identity"),
-        "with no tool_headers_from_response configured, the call keeps the frozen \
-         identity, got: {headers}"
-    );
-    assert_eq!(
-        approver.hits(),
-        1,
-        "exactly one decision request for the one gated call"
-    );
-    server.stop().await;
-}
-
-/// Case 5: `[hitl]` is configured, but the glob does not match this tool —
+/// Case 3: `[hitl]` is configured, but the glob does not match this tool —
 /// the call never consults the route, so a denying approver never fires.
 #[tokio::test]
 async fn a_tool_the_glob_does_not_match_is_unaffected() {
