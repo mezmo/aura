@@ -456,6 +456,8 @@ pipeline {
           }
 
           steps {
+            sh "git checkout -B ${CURRENT_BRANCH}"
+
             script {
               env.NEXT_RELEASE_VERSION = sh(
                 script: "npm run --silent release:version 'file://${env.WORKSPACE}'",
