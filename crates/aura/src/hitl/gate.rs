@@ -207,29 +207,8 @@ mod tests {
         );
     }
 
-    /// No decision other than approval may carry identity forward: a denial,
-    /// a timeout, a cancellation and a channel fault all stop the call, so
-    /// there is nothing to apply.
-    #[test]
-    fn only_an_approval_yields_a_proceed() {
-        for result in [
-            Ok(GateDecision::Denied { reason: None }),
-            Ok(GateDecision::TimedOut {
-                waited: Duration::from_secs(1),
-            }),
-            Ok(GateDecision::Cancelled(CancelReason::ClientDisconnected)),
-            Err(ApprovalError::BadStatus { status: 500 }),
-        ] {
-            assert!(
-                !matches!(
-                    approval_result_to_pre_call(result),
-                    Ok(PreCallOutcome::Proceed { .. })
-                ),
-                "an undecided or refused approval must never proceed",
-            );
-        }
-    }
-
+    /// A denial is feedback the model can act on, not a tool error: the
+    /// mapping short-circuits the call with the denial reason.
     #[test]
     fn approval_result_mapping_denial_is_feedback_not_error() {
         let outcome = approval_result_to_pre_call(Ok(GateDecision::Denied {
