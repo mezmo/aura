@@ -7,16 +7,27 @@
 //
 // Usage: next-version.mjs [repository-url]
 
+import {createRequire} from 'node:module'
 import semanticRelease from 'semantic-release'
 
-const [repositoryUrl] = process.argv.slice(2)
+const branchName = process.env.BRANCH_NAME || 'main'
+process.env.BRANCH_NAME = branchName
 
-// Mirrors the release:dry script: no CI detection, and the branch under test
-// is the one that releases.
+const require = createRequire(import.meta.url)
+const {branches} = require('../release.config.js')
+
+const [repositoryUrl] = process.argv.slice(2)
+const configured = branches.map((branch) => {
+  return typeof branch === 'string' ? branch : branch.name
+})
+
+// A channel branch is analysed against the whole list so a prerelease derives
+// from the last release on main; any other branch on its own, which is what
+// makes a feature branch under test releasable.
 const options = {
   dryRun: true,
   ci: false,
-  branches: [process.env.BRANCH_NAME || 'main'],
+  branches: configured.includes(branchName) ? branches : [branchName],
   plugins: ['@semantic-release/commit-analyzer'],
 }
 if (repositoryUrl) {
