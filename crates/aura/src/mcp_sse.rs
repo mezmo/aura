@@ -264,6 +264,11 @@ mod tests {
                 .await
                 .expect("the loopback server accepts the second post");
 
+            assert_eq!(
+                server.tool_calls().len(),
+                2,
+                "exactly one POST per message, nothing duplicated"
+            );
             let ungated = &server.tool_calls()[1];
             assert_eq!(
                 ungated.header_values("authorization"),
