@@ -23,21 +23,32 @@ fn main() -> Result<()> {
     }
 
     // Load .env so a config's {{ env.* }} references resolve without manual
-    // exporting. CWD first, then the config file's directory (init writes
-    // .env next to the config). dotenvy never overwrites — shell exports and
-    // earlier .env entries win.
+    // exporting. dotenvy never overwrites — shell exports and earlier .env
+    // entries win.
     dotenvy::dotenv().ok();
-    #[cfg(feature = "standalone-cli")]
-    if let Some(cfg) = &args.agent_config
-        && let Some(dir) = std::path::Path::new(cfg).parent()
-    {
-        dotenvy::from_path(dir.join(".env")).ok();
-    }
 
+    // `resolve_standalone` reads AURA_API_URL from the process environment, so
+    // it must run after the CWD `.env` is loaded.
     #[cfg(feature = "standalone-cli")]
     let is_standalone = aura_cli::cli::resolve_standalone(&args);
     #[cfg(not(feature = "standalone-cli"))]
     let is_standalone = false;
+
+    // Then the agent config's own directory, so a config outside the working
+    // directory still gets the `.env` written beside it. A resolution failure
+    // is ignored here — the backend reports it.
+    #[cfg(feature = "standalone-cli")]
+    if is_standalone && let Ok(path) = aura_cli::agent_config::resolve(args.agent_config.as_deref())
+    {
+        let dir = if path.is_dir() {
+            Some(path.as_path())
+        } else {
+            path.parent()
+        };
+        if let Some(dir) = dir {
+            dotenvy::from_path(dir.join(".env")).ok();
+        }
+    }
 
     let mut config = AppConfig::load(&args)?;
 

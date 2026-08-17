@@ -1,3 +1,4 @@
+pub mod agent_config;
 pub mod api;
 pub mod aura_dir;
 pub mod backend;

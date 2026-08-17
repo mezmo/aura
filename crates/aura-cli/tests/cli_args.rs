@@ -4,6 +4,25 @@ fn aura_cli() -> Command {
     Command::new(env!("CARGO_BIN_EXE_aura"))
 }
 
+/// `aura_cli()` with the agent-config search path pinned to empty temp
+/// directories. Agent-config discovery reads `$HOME` and the working
+/// directory, so without this a developer's own `~/.aura/agents/` would
+/// change what these tests exercise.
+///
+/// Returns the command plus the two `TempDir` guards — hold them for the
+/// duration of the run.
+#[cfg(feature = "standalone-cli")]
+fn aura_cli_isolated() -> (Command, tempfile::TempDir, tempfile::TempDir) {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let mut cmd = aura_cli();
+    cmd.env("HOME", home.path())
+        .env_remove("AURA_CONFIG")
+        .env_remove("AURA_API_URL")
+        .current_dir(cwd.path());
+    (cmd, home, cwd)
+}
+
 #[test]
 fn help_flag_exits_zero() {
     let output = aura_cli().arg("--help").output().unwrap();
@@ -335,13 +354,75 @@ fn help_includes_standalone_and_config_flags() {
 #[cfg(feature = "standalone-cli")]
 #[test]
 fn standalone_without_config_defaults_to_config_toml() {
-    // --standalone without --config should try to load config.toml (will fail
-    // because the file doesn't exist, but it should NOT error about missing flags)
-    let output = aura_cli().arg("--standalone").output().unwrap();
+    // --standalone without --config should try to discover a config (will fail
+    // because none exists, but it should NOT error about missing flags)
+    let (mut cmd, _home, _cwd) = aura_cli_isolated();
+    let output = cmd.arg("--standalone").output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("requires --config"),
-        "should not require --config; defaults to config.toml"
+        "should not require --config; the config is discovered"
+    );
+}
+
+#[cfg(feature = "standalone-cli")]
+#[test]
+fn discovery_failure_names_every_searched_location() {
+    let (mut cmd, home, cwd) = aura_cli_isolated();
+    let output = cmd.arg("--standalone").output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains(&cwd.path().join("config.toml").display().to_string()),
+        "got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&home.path().join(".aura/agents").display().to_string()),
+        "got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&home.path().join(".aura/agent.toml").display().to_string()),
+        "got: {stderr}"
+    );
+}
+
+#[cfg(feature = "standalone-cli")]
+#[test]
+fn global_agents_dir_is_found_from_an_unrelated_directory() {
+    let (mut cmd, home, _cwd) = aura_cli_isolated();
+    let agents = home.path().join(".aura/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("assistant.toml"),
+        "[agent]\nname = \"assistant\"\n\n[agent.llm]\n\
+         provider = \"openai\"\napi_key = \"test-key\"\nmodel = \"gpt-4o\"\n",
+    )
+    .unwrap();
+
+    // A query is enough to prove discovery: it gets far enough to talk to the
+    // provider (and fail on the fake key) instead of bailing at startup.
+    let output = cmd.arg("--query").arg("hi").output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("No agent config found"),
+        "the global agents dir should have been discovered; got: {stderr}"
+    );
+}
+
+#[cfg(feature = "standalone-cli")]
+#[test]
+fn aura_config_env_selects_the_agent_config() {
+    let (mut cmd, _home, _cwd) = aura_cli_isolated();
+    let output = cmd
+        .env("AURA_CONFIG", "/nope/typo.toml")
+        .arg("--query")
+        .arg("hi")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No agent config found at `/nope/typo.toml`"),
+        "AURA_CONFIG should be reported verbatim, not fall through; got: {stderr}"
     );
 }
 

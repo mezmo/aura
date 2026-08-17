@@ -27,9 +27,9 @@ pub enum Backend {
 impl Backend {
     /// Create the appropriate backend based on config.
     ///
-    /// When `is_standalone` is true, uses `DirectBackend` with the config from
-    /// `--config` (or `config.toml` in the current directory if omitted).
-    /// Otherwise, uses `HttpBackend` (HTTP/SSE to aura-web-server).
+    /// When `is_standalone` is true, uses `DirectBackend` with the config
+    /// resolved by [`crate::agent_config::resolve`]. Otherwise, uses
+    /// `HttpBackend` (HTTP/SSE to aura-web-server).
     pub fn from_config(
         _rt: &tokio::runtime::Runtime,
         config: &AppConfig,
@@ -38,10 +38,9 @@ impl Backend {
     ) -> Result<Self> {
         #[cfg(feature = "standalone-cli")]
         if _is_standalone {
-            let default_config = String::from("config.toml");
-            let config_path = _args.agent_config.as_ref().unwrap_or(&default_config);
+            let config_path = crate::agent_config::resolve(_args.agent_config.as_deref())?;
             let direct = _rt.block_on(direct::DirectBackend::from_toml(
-                config_path,
+                &config_path,
                 config.extra_headers.clone(),
             ))?;
             return Ok(Self::Direct(direct));
