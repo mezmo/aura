@@ -51,28 +51,44 @@ pub(crate) fn render_env(env_var: &str, value: &str) -> String {
     )
 }
 
-/// Value currently bound to `env_var` in a `.env`, matched the same way
-/// [`merge_env`] decides which line to replace.
-pub(crate) fn env_value<'a>(existing: &'a str, env_var: &str) -> Option<&'a str> {
-    existing.lines().find_map(|line| {
-        let rest = line.trim_start().strip_prefix(env_var)?;
-        Some(rest.trim_start().strip_prefix('=')?.trim())
-    })
+/// If `line` assigns `env_var`, return the raw right-hand side.
+///
+/// Recognises the same shapes the runtime loader does — a bare `KEY=value`,
+/// an `export KEY=value`, and whitespace around either — so that the line
+/// this file rewrites is the line the runtime would have read. A miss here
+/// against a hit at load time is what lets an old value stay in force after
+/// a new one is appended below it.
+fn env_assignment<'a>(line: &'a str, env_var: &str) -> Option<&'a str> {
+    let line = line.trim_start();
+    let line = line
+        .strip_prefix("export")
+        .filter(|rest| rest.starts_with([' ', '\t']))
+        .map_or(line, str::trim_start);
+    let rest = line.strip_prefix(env_var)?;
+    Some(rest.trim_start().strip_prefix('=')?.trim())
 }
 
-/// Merge a new key into an existing `.env`: replace the line if the key
-/// already exists, otherwise append it.
+/// Value currently bound to `env_var` in a `.env`, as the runtime would read
+/// it: the first assignment wins.
+pub(crate) fn env_value<'a>(existing: &'a str, env_var: &str) -> Option<&'a str> {
+    existing
+        .lines()
+        .find_map(|line| env_assignment(line, env_var))
+}
+
+/// Merge a new key into an existing `.env`. Every assignment of `env_var` is
+/// replaced — the runtime applies the first one it meets, so leaving an
+/// earlier line in place would keep the old value effective. Appended when
+/// absent.
 pub(crate) fn merge_env(existing: &str, env_var: &str, value: &str) -> String {
     let mut found = false;
     let mut out = String::new();
     for line in existing.lines() {
-        let trimmed = line.trim_start();
-        if trimmed
-            .strip_prefix(env_var)
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-        {
-            out.push_str(&format!("{env_var}={value}\n"));
-            found = true;
+        if env_assignment(line, env_var).is_some() {
+            if !found {
+                out.push_str(&format!("{env_var}={value}\n"));
+                found = true;
+            }
         } else {
             out.push_str(line);
             out.push('\n');
@@ -248,6 +264,48 @@ mod tests {
     fn env_value_does_not_match_a_longer_variable_name() {
         let existing = "OPENAI_API_KEY_STAGING=sk-staging\n";
         assert_eq!(env_value(existing, "OPENAI_API_KEY"), None);
+    }
+
+    #[test]
+    fn env_value_sees_an_export_prefixed_assignment() {
+        // The runtime loader accepts this form; the helpers must too, or a
+        // value the runtime will use is invisible to the collision warning.
+        assert_eq!(
+            env_value("export OPENAI_API_KEY=sk-old\n", "OPENAI_API_KEY"),
+            Some("sk-old")
+        );
+        assert_eq!(
+            env_value("  export\tOPENAI_API_KEY = sk-old \n", "OPENAI_API_KEY"),
+            Some("sk-old")
+        );
+    }
+
+    #[test]
+    fn env_value_does_not_treat_exported_as_export() {
+        // `exportOPENAI_API_KEY=` and `exported_KEY=` are other variables.
+        assert_eq!(
+            env_value("exportOPENAI_API_KEY=x\n", "OPENAI_API_KEY"),
+            None
+        );
+    }
+
+    #[test]
+    fn env_value_returns_the_first_assignment_like_the_runtime() {
+        let existing = "OPENAI_API_KEY=first\nOPENAI_API_KEY=second\n";
+        assert_eq!(env_value(existing, "OPENAI_API_KEY"), Some("first"));
+    }
+
+    #[test]
+    fn merge_env_replaces_an_export_prefixed_line() {
+        let env = merge_env("export OPENAI_API_KEY=sk-old\n", "OPENAI_API_KEY", "sk-new");
+        assert_eq!(env, "OPENAI_API_KEY=sk-new\n");
+    }
+
+    #[test]
+    fn merge_env_collapses_every_duplicate_so_the_new_value_is_first() {
+        let existing = "A=1\nexport OPENAI_API_KEY=old1\nB=2\nOPENAI_API_KEY=old2\n";
+        let env = merge_env(existing, "OPENAI_API_KEY", "new");
+        assert_eq!(env, "A=1\nOPENAI_API_KEY=new\nB=2\n");
     }
 
     #[test]
