@@ -38,16 +38,11 @@ fn main() -> Result<()> {
     // directory still gets the `.env` written beside it. A resolution failure
     // is ignored here — the backend reports it.
     #[cfg(feature = "standalone-cli")]
-    if is_standalone && let Ok(path) = aura_cli::agent_config::resolve(args.agent_config.as_deref())
+    if is_standalone
+        && let Ok(path) = aura_cli::agent_config::resolve(args.agent_config.as_deref())
+        && let Some(dir) = aura_cli::agent_config::env_dir(&path)
     {
-        let dir = if path.is_dir() {
-            Some(path.as_path())
-        } else {
-            path.parent()
-        };
-        if let Some(dir) = dir {
-            dotenvy::from_path(dir.join(".env")).ok();
-        }
+        dotenvy::from_path(dir.join(".env")).ok();
     }
 
     let mut config = AppConfig::load(&args)?;

@@ -130,6 +130,16 @@ pub fn missing_config_message<P: AsRef<Path>>(searched: &[P]) -> String {
     )
 }
 
+/// Directory whose `.env` accompanies the config at `path`: the directory
+/// itself when the config is one, otherwise the file's parent.
+pub fn env_dir(path: &Path) -> Option<&Path> {
+    if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    }
+}
+
 /// Derive the program name from the running executable rather than
 /// hardcoding it, so suggested commands stay correct if the binary is
 /// renamed (e.g. `aura-cli` -> `aura`).
@@ -139,7 +149,7 @@ fn program_name() -> String {
         .as_deref()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "aura".to_string())
+        .unwrap_or_else(|| "aura".to_owned())
 }
 
 #[cfg(test)]
