@@ -14,7 +14,8 @@ use super::spec::{ConfigSpec, resolve_spec};
 
 pub(crate) fn args() -> InitArgs {
     InitArgs {
-        output: PathBuf::from("config.toml"),
+        output: Some(PathBuf::from("config.toml")),
+        global: false,
         provider: Some(Provider::OpenAI),
         model: Some("gpt-5.1".to_string()),
         api_key_env: None,

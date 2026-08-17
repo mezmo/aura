@@ -7,6 +7,7 @@ use std::path::Path;
 #[cfg(feature = "standalone-cli")]
 use anyhow::Result;
 
+use super::Scope;
 use super::spec::ConfigSpec;
 
 fn toml_escape(s: &str) -> String {
@@ -90,31 +91,36 @@ pub(crate) fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()>
 }
 
 /// Human-readable next-steps shown after writing the files.
-pub(crate) fn next_steps(config_path: &Path, wrote_env: bool) -> String {
-    let dir = config_path.parent().filter(|p| !p.as_os_str().is_empty());
-    let (run_prefix, config_for_run) = match dir {
-        Some(d) => {
-            let name = config_path.file_name().map_or_else(
-                || config_path.display().to_string(),
-                |n| n.to_string_lossy().into_owned(),
-            );
-            (format!("cd {} && ", d.display()), name)
-        }
-        None => (String::new(), config_path.display().to_string()),
-    };
+pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, scope: Scope) -> String {
     let env_note = if wrote_env {
         "\nThe API key was written to .env (gitignored — do not commit it).\n\
-         The server reads it automatically; a shell export of the same \
-         variable takes precedence."
+         It is read automatically; a shell export of the same variable takes \
+         precedence."
     } else {
         ""
     };
+
+    // A global config is already on the search path, so the only thing left is
+    // to run `aura`. A local one has to be run from its own directory.
+    let run = match scope {
+        Scope::Global => {
+            "  2. Run `aura` from any directory — it finds this config automatically".to_string()
+        }
+        Scope::Local => config_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(
+                || "  2. aura".to_string(),
+                |d| format!("  2. cd {} && aura", d.display()),
+            ),
+    };
+
     format!(
         "\nNext steps:\n  \
-           1. Add MCP servers to {config_for_run} to connect your observability stack\n  \
-           2. {run_prefix}CONFIG_PATH={config_for_run} aura webserver\n  \
-           3. aura --api-url http://localhost:8080\n\
+           1. Add MCP servers to {} to connect your observability stack\n\
+         {run}\n\
          {env_note}",
+        config_path.display(),
     )
 }
 
@@ -205,21 +211,31 @@ mod tests {
 
     #[test]
     fn next_steps_mentions_config() {
-        let s = next_steps(Path::new("config.toml"), false);
+        let s = next_steps(Path::new("config.toml"), false, Scope::Local);
         assert!(s.contains("config.toml"), "got: {s}");
     }
 
     #[test]
     fn next_steps_mentions_env_when_written() {
-        let s = next_steps(Path::new("config.toml"), true);
+        let s = next_steps(Path::new("config.toml"), true, Scope::Local);
         assert!(s.contains(".env"), "got: {s}");
     }
 
     #[test]
     fn next_steps_cds_into_config_dir() {
-        let s = next_steps(Path::new("proj/config.toml"), false);
-        assert!(s.contains("cd proj"), "got: {s}");
-        assert!(s.contains("CONFIG_PATH=config.toml"), "got: {s}");
+        let s = next_steps(Path::new("proj/config.toml"), false, Scope::Local);
+        assert!(s.contains("cd proj && aura"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_for_global_needs_no_cd() {
+        let s = next_steps(
+            Path::new("/home/u/.aura/agents/assistant.toml"),
+            false,
+            Scope::Global,
+        );
+        assert!(s.contains("from any directory"), "got: {s}");
+        assert!(!s.contains("cd "), "got: {s}");
     }
 
     #[cfg(feature = "standalone-cli")]
