@@ -28,7 +28,7 @@ use anyhow::Result;
 use crate::aura_dir::global_aura_dir;
 
 /// Agent-config filename in the current working directory.
-const CWD_CONFIG_FILENAME: &str = "config.toml";
+pub const CWD_CONFIG_FILENAME: &str = "config.toml";
 
 /// Directory of agent configs under `~/.aura/`.
 const GLOBAL_AGENTS_DIRNAME: &str = "agents";
