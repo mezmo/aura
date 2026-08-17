@@ -67,8 +67,7 @@ a defect in this document, not an implicit exclusion.
 | The untracked call path delivers the override | `mcp_streamable_http::tests::override_rides_one_call_and_no_later_one` | This path builds its request explicitly rather than delegating to the client library |
 | The tracked call path delivers the override | `mcp_streamable_http::tests::call_tool_delivers_the_override_on_either_branch` | Reaches `call_tool_tracked` through the public `call_tool` dispatch, the route production takes under the web server |
 | Both paths behave alike on one client | `mcp_streamable_http::tests::call_tool_delivers_the_override_on_either_branch` | Which path a call takes must not decide whether identity is delivered |
-| The SSE send path applies the override once and keeps it out of the body | `mcp_sse::tests::approver_overrides::send_applies_the_override_to_the_post_and_not_the_body` | Exercises the transport's send directly |
-| The SSE send path leaves an ungated message alone | `mcp_sse::tests::approver_overrides::send_without_an_extension_keeps_the_frozen_identity` | |
+| The SSE send path applies the override once, keeps it out of the body, and leaves the next ungated message alone | `mcp_sse::tests::approver_overrides::send_applies_the_override_to_that_post_alone` | Exercises the transport's send directly, gated then ungated on one transport |
 | Capture rekeys a response header under the configured outbound name | `approver_headers::tests::captures_response_value_under_outbound_name` | |
 | Capture reads response headers case-insensitively | `approver_headers::tests::response_lookup_is_case_insensitive` | |
 | A repeated response header yields exactly one captured value | `approver_headers::tests::repeated_response_header_captures_only_the_first_value` | |
