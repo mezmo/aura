@@ -99,6 +99,21 @@ pub(crate) fn validate_rendered(spec: &ConfigSpec, rendered: &str) -> Result<()>
     Ok(())
 }
 
+/// Render a path for pasting into a shell, quoting it when it holds anything
+/// that would otherwise split the argument or be reinterpreted.
+fn shell_quote(path: &Path) -> String {
+    let s = path.display().to_string();
+    let safe = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
+    if safe {
+        return s;
+    }
+    // Close the quote, emit an escaped literal quote, reopen — the only way to
+    // carry a single quote through single quoting in POSIX shells.
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 /// Human-readable next-steps shown after writing the files.
 pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, scope: Scope) -> String {
     let env_note = if wrote_env {
@@ -117,17 +132,22 @@ pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, scope: Scope) -> S
         .file_name()
         .is_some_and(|n| n == std::ffi::OsStr::new(crate::agent_config::CWD_CONFIG_FILENAME));
     let run = match scope {
-        Scope::Global => {
-            "  2. Run `aura` from any directory — it finds this config automatically".to_string()
-        }
+        // Discovery stops at the first hit, so a working directory holding its
+        // own `config.toml` never reaches the global set — promising it is
+        // found "from any directory" would be wrong in exactly that case.
+        Scope::Global => concat!(
+            "  2. Run `aura` from any directory that has no config.toml of its own\n",
+            "     (a local config.toml takes precedence)"
+        )
+        .to_string(),
         Scope::Local if discoverable => config_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .map_or_else(
                 || "  2. aura".to_string(),
-                |d| format!("  2. cd {} && aura", d.display()),
+                |d| format!("  2. cd {} && aura", shell_quote(d)),
             ),
-        Scope::Local => format!("  2. aura --config {}", config_path.display()),
+        Scope::Local => format!("  2. aura --config {}", shell_quote(config_path)),
     };
 
     format!(
@@ -274,6 +294,49 @@ mod tests {
         );
         assert!(s.contains("from any directory"), "got: {s}");
         assert!(!s.contains("cd "), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_for_global_does_not_promise_a_shadowed_directory() {
+        // A directory with its own config.toml never reaches the global set.
+        let s = next_steps(
+            Path::new("/home/u/.aura/agents/assistant.toml"),
+            false,
+            Scope::Global,
+        );
+        assert!(s.contains("no config.toml of its own"), "got: {s}");
+        assert!(s.contains("takes precedence"), "got: {s}");
+    }
+
+    #[test]
+    fn shell_quote_leaves_ordinary_paths_alone() {
+        assert_eq!(shell_quote(Path::new("config.toml")), "config.toml");
+        assert_eq!(
+            shell_quote(Path::new("proj/my-agent_2.toml")),
+            "proj/my-agent_2.toml"
+        );
+    }
+
+    #[test]
+    fn shell_quote_protects_paths_a_shell_would_mangle() {
+        assert_eq!(shell_quote(Path::new("my agent.toml")), "'my agent.toml'");
+        assert_eq!(
+            shell_quote(Path::new("a;rm -rf b.toml")),
+            "'a;rm -rf b.toml'"
+        );
+        assert_eq!(shell_quote(Path::new("it's.toml")), r"'it'\''s.toml'");
+    }
+
+    #[test]
+    fn next_steps_quotes_a_path_with_spaces() {
+        let s = next_steps(Path::new("my agent.toml"), false, Scope::Local);
+        assert!(s.contains("aura --config 'my agent.toml'"), "got: {s}");
+    }
+
+    #[test]
+    fn next_steps_quotes_a_cd_target_with_spaces() {
+        let s = next_steps(Path::new("my proj/config.toml"), false, Scope::Local);
+        assert!(s.contains("cd 'my proj' && aura"), "got: {s}");
     }
 
     #[cfg(feature = "standalone-cli")]
