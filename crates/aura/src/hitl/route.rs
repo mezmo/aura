@@ -2041,6 +2041,35 @@ mod tests {
             );
         }
 
+        /// The route-wide `request_approval` surface — what the
+        /// agent-callable tool uses — never captures identity, whatever the
+        /// mapping says: an approved, identity-bearing response resolves to
+        /// a plain decision, and the outcome type has no override channel
+        /// that could carry the headers anywhere.
+        #[tokio::test]
+        async fn route_wide_approval_discards_identity_headers() {
+            let (url, _received) = one_shot_receiver(
+                vec![("x-approver-id".to_owned(), "alice".to_owned())],
+                r#"{"approved":true}"#.to_owned(),
+            )
+            .await;
+
+            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
+            let outcome = client
+                .request_approval(
+                    &test_request(DecisionId::generate()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("the route-wide round trip succeeds");
+
+            assert_eq!(
+                outcome,
+                ApprovalOutcome::Decided(ApprovalDecision::Approved),
+                "the identity headers must be discarded, not captured"
+            );
+        }
+
         /// The gate path's response matrix, one loopback receiver per row:
         /// identity exists only on an approved response whose mapped headers
         /// are all present. Every other row — a denial, a missing mapped
