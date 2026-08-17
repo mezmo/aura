@@ -77,7 +77,7 @@ Make targets are composed from modular includes under `.makefiles/` (rust, docke
 | `make lint`            | Run clippy with warnings as errors             |
 | `make ci`              | Run fmt-check and lint (the `test` hook is empty; run `cargo test --workspace` separately) |
 | `make coverage`        | Run the test suite with code coverage          |
-| `make lint-commits`    | Lint commits on the current branch against main |
+| `make lint-commits`    | Lint commits on the current branch against its base (`nightly`, or the change request's target branch in CI; override with `COMMITLINT_BASE`) |
 | `make clean`           | Clean build artifacts                          |
 | `make docker-build`    | Build the Docker image (full release)          |
 | `make docker-test`     | Run the Docker build's lint/test stage         |
@@ -205,4 +205,5 @@ Worth reading before diving into the code:
 - [Streaming API Guide](https://docs.mezmo.com/aura/streaming-api-guide): SSE protocol, event types, and client handling.
 - [Request Lifecycle](https://docs.mezmo.com/aura/request-lifecycle): request flow, timeouts, cancellation, and shutdown.
 - [docs/rig-fork-changes.md](docs/rig-fork-changes.md): why AURA uses a Rig.rs fork, what changed, and tool execution ordering (important for `tool_event_broker.rs`).
+- [docs/adr/2026-07-29-release-channels.md](docs/adr/2026-07-29-release-channels.md) and [docs/design/release-channels.md](docs/design/release-channels.md): the `nightly` / `beta` / `main` release channels, what each publishes, and how a release is promoted.
 - [Tracing & Span Layout](https://docs.mezmo.com/aura/tracing-spans): OpenTelemetry span layout and trace parenting.

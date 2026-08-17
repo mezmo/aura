@@ -10,6 +10,10 @@ Release and install helpers.
 | [`bump-homebrew-tap.sh`](bump-homebrew-tap.sh) | Bump `mezmo/homebrew-tap` formulae to a released version |
 | [`set-version.sh`](set-version.sh) | Set the workspace and crate versions in `Cargo.toml` |
 | [`next-version.mjs`](next-version.mjs) | Print the version semantic-release would release next |
+| [`verify-release-version.sh`](verify-release-version.sh) | Assert the version being released is the one the artifacts were built from |
+
+`BRANCH_NAME` selects the release channel; see
+[the release channels design note](../docs/design/release-channels.md).
 
 ## `install.sh`
 
@@ -116,6 +120,9 @@ bump-homebrew-tap.sh [--dry-run] <version>
 Rewrites the `version` and `sha256` fields in each `Formula/*.rb` of
 `mezmo/homebrew-tap` and pushes to `main`.
 
+A prerelease version (`0.2.0-beta.1`) exits 0 without doing anything, before
+any token or network use — the tap follows stable only.
+
 | Switch | Default | Effect |
 | --- | --- | --- |
 | `--dry-run` / `DRY_RUN=1` | off | Print the proposed commit and test the push with `git push --dry-run` without updating any refs. Tolerates a missing or incomplete checksums file, leaving any hash it cannot resolve untouched. |
@@ -133,8 +140,26 @@ npm run --silent release:version [repository-url]
 Prints the version semantic-release would release next, or nothing when no
 change is releasable. Loads only `commit-analyzer`, so no release lifecycle
 command runs; semantic-release's logging goes to stderr, leaving stdout as the
-version alone. `BRANCH_NAME` selects the branch to analyse, matching
-`release:dry`.
+version alone.
+
+`BRANCH_NAME` selects the branch to analyse. A channel branch is analysed
+against the whole channel branch list, so a prerelease derives its version from
+the last release on `main` (`0.2.0-nightly.1`); any other branch on its own,
+which is what makes a feature branch under test releasable.
+
+## `verify-release-version.sh`
+
+```
+verify-release-version.sh <version>
+```
+
+Fails unless `<version>` matches `NEXT_RELEASE_VERSION`, the version CI
+previewed and built the release artifacts from. Runs as the first command of the
+`exec` plugin's `verifyReleaseCmd`, so a drift aborts before any `prepare` or
+publish side effect instead of shipping mismatched artifacts.
+
+With `NEXT_RELEASE_VERSION` unset it warns and exits 0; every CI path that
+builds artifacts sets it.
 
 ## `set-version.sh`
 

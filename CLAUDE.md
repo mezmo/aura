@@ -177,6 +177,13 @@ make ci                     # Bundle: fmt-check + lint (test hook is empty)
 --check` — not `cargo fmt` — to match CI. See `CONTRIBUTING.md` for the
 full workflow.
 
+### Release channels
+
+One branch per channel: `nightly` (development, `X.Y.Z-nightly.N`), a
+per-cycle `beta` (`X.Y.Z-beta.N`), and `main` (stable `X.Y.Z`, what
+`latest`/Homebrew/the package repo follow). **Branch from and target
+`nightly`**, not `main`. See `docs/design/release-channels.md`.
+
 ## Code Comment Conventions
 
 - **Document behavior where it lives, not on data.** A comment describing *what
