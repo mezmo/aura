@@ -124,10 +124,9 @@ pub(crate) fn next_steps(config_path: &Path, wrote_env: bool, scope: Scope) -> S
         ""
     };
 
-    // A global config is already on the search path, so the only thing left is
-    // to run `aura`. Locally, only the well-known filename is discovered — any
-    // other name has to be named on the command line, or the printed command
-    // would load something else or nothing at all.
+    // Only the well-known filename is discovered in a working directory; any
+    // other local name has to be passed on the command line, or the printed
+    // command would load something else or nothing at all.
     let discoverable = config_path
         .file_name()
         .is_some_and(|n| n == std::ffi::OsStr::new(crate::agent_config::CWD_CONFIG_FILENAME));

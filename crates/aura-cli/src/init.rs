@@ -200,29 +200,7 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
     let mut wrote_env = false;
     if let Some(ApiKeySource::Provided { env_var, value }) = &spec.api_key {
         let env_path = dir.map_or_else(|| PathBuf::from(".env"), |dir| dir.join(".env"));
-        let env_contents = if env_path.exists() {
-            let existing = std::fs::read_to_string(&env_path)
-                .with_context(|| format!("failed to read {}", env_path.display()))?;
-            // Agents installed side by side share the one `.env` in their
-            // directory, so replacing a variable re-points every config that
-            // references it — silently, since each only names the variable.
-            if let Some(current) = env_value(&existing, env_var)
-                && current != value
-            {
-                eprintln!(
-                    "warning: {env_var} is already set to a different value in {} — \
-                     replacing it changes the key used by any agent already installed \
-                     there.\n         Pass --api-key-env to give this agent its own \
-                     variable instead.",
-                    env_path.display()
-                );
-            }
-            merge_env(&existing, env_var, value)
-        } else {
-            render_env(env_var, value)
-        };
-        std::fs::write(&env_path, &env_contents)
-            .with_context(|| format!("failed to write {}", env_path.display()))?;
+        write_env(&env_path, env_var, value)?;
         wrote_env = true;
         println!("Wrote {}", env_path.display());
     }
@@ -233,6 +211,35 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
 
     println!("{}", next_steps(&output, wrote_env, scope));
     Ok(())
+}
+
+/// Bind `env_var` to `value` in the `.env` at `env_path`, creating the file
+/// or merging into an existing one.
+///
+/// Agents installed side by side share the one `.env` in their directory, and
+/// each config names only the variable — so replacing a value re-points every
+/// agent that references it. Warn before doing that.
+fn write_env(env_path: &Path, env_var: &str, value: &str) -> Result<()> {
+    let contents = if env_path.exists() {
+        let existing = std::fs::read_to_string(env_path)
+            .with_context(|| format!("failed to read {}", env_path.display()))?;
+        if let Some(current) = env_value(&existing, env_var)
+            && current != value
+        {
+            eprintln!(
+                "warning: {env_var} is already set to a different value in {} — \
+                 replacing it changes the key used by any agent already installed \
+                 there.\n         Pass --api-key-env to give this agent its own \
+                 variable instead.",
+                env_path.display()
+            );
+        }
+        merge_env(&existing, env_var, value)
+    } else {
+        render_env(env_var, value)
+    };
+    std::fs::write(env_path, &contents)
+        .with_context(|| format!("failed to write {}", env_path.display()))
 }
 
 /// Where the generated config is installed: at a specific path, or in the
@@ -271,30 +278,28 @@ fn resolve_output_with<R: std::io::BufRead>(
     prompter: &mut Prompter<R>,
     agents_dir: Option<PathBuf>,
 ) -> Result<Destination> {
-    if let Some(output) = &args.output {
-        return Ok(Destination {
-            path: output.clone(),
-            scope: Scope::Local,
-            name: args.name.clone(),
-        });
-    }
+    let local = |path: PathBuf| Destination {
+        path,
+        scope: Scope::Local,
+        name: args.name.clone(),
+    };
+    let global = |dir: &Path, name: String| Destination {
+        path: global_config_path(dir, &name),
+        scope: Scope::Global,
+        name,
+    };
 
+    if let Some(output) = &args.output {
+        return Ok(local(output.clone()));
+    }
     if args.global {
         let Some(dir) = agents_dir else {
             bail!("--global needs a home directory, and none could be determined");
         };
-        return Ok(Destination {
-            path: global_config_path(&dir, &args.name),
-            scope: Scope::Global,
-            name: args.name.clone(),
-        });
+        return Ok(global(&dir, args.name.clone()));
     }
 
-    let local = Destination {
-        path: PathBuf::from("config.toml"),
-        scope: Scope::Local,
-        name: args.name.clone(),
-    };
+    let local = local(PathBuf::from(crate::agent_config::CWD_CONFIG_FILENAME));
     if !prompter.interactive {
         return Ok(local);
     }
@@ -327,11 +332,7 @@ fn resolve_output_with<R: std::io::BufRead>(
             let name = prompter
                 .ask("Agent name", Some(&args.name))?
                 .unwrap_or_else(|| args.name.clone());
-            Ok(Destination {
-                path: global_config_path(&dir, &name),
-                scope: Scope::Global,
-                name,
-            })
+            Ok(global(&dir, name))
         }
         Some(_) | None => Ok(local),
     }
