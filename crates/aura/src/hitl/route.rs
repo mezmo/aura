@@ -1818,6 +1818,18 @@ mod tests {
             );
         }
 
+        /// Capture what `body` logs at WARN and above, as text.
+        fn captured_warn_log(body: impl FnOnce()) -> String {
+            let buf = std::sync::Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, body);
+            String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string()
+        }
+
         /// Construction (`HitlRuntime::from_config`, and so `WebhookClient`
         /// construction) runs once per chat request, not once at startup —
         /// so it must never warn on cleartext capture itself, or every
@@ -1825,17 +1837,8 @@ mod tests {
         /// [`warn_on_cleartext_capture`] is the boot-time seam for it.
         #[test]
         fn capture_over_plaintext_url_stays_silent_at_construction() {
-            use std::sync::Arc;
-
-            let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buf.clone())
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .finish();
-
             let pending = crate::hitl::PendingApprovals::new();
-            tracing::subscriber::with_default(subscriber, || {
+            let log = captured_warn_log(|| {
                 let _ = super::super::HitlRuntime::from_config(
                     &webhook_config("http://approvals.example.com/aura", user_mapping()),
                     &pending,
@@ -1843,8 +1846,6 @@ mod tests {
                     None,
                 );
             });
-
-            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
             assert!(log.is_empty(), "construction must not log, got: {log}");
         }
 
@@ -1855,16 +1856,7 @@ mod tests {
         /// cleartext scheme alone.
         #[test]
         fn warn_on_cleartext_capture_warns_once_and_redacts_the_url() {
-            use std::sync::Arc;
-
-            let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buf.clone())
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .finish();
-
-            tracing::subscriber::with_default(subscriber, || {
+            let log = captured_warn_log(|| {
                 super::super::warn_on_cleartext_capture(&webhook_config(
                     "http://token:secret@approvals.example.com:8443/aura/hook?key=shh",
                     user_mapping(),
@@ -1874,8 +1866,6 @@ mod tests {
                     user_mapping(),
                 ));
             });
-
-            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
             assert!(
                 log.contains("cleartext http"),
                 "the warning must name the risk, got log: {log}"
@@ -1901,23 +1891,12 @@ mod tests {
         /// either scheme.
         #[test]
         fn warn_on_cleartext_capture_is_quiet_with_no_map() {
-            use std::sync::Arc;
-
-            let buf = Arc::new(super::CapturedLog(std::sync::Mutex::new(Vec::new())));
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buf.clone())
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .finish();
-
-            tracing::subscriber::with_default(subscriber, || {
+            let log = captured_warn_log(|| {
                 super::super::warn_on_cleartext_capture(&webhook_config(
                     "http://approvals.example.com/aura",
                     aura_config::ToolHeaderMappings::default(),
                 ));
             });
-
-            let log = String::from_utf8_lossy(&buf.0.lock().unwrap()).to_string();
             assert!(
                 log.is_empty(),
                 "no map means nothing to warn about, got: {log}"
@@ -1952,34 +1931,6 @@ mod tests {
                 "no secret configured must mean no signature header"
             );
             assert!(received.header(TIMESTAMP_HEADER).is_none());
-        }
-
-        #[tokio::test]
-        async fn unsigned_gate_approved_captures_mapped_headers() {
-            let (url, _received) = one_shot_receiver(
-                vec![("x-approver-id".to_owned(), "alice".to_owned())],
-                r#"{"approved":true}"#.to_owned(),
-            )
-            .await;
-
-            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
-            let decision = client
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect("unsigned gate round trip succeeds");
-
-            match decision {
-                GateDecision::Approved {
-                    overrides: Some(overrides),
-                } => assert_eq!(
-                    overrides.captured_names().collect::<Vec<_>>(),
-                    vec!["x-forwarded-user"]
-                ),
-                other => panic!("expected Approved carrying overrides, got {other:?}"),
-            }
         }
 
         /// Capture composes with the response-leg signature check: the same
@@ -2017,223 +1968,232 @@ mod tests {
             );
         }
 
-        /// An approval that does not carry the demanded identity is not an
-        /// approval: no partial override survives.
+        /// The gate path's response matrix, one loopback receiver per row:
+        /// identity exists only on an approved response whose mapped headers
+        /// are all present. Every other row — a denial, a missing mapped
+        /// header, an empty mapping, a non-2xx status, a malformed body, an
+        /// unverified response, a timeout — yields no override object, each
+        /// asserted at its own shape rather than by omission.
         #[tokio::test]
-        async fn gate_approved_missing_mapped_header_fails_closed() {
-            let (url, _received) =
-                one_shot_receiver(vec![], r#"{"approved":true}"#.to_owned()).await;
-
-            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
-            let err = client
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect_err("a missing mapped header must fail the approval closed");
-
-            match &err {
-                ApprovalError::CaptureFailed(CaptureError::MissingHeaders { names }) => {
-                    assert_eq!(names, &["x-forwarded-user".to_owned()]);
-                }
-                other => panic!("expected CaptureFailed, got {other:?}"),
+        async fn gate_response_matrix_yields_overrides_only_on_a_complete_approval() {
+            enum Reply {
+                Respond {
+                    status: &'static str,
+                    headers: Vec<(String, String)>,
+                    body: String,
+                },
+                Stall,
             }
-            assert!(
-                err.to_string().contains("x-forwarded-user"),
-                "the audit message must name the missing header: {err}"
-            );
-        }
+            enum Expected {
+                ApprovedWithOverrides,
+                ApprovedWithoutOverrides,
+                Denied(&'static str),
+                TimedOut,
+                BadStatus(u16),
+                Parse,
+                Unverified,
+                CaptureFailed(&'static str),
+            }
 
-        /// A denial short-circuits before capture, so the same response that
-        /// would fail an approval closed is a clean `Denied` here.
-        #[tokio::test]
-        async fn gate_denied_response_ignores_missing_mapped_header() {
-            let (url, _received) = one_shot_receiver(
-                vec![],
-                r#"{"approved":false,"reason":"not today"}"#.to_owned(),
-            )
-            .await;
+            let identity = || ("x-approver-id".to_owned(), "alice".to_owned());
+            let approved = || r#"{"approved":true}"#.to_owned();
+            let cases: Vec<(&str, Reply, EgressSigning, bool, Expected)> = vec![
+                (
+                    "an unsigned approval carrying the mapped header",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![identity()],
+                        body: approved(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    Expected::ApprovedWithOverrides,
+                ),
+                (
+                    "an approval missing the mapped header fails closed",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![],
+                        body: approved(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    Expected::CaptureFailed("x-forwarded-user"),
+                ),
+                (
+                    "a denial short-circuits before capture",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![],
+                        body: r#"{"approved":false,"reason":"not today"}"#.to_owned(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    Expected::Denied("not today"),
+                ),
+                (
+                    "an empty mapping yields no override object at all",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![identity()],
+                        body: approved(),
+                    },
+                    EgressSigning::Disabled,
+                    false,
+                    Expected::ApprovedWithoutOverrides,
+                ),
+                (
+                    "a non-2xx status is a channel fault",
+                    Reply::Respond {
+                        status: "503 Service Unavailable",
+                        headers: vec![identity()],
+                        body: approved(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    Expected::BadStatus(503),
+                ),
+                (
+                    "a malformed body is a channel fault",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![identity()],
+                        body: "not json".to_owned(),
+                    },
+                    EgressSigning::Disabled,
+                    true,
+                    Expected::Parse,
+                ),
+                (
+                    "an unsigned response under a configured HMAC is rejected",
+                    Reply::Respond {
+                        status: "200 OK",
+                        headers: vec![identity()],
+                        body: approved(),
+                    },
+                    EgressSigning::Enabled(test_hmac()),
+                    true,
+                    Expected::Unverified,
+                ),
+                (
+                    "a webhook that never answers times out",
+                    Reply::Stall,
+                    EgressSigning::Disabled,
+                    true,
+                    Expected::TimedOut,
+                ),
+            ];
 
-            let client = loopback_client(&url, EgressSigning::Disabled, user_mapping());
-            let decision = client
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect("a denial is a decision, not a capture failure");
+            for (case, reply, signing, mapped, expected) in cases {
+                let (url, timeout) = match reply {
+                    Reply::Respond {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        let (url, _received) =
+                            one_shot_receiver_with_status(status, headers, body).await;
+                        (url, Duration::from_secs(5))
+                    }
+                    Reply::Stall => {
+                        let (url, _accepted) = stalled_receiver().await;
+                        (url, Duration::from_millis(200))
+                    }
+                };
+                let mapping = if mapped {
+                    user_mapping()
+                } else {
+                    aura_config::ToolHeaderMappings::default()
+                };
+                let decision = loopback_client(&url, signing, mapping)
+                    .request_approval_for_gate(&test_request(DecisionId::generate()), timeout)
+                    .await;
 
-            assert!(
-                matches!(decision, GateDecision::Denied { reason } if reason.as_deref() == Some("not today")),
-                "expected Denied"
-            );
-        }
-
-        /// With no mapping configured, a response header that happens to
-        /// match one is not identity: `Approved` carries no override object
-        /// at all rather than an empty one.
-        #[tokio::test]
-        async fn gate_empty_mapping_yields_no_overrides() {
-            let (url, _received) = one_shot_receiver(
-                vec![("x-approver-id".to_owned(), "alice".to_owned())],
-                r#"{"approved":true}"#.to_owned(),
-            )
-            .await;
-
-            let client = loopback_client(
-                &url,
-                EgressSigning::Disabled,
-                aura_config::ToolHeaderMappings::default(),
-            );
-            let decision = client
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect("unsigned gate round trip succeeds");
-
-            assert!(
-                matches!(decision, GateDecision::Approved { overrides: None }),
-                "expected Approved without overrides, got {decision:?}"
-            );
-        }
-
-        /// The remaining loopback-matrix rows on the gate path: with capture
-        /// configured, none of them reaches an `Approved` decision, so no
-        /// override object can exist.
-        #[tokio::test]
-        async fn gate_non_happy_responses_yield_no_overrides() {
-            // Non-2xx.
-            let (url, _received) = one_shot_receiver_with_status(
-                "503 Service Unavailable",
-                vec![("x-approver-id".to_owned(), "alice".to_owned())],
-                r#"{"approved":true}"#.to_owned(),
-            )
-            .await;
-            let err = loopback_client(&url, EgressSigning::Disabled, user_mapping())
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect_err("a non-2xx response is a channel fault");
-            assert!(matches!(err, ApprovalError::BadStatus { status: 503 }));
-
-            // Malformed body.
-            let (url, _received) = one_shot_receiver(
-                vec![("x-approver-id".to_owned(), "alice".to_owned())],
-                "not json".to_owned(),
-            )
-            .await;
-            let err = loopback_client(&url, EgressSigning::Disabled, user_mapping())
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect_err("an unparsable body is a channel fault");
-            assert!(matches!(err, ApprovalError::Parse(_)));
-
-            // Response-leg HMAC failure: an approved, identity-bearing body
-            // that is not signed must not become an approval.
-            let (url, _received) = one_shot_receiver(
-                vec![("x-approver-id".to_owned(), "alice".to_owned())],
-                r#"{"approved":true}"#.to_owned(),
-            )
-            .await;
-            let err = loopback_client(&url, EgressSigning::Enabled(test_hmac()), user_mapping())
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect_err("an unverified response must not become an approval");
-            assert!(matches!(err, ApprovalError::ResponseUnverified(_)));
-        }
-
-        /// A round trip the webhook never answers times out, and a timeout
-        /// is not an approval.
-        #[tokio::test]
-        async fn gate_timeout_yields_no_overrides() {
-            let (url, _accepted) = stalled_receiver().await;
-
-            let decision = loopback_client(&url, EgressSigning::Disabled, user_mapping())
-                .request_approval_for_gate(
-                    &test_request(DecisionId::generate()),
-                    Duration::from_millis(200),
-                )
-                .await
-                .expect("a timeout is an outcome, not a channel fault");
-
-            assert!(
-                matches!(decision, GateDecision::TimedOut { .. }),
-                "expected TimedOut, got {decision:?}"
-            );
+                match (expected, decision) {
+                    (
+                        Expected::ApprovedWithOverrides,
+                        Ok(GateDecision::Approved {
+                            overrides: Some(overrides),
+                        }),
+                    ) => assert_eq!(
+                        overrides.captured_names().collect::<Vec<_>>(),
+                        vec!["x-forwarded-user"],
+                        "{case}"
+                    ),
+                    (
+                        Expected::ApprovedWithoutOverrides,
+                        Ok(GateDecision::Approved { overrides: None }),
+                    ) => {}
+                    (Expected::Denied(reason), Ok(GateDecision::Denied { reason: got })) => {
+                        assert_eq!(got.as_deref(), Some(reason), "{case}")
+                    }
+                    (Expected::TimedOut, Ok(GateDecision::TimedOut { .. })) => {}
+                    (
+                        Expected::BadStatus(status),
+                        Err(ApprovalError::BadStatus { status: got }),
+                    ) => {
+                        assert_eq!(got, status, "{case}")
+                    }
+                    (Expected::Parse, Err(ApprovalError::Parse(_))) => {}
+                    (Expected::Unverified, Err(ApprovalError::ResponseUnverified(_))) => {}
+                    (
+                        Expected::CaptureFailed(name),
+                        Err(
+                            ref err @ ApprovalError::CaptureFailed(CaptureError::MissingHeaders {
+                                ref names,
+                            }),
+                        ),
+                    ) => {
+                        assert_eq!(names, &[name.to_owned()], "{case}");
+                        assert!(
+                            err.to_string().contains(name),
+                            "{case}: the audit message must name the missing header: {err}"
+                        );
+                    }
+                    (_, got) => panic!("{case}: unexpected gate outcome {got:?}"),
+                }
+            }
         }
 
         /// Cancelling a round trip the receiver has already accepted — so it
-        /// is provably in flight — resolves the gate's webhook arm without
-        /// waiting out its timeout, and the cancelled decision carries no
-        /// override.
+        /// is provably in flight — resolves the cancelled decision without
+        /// waiting out the timeout. Both entrypoints honour the same token:
+        /// `decide_for_gate` and the route-wide `decide`.
         #[tokio::test]
-        async fn webhook_gate_cancellation_short_circuits_the_round_trip() {
-            let (url, accepted) = stalled_receiver().await;
-            let route = super::super::DecisionRoute::Webhook {
-                client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
-                timeout: Duration::from_secs(300),
-            };
-            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+        async fn webhook_cancellation_short_circuits_the_round_trip_on_both_paths() {
+            for route_wide in [false, true] {
+                let (url, accepted) = stalled_receiver().await;
+                let route = super::super::DecisionRoute::Webhook {
+                    client: loopback_client(&url, EgressSigning::Disabled, user_mapping()),
+                    timeout: Duration::from_secs(300),
+                };
+                let cancel = crate::request_cancellation::RequestCancelToken::unbound();
+                let request = test_request(DecisionId::generate());
 
-            let (decision, ()) = tokio::join!(
-                route.decide_for_gate(test_request(DecisionId::generate()), &cancel),
-                async {
+                let cancelled = async {
+                    if route_wide {
+                        match route.decide(request, &cancel).await {
+                            Ok(ApprovalOutcome::Cancelled(CancelReason::ClientDisconnected)) => {}
+                            other => {
+                                panic!("route_wide={route_wide}: expected Cancelled, got {other:?}")
+                            }
+                        }
+                    } else {
+                        match route.decide_for_gate(request, &cancel).await {
+                            Ok(GateDecision::Cancelled(CancelReason::ClientDisconnected)) => {}
+                            other => {
+                                panic!("route_wide={route_wide}: expected Cancelled, got {other:?}")
+                            }
+                        }
+                    }
+                };
+                let ((), ()) = tokio::join!(cancelled, async {
                     accepted
                         .await
                         .expect("the round trip must reach the receiver first");
                     cancel.cancel();
-                }
-            );
-
-            let decision = decision.expect("cancellation is an outcome, not a channel fault");
-            assert!(
-                matches!(
-                    decision,
-                    GateDecision::Cancelled(CancelReason::ClientDisconnected)
-                ),
-                "expected Cancelled, got {decision:?}"
-            );
-        }
-
-        /// The route-wide path honours the same token.
-        #[tokio::test]
-        async fn webhook_route_cancellation_short_circuits_the_round_trip() {
-            let (url, accepted) = stalled_receiver().await;
-            let route = super::super::DecisionRoute::Webhook {
-                client: loopback_client(
-                    &url,
-                    EgressSigning::Disabled,
-                    aura_config::ToolHeaderMappings::default(),
-                ),
-                timeout: Duration::from_secs(300),
-            };
-            let cancel = crate::request_cancellation::RequestCancelToken::unbound();
-
-            let (outcome, ()) = tokio::join!(
-                route.decide(test_request(DecisionId::generate()), &cancel),
-                async {
-                    accepted
-                        .await
-                        .expect("the round trip must reach the receiver first");
-                    cancel.cancel();
-                }
-            );
-
-            assert_eq!(
-                outcome.expect("cancellation is an outcome, not a channel fault"),
-                ApprovalOutcome::Cancelled(CancelReason::ClientDisconnected)
-            );
+                });
+            }
         }
 
         /// Cancellation beats an approval that is already on the wire: the
