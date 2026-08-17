@@ -51,8 +51,8 @@ use std::io::IsTerminal;
 use model_list::HttpModelLister;
 use prompt::Prompter;
 use provider::Provider;
+use render::{env_value, next_steps, render_config};
 pub(crate) use render::{merge_env, render_env};
-use render::{next_steps, render_config};
 use spec::{ApiKeySource, resolve_spec};
 
 #[derive(Debug, clap::Args)]
@@ -184,6 +184,20 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
         let env_contents = if env_path.exists() {
             let existing = std::fs::read_to_string(&env_path)
                 .with_context(|| format!("failed to read {}", env_path.display()))?;
+            // Agents installed side by side share the one `.env` in their
+            // directory, so replacing a variable re-points every config that
+            // references it — silently, since each only names the variable.
+            if let Some(current) = env_value(&existing, env_var)
+                && current != value
+            {
+                eprintln!(
+                    "warning: {env_var} is already set to a different value in {} — \
+                     replacing it changes the key used by any agent already installed \
+                     there.\n         Pass --api-key-env to give this agent its own \
+                     variable instead.",
+                    env_path.display()
+                );
+            }
             merge_env(&existing, env_var, value)
         } else {
             render_env(env_var, value)
