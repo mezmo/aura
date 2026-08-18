@@ -12,12 +12,13 @@
 
 use serde_json::{Map, Value, json};
 
-/// Unanchored match for `{{ env.VAR }}` / `{{ env.VAR | default: '...' }}`.
-/// Env resolution substitutes these before parsing, so a constrained string
-/// field must accept a raw config that still carries one (the quickstart
-/// templates even the `provider` discriminant).
+/// Whole-value match for `{{ env.VAR }}` / `{{ env.VAR | default: '...' }}`.
+/// A constrained string field must accept a raw config that still carries a
+/// template (the quickstart templates even the `provider` discriminant), but
+/// resolution preserves surrounding literal text — the anchors keep a
+/// partly-templated value subject to the field's own constraint.
 const ENV_TEMPLATE_PATTERN: &str =
-    r"\{\{\s*env\.[A-Z_][A-Z0-9_]*(\s*\|\s*default:\s*'[^']*')?\s*\}\}";
+    r"^\{\{\s*env\.[A-Z_][A-Z0-9_]*(\s*\|\s*default:\s*'[^']*')?\s*\}\}$";
 
 /// Generate the JSON Schema (draft 2020-12) for the agent config TOML surface.
 pub fn config_schema() -> Value {
@@ -484,6 +485,26 @@ model = "m"
         assert!(
             errors.is_empty(),
             "templated discriminant should validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_partly_templated_constrained_string() {
+        let _env_lock = crate::test_env_lock::lock();
+        unsafe { std::env::set_var("SCHEMA_TEST_PROVIDER", "openai") };
+        let validator = validator();
+        let contents = BASE.replace(
+            "provider = \"openai\"",
+            "provider = \"prefix-{{ env.SCHEMA_TEST_PROVIDER }}\"",
+        );
+        let resolved = crate::resolve_env_vars(&contents).expect("resolver substitutes the form");
+        assert!(
+            resolved.contains("prefix-openai"),
+            "resolution keeps the surrounding text: {resolved}"
+        );
+        assert!(
+            !validator.is_valid(&toml_to_json(&contents)),
+            "a value that resolves to an unknown provider should fail schema validation"
         );
     }
 
