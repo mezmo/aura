@@ -307,6 +307,7 @@ mod tests {
             McpServerOverview::Sse {
                 url: "https://logs.example.com/sse".to_string(),
                 description: None,
+                tools: None,
             },
         );
         configured.mcp_servers = Some(servers);

@@ -62,11 +62,14 @@ fn format_server_list(agent: Option<&AgentInfo>) -> String {
             McpServerOverview::Stdio {
                 command,
                 description,
+                ..
             } => ("stdio", command, description.as_deref()),
-            McpServerOverview::HttpStreamable { url, description } => {
-                ("http_streamable", url, description.as_deref())
-            }
-            McpServerOverview::Sse { url, description } => ("sse", url, description.as_deref()),
+            McpServerOverview::HttpStreamable {
+                url, description, ..
+            } => ("http_streamable", url, description.as_deref()),
+            McpServerOverview::Sse {
+                url, description, ..
+            } => ("sse", url, description.as_deref()),
             // `McpServerOverview` is #[non_exhaustive]; a newer wire peer
             // may send a transport this build doesn't know.
             _ => ("unknown transport", "", None),
@@ -101,6 +104,7 @@ mod tests {
                 McpServerOverview::HttpStreamable {
                     url: "https://mcp.mezmo.com".to_string(),
                     description: Some("Log analysis".to_string()),
+                    tools: None,
                 },
             ),
             (
@@ -108,6 +112,7 @@ mod tests {
                 McpServerOverview::Stdio {
                     command: "kubernetes-mcp-server".to_string(),
                     description: None,
+                    tools: None,
                 },
             ),
         ]));

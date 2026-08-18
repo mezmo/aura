@@ -176,9 +176,60 @@ pub struct WorkerOverview {
     pub model: Option<String>,
 }
 
+/// Behavior hints for one MCP tool.
+///
+/// Mirrors `ToolAnnotations` from the MCP 2026-07-28 specification, declared
+/// locally so this crate keeps its serde-only dependency set. Field names
+/// serialize in the spec's camelCase (`readOnlyHint`), unlike the snake_case
+/// used elsewhere in this crate.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+/// One MCP tool as exposed to the agent.
+///
+/// Mirrors `Tool` from the MCP 2026-07-28 specification, minus `icons`
+/// (display metadata with no bearing on capability introspection), declared
+/// locally so this crate keeps its serde-only dependency set. Field names
+/// serialize in the spec's camelCase (`inputSchema`), unlike the snake_case
+/// used elsewhere in this crate.
+///
+/// The spec requires `inputSchema`; it is optional here only so the same type
+/// can carry a reduced summary projection.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolOverview {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
 /// Credential-free view of one configured MCP server for `GET /aura/info`,
 /// tagged by `transport` to mirror the `[mcp.servers.<name>]` config.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `tools` is the server's discovered tool list.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum McpServerOverview {
@@ -187,21 +238,27 @@ pub enum McpServerOverview {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<McpToolOverview>>,
     },
     HttpStreamable {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<McpToolOverview>>,
     },
     Sse {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools: Option<Vec<McpToolOverview>>,
     },
 }
 
 /// One agent entry in the `GET /aura/info` response.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentInfo {
     /// Agent identifier — matches the `id` field in `/v1/models` (alias or name).
     pub id: String,
@@ -218,7 +275,7 @@ pub struct AgentInfo {
 }
 
 /// Response body for `GET /aura/info`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ServerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,
@@ -633,6 +690,7 @@ mod tests {
             McpServerOverview::HttpStreamable {
                 url: "https://logs.example.com/mcp".to_string(),
                 description: Some("Search logs.".to_string()),
+                tools: None,
             },
         );
         servers.insert(
@@ -640,6 +698,7 @@ mod tests {
             McpServerOverview::Stdio {
                 command: "fs-server".to_string(),
                 description: None,
+                tools: None,
             },
         );
         let mut known = unknown.clone();
@@ -670,6 +729,123 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&empty).unwrap()["mcp_servers"],
             serde_json::json!({})
+        );
+    }
+
+    fn sample_tool() -> McpToolOverview {
+        McpToolOverview {
+            name: "list_incidents".to_string(),
+            title: Some("List Incidents".to_string()),
+            description: Some("List open incidents".to_string()),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "limit": { "type": "integer" } }
+            })),
+            output_schema: Some(serde_json::json!({ "type": "object" })),
+            annotations: Some(McpToolAnnotations {
+                read_only_hint: Some(true),
+                destructive_hint: Some(false),
+                ..McpToolAnnotations::default()
+            }),
+            meta: Some(serde_json::json!({ "vendor/tier": "gold" })),
+        }
+    }
+
+    /// Tools go on the wire in the MCP spec's own camelCase, so a consumer
+    /// written against the spec can read them without translation.
+    #[test]
+    fn mcp_tool_overview_uses_spec_field_names() {
+        let json = serde_json::to_value(sample_tool()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "list_incidents",
+                "title": "List Incidents",
+                "description": "List open incidents",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "limit": { "type": "integer" } }
+                },
+                "outputSchema": { "type": "object" },
+                "annotations": { "readOnlyHint": true, "destructiveHint": false },
+                "_meta": { "vendor/tier": "gold" }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<McpToolOverview>(json).unwrap(),
+            sample_tool()
+        );
+    }
+
+    /// The summary projection drops every field the spec marks optional; the
+    /// spec-required `name` survives regardless.
+    #[test]
+    fn mcp_tool_overview_summary_keeps_only_name_and_description() {
+        let summary = McpToolOverview {
+            name: "list_incidents".to_string(),
+            description: Some("List open incidents".to_string()),
+            ..McpToolOverview::default()
+        };
+        assert_eq!(
+            serde_json::to_value(summary).unwrap(),
+            serde_json::json!({
+                "name": "list_incidents",
+                "description": "List open incidents"
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_server_overview_round_trips_discovered_tools() {
+        let server = McpServerOverview::HttpStreamable {
+            url: "https://mcp.example.com".to_string(),
+            description: None,
+            tools: Some(vec![sample_tool()]),
+        };
+        let json = serde_json::to_value(&server).unwrap();
+        assert_eq!(json["transport"], "http_streamable");
+        assert_eq!(json["tools"][0]["name"], "list_incidents");
+        assert_eq!(
+            serde_json::from_value::<McpServerOverview>(json).unwrap(),
+            server
+        );
+
+        // A server that reported no tools is distinct from one carrying none:
+        // `[]` on the wire versus an absent field.
+        let known_empty = McpServerOverview::Sse {
+            url: "https://mcp.example.com".to_string(),
+            description: None,
+            tools: Some(Vec::new()),
+        };
+        assert_eq!(
+            serde_json::to_value(&known_empty).unwrap()["tools"],
+            serde_json::json!([])
+        );
+        assert!(serde_json::to_value(McpServerOverview::Stdio {
+            command: "fs-server".to_string(),
+            description: None,
+            tools: None,
+        })
+        .unwrap()
+        .get("tools")
+        .is_none());
+    }
+
+    /// A peer that predates the field still deserializes.
+    #[test]
+    fn mcp_server_overview_without_tools_deserializes() {
+        let server: McpServerOverview = serde_json::from_value(serde_json::json!({
+            "transport": "stdio",
+            "command": "fs-server"
+        }))
+        .unwrap();
+        assert_eq!(
+            server,
+            McpServerOverview::Stdio {
+                command: "fs-server".to_string(),
+                description: None,
+                tools: None,
+            }
         );
     }
 

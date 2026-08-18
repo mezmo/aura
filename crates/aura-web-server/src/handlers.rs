@@ -1953,6 +1953,7 @@ url = "http://127.0.0.1:9"
             aura_events::McpServerOverview::HttpStreamable {
                 url: "http://127.0.0.1:9".to_string(),
                 description: None,
+                tools: None,
             }
         );
     }

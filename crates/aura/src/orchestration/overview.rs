@@ -38,18 +38,21 @@ fn mcp_server_overview(server: &McpServerConfig) -> McpServerOverview {
         } => McpServerOverview::Stdio {
             command: command_basename(cmd),
             description: description.clone(),
+            tools: None,
         },
         McpServerConfig::HttpStreamable {
             url, description, ..
         } => McpServerOverview::HttpStreamable {
             url: sanitize_url(url),
             description: description.clone(),
+            tools: None,
         },
         McpServerConfig::Sse {
             url, description, ..
         } => McpServerOverview::Sse {
             url: sanitize_url(url),
             description: description.clone(),
+            tools: None,
         },
     }
 }
@@ -267,6 +270,7 @@ args = ["--api-key", "argsecret"]
             McpServerOverview::HttpStreamable {
                 url: "http://127.0.0.1:9".to_string(),
                 description: Some("Dead server.".to_string()),
+                tools: None,
             }
         );
         assert_eq!(
@@ -274,6 +278,7 @@ args = ["--api-key", "argsecret"]
             McpServerOverview::Stdio {
                 command: "fs-server".to_string(),
                 description: None,
+                tools: None,
             }
         );
         // No secret from headers/userinfo/path/query/args leaks into the

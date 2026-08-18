@@ -243,6 +243,7 @@ mod tests {
             McpServerOverview::Sse {
                 url: "https://logs.example.com/sse".to_string(),
                 description: None,
+                tools: None,
             },
         );
         orch.mcp_servers = Some(servers.clone());
