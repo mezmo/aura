@@ -189,7 +189,7 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
             }
             (
                 format!(
-                    "scratchpad −{} +{}",
+                    "scratchpad in {} / out {}",
                     compact(snapshot.scratchpad_intercepted),
                     compact(snapshot.scratchpad_extracted)
                 ),
@@ -524,7 +524,7 @@ mod tests {
             ..Snapshot::default()
         };
         let line = strip_ansi(&render(&snapshot, &[Segment::Scratchpad], 80, ""));
-        assert_eq!(line, "scratchpad −48k +3.1k");
+        assert_eq!(line, "scratchpad in 48k / out 3.1k");
     }
 
     #[test]
