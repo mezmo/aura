@@ -3535,8 +3535,12 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Revisit if/when we replace rig.
     ///
     /// Arm ordering is load-bearing. The context arm precedes the provider arms
-    /// because context-overflow bodies embed large token counts (e.g. "135000
-    /// tokens") that collide with bare status-code substrings like "500". An
+    /// because context-overflow bodies embed large token counts (e.g. "14290
+    /// tokens") that collide with bare status-code substrings like "429". The
+    /// "500" match is anchored to rig's "invalid status code" prefixes because
+    /// bare "500" also collides with durations and byte sizes in permanent
+    /// errors (a 404 body mentioning "500" must not read as transient); its
+    /// unanchored textual companion is "internal server error". An
     /// own-timeout guard precedes the provider arms because "timed out after"
     /// is this orchestrator's timeout-format signature; its "invalid status
     /// code" exclusion keeps a rig-flattened provider error whose body mentions
@@ -3576,11 +3580,13 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("service unavailable")
             || lower.contains("overloaded")
             || lower.contains("529")
-            || lower.contains("500")
+            || lower.contains("invalid status code 500")
+            || lower.contains("invalid status code: 500")
             || lower.contains("internal server error")
             || lower.contains("504")
             || lower.contains("gateway timeout")
             || lower.contains("invalid status code 408")
+            || lower.contains("invalid status code: 408")
             || lower.contains("408 request timeout")
             || lower.contains("connection refused")
             || lower.contains("connection reset")
@@ -5678,6 +5684,26 @@ mod tests {
                 "CompletionError: ProviderError: Invalid status code 401 Unauthorized with message: key ending 408 is revoked"
             ),
             FailureCategory::ProviderAuthError
+        );
+    }
+
+    #[test]
+    fn test_500_match_does_not_swallow_other_provider_categories() {
+        // Both 500 patterns are anchored to rig's "invalid status code"
+        // prefixes so a stray "500" in another status's body (durations,
+        // byte sizes, ids) cannot pull a permanent error onto the overloaded
+        // arm, which runs first.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 404 Not Found with message: model 'foo-500' not found"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 500 Internal Server Error with message: upstream crashed"
+            ),
+            FailureCategory::ProviderOverloaded
         );
     }
 
