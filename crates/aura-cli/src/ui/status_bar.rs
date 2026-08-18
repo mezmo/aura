@@ -25,7 +25,7 @@ use super::state::{
     QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS,
     TURN_NOTICES, get_selected_model, lock_term, status_rows, term_size,
 };
-use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot};
+use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot, sanitize};
 
 /// Right-aligned on the status line while the REPL is idle.
 const IDLE_RIGHT_TEXT: &str = "AURA, by Mezmo!";
@@ -56,6 +56,22 @@ pub fn set_mcp_counts(counts: McpCounts) {
     if let Ok(mut g) = MCP_COUNTS.lock() {
         *g = Some(counts);
     }
+}
+
+/// Forget everything the status line learned from the previous
+/// conversation's stream — reported model, context window, MCP tally, and
+/// context size — so a fresh conversation starts blank rather than showing
+/// the old session's metadata until its first turn reports.
+pub fn reset_session_status() {
+    if let Ok(mut g) = SESSION_MODEL.lock() {
+        *g = None;
+    }
+    MODEL_CONTEXT_LIMIT.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = MCP_COUNTS.lock() {
+        *g = None;
+    }
+    set_context_used(0);
+    CONTEXT_USED_FRESH.store(false, Ordering::Relaxed);
 }
 
 fn capture_snapshot() -> Snapshot {
@@ -169,7 +185,7 @@ pub(crate) fn print_status_line(line: &str) {
 /// redrawn (i.e. once the in-flight request finishes), so this is safe to
 /// call mid-stream.
 pub fn add_turn_notice(style: AuraStyle, message: impl AsRef<str>) {
-    let styled = message.as_ref().themed(style).to_string();
+    let styled = sanitize(message.as_ref()).themed(style).to_string();
     if let Ok(mut g) = TURN_NOTICES.lock() {
         g.push(styled);
     }
@@ -341,7 +357,9 @@ pub fn seed_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
     }
 }
 
-/// Reset cumulative token counters and context usage to zero.
+/// Reset the cumulative token and scratchpad counters to zero. Replaying an
+/// event log rebuilds them, so repaint paths call this before a replay;
+/// conversation boundaries also call [`reset_session_status`].
 pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_PROMPT.lock() {
         *g = 0;
@@ -355,8 +373,6 @@ pub fn reset_status_bar_tokens() {
     if let Ok(mut g) = CUMULATIVE_SCRATCHPAD_EXTRACTED.lock() {
         *g = 0;
     }
-    set_context_used(0);
-    CONTEXT_USED_FRESH.store(false, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

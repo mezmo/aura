@@ -13,9 +13,10 @@ use crate::ui::prompt::{
     clear_display_events, clear_stream_events, clear_stream_panel_in_place, extend_display_events,
     get_model_cache, get_model_matches, is_expanded_output, list_conversations,
     load_and_restore_sse_events, print_help, print_welcome_state, redraw_input_frame,
-    replay_event_log_global, reset_status_bar_tokens, seed_model_cache, seed_status_bar_tokens,
-    set_expanded_output, set_mid_stream_history, set_selected_model, set_stream_conv_dir,
-    set_stream_show_all, set_welcome_state, toggle_stream_panel, with_event_log,
+    replay_event_log_global, reset_session_status, reset_status_bar_tokens, seed_model_cache,
+    seed_status_bar_tokens, set_expanded_output, set_mid_stream_history, set_selected_model,
+    set_stream_conv_dir, set_stream_show_all, set_welcome_state, toggle_stream_panel,
+    with_event_log,
 };
 use crate::ui::state::{RESUME_MATCHES, get_tab_select_index, set_tab_select_index};
 use crate::ui::welcome::WelcomeState;
@@ -94,6 +95,7 @@ pub(crate) fn handle_clear(
         crossterm::cursor::MoveTo(0, 0),
     );
     reset_status_bar_tokens();
+    reset_session_status();
     print_welcome_state();
 
     redraw_input_frame();
@@ -342,6 +344,9 @@ pub(crate) fn handle_resume(
             if let Some(s) = conv_store {
                 load_and_restore_sse_events(s.dir());
             }
+            // A different conversation: drop the previous one's reported
+            // model, window, MCP tally, and context size before replaying.
+            reset_session_status();
             // Restore selected model and model cache
             if let Some(s) = conv_store {
                 if let Some(model) = s.load_model() {
