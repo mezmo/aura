@@ -6,6 +6,7 @@
 //! mapping, event emission) in one place instead of per-impl.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,6 +212,60 @@ fn stamp_decision_id(decision_id: DecisionId) {
     );
 }
 
+/// Run one webhook approval round trip behind the choreography both webhook
+/// arms share: publish `Requested`, race the round trip against the cancel
+/// token, then publish `Completed`.
+///
+/// Two phases, both failing closed: the race is `biased` so a pending
+/// cancellation wins, and the result is rechecked against the token before
+/// it becomes the decision, so a disconnect landing just as the decision
+/// arrives is caught too. The arms differ only in the round trip itself and
+/// in how their decision shape projects into the completed event.
+async fn webhook_round_trip<T>(
+    request: &ApprovalRequest,
+    cancel: &crate::request_cancellation::RequestCancelToken,
+    round_trip: impl Future<Output = Result<T, ApprovalError>>,
+    cancelled: impl FnOnce() -> T,
+    event_outcome: impl FnOnce(&T) -> ApprovalOutcome,
+) -> Result<T, ApprovalError> {
+    let started = Instant::now();
+    let request_id = request.request_id.clone();
+    let decision_id = request.decision_id;
+    let scope = request.scope.clone();
+
+    approval_event_broker::publish(
+        &request_id,
+        ApprovalLifecycleEvent::Requested(request.into()),
+    )
+    .await;
+
+    let raced = tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        decision = round_trip => Some(decision),
+    };
+    let result = match raced {
+        Some(decision) if !cancel.is_cancelled() => decision,
+        _ => {
+            tracing::warn!(%decision_id, "approval cancelled: client disconnected");
+            Ok(cancelled())
+        }
+    };
+    let completed = match &result {
+        Ok(decision) => events::completed(
+            decision_id,
+            &event_outcome(decision),
+            &scope,
+            started.elapsed(),
+        ),
+        Err(err) => {
+            events::completed_error(decision_id, err.to_string(), &scope, started.elapsed())
+        }
+    };
+    approval_event_broker::publish(&request_id, ApprovalLifecycleEvent::Completed(completed)).await;
+    result
+}
+
 impl DecisionRoute {
     /// Obtain a decision for a config-gated call, carrying any captured
     /// approver header overrides on the approved arm.
@@ -232,55 +287,14 @@ impl DecisionRoute {
                 Ok(GateDecision::without_overrides(outcome))
             }
             Self::Webhook { client, timeout } => {
-                let started = Instant::now();
-                let request_id = request.request_id.clone();
-                let decision_id = request.decision_id;
-                let scope = request.scope.clone();
-
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Requested((&request).into()),
+                webhook_round_trip(
+                    &request,
+                    cancel,
+                    client.request_approval_for_gate(&request, *timeout),
+                    || GateDecision::Cancelled(super::decision::CancelReason::ClientDisconnected),
+                    GateDecision::to_outcome,
                 )
-                .await;
-
-                // Two phases, both failing closed: the round trip races the
-                // cancel token, and the result is rechecked against the token
-                // before it becomes this arm's decision, so a disconnect
-                // landing just as the decision arrives is caught too.
-                let raced = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => None,
-                    decision = client.request_approval_for_gate(&request, *timeout) => Some(decision),
-                };
-                let result = match raced {
-                    Some(decision) if !cancel.is_cancelled() => decision,
-                    _ => {
-                        tracing::warn!(%decision_id, "approval cancelled: client disconnected");
-                        Ok(GateDecision::Cancelled(
-                            super::decision::CancelReason::ClientDisconnected,
-                        ))
-                    }
-                };
-                let completed = match &result {
-                    Ok(decision) => events::completed(
-                        decision_id,
-                        &decision.to_outcome(),
-                        &scope,
-                        started.elapsed(),
-                    ),
-                    Err(err) => events::completed_error(
-                        decision_id,
-                        err.to_string(),
-                        &scope,
-                        started.elapsed(),
-                    ),
-                };
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Completed(completed),
-                )
-                .await;
-                result
+                .await
             }
         }
     }
@@ -359,44 +373,18 @@ impl DecisionRoute {
                 Ok(outcome)
             }
             Self::Webhook { client, timeout } => {
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Requested((&request).into()),
-                )
-                .await;
-
-                // Two-phase, as on the gate path.
-                let raced = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => None,
-                    outcome = client.request_approval(&request, *timeout) => Some(outcome),
-                };
-                let result = match raced {
-                    Some(outcome) if !cancel.is_cancelled() => outcome,
-                    _ => {
-                        tracing::warn!(%decision_id, "approval cancelled: client disconnected");
-                        Ok(ApprovalOutcome::Cancelled(
+                webhook_round_trip(
+                    &request,
+                    cancel,
+                    client.request_approval(&request, *timeout),
+                    || {
+                        ApprovalOutcome::Cancelled(
                             super::decision::CancelReason::ClientDisconnected,
-                        ))
-                    }
-                };
-                let completed = match &result {
-                    Ok(outcome) => {
-                        events::completed(decision_id, outcome, &scope, started.elapsed())
-                    }
-                    Err(err) => events::completed_error(
-                        decision_id,
-                        err.to_string(),
-                        &scope,
-                        started.elapsed(),
-                    ),
-                };
-                approval_event_broker::publish(
-                    &request_id,
-                    ApprovalLifecycleEvent::Completed(completed),
+                        )
+                    },
+                    |outcome| outcome.clone(),
                 )
-                .await;
-                result
+                .await
             }
         }
     }
@@ -484,9 +472,6 @@ pub struct WebhookClient {
 
 /// One webhook round trip's answer, with the HTTP response headers it
 /// arrived alongside.
-///
-/// Only the decided arm carries headers, so headers-without-a-decision is
-/// unrepresentable.
 enum WebhookReply {
     Decided {
         decision: ApprovalDecision,

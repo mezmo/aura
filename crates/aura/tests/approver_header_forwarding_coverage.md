@@ -56,8 +56,7 @@ a defect in this document, not an implicit exclusion.
 | Stdio adaptor runs an ungated call untouched | `mcp_dynamic::tests::stdio_adaptor_runs_an_ungated_call` | The fail-open complement: no override means no transport check |
 | Adaptor reads the scoped overrides and threads them to the client | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | Exercises the wrapper, the spawn, the adaptor read and the wire in one call |
 | Transport check accepts both HTTP transports | `approver_headers::tests::http_transports_accept_overrides` | |
-| Transport check refuses stdio | `approver_headers::tests::stdio_transport_refuses_overrides` | |
-| Transport check refuses stdio for an override set with no pairs | `approver_headers::tests::stdio_refuses_even_an_empty_override_set` | Existence of an override value, not its size, is what the check keys off |
+| Transport check refuses stdio | `approver_headers::tests::stdio_transport_refuses_overrides` | The check takes the transport alone, so refusal cannot depend on what the override set holds |
 | Every captured pair lands on the outbound request | `approver_headers::tests::apply_to_sets_every_captured_pair_on_the_request` | |
 | An override replaces a same-named header already on the builder | `approver_headers::tests::apply_to_replaces_a_header_already_on_the_builder` | The per-header setter appends, so pair-by-pair application would send both identities |
 | An override replaces the client's frozen header on the wire | `mcp_streamable_http::tests::override_replaces_the_clients_frozen_identity_for_that_call_only` | Also asserts the handshake kept the original identity |
