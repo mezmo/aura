@@ -22,6 +22,7 @@ use crate::ui::text::truncate_with_ellipsis;
 use super::orchestrator::{
     TREE_END_BULLET, TREE_END_DURATION, TREE_MID_BULLET, TREE_MID_DURATION, format_orch_duration_ms,
 };
+use super::state::CONTEXT_USED;
 use super::state::{
     EVENT_LOG, EXPANDED_OUTPUT, WELCOME_STATE, random_bullet_color, task_color_for,
 };
@@ -184,9 +185,12 @@ pub fn replay_event_log_global() {
                 completion_tokens,
             } => {
                 set_status_bar_tokens(*prompt_tokens, *completion_tokens);
-                // The log keeps only end-of-turn usage, so this is a lower
-                // bound on context size until the next live turn reports.
-                set_context_used(*prompt_tokens + *completion_tokens);
+                // The log keeps only end-of-turn usage, a lower bound on
+                // context size: seed a fresh conversation from it, but never
+                // lower the exact figure a live turn already reported when a
+                // repaint replays the same log.
+                let logged = *prompt_tokens + *completion_tokens;
+                set_context_used(CONTEXT_USED.load(Ordering::Relaxed).max(logged));
                 i += 1;
             }
             DisplayEvent::OrchestratorScratchpadSavings {
