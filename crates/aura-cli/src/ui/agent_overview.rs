@@ -1,10 +1,8 @@
-use std::borrow::Cow;
-
 use aura_events::{AgentInfo, WorkerOverview};
 
 use crate::theme::{AuraStyle, Themed};
 use crate::ui::state::term_size;
-use crate::ui::text::wrap_words;
+use crate::ui::text::{strip_control_chars, wrap_words};
 
 const INDENT: &str = "  ";
 
@@ -29,6 +27,8 @@ pub fn print_startup_cta(agent: &AgentInfo) {
     println!();
 }
 
+/// Every string in an [`AgentInfo`] arrives from the server, so each is
+/// stripped of control characters before it reaches the terminal.
 fn agent_overview_block_lines(agent: &AgentInfo, width: usize) -> Vec<String> {
     let mut lines = Vec::with_capacity(agent.workers.len() + 3);
     let role = if agent.workers.is_empty() {
@@ -41,16 +41,17 @@ fn agent_overview_block_lines(agent: &AgentInfo, width: usize) -> Vec<String> {
     lines.push(format!(
         "{INDENT}{} {} {} {}: {}",
         "•".themed(AuraStyle::Muted),
-        agent.id.as_str().themed(AuraStyle::Heading),
+        strip_control_chars(&agent.id).themed(AuraStyle::Heading),
         "—".themed(AuraStyle::Muted),
         role.themed(AuraStyle::Muted),
-        agent.model.as_str().themed(AuraStyle::Muted),
+        strip_control_chars(&agent.model).themed(AuraStyle::Muted),
     ));
     if let Some(description) = agent.description.as_deref() {
         // Wrapped under the bullet, aligned with the agent id.
         let desc_indent = INDENT.len() + 2;
         let pad = " ".repeat(desc_indent);
-        for line in wrap_words(description, width.saturating_sub(desc_indent)) {
+        let description = strip_control_chars(description);
+        for line in wrap_words(&description, width.saturating_sub(desc_indent)) {
             lines.push(format!("{pad}{}", line.as_str().themed(AuraStyle::Muted)));
         }
     }
@@ -69,19 +70,20 @@ fn worker_block_lines(workers: &[WorkerOverview], width: usize) -> Vec<String> {
     lines.push(format!("{}", "Workers".themed(AuraStyle::Heading)));
 
     for worker in workers {
-        let text = match &worker.model {
-            Some(model) => Cow::Owned(format!("{} ({model})", worker.description)),
-            None => Cow::Borrowed(worker.description.as_str()),
-        };
+        let name = strip_control_chars(&worker.name);
+        let text = strip_control_chars(&match &worker.model {
+            Some(model) => format!("{} ({model})", worker.description),
+            None => worker.description.clone(),
+        });
         // Width of the "  • name — " prefix.
-        let prefix_len = INDENT.len() + 2 + worker.name.chars().count() + 3;
+        let prefix_len = INDENT.len() + 2 + name.chars().count() + 3;
 
         if width >= prefix_len + MIN_DESC_WIDTH {
             let wrapped = wrap_words(&text, width - prefix_len);
             lines.push(format!(
                 "{INDENT}{} {} {} {}",
                 "•".themed(AuraStyle::Muted),
-                worker.name.as_str().themed(AuraStyle::Heading),
+                name.as_str().themed(AuraStyle::Heading),
                 "—".themed(AuraStyle::Muted),
                 wrapped[0].as_str().themed(AuraStyle::Muted),
             ));
@@ -95,7 +97,7 @@ fn worker_block_lines(workers: &[WorkerOverview], width: usize) -> Vec<String> {
             lines.push(format!(
                 "{INDENT}{} {}",
                 "•".themed(AuraStyle::Muted),
-                worker.name.as_str().themed(AuraStyle::Heading),
+                name.as_str().themed(AuraStyle::Heading),
             ));
             let desc_indent = INDENT.len() + 2;
             let pad = " ".repeat(desc_indent);
@@ -152,6 +154,31 @@ mod tests {
                 "  • sre — model: gpt-4o",
                 "    Anthropic backed config to solve all of your production",
                 "    problems",
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_overview_strips_control_characters_from_server_text() {
+        let mut agent = agent("sre\x1b]0;pwned\x07", vec![worker("w\x1b[2J")]);
+        agent.model = "gpt\u{9b}31m".to_string();
+        agent.description = Some("desc\x1b[31m red".to_string());
+        agent.workers[0].description = "does\x07 work".to_string();
+        agent.workers[0].model = Some("mini\x1b[K".to_string());
+
+        let lines = plain(&agent_overview_block_lines(&agent, 80));
+        assert!(
+            lines.iter().all(|l| l.chars().all(|c| !c.is_control())),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines,
+            [
+                "Agent",
+                "  • sre]0;pwned — coordinator: gpt31m",
+                "    desc[31m red",
+                "Workers",
+                "  • w[2J — does work (mini[K)",
             ]
         );
     }

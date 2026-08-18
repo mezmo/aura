@@ -235,6 +235,28 @@ fn description_column(model: &ModelEntry, room: usize) -> Option<String> {
     (fits || room >= MIN_DESC_WIDTH).then(|| truncate_with_ellipsis(&desc, room))
 }
 
+/// The single-row hint for a `/model` filter that leaves exactly one match:
+/// `▸  id  [description  ]press enter to auto-complete`. The id yields to the
+/// call to action and the description to both, so the row fits `width`
+/// columns for any id the server hands out.
+fn unique_model_hint(model: &ModelEntry, width: usize) -> String {
+    let cta = "press enter to auto-complete";
+    let name = truncate_with_ellipsis(
+        &strip_control_chars(&model.id),
+        width.saturating_sub(3 + 2 + cta.len()),
+    );
+    let used = 3 + UnicodeWidthStr::width(name.as_str()) + 2 + cta.len() + 2;
+    let desc = description_column(model, width.saturating_sub(used))
+        .map(|d| format!("{}  ", d.themed(AuraStyle::Muted)))
+        .unwrap_or_default();
+    format!(
+        "{}  {}  {desc}{}",
+        "▸".themed(AuraStyle::Connector),
+        name.themed(AuraStyle::Muted),
+        cta.with(random_bullet_color()),
+    )
+}
+
 /// Build hint lines for the `/model` picker at `width` columns, one model per
 /// numbered row:
 ///
@@ -421,22 +443,8 @@ pub fn update_input_hint(line: &str) {
                     vec![format!("{}", "no matching models".themed(AuraStyle::Muted))]
                 }
             } else if filtered.len() == 1 {
-                let color = random_bullet_color();
-                let model = &filtered[0];
-                let name = strip_control_chars(&model.id);
-                let cta = "press enter to auto-complete";
-                // "▸  id  [description  ]cta"
                 let (width, _) = term_size();
-                let used = 3 + UnicodeWidthStr::width(name.as_str()) + 2 + cta.len() + 2;
-                let desc = description_column(model, (width as usize).saturating_sub(used))
-                    .map(|d| format!("{}  ", d.themed(AuraStyle::Muted)))
-                    .unwrap_or_default();
-                vec![format!(
-                    "{}  {}  {desc}{}",
-                    "▸".themed(AuraStyle::Connector),
-                    name.themed(AuraStyle::Muted),
-                    cta.with(color),
-                )]
+                vec![unique_model_hint(&filtered[0], width as usize)]
             } else {
                 let tab_idx = get_tab_select_index();
                 let current = get_selected_model();
@@ -577,9 +585,10 @@ pub fn validate_command_input(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_VISIBLE, ModelEntry, build_model_hints, description_column, validate_command_input,
+        MAX_VISIBLE, ModelEntry, build_model_hints, description_column, unique_model_hint,
+        validate_command_input,
     };
-    use crate::test_fixtures::plain;
+    use crate::test_fixtures::{plain, strip_sgr};
 
     fn model(id: &str, description: Option<&str>) -> ModelEntry {
         ModelEntry {
@@ -738,6 +747,27 @@ mod tests {
         let lines = plain(&build_model_hints(&models, None, None, 20));
         assert_eq!(lines[0], "  1. a-model-id-t...");
         assert_eq!(lines[1], "  2. short");
+    }
+
+    #[test]
+    fn unique_match_hint_fits_the_terminal_for_any_id() {
+        let long = "a-model-id-that-is-far-longer-than-any-sane-terminal-would-be";
+        let model = model(long, Some("with a description as well"));
+        for width in [40usize, 60, 80, 120] {
+            let line = strip_sgr(&unique_model_hint(&model, width));
+            let cols = unicode_width::UnicodeWidthStr::width(line.as_str());
+            assert!(cols <= width, "width {width}: {cols} cols in {line:?}");
+            assert!(line.ends_with("press enter to auto-complete"), "{line:?}");
+        }
+        // Wide enough: id whole, description truncated to what is left.
+        let line = strip_sgr(&unique_model_hint(&model, 120));
+        assert_eq!(
+            line,
+            format!("▸  {long}  with a description as...  press enter to auto-complete")
+        );
+        // Narrow: the id itself is truncated and the description dropped.
+        let line = strip_sgr(&unique_model_hint(&model, 50));
+        assert_eq!(line, "▸  a-model-id-tha...  press enter to auto-complete");
     }
 
     #[test]
