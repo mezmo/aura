@@ -153,12 +153,21 @@ pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &s
     out
 }
 
+/// Replace control characters (C0, DEL, C1) with U+FFFD so text lifted from
+/// the filesystem or a server cannot smuggle escape sequences into the
+/// terminal, and so tampering stays visible rather than silently vanishing.
+pub(crate) fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
     let (text, style) = match segment {
-        Segment::Model => (snapshot.model.clone()?, AuraStyle::StatusModel),
-        Segment::Cwd => (snapshot.cwd.clone()?, AuraStyle::StatusPath),
+        Segment::Model => (sanitize(snapshot.model.as_deref()?), AuraStyle::StatusModel),
+        Segment::Cwd => (sanitize(snapshot.cwd.as_deref()?), AuraStyle::StatusPath),
         Segment::Git => (
-            format!("⎇ {}", snapshot.git_branch.as_deref()?),
+            format!("⎇ {}", sanitize(snapshot.git_branch.as_deref()?)),
             AuraStyle::StatusGit,
         ),
         Segment::Context => context_piece(snapshot.context?),
@@ -340,10 +349,20 @@ pub fn abbreviate_home(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
+/// Upper bound on how much of `HEAD` is read; a well-formed file is under
+/// 100 bytes, so anything larger is not a ref worth displaying.
+const MAX_HEAD_BYTES: u64 = 4096;
+
 /// Current branch of the git repository containing `start`, read from
 /// `HEAD` without spawning `git`. Detached heads yield the short commit id.
 pub fn git_branch(start: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(git_head_path(start)?).ok()?;
+    use std::io::Read;
+    let mut head = String::new();
+    std::fs::File::open(git_head_path(start)?)
+        .ok()?
+        .take(MAX_HEAD_BYTES)
+        .read_to_string(&mut head)
+        .ok()?;
     let head = head.trim();
     if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
         return Some(branch.to_owned());
@@ -454,6 +473,31 @@ mod tests {
         assert_eq!(
             line,
             "claude-sonnet-4-5 │ ~/src/aura │ ⎇ main │ ctx ███░░░░░ 38% 76k/200k │ in 182k / out 41k │ mcp 3/3"
+        );
+    }
+
+    #[test]
+    fn control_characters_in_external_text_are_neutralised() {
+        let snapshot = Snapshot {
+            model: Some("gpt\x1b[2J-4o".to_owned()),
+            cwd: Some("~/a\tb".to_owned()),
+            git_branch: Some("main\u{9b}31m".to_owned()),
+            ..Snapshot::default()
+        };
+        let line = render(
+            &snapshot,
+            &[Segment::Model, Segment::Cwd, Segment::Git],
+            200,
+            "",
+        );
+        // The raw output carries only our own SGR styling: the injected
+        // clear-screen, tab, and C1 CSI never reach the terminal.
+        assert!(!line.contains("\x1b[2J"));
+        assert!(!line.contains('\t'));
+        assert!(!line.contains('\u{9b}'));
+        assert_eq!(
+            strip_ansi(&line),
+            "gpt\u{FFFD}[2J-4o │ ~/a\u{FFFD}b │ ⎇ main\u{FFFD}31m"
         );
     }
 
