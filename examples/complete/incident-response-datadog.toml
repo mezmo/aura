@@ -35,6 +35,7 @@ DD-APPLICATION-KEY = "{{ env.DD_APPLICATION_KEY | default: '' }}"
 [agent]
 name = "Incident Response Agent"
 alias = "incident-response/datadog"
+description = "Incident triage with PagerDuty context and Datadog metrics"
 model_owner = "mezmo"
 system_prompt = """
 You are an incident response agent with access to PagerDuty and
