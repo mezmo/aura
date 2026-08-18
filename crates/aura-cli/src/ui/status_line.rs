@@ -113,15 +113,12 @@ pub struct Snapshot {
     pub mcp: Option<McpCounts>,
 }
 
-const SEPARATOR: &str = " · ";
+const SEPARATOR: &str = " │ ";
 const METER_CELLS: u64 = 8;
 const CONTEXT_WARN_PCT: u64 = 70;
 const CONTEXT_ERROR_PCT: u64 = 90;
 /// Narrowest the cwd segment is squeezed to before whole segments are dropped.
 const MIN_CWD_WIDTH: usize = 12;
-/// Below this many columns for the segments, the right-aligned text is
-/// dropped instead of squeezing the segments further.
-const MIN_LEFT_WIDTH: usize = 8;
 /// Minimum spacing between the segments and the right-aligned text.
 const MIN_GAP: usize = 2;
 
@@ -132,23 +129,19 @@ struct Piece {
 }
 
 /// Render `segments` from `snapshot` as one styled line that fits within
-/// `width` columns, with `right` right-aligned when there is room.
+/// `width` columns, with `right` right-aligned when there is room left over.
 ///
 /// Segments with nothing to show are omitted. When the line is too wide,
-/// the cwd is tail-truncated first, then trailing segments are dropped. A
-/// `width` of 0 means the terminal size is unknown; the segments are then
-/// rendered unconstrained and `right` is omitted.
+/// the cwd is tail-truncated first, then trailing segments are dropped;
+/// `right` is only added once every remaining segment fits. A `width` of 0
+/// means the terminal size is unknown; the segments are then rendered
+/// unconstrained and `right` is omitted.
 pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &str) -> String {
     let mut pieces: Vec<Piece> = segments
         .iter()
         .filter_map(|&segment| piece(segment, snapshot))
         .collect();
-
-    let right_width = right.width();
-    let reserve_right = !right.is_empty() && width >= right_width + MIN_GAP + MIN_LEFT_WIDTH;
-    if reserve_right {
-        fit(&mut pieces, width - right_width - MIN_GAP);
-    } else if width > 0 {
+    if width > 0 {
         fit(&mut pieces, width);
     }
 
@@ -160,7 +153,8 @@ pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &s
         }
         out.push_str(&piece.text.as_str().themed(piece.style).to_string());
     }
-    if reserve_right {
+    let right_width = right.width();
+    if width > 0 && !right.is_empty() && left_width + MIN_GAP + right_width <= width {
         out.push_str(&" ".repeat(width - left_width - right_width));
         out.push_str(&right.themed(AuraStyle::Muted).to_string());
     }
@@ -169,11 +163,11 @@ pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &s
 
 fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
     let (text, style) = match segment {
-        Segment::Model => (snapshot.model.clone()?, AuraStyle::Muted),
-        Segment::Cwd => (snapshot.cwd.clone()?, AuraStyle::Muted),
+        Segment::Model => (snapshot.model.clone()?, AuraStyle::StatusModel),
+        Segment::Cwd => (snapshot.cwd.clone()?, AuraStyle::StatusPath),
         Segment::Git => (
             format!("⎇ {}", snapshot.git_branch.as_deref()?),
-            AuraStyle::Muted,
+            AuraStyle::StatusGit,
         ),
         Segment::Context => context_piece(snapshot.context)?,
         Segment::Tokens => {
@@ -182,11 +176,11 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
             }
             (
                 format!(
-                    "↑{} ↓{}",
+                    "in {} / out {}",
                     compact(snapshot.prompt_tokens),
                     compact(snapshot.completion_tokens)
                 ),
-                AuraStyle::Muted,
+                AuraStyle::StatusTokens,
             )
         }
         Segment::Scratchpad => {
@@ -199,13 +193,13 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
                     compact(snapshot.scratchpad_intercepted),
                     compact(snapshot.scratchpad_extracted)
                 ),
-                AuraStyle::Muted,
+                AuraStyle::StatusScratch,
             )
         }
         Segment::Mcp => {
             let McpCounts { connected, total } = snapshot.mcp?;
             let style = if total == 0 || connected == total {
-                AuraStyle::Muted
+                AuraStyle::StatusMcp
             } else if connected == 0 {
                 AuraStyle::Error
             } else {
@@ -225,7 +219,7 @@ fn context_piece(context: ContextUsage) -> Option<(String, AuraStyle)> {
     match context {
         ContextUsage::Unknown => None,
         ContextUsage::Unbounded { used } => {
-            Some((format!("ctx {}", compact(used)), AuraStyle::Muted))
+            Some((format!("ctx {}", compact(used)), AuraStyle::Success))
         }
         ContextUsage::Bounded { used, limit } => {
             let limit = limit.get();
@@ -235,7 +229,7 @@ fn context_piece(context: ContextUsage) -> Option<(String, AuraStyle)> {
             } else if pct >= CONTEXT_WARN_PCT {
                 AuraStyle::Warning
             } else {
-                AuraStyle::Muted
+                AuraStyle::Success
             };
             Some((
                 format!(
@@ -475,7 +469,7 @@ mod tests {
         let line = strip_ansi(&render(&snapshot(), DEFAULT_SEGMENTS, 200, ""));
         assert_eq!(
             line,
-            "claude-sonnet-4-5 · ~/src/aura · ⎇ main · ctx ███░░░░░ 38% 76k/200k · ↑182k ↓41k · mcp 3/3"
+            "claude-sonnet-4-5 │ ~/src/aura │ ⎇ main │ ctx ███░░░░░ 38% 76k/200k │ in 182k / out 41k │ mcp 3/3"
         );
     }
 
@@ -487,7 +481,7 @@ mod tests {
             ..Snapshot::default()
         };
         let line = strip_ansi(&render(&snapshot, DEFAULT_SEGMENTS, 80, ""));
-        assert_eq!(line, "gpt-4o · ~/x");
+        assert_eq!(line, "gpt-4o │ ~/x");
     }
 
     #[test]
@@ -498,7 +492,7 @@ mod tests {
             80,
             "",
         ));
-        assert_eq!(line, "⎇ main · claude-sonnet-4-5");
+        assert_eq!(line, "⎇ main │ claude-sonnet-4-5");
     }
 
     #[test]
@@ -509,6 +503,17 @@ mod tests {
         };
         let line = strip_ansi(&render(&snapshot, &[Segment::Context], 80, ""));
         assert_eq!(line, "ctx 76k");
+    }
+
+    #[test]
+    fn tokens_are_labelled_in_and_out() {
+        let snapshot = Snapshot {
+            prompt_tokens: 182_000,
+            completion_tokens: 41_000,
+            ..Snapshot::default()
+        };
+        let line = strip_ansi(&render(&snapshot, &[Segment::Tokens], 80, ""));
+        assert_eq!(line, "in 182k / out 41k");
     }
 
     #[test]
@@ -534,6 +539,22 @@ mod tests {
     }
 
     #[test]
+    fn segments_take_priority_over_right_text() {
+        let snapshot = Snapshot {
+            model: Some("claude-sonnet-4-5".to_owned()),
+            git_branch: Some("main".to_owned()),
+            ..Snapshot::default()
+        };
+        let segments = [Segment::Model, Segment::Git];
+        // 26 columns of segments fit in 30; the 11-column hint does not.
+        let line = strip_ansi(&render(&snapshot, &segments, 30, "esc to stop"));
+        assert_eq!(line, "claude-sonnet-4-5 │ ⎇ main");
+        // Widen until the hint plus a two-column gap fits as well.
+        let line = strip_ansi(&render(&snapshot, &segments, 39, "esc to stop"));
+        assert_eq!(line, "claude-sonnet-4-5 │ ⎇ main  esc to stop");
+    }
+
+    #[test]
     fn right_text_dropped_when_too_narrow() {
         let snapshot = Snapshot {
             model: Some("model-name".to_owned()),
@@ -554,11 +575,11 @@ mod tests {
         let segments = [Segment::Model, Segment::Cwd, Segment::Git];
 
         let line = strip_ansi(&render(&snapshot, &segments, 40, ""));
-        assert_eq!(line, "gpt-4o · …/aura/crates/aura-cli · ⎇ main");
+        assert_eq!(line, "gpt-4o │ …/aura/crates/aura-cli │ ⎇ main");
         assert!(line.width() <= 40);
 
         let line = strip_ansi(&render(&snapshot, &segments, 24, ""));
-        assert_eq!(line, "gpt-4o · …/aura-cli");
+        assert_eq!(line, "gpt-4o │ …/aura-cli");
         assert!(line.width() <= 24);
 
         let line = strip_ansi(&render(&snapshot, &segments, 4, ""));
@@ -568,7 +589,7 @@ mod tests {
     #[test]
     fn unknown_width_renders_unconstrained() {
         let line = strip_ansi(&render(&snapshot(), DEFAULT_SEGMENTS, 0, "AURA, by Mezmo!"));
-        assert!(line.starts_with("claude-sonnet-4-5 · ~/src/aura"));
+        assert!(line.starts_with("claude-sonnet-4-5 │ ~/src/aura"));
         assert!(line.ends_with("mcp 3/3"));
     }
 
@@ -580,7 +601,7 @@ mod tests {
         };
         assert!(matches!(
             context_piece(bounded(69)),
-            Some((_, AuraStyle::Muted))
+            Some((_, AuraStyle::Success))
         ));
         assert!(matches!(
             context_piece(bounded(70)),
@@ -602,7 +623,7 @@ mod tests {
         };
         assert!(matches!(
             piece(Segment::Mcp, &mcp(3, 3)).map(|p| p.style),
-            Some(AuraStyle::Muted)
+            Some(AuraStyle::StatusMcp)
         ));
         assert!(matches!(
             piece(Segment::Mcp, &mcp(1, 3)).map(|p| p.style),
@@ -614,7 +635,7 @@ mod tests {
         ));
         assert!(matches!(
             piece(Segment::Mcp, &mcp(0, 0)).map(|p| p.style),
-            Some(AuraStyle::Muted)
+            Some(AuraStyle::StatusMcp)
         ));
     }
 
