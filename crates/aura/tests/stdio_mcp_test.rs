@@ -86,3 +86,61 @@ async fn test_stdio_mcp_connection_and_tool_execution() {
         "Tool result should contain echoed message. Got: {result}"
     );
 }
+
+/// `agent_info_with_tools` against a real server: the tools land on the
+/// matching server entry, spec-shaped, with the schemas the agent sees.
+#[tokio::test]
+async fn test_agent_info_with_tools_reports_discovered_stdio_tools() {
+    let binary_ok = std::process::Command::new("which")
+        .arg(EVERYTHING_BIN)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        binary_ok,
+        "{EVERYTHING_BIN} not found on PATH. \
+         Install with: npm install -g @modelcontextprotocol/server-everything@2026.1.26"
+    );
+
+    let config = aura_config::load_config_from_str(&format!(
+        r#"
+[agent]
+name = "stdio-info"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[mcp.servers.test_stdio]
+transport = "stdio"
+cmd = ["{EVERYTHING_BIN}"]
+args = ["stdio"]
+"#
+    ))
+    .expect("config should parse");
+
+    let info = aura::agent_info_with_tools(&config, None, std::time::Duration::from_secs(30)).await;
+
+    let servers = info.mcp_servers.expect("a current server projects Some");
+    let aura_events::McpServerOverview::Stdio { tools, .. } = &servers["test_stdio"] else {
+        panic!("expected a stdio server entry");
+    };
+    let tools = tools
+        .as_ref()
+        .expect("a connected server reports its tools");
+
+    let echo = tools
+        .iter()
+        .find(|tool| tool.name == "echo")
+        .expect("Expected 'echo' among the discovered tools");
+    assert!(
+        echo.input_schema.is_some(),
+        "the MCP spec requires inputSchema on every tool"
+    );
+
+    // The wire form uses the spec's camelCase, not aura's usual snake_case.
+    let json = serde_json::to_value(echo).expect("tool serializes");
+    assert!(json.get("inputSchema").is_some(), "{json}");
+    assert!(json.get("input_schema").is_none(), "{json}");
+}

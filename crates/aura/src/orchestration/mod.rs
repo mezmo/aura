@@ -66,7 +66,7 @@ pub use events::{OrchestratorEvent, RoutingMode};
 pub use factory::OrchestratorFactory;
 pub use observer_wrapper::ObserverWrapper;
 pub use orchestrator::Orchestrator;
-pub use overview::{agent_info, worker_overview};
+pub use overview::{agent_info, agent_info_with_tools, summarize_tools, worker_overview};
 pub use persistence::{
     ExecutionPersistence, RunManifest, RunStatus, TaskExecutionRecord, TaskSummary, ToolCallRecord,
     build_session_context, load_session_manifests,

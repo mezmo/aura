@@ -2,7 +2,11 @@
 //! `GET /aura/info` ([`AgentInfo`], [`WorkerOverview`]).
 
 use aura_config::{Config, McpServerConfig};
-use aura_events::{AgentInfo, McpServerOverview, WorkerOverview};
+use aura_events::{
+    AgentInfo, McpServerOverview, McpToolAnnotations, McpToolOverview, WorkerOverview,
+};
+use std::collections::HashMap;
+use std::time::Duration;
 
 pub fn agent_info(config: &Config) -> AgentInfo {
     AgentInfo {
@@ -24,6 +28,160 @@ pub fn agent_info(config: &Config) -> AgentInfo {
                 })
                 .unwrap_or_default(),
         ),
+    }
+}
+
+/// [`agent_info`] plus each server's live tool list, discovered by connecting
+/// to every configured MCP server and issuing `tools/list`.
+///
+/// `req_headers` feeds `headers_from_request` resolution, so the discovered
+/// tools are the ones this caller's credentials can see. Connecting is bounded
+/// by `timeout`, and every client — including spawned stdio children — is
+/// closed before returning.
+///
+/// A server sets `tools` only once it connects: one that fails, is never
+/// attempted, or is still connecting when `timeout` expires reports `None`
+/// rather than an empty list, so "no tools" stays distinguishable from "no
+/// answer".
+pub async fn agent_info_with_tools(
+    config: &Config,
+    req_headers: Option<&HashMap<String, String>>,
+    timeout: Duration,
+) -> AgentInfo {
+    let mut info = agent_info(config);
+    let Some(mut mcp_config) = config.mcp.clone() else {
+        return info;
+    };
+    crate::rig_builder::resolve_mcp_headers_in(&mut mcp_config, req_headers);
+
+    let discovered = discover_tools(&mcp_config, timeout).await;
+    if let Some(servers) = info.mcp_servers.as_mut() {
+        for (name, server) in servers.iter_mut() {
+            set_tools(server, discovered.get(name).cloned());
+        }
+    }
+    info
+}
+
+/// Connect to every server in `mcp_config` and collect the tools each reports,
+/// keyed by server name. Servers that did not connect are absent from the map.
+async fn discover_tools(
+    mcp_config: &aura_config::McpConfig,
+    timeout: Duration,
+) -> HashMap<String, Vec<McpToolOverview>> {
+    let manager = match tokio::time::timeout(
+        timeout,
+        crate::mcp::McpManager::initialize_from_config(mcp_config),
+    )
+    .await
+    {
+        Ok(Ok(manager)) => manager,
+        Ok(Err(e)) => {
+            tracing::warn!("MCP tool discovery for /aura/info failed: {e}");
+            return HashMap::new();
+        }
+        Err(_) => {
+            tracing::warn!(
+                "MCP tool discovery for /aura/info timed out after {}s",
+                timeout.as_secs()
+            );
+            return HashMap::new();
+        }
+    };
+
+    let per_server = manager
+        .server_info
+        .iter()
+        .filter(|(_, server)| matches!(server.status, crate::mcp::ConnectionStatus::Connected))
+        .map(|(name, _)| {
+            let tools = manager
+                .streamable_tools
+                .get(name)
+                .or_else(|| manager.sse_tools.get(name))
+                .or_else(|| manager.stdio_tools.get(name))
+                .map(|tools| tools.iter().map(tool_overview).collect())
+                .unwrap_or_default();
+            (name.clone(), tools)
+        })
+        .collect();
+
+    manager
+        .cancel_and_close_all("aura-info", "tool detail collected")
+        .await;
+    per_server
+}
+
+/// Project a discovered MCP tool into its wire form.
+///
+/// These are the values AURA holds, not the ones the server advertised:
+/// `McpManager::sanitize_mcp_tool` has already rewritten the name to the
+/// LLM-safe character set and, under `[mcp].sanitize_schemas`, rewritten the
+/// input schema. Publishing that form is what makes the output usable for
+/// governance — it names the tools AURA actually invokes with the schemas the
+/// model actually receives.
+///
+/// `icons` is dropped; everything else in the MCP `Tool` object carries over.
+fn tool_overview(tool: &rmcp::model::Tool) -> McpToolOverview {
+    McpToolOverview {
+        name: tool.name.to_string(),
+        title: tool.title.clone(),
+        description: tool.description.as_ref().map(|d| d.to_string()),
+        input_schema: Some(serde_json::Value::Object((*tool.input_schema).clone())),
+        output_schema: tool
+            .output_schema
+            .as_ref()
+            .map(|schema| serde_json::Value::Object((**schema).clone())),
+        annotations: tool
+            .annotations
+            .as_ref()
+            .map(|annotations| McpToolAnnotations {
+                title: annotations.title.clone(),
+                read_only_hint: annotations.read_only_hint,
+                destructive_hint: annotations.destructive_hint,
+                idempotent_hint: annotations.idempotent_hint,
+                open_world_hint: annotations.open_world_hint,
+            }),
+        meta: tool
+            .meta
+            .as_ref()
+            .map(|meta| serde_json::Value::Object(meta.0.clone())),
+    }
+}
+
+fn set_tools(server: &mut McpServerOverview, discovered: Option<Vec<McpToolOverview>>) {
+    match server {
+        McpServerOverview::Stdio { tools, .. }
+        | McpServerOverview::HttpStreamable { tools, .. }
+        | McpServerOverview::Sse { tools, .. } => *tools = discovered,
+        // `McpServerOverview` is #[non_exhaustive]; a transport added to the
+        // wire crate but not handled here simply carries no tools.
+        _ => {}
+    }
+}
+
+/// Reduce every discovered tool to the fields a listing needs, dropping the
+/// schemas that dominate the payload.
+pub fn summarize_tools(info: &mut AgentInfo) {
+    let Some(servers) = info.mcp_servers.as_mut() else {
+        return;
+    };
+    for server in servers.values_mut() {
+        let (McpServerOverview::Stdio { tools, .. }
+        | McpServerOverview::HttpStreamable { tools, .. }
+        | McpServerOverview::Sse { tools, .. }) = server
+        else {
+            continue;
+        };
+        let Some(tools) = tools.as_mut() else {
+            continue;
+        };
+        for tool in tools.iter_mut() {
+            *tool = McpToolOverview {
+                name: std::mem::take(&mut tool.name),
+                description: tool.description.take(),
+                ..McpToolOverview::default()
+            };
+        }
     }
 }
 
@@ -114,10 +272,14 @@ pub fn worker_overview(config: &Config) -> Vec<WorkerOverview> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_info, command_basename, sanitize_url, worker_overview};
+    use super::{
+        agent_info, agent_info_with_tools, command_basename, sanitize_url, summarize_tools,
+        worker_overview,
+    };
     use aura_config::load_config_from_str;
-    use aura_events::McpServerOverview;
+    use aura_events::{AgentInfo, McpServerOverview, McpToolOverview};
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     #[test]
     fn test_worker_overview_empty_when_orchestration_disabled() {
@@ -296,6 +458,130 @@ args = ["--api-key", "argsecret"]
         ] {
             assert!(!json.contains(secret), "leaked {secret}: {json}");
         }
+    }
+
+    /// Nothing about a dead server should make it look like it answered.
+    #[tokio::test]
+    async fn agent_info_with_tools_reports_no_tools_for_a_server_that_never_connects() {
+        let config = load_config_from_str(
+            r#"
+[agent]
+name = "unreachable"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+
+[mcp.servers.dead]
+transport = "http_streamable"
+url = "http://user:secret@127.0.0.1:9/mcp"
+description = "Dead server."
+headers = { authorization = "Bearer topsecret" }
+"#,
+        )
+        .expect("config should parse");
+
+        let info = agent_info_with_tools(&config, None, Duration::from_secs(5)).await;
+
+        // The config-derived projection is untouched, credentials included.
+        assert_eq!(info.id, "unreachable");
+        assert_eq!(
+            info.mcp_servers.as_ref().expect("projects Some")["dead"],
+            McpServerOverview::HttpStreamable {
+                url: "http://127.0.0.1:9".to_string(),
+                description: Some("Dead server.".to_string()),
+                tools: None,
+            },
+            "a server that never connected reports no tools, not an empty list"
+        );
+    }
+
+    /// An agent with no `[mcp]` table makes no connection attempt at all.
+    #[tokio::test]
+    async fn agent_info_with_tools_matches_agent_info_without_mcp() {
+        let config = load_config_from_str(
+            r#"
+[agent]
+name = "solo"
+system_prompt = "p"
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            agent_info_with_tools(&config, None, Duration::from_secs(5)).await,
+            agent_info(&config)
+        );
+    }
+
+    #[test]
+    fn summarize_tools_keeps_only_name_and_description() {
+        let full = McpToolOverview {
+            name: "list_incidents".to_string(),
+            title: Some("List Incidents".to_string()),
+            description: Some("List open incidents".to_string()),
+            input_schema: Some(serde_json::json!({ "type": "object" })),
+            output_schema: Some(serde_json::json!({ "type": "object" })),
+            annotations: Some(aura_events::McpToolAnnotations {
+                read_only_hint: Some(true),
+                ..Default::default()
+            }),
+            meta: Some(serde_json::json!({ "k": "v" })),
+        };
+        let mut info = AgentInfo {
+            id: "a".to_string(),
+            description: None,
+            model: "gpt-4o".to_string(),
+            workers: Vec::new(),
+            mcp_servers: Some(BTreeMap::from([
+                (
+                    "with-tools".to_string(),
+                    McpServerOverview::Sse {
+                        url: "https://mcp.example.com".to_string(),
+                        description: None,
+                        tools: Some(vec![full]),
+                    },
+                ),
+                (
+                    "no-tools".to_string(),
+                    McpServerOverview::Stdio {
+                        command: "fs-server".to_string(),
+                        description: None,
+                        tools: None,
+                    },
+                ),
+            ])),
+        };
+
+        summarize_tools(&mut info);
+
+        let servers = info.mcp_servers.expect("projects Some");
+        assert_eq!(
+            servers["with-tools"],
+            McpServerOverview::Sse {
+                url: "https://mcp.example.com".to_string(),
+                description: None,
+                tools: Some(vec![McpToolOverview {
+                    name: "list_incidents".to_string(),
+                    description: Some("List open incidents".to_string()),
+                    ..Default::default()
+                }]),
+            }
+        );
+        // A server carrying no tool list is left alone.
+        assert_eq!(
+            servers["no-tools"],
+            McpServerOverview::Stdio {
+                command: "fs-server".to_string(),
+                description: None,
+                tools: None,
+            }
+        );
     }
 
     #[test]
