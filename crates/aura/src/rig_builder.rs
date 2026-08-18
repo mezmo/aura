@@ -13,7 +13,7 @@ use crate::config::{AgentRuntimeConfig, WorkerSkills};
 use crate::error::BuilderError;
 use crate::hitl::PendingApprovals;
 use crate::streaming::StreamingAgent;
-use aura_config::{AgentSettings, Config, McpServerConfig};
+use aura_config::{AgentSettings, Config, McpConfig, McpServerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -210,12 +210,24 @@ fn resolve_mcp_headers(
     agent_config: &mut AgentRuntimeConfig,
     req_headers: Option<&HashMap<String, String>>,
 ) {
-    let empty = HashMap::new();
-    let req_headers = req_headers.unwrap_or(&empty);
-
     let Some(ref mut mcp_config) = agent_config.mcp else {
         return;
     };
+    resolve_mcp_headers_in(mcp_config, req_headers);
+}
+
+/// Resolve `headers_from_request` mappings on an [`McpConfig`] directly, for
+/// callers that hold one without a surrounding [`AgentRuntimeConfig`].
+///
+/// Static TOML `headers` are already loaded in each server's header map and
+/// serve as fallback when the mapped request header is absent. STDIO servers
+/// carry no headers and are skipped.
+pub fn resolve_mcp_headers_in(
+    mcp_config: &mut McpConfig,
+    req_headers: Option<&HashMap<String, String>>,
+) {
+    let empty = HashMap::new();
+    let req_headers = req_headers.unwrap_or(&empty);
 
     for (server_name, server_config) in mcp_config.servers.iter_mut() {
         let (server_headers, headers_from_request) = match server_config {
@@ -389,6 +401,35 @@ mod tests {
         let mut config = AgentRuntimeConfig::default(); // mcp is None
         resolve_mcp_headers(&mut config, None);
         assert!(config.mcp.is_none());
+    }
+
+    #[test]
+    fn resolves_headers_on_a_bare_mcp_config() {
+        let mut headers_from_request = HashMap::new();
+        headers_from_request.insert("authorization".to_string(), "x-incoming-auth".to_string());
+
+        let mut static_headers = HashMap::new();
+        static_headers.insert("x-static".to_string(), "kept".to_string());
+
+        let mut mcp_config = make_agent_config(static_headers, headers_from_request)
+            .mcp
+            .expect("fixture always sets mcp");
+
+        let mut req_headers = HashMap::new();
+        req_headers.insert("x-incoming-auth".to_string(), "dynamic-token".to_string());
+
+        resolve_mcp_headers_in(&mut mcp_config, Some(&req_headers));
+
+        let McpServerConfig::HttpStreamable { headers, .. } =
+            mcp_config.servers.get("test_server").unwrap()
+        else {
+            panic!("expected HttpStreamable");
+        };
+        assert_eq!(
+            headers.get("authorization"),
+            Some(&"dynamic-token".to_string())
+        );
+        assert_eq!(headers.get("x-static"), Some(&"kept".to_string()));
     }
 
     #[test]
