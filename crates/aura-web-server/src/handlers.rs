@@ -8,7 +8,7 @@ use aura::{
 use aura_events::{AgentInfo, ServerInfo};
 use axum::Json;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -1021,14 +1021,96 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// Ceiling on a single agent's MCP tool discovery, so one hung server can't
+/// hold an `/aura/info` request open indefinitely.
+const INFO_TOOL_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Query string for [`info`].
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct InfoQuery {
+    /// Comma-separated detail tokens; see [`ToolDetail::parse`].
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// How much MCP tool information `GET /aura/info` should gather.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDetail {
+    /// Config view only — no MCP server is contacted.
+    None,
+    /// Every field of the MCP `Tool` object, schemas included.
+    Full,
+    /// Tool names and descriptions.
+    Summary,
+}
+
+impl ToolDetail {
+    /// Read the `detail` query parameter.
+    ///
+    /// Tokens are comma-separated and trimmed; empty ones are ignored, so an
+    /// absent parameter and `detail=` both mean [`ToolDetail::None`].
+    /// `tools` outranks `tools:summary` when both appear, being a superset.
+    /// An unrecognized token is an error rather than a silent no-op — a
+    /// misspelled parameter should not look like a server with no tools.
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let mut detail = Self::None;
+        for token in raw.unwrap_or_default().split(',') {
+            match token.trim() {
+                "" => continue,
+                "tools" => detail = Self::Full,
+                "tools:summary" if detail != Self::Full => detail = Self::Summary,
+                "tools:summary" => {}
+                other => {
+                    return Err(format!(
+                        "unknown detail '{other}'; expected 'tools' or 'tools:summary'"
+                    ));
+                }
+            }
+        }
+        Ok(detail)
+    }
+}
+
 /// `GET /aura/info`: aura-native introspection. Off `/v1/` to keep the OpenAI surface clean.
-pub async fn info(State(state): State<Arc<AppState>>) -> Response {
-    let agents: Vec<AgentInfo> = state
-        .configs
-        .iter()
-        .filter(|config| !config.agent.hidden)
-        .map(aura::agent_info)
-        .collect();
+///
+/// `?detail=tools` (or `tools:summary`) additionally connects to every visible
+/// agent's MCP servers to list their tools, forwarding the caller's headers so
+/// the result reflects that caller's authorization. Agents are swept
+/// concurrently, but the response still costs a full round of MCP connections —
+/// callers that only need the config view should omit the parameter.
+pub async fn info(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<InfoQuery>,
+) -> Response {
+    let detail = match ToolDetail::parse(query.detail.as_deref()) {
+        Ok(detail) => detail,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, &message, "invalid_request_error");
+        }
+    };
+
+    let visible = state.configs.iter().filter(|config| !config.agent.hidden);
+
+    let agents: Vec<AgentInfo> = if detail == ToolDetail::None {
+        visible.map(aura::agent_info).collect()
+    } else {
+        // Convert HeaderMap to HashMap for framework-agnostic passing
+        let req_headers: HashMap<String, String> = headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
+            .collect();
+
+        let mut agents: Vec<AgentInfo> = futures_util::future::join_all(visible.map(|config| {
+            aura::agent_info_with_tools(config, Some(&req_headers), INFO_TOOL_DISCOVERY_TIMEOUT)
+        }))
+        .await;
+
+        if detail == ToolDetail::Summary {
+            agents.iter_mut().for_each(aura::summarize_tools);
+        }
+        agents
+    };
 
     Json(ServerInfo {
         default_agent: state.default_agent.clone(),
@@ -1901,7 +1983,7 @@ model = "gpt-4o-mini"
     #[tokio::test]
     async fn test_info_returns_agents_with_workers() {
         let state = make_info_state(vec![orch_info_config()], None);
-        let resp = info(State(state)).await;
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
         let info = parse_info_response(resp).await;
 
         assert_eq!(info.agents.len(), 1);
@@ -1927,7 +2009,10 @@ model = "gpt-4o-mini"
             )],
             None,
         );
-        let info = parse_info_response(info(State(state)).await).await;
+        let info = parse_info_response(
+            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+        )
+        .await;
 
         assert_eq!(
             info.agents[0].description.as_deref(),
@@ -1960,7 +2045,10 @@ url = "http://127.0.0.1:9"
             ],
             None,
         );
-        let info = parse_info_response(info(State(state)).await).await;
+        let info = parse_info_response(
+            info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await,
+        )
+        .await;
         let servers_of = |id: &str| {
             info.agents
                 .iter()
@@ -2002,12 +2090,123 @@ url = "http://127.0.0.1:9"
             ],
             Some("visible-agent"),
         );
-        let resp = info(State(state)).await;
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
         let info = parse_info_response(resp).await;
 
         let ids: Vec<_> = info.agents.iter().map(|agent| agent.id.as_str()).collect();
         assert_eq!(ids, ["visible-agent"]);
         assert_eq!(info.default_agent.as_deref(), Some("visible-agent"));
+    }
+
+    #[test]
+    fn tool_detail_parses_recognized_tokens() {
+        let parse = |raw: Option<&str>| ToolDetail::parse(raw);
+
+        // Absent and empty both mean "don't connect".
+        assert_eq!(parse(None), Ok(ToolDetail::None));
+        assert_eq!(parse(Some("")), Ok(ToolDetail::None));
+        assert_eq!(parse(Some(" , ")), Ok(ToolDetail::None));
+
+        assert_eq!(parse(Some("tools")), Ok(ToolDetail::Full));
+        assert_eq!(parse(Some(" tools ")), Ok(ToolDetail::Full));
+        assert_eq!(parse(Some("tools:summary")), Ok(ToolDetail::Summary));
+
+        // `tools` is a superset, so it wins in either order.
+        assert_eq!(parse(Some("tools,tools:summary")), Ok(ToolDetail::Full));
+        assert_eq!(parse(Some("tools:summary,tools")), Ok(ToolDetail::Full));
+
+        assert!(parse(Some("bogus")).is_err());
+        assert!(parse(Some("tools,bogus")).is_err());
+        // A near-miss is still rejected rather than silently ignored.
+        assert!(parse(Some("schemas")).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_info_rejects_unknown_detail_token() {
+        let state = make_info_state(vec![solo_info_config("solo")], None);
+        let resp = info(
+            State(state),
+            HeaderMap::new(),
+            Query(InfoQuery {
+                detail: Some("bogus".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("tools:summary"), "{body}");
+    }
+
+    /// Without `detail`, the response carries no `tools` key at all — the
+    /// wire shape is exactly what it was before the parameter existed.
+    #[tokio::test]
+    async fn test_info_omits_tools_without_detail() {
+        let state = make_info_state(
+            vec![info_config(
+                "dead-mcp",
+                "",
+                r#"
+[mcp.servers.dead]
+transport = "http_streamable"
+url = "http://127.0.0.1:9"
+"#,
+            )],
+            None,
+        );
+        let resp = info(State(state), HeaderMap::new(), Query(InfoQuery::default())).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let server = &body["agents"][0]["mcp_servers"]["dead"];
+        assert_eq!(server["transport"], "http_streamable");
+        assert!(server.get("tools").is_none(), "{body}");
+    }
+
+    /// An unreachable server reports no tools under either detail level, and
+    /// the config view survives intact.
+    #[tokio::test]
+    async fn test_info_detail_leaves_unreachable_server_without_tools() {
+        for detail in ["tools", "tools:summary"] {
+            let state = make_info_state(
+                vec![info_config(
+                    "dead-mcp",
+                    "",
+                    r#"
+[mcp.servers.dead]
+transport = "http_streamable"
+url = "http://127.0.0.1:9"
+"#,
+                )],
+                None,
+            );
+            let resp = info(
+                State(state),
+                HeaderMap::new(),
+                Query(InfoQuery {
+                    detail: Some(detail.to_string()),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{detail}");
+
+            let parsed = parse_info_response(resp).await;
+            assert_eq!(
+                parsed.agents[0].mcp_servers.as_ref().unwrap()["dead"],
+                aura_events::McpServerOverview::HttpStreamable {
+                    url: "http://127.0.0.1:9".to_string(),
+                    description: None,
+                    tools: None,
+                },
+                "{detail}"
+            );
+        }
     }
 
     // --- streaming / response builder tests ---
