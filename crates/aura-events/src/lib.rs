@@ -205,6 +205,9 @@ pub enum McpServerOverview {
 pub struct AgentInfo {
     /// Agent identifier — matches the `id` field in `/v1/models` (alias or name).
     pub id: String,
+    /// Short human-readable summary of what the agent does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// LLM model name (e.g., "gpt-4o").
     pub model: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -617,10 +620,10 @@ mod tests {
         .unwrap();
         let unknown = &old.agents[0];
         assert_eq!(unknown.mcp_servers, None);
-        assert!(serde_json::to_value(unknown)
-            .unwrap()
-            .get("mcp_servers")
-            .is_none());
+        assert_eq!(unknown.description, None);
+        let serialized = serde_json::to_value(unknown).unwrap();
+        assert!(serialized.get("mcp_servers").is_none());
+        assert!(serialized.get("description").is_none());
 
         // A populated config view round-trips through the standard keyed-map
         // shape; `description` is omitted when absent.

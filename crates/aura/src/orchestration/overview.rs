@@ -7,6 +7,7 @@ use aura_events::{AgentInfo, McpServerOverview, WorkerOverview};
 pub fn agent_info(config: &Config) -> AgentInfo {
     AgentInfo {
         id: config.agent_id().to_owned(),
+        description: config.agent.description.clone(),
         model: config.agent.llm.model_info().1.to_owned(),
         workers: worker_overview(config),
         // `Some(empty)` means this config has no servers; `None` is reserved
@@ -184,6 +185,35 @@ api_key = "k"
         assert_eq!(workers[0].model, None);
         assert_eq!(workers[1].model, Some("gpt-4o-mini".to_string()));
         assert_eq!(workers[2].model, None);
+    }
+
+    #[test]
+    fn agent_info_carries_the_configured_description() {
+        let config_with = |agent_fields: &str| {
+            load_config_from_str(&format!(
+                r#"
+[agent]
+name = "described"
+system_prompt = "p"
+{agent_fields}
+[agent.llm]
+provider = "openai"
+model = "gpt-4o"
+api_key = "k"
+"#
+            ))
+            .expect("config should parse")
+        };
+
+        assert_eq!(agent_info(&config_with("")).description, None);
+        assert_eq!(
+            agent_info(&config_with(
+                r#"description = "Triage production incidents""#
+            ))
+            .description
+            .as_deref(),
+            Some("Triage production incidents")
+        );
     }
 
     #[test]

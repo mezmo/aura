@@ -1008,7 +1008,9 @@ pub async fn info(State(state): State<Arc<AppState>>) -> Response {
 
 /// OpenAI-compatible model listing endpoint.
 /// Each model `id` maps to an agent's `alias` (if set) or `name` from the TOML config.
-/// Filters out `hidden` agents
+/// Filters out `hidden` agents. `description` is an additive extension of
+/// the OpenAI model object, absent unless `[agent].description` is set, so
+/// strict OpenAI clients can ignore it.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     let models: Vec<serde_json::Value> = state
         .configs
@@ -1021,12 +1023,16 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                 let (provider, _) = config.agent.llm.model_info();
                 provider.to_string()
             });
-            serde_json::json!({
+            let mut model = serde_json::json!({
                 "id": id,
                 "object": "model",
                 "created": created,
                 "owned_by": owned_by
-            })
+            });
+            if let Some(description) = &config.agent.description {
+                model["description"] = serde_json::Value::String(description.clone());
+            }
+            model
         })
         .collect();
 
@@ -1741,6 +1747,39 @@ model = "gpt-4o"
         assert_eq!(data[0]["id"], "visible-agent");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "openai");
+        assert!(data[0].get("description").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_models_includes_configured_description() {
+        let described = parse_config(
+            r#"
+[agent]
+name = "sre-agent"
+description = "Anthropic-backed SRE agent for production incidents"
+system_prompt = "You triage incidents."
+
+[agent.llm]
+provider = "openai"
+api_key = "test"
+model = "gpt-4o"
+"#,
+        );
+
+        let state = make_state(vec![described]);
+        let resp = list_models(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let data = json["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "sre-agent");
+        assert_eq!(
+            data[0]["description"],
+            "Anthropic-backed SRE agent for production incidents"
+        );
     }
 
     // --- info endpoint tests ---
@@ -1833,6 +1872,7 @@ model = "gpt-4o-mini"
         assert_eq!(info.agents.len(), 1);
         let agent = &info.agents[0];
         assert_eq!(agent.id, "orch");
+        assert_eq!(agent.description, None);
         assert_eq!(agent.model, "gpt-4o");
         assert_eq!(agent.workers.len(), 2);
         assert_eq!(agent.workers[0].name, "planner");
@@ -1840,6 +1880,24 @@ model = "gpt-4o-mini"
         assert_eq!(agent.workers[1].name, "writer");
         assert_eq!(agent.workers[1].model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(agent.mcp_servers, Some(std::collections::BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn test_info_carries_agent_description() {
+        let state = make_info_state(
+            vec![info_config(
+                "sre",
+                r#"description = "Triage production incidents""#,
+                "",
+            )],
+            None,
+        );
+        let info = parse_info_response(info(State(state)).await).await;
+
+        assert_eq!(
+            info.agents[0].description.as_deref(),
+            Some("Triage production incidents")
+        );
     }
 
     #[tokio::test]
