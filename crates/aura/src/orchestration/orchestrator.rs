@@ -3528,7 +3528,7 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Classify a task failure error string into a structured category.
     ///
     /// These are deterministic string matches against error messages produced by
-    /// our rig fork (mezmo/rig @ d7e9d92) and our own orchestrator code — never
+    /// our rig fork (mezmo/rig @ ffd9eb7) and our own orchestrator code — never
     /// against non-deterministic model output. Rig's `CompletionError::ProviderError(String)`
     /// flattens HTTP status codes into the error string, so string matching is
     /// the only classification path available without forking rig's error types.
