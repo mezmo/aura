@@ -476,13 +476,10 @@ impl TurnTally {
     }
 }
 
-/// Outcome of a failed planning call after the transient-retry loop.
+/// Failure outcome of [`Orchestrator::planning_stream_with_transient_retry`].
 enum PlanningCallError {
-    /// Transient provider error; the retry budget is exhausted.
     TransientExhausted { source: StreamError, retries: usize },
-    /// Context-window overflow; the caller adds the remediation suggestion.
     ContextOverflow,
-    /// Non-transient failure; never retried.
     Fatal(StreamError),
 }
 
@@ -1568,7 +1565,11 @@ impl Orchestrator {
     /// early-exit cannot observe a decision set by a failed stream. Transient
     /// provider errors are resent the same prompt after an exponential backoff
     /// governed by `[orchestration.retry]`; the conversation is never touched
-    /// here because the resent prompt is identical to the failed one.
+    /// here because the resent prompt is identical to the failed one. Each
+    /// attempt gets a fresh `per_call_timeout_secs` budget; when that timeout
+    /// is nonzero, one coordinator planning call is bounded by
+    /// `(max_retries + 1) × per_call_timeout_secs` plus the cumulative
+    /// backoff.
     async fn planning_stream_with_transient_retry(
         &self,
         agent: &Agent,

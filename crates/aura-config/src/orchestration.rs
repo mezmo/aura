@@ -157,9 +157,7 @@ impl Default for TimeoutsConfig {
 /// Retry configuration for the orchestration planning loop.
 ///
 /// The schedule is local to aura-config: it does not reuse rig's
-/// `ExponentialBackoff` (aura-config stays free of rig-core) and is
-/// independent of `RetryHint`, which governs MCP tool-error retries for a
-/// different consumer.
+/// `ExponentialBackoff` (aura-config stays free of rig-core).
 ///
 /// # Example
 ///
@@ -199,10 +197,7 @@ impl RetryConfig {
     ///
     /// Retry 1 uses the base delay; each subsequent retry doubles the
     /// previous delay, capped at `max_delay_ms`. Saturating arithmetic — a
-    /// huge `retry_num` returns the cap without panicking. Each retry is a
-    /// fresh `per_call_timeout_secs` budget, so one coordinator planning call
-    /// is bounded by `(max_retries + 1) × per_call_timeout_secs` plus the
-    /// cumulative backoff.
+    /// huge `retry_num` returns the cap without panicking.
     pub fn delay_for_retry(&self, retry_num: usize) -> std::time::Duration {
         // Multiplier is 2^(retry_num - 1): retry 1 -> base, each subsequent doubles.
         let exponent = retry_num.saturating_sub(1).min(128);
