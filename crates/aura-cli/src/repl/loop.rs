@@ -33,14 +33,15 @@ use crate::ui::prompt::{
     last_mid_stream_history_entry, load_and_restore_sse_events, lock_term,
     overwrite_orch_task_header_unlocked, prepare_input_line, print_fields_tree,
     print_tool_call_expanded, print_user_echo, print_welcome_state_animated, push_display_event,
-    push_mid_stream_history, push_sse_event, random_bullet_color, rebuild_status_bar,
-    redraw_input_frame, replay_event_log_global, reset_ctrlc_state, reset_input_geometry,
-    restore_terminal_mode, seed_model_cache, seed_status_bar_tokens, set_context_window_usage,
-    set_expanded_output, set_mid_stream_history, set_noncanonical_noecho, set_processing,
-    set_readline_active, set_selected_model, set_startup_status, set_status_bar_tokens,
-    set_stream_conv_dir, set_welcome_state, setup_terminal, stop_and_clear_animation,
-    styled_prompt, take_pending_command, take_queued_input, task_color_for, text_lines,
-    update_status_bar, update_status_bar_unlocked, with_event_log, with_event_log_mut,
+    push_mid_stream_history, push_sse_event, random_bullet_color, redraw_input_frame,
+    replay_event_log_global, reset_ctrlc_state, reset_input_geometry, restore_terminal_mode,
+    seed_model_cache, seed_status_bar_tokens, set_context_used, set_context_window_usage,
+    set_expanded_output, set_mcp_counts, set_mid_stream_history, set_noncanonical_noecho,
+    set_processing, set_readline_active, set_selected_model, set_session_info, set_startup_status,
+    set_status_bar_tokens, set_stream_conv_dir, set_welcome_state, setup_terminal,
+    stop_and_clear_animation, styled_prompt, take_pending_command, take_queued_input,
+    task_color_for, text_lines, update_status_bar, update_status_bar_unlocked, with_event_log,
+    with_event_log_mut,
 };
 use crate::ui::welcome::WelcomeState;
 
@@ -112,9 +113,6 @@ impl ResizeWatcher {
                 if width == drawn_width {
                     continue;
                 }
-                // Re-pad the status to the new width before redrawing so it
-                // doesn't wrap (data-only; no lock needed).
-                rebuild_status_bar();
                 let _term = lock_term();
                 // Re-check under the lock: a turn may have started between the
                 // signal and acquiring the terminal write lock.
@@ -1960,8 +1958,6 @@ pub fn run_repl(
                                     last_compact_prompt_threshold += 2_000_000;
                                 }
                                 compact_hint_pending = true;
-                                // Show "Context left: N%" in the status bar from now on
-                                crate::ui::prompt::set_auto_compact_ceiling(8_000_000);
                             }
                         }
                     }
@@ -2449,6 +2445,11 @@ impl StreamHandler for ReplStreamHandler {
         prepare_input_line(&self.input_buf, Some(&self.cancel));
     }
 
+    fn on_tool_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+        set_context_used(prompt_tokens + completion_tokens);
+        update_status_bar();
+    }
+
     fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
         set_status_bar_tokens(prompt_tokens, completion_tokens);
         update_status_bar();
@@ -2759,18 +2760,33 @@ impl StreamHandler for ReplStreamHandler {
     }
 
     fn on_orchestrator_event(&mut self, event_name: &str, val: &serde_json::Value) {
-        // Per-turn MCP connection status. Surfaced two ways:
-        //  1. Persistent status notices below the token line, rendered when
+        if event_name == event_names::SESSION_INFO {
+            if let Some(model) = val.get("model").and_then(|m| m.as_str()) {
+                set_session_info(
+                    model.to_owned(),
+                    val.get("model_context_limit").and_then(|l| l.as_u64()),
+                );
+                update_status_bar();
+            }
+            return;
+        }
+
+        // Per-turn MCP connection status. Surfaced three ways:
+        //  1. The `mcp` status line segment (connected/total tally).
+        //  2. Persistent status notices below the status line, rendered when
         //     this turn's frame is redrawn at turn end (data-only).
-        //  2. Immediately in the scrollback, so the user can react — e.g. stop
+        //  3. Immediately in the scrollback, so the user can react — e.g. stop
         //     a doomed run — without waiting for the turn to finish.
         if event_name == event_names::MCP_STATUS {
+            if let Some(counts) = crate::api::mcp_status::counts_from_event(val) {
+                set_mcp_counts(counts);
+            }
             let notices = crate::api::mcp_status::notices_from_event(val);
             if notices.is_empty() {
                 return;
             }
 
-            // (1) Persistent status section.
+            // (2) Persistent status section.
             for notice in &notices {
                 // Prefixes are padded so message text aligns
                 // ("error:   " / "warning: ").
@@ -2783,7 +2799,7 @@ impl StreamHandler for ReplStreamHandler {
                 crate::ui::prompt::add_turn_notice(style, line);
             }
 
-            // (2) Immediate scrollback line(s). Mirror the on_tool_complete
+            // (3) Immediate scrollback line(s). Mirror the on_tool_complete
             // dance: stop the spinner, print above the frame, then restart
             // "Thinking" so feedback continues until the next event/response.
             let had_ptw = if let Ok(mut guard) = self.post_tool_wave.lock() {

@@ -135,7 +135,9 @@ struct Piece {
 /// `width` columns, with `right` right-aligned when there is room.
 ///
 /// Segments with nothing to show are omitted. When the line is too wide,
-/// the cwd is tail-truncated first, then trailing segments are dropped.
+/// the cwd is tail-truncated first, then trailing segments are dropped. A
+/// `width` of 0 means the terminal size is unknown; the segments are then
+/// rendered unconstrained and `right` is omitted.
 pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &str) -> String {
     let mut pieces: Vec<Piece> = segments
         .iter()
@@ -144,12 +146,11 @@ pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &s
 
     let right_width = right.width();
     let reserve_right = !right.is_empty() && width >= right_width + MIN_GAP + MIN_LEFT_WIDTH;
-    let available = if reserve_right {
-        width - right_width - MIN_GAP
-    } else {
-        width
-    };
-    fit(&mut pieces, available);
+    if reserve_right {
+        fit(&mut pieces, width - right_width - MIN_GAP);
+    } else if width > 0 {
+        fit(&mut pieces, width);
+    }
 
     let left_width = joined_width(&pieces);
     let mut out = String::new();
@@ -562,6 +563,13 @@ mod tests {
 
         let line = strip_ansi(&render(&snapshot, &segments, 4, ""));
         assert_eq!(line, "gpt…");
+    }
+
+    #[test]
+    fn unknown_width_renders_unconstrained() {
+        let line = strip_ansi(&render(&snapshot(), DEFAULT_SEGMENTS, 0, "AURA, by Mezmo!"));
+        assert!(line.starts_with("claude-sonnet-4-5 · ~/src/aura"));
+        assert!(line.ends_with("mcp 3/3"));
     }
 
     #[test]

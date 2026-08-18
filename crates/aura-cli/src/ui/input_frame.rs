@@ -16,10 +16,7 @@ use super::state::{
     CURSOR_ROW, FORCE_REPAINT, FRAME_LINES, INPUT_LINES, LAST_TERM_WIDTH, PROCESSING, QUEUED_INPUT,
     QUEUED_WAVE_POS, STATUS_ROWS, lock_term, status_rows, term_size,
 };
-use super::status_bar::{
-    desired_status_rows, get_effective_status, print_status_line, set_status_bar,
-    set_status_with_right_text, status_is_prestyled,
-};
+use super::status_bar::{desired_status_rows, get_effective_status, print_status_line};
 use super::stream_panel::{render_stream_panel_in_place, stream_panel_rows};
 
 const PROMPT_COLS: usize = 2; // "❯ " occupies 2 display columns
@@ -124,8 +121,6 @@ fn adjust_frame_for_line_change(old_lines: u16, new_lines: u16, old_cursor_row: 
     let _ = execute!(stdout, terminal::Clear(terminal::ClearType::CurrentLine));
     print!("{styled_border}");
 
-    let hint_active = status_is_prestyled();
-
     for i in 0..sr as usize {
         let _ = execute!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0));
         let _ = execute!(stdout, terminal::Clear(terminal::ClearType::CurrentLine));
@@ -133,7 +128,7 @@ fn adjust_frame_for_line_change(old_lines: u16, new_lines: u16, old_cursor_row: 
             let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
             print!("{}", render_queued_wave(&queued, wave_pos));
         } else if let Some(line) = status_lines.get(i) {
-            print_status_line(line, hint_active);
+            print_status_line(line);
         }
     }
 
@@ -151,7 +146,6 @@ fn adjust_frame_for_line_change(old_lines: u16, new_lines: u16, old_cursor_row: 
 
 /// Set up the terminal.
 pub fn setup_terminal() {
-    set_status_bar(set_status_with_right_text("", "AURA, by Mezmo!"));
     let (w, _) = term_size();
     LAST_TERM_WIDTH.store(w, Ordering::Relaxed);
     println!();
@@ -183,7 +177,6 @@ pub fn redraw_input_frame() {
     let sr = desired_status_rows();
     STATUS_ROWS.store(sr, Ordering::Relaxed);
     let status_lines = get_effective_status();
-    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
@@ -200,18 +193,8 @@ pub fn redraw_input_frame() {
                 let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
                 print!("{}", render_queued_wave(&queued, wave_pos));
             }
-        } else if let Some(line) = status_lines.get(i) {
-            if !line.is_empty() {
-                if hint_active {
-                    println!("{line}");
-                } else {
-                    println!("{}", line.as_str().themed(AuraStyle::Muted));
-                }
-            } else {
-                println!();
-            }
         } else {
-            println!();
+            println!("{}", status_lines.get(i).map_or("", String::as_str));
         }
     }
     // Pre-allocate space for the stream panel by printing blank lines.
@@ -331,7 +314,6 @@ pub fn handle_resize_frame(old_width: u16) {
     print!("{styled_border}");
 
     let status_lines = get_effective_status();
-    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
@@ -341,7 +323,7 @@ pub fn handle_resize_frame(old_width: u16) {
             let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
             print!("{}", render_queued_wave(&queued, wave_pos));
         } else if let Some(line) = status_lines.get(i) {
-            print_status_line(line, hint_active);
+            print_status_line(line);
         }
     }
 
@@ -363,7 +345,6 @@ pub fn resize_status_area(old_sr: u16, new_sr: u16) {
     let n = FRAME_LINES.load(Ordering::Relaxed);
     let r = CURSOR_ROW.load(Ordering::Relaxed);
     let status_lines = get_effective_status();
-    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
@@ -399,7 +380,7 @@ pub fn resize_status_area(old_sr: u16, new_sr: u16) {
                 let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
                 print!("{}", render_queued_wave(&queued, wave_pos));
             } else if let Some(line) = status_lines.get(i) {
-                print_status_line(line, hint_active);
+                print_status_line(line);
             }
         }
 
@@ -436,7 +417,7 @@ pub fn resize_status_area(old_sr: u16, new_sr: u16) {
             let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
             print!("{}", render_queued_wave(&queued, wave_pos));
         } else if let Some(line) = status_lines.get(i) {
-            print_status_line(line, hint_active);
+            print_status_line(line);
         }
     }
 
@@ -489,7 +470,6 @@ pub(crate) fn collapse_two_lines_above_frame() {
     let border: String = "─".repeat(width as usize);
     let styled_border = border.themed(AuraStyle::Connector);
     let status_lines = get_effective_status();
-    let hint_active = status_is_prestyled();
     let queued = QUEUED_INPUT.lock().map(|g| g.clone()).unwrap_or_default();
     let show_queued = PROCESSING.load(Ordering::Relaxed) && !queued.is_empty();
 
@@ -509,7 +489,7 @@ pub(crate) fn collapse_two_lines_above_frame() {
             let wave_pos = QUEUED_WAVE_POS.lock().map(|g| *g).unwrap_or(0.0);
             print!("{}", render_queued_wave(&queued, wave_pos));
         } else if let Some(line) = status_lines.get(i) {
-            print_status_line(line, hint_active);
+            print_status_line(line);
         }
     }
     // Clear the 2 orphan rows left by collapsing the animation lines.

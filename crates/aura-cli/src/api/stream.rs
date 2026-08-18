@@ -89,6 +89,10 @@ pub trait StreamHandler {
     ) {
     }
 
+    /// Called with (prompt_tokens, completion_tokens) from `aura.tool_usage`
+    /// events, which report one LLM call's usage mid-turn.
+    fn on_tool_usage(&mut self, _prompt_tokens: u64, _completion_tokens: u64) {}
+
     /// Called for `aura.reasoning` events, with (content, agent_id, fields).
     fn on_reasoning(
         &mut self,
@@ -283,7 +287,14 @@ where
                     }
                 }
                 event_names::TOOL_USAGE => {
-                    // Silently skip — usage is tracked via aura.usage at stream end
+                    if let Ok(AuraStreamEvent::ToolUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        ..
+                    }) = serde_json::from_str::<AuraStreamEvent>(&event.data)
+                    {
+                        handler.on_tool_usage(prompt_tokens, completion_tokens);
+                    }
                 }
                 event_names::REASONING => {
                     // Parse the raw payload into a BTreeMap so the consumer
@@ -477,6 +488,7 @@ mod tests {
         tools_started: Vec<(String, String)>,
         tools_completed: Vec<(String, String, Option<String>)>,
         usages: Vec<(u64, u64)>,
+        tool_usages: Vec<(u64, u64)>,
         reasoning: Vec<(String, String)>,
         raw_events: Vec<(String, String)>,
         orchestrator_events: Vec<(String, serde_json::Value)>,
@@ -517,6 +529,9 @@ mod tests {
         }
         fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
             self.usages.push((prompt_tokens, completion_tokens));
+        }
+        fn on_tool_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
+            self.tool_usages.push((prompt_tokens, completion_tokens));
         }
         fn on_reasoning(
             &mut self,
@@ -1019,17 +1034,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aura_tool_usage_silently_skipped() {
-        let data = serde_json::json!({"tool_ids": ["c1"], "prompt_tokens": 10});
+    async fn aura_tool_usage_callback() {
+        let data = serde_json::json!({
+            "tool_ids": ["c1"],
+            "prompt_tokens": 18777,
+            "completion_tokens": 500,
+            "total_tokens": 19277,
+            "session_id": "s1"
+        });
         let events = vec![
             sse(event_names::TOOL_USAGE, &data.to_string()),
             sse("", "[DONE]"),
         ];
         let (_, caps) = run_stream(events).await;
-        // tool_usage is explicitly skipped — only raw_event should fire
+        assert_eq!(caps.tool_usages, vec![(18777, 500)]);
+        // Mid-turn usage must not feed the end-of-stream usage callback.
         assert!(caps.usages.is_empty());
         assert!(caps.orchestrator_events.is_empty());
-        // But it IS a named event, so raw_event should have captured it
+        // It IS a named event, so raw_event should have captured it.
         assert_eq!(caps.raw_events.len(), 1);
     }
 
