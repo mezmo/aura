@@ -23,6 +23,7 @@ const ENV_TEMPLATE_PATTERN: &str =
 pub fn config_schema() -> Value {
     let schema = schemars::schema_for!(crate::Config);
     let mut value = serde_json::to_value(schema).expect("schema serializes to JSON");
+    for_each_schema(&mut value, &mut collapse_nullable);
     for_each_schema(&mut value, &mut widen_template_strings);
     for_each_schema(&mut value, &mut one_of_to_any_of);
     close_schemas(&mut value, false);
@@ -64,6 +65,38 @@ fn for_each_schema<F: FnMut(&mut Map<String, Value>)>(value: &mut Value, f: &mut
         }
     }
     f(map);
+}
+
+/// TOML cannot express `null`, so the nullable wrappers schemars emits for
+/// `Option` fields (`anyOf` with a null branch, `type` arrays with "null")
+/// never admit anything a config file can contain; they only obscure
+/// validator errors ("not valid under anyOf" instead of the offending key)
+/// and editor completion. Collapse them to the non-null schema.
+fn collapse_nullable(map: &mut Map<String, Value>) {
+    if let Some(Value::Array(branches)) = map.get("anyOf")
+        && branches.len() == 2
+        && let Some(null_pos) = branches
+            .iter()
+            .position(|b| b.get("type") == Some(&json!("null")))
+    {
+        let Some(Value::Array(mut branches)) = map.remove("anyOf") else {
+            unreachable!("checked above");
+        };
+        branches.remove(null_pos);
+        if let Value::Object(branch) = branches.remove(0) {
+            for (key, value) in branch {
+                map.entry(key).or_insert(value);
+            }
+        }
+    }
+    if let Some(Value::Array(types)) = map.get_mut("type")
+        && types.len() == 2
+        && let Some(null_pos) = types.iter().position(|t| t == "null")
+    {
+        types.remove(null_pos);
+        let only = types.remove(0);
+        map.insert("type".to_owned(), only);
+    }
 }
 
 /// Rewrite a value-constrained string schema (`enum`/`const`/`pattern`) into

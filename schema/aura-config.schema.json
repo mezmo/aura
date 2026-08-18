@@ -6,10 +6,7 @@
       "properties": {
         "alias": {
           "default": null,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "client_tool_filter": {
           "default": null,
@@ -17,10 +14,7 @@
           "items": {
             "type": "string"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         },
         "context": {
           "default": [],
@@ -85,18 +79,12 @@
           "items": {
             "type": "string"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         },
         "model_owner": {
           "default": null,
           "description": "Override the `owned_by` field in /v1/models responses.\nWhen omitted, defaults to the underlying LLM provider (e.g. \"openai\", \"anthropic\").",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "name": {
           "type": "string"
@@ -130,20 +118,10 @@
           "description": "Nudge the agent to start wrapping up when this many turns remain\nbefore the turn-depth limit. `None` disables wrap-up nudging.",
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "scratchpad": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ScratchpadConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/ScratchpadConfig",
           "default": null,
           "description": "Agent-level scratchpad config. Workers inherit this unless they\nprovide `[orchestration.worker.<name>.scratchpad]`."
         },
@@ -162,10 +140,7 @@
           "description": "Maximum depth of tool calls per turn (default: 5, set to 0 to disable)",
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         }
       },
       "required": [
@@ -188,18 +163,12 @@
         "memory_dir": {
           "default": null,
           "description": "Optional base directory for execution persistence and plan storage.\n\nStructure: `<memory_dir>/<run_id>/iteration-{n}/...`\nIf not set, execution persistence is disabled.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "memory_path": {
           "default": null,
           "description": "Optional base directory for execution persistence and plan storage.\n\nStructure: `<memory_dir>/<run_id>/iteration-{n}/...`\nIf not set, execution persistence is disabled.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "persistence_drain_timeout_ms": {
           "default": 2000,
@@ -347,10 +316,7 @@
             "base_url": {
               "default": null,
               "description": "Custom API endpoint for OpenAI-compatible embedding servers",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "model": {
               "type": "string"
@@ -384,10 +350,7 @@
             "profile": {
               "default": null,
               "description": "AWS profile name (optional, uses default credentials if not specified)",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "provider": {
               "anyOf": [
@@ -455,29 +418,20 @@
             },
             "base_url": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "context_window": {
               "default": null,
               "description": "Context window size in tokens.",
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "max_tokens": {
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "model": {
               "type": "string"
@@ -495,24 +449,14 @@
               ]
             },
             "reasoning_effort": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ReasoningEffort"
-                },
-                {
-                  "type": "null"
-                }
-              ],
+              "$ref": "#/$defs/ReasoningEffort",
               "default": null
             },
             "temperature": {
               "default": null,
               "description": "Controls the randomness and creativity of the llm",
               "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
+              "type": "number"
             }
           },
           "required": [
@@ -534,29 +478,20 @@
             },
             "base_url": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "context_window": {
               "default": null,
               "description": "Context window size in tokens.",
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "max_tokens": {
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "model": {
               "type": "string"
@@ -577,10 +512,7 @@
               "default": null,
               "description": "Controls the randomness and creativity of the llm",
               "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
+              "type": "number"
             }
           },
           "required": [
@@ -602,19 +534,13 @@
               "description": "Context window size in tokens.",
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "max_tokens": {
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "model": {
               "type": "string"
@@ -622,10 +548,7 @@
             "profile": {
               "default": null,
               "description": "AWS profile name (optional, uses default credentials if not specified)",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "provider": {
               "anyOf": [
@@ -645,10 +568,7 @@
             "temperature": {
               "default": null,
               "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
+              "type": "number"
             }
           },
           "required": [
@@ -670,29 +590,20 @@
             },
             "base_url": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "context_window": {
               "default": null,
               "description": "Context window size in tokens.",
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "max_tokens": {
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "model": {
               "type": "string"
@@ -713,10 +624,7 @@
               "default": null,
               "description": "Controls the randomness and creativity of the llm",
               "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
+              "type": "number"
             }
           },
           "required": [
@@ -735,20 +643,14 @@
             },
             "base_url": {
               "default": "http://localhost:11434",
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "context_window": {
               "default": null,
               "description": "Context window size in tokens.",
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "fallback_tool_parsing": {
               "default": false,
@@ -759,10 +661,7 @@
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "model": {
               "type": "string"
@@ -783,10 +682,7 @@
               "default": null,
               "description": "Controls the randomness and creativity of the llm",
               "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
+              "type": "number"
             }
           },
           "required": [
@@ -806,28 +702,19 @@
             },
             "base_url": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "context_window": {
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "max_tokens": {
               "default": null,
               "format": "uint64",
               "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
+              "type": "integer"
             },
             "model": {
               "type": "string"
@@ -847,10 +734,7 @@
             "temperature": {
               "default": null,
               "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
+              "type": "number"
             }
           },
           "required": [
@@ -918,10 +802,7 @@
             },
             "description": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "env": {
               "additionalProperties": {
@@ -962,10 +843,7 @@
           "properties": {
             "description": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "headers": {
               "additionalProperties": {
@@ -1016,10 +894,7 @@
           "properties": {
             "description": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "headers": {
               "additionalProperties": {
@@ -1081,14 +956,7 @@
           "type": "boolean"
         },
         "artifacts": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ArtifactsConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/ArtifactsConfig",
           "default": null
         },
         "coordinator_vector_stores": {
@@ -1134,82 +1002,51 @@
         },
         "memory_dir": {
           "default": null,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "memory_path": {
           "default": null,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "persistence_drain_timeout_ms": {
           "default": null,
           "format": "uint64",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "result_artifact_threshold": {
           "default": null,
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "result_summary_length": {
           "default": null,
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "session_history_turns": {
           "default": null,
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "timeouts": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeoutsConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/TimeoutsConfig",
           "default": null
         },
         "tool_output_artifact_threshold": {
           "default": null,
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "tool_output_duration_threshold_ms": {
           "default": null,
           "format": "uint64",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "tools_in_planning": {
           "$ref": "#/$defs/ToolVisibility",
@@ -1224,10 +1061,7 @@
         },
         "worker_system_prompt": {
           "default": null,
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         }
       },
       "type": "object"
@@ -1473,10 +1307,7 @@
             },
             "profile": {
               "default": null,
-              "type": [
-                "string",
-                "null"
-              ]
+              "type": "string"
             },
             "region": {
               "type": "string"
@@ -1507,10 +1338,7 @@
         "context_prefix": {
           "default": null,
           "description": "Optional context string describing what the vector store contains (for better LLM guidance)",
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string"
         },
         "name": {
           "description": "Unique name to identify this vector store",
@@ -1545,14 +1373,7 @@
           "type": "string"
         },
         "llm": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LlmConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/LlmConfig",
           "default": null,
           "description": "Optional per-worker LLM override.\n\nWhen `Some`, the worker runs with this LLM config instead of inheriting\n`[agent.llm]`. The resolved `context_window` drives per-worker budget\nmath (e.g. scratchpad sizing)."
         },
@@ -1562,36 +1383,19 @@
           "items": {
             "type": "string"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         },
         "preamble": {
           "description": "System prompt for this worker (replaces generic worker preamble).\n\nThis is the complete system prompt - it does NOT use the worker_preamble.md template.\nFor specialized workers, provide domain-specific instructions here.",
           "type": "string"
         },
         "scratchpad": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ScratchpadConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/ScratchpadConfig",
           "default": null,
           "description": "Per-worker override of `[agent.scratchpad]`. Parsed from\n`[orchestration.worker.<name>.scratchpad]`."
         },
         "skills": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SkillsConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
+          "$ref": "#/$defs/SkillsConfig",
           "default": null,
           "description": "Per-worker skill sources. Parsed from `[orchestration.worker.<name>.skills]`.\n`None` inherits `[agent.skills]`; an explicit empty list disables skills\nfor this worker; a non-empty list replaces the agent's skills entirely\n(no merging)."
         },
@@ -1600,10 +1404,7 @@
           "description": "Max tool-calling turns for this worker.\n\nControls how many Rig ReAct turns (tool calls) a worker can make\nper task execution. Overrides `[agent].turn_depth`. Falls back to\n`[agent].turn_depth` → `DEFAULT_MAX_DEPTH` if not set.",
           "format": "uint",
           "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+          "type": "integer"
         },
         "vector_stores": {
           "default": [],
@@ -1629,56 +1430,25 @@
       "$ref": "#/$defs/AgentConfig"
     },
     "hitl": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/HitlConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
+      "$ref": "#/$defs/HitlConfig",
       "default": null,
       "description": "Human-in-the-loop approval gating. `None` (no `[hitl]` table) disables\nit; presence of the table is the enable bit."
     },
     "mcp": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/McpConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/McpConfig"
     },
     "memory_dir": {
       "default": null,
       "description": "Top-level persistence directory shared by scratchpad and orchestration\nartifacts. `[orchestration.artifacts].memory_dir` is honored as a\nlegacy fallback.",
-      "type": [
-        "string",
-        "null"
-      ]
+      "type": "string"
     },
     "orchestration": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/OrchestrationConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
+      "$ref": "#/$defs/OrchestrationConfig",
       "default": null,
       "description": "Orchestration mode configuration (multi-agent workflows)"
     },
     "tools": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ToolsConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/ToolsConfig"
     },
     "vector_stores": {
       "default": [],
