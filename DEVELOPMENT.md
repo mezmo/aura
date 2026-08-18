@@ -61,9 +61,15 @@ aura/
 │   ├── reference.toml       # Complete annotated configuration
 │   ├── minimal/             # Bare minimum per-provider configs
 │   └── complete/            # Full agent composition examples
+├── schema/                  # Generated JSON Schema for the config TOML surface
 ├── scripts/                 # CI and utility scripts
 └── tests/                   # Integration test fixtures and helpers
 ```
+
+`schema/aura-config.schema.json` is generated from the `aura-config` types
+(`aura_config::schema::config_schema()`); after changing config structs, run
+`AURA_UPDATE_SCHEMA=1 cargo test -p aura-config schema_file_up_to_date` to
+regenerate it. The `schema_file_up_to_date` test fails CI when it drifts.
 
 ## Make Targets
 

@@ -1,0 +1,1697 @@
+{
+  "$defs": {
+    "AgentConfig": {
+      "additionalProperties": false,
+      "description": "Agent configuration (TOML `[agent]` table shape).\n\nThis is the TOML-facing view of the agent config. The runtime\n`AgentRuntimeConfig` in the `aura` crate extracts a subset (`AgentSettings`)\nfor agent construction.",
+      "properties": {
+        "alias": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_tool_filter": {
+          "default": null,
+          "description": "Glob patterns selecting which client-side tools this agent can call.\n`None` or empty means all client tools are available when\n`enable_client_tools = true`.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "context": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "description": "Creation timestamp in milliseconds since epoch (defaults to current time)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enable_client_tools": {
+          "default": false,
+          "description": "Whether this agent (single-agent or orchestration coordinator) may\ninvoke client-side tools advertised on the request. When false\n(default), client tools are not attached even if the request\nsupplied them.",
+          "type": "boolean"
+        },
+        "hidden": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "true",
+                    "false"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            }
+          ],
+          "default": false,
+          "description": "Indicates an agent should be hidden from a models list endpoint.\nUseful when a model is not ready to be  or should only be invoked\nby known callers (default: false)"
+        },
+        "llm": {
+          "$ref": "#/$defs/LlmConfig",
+          "default": {
+            "additional_params": null,
+            "api_key": "",
+            "base_url": null,
+            "context_window": null,
+            "max_tokens": null,
+            "model": "gpt-4o",
+            "provider": "openai",
+            "reasoning_effort": null,
+            "temperature": null
+          },
+          "description": "LLM configuration for this agent.\n\nParsed from the `[agent.llm]` TOML table. Workers inherit this config\nwhen no `[orchestration.worker.<name>.llm]` is provided."
+        },
+        "mcp_filter": {
+          "default": null,
+          "description": "Glob patterns for filtering which MCP tools to include.\nWhen set, only tools matching at least one pattern are added.\nExample: `mcp_filter = [\"sin\", \"cos\", \"degreesToRadians\"]`",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "model_owner": {
+          "default": null,
+          "description": "Override the `owned_by` field in /v1/models responses.\nWhen omitted, defaults to the underlying LLM provider (e.g. \"openai\", \"anthropic\").",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "nudge_last_turn": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "anyOf": [
+                {
+                  "enum": [
+                    "true",
+                    "false"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            }
+          ],
+          "default": false,
+          "description": "Nudge the agent on its final turn to submit its results instead of\ncalling more tools (default: false)."
+        },
+        "nudge_turns_remaining": {
+          "default": null,
+          "description": "Nudge the agent to start wrapping up when this many turns remain\nbefore the turn-depth limit. `None` disables wrap-up nudging.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scratchpad": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScratchpadConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Agent-level scratchpad config. Workers inherit this unless they\nprovide `[orchestration.worker.<name>.scratchpad]`."
+        },
+        "skills": {
+          "$ref": "#/$defs/SkillsConfig",
+          "default": {
+            "local": []
+          },
+          "description": "Skill discovery sources. Workers inherit these unless they provide\n`[orchestration.worker.<name>.skills]`."
+        },
+        "system_prompt": {
+          "type": "string"
+        },
+        "turn_depth": {
+          "default": 5,
+          "description": "Maximum depth of tool calls per turn (default: 5, set to 0 to disable)",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "system_prompt"
+      ],
+      "type": "object"
+    },
+    "ArtifactsConfig": {
+      "additionalProperties": false,
+      "description": "Artifact and persistence configuration for orchestration.\n\n# Example\n\n```toml\n[orchestration.artifacts]\nmemory_dir = \"/tmp/aura-orchestration\"\nresult_artifact_threshold = 4000\nresult_summary_length = 2000\n```",
+      "properties": {
+        "max_session_runs": {
+          "default": 20,
+          "description": "Maximum number of run directories retained per session. When a new run\nis created and the directory count exceeds this limit, the oldest runs\nare pruned. Set to 0 to disable pruning. Default: 20.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_dir": {
+          "default": null,
+          "description": "Optional base directory for execution persistence and plan storage.\n\nStructure: `<memory_dir>/<run_id>/iteration-{n}/...`\nIf not set, execution persistence is disabled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_path": {
+          "default": null,
+          "description": "Optional base directory for execution persistence and plan storage.\n\nStructure: `<memory_dir>/<run_id>/iteration-{n}/...`\nIf not set, execution persistence is disabled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "persistence_drain_timeout_ms": {
+          "default": 2000,
+          "description": "Timeout (ms) for draining in-flight persistence writes between execute()\nand write_plan(). Default: 2000ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result_artifact_threshold": {
+          "default": 4000,
+          "description": "Character threshold for writing large results to artifact files.\nResults exceeding this length are written to disk with an inline summary.\nDefault: 4000 characters.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result_summary_length": {
+          "default": 2000,
+          "description": "Maximum length of inline summary when a result is written to an artifact.\nDefault: 2000 characters.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_history_turns": {
+          "default": 3,
+          "description": "Maximum number of prior run manifests auto-injected into the coordinator\npreamble as session context. Set to 0 to disable session history injection.\nDefault: 3.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "show_tool_reasoning_in_continuation": {
+          "default": false,
+          "description": "When true, include condensed tool reasoning traces in the continuation\nprompt so the coordinator can see why workers called specific tools.\nDefault: false.",
+          "type": "boolean"
+        },
+        "tool_output_artifact_threshold": {
+          "default": 500,
+          "description": "Character threshold for promoting tool outputs to artifact files.\nOutputs exceeding this size get written to artifacts/ with an inline\nfooter referencing the file. Set to 0 to promote all tool outputs.\nDefault: 500.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool_output_duration_threshold_ms": {
+          "default": 5000,
+          "description": "Duration threshold (ms) for promoting tool outputs to artifact files.\nTool calls exceeding this duration get promoted regardless of size.\nSet to 0 to disable duration-based promotion. Default: 5000ms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "DecisionRouteConfig": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "description": "Attended: the approver is already at the client (default timeout 60s).",
+          "properties": {
+            "mode": {
+              "anyOf": [
+                {
+                  "const": "conversational",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "timeout_secs": {
+              "default": 60,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Unattended: the webhook may page a human or route through chat ops\n(default timeout 300s).",
+          "properties": {
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Static webhook headers.",
+              "type": "object"
+            },
+            "headers_from_request": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Outbound header name → inbound request header name mapping.",
+              "type": "object"
+            },
+            "mode": {
+              "anyOf": [
+                {
+                  "const": "webhook",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "timeout_secs": {
+              "default": 300,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tool_headers_from_response": {
+              "$ref": "#/$defs/ToolHeaderMappings",
+              "description": "Outbound MCP header name → webhook approval-response header name.\nNon-empty opts gated calls into approver identity forwarding.\nValidated at parse (see [`ToolHeaderMappings`]); the validated\nmap is carried but not consumed until capture wiring lands."
+            },
+            "url": {
+              "$ref": "#/$defs/WebhookUrl"
+            }
+          },
+          "required": [
+            "mode",
+            "url"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "`[hitl.route]` table. The `Webhook` variant cannot parse without a valid\nURL, so the \"url required, never empty\" invariant holds structurally."
+    },
+    "EmbeddingConfig": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "api_key": {
+              "type": "string"
+            },
+            "base_url": {
+              "default": null,
+              "description": "Custom API endpoint for OpenAI-compatible embedding servers",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "openai",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "api_key",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "profile": {
+              "default": null,
+              "description": "AWS profile name (optional, uses default credentials if not specified)",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "bedrock",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "region": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "model",
+            "region"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Embedding model configuration with strong typing per provider"
+    },
+    "GlobPattern": {
+      "description": "A tool-name glob pattern.",
+      "type": "string"
+    },
+    "HitlConfig": {
+      "additionalProperties": false,
+      "description": "`[hitl]` config table. `Option<HitlConfig>` on [`Config`] is the enable bit;\nthere is no `enabled` bool.",
+      "properties": {
+        "require_approval": {
+          "default": [],
+          "description": "Glob patterns whose match gates a tool call. Compiled at TOML load.",
+          "items": {
+            "$ref": "#/$defs/GlobPattern"
+          },
+          "type": "array"
+        },
+        "route": {
+          "$ref": "#/$defs/DecisionRouteConfig",
+          "description": "The decision route; required when `[hitl]` is present."
+        }
+      },
+      "required": [
+        "route"
+      ],
+      "type": "object"
+    },
+    "LlmConfig": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "additional_params": {
+              "default": null,
+              "description": "Additional provider-specific parameters merged into the API request.\nProvider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.\nExample: `{ thinking = { type = \"adaptive\", budget_tokens = 8000 } }`"
+            },
+            "api_key": {
+              "type": "string"
+            },
+            "base_url": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "default": null,
+              "description": "Context window size in tokens.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_tokens": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "openai",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "reasoning_effort": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReasoningEffort"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "temperature": {
+              "default": null,
+              "description": "Controls the randomness and creativity of the llm",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "api_key",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "additional_params": {
+              "default": null,
+              "description": "Additional provider-specific parameters merged into the API request.\nProvider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.\nExample: `{ thinking = { type = \"adaptive\", budget_tokens = 8000 } }`"
+            },
+            "api_key": {
+              "type": "string"
+            },
+            "base_url": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "default": null,
+              "description": "Context window size in tokens.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_tokens": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "anthropic",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "temperature": {
+              "default": null,
+              "description": "Controls the randomness and creativity of the llm",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "api_key",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "additional_params": {
+              "default": null,
+              "description": "Additional provider-specific parameters merged into the API request.\nProvider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.\nExample: `{ thinking = { type = \"adaptive\", budget_tokens = 8000 } }`"
+            },
+            "context_window": {
+              "default": null,
+              "description": "Context window size in tokens.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_tokens": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "profile": {
+              "default": null,
+              "description": "AWS profile name (optional, uses default credentials if not specified)",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "bedrock",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "region": {
+              "type": "string"
+            },
+            "temperature": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "model",
+            "region"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "additional_params": {
+              "default": null,
+              "description": "Additional provider-specific parameters merged into the API request.\nProvider-agnostic: works for Anthropic thinking, Gemini thinking budget, etc.\nExample: `{ thinking = { type = \"adaptive\", budget_tokens = 8000 } }`"
+            },
+            "api_key": {
+              "type": "string"
+            },
+            "base_url": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "default": null,
+              "description": "Context window size in tokens.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_tokens": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "gemini",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "temperature": {
+              "default": null,
+              "description": "Controls the randomness and creativity of the llm",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "api_key",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "additional_params": {
+              "default": null,
+              "description": "Additional Ollama-specific parameters passed directly to the API.\nExamples: seed, top_k, top_p, mirostat, etc.\nSee: https://github.com/ollama/ollama/blob/main/docs/modelfile.mdx#valid-parameters-and-values"
+            },
+            "base_url": {
+              "default": "http://localhost:11434",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "default": null,
+              "description": "Context window size in tokens.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "fallback_tool_parsing": {
+              "default": false,
+              "description": "Parse tool calls from text output (Ollama-specific workaround).\n\nSome Ollama models (especially qwen3-coder) output tool calls as text\n(JSON, XML, etc.) instead of using native tool_call structures. When\nenabled, the agent intercepts streamed text, detects tool call patterns,\nand executes them via MCP.\n\nRequires MCP servers to be configured - logs a warning otherwise.\n\nFlow: Config → Agent::maybe_wrap_with_fallback → FallbackToolExecutor\nSee: `fallback_tool_parser` module for supported formats.",
+              "type": "boolean"
+            },
+            "max_tokens": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "ollama",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "temperature": {
+              "default": null,
+              "description": "Controls the randomness and creativity of the llm",
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "additional_params": {
+              "default": null
+            },
+            "api_key": {
+              "type": "string"
+            },
+            "base_url": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "context_window": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_tokens": {
+              "default": null,
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "anyOf": [
+                {
+                  "const": "openrouter",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "temperature": {
+              "default": null,
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "provider",
+            "api_key",
+            "model"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "LLM provider configuration with strong typing per provider"
+    },
+    "LocalSkillSource": {
+      "additionalProperties": false,
+      "description": "One `[[agent.skills.local]]` entry.",
+      "properties": {
+        "source": {
+          "description": "Path to directory containing skill subdirectories (absolute or relative to the process CWD)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "McpConfig": {
+      "additionalProperties": false,
+      "description": "MCP servers configuration",
+      "properties": {
+        "sanitize_schemas": {
+          "default": true,
+          "description": "Enable OpenAI-compatible tool schema sanitization (default: true)",
+          "type": "boolean"
+        },
+        "servers": {
+          "additionalProperties": {
+            "$ref": "#/$defs/McpServerConfig"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "type": "object"
+    },
+    "McpServerConfig": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "args": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "cmd": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "scratchpad": {
+              "additionalProperties": {
+                "$ref": "#/$defs/ScratchpadToolEntry"
+              },
+              "default": {},
+              "description": "Per-tool scratchpad interception thresholds (glob-matched on tool name).",
+              "type": "object"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "const": "stdio",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "required": [
+            "transport",
+            "cmd"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "headers_from_request": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "scratchpad": {
+              "additionalProperties": {
+                "$ref": "#/$defs/ScratchpadToolEntry"
+              },
+              "default": {},
+              "description": "Per-tool scratchpad interception thresholds (glob-matched on tool name).",
+              "type": "object"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "const": "http_streamable",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "transport",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "headers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "headers_from_request": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "scratchpad": {
+              "additionalProperties": {
+                "$ref": "#/$defs/ScratchpadToolEntry"
+              },
+              "default": {},
+              "description": "Per-tool scratchpad interception thresholds (glob-matched on tool name).",
+              "type": "object"
+            },
+            "transport": {
+              "anyOf": [
+                {
+                  "const": "sse",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "transport",
+            "url"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Individual MCP server configuration"
+    },
+    "OrchestrationConfig": {
+      "additionalProperties": false,
+      "description": "Configuration for orchestration mode (multi-agent coordinator/worker workflows).",
+      "properties": {
+        "allow_clarification": {
+          "default": true,
+          "type": "boolean"
+        },
+        "allow_direct_answers": {
+          "default": true,
+          "type": "boolean"
+        },
+        "artifacts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "coordinator_vector_stores": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "duplicate_call_block_threshold": {
+          "default": 5,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "duplicate_call_nudge_threshold": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_plan_parse_retries": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_planning_cycles": {
+          "default": 3,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_tools_per_worker": {
+          "default": 10,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_dir": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_path": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "persistence_drain_timeout_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "result_artifact_threshold": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "result_summary_length": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_history_turns": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timeouts": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeoutsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "tool_output_artifact_threshold": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tool_output_duration_threshold_ms": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tools_in_planning": {
+          "$ref": "#/$defs/ToolVisibility",
+          "default": "summary"
+        },
+        "worker": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkerConfig"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "worker_system_prompt": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ReasoningEffort": {
+      "anyOf": [
+        {
+          "enum": [
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ],
+          "type": "string"
+        },
+        {
+          "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+          "type": "string"
+        }
+      ],
+      "description": "Reasoning effort level for GPT-5 models"
+    },
+    "ScratchpadConfig": {
+      "additionalProperties": false,
+      "description": "Scratchpad configuration.\n\nConfigured at `[agent.scratchpad]` for the default (inherited by all workers),\nand optionally overridden at `[orchestration.worker.<name>.scratchpad]`.\nA worker's effective config is the agent defaults merged with any overrides\non the worker.",
+      "properties": {
+        "context_safety_margin": {
+          "default": 0.20000000298023224,
+          "description": "Fraction (0.0–1.0) of the context window reserved for reasoning + output.",
+          "format": "float",
+          "type": "number"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether scratchpad is active for this agent/worker.",
+          "type": "boolean"
+        },
+        "max_extraction_tokens": {
+          "default": 10000,
+          "description": "Maximum tokens a single extraction tool may return.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn_depth_bonus": {
+          "default": 6,
+          "description": "Extra turns added when scratchpad is active (to account for exploration).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ScratchpadToolEntry": {
+      "additionalProperties": false,
+      "description": "Per-tool scratchpad override, configured via `[mcp.servers.<name>.scratchpad]`.\n\nControls when a tool's output gets intercepted and diverted to scratchpad\nstorage instead of being returned inline to the LLM.",
+      "properties": {
+        "min_tokens": {
+          "default": 5120,
+          "description": "Minimum output size (in tokens) before interception kicks in.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "SkillsConfig": {
+      "additionalProperties": false,
+      "description": "The `[agent.skills]` TOML table: where to discover skills from.",
+      "properties": {
+        "local": {
+          "default": [],
+          "description": "Local skill sources (directories containing skill subdirectories)",
+          "items": {
+            "$ref": "#/$defs/LocalSkillSource"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "TimeoutsConfig": {
+      "additionalProperties": false,
+      "description": "Timeout configuration for orchestration LLM calls.\n\n# Example\n\n```toml\n[orchestration.timeouts]\nper_call_timeout_secs = 120\nstream_inactivity_timeout_secs = 45\n```",
+      "properties": {
+        "per_call_timeout_secs": {
+          "default": 0,
+          "description": "Wall-clock budget (seconds) for one coordinator phase or one worker\ntask. 0 disables.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stream_inactivity_timeout_secs": {
+          "default": 0,
+          "description": "Inactivity window (seconds) for coordinator and worker streams; governs\nsilence between stream items. 0 disables.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ToolHeaderMappings": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Outbound MCP header name → webhook approval-response header name.",
+      "type": "object"
+    },
+    "ToolVisibility": {
+      "anyOf": [
+        {
+          "anyOf": [
+            {
+              "const": "none",
+              "type": "string"
+            },
+            {
+              "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+              "type": "string"
+            }
+          ],
+          "description": "No tool information in planning prompt (minimal context, display only)."
+        },
+        {
+          "anyOf": [
+            {
+              "const": "summary",
+              "type": "string"
+            },
+            {
+              "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+              "type": "string"
+            }
+          ],
+          "description": "Tool names only, bucketed by worker (default — good balance, display only)."
+        },
+        {
+          "anyOf": [
+            {
+              "const": "full",
+              "type": "string"
+            },
+            {
+              "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+              "type": "string"
+            }
+          ],
+          "description": "Tool names with descriptions (maximum context, higher token usage, display only)."
+        }
+      ],
+      "description": "Controls how tool information is shown to the coordinator during planning.\n\nThis is **display only** — it does not affect which tools workers can execute.\nTool execution access is controlled by each worker's `mcp_filter`.\nThis setting only affects what the coordinator sees when deciding how to\nassign tasks, balancing context length vs. precision."
+    },
+    "ToolsConfig": {
+      "additionalProperties": false,
+      "description": "Tools configuration",
+      "properties": {
+        "custom_tools": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "filesystem": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "VectorStoreConfig": {
+      "anyOf": [
+        {
+          "properties": {
+            "embedding_model": {
+              "$ref": "#/$defs/EmbeddingConfig"
+            },
+            "type": {
+              "anyOf": [
+                {
+                  "const": "in_memory",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "embedding_model"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "collection_name": {
+              "type": "string"
+            },
+            "embedding_model": {
+              "$ref": "#/$defs/EmbeddingConfig"
+            },
+            "type": {
+              "anyOf": [
+                {
+                  "const": "qdrant",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "embedding_model",
+            "url",
+            "collection_name"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "knowledge_base_id": {
+              "type": "string"
+            },
+            "managed": {
+              "default": false,
+              "description": "Bedrock managed knowledge base (vs. classic vector-store-backed)",
+              "type": "boolean"
+            },
+            "profile": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "region": {
+              "type": "string"
+            },
+            "type": {
+              "anyOf": [
+                {
+                  "const": "bedrock_kb",
+                  "type": "string"
+                },
+                {
+                  "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "knowledge_base_id",
+            "region"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "Vector store configuration (in-memory, Qdrant, and Bedrock KB)",
+      "properties": {
+        "context_prefix": {
+          "default": null,
+          "description": "Optional context string describing what the vector store contains (for better LLM guidance)",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Unique name to identify this vector store",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object",
+      "unevaluatedProperties": false
+    },
+    "WebhookUrl": {
+      "anyOf": [
+        {
+          "pattern": "^https?://",
+          "type": "string"
+        },
+        {
+          "pattern": "\\{\\{\\s*env\\.[A-Z_][A-Z0-9_]*(\\s*\\|\\s*default:\\s*'[^']*')?\\s*\\}\\}",
+          "type": "string"
+        }
+      ],
+      "description": "A webhook URL with an http(s) scheme."
+    },
+    "WorkerConfig": {
+      "additionalProperties": false,
+      "description": "Per-worker configuration for specialized workers.\n\nWorkers are specialized agents with custom preambles and filtered tool access.\nConfigure workers using TOML sections like `[orchestration.worker.operations]`.\n\n# Example\n\n```toml\n[orchestration.worker.operations]\ndescription = \"For logs, pipelines, metrics, and system analysis\"\npreamble = \"You are an Operations Specialist...\"\nmcp_filter = [\"mezmo_*\"]\n```",
+      "properties": {
+        "description": {
+          "description": "Short description of this worker's purpose (for planning prompt).\n\nThis is shown to the LLM during planning so it can assign tasks appropriately.\nKeep it concise (one line).",
+          "type": "string"
+        },
+        "llm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LlmConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional per-worker LLM override.\n\nWhen `Some`, the worker runs with this LLM config instead of inheriting\n`[agent.llm]`. The resolved `context_window` drives per-worker budget\nmath (e.g. scratchpad sizing)."
+        },
+        "mcp_filter": {
+          "default": null,
+          "description": "Glob patterns for which MCP tools this worker gets access to.\n\nExamples:\n- omitted - all tools (default)\n- `[\"mezmo_*\"]` - all tools starting with \"mezmo_\"\n- `[\"ListKnowledgeBases\", \"QueryKnowledgeBases\"]` - specific tools\n- `[]` - no MCP tools\n\nPatterns are matched using glob syntax (supports `*`, `**`, `?`, `[abc]`).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "preamble": {
+          "description": "System prompt for this worker (replaces generic worker preamble).\n\nThis is the complete system prompt - it does NOT use the worker_preamble.md template.\nFor specialized workers, provide domain-specific instructions here.",
+          "type": "string"
+        },
+        "scratchpad": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScratchpadConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-worker override of `[agent.scratchpad]`. Parsed from\n`[orchestration.worker.<name>.scratchpad]`."
+        },
+        "skills": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-worker skill sources. Parsed from `[orchestration.worker.<name>.skills]`.\n`None` inherits `[agent.skills]`; an explicit empty list disables skills\nfor this worker; a non-empty list replaces the agent's skills entirely\n(no merging)."
+        },
+        "turn_depth": {
+          "default": null,
+          "description": "Max tool-calling turns for this worker.\n\nControls how many Rig ReAct turns (tool calls) a worker can make\nper task execution. Overrides `[agent].turn_depth`. Falls back to\n`[agent].turn_depth` → `DEFAULT_MAX_DEPTH` if not set.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vector_stores": {
+          "default": [],
+          "description": "Vector stores this worker has access to.\n\nBy default (empty), workers have NO vector store access. Workers must\nexplicitly list the stores they need. This prevents unintended RAG\naccess and keeps workers focused on their specialization.\n\nValues should match the `name` field of entries in `[[vector_stores]]`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "description",
+        "preamble"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Root configuration structure for our POC",
+  "properties": {
+    "agent": {
+      "$ref": "#/$defs/AgentConfig"
+    },
+    "hitl": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HitlConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Human-in-the-loop approval gating. `None` (no `[hitl]` table) disables\nit; presence of the table is the enable bit."
+    },
+    "mcp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "memory_dir": {
+      "default": null,
+      "description": "Top-level persistence directory shared by scratchpad and orchestration\nartifacts. `[orchestration.artifacts].memory_dir` is honored as a\nlegacy fallback.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "orchestration": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrchestrationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Orchestration mode configuration (multi-agent workflows)"
+    },
+    "tools": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ToolsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vector_stores": {
+      "default": [],
+      "description": "Vector stores for RAG - optional, defaults to empty",
+      "items": {
+        "$ref": "#/$defs/VectorStoreConfig"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "agent"
+  ],
+  "title": "AURA agent configuration",
+  "type": "object"
+}

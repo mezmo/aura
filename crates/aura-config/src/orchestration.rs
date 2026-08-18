@@ -20,7 +20,7 @@ use std::collections::HashMap;
 /// Tool execution access is controlled by each worker's `mcp_filter`.
 /// This setting only affects what the coordinator sees when deciding how to
 /// assign tasks, balancing context length vs. precision.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolVisibility {
     /// No tool information in planning prompt (minimal context, display only).
@@ -49,7 +49,7 @@ pub enum ToolVisibility {
 /// preamble = "You are an Operations Specialist..."
 /// mcp_filter = ["mezmo_*"]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkerConfig {
     /// Short description of this worker's purpose (for planning prompt).
     ///
@@ -127,7 +127,7 @@ pub struct WorkerConfig {
 /// per_call_timeout_secs = 120
 /// stream_inactivity_timeout_secs = 45
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TimeoutsConfig {
     /// Wall-clock budget (seconds) for one coordinator phase or one worker
@@ -164,7 +164,7 @@ impl Default for TimeoutsConfig {
 /// result_artifact_threshold = 4000
 /// result_summary_length = 2000
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ArtifactsConfig {
     /// Optional base directory for execution persistence and plan storage.
     ///
@@ -474,7 +474,7 @@ impl OrchestrationConfig {
 ///   `result_summary_length` at root level
 ///
 /// Flat fields take precedence over sub-table values when both are present.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 struct RawOrchestrationConfig {
     #[serde(default)]
     enabled: bool,
@@ -571,6 +571,24 @@ impl<'de> Deserialize<'de> for OrchestrationConfig {
             timeouts,
             artifacts,
         })
+    }
+}
+
+impl schemars::JsonSchema for OrchestrationConfig {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "OrchestrationConfig".into()
+    }
+
+    /// The accepted input shape is [`RawOrchestrationConfig`], not the struct's
+    /// own fields: the schema must admit the flat legacy artifact fields too.
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let mut schema = RawOrchestrationConfig::json_schema(generator);
+        schema.insert(
+            "description".to_owned(),
+            "Configuration for orchestration mode (multi-agent coordinator/worker workflows)."
+                .into(),
+        );
+        schema
     }
 }
 
