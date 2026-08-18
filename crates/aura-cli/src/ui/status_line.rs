@@ -79,11 +79,12 @@ impl FromStr for Segment {
     }
 }
 
-/// Context-window occupancy: tokens in context against the model's window.
+/// Tokens in the model's context, and the window they count against when
+/// the server reported one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContextUsage {
     pub used: u64,
-    pub limit: NonZeroU64,
+    pub limit: Option<NonZeroU64>,
 }
 
 /// Values the status line renders from.
@@ -217,6 +218,9 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
 }
 
 fn context_piece(ContextUsage { used, limit }: ContextUsage) -> (String, AuraStyle) {
+    let Some(limit) = limit else {
+        return (format!("ctx {}", compact(used)), AuraStyle::Success);
+    };
     let limit = limit.get();
     let pct = (used.saturating_mul(100) + limit / 2) / limit;
     let style = if pct >= CONTEXT_ERROR_PCT {
@@ -421,7 +425,7 @@ mod tests {
             git_branch: Some("main".to_owned()),
             context: Some(ContextUsage {
                 used: 76_000,
-                limit: NonZeroU64::new(200_000).unwrap(),
+                limit: NonZeroU64::new(200_000),
             }),
             prompt_tokens: 182_000,
             completion_tokens: 41_000,
@@ -524,7 +528,20 @@ mod tests {
     }
 
     #[test]
-    fn context_hidden_without_a_known_window() {
+    fn context_without_a_window_shows_the_raw_count() {
+        let snapshot = Snapshot {
+            context: Some(ContextUsage {
+                used: 76_412,
+                limit: None,
+            }),
+            ..Snapshot::default()
+        };
+        let line = strip_ansi(&render(&snapshot, &[Segment::Context], 80, ""));
+        assert_eq!(line, "ctx 76k");
+    }
+
+    #[test]
+    fn context_hidden_when_absent() {
         let snapshot = Snapshot {
             model: Some("m".to_owned()),
             context: None,
@@ -631,7 +648,7 @@ mod tests {
     fn context_thresholds_pick_style() {
         let usage = |used| ContextUsage {
             used,
-            limit: NonZeroU64::new(100).unwrap(),
+            limit: NonZeroU64::new(100),
         };
         assert!(matches!(context_piece(usage(69)), (_, AuraStyle::Success)));
         assert!(matches!(context_piece(usage(70)), (_, AuraStyle::Warning)));

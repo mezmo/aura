@@ -26,7 +26,9 @@ use super::state::CONTEXT_USED;
 use super::state::{
     EVENT_LOG, EXPANDED_OUTPUT, WELCOME_STATE, random_bullet_color, task_color_for,
 };
-use super::status_bar::{reset_status_bar_tokens, set_context_used, set_status_bar_tokens};
+use super::status_bar::{
+    mark_orchestrated, reset_status_bar_tokens, set_context_used, set_status_bar_tokens,
+};
 
 /// Clear the terminal and replay all recorded events.
 pub fn replay_event_log_global() {
@@ -52,6 +54,17 @@ pub fn replay_event_log_global() {
     }
 
     let events = &*event_log;
+    if events.iter().any(|e| {
+        matches!(
+            e,
+            DisplayEvent::OrchestratorPlanCreated { .. }
+                | DisplayEvent::OrchestratorTaskStarted { .. }
+                | DisplayEvent::OrchestratorSynthesizing
+                | DisplayEvent::OrchestratorIterationComplete { .. }
+        )
+    }) {
+        mark_orchestrated();
+    }
     let mut i = 0;
     while i < events.len() {
         match &events[i] {

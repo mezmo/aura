@@ -2874,6 +2874,7 @@ impl StreamHandler for ReplStreamHandler {
         if !event_name.starts_with("aura.orchestrator.") {
             return;
         }
+        crate::ui::prompt::mark_orchestrated();
 
         // Worker reasoning deltas carry the `task_id` that demultiplexes
         // concurrent same-wave workers, so orchestrated runs render from

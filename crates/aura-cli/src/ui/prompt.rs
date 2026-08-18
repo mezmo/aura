@@ -25,9 +25,9 @@ pub(crate) use super::state::{lock_term, take_pending_command};
 pub(crate) use super::status_bar::update_status_bar_unlocked;
 pub use super::status_bar::{
     add_scratchpad_usage, add_turn_notice, clear_turn_notices, get_cumulative_tokens, handle_ctrlc,
-    reset_ctrlc_state, reset_session_status, reset_status_bar_tokens, seed_status_bar_tokens,
-    set_context_used, set_mcp_counts, set_session_info, set_status_bar_tokens, set_status_segments,
-    update_status_bar,
+    mark_orchestrated, reset_ctrlc_state, reset_session_status, reset_status_bar_tokens,
+    seed_status_bar_tokens, set_context_used, set_mcp_counts, set_session_info,
+    set_status_bar_tokens, set_status_segments, update_status_bar,
 };
 
 // Re-export from input_frame.rs

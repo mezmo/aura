@@ -84,6 +84,8 @@ pub(crate) static CONTEXT_USED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static MODEL_CONTEXT_LIMIT: AtomicU64 = AtomicU64::new(0);
 /// Latest MCP server tally.
 pub(crate) static MCP_COUNTS: Mutex<Option<McpCounts>> = Mutex::new(None);
+/// Whether this conversation has streamed orchestration events.
+pub(crate) static ORCHESTRATED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Mid-stream input history (for up/down arrow during streaming)

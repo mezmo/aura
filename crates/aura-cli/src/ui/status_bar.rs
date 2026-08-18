@@ -21,9 +21,9 @@ use super::animation::render_queued_wave;
 use super::state::{
     CONTEXT_USED, CTRLC_HINT_VISIBLE, CTRLC_RESET_SKIP, CUMULATIVE_COMPLETION, CUMULATIVE_PROMPT,
     CUMULATIVE_SCRATCHPAD_EXTRACTED, CUMULATIVE_SCRATCHPAD_INTERCEPTED, CURSOR_ROW, CWD,
-    FRAME_LINES, LAST_CTRLC, MCP_COUNTS, MODEL_CONTEXT_LIMIT, PROCESSING, QUEUED_INPUT,
-    QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS, TURN_NOTICES,
-    get_selected_model, lock_term, status_rows, term_size,
+    FRAME_LINES, LAST_CTRLC, MCP_COUNTS, MODEL_CONTEXT_LIMIT, ORCHESTRATED, PROCESSING,
+    QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS, STATUS_SEGMENTS,
+    TURN_NOTICES, get_selected_model, lock_term, status_rows, term_size,
 };
 use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot, sanitize};
 
@@ -58,10 +58,16 @@ pub fn set_mcp_counts(counts: McpCounts) {
     }
 }
 
+/// Record that this conversation is orchestrated.
+pub fn mark_orchestrated() {
+    ORCHESTRATED.store(true, Ordering::Relaxed);
+}
+
 /// Forget everything the status line learned from the previous
-/// conversation's stream — reported model, context window, MCP tally, and
-/// context size — so a fresh conversation starts blank rather than showing
-/// the old session's metadata until its first turn reports.
+/// conversation's stream — reported model, context window, MCP tally,
+/// context size, and whether it was orchestrated — so a fresh conversation
+/// starts blank rather than showing the old session's metadata until its
+/// first turn reports.
 pub fn reset_session_status() {
     if let Ok(mut g) = SESSION_MODEL.lock() {
         *g = None;
@@ -70,19 +76,23 @@ pub fn reset_session_status() {
     if let Ok(mut g) = MCP_COUNTS.lock() {
         *g = None;
     }
+    ORCHESTRATED.store(false, Ordering::Relaxed);
     set_context_used(0);
 }
 
 fn capture_snapshot() -> Snapshot {
     let cwd = CWD.get_or_init(|| std::env::current_dir().ok()).as_deref();
-    // No window, no meter: a bare token count would be a sum of many agent
-    // contexts in orchestration mode (which never reports a window), so the
-    // segment only appears when there is a real ceiling to measure against.
-    let context =
-        NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed)).map(|limit| ContextUsage {
-            used: CONTEXT_USED.load(Ordering::Relaxed),
-            limit,
-        });
+    // In an orchestrated conversation aura.usage is the sum of every
+    // planning, worker, and synthesis call, not any one context, so there is
+    // no single figure to show. Otherwise show the count once something has
+    // been reported, with the meter when the model's window is known.
+    let used = CONTEXT_USED.load(Ordering::Relaxed);
+    let limit = NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed));
+    let context = if ORCHESTRATED.load(Ordering::Relaxed) || (used == 0 && limit.is_none()) {
+        None
+    } else {
+        Some(ContextUsage { used, limit })
+    };
     Snapshot {
         model: get_selected_model().or_else(|| SESSION_MODEL.lock().ok().and_then(|g| g.clone())),
         cwd: cwd.map(|p| status_line::abbreviate_home(p, dirs::home_dir().as_deref())),
