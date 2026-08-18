@@ -1405,8 +1405,6 @@ pub enum DecisionRouteConfig {
         #[serde(default)]
         headers_from_request: HashMap<String, String>,
         /// Outbound MCP header name → webhook approval-response header name.
-        /// Non-empty opts gated calls into approver identity forwarding.
-        /// Validated at parse; see [`ToolHeaderMappings`].
         #[serde(default, skip_serializing_if = "ToolHeaderMappings::is_empty")]
         tool_headers_from_response: ToolHeaderMappings,
     },
@@ -1424,8 +1422,7 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 ];
 
 /// Validated `tool_headers_from_response` mapping: outbound MCP header
-/// name → webhook approval-response header name, both sides lowercased
-/// at parse so an override always replaces the frozen default header.
+/// name → webhook approval-response header name, both sides lowercased.
 /// Syntactically invalid header names, duplicates after lowercasing, and
 /// reserved transport-owned names (see [`RESERVED_TOOL_HEADER_NAMES`])
 /// are rejected at construction, so downstream code never holds an
@@ -1434,7 +1431,7 @@ pub const RESERVED_TOOL_HEADER_NAMES: [&str; 6] = [
 pub struct ToolHeaderMappings(HashMap<String, String>);
 
 impl ToolHeaderMappings {
-    /// True when no mapping is configured (the legacy, feature-off state).
+    /// True when no mapping is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
