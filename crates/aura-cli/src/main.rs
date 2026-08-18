@@ -95,6 +95,9 @@ fn main() -> Result<()> {
     // opts in. Read by the welcome printer in `repl::loop` and by
     // `render_queued_wave` in `ui::animation`.
     aura_cli::ui::prompt::set_pretty(config.pretty);
+    if let Some(segments) = config.status_line_segments.clone() {
+        aura_cli::ui::prompt::set_status_segments(segments);
+    }
     let permissions = PermissionChecker::load(&std::env::current_dir()?)?;
     let mut backend = Backend::from_config(&rt, &config, &args, is_standalone)?;
 
