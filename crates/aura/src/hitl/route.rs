@@ -224,11 +224,11 @@ fn stamp_decision_id(decision_id: DecisionId) {
 async fn webhook_round_trip<T>(
     request: &ApprovalRequest,
     cancel: &crate::request_cancellation::RequestCancelToken,
+    started: Instant,
     round_trip: impl Future<Output = Result<T, ApprovalError>>,
     cancelled: impl FnOnce() -> T,
     event_outcome: impl FnOnce(&T) -> ApprovalOutcome,
 ) -> Result<T, ApprovalError> {
-    let started = Instant::now();
     let request_id = request.request_id.clone();
     let decision_id = request.decision_id;
     let scope = request.scope.clone();
@@ -252,12 +252,10 @@ async fn webhook_round_trip<T>(
         }
     };
     let completed = match &result {
-        Ok(decision) => events::completed(
-            decision_id,
-            &event_outcome(decision),
-            &scope,
-            started.elapsed(),
-        ),
+        Ok(decision) => {
+            let elapsed = started.elapsed();
+            events::completed(decision_id, &event_outcome(decision), &scope, elapsed)
+        }
         Err(err) => {
             events::completed_error(decision_id, err.to_string(), &scope, started.elapsed())
         }
@@ -290,6 +288,7 @@ impl DecisionRoute {
                 webhook_round_trip(
                     &request,
                     cancel,
+                    Instant::now(),
                     client.request_approval_for_gate(&request, *timeout),
                     || GateDecision::Cancelled(super::decision::CancelReason::ClientDisconnected),
                     GateDecision::to_outcome,
@@ -376,6 +375,7 @@ impl DecisionRoute {
                 webhook_round_trip(
                     &request,
                     cancel,
+                    started,
                     client.request_approval(&request, *timeout),
                     || {
                         ApprovalOutcome::Cancelled(
