@@ -1240,9 +1240,19 @@
     "VectorStoreConfig": {
       "anyOf": [
         {
+          "additionalProperties": false,
           "properties": {
+            "context_prefix": {
+              "default": null,
+              "description": "Optional context string describing what the vector store contains (for better LLM guidance)",
+              "type": "string"
+            },
             "embedding_model": {
               "$ref": "#/$defs/EmbeddingConfig"
+            },
+            "name": {
+              "description": "Unique name to identify this vector store",
+              "type": "string"
             },
             "type": {
               "anyOf": [
@@ -1259,17 +1269,28 @@
           },
           "required": [
             "type",
-            "embedding_model"
+            "embedding_model",
+            "name"
           ],
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "properties": {
             "collection_name": {
               "type": "string"
             },
+            "context_prefix": {
+              "default": null,
+              "description": "Optional context string describing what the vector store contains (for better LLM guidance)",
+              "type": "string"
+            },
             "embedding_model": {
               "$ref": "#/$defs/EmbeddingConfig"
+            },
+            "name": {
+              "description": "Unique name to identify this vector store",
+              "type": "string"
             },
             "type": {
               "anyOf": [
@@ -1291,12 +1312,19 @@
             "type",
             "embedding_model",
             "url",
-            "collection_name"
+            "collection_name",
+            "name"
           ],
           "type": "object"
         },
         {
+          "additionalProperties": false,
           "properties": {
+            "context_prefix": {
+              "default": null,
+              "description": "Optional context string describing what the vector store contains (for better LLM guidance)",
+              "type": "string"
+            },
             "knowledge_base_id": {
               "type": "string"
             },
@@ -1304,6 +1332,10 @@
               "default": false,
               "description": "Bedrock managed knowledge base (vs. classic vector-store-backed)",
               "type": "boolean"
+            },
+            "name": {
+              "description": "Unique name to identify this vector store",
+              "type": "string"
             },
             "profile": {
               "default": null,
@@ -1328,28 +1360,14 @@
           "required": [
             "type",
             "knowledge_base_id",
-            "region"
+            "region",
+            "name"
           ],
           "type": "object"
         }
       ],
       "description": "Vector store configuration (in-memory, Qdrant, and Bedrock KB)",
-      "properties": {
-        "context_prefix": {
-          "default": null,
-          "description": "Optional context string describing what the vector store contains (for better LLM guidance)",
-          "type": "string"
-        },
-        "name": {
-          "description": "Unique name to identify this vector store",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name"
-      ],
-      "type": "object",
-      "unevaluatedProperties": false
+      "type": "object"
     },
     "WebhookUrl": {
       "anyOf": [

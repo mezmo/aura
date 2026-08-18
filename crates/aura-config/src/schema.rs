@@ -26,7 +26,7 @@ pub fn config_schema() -> Value {
     for_each_schema(&mut value, &mut collapse_nullable);
     for_each_schema(&mut value, &mut widen_template_strings);
     for_each_schema(&mut value, &mut one_of_to_any_of);
-    close_schemas(&mut value, false);
+    close_schemas(&mut value);
     add_memory_path_alias(&mut value);
     strip_volatile_defaults(&mut value);
     value
@@ -136,23 +136,27 @@ fn one_of_to_any_of(map: &mut Map<String, Value>) {
 
 /// Close every object schema against unknown keys (serde silently ignores
 /// them on most tables; the schema rejects them so editors and CI catch
-/// typos). A schema that composes (`$ref` or a combinator alongside
-/// `properties`, e.g. the flattened `[[vector_stores]]` entry) gets
-/// `unevaluatedProperties` so the closure spans the composed parts; a plain
-/// object gets `additionalProperties: false`.
-///
-/// `keep_open` marks a combinator branch of a composing schema: the branch
-/// shares its parent's instance location, so closing it would reject the
-/// parent's own keys — the parent's `unevaluatedProperties` is the closure.
-fn close_schemas(value: &mut Value, keep_open: bool) {
+/// typos). A schema whose `anyOf` branches sit alongside `properties` (the
+/// flattened `[[vector_stores]]` entry) first has those properties merged
+/// into each branch so the branches are self-contained; every object schema
+/// then closes with `additionalProperties: false`. Draft 2020-12's
+/// `unevaluatedProperties` could close the composed form directly, but
+/// taplo's validator does not implement it, so the schema avoids needing it.
+fn close_schemas(value: &mut Value) {
     let Value::Object(map) = value else { return };
-    const COMBINATORS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
-    let has_properties = map.contains_key("properties");
-    let composes = map.contains_key("$ref") || COMBINATORS.iter().any(|key| map.contains_key(*key));
 
-    if has_properties && !keep_open {
-        if composes {
-            map.entry("unevaluatedProperties").or_insert(json!(false));
+    if map.contains_key("properties") {
+        // Compositions the merge cannot reach into; no current type produces
+        // them, and a future one must pick its own closure strategy.
+        for key in ["$ref", "allOf", "oneOf"] {
+            assert!(
+                !map.contains_key(key),
+                "schema composes `properties` with `{key}`; \
+                 close_schemas cannot merge through it"
+            );
+        }
+        if map.contains_key("anyOf") {
+            merge_properties_into_branches(map);
         } else if !map.contains_key("additionalProperties")
             && !map.contains_key("patternProperties")
         {
@@ -160,30 +164,62 @@ fn close_schemas(value: &mut Value, keep_open: bool) {
         }
     }
 
-    // An open node's nested combinator branches still share the ancestor's
-    // instance location, so openness propagates through them.
-    let branches_open = keep_open || (has_properties && composes);
-    for key in COMBINATORS {
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
         if let Some(Value::Array(children)) = map.get_mut(key) {
             for child in children {
-                close_schemas(child, branches_open);
+                close_schemas(child);
             }
         }
     }
-    for key in [
-        "additionalProperties",
-        "unevaluatedProperties",
-        "items",
-        "not",
-    ] {
+    for key in ["additionalProperties", "items", "not"] {
         if let Some(child) = map.get_mut(key) {
-            close_schemas(child, false);
+            close_schemas(child);
         }
     }
     for key in ["properties", "$defs", "patternProperties"] {
         if let Some(Value::Object(children)) = map.get_mut(key) {
             for child in children.values_mut() {
-                close_schemas(child, false);
+                close_schemas(child);
+            }
+        }
+    }
+}
+
+/// Move a composing schema's own `properties`/`required` into each of its
+/// `anyOf` branches, which validate against the same instance location.
+fn merge_properties_into_branches(map: &mut Map<String, Value>) {
+    let Some(Value::Object(parent_properties)) = map.remove("properties") else {
+        unreachable!("caller checked `properties` exists");
+    };
+    let parent_required = match map.remove("required") {
+        Some(Value::Array(required)) => required,
+        _ => Vec::new(),
+    };
+    let Some(Value::Array(branches)) = map.get_mut("anyOf") else {
+        unreachable!("caller checked `anyOf` exists");
+    };
+    for branch in branches {
+        let Value::Object(branch) = branch else {
+            continue;
+        };
+        let properties = branch
+            .entry("properties")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("branch `properties` is an object");
+        for (key, value) in &parent_properties {
+            properties.entry(key.clone()).or_insert(value.clone());
+        }
+        if !parent_required.is_empty() {
+            let required = branch
+                .entry("required")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .expect("branch `required` is an array");
+            for key in &parent_required {
+                if !required.contains(key) {
+                    required.push(key.clone());
+                }
             }
         }
     }
