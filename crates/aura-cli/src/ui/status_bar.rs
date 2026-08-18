@@ -232,7 +232,7 @@ pub(crate) fn update_status_bar_unlocked() {
     let _ = stdout.flush();
 }
 
-/// Accumulate a turn's token usage and record the resulting context size.
+/// Accumulate a turn's token usage.
 pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
     if let Ok(mut g) = CUMULATIVE_PROMPT.lock() {
         *g += prompt_tokens;
@@ -240,9 +240,6 @@ pub fn set_status_bar_tokens(prompt_tokens: u64, completion_tokens: u64) {
     if let Ok(mut g) = CUMULATIVE_COMPLETION.lock() {
         *g += completion_tokens;
     }
-    // Per the `aura.usage` contract, prompt + completion is the context
-    // window position for the next request.
-    set_context_used(prompt_tokens + completion_tokens);
 }
 
 /// Accumulate scratchpad savings.

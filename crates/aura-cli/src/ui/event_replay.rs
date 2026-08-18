@@ -25,7 +25,7 @@ use super::orchestrator::{
 use super::state::{
     EVENT_LOG, EXPANDED_OUTPUT, WELCOME_STATE, random_bullet_color, task_color_for,
 };
-use super::status_bar::{reset_status_bar_tokens, set_status_bar_tokens};
+use super::status_bar::{reset_status_bar_tokens, set_context_used, set_status_bar_tokens};
 
 /// Clear the terminal and replay all recorded events.
 pub fn replay_event_log_global() {
@@ -184,6 +184,9 @@ pub fn replay_event_log_global() {
                 completion_tokens,
             } => {
                 set_status_bar_tokens(*prompt_tokens, *completion_tokens);
+                // The log keeps only end-of-turn usage, so this is a lower
+                // bound on context size until the next live turn reports.
+                set_context_used(*prompt_tokens + *completion_tokens);
                 i += 1;
             }
             DisplayEvent::OrchestratorScratchpadSavings {

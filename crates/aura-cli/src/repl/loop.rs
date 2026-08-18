@@ -1116,6 +1116,7 @@ pub fn run_repl(
                             approval_poster: approval_poster.clone(),
                             #[cfg(feature = "standalone-cli")]
                             pending_approvals: pending_approvals.clone(),
+                            turn_context_peak: 0,
                         };
                         backend
                             .stream_chat(
@@ -2163,6 +2164,8 @@ struct ReplStreamHandler {
     /// `PendingApprovals::resolve()` instead of an HTTP POST.
     #[cfg(feature = "standalone-cli")]
     pending_approvals: Option<aura::hitl::PendingApprovals>,
+    /// Largest context size any `aura.tool_usage` reported this request.
+    turn_context_peak: u64,
 }
 
 impl ReplStreamHandler {
@@ -2392,12 +2395,24 @@ impl StreamHandler for ReplStreamHandler {
     }
 
     fn on_tool_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
-        set_context_used(prompt_tokens + completion_tokens);
+        // Each tool-turn call re-sends the whole context, so its input+output
+        // is the provider's exact figure for context size at that point.
+        self.turn_context_peak = self
+            .turn_context_peak
+            .max(prompt_tokens + completion_tokens);
+        set_context_used(self.turn_context_peak);
         update_status_bar();
     }
 
     fn on_usage(&mut self, prompt_tokens: u64, completion_tokens: u64) {
         set_status_bar_tokens(prompt_tokens, completion_tokens);
+        // The end-of-turn figure is first-call input + all output, which
+        // leaves out tool results appended to history; on tool turns the last
+        // tool_usage snapshot is the larger, more faithful number.
+        set_context_used(
+            self.turn_context_peak
+                .max(prompt_tokens + completion_tokens),
+        );
         update_status_bar();
         if let Ok(mut events) = self.turn_events.lock() {
             events.push(DisplayEvent::Usage {
