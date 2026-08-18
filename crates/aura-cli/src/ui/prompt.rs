@@ -22,12 +22,13 @@ pub use super::state::{
 pub(crate) use super::state::{lock_term, take_pending_command};
 
 // Re-export from status_bar.rs
+pub(crate) use super::status_bar::update_status_bar_unlocked;
 pub use super::status_bar::{
     add_scratchpad_usage, add_turn_notice, clear_turn_notices, get_cumulative_tokens, handle_ctrlc,
-    reset_ctrlc_state, reset_status_bar_tokens, seed_status_bar_tokens, set_auto_compact_ceiling,
-    set_status_bar, set_status_bar_tokens, update_status_bar,
+    reset_ctrlc_state, reset_status_bar_tokens, seed_status_bar_tokens, set_context_used,
+    set_mcp_counts, set_session_info, set_status_bar_tokens, set_status_segments,
+    update_status_bar,
 };
-pub(crate) use super::status_bar::{rebuild_status_bar, update_status_bar_unlocked};
 
 // Re-export from input_frame.rs
 pub use super::input_frame::{

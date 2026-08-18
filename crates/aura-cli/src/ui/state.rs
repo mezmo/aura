@@ -9,13 +9,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use crossterm::style::Color;
 
+use crate::api::mcp_status::McpCounts;
 use crate::api::types::{DisplayEvent, ModelEntry};
 use crate::repl::registry::PendingCommand;
+use crate::ui::status_line::Segment;
 use crate::ui::welcome::WelcomeState;
 
 use super::orchestrator::{ActiveOrchTool, OrchLastToolInfo};
@@ -44,10 +46,9 @@ pub fn term_size() -> (u16, u16) {
 // Status bar state
 // ---------------------------------------------------------------------------
 
-pub(crate) static STATUS_BAR: Mutex<String> = Mutex::new(String::new());
 pub(crate) static STATUS_HINT: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Per-turn status notices (pre-styled error/warning lines) shown below the
-/// token line in the status area while the REPL is idle. Populated during a
+/// status line in the status area while the REPL is idle. Populated during a
 /// turn (e.g. from `aura.mcp_status`) and cleared at the start of the next
 /// request. Hidden while a request is processing and while a hint overlay is
 /// active — this is the *persistent* surface that sticks after the turn ends.
@@ -66,8 +67,23 @@ pub(crate) static PROCESSING: AtomicBool = AtomicBool::new(false);
 pub(crate) static QUEUED_INPUT: Mutex<String> = Mutex::new(String::new());
 pub(crate) static QUEUED_WAVE_POS: Mutex<f32> = Mutex::new(0.0);
 pub(crate) static QUEUED_WAVE_DIR: Mutex<f32> = Mutex::new(0.5);
-/// Token ceiling at which auto-compact fires. 0 means no warning active yet.
-pub(crate) static AUTO_COMPACT_CEILING: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Status line state
+// ---------------------------------------------------------------------------
+
+/// Segments the status line shows; unset means `status_line::DEFAULT_SEGMENTS`.
+pub(crate) static STATUS_SEGMENTS: OnceLock<Vec<Segment>> = OnceLock::new();
+/// Process working directory, resolved once.
+pub(crate) static CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Model name reported by the server for the current session.
+pub(crate) static SESSION_MODEL: Mutex<Option<String>> = Mutex::new(None);
+/// Tokens occupying the model's context after the latest usage report.
+pub(crate) static CONTEXT_USED: AtomicU64 = AtomicU64::new(0);
+/// Model context window in tokens (0 = unknown).
+pub(crate) static MODEL_CONTEXT_LIMIT: AtomicU64 = AtomicU64::new(0);
+/// Latest MCP server tally.
+pub(crate) static MCP_COUNTS: Mutex<Option<McpCounts>> = Mutex::new(None);
 
 // ---------------------------------------------------------------------------
 // Mid-stream input history (for up/down arrow during streaming)
