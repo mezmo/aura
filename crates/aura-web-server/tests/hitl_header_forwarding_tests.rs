@@ -39,6 +39,9 @@ use tokio::process::{Child, Command};
 const CHAT_TIMEOUT: Duration = Duration::from_secs(90);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The prompt that has the model call `echo_headers` and relay its output.
+const ECHO_PROMPT: &str = "Call the echo_headers tool now and reply with only its raw JSON output.";
+
 // ---------------------------------------------------------------------------
 // A dedicated aura-web-server, spawned fresh per test case
 // ---------------------------------------------------------------------------
@@ -467,27 +470,35 @@ fn extract_json_object(text: &str) -> Option<Value> {
 // Cases (spec Phase 3)
 // ---------------------------------------------------------------------------
 
-/// Case 1: an approved decision carrying the mapped header replaces the
-/// frozen requester identity on the one gated call.
-#[tokio::test]
-async fn override_forwarded_to_the_gated_call() {
-    let approver = MockApprover::start(ApproverReply::ApproveWithHeader {
-        name: "x-approver-token",
-        value: "Bearer approver-issued-identity",
-    })
-    .await;
+/// An approver answering with `reply`, plus a freshly spawned server whose
+/// `[hitl]` route points at it and whose client carries the frozen identity.
+async fn gated_server(reply: ApproverReply) -> (MockApprover, AuraServer) {
+    let approver = MockApprover::start(reply).await;
     let server = AuraServer::start(&config_toml(
         &mcp_url(),
         "Bearer legacy-frozen-identity",
         &gated_hitl_toml(&approver.url),
     ))
     .await;
+    (approver, server)
+}
 
-    let response = send_chat(
-        &server,
-        "Call the echo_headers tool now and reply with only its raw JSON output.",
-    )
+/// The approver saw exactly `expected` decision requests; `context` says why.
+fn assert_hits(approver: &MockApprover, expected: usize, context: &str) {
+    assert_eq!(approver.hits(), expected, "{context}");
+}
+
+/// Case 1: an approved decision carrying the mapped header replaces the
+/// frozen requester identity on the one gated call.
+#[tokio::test]
+async fn override_forwarded_to_the_gated_call() {
+    let (approver, server) = gated_server(ApproverReply::ApproveWithHeader {
+        name: "x-approver-token",
+        value: "Bearer approver-issued-identity",
+    })
     .await;
+
+    let response = send_chat(&server, ECHO_PROMPT).await;
     let headers = headers_from_response(
         &response,
         "the assistant relays the echo_headers JSON output",
@@ -498,10 +509,10 @@ async fn override_forwarded_to_the_gated_call() {
         Some("Bearer approver-issued-identity"),
         "the approver's identity must replace the frozen requester identity, got: {headers}"
     );
-    assert_eq!(
-        approver.hits(),
+    assert_hits(
+        &approver,
         1,
-        "exactly one decision request for the one gated call"
+        "exactly one decision request for the one gated call",
     );
     server.stop().await;
 }
@@ -510,13 +521,7 @@ async fn override_forwarded_to_the_gated_call() {
 /// call closed; the error names the header, never any value.
 #[tokio::test]
 async fn missing_mapped_header_fails_the_call_by_name_only() {
-    let approver = MockApprover::start(ApproverReply::ApproveBare).await;
-    let server = AuraServer::start(&config_toml(
-        &mcp_url(),
-        "Bearer legacy-frozen-identity",
-        &gated_hitl_toml(&approver.url),
-    ))
-    .await;
+    let (approver, server) = gated_server(ApproverReply::ApproveBare).await;
 
     let response = send_chat(
         &server,
@@ -534,10 +539,10 @@ async fn missing_mapped_header_fails_the_call_by_name_only() {
         !text.contains("legacy-frozen-identity"),
         "the error must never leak a header value, got: {text}"
     );
-    assert_eq!(
-        approver.hits(),
+    assert_hits(
+        &approver,
         1,
-        "exactly one decision request for the one gated call"
+        "exactly one decision request for the one gated call",
     );
     server.stop().await;
 }
@@ -554,11 +559,7 @@ async fn a_tool_the_glob_does_not_match_is_unaffected() {
     ))
     .await;
 
-    let response = send_chat(
-        &server,
-        "Call the echo_headers tool now and reply with only its raw JSON output.",
-    )
-    .await;
+    let response = send_chat(&server, ECHO_PROMPT).await;
     let headers = headers_from_response(
         &response,
         "a tool the glob does not match runs with no approval step at all",
@@ -569,10 +570,10 @@ async fn a_tool_the_glob_does_not_match_is_unaffected() {
         Some("Bearer legacy-frozen-identity"),
         "an unmatched call must carry no approver override, got: {headers}"
     );
-    assert_eq!(
-        approver.hits(),
+    assert_hits(
+        &approver,
         0,
-        "a call the glob does not match must never consult the approver at all"
+        "a call the glob does not match must never consult the approver at all",
     );
     server.stop().await;
 }

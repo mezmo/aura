@@ -872,6 +872,18 @@ pub(crate) mod tests {
         HashMap::from([("authorization".to_owned(), "Bearer requester".to_owned())])
     }
 
+    /// A running recording server and a client connected to it, frozen with
+    /// `headers` as its request-time identity.
+    pub(crate) async fn client_and_server(
+        headers: &HashMap<String, String>,
+    ) -> (RecordingMcpServer, McpClient) {
+        let server = RecordingMcpServer::start().await;
+        let client = McpClient::new(server.url.clone(), headers)
+            .await
+            .expect("the loopback server completes the handshake");
+        (server, client)
+    }
+
     fn no_args() -> HashMap<String, Value> {
         HashMap::new()
     }
@@ -881,10 +893,7 @@ pub(crate) mod tests {
     /// no approval unblocked — is back to the client's own identity.
     #[tokio::test]
     async fn override_rides_one_call_and_no_later_one() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
+        let (server, client) = client_and_server(&requester_headers()).await;
 
         client
             .call_tool(
@@ -912,10 +921,7 @@ pub(crate) mod tests {
     /// value as an extension, and the serializer emits no trace of it.
     #[tokio::test]
     async fn override_never_reaches_the_json_body() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
+        let (server, client) = client_and_server(&requester_headers()).await;
 
         client
             .call_tool(
@@ -935,10 +941,7 @@ pub(crate) mod tests {
     /// stand in place of the requester's on the gated call, not beside it.
     #[tokio::test]
     async fn override_replaces_the_clients_frozen_identity_for_that_call_only() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
+        let (server, client) = client_and_server(&requester_headers()).await;
 
         client
             .call_tool(
@@ -975,10 +978,7 @@ pub(crate) mod tests {
     /// and this is the test that would catch a regression to shared state.
     #[tokio::test]
     async fn concurrent_gated_calls_keep_their_own_identity() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
+        let (server, client) = client_and_server(&requester_headers()).await;
 
         let (first, second) = tokio::join!(
             client.call_tool(
@@ -1012,10 +1012,7 @@ pub(crate) mod tests {
     /// not decide whether identity is delivered.
     #[tokio::test]
     async fn call_tool_delivers_the_override_on_either_branch() {
-        let server = RecordingMcpServer::start().await;
-        let client = McpClient::new(server.url.clone(), &requester_headers())
-            .await
-            .expect("the loopback server completes the handshake");
+        let (server, client) = client_and_server(&requester_headers()).await;
 
         client
             .call_tool(

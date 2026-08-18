@@ -1495,17 +1495,9 @@ mod tests {
             )
         }
 
-        fn mappings(pairs: &[(&str, &str)]) -> aura_config::ToolHeaderMappings {
-            let raw: HashMap<String, String> = pairs
-                .iter()
-                .map(|(outbound, response)| ((*outbound).to_owned(), (*response).to_owned()))
-                .collect();
-            aura_config::ToolHeaderMappings::try_from(raw).expect("test mappings are valid config")
-        }
-
         /// The one mapping every gate test below configures.
         fn user_mapping() -> aura_config::ToolHeaderMappings {
-            mappings(&[("x-forwarded-user", "x-approver-id")])
+            crate::approver_headers::tests::mappings(&[("x-forwarded-user", "x-approver-id")])
         }
 
         /// Sign `body` under the approval-decision context for `decision_id`,
