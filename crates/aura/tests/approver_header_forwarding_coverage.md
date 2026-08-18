@@ -48,13 +48,11 @@ a defect in this document, not an implicit exclusion.
 | Denial, timeout, cancellation and channel fault never proceed | `hitl::gate::tests::approval_result_mapping_denial_is_feedback_not_error`, `hitl::gate::tests::approval_result_mapping_timeout_cancel_and_channel_fault_are_errors` | Denial maps to feedback, the rest to errors — neither is a proceed, so nothing may be applied |
 | Composition keeps the one producer's overrides across passive wrappers | `tool_wrapper::tests::composed_overrides::the_single_producers_identity_survives_its_passive_neighbours` | Composition builds a fresh outcome, so this is a value-loss seam |
 | Two producing wrappers fail the call | `tool_wrapper::tests::composed_overrides::two_producers_fail_the_call_rather_than_pick_one` | Wrapper order must never decide identity |
-| Overrides scoped by the wrapper reach the adaptor across its inner-call spawn | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | Exercises the wrapper, the spawn, the adaptor read and the wire in one call |
-| Streamable-HTTP tools are tagged as able to deliver | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | |
-| SSE tools are tagged as able to deliver | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | |
+| Overrides scoped by the wrapper reach the adaptor across its inner-call spawn, which threads them to the client | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | Exercises the wrapper, the spawn, the adaptor read and the wire in one call |
+| Streamable-HTTP and SSE tools are tagged as able to deliver | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | |
 | Stdio tools are tagged as unable to deliver | `builder::tests::transport_tagging::stdio_tools_are_tagged_so_a_gated_call_fails_closed` | A mistag here would run a gated call under the cached identity |
 | Stdio adaptor refuses a gated call before anything is dispatched | `builder::tests::transport_tagging::stdio_tools_are_tagged_so_a_gated_call_fails_closed` | Asserts the recording server saw nothing, not only that the call errored |
 | Stdio adaptor runs an ungated call untouched | `mcp_dynamic::tests::stdio_adaptor_runs_an_ungated_call` | The fail-open complement: no override means no transport check |
-| Adaptor reads the scoped overrides and threads them to the client | `builder::tests::transport_tagging::http_and_sse_tools_are_tagged_so_a_gated_call_delivers_identity` | Exercises the wrapper, the spawn, the adaptor read and the wire in one call |
 | Transport check accepts both HTTP transports | `approver_headers::tests::http_transports_accept_overrides` | |
 | Transport check refuses stdio | `approver_headers::tests::stdio_transport_refuses_overrides` | The check takes the transport alone, so refusal cannot depend on what the override set holds |
 | Every captured pair lands on the outbound request | `approver_headers::tests::apply_to_sets_every_captured_pair_on_the_request` | |

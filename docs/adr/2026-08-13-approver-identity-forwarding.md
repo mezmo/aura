@@ -71,66 +71,35 @@ verified against pinned `rmcp` 0.12.0:
 Chosen option: **the rmcp request-extension side-channel, webhook route
 only.**
 
-A `#[derive(Clone)] ApproverHeaders(HeaderMap)` (redacting `Debug`) is
-inserted into a request's extensions at every `call_tool*` construction site
-when the gate released an override, and read back at the two send points
-that own an outbound POST: `CustomHttpClient::post_message` (HTTP-streamable)
-and aura's own `SseTransport::send`. Both apply the override as per-request
-headers, which `reqwest` uses to replace the client's frozen default header
-for that one request only — the JSON body never carries it, and the
-serializer emits no trace of it, because the hand-written wire serializer
-extracts only the `Meta` extension. One-call scoping is structural: the
-extension rides on the one request value, so there is no keyed map, no
-cleanup step, and no cross-call leakage under concurrency.
+A `#[derive(Clone)] ApproverHeaders(HeaderMap)` (redacting `Debug`) rides
+the one gated call's request value as an extension — inserted at every
+`call_tool*` construction site, read back at the two send points that own an
+outbound POST — so one-call scoping is structural: no keyed map, no cleanup
+step, no cross-call leakage under concurrency.
 
-Only the webhook decision route captures. The conversational route's
-decision also arrives on its own request (`POST
-/v1/approvals/{decision_id}`), which carries its own caller headers — but in
-this system's deployment model that caller is the session holder already on
-the stream, not a distinct identity source, so forwarding it would forward
-nothing new. Excluding it is a deliberate scope choice, recorded here as
-such. Capture is further conditioned
-on the approval's origin: the webhook client captures response headers only
-when the request that raised it came from the config gate
-(`ApprovalOrigin::ConfigGate`), never from the agent-callable
+Only the webhook route captures, and only for approvals raised by the config
+gate (`ApprovalOrigin::ConfigGate`) — never the agent-callable
 `request_approval` surface ([#306](https://github.com/mezmo/aura/issues/306)),
-because that surface's route-wide `ApprovalOutcome` has no consumer for
-credentials it would otherwise hold with nowhere to go.
+whose route-wide `ApprovalOutcome` has no consumer for credentials it would
+otherwise hold with nowhere to go. The conversational route is excluded just
+as deliberately: its decision caller is the session holder already on the
+stream, not a distinct identity source, so forwarding it would forward
+nothing new.
 
-Capture fails closed: when `tool_headers_from_response` is non-empty and the
-approved response is missing a mapped header, the approval resolves to an
-error naming every missing header — never a value. A malformed value cannot
-reach capture at all: values are read from the parsed response's header map,
-which admits only valid HTTP header values. A denied, timed-out, or cancelled
-decision captures nothing, because there is no decision to capture from.
-Every non-webhook, non-approved, or non-`ConfigGate` path produces no
-override, which the unit suite proves directly rather than by omission.
+Capture and delivery both fail closed: a missing mapped header errors the
+call naming every missing header, never a value, and a gated stdio call
+carrying an override is refused before dispatch, since stdio has no per-call
+header channel. Cleartext capture stays allowed (TLS termination ahead of
+the process is a legitimate topology) but never silent: startup logs one
+warning per `[hitl]` config at the HMAC boot-time seam, while an HMAC secret
+over `http://` remains a boot-time misconfiguration, unchanged and
+independent of capture. Audit is names-only: the applied header names land
+on the `mcp.tool_call` span as `applied_headers`, and a capture failure's
+error text is the event-level signal — no new `aura-events` wire type.
 
-Stdio fails closed on a gated call that carries an override. The tool
-adaptor is tagged with its transport kind at construction; stdio has no
-per-call header channel, so a gated call demanding identity is refused
-before dispatch, and the cached identity never runs the call in its place.
-
-Capture does not require `https://`. A cleartext webhook route with
-`tool_headers_from_response` configured is usable and unsigned, because TLS
-termination ahead of the process (a trusted gateway, service-to-service) is
-a legitimate topology. It is never silent: startup logs one warning per
-`[hitl]` config naming the exposure (scheme and host only, never path,
-query, or userinfo), at the same boot-time seam as the HMAC-signing check —
-not at webhook-client construction, which happens fresh on every request
-that builds an agent. The one rule that still rejects plaintext is unchanged
-and independent of capture: an HMAC secret configured over `http://` is a
-misconfiguration and fails at boot.
-
-Audit is names-only. `execute_mcp_tool` stamps the applied header names,
-sorted and joined, on the `mcp.tool_call` span as `applied_headers`; a
-capture failure's own error text is the event-level signal, naming every
-affected header. Under fail-closed semantics a capture-success stamp would
-be degenerate (success always equals the configured key set), so no
-`aura-events` wire type or CLI deserializer changes. This contract covers
-only the audit fields this feature emits — a tool that echoes the header it
-received puts the forwarded value into its own recorded result the same
-way any tool call's output is recorded, feature or no feature.
+Mechanism detail (config shape, capture contract, send points, extension
+lifecycle, audit fields): [docs/design/hitl.md](../design/hitl.md),
+approver header forwarding section.
 
 ### Positive Consequences
 
