@@ -8,7 +8,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::mcp_status::McpCounts;
 use crate::theme::{AuraStyle, Themed};
@@ -283,7 +283,7 @@ fn truncate_start(s: &str, max: usize) -> String {
     let mut kept = 0;
     let mut tail = String::new();
     for c in s.chars().rev() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = c.width().unwrap_or(0);
         if kept + w > budget {
             break;
         }
@@ -302,7 +302,7 @@ fn truncate_end(s: &str, max: usize) -> String {
     let mut kept = 0;
     let mut head = String::new();
     for c in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = c.width().unwrap_or(0);
         if kept + w > budget {
             break;
         }

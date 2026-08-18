@@ -1,5 +1,7 @@
 // ---------------------------------------------------------------------------
-// Status bar rendering
+// Status area below the input frame: row sizing, the hint overlay, per-turn
+// notices, Ctrl-C handling, and the counters the status line reads. Row 0's
+// text itself is rendered by `status_line`.
 // ---------------------------------------------------------------------------
 
 use std::io::{self, Write};
