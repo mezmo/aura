@@ -156,7 +156,7 @@ Integration tests run single-threaded (`--test-threads=1`) due to LLM API rate l
 | `integration-orchestration-sre` | SRE orchestration (requires k8s-sre-mcp server config)   |
 | `integration-scratchpad`        | Scratchpad (separate from parent `integration`; requires scratchpad-test-mcp server config) |
 | `integration-session-store`     | Redis/Valkey session store (separate from parent `integration`; requires a live Redis/Valkey via `AURA_TEST_REDIS_URL`) |
-| `integration-hitl-header-forwarding` | HITL approver header forwarding (separate from parent `integration`; a gated `echo_headers` would break the base suite's ungated calls to the same tool, so each test spawns its own aura-web-server) |
+| `integration-hitl-header-forwarding` | HITL approver header forwarding (separate from parent `integration`; spawns a per-case aura-web-server) |
 | `integration-vector`            | Vector store / RAG (requires external Qdrant)            |
 
 Example, run only the streaming tests:
