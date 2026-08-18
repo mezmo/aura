@@ -451,8 +451,22 @@ pub fn get_selected_model() -> Option<String> {
 
 /// Set the selected model.
 pub fn set_selected_model(model: Option<String>) {
-    if let Ok(mut g) = SELECTED_MODEL.lock() {
-        *g = model;
+    let changed = SELECTED_MODEL
+        .lock()
+        .map(|mut g| {
+            let changed = *g != model;
+            *g = model;
+            changed
+        })
+        .unwrap_or(false);
+    if !changed {
+        return;
+    }
+    // A different model has a different window; forget the old one rather
+    // than measure the next turn against it until session_info reports again.
+    MODEL_CONTEXT_LIMIT.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = SESSION_MODEL.lock() {
+        *g = None;
     }
 }
 
