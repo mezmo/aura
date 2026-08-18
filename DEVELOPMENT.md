@@ -70,6 +70,9 @@ aura/
 (`aura_config::schema::config_schema()`); after changing config structs, run
 `AURA_UPDATE_SCHEMA=1 cargo test -p aura-config schema_file_up_to_date` to
 regenerate it. The `schema_file_up_to_date` test fails CI when it drifts.
+`.taplo.toml` associates the shipped configs with the schema, so taplo- and
+tombi-based editors (VS Code Even Better TOML, the taplo or tombi LSP in
+Neovim) validate them and complete keys with doc hovers.
 
 ## Make Targets
 

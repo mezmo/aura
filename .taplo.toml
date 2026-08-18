@@ -1,0 +1,16 @@
+# Associates AURA agent config files with the generated JSON Schema
+# (schema/aura-config.schema.json) for editor validation, completion, and
+# hover docs via the taplo/tombi language servers. Regeneration:
+# see DEVELOPMENT.md.
+
+[[rule]]
+include = [
+    "configs/**/*.toml",
+    "examples/minimal/*.toml",
+    "examples/complete/*.toml",
+    "examples/reference.toml",
+    "quickstart.toml",
+]
+
+[rule.schema]
+path = "schema/aura-config.schema.json"
