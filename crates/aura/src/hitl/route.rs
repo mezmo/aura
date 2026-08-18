@@ -1863,9 +1863,9 @@ mod tests {
             );
         }
 
-        /// An absent or empty `tool_headers_from_response` map is the
-        /// legacy path: no capture, so no exposure to warn about, over
-        /// either scheme.
+        /// An absent or empty `tool_headers_from_response` map captures
+        /// nothing, so there is no exposure to warn about, over either
+        /// scheme.
         #[test]
         fn warn_on_cleartext_capture_is_quiet_with_no_map() {
             let log = captured_warn_log(|| {
