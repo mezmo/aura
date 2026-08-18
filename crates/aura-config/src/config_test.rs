@@ -995,6 +995,42 @@ model = "llama3.2"
     }
 
     #[test]
+    fn test_description_defaults_to_none() {
+        let config_str = r#"
+[agent]
+name = "Test"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(config.agent.description, None);
+    }
+
+    #[test]
+    fn test_description_explicit_value() {
+        let config_str = r#"
+[agent]
+name = "Test"
+description = "Anthropic-backed SRE agent for production incidents"
+system_prompt = "Test"
+
+[agent.llm]
+provider = "ollama"
+model = "llama3.2"
+
+"#;
+        let config = load_config_from_str(config_str).expect("Failed to parse config");
+        assert_eq!(
+            config.agent.description.as_deref(),
+            Some("Anthropic-backed SRE agent for production incidents")
+        );
+    }
+
+    #[test]
     fn test_ollama_config_all_params() {
         println!("\n=== TEST_OLLAMA_CONFIG_ALL_PARAMS ===");
         let config_str = r#"

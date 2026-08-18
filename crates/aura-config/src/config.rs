@@ -767,6 +767,9 @@ pub struct AgentConfig {
     pub name: String,
     #[serde(default)]
     pub alias: Option<String>,
+    /// Short human-readable summary of what this agent does.
+    #[serde(default)]
+    pub description: Option<String>,
     pub system_prompt: String,
     #[serde(default)]
     pub context: Vec<String>,
@@ -843,6 +846,7 @@ impl Default for AgentConfig {
         Self {
             name: "Assistant".to_string(),
             alias: None,
+            description: None,
             system_prompt: "You are a helpful assistant.".to_string(),
             context: Vec::new(),
             turn_depth: default_turn_depth(),

@@ -157,6 +157,9 @@ name = "Assistant"
 #                         # Clients send this as the "model" field in requests.
 #                         # If omitted, the agent name is used as the identifier.
 #                         # Must be unique across all loaded configs.
+# description = "General-purpose assistant with tool access"
+#                         # optional: one-line summary shown next to the model
+#                         # id in /v1/models, /aura/info, and the CLI's /model picker.
 system_prompt = """
 You are a helpful assistant with access to external tools and
 knowledge bases. Use them to provide accurate, grounded answers.
