@@ -97,6 +97,12 @@ pub enum AuraStyle {
     KeyLabel,      // tool argument key labels in trees
     StreamAura,    // stream panel: aura.* event lines
     StreamMessage, // stream panel: 'message' event lines
+    StatusModel,   // status line: model name
+    StatusPath,    // status line: working directory
+    StatusGit,     // status line: git branch
+    StatusTokens,  // status line: cumulative in/out tokens
+    StatusScratch, // status line: scratchpad savings
+    StatusMcp,     // status line: MCP tally when every server connected
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +132,12 @@ pub struct Theme {
     pub key_label: Style,
     pub stream_aura: Style,
     pub stream_message: Style,
+    pub status_model: Style,
+    pub status_path: Style,
+    pub status_git: Style,
+    pub status_tokens: Style,
+    pub status_scratch: Style,
+    pub status_mcp: Style,
 
     // Region backgrounds — applied to large output zones.
     pub default_output_bg: Color,
@@ -166,6 +178,12 @@ impl Theme {
             AuraStyle::KeyLabel => self.key_label,
             AuraStyle::StreamAura => self.stream_aura,
             AuraStyle::StreamMessage => self.stream_message,
+            AuraStyle::StatusModel => self.status_model,
+            AuraStyle::StatusPath => self.status_path,
+            AuraStyle::StatusGit => self.status_git,
+            AuraStyle::StatusTokens => self.status_tokens,
+            AuraStyle::StatusScratch => self.status_scratch,
+            AuraStyle::StatusMcp => self.status_mcp,
         }
     }
 
@@ -322,6 +340,37 @@ pub static NORMAL: Theme = Theme {
     key_label: Style::fg(Color::Reset),
     stream_aura: Style::fg(Color::Yellow),
     stream_message: Style::fg(Color::Cyan),
+    // Status line hues are lifted from the `.welcome` logo gradient.
+    status_model: Style::fg(Color::Rgb {
+        r: 243,
+        g: 116,
+        b: 195,
+    }), // Logo pink
+    status_path: Style::fg(Color::Rgb {
+        r: 93,
+        g: 147,
+        b: 215,
+    }), // Logo blue
+    status_git: Style::fg(Color::Rgb {
+        r: 236,
+        g: 172,
+        b: 149,
+    }), // Logo peach
+    status_tokens: Style::fg(Color::Rgb {
+        r: 147,
+        g: 112,
+        b: 219,
+    }), // Lavender
+    status_scratch: Style::fg(Color::Rgb {
+        r: 64,
+        g: 224,
+        b: 208,
+    }), // Turquoise
+    status_mcp: Style::fg(Color::Rgb {
+        r: 232,
+        g: 224,
+        b: 168,
+    }), // Logo yellow
     default_output_bg: Color::Reset,
     markdown_bg: Color::Reset,
     diff_bg: Color::Reset,
@@ -364,6 +413,12 @@ pub static HIGH_CONTRAST: Theme = Theme {
     key_label: Style::fg(Color::Cyan).bold(),
     stream_aura: Style::fg(Color::Yellow).bold(),
     stream_message: Style::fg(Color::Cyan).bold(),
+    status_model: Style::fg(Color::Magenta).bold(),
+    status_path: Style::fg(Color::Cyan).bold(),
+    status_git: Style::fg(Color::Yellow).bold(),
+    status_tokens: Style::fg(Color::White).bold(),
+    status_scratch: Style::fg(Color::Cyan).bold(),
+    status_mcp: Style::fg(Color::Green).bold(),
     default_output_bg: Color::Reset,
     markdown_bg: Color::Reset,
     diff_bg: Color::Reset,
@@ -397,6 +452,12 @@ pub static NO_COLORS: Theme = Theme {
     key_label: Style::fg(Color::Reset).bold(),
     stream_aura: Style::fg(Color::Reset).dim(),
     stream_message: Style::fg(Color::Reset).dim(),
+    status_model: Style::fg(Color::Reset).bold(),
+    status_path: Style::fg(Color::Reset).dim(),
+    status_git: Style::fg(Color::Reset).dim(),
+    status_tokens: Style::fg(Color::Reset).dim(),
+    status_scratch: Style::fg(Color::Reset).dim(),
+    status_mcp: Style::fg(Color::Reset).dim(),
     default_output_bg: Color::Reset,
     markdown_bg: Color::Reset,
     diff_bg: Color::DarkGrey,
