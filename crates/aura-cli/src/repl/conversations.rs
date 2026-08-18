@@ -2,7 +2,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::api::types::{DisplayEvent, Message};
+use crate::api::types::{DisplayEvent, Message, ModelEntry};
+use crate::ui::text::collapse_whitespace;
 
 pub struct ConversationStore {
     pub uuid: String,
@@ -256,21 +257,38 @@ impl ConversationStore {
             .collect()
     }
 
-    /// Save the available model list for this conversation's server.
-    #[allow(dead_code)]
-    pub fn save_models_cache(&self, models: &[String]) {
-        let path = self.dir.join("models_cache");
-        let _ = fs::write(&path, models.join("\n"));
+    /// Write `models` to `<dir>/models_cache`, one model per line as
+    /// `id[\tdescription]`. Descriptions are flattened to a single line so
+    /// they cannot break the line-per-model layout.
+    pub fn write_models_cache(dir: &Path, models: &[ModelEntry]) {
+        let lines: Vec<String> = models
+            .iter()
+            .map(|m| match m.description.as_deref() {
+                Some(desc) => format!("{}\t{}", m.id, collapse_whitespace(desc)),
+                None => m.id.clone(),
+            })
+            .collect();
+        let _ = fs::write(dir.join("models_cache"), lines.join("\n"));
     }
 
-    /// Load the cached model list from this conversation's directory.
-    pub fn load_models_cache(&self) -> Option<Vec<String>> {
+    /// Load the cached model list from this conversation's directory. A line
+    /// without a tab loads as an id with no description.
+    pub fn load_models_cache(&self) -> Option<Vec<ModelEntry>> {
         let path = self.dir.join("models_cache");
         let data = fs::read_to_string(&path).ok()?;
-        let models: Vec<String> = data
+        let models: Vec<ModelEntry> = data
             .lines()
             .filter(|l| !l.is_empty())
-            .map(String::from)
+            .map(|line| match line.split_once('\t') {
+                Some((id, desc)) => ModelEntry {
+                    id: id.to_string(),
+                    description: (!desc.is_empty()).then(|| desc.to_string()),
+                },
+                None => ModelEntry {
+                    id: line.to_string(),
+                    description: None,
+                },
+            })
             .collect();
         if models.is_empty() {
             None
@@ -525,13 +543,60 @@ mod tests {
         assert!(store.load_system_prompt().is_none());
     }
 
+    fn model(id: &str, description: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
     #[test]
     fn models_cache_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         assert!(store.load_models_cache().is_none());
-        store.save_models_cache(&["gpt-4".to_string(), "gpt-3.5".to_string()]);
+        ConversationStore::write_models_cache(
+            store.dir(),
+            &[
+                model("gpt-4", None),
+                model("sre", Some("Anthropic-backed SRE agent")),
+            ],
+        );
         let cached = store.load_models_cache().unwrap();
-        assert_eq!(cached, vec!["gpt-4", "gpt-3.5"]);
+        assert_eq!(
+            cached,
+            vec![
+                model("gpt-4", None),
+                model("sre", Some("Anthropic-backed SRE agent")),
+            ]
+        );
+    }
+
+    #[test]
+    fn models_cache_flattens_multiline_descriptions() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        ConversationStore::write_models_cache(
+            store.dir(),
+            &[
+                model("sre", Some("Line one\nline\ttwo  \n")),
+                model("next", None),
+            ],
+        );
+        assert_eq!(
+            store.load_models_cache().unwrap(),
+            vec![model("sre", Some("Line one line two")), model("next", None)]
+        );
+    }
+
+    #[test]
+    fn models_cache_reads_id_only_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        fs::write(store.dir().join("models_cache"), "gpt-4\ngpt-3.5\n").unwrap();
+        assert_eq!(
+            store.load_models_cache().unwrap(),
+            vec![model("gpt-4", None), model("gpt-3.5", None)]
+        );
     }
 }

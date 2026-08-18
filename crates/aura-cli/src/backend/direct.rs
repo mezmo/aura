@@ -29,7 +29,7 @@ use aura_web_server::types::{
 };
 
 use crate::api::stream::{StreamHandler, StreamResult, process_sse_events};
-use crate::api::types::{Message, ToolCallInfo, ToolDefinition};
+use crate::api::types::{Message, ModelEntry, ToolCallInfo, ToolDefinition};
 use crate::ui::prompt::get_selected_model;
 
 /// Factory for `additional_tools` registered on every standalone agent.
@@ -162,11 +162,20 @@ impl DirectBackend {
 
     /// Return the effective model ID for each loaded config.
     pub(crate) fn model_ids(&self) -> Vec<String> {
+        self.model_choices().into_iter().map(|m| m.id).collect()
+    }
+
+    /// Return the effective model ID and `[agent].description` of each
+    /// loaded, non-hidden config.
+    pub(crate) fn model_choices(&self) -> Vec<ModelEntry> {
         self.app_state
             .configs
             .iter()
             .filter(|c| !c.agent.hidden)
-            .map(|c| c.agent_id().to_string())
+            .map(|c| ModelEntry {
+                id: c.agent_id().to_string(),
+                description: c.agent.description.clone(),
+            })
             .collect()
     }
 
@@ -629,6 +638,26 @@ preamble = "p"
             make_config("Code Agent", None, ""),
         ]);
         assert_eq!(backend.model_ids(), vec!["math", "Code Agent"]);
+    }
+
+    #[test]
+    fn model_choices_carry_agent_descriptions() {
+        let mut described = make_config("SRE Agent", Some("sre"), "");
+        described.agent.description = Some("Triage production incidents".to_string());
+        let backend = make_backend(vec![described, make_config("Plain", None, "")]);
+        assert_eq!(
+            backend.model_choices(),
+            vec![
+                ModelEntry {
+                    id: "sre".to_string(),
+                    description: Some("Triage production incidents".to_string()),
+                },
+                ModelEntry {
+                    id: "Plain".to_string(),
+                    description: None,
+                },
+            ]
+        );
     }
 
     #[test]

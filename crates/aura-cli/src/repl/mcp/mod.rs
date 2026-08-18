@@ -89,25 +89,8 @@ fn format_server_list(agent: Option<&AgentInfo>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::strip_sgr;
     use std::collections::BTreeMap;
-
-    /// Strip SGR sequences (`ESC[…m`) so assertions are theme-independent.
-    fn strip_sgr(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for c2 in chars.by_ref() {
-                    if c2 == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
 
     #[test]
     fn lists_servers_with_transport_and_target() {

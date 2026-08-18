@@ -154,7 +154,7 @@ impl Backend {
             }
             #[cfg(feature = "standalone-cli")]
             Self::Direct(direct) => {
-                crate::ui::prompt::seed_model_cache(direct.model_ids());
+                crate::ui::prompt::seed_model_cache(direct.model_choices());
             }
         }
     }

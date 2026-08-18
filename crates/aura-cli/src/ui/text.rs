@@ -15,7 +15,13 @@ pub fn truncate_with_ellipsis(text: &str, max: usize) -> String {
     // Reserve three clusters for the ellipsis so the result fits in `max`.
     let keep = max.saturating_sub(3);
     let prefix: String = text.graphemes(true).take(keep).collect();
-    format!("{prefix}...")
+    format!("{}...", prefix.trim_end())
+}
+
+/// Collapse every run of whitespace (newlines included) into one space and
+/// trim the ends, so multi-line text renders on a single terminal row.
+pub fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Greedy word-wrap of `text` into lines of at most `width` columns.
@@ -55,6 +61,22 @@ mod tests {
     #[test]
     fn short_text_is_unchanged() {
         assert_eq!(truncate_with_ellipsis("hello", 120), "hello");
+    }
+
+    #[test]
+    fn truncation_does_not_leave_a_space_before_the_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("hello brave world", 9), "hello...");
+        assert_eq!(
+            truncate_with_ellipsis("hello brave world", 10),
+            "hello b..."
+        );
+    }
+
+    #[test]
+    fn collapse_whitespace_flattens_runs_and_newlines() {
+        assert_eq!(collapse_whitespace("  a\tb  \n\n c\r\n"), "a b c");
+        assert_eq!(collapse_whitespace("single"), "single");
+        assert_eq!(collapse_whitespace("   "), "");
     }
 
     #[test]

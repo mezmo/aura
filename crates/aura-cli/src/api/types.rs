@@ -7,9 +7,13 @@ pub struct ModelList {
     pub data: Vec<ModelEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// One `/v1/models` entry: the id clients send as `model`, plus the server's
+/// optional `description` extension.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +353,35 @@ pub mod duration_millis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // ModelList
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_list_reads_optional_descriptions() {
+        let list: ModelList = serde_json::from_str(
+            r#"{"object":"list","data":[
+                {"id":"sre","object":"model","created":1,"owned_by":"mezmo",
+                 "description":"Triage production incidents"},
+                {"id":"gpt-4o","object":"model","created":1,"owned_by":"openai"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            list.data,
+            vec![
+                ModelEntry {
+                    id: "sre".to_string(),
+                    description: Some("Triage production incidents".to_string()),
+                },
+                ModelEntry {
+                    id: "gpt-4o".to_string(),
+                    description: None,
+                },
+            ]
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Message constructors

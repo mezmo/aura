@@ -2,13 +2,13 @@
 // Input validation and hints
 // ---------------------------------------------------------------------------
 
-use std::fs;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
 use crossterm::style::Stylize;
 
+use crate::api::types::ModelEntry;
 use crate::repl::conversations::ConversationStore;
 use crate::repl::registry::{lookup, matching_commands, split_command};
 
@@ -16,21 +16,22 @@ use super::input_frame::resize_status_area;
 use super::state::{
     CTRLC_HINT_VISIBLE, LAST_HINT_LINE, MODEL_CACHE, MODEL_ERROR, MODEL_FETCH_CONFIG,
     MODEL_FETCH_IN_PROGRESS, MODEL_MATCHES, RESUME_MATCHES, STATUS_HINT, STATUS_ROWS,
-    STREAM_CONV_DIR, STYLE_MATCHES, get_tab_select_index, lock_term, random_bullet_color,
-    status_rows, term_size,
+    STREAM_CONV_DIR, STYLE_MATCHES, get_selected_model, get_tab_select_index, lock_term,
+    random_bullet_color, status_rows, term_size,
 };
 use super::status_bar::{notice_status_rows, update_status_bar};
+use super::text::{collapse_whitespace, truncate_with_ellipsis};
 use crate::theme::{AuraStyle, STYLE_NAMES, Themed, theme};
 
 /// Update the model cache from a successful fetch.
-pub fn set_model_cache(models: Vec<String>) {
+pub fn set_model_cache(models: Vec<ModelEntry>) {
+    persist_model_cache(&models);
     if let Ok(mut g) = MODEL_CACHE.lock() {
-        *g = models.clone();
+        *g = models;
     }
     if let Ok(mut g) = MODEL_ERROR.lock() {
         g.clear();
     }
-    persist_model_cache(&models);
     refresh_model_hints();
 }
 
@@ -52,7 +53,7 @@ pub fn trigger_model_fetch(
         return;
     }
     thread::spawn(move || {
-        let result = (|| -> Result<Vec<String>, String> {
+        let result = (|| -> Result<Vec<ModelEntry>, String> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
@@ -69,7 +70,7 @@ pub fn trigger_model_fetch(
                 return Err(format!("HTTP {}", resp.status()));
             }
             let list: crate::api::types::ModelList = resp.json().map_err(|e| e.to_string())?;
-            Ok(list.data.into_iter().map(|m| m.id).collect())
+            Ok(list.data)
         })();
         match result {
             Ok(models) => set_model_cache(models),
@@ -108,16 +109,14 @@ fn refresh_model_hints() {
 }
 
 /// Persist the model list to the current conversation directory.
-fn persist_model_cache(models: &[String]) {
-    let dir = match STREAM_CONV_DIR.lock().ok().and_then(|g| g.clone()) {
-        Some(d) => d,
-        None => return,
-    };
-    let _ = fs::write(dir.join("models_cache"), models.join("\n"));
+fn persist_model_cache(models: &[ModelEntry]) {
+    if let Some(dir) = STREAM_CONV_DIR.lock().ok().and_then(|g| g.clone()) {
+        ConversationStore::write_models_cache(&dir, models);
+    }
 }
 
 /// Seed the in-memory model cache.
-pub fn seed_model_cache(models: Vec<String>) {
+pub fn seed_model_cache(models: Vec<ModelEntry>) {
     if let Ok(mut g) = MODEL_CACHE.lock()
         && g.is_empty()
     {
@@ -125,12 +124,60 @@ pub fn seed_model_cache(models: Vec<String>) {
     }
 }
 
+/// Maximum rows a scrolling hint list shows at once.
+const MAX_VISIBLE: usize = 5;
+
+/// Narrowest column worth truncating a model description into; below it a
+/// description that does not fit whole is dropped rather than shown as a stub.
+const MIN_DESC_WIDTH: usize = 12;
+
+/// Render `lines` (each the entry indices it holds) through `render`, showing
+/// at most [`MAX_VISIBLE`] of them. `render` also receives the styled
+/// two-column `▲ `/`▼ ` scroll cue on the window's edge lines when more lines
+/// lie beyond them. The window keeps the tab selection in its middle row where
+/// it can, so the selected line is never also an edge line carrying a cue —
+/// layouts may share one gutter for both.
+fn windowed_hint_lines(
+    lines: &[Vec<usize>],
+    tab_idx: Option<usize>,
+    render: impl Fn(&[usize], Option<&str>) -> String,
+) -> Vec<String> {
+    let total_lines = lines.len();
+    let (window_start, window_end) = if total_lines <= MAX_VISIBLE {
+        (0, total_lines)
+    } else {
+        let selected_line = tab_idx
+            .and_then(|idx| lines.iter().position(|line| line.contains(&idx)))
+            .unwrap_or(0);
+        let start = selected_line
+            .saturating_sub(MAX_VISIBLE / 2)
+            .min(total_lines - MAX_VISIBLE);
+        (start, start + MAX_VISIBLE)
+    };
+
+    lines[window_start..window_end]
+        .iter()
+        .enumerate()
+        .map(|(line_offset, line_entries)| {
+            let glyph = if line_offset == 0 && window_start > 0 {
+                Some("▲")
+            } else if line_offset == window_end - window_start - 1 && window_end < total_lines {
+                Some("▼")
+            } else {
+                None
+            };
+            let cue = glyph.map(|g| format!("{} ", g.themed(AuraStyle::Connector)));
+            render(line_entries, cue.as_deref())
+        })
+        .collect()
+}
+
 /// Build columnar hint lines from a list of display entries.
 /// Each entry is rendered with per-item styling: the tab-highlighted entry (if any)
 /// gets `AuraStyle::Selected`, others get `AuraStyle::Muted`.
 ///
-/// For large lists, shows a scrolling 5-line window with ▲/▼ indicators.
-/// The window follows the tab selection to keep it visible.
+/// For large lists, shows a scrolling window with ▲/▼ indicators that follows
+/// the tab selection (see [`windowed_hint_lines`]).
 fn build_columnar_hints(entries: &[String], tab_idx: Option<usize>) -> Vec<String> {
     if entries.is_empty() {
         return vec![];
@@ -142,14 +189,10 @@ fn build_columnar_hints(entries: &[String], tab_idx: Option<usize>) -> Vec<Strin
         return vec![];
     }
 
-    const MAX_VISIBLE: usize = 5;
-
-    // First pass: assign each entry index to a line number.
-    let mut line_of: Vec<usize> = Vec::with_capacity(entries.len());
+    // Pack entries into lines of equal-width columns.
     let mut entries_per_line: Vec<Vec<usize>> = vec![vec![]];
     let mut current_raw_len: usize = 0;
-
-    for (i, _entry) in entries.iter().enumerate() {
+    for i in 0..entries.len() {
         if current_raw_len > 0 && current_raw_len + 2 + col_w > max_w {
             entries_per_line.push(vec![]);
             current_raw_len = 0;
@@ -158,41 +201,11 @@ fn build_columnar_hints(entries: &[String], tab_idx: Option<usize>) -> Vec<Strin
             current_raw_len += 2;
         }
         current_raw_len += col_w;
-        let line_num = entries_per_line.len() - 1;
-        line_of.push(line_num);
         entries_per_line.last_mut().unwrap().push(i);
     }
 
-    let total_lines = entries_per_line.len();
-
-    // Determine visible window
-    let (window_start, window_end, has_above, has_below) = if total_lines <= MAX_VISIBLE {
-        (0, total_lines, false, false)
-    } else {
-        let selected_line = tab_idx.map(|idx| line_of[idx]).unwrap_or(0);
-        let start = selected_line.min(total_lines - MAX_VISIBLE);
-        let end = start + MAX_VISIBLE;
-        (start, end, start > 0, end < total_lines)
-    };
-
-    // Render visible lines
-    let mut result = Vec::new();
-    for (line_offset, line_entries) in entries_per_line[window_start..window_end]
-        .iter()
-        .enumerate()
-    {
-        let mut line_str = String::new();
-
-        // Scroll indicators on first/last visible line
-        let is_first = line_offset == 0;
-        let is_last = line_offset == window_end - window_start - 1;
-        if is_first && has_above {
-            line_str.push_str(&format!("{} ", "▲".themed(AuraStyle::Connector)));
-        }
-        if is_last && has_below {
-            line_str.push_str(&format!("{} ", "▼".themed(AuraStyle::Connector)));
-        }
-
+    windowed_hint_lines(&entries_per_line, tab_idx, |line_entries, cue| {
+        let mut line_str = cue.unwrap_or_default().to_string();
         for (pos, &idx) in line_entries.iter().enumerate() {
             if pos > 0 {
                 line_str.push_str("  ");
@@ -204,9 +217,105 @@ fn build_columnar_hints(entries: &[String], tab_idx: Option<usize>) -> Vec<Strin
                 line_str.push_str(&format!("{}", padded.themed(AuraStyle::Muted)));
             }
         }
-        result.push(line_str);
+        line_str
+    })
+}
+
+/// A model's description flattened to one line and truncated to `room`
+/// columns. `None` when the model has no description, or when it would need
+/// truncating and `room` is too narrow to say anything useful.
+fn description_column(model: &ModelEntry, room: usize) -> Option<String> {
+    let desc = collapse_whitespace(model.description.as_deref()?);
+    if desc.is_empty() {
+        return None;
     }
-    result
+    let fits = desc.chars().count() <= room;
+    (fits || room >= MIN_DESC_WIDTH).then(|| truncate_with_ellipsis(&desc, room))
+}
+
+/// Build hint lines for the `/model` picker at `width` columns, one model per
+/// numbered row:
+///
+/// ```text
+///      Name                Description
+///   1. sre/openai          OpenAI backed SRE agent
+/// ❯ 2. sre/anthropic ✓     Anthropic backed SRE agent
+/// ```
+///
+/// The two-column gutter holds the `❯` cursor on the tab-selected row and the
+/// ▲/▼ scroll cue on the window's edge rows; `✓` marks `current`. The
+/// header appears once any model has a description; descriptions are
+/// truncated to fit. Numbers count within `models` as given, so a filtered
+/// list renumbers from 1.
+fn build_model_hints(
+    models: &[ModelEntry],
+    tab_idx: Option<usize>,
+    current: Option<&str>,
+    width: usize,
+) -> Vec<String> {
+    const CHECK: &str = " ✓";
+    let is_current = |m: &ModelEntry| current.is_some_and(|c| c.eq_ignore_ascii_case(&m.id));
+    // Columns the id (plus its check, when current) occupies in the name column.
+    let name_cols = |m: &ModelEntry| {
+        m.id.chars().count()
+            + if is_current(m) {
+                CHECK.chars().count()
+            } else {
+                0
+            }
+    };
+    let has_descriptions = models.iter().any(|m| m.description.is_some());
+    let num_w = models.len().to_string().len();
+    let name_w = models
+        .iter()
+        .map(name_cols)
+        .chain(has_descriptions.then_some("Name".len()))
+        .max()
+        .unwrap_or(0);
+    // "❯ " + "NN. " precede the name column; two spaces separate the columns.
+    let prefix_w = 2 + num_w + 2;
+    let desc_room = width.saturating_sub(prefix_w + name_w + 2);
+    let lines: Vec<Vec<usize>> = (0..models.len()).map(|i| vec![i]).collect();
+
+    let header = has_descriptions.then(|| {
+        format!(
+            "{}{}{}  {}",
+            " ".repeat(prefix_w),
+            "Name".themed(AuraStyle::KeyLabel),
+            " ".repeat(name_w - "Name".len()),
+            "Description".themed(AuraStyle::KeyLabel),
+        )
+    });
+    let rows = windowed_hint_lines(&lines, tab_idx, |line_entries, cue| {
+        let idx = line_entries[0];
+        let model = &models[idx];
+        let selected = tab_idx == Some(idx);
+        let gutter = if selected {
+            format!("{} ", "❯".themed(AuraStyle::Prompt))
+        } else {
+            cue.unwrap_or("  ").to_string()
+        };
+        let number = format!("{:>num_w$}.", idx + 1);
+        let name_style = if selected {
+            AuraStyle::Selected
+        } else {
+            AuraStyle::Muted
+        };
+        let mut row = format!(
+            "{gutter}{} {}",
+            number.themed(AuraStyle::Muted),
+            model.id.as_str().themed(name_style)
+        );
+        if is_current(model) {
+            row.push_str(&format!("{}", CHECK.themed(AuraStyle::Success)));
+        }
+        if let Some(desc) = description_column(model, desc_room) {
+            row.push_str(&" ".repeat(name_w - name_cols(model) + 2));
+            row.push_str(&format!("{}", desc.themed(AuraStyle::Muted)));
+        }
+        row
+    });
+    header.into_iter().chain(rows).collect()
 }
 
 /// Update the status bar hint based on the current input line.
@@ -279,17 +388,17 @@ pub fn update_input_hint(line: &str) {
             )]
         } else {
             let cached = MODEL_CACHE.lock().map(|g| g.clone()).unwrap_or_default();
-            let filtered: Vec<String> = if filter.is_empty() {
+            let filtered: Vec<ModelEntry> = if filter.is_empty() {
                 cached
             } else {
                 let lower = filter.to_lowercase();
                 cached
                     .into_iter()
-                    .filter(|m| m.to_lowercase().contains(&lower))
+                    .filter(|m| m.id.to_lowercase().contains(&lower))
                     .collect()
             };
             if let Ok(mut guard) = MODEL_MATCHES.lock() {
-                *guard = filtered.clone();
+                *guard = filtered.iter().map(|m| m.id.clone()).collect();
             }
             if filtered.is_empty() {
                 if MODEL_FETCH_IN_PROGRESS.load(Ordering::Relaxed) {
@@ -306,15 +415,25 @@ pub fn update_input_hint(line: &str) {
                 }
             } else if filtered.len() == 1 {
                 let color = random_bullet_color();
+                let model = &filtered[0];
+                let cta = "press enter to auto-complete";
+                // "▸  id  [description  ]cta"
+                let (width, _) = term_size();
+                let used = 3 + model.id.chars().count() + 2 + cta.len() + 2;
+                let desc = description_column(model, (width as usize).saturating_sub(used))
+                    .map(|d| format!("{}  ", d.themed(AuraStyle::Muted)))
+                    .unwrap_or_default();
                 vec![format!(
-                    "{}  {}  {}",
+                    "{}  {}  {desc}{}",
                     "▸".themed(AuraStyle::Connector),
-                    filtered[0].clone().themed(AuraStyle::Muted),
-                    "press enter to auto-complete".with(color),
+                    model.id.as_str().themed(AuraStyle::Muted),
+                    cta.with(color),
                 )]
             } else {
                 let tab_idx = get_tab_select_index();
-                build_columnar_hints(&filtered, tab_idx)
+                let current = get_selected_model();
+                let (width, _) = term_size();
+                build_model_hints(&filtered, tab_idx, current.as_deref(), width as usize)
             }
         }
     } else if line == "/style" || line.starts_with("/style ") {
@@ -449,7 +568,169 @@ pub fn validate_command_input(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_command_input;
+    use super::{
+        MAX_VISIBLE, ModelEntry, build_model_hints, description_column, validate_command_input,
+    };
+    use crate::test_fixtures::plain;
+
+    fn model(id: &str, description: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn model_list_numbers_rows_and_omits_header_without_descriptions() {
+        let models = [model("gpt-4o", None), model("gpt-4o-mini", None)];
+        assert_eq!(
+            plain(&build_model_hints(&models, None, None, 80)),
+            ["  1. gpt-4o", "  2. gpt-4o-mini"]
+        );
+    }
+
+    #[test]
+    fn model_list_has_header_and_aligned_columns_with_descriptions() {
+        let models = [
+            model(
+                "Mezmo Anthropic SRE Agent",
+                Some("Anthropic-backed SRE agent"),
+            ),
+            model("Mezmo OpenAI SRE Agent", Some("OpenAI-backed SRE agent")),
+            model("plain", None),
+        ];
+        assert_eq!(
+            plain(&build_model_hints(&models, None, None, 80)),
+            [
+                "     Name                       Description",
+                "  1. Mezmo Anthropic SRE Agent  Anthropic-backed SRE agent",
+                "  2. Mezmo OpenAI SRE Agent     OpenAI-backed SRE agent",
+                "  3. plain",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_list_marks_cursor_and_current_model() {
+        let models = [
+            model("sre/openai", Some("OpenAI")),
+            model("sre/anthropic", Some("Anthropic")),
+        ];
+        // The check widens the name column; the cursor sits in the gutter.
+        assert_eq!(
+            plain(&build_model_hints(
+                &models,
+                Some(1),
+                Some("SRE/Anthropic"),
+                80
+            )),
+            [
+                "     Name             Description",
+                "  1. sre/openai       OpenAI",
+                "❯ 2. sre/anthropic ✓  Anthropic",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_list_right_aligns_numbers_past_nine() {
+        let models: Vec<ModelEntry> = (0..10).map(|i| model(&format!("m{i}"), None)).collect();
+        let lines = plain(&build_model_hints(&models, Some(9), None, 80));
+        assert_eq!(lines[MAX_VISIBLE - 1], "❯ 10. m9");
+        assert!(lines[MAX_VISIBLE - 2].ends_with("  9. m8"), "{lines:?}");
+    }
+
+    #[test]
+    fn model_list_truncates_descriptions_to_the_terminal_width() {
+        let models = [
+            model(
+                "sre",
+                Some("A very long description that will not fit here"),
+            ),
+            model("ops", Some("short")),
+        ];
+        let lines = plain(&build_model_hints(&models, None, None, 36));
+        assert_eq!(
+            lines,
+            [
+                "     Name  Description",
+                "  1. sre   A very long descriptio...",
+                "  2. ops   short",
+            ]
+        );
+        assert!(lines.iter().all(|l| l.chars().count() <= 36));
+    }
+
+    #[test]
+    fn model_list_drops_only_descriptions_that_cannot_fit_when_narrow() {
+        let models = [
+            model("agent-one", Some("a description")),
+            model("agent-two", Some("ok")),
+        ];
+        // 5 prefix + 9-char name + 2 leaves 4 columns at width 20: below
+        // MIN_DESC_WIDTH, so a description that needs truncating is dropped
+        // while one that fits whole still shows.
+        assert_eq!(
+            plain(&build_model_hints(&models, None, None, 20)),
+            [
+                "     Name       Description",
+                "  1. agent-one",
+                "  2. agent-two  ok",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_list_windows_around_the_cursor_and_marks_overflow() {
+        let models: Vec<ModelEntry> = (0..MAX_VISIBLE + 3)
+            .map(|i| model(&format!("m{i}"), Some(&format!("model {i}"))))
+            .collect();
+
+        // No selection: top of the list, ▼ on the last visible row.
+        let top = plain(&build_model_hints(&models, None, None, 80));
+        assert_eq!(top.len(), MAX_VISIBLE + 1, "{top:?}");
+        assert!(top[1].starts_with("  1. m0  "), "{top:?}");
+        assert!(top[MAX_VISIBLE].starts_with("▼ 5. m4"), "{top:?}");
+
+        // A mid-list selection is centred: ▲ above, ▼ below, ❯ in between.
+        let mid = plain(&build_model_hints(&models, Some(4), None, 80));
+        assert!(mid[1].starts_with("▲ 3. m2"), "{mid:?}");
+        assert!(mid[3].starts_with("❯ 5. m4"), "{mid:?}");
+        assert!(mid[MAX_VISIBLE].starts_with("▼ 7. m6"), "{mid:?}");
+
+        // Selecting the last entry pins the window to the bottom.
+        let bottom = plain(&build_model_hints(
+            &models,
+            Some(models.len() - 1),
+            None,
+            80,
+        ));
+        assert!(bottom[1].starts_with("▲ 4. m3"), "{bottom:?}");
+        assert!(bottom[MAX_VISIBLE].starts_with("❯ 8. m7"), "{bottom:?}");
+        assert!(bottom.iter().all(|l| l.chars().count() <= 80));
+    }
+
+    #[test]
+    fn description_column_flattens_and_respects_room() {
+        let multi = model("m", Some("  first\nsecond   line  "));
+        assert_eq!(
+            description_column(&multi, 40).as_deref(),
+            Some("first second line")
+        );
+        assert_eq!(
+            description_column(&multi, 12).as_deref(),
+            Some("first sec...")
+        );
+        assert_eq!(description_column(&multi, 11), None);
+        // A short description that fits whole shows even in a narrow column.
+        assert_eq!(
+            description_column(&model("m", Some("SRE")), 3).as_deref(),
+            Some("SRE")
+        );
+        assert_eq!(description_column(&model("m", Some("SRE")), 2), None);
+        assert_eq!(description_column(&model("m", Some("   ")), 40), None);
+        assert_eq!(description_column(&model("m", None), 40), None);
+    }
 
     #[test]
     fn plain_text_submits() {

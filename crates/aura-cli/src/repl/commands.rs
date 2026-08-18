@@ -44,14 +44,12 @@ fn model_matches_for_command(filter: &str) -> Vec<String> {
     if cached.is_empty() {
         return get_model_matches();
     }
-    if filter.is_empty() {
-        return cached;
-    }
 
     let lower = filter.to_lowercase();
     cached
         .into_iter()
-        .filter(|model| model.to_lowercase().contains(&lower))
+        .map(|model| model.id)
+        .filter(|id| lower.is_empty() || id.to_lowercase().contains(&lower))
         .collect()
 }
 

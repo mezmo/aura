@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use crossterm::style::Color;
 
-use crate::api::types::DisplayEvent;
+use crate::api::types::{DisplayEvent, ModelEntry};
 use crate::repl::registry::PendingCommand;
 use crate::ui::welcome::WelcomeState;
 
@@ -227,8 +227,9 @@ pub(crate) static STYLE_PREVIEW_ORIGINAL: Mutex<Option<&'static crate::theme::Th
 // Cached matches from the last /resume autocomplete lookup.
 pub(crate) static RESUME_MATCHES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
-// Model selection state
-pub(crate) static MODEL_CACHE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+// Model selection state. `MODEL_CACHE` holds every model the backend offers;
+// `MODEL_MATCHES` holds the ids of those matching the current `/model` filter.
+pub(crate) static MODEL_CACHE: Mutex<Vec<ModelEntry>> = Mutex::new(Vec::new());
 pub(crate) static MODEL_MATCHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub(crate) static MODEL_ERROR: Mutex<String> = Mutex::new(String::new());
 
@@ -442,7 +443,7 @@ pub fn get_model_matches() -> Vec<String> {
     MODEL_MATCHES.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
-pub fn get_model_cache() -> Vec<String> {
+pub fn get_model_cache() -> Vec<ModelEntry> {
     MODEL_CACHE.lock().map(|g| g.clone()).unwrap_or_default()
 }
 

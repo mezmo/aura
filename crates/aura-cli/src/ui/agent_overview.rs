@@ -46,6 +46,14 @@ fn agent_overview_block_lines(agent: &AgentInfo, width: usize) -> Vec<String> {
         role.themed(AuraStyle::Muted),
         agent.model.as_str().themed(AuraStyle::Muted),
     ));
+    if let Some(description) = agent.description.as_deref() {
+        // Wrapped under the bullet, aligned with the agent id.
+        let desc_indent = INDENT.len() + 2;
+        let pad = " ".repeat(desc_indent);
+        for line in wrap_words(description, width.saturating_sub(desc_indent)) {
+            lines.push(format!("{pad}{}", line.as_str().themed(AuraStyle::Muted)));
+        }
+    }
 
     lines.extend(worker_block_lines(&agent.workers, width));
 
@@ -116,31 +124,9 @@ fn startup_cta_lines(agent: &AgentInfo, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{agent, worker};
+    use crate::test_fixtures::{agent, plain, worker};
     use aura_events::McpServerOverview;
     use std::collections::BTreeMap;
-
-    /// Strip SGR sequences (`ESC[…m`) so frame assertions are theme-independent.
-    fn strip_sgr(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for c2 in chars.by_ref() {
-                    if c2 == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
-
-    fn plain(lines: &[String]) -> Vec<String> {
-        lines.iter().map(|l| strip_sgr(l)).collect()
-    }
 
     #[test]
     fn agent_overview_renders_single_agent_model_without_workers() {
@@ -152,6 +138,22 @@ mod tests {
         assert!(all.contains("model"));
         assert!(all.contains("gpt-4o"));
         assert!(!all.contains("Workers"));
+    }
+
+    #[test]
+    fn agent_overview_wraps_the_description_under_the_agent_line() {
+        let mut agent = agent("sre", Vec::new());
+        agent.description =
+            Some("Anthropic backed config to solve all of your production problems".to_string());
+        assert_eq!(
+            plain(&agent_overview_block_lines(&agent, 60)),
+            [
+                "Agent",
+                "  • sre — model: gpt-4o",
+                "    Anthropic backed config to solve all of your production",
+                "    problems",
+            ]
+        );
     }
 
     #[test]
