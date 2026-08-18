@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::api::types::{DisplayEvent, Message, ModelEntry};
-use crate::ui::text::collapse_whitespace;
 
 pub struct ConversationStore {
     pub uuid: String,
@@ -257,39 +256,29 @@ impl ConversationStore {
             .collect()
     }
 
-    /// Write `models` to `<dir>/models_cache`, one model per line as
-    /// `id[\tdescription]`. Descriptions are flattened to a single line so
-    /// they cannot break the line-per-model layout.
+    /// Write `models` to `<dir>/models_cache` as a JSON array, so ids and
+    /// descriptions round-trip verbatim whatever characters they contain.
     pub fn write_models_cache(dir: &Path, models: &[ModelEntry]) {
-        let lines: Vec<String> = models
-            .iter()
-            .map(|m| match m.description.as_deref() {
-                Some(desc) => format!("{}\t{}", m.id, collapse_whitespace(desc)),
-                None => m.id.clone(),
-            })
-            .collect();
-        let _ = fs::write(dir.join("models_cache"), lines.join("\n"));
+        if let Ok(json) = serde_json::to_string(models) {
+            let _ = fs::write(dir.join("models_cache"), json);
+        }
     }
 
-    /// Load the cached model list from this conversation's directory. A line
-    /// without a tab loads as an id with no description.
+    /// Load the cached model list from this conversation's directory. Reads
+    /// the JSON array form, and the earlier one-id-per-line form as ids with
+    /// no description.
     pub fn load_models_cache(&self) -> Option<Vec<ModelEntry>> {
         let path = self.dir.join("models_cache");
         let data = fs::read_to_string(&path).ok()?;
-        let models: Vec<ModelEntry> = data
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|line| match line.split_once('\t') {
-                Some((id, desc)) => ModelEntry {
+        let models: Vec<ModelEntry> = serde_json::from_str(&data).unwrap_or_else(|_| {
+            data.lines()
+                .filter(|l| !l.is_empty())
+                .map(|id| ModelEntry {
                     id: id.to_string(),
-                    description: (!desc.is_empty()).then(|| desc.to_string()),
-                },
-                None => ModelEntry {
-                    id: line.to_string(),
                     description: None,
-                },
-            })
-            .collect();
+                })
+                .collect()
+        });
         if models.is_empty() {
             None
         } else {
@@ -573,20 +562,15 @@ mod tests {
     }
 
     #[test]
-    fn models_cache_flattens_multiline_descriptions() {
+    fn models_cache_round_trips_delimiter_and_control_characters_verbatim() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
-        ConversationStore::write_models_cache(
-            store.dir(),
-            &[
-                model("sre", Some("Line one\nline\ttwo  \n")),
-                model("next", None),
-            ],
-        );
-        assert_eq!(
-            store.load_models_cache().unwrap(),
-            vec![model("sre", Some("Line one line two")), model("next", None)]
-        );
+        let models = [
+            model("odd\tid\nwith breaks", Some("Line one\nline\ttwo \x1b[31m")),
+            model("next", None),
+        ];
+        ConversationStore::write_models_cache(store.dir(), &models);
+        assert_eq!(store.load_models_cache().unwrap(), models);
     }
 
     #[test]

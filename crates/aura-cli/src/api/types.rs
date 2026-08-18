@@ -9,10 +9,10 @@ pub struct ModelList {
 
 /// One `/v1/models` entry: the id clients send as `model`, plus the server's
 /// optional `description` extension.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 

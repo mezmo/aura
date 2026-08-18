@@ -1,21 +1,38 @@
-//! Grapheme-aware text helpers for terminal display.
+//! Grapheme- and width-aware text helpers for terminal display.
 
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
-/// Truncate `text` to at most `max` grapheme clusters, appending `...` when
-/// truncation occurs (so the result stays within `max` clusters).
+/// Truncate `text` to at most `max` display columns, appending `...` when
+/// truncation occurs (so the result stays within `max` columns).
 ///
-/// Counts and splits on grapheme cluster boundaries, not `char`s, so
+/// Width is measured with `unicode-width`, so double-width glyphs (CJK, many
+/// emoji) count as 2 columns. Splits only on grapheme cluster boundaries, so
 /// multi-scalar glyphs — ZWJ emoji sequences (👨‍👩‍👧), skin-tone modifiers
 /// (👋🏽), and regional-indicator flags (🇯🇵) — are never cut mid-glyph.
 pub fn truncate_with_ellipsis(text: &str, max: usize) -> String {
-    if text.graphemes(true).count() <= max {
+    if UnicodeWidthStr::width(text) <= max {
         return text.to_string();
     }
-    // Reserve three clusters for the ellipsis so the result fits in `max`.
+    // Reserve three columns for the ellipsis so the result fits in `max`.
     let keep = max.saturating_sub(3);
-    let prefix: String = text.graphemes(true).take(keep).collect();
-    format!("{}...", prefix.trim_end())
+    let mut width = 0;
+    let mut end = 0;
+    for (i, grapheme) in text.grapheme_indices(true) {
+        let w = UnicodeWidthStr::width(grapheme);
+        if width + w > keep {
+            break;
+        }
+        width += w;
+        end = i + grapheme.len();
+    }
+    format!("{}...", text[..end].trim_end())
+}
+
+/// Drop control characters (C0, C1, DEL) so text from a remote source cannot
+/// carry terminal escape sequences into the display.
+pub fn strip_control_chars(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Collapse every run of whitespace (newlines included) into one space and
@@ -88,27 +105,53 @@ mod tests {
     }
 
     #[test]
+    fn truncation_counts_display_columns_not_scalars() {
+        // Each CJK glyph is one scalar but two columns.
+        let s = "漢字".repeat(20);
+        let out = truncate_with_ellipsis(&s, 11);
+        // 8 columns of glyphs (4 whole chars) + "..." = 11 columns.
+        assert_eq!(out, "漢字漢字...");
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 11);
+        // A boundary that would split a wide glyph rounds down instead.
+        assert_eq!(truncate_with_ellipsis(&s, 10), "漢字漢...");
+    }
+
+    #[test]
     fn does_not_split_zwj_emoji() {
         // Family emoji is a single grapheme made of multiple scalars.
         let family = "👨‍👩‍👧";
+        let family_w = UnicodeWidthStr::width(family);
         // Pad with enough families to force truncation at a boundary.
         let s = family.repeat(50);
         let out = truncate_with_ellipsis(&s, 10);
-        // Truncation point keeps 7 whole families + "...". Crucially, the
-        // output must still be valid and contain only whole families.
-        let body = out.strip_suffix("...").unwrap();
-        assert_eq!(body, family.repeat(7));
-        assert_eq!(out, format!("{}...", family.repeat(7)));
+        // Whole families only, as many as fit beside "...".
+        let kept = (10 - 3) / family_w;
+        assert_eq!(out, format!("{}...", family.repeat(kept)));
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 10);
     }
 
     #[test]
     fn does_not_split_skin_tone_or_flag() {
         let wave = "👋🏽"; // base + skin-tone modifier
         let flag = "🇯🇵"; // two regional indicators
+        let wave_w = UnicodeWidthStr::width(wave);
         let s = format!("{}{}", wave.repeat(8), flag.repeat(8));
         let out = truncate_with_ellipsis(&s, 6);
-        // 3 kept clusters + ellipsis; all kept clusters are whole waves.
-        assert_eq!(out, format!("{}...", wave.repeat(3)));
+        // Whole waves only, as many as fit beside "...".
+        let kept = (6 - 3) / wave_w;
+        assert_eq!(out, format!("{}...", wave.repeat(kept)));
+    }
+
+    #[test]
+    fn strip_control_chars_removes_escape_introducers() {
+        assert_eq!(
+            strip_control_chars("red\x1b[31m text\x07 \u{9b}31m ok\x7f"),
+            "red[31m text 31m ok"
+        );
+        assert_eq!(
+            strip_control_chars("plain ünïcödé 漢字"),
+            "plain ünïcödé 漢字"
+        );
     }
 
     #[test]

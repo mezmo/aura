@@ -7,6 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::style::Stylize;
+use unicode_width::UnicodeWidthStr;
 
 use crate::api::types::ModelEntry;
 use crate::repl::conversations::ConversationStore;
@@ -20,7 +21,7 @@ use super::state::{
     random_bullet_color, status_rows, term_size,
 };
 use super::status_bar::{notice_status_rows, update_status_bar};
-use super::text::{collapse_whitespace, truncate_with_ellipsis};
+use super::text::{collapse_whitespace, strip_control_chars, truncate_with_ellipsis};
 use crate::theme::{AuraStyle, STYLE_NAMES, Themed, theme};
 
 /// Update the model cache from a successful fetch.
@@ -221,15 +222,16 @@ fn build_columnar_hints(entries: &[String], tab_idx: Option<usize>) -> Vec<Strin
     })
 }
 
-/// A model's description flattened to one line and truncated to `room`
-/// columns. `None` when the model has no description, or when it would need
-/// truncating and `room` is too narrow to say anything useful.
+/// A model's description flattened to one line, stripped of control
+/// characters, and truncated to `room` columns. `None` when the model has no
+/// description, or when it would need truncating and `room` is too narrow to
+/// say anything useful.
 fn description_column(model: &ModelEntry, room: usize) -> Option<String> {
-    let desc = collapse_whitespace(model.description.as_deref()?);
+    let desc = strip_control_chars(&collapse_whitespace(model.description.as_deref()?));
     if desc.is_empty() {
         return None;
     }
-    let fits = desc.chars().count() <= room;
+    let fits = UnicodeWidthStr::width(desc.as_str()) <= room;
     (fits || room >= MIN_DESC_WIDTH).then(|| truncate_with_ellipsis(&desc, room))
 }
 
@@ -244,9 +246,10 @@ fn description_column(model: &ModelEntry, room: usize) -> Option<String> {
 ///
 /// The two-column gutter holds the `❯` cursor on the tab-selected row and the
 /// ▲/▼ scroll cue on the window's edge rows; `✓` marks `current`. The
-/// header appears once any model has a description; descriptions are
-/// truncated to fit. Numbers count within `models` as given, so a filtered
-/// list renumbers from 1.
+/// header appears once any model has a description and the header fits.
+/// Ids and descriptions are stripped of control characters and truncated so
+/// no row exceeds `width` display columns. Numbers count within `models` as
+/// given, so a filtered list renumbers from 1.
 fn build_model_hints(
     models: &[ModelEntry],
     tab_idx: Option<usize>,
@@ -254,30 +257,34 @@ fn build_model_hints(
     width: usize,
 ) -> Vec<String> {
     const CHECK: &str = " ✓";
+    let check_w = UnicodeWidthStr::width(CHECK);
     let is_current = |m: &ModelEntry| current.is_some_and(|c| c.eq_ignore_ascii_case(&m.id));
-    // Columns the id (plus its check, when current) occupies in the name column.
-    let name_cols = |m: &ModelEntry| {
-        m.id.chars().count()
-            + if is_current(m) {
-                CHECK.chars().count()
-            } else {
-                0
-            }
-    };
     let has_descriptions = models.iter().any(|m| m.description.is_some());
     let num_w = models.len().to_string().len();
-    let name_w = models
+    // "❯ " + "NN. " precede the name column; two spaces separate the columns.
+    let prefix_w = 2 + num_w + 2;
+    // Every row must hold its prefix, name, and check without wrapping.
+    let max_name_w = width.saturating_sub(prefix_w);
+    let names: Vec<String> = models
         .iter()
+        .map(|m| {
+            let room = max_name_w.saturating_sub(if is_current(m) { check_w } else { 0 });
+            truncate_with_ellipsis(&strip_control_chars(&m.id), room)
+        })
+        .collect();
+    // Columns the name (plus its check, when current) occupies in the name column.
+    let name_cols = |i: usize| {
+        UnicodeWidthStr::width(names[i].as_str()) + if is_current(&models[i]) { check_w } else { 0 }
+    };
+    let name_w = (0..models.len())
         .map(name_cols)
         .chain(has_descriptions.then_some("Name".len()))
         .max()
         .unwrap_or(0);
-    // "❯ " + "NN. " precede the name column; two spaces separate the columns.
-    let prefix_w = 2 + num_w + 2;
     let desc_room = width.saturating_sub(prefix_w + name_w + 2);
     let lines: Vec<Vec<usize>> = (0..models.len()).map(|i| vec![i]).collect();
 
-    let header = has_descriptions.then(|| {
+    let header = (has_descriptions && desc_room >= "Description".len()).then(|| {
         format!(
             "{}{}{}  {}",
             " ".repeat(prefix_w),
@@ -304,13 +311,13 @@ fn build_model_hints(
         let mut row = format!(
             "{gutter}{} {}",
             number.themed(AuraStyle::Muted),
-            model.id.as_str().themed(name_style)
+            names[idx].as_str().themed(name_style)
         );
         if is_current(model) {
             row.push_str(&format!("{}", CHECK.themed(AuraStyle::Success)));
         }
         if let Some(desc) = description_column(model, desc_room) {
-            row.push_str(&" ".repeat(name_w - name_cols(model) + 2));
+            row.push_str(&" ".repeat(name_w - name_cols(idx) + 2));
             row.push_str(&format!("{}", desc.themed(AuraStyle::Muted)));
         }
         row
@@ -416,17 +423,18 @@ pub fn update_input_hint(line: &str) {
             } else if filtered.len() == 1 {
                 let color = random_bullet_color();
                 let model = &filtered[0];
+                let name = strip_control_chars(&model.id);
                 let cta = "press enter to auto-complete";
                 // "▸  id  [description  ]cta"
                 let (width, _) = term_size();
-                let used = 3 + model.id.chars().count() + 2 + cta.len() + 2;
+                let used = 3 + UnicodeWidthStr::width(name.as_str()) + 2 + cta.len() + 2;
                 let desc = description_column(model, (width as usize).saturating_sub(used))
                     .map(|d| format!("{}  ", d.themed(AuraStyle::Muted)))
                     .unwrap_or_default();
                 vec![format!(
                     "{}  {}  {desc}{}",
                     "▸".themed(AuraStyle::Connector),
-                    model.id.as_str().themed(AuraStyle::Muted),
+                    name.themed(AuraStyle::Muted),
                     cta.with(color),
                 )]
             } else {
@@ -669,15 +677,67 @@ mod tests {
         ];
         // 5 prefix + 9-char name + 2 leaves 4 columns at width 20: below
         // MIN_DESC_WIDTH, so a description that needs truncating is dropped
-        // while one that fits whole still shows.
+        // while one that fits whole still shows; the header no longer fits.
         assert_eq!(
             plain(&build_model_hints(&models, None, None, 20)),
+            ["  1. agent-one", "  2. agent-two  ok"]
+        );
+    }
+
+    #[test]
+    fn model_list_strips_control_characters_from_remote_text() {
+        let models = [
+            model("sre\x1b]0;pwned\x07", Some("desc\x1b[31m red\u{9b}2J")),
+            model("ok", None),
+        ];
+        // Checked before theming, since `plain` would itself swallow an SGR.
+        assert_eq!(
+            description_column(&models[0], 80).as_deref(),
+            Some("desc[31m red2J")
+        );
+        let lines = plain(&build_model_hints(&models, None, None, 80));
+        assert!(
+            lines.iter().all(|l| l.chars().all(|c| !c.is_control())),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "  1. sre]0;pwned  desc[31m red2J");
+    }
+
+    #[test]
+    fn model_list_measures_wide_glyphs_in_columns() {
+        let models = [
+            model("漢字モデル", Some("wide id")),
+            model("ascii", Some("narrow id")),
+        ];
+        // "漢字モデル" is 5 scalars but 10 columns, so "ascii" pads to 10.
+        assert_eq!(
+            plain(&build_model_hints(&models, None, None, 80)),
             [
-                "     Name       Description",
-                "  1. agent-one",
-                "  2. agent-two  ok",
+                "     Name        Description",
+                "  1. 漢字モデル  wide id",
+                "  2. ascii       narrow id",
             ]
         );
+    }
+
+    #[test]
+    fn model_list_never_exceeds_the_terminal_width() {
+        let long = "a-model-id-that-is-far-longer-than-any-sane-terminal-would-be";
+        let models = [
+            model(long, Some("and a description on top of that")),
+            model("short", Some("x")),
+        ];
+        for width in [12usize, 20, 30, 40] {
+            let lines = build_model_hints(&models, Some(0), Some(long), width);
+            for line in plain(&lines) {
+                let cols = unicode_width::UnicodeWidthStr::width(line.as_str());
+                assert!(cols <= width, "width {width}: {cols} cols in {line:?}");
+            }
+        }
+        // At 20 columns the long id is truncated to fit its row alone.
+        let lines = plain(&build_model_hints(&models, None, None, 20));
+        assert_eq!(lines[0], "  1. a-model-id-t...");
+        assert_eq!(lines[1], "  2. short");
     }
 
     #[test]
