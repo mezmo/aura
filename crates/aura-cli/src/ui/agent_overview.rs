@@ -71,10 +71,10 @@ fn worker_block_lines(workers: &[WorkerOverview], width: usize) -> Vec<String> {
 
     for worker in workers {
         let name = strip_control_chars(&worker.name);
-        let text = strip_control_chars(&match &worker.model {
-            Some(model) => format!("{} ({model})", worker.description),
-            None => worker.description.clone(),
-        });
+        let mut text = strip_control_chars(&worker.description);
+        if let Some(model) = &worker.model {
+            text.push_str(&format!(" ({})", strip_control_chars(model)));
+        }
         // Width of the "  • name — " prefix.
         let prefix_len = INDENT.len() + 2 + name.chars().count() + 3;
 

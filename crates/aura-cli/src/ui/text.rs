@@ -14,8 +14,11 @@ pub fn truncate_with_ellipsis(text: &str, max: usize) -> String {
     if UnicodeWidthStr::width(text) <= max {
         return text.to_string();
     }
+    if max < 3 {
+        return ".".repeat(max);
+    }
     // Reserve three columns for the ellipsis so the result fits in `max`.
-    let keep = max.saturating_sub(3);
+    let keep = max - 3;
     let mut width = 0;
     let mut end = 0;
     for (i, grapheme) in text.grapheme_indices(true) {
@@ -78,6 +81,13 @@ mod tests {
     #[test]
     fn short_text_is_unchanged() {
         assert_eq!(truncate_with_ellipsis("hello", 120), "hello");
+    }
+
+    #[test]
+    fn truncation_never_exceeds_max_even_below_the_ellipsis_width() {
+        assert_eq!(truncate_with_ellipsis("hello", 2), "..");
+        assert_eq!(truncate_with_ellipsis("hello", 0), "");
+        assert_eq!(truncate_with_ellipsis("hi", 2), "hi");
     }
 
     #[test]

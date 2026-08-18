@@ -236,25 +236,48 @@ fn description_column(model: &ModelEntry, room: usize) -> Option<String> {
 }
 
 /// The single-row hint for a `/model` filter that leaves exactly one match:
-/// `▸  id  [description  ]press enter to auto-complete`. The id yields to the
-/// call to action and the description to both, so the row fits `width`
-/// columns for any id the server hands out.
+/// `▸  id  [description  ][press enter to auto-complete]`. As `width` shrinks
+/// the description goes first, then the call to action, and finally the id
+/// is truncated, so the row fits any terminal for any id the server hands out.
 fn unique_model_hint(model: &ModelEntry, width: usize) -> String {
+    let marker = "▸  ";
+    let marker_w = UnicodeWidthStr::width(marker);
+    if width < marker_w {
+        let partial: String = marker.chars().take(width).collect();
+        return format!("{}", partial.themed(AuraStyle::Connector));
+    }
     let cta = "press enter to auto-complete";
-    let name = truncate_with_ellipsis(
-        &strip_control_chars(&model.id),
-        width.saturating_sub(3 + 2 + cta.len()),
-    );
-    let used = 3 + UnicodeWidthStr::width(name.as_str()) + 2 + cta.len() + 2;
-    let desc = description_column(model, width.saturating_sub(used))
-        .map(|d| format!("{}  ", d.themed(AuraStyle::Muted)))
-        .unwrap_or_default();
-    format!(
-        "{}  {}  {desc}{}",
-        "▸".themed(AuraStyle::Connector),
-        name.themed(AuraStyle::Muted),
-        cta.with(random_bullet_color()),
-    )
+    let name = strip_control_chars(&model.id);
+    let with_cta = marker_w + UnicodeWidthStr::width(name.as_str()) + 2 + cta.len();
+    let mut line = format!("{}", marker.themed(AuraStyle::Connector));
+    if with_cta <= width {
+        line.push_str(&format!("{}  ", name.themed(AuraStyle::Muted)));
+        if let Some(desc) = description_column(model, width.saturating_sub(with_cta + 2)) {
+            line.push_str(&format!("{}  ", desc.themed(AuraStyle::Muted)));
+        }
+        line.push_str(&format!("{}", cta.with(random_bullet_color())));
+    } else {
+        let name = truncate_with_ellipsis(&name, width - marker_w);
+        line.push_str(&format!("{}", name.themed(AuraStyle::Muted)));
+    }
+    line
+}
+
+/// Hint lines for `/model <filter>` over the models `filtered` leaves. A typed
+/// filter that narrows to one model gets the auto-complete row; everything
+/// else — including a bare `/model` with a single model — is the numbered
+/// table.
+fn model_hint_lines(
+    filtered: &[ModelEntry],
+    filter: &str,
+    tab_idx: Option<usize>,
+    current: Option<&str>,
+    width: usize,
+) -> Vec<String> {
+    match filtered {
+        [only] if !filter.is_empty() => vec![unique_model_hint(only, width)],
+        _ => build_model_hints(filtered, tab_idx, current, width),
+    }
 }
 
 /// Build hint lines for the `/model` picker at `width` columns, one model per
@@ -285,8 +308,23 @@ fn build_model_hints(
     let num_w = models.len().to_string().len();
     // "❯ " + "NN. " precede the name column; two spaces separate the columns.
     let prefix_w = 2 + num_w + 2;
+    let lines: Vec<Vec<usize>> = (0..models.len()).map(|i| vec![i]).collect();
+    // A terminal too narrow for the prefix plus a few name columns gets bare
+    // truncated names, so rows fit any width at all.
+    if width < prefix_w + 4 {
+        return windowed_hint_lines(&lines, tab_idx, |line_entries, _| {
+            let idx = line_entries[0];
+            let name = truncate_with_ellipsis(&strip_control_chars(&models[idx].id), width);
+            let style = if tab_idx == Some(idx) {
+                AuraStyle::Selected
+            } else {
+                AuraStyle::Muted
+            };
+            format!("{}", name.themed(style))
+        });
+    }
     // Every row must hold its prefix, name, and check without wrapping.
-    let max_name_w = width.saturating_sub(prefix_w);
+    let max_name_w = width - prefix_w;
     let names: Vec<String> = models
         .iter()
         .map(|m| {
@@ -304,7 +342,6 @@ fn build_model_hints(
         .max()
         .unwrap_or(0);
     let desc_room = width.saturating_sub(prefix_w + name_w + 2);
-    let lines: Vec<Vec<usize>> = (0..models.len()).map(|i| vec![i]).collect();
 
     let header = (has_descriptions && desc_room >= "Description".len()).then(|| {
         format!(
@@ -442,14 +479,17 @@ pub fn update_input_hint(line: &str) {
                 } else {
                     vec![format!("{}", "no matching models".themed(AuraStyle::Muted))]
                 }
-            } else if filtered.len() == 1 {
-                let (width, _) = term_size();
-                vec![unique_model_hint(&filtered[0], width as usize)]
             } else {
                 let tab_idx = get_tab_select_index();
                 let current = get_selected_model();
                 let (width, _) = term_size();
-                build_model_hints(&filtered, tab_idx, current.as_deref(), width as usize)
+                model_hint_lines(
+                    &filtered,
+                    filter,
+                    tab_idx,
+                    current.as_deref(),
+                    width as usize,
+                )
             }
         }
     } else if line == "/style" || line.starts_with("/style ") {
@@ -585,8 +625,8 @@ pub fn validate_command_input(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_VISIBLE, ModelEntry, build_model_hints, description_column, unique_model_hint,
-        validate_command_input,
+        MAX_VISIBLE, ModelEntry, build_model_hints, description_column, model_hint_lines,
+        unique_model_hint, validate_command_input,
     };
     use crate::test_fixtures::{plain, strip_sgr};
 
@@ -732,42 +772,69 @@ mod tests {
     #[test]
     fn model_list_never_exceeds_the_terminal_width() {
         let long = "a-model-id-that-is-far-longer-than-any-sane-terminal-would-be";
-        let models = [
-            model(long, Some("and a description on top of that")),
-            model("short", Some("x")),
-        ];
-        for width in [12usize, 20, 30, 40] {
-            let lines = build_model_hints(&models, Some(0), Some(long), width);
-            for line in plain(&lines) {
-                let cols = unicode_width::UnicodeWidthStr::width(line.as_str());
-                assert!(cols <= width, "width {width}: {cols} cols in {line:?}");
+        let models: Vec<ModelEntry> = std::iter::once(model(long, Some("and a description")))
+            .chain((0..12).map(|i| model(&format!("m{i}"), Some("漢字 wide"))))
+            .collect();
+        for width in (0..=60).chain([80, 120, 200]) {
+            for (tab_idx, current) in [(None, None), (Some(0), Some(long)), (Some(12), Some("m11"))]
+            {
+                let lines = build_model_hints(&models, tab_idx, current, width);
+                assert!(!lines.is_empty());
+                for line in plain(&lines) {
+                    let cols = unicode_width::UnicodeWidthStr::width(line.as_str());
+                    assert!(cols <= width, "width {width}: {cols} cols in {line:?}");
+                }
             }
         }
         // At 20 columns the long id is truncated to fit its row alone.
-        let lines = plain(&build_model_hints(&models, None, None, 20));
+        let lines = plain(&build_model_hints(&models[..2], None, None, 20));
         assert_eq!(lines[0], "  1. a-model-id-t...");
-        assert_eq!(lines[1], "  2. short");
+        assert_eq!(lines[1], "  2. m0");
+        // Narrower than the prefix allows: bare names, still cut to fit.
+        let lines = plain(&build_model_hints(&models[..2], Some(1), None, 6));
+        assert_eq!(lines, ["a-m...", "m0"]);
     }
 
     #[test]
-    fn unique_match_hint_fits_the_terminal_for_any_id() {
+    fn unique_match_hint_fits_the_terminal_for_any_id_and_width() {
         let long = "a-model-id-that-is-far-longer-than-any-sane-terminal-would-be";
         let model = model(long, Some("with a description as well"));
-        for width in [40usize, 60, 80, 120] {
+        for width in [0usize, 1, 2, 3, 5, 8, 20, 36, 50, 80, 120, 200] {
             let line = strip_sgr(&unique_model_hint(&model, width));
             let cols = unicode_width::UnicodeWidthStr::width(line.as_str());
             assert!(cols <= width, "width {width}: {cols} cols in {line:?}");
-            assert!(line.ends_with("press enter to auto-complete"), "{line:?}");
         }
-        // Wide enough: id whole, description truncated to what is left.
+        // Wide: id whole, description truncated to what is left, then the cta.
         let line = strip_sgr(&unique_model_hint(&model, 120));
         assert_eq!(
             line,
             format!("▸  {long}  with a description as...  press enter to auto-complete")
         );
-        // Narrow: the id itself is truncated and the description dropped.
-        let line = strip_sgr(&unique_model_hint(&model, 50));
-        assert_eq!(line, "▸  a-model-id-tha...  press enter to auto-complete");
+        // Room for id and cta but not the description: description goes.
+        let line = strip_sgr(&unique_model_hint(&model, 100));
+        assert_eq!(line, format!("▸  {long}  press enter to auto-complete"));
+        // Room for the id alone: the cta goes before the id is cut.
+        let line = strip_sgr(&unique_model_hint(&model, 70));
+        assert_eq!(line, format!("▸  {long}"));
+        // Narrower still: the id itself is truncated.
+        let line = strip_sgr(&unique_model_hint(&model, 20));
+        assert_eq!(line, "▸  a-model-id-tha...");
+    }
+
+    #[test]
+    fn bare_model_command_lists_even_a_single_model_but_a_filter_autocompletes() {
+        let only = [model("Mezmo SRE Agent", Some("Testing the description"))];
+        assert_eq!(
+            plain(&model_hint_lines(&only, "", None, None, 80)),
+            [
+                "     Name             Description",
+                "  1. Mezmo SRE Agent  Testing the description",
+            ]
+        );
+        assert_eq!(
+            plain(&model_hint_lines(&only, "mez", None, None, 80)),
+            ["▸  Mezmo SRE Agent  Testing the description  press enter to auto-complete"]
+        );
     }
 
     #[test]
