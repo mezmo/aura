@@ -199,26 +199,6 @@ mod tests {
         use crate::mcp_streamable_http::call_tool_request;
         use crate::mcp_streamable_http::tests::RecordingMcpServer;
 
-        /// An SSE transport aimed at `endpoint`, carrying the same frozen
-        /// identity a configured client would hold. Built by hand because
-        /// `connect` needs a live SSE stream and the send path is what is
-        /// under test.
-        fn transport_to(endpoint: &str) -> SseTransport {
-            let mut frozen = HeaderMap::new();
-            frozen.insert(
-                "authorization",
-                HeaderValue::from_static("Bearer requester"),
-            );
-            SseTransport {
-                http_client: reqwest::Client::builder()
-                    .default_headers(frozen)
-                    .build()
-                    .unwrap(),
-                message_endpoint: url::Url::parse(endpoint).unwrap(),
-                stream: None,
-            }
-        }
-
         fn call_message(tool: &str, overrides: Option<ApproverHeaders>) -> ClientJsonRpcMessage {
             ClientJsonRpcMessage::request(
                 call_tool_request(
@@ -239,7 +219,22 @@ mod tests {
         #[tokio::test]
         async fn send_applies_the_override_to_that_post_alone() {
             let server = RecordingMcpServer::start().await;
-            let mut transport = transport_to(&server.url);
+            // Built by hand because `connect` needs a live SSE stream and the
+            // send path is what is under test. The frozen header stands in
+            // for the identity a configured client would hold.
+            let mut frozen = HeaderMap::new();
+            frozen.insert(
+                "authorization",
+                HeaderValue::from_static("Bearer requester"),
+            );
+            let mut transport = SseTransport {
+                http_client: reqwest::Client::builder()
+                    .default_headers(frozen)
+                    .build()
+                    .unwrap(),
+                message_endpoint: url::Url::parse(&server.url).unwrap(),
+                stream: None,
+            };
 
             transport
                 .send(call_message(

@@ -302,7 +302,7 @@ mod tests {
 
         use super::*;
         use crate::logging::ATTR_APPLIED_HEADERS;
-        use crate::mcp_streamable_http::tests::RecordingMcpServer;
+        use crate::mcp_streamable_http::tests::client_and_server;
         use crate::test_span_capture::CapturedSpans;
 
         /// Run `execute_mcp_tool` under a subscriber that exports to memory,
@@ -340,10 +340,7 @@ mod tests {
         /// produce `"x-tenant,authorization"` and this test would catch it.
         #[tokio::test]
         async fn gated_call_stamps_the_applied_header_names_never_values() {
-            let server = RecordingMcpServer::start().await;
-            let client = McpClient::new(server.url.clone(), &HashMap::new())
-                .await
-                .expect("the loopback server completes the handshake");
+            let (_server, client) = client_and_server(&HashMap::new()).await;
 
             let overrides = crate::approver_headers::tests::captured_overrides_multi(&[
                 ("x-tenant", "acme"),
@@ -368,10 +365,7 @@ mod tests {
         /// no `applied_headers` attribute at all.
         #[tokio::test]
         async fn ungated_call_records_no_applied_headers() {
-            let server = RecordingMcpServer::start().await;
-            let client = McpClient::new(server.url.clone(), &HashMap::new())
-                .await
-                .expect("the loopback server completes the handshake");
+            let (_server, client) = client_and_server(&HashMap::new()).await;
 
             let attribute = applied_headers_on_call(&client, None).await;
 
