@@ -74,8 +74,8 @@ only.**
 A `#[derive(Clone)] ApproverHeaders(HeaderMap)` (redacting `Debug`) rides
 the one gated call's request value as an extension — inserted at every
 `call_tool*` construction site, read back at the two send points that own an
-outbound POST — so one-call scoping is structural: no keyed map, no cleanup
-step, no cross-call leakage under concurrency.
+outbound POST — so one-call scoping is structural: nothing is keyed or
+cleaned up, and concurrent calls never leak into each other.
 
 Only the webhook route captures, and only for approvals raised by the config
 gate (`ApprovalOrigin::ConfigGate`) — never the agent-callable
@@ -83,12 +83,11 @@ gate (`ApprovalOrigin::ConfigGate`) — never the agent-callable
 whose route-wide `ApprovalOutcome` has no consumer for credentials it would
 otherwise hold with nowhere to go. The conversational route is excluded just
 as deliberately: its decision caller is the session holder already on the
-stream, not a distinct identity source, so forwarding it would forward
-nothing new.
+stream, so forwarding that identity adds nothing.
 
-Capture and delivery both fail closed: a missing mapped header errors the
-call naming every missing header, never a value, and a gated stdio call
-carrying an override is refused before dispatch, since stdio has no per-call
+Capture and delivery both fail closed. A missing mapped header errors the
+call, naming every missing header and never a value. A gated stdio call
+carrying an override is refused before dispatch: stdio has no per-call
 header channel. Cleartext capture stays allowed (TLS termination ahead of
 the process is a legitimate topology) but never silent: startup logs one
 warning per `[hitl]` config at the HMAC boot-time seam, while an HMAC secret
