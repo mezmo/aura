@@ -112,20 +112,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::mcp_streamable_http::tests::RecordingMcpServer;
+    use crate::mcp_streamable_http::tests::client_and_server;
 
-    /// An adaptor for `tool_name`, fronting `server`, tagged as `kind`.
+    /// An adaptor for `tool_name`, fronting `client`, tagged as `kind`.
     /// The client is always a streamable-HTTP one: the tag, not the wire, is
     /// what the override path consults, so a stdio-tagged adaptor over a
     /// reachable server is exactly the case that must still refuse.
     async fn adaptor_for(
-        server: &RecordingMcpServer,
+        client: McpClient,
         tool_name: &str,
         kind: McpTransportKind,
     ) -> McpToolAdaptor {
-        let client = McpClient::new(server.url.clone(), &std::collections::HashMap::new())
-            .await
-            .expect("the loopback server completes the handshake");
         let tool = rmcp::model::Tool::new(
             tool_name.to_owned(),
             "test tool".to_owned(),
@@ -137,8 +134,8 @@ mod tests {
     /// A stdio tool that no approval gated is untouched by any of this.
     #[tokio::test]
     async fn stdio_adaptor_runs_an_ungated_call() {
-        let server = RecordingMcpServer::start().await;
-        let adaptor = adaptor_for(&server, "ungated", McpTransportKind::Stdio).await;
+        let (server, client) = client_and_server(&std::collections::HashMap::new()).await;
+        let adaptor = adaptor_for(client, "ungated", McpTransportKind::Stdio).await;
 
         adaptor
             .call(json!({}))

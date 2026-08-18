@@ -239,7 +239,7 @@ pub(crate) mod tests {
             .expect("every mapped header is present")
     }
 
-    fn mappings(pairs: &[(&str, &str)]) -> ToolHeaderMappings {
+    pub(crate) fn mappings(pairs: &[(&str, &str)]) -> ToolHeaderMappings {
         let raw: HashMap<String, String> = pairs
             .iter()
             .map(|(outbound, response)| ((*outbound).to_owned(), (*response).to_owned()))
