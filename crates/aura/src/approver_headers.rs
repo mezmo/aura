@@ -139,15 +139,10 @@ pub enum McpTransportKind {
 }
 
 /// Fail closed when `kind` cannot deliver per-call header overrides.
-/// Called at the execution seam only when overrides exist.
-///
-/// The transport alone decides. An override value carrying no pairs is not
-/// "no override": the caller reached here because identity was demanded, and
-/// a transport with no per-call header channel cannot honor that demand
-/// whatever the configured map turned out to hold.
+/// Called at the execution seam only when overrides exist, so the check
+/// keys off the transport alone.
 pub(crate) fn ensure_transport_delivers_overrides(
     kind: McpTransportKind,
-    _overrides: &ApproverHeaders,
 ) -> Result<(), OverrideApplicationError> {
     match kind {
         // Both HTTP send paths read the extension and apply the overrides.
@@ -401,20 +396,12 @@ pub(crate) mod tests {
         );
     }
 
-    fn any_overrides() -> ApproverHeaders {
-        ApproverHeaders::from_captured(
-            &mappings(&[("x-forwarded-user", "x-approver-id")]),
-            &response(&[("x-approver-id", "alice")]),
-        )
-        .expect("test overrides capture")
-    }
-
     /// Stdio has no per-call header channel, so a call that demands identity
     /// cannot be delivered and must not proceed under the cached one.
     #[test]
     fn stdio_transport_refuses_overrides() {
         assert_eq!(
-            ensure_transport_delivers_overrides(McpTransportKind::Stdio, &any_overrides()),
+            ensure_transport_delivers_overrides(McpTransportKind::Stdio),
             Err(OverrideApplicationError::TransportUnsupported {
                 kind: McpTransportKind::Stdio
             }),
@@ -425,32 +412,13 @@ pub(crate) mod tests {
     /// can deliver.
     #[test]
     fn http_transports_accept_overrides() {
-        let overrides = any_overrides();
         assert_eq!(
-            ensure_transport_delivers_overrides(McpTransportKind::StreamableHttp, &overrides),
+            ensure_transport_delivers_overrides(McpTransportKind::StreamableHttp),
             Ok(()),
         );
         assert_eq!(
-            ensure_transport_delivers_overrides(McpTransportKind::Sse, &overrides),
+            ensure_transport_delivers_overrides(McpTransportKind::Sse),
             Ok(()),
-        );
-    }
-
-    /// The check keys off the transport alone. An override value with no pairs
-    /// is not "no override": identity was demanded, the configured map decided
-    /// what that means, and a transport that cannot carry headers still cannot
-    /// honor the demand.
-    #[test]
-    fn stdio_refuses_even_an_empty_override_set() {
-        let empty = ApproverHeaders::from_captured(&mappings(&[]), &HeaderMap::new())
-            .expect("an empty mapping captures nothing and succeeds");
-        assert_eq!(empty.captured_names().count(), 0);
-
-        assert_eq!(
-            ensure_transport_delivers_overrides(McpTransportKind::Stdio, &empty),
-            Err(OverrideApplicationError::TransportUnsupported {
-                kind: McpTransportKind::Stdio
-            }),
         );
     }
 

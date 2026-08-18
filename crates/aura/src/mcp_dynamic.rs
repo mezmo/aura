@@ -19,9 +19,7 @@ pub struct McpToolAdaptor {
     #[allow(dead_code)]
     server_name: String,
     client: Arc<McpClient>,
-    /// Which transport this adaptor fronts, tagged at construction. The
-    /// approver-override path fails closed on transports that cannot
-    /// deliver per-request headers.
+    /// Which transport this adaptor fronts, tagged at construction.
     transport_kind: McpTransportKind,
 }
 
@@ -96,10 +94,10 @@ impl RigTool for McpToolAdaptor {
             // captured any. Unscoped reads yield `None` (wrapper-less
             // agents).
             let approver_overrides = current_approver_overrides();
-            if let Some(overrides) = &approver_overrides {
+            if approver_overrides.is_some() {
                 // Fail closed before dispatch when the transport cannot
                 // deliver per-request headers.
-                ensure_transport_delivers_overrides(transport_kind, overrides)
+                ensure_transport_delivers_overrides(transport_kind)
                     .map_err(|e| ToolError::ToolCallError(Box::new(e)))?;
             }
 
