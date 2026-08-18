@@ -58,12 +58,14 @@ pub fn set_mcp_counts(counts: McpCounts) {
 
 fn capture_snapshot() -> Snapshot {
     let cwd = CWD.get_or_init(|| std::env::current_dir().ok()).as_deref();
-    let used = CONTEXT_USED.load(Ordering::Relaxed);
-    let context = match NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed)) {
-        Some(limit) => ContextUsage::Bounded { used, limit },
-        None if used > 0 => ContextUsage::Unbounded { used },
-        None => ContextUsage::Unknown,
-    };
+    // No window, no meter: a bare token count would be a sum of many agent
+    // contexts in orchestration mode (which never reports a window), so the
+    // segment only appears when there is a real ceiling to measure against.
+    let context =
+        NonZeroU64::new(MODEL_CONTEXT_LIMIT.load(Ordering::Relaxed)).map(|limit| ContextUsage {
+            used: CONTEXT_USED.load(Ordering::Relaxed),
+            limit,
+        });
     Snapshot {
         model: get_selected_model().or_else(|| SESSION_MODEL.lock().ok().and_then(|g| g.clone())),
         cwd: cwd.map(|p| status_line::abbreviate_home(p, dirs::home_dir().as_deref())),

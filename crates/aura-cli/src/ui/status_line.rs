@@ -79,19 +79,11 @@ impl FromStr for Segment {
     }
 }
 
-/// Context-window occupancy as last reported by the server.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ContextUsage {
-    #[default]
-    Unknown,
-    /// Tokens in context; the model's window size was not reported.
-    Unbounded {
-        used: u64,
-    },
-    Bounded {
-        used: u64,
-        limit: NonZeroU64,
-    },
+/// Context-window occupancy: tokens in context against the model's window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub limit: NonZeroU64,
 }
 
 /// Values the status line renders from.
@@ -101,7 +93,7 @@ pub struct Snapshot {
     /// Working directory, already home-abbreviated for display.
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
-    pub context: ContextUsage,
+    pub context: Option<ContextUsage>,
     /// Cumulative prompt tokens across the conversation.
     pub prompt_tokens: u64,
     /// Cumulative completion tokens across the conversation.
@@ -169,7 +161,7 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
             format!("⎇ {}", snapshot.git_branch.as_deref()?),
             AuraStyle::StatusGit,
         ),
-        Segment::Context => context_piece(snapshot.context)?,
+        Segment::Context => context_piece(snapshot.context?),
         Segment::Tokens => {
             if snapshot.prompt_tokens == 0 && snapshot.completion_tokens == 0 {
                 return None;
@@ -215,33 +207,25 @@ fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
     })
 }
 
-fn context_piece(context: ContextUsage) -> Option<(String, AuraStyle)> {
-    match context {
-        ContextUsage::Unknown => None,
-        ContextUsage::Unbounded { used } => {
-            Some((format!("ctx {}", compact(used)), AuraStyle::Success))
-        }
-        ContextUsage::Bounded { used, limit } => {
-            let limit = limit.get();
-            let pct = (used.saturating_mul(100) + limit / 2) / limit;
-            let style = if pct >= CONTEXT_ERROR_PCT {
-                AuraStyle::Error
-            } else if pct >= CONTEXT_WARN_PCT {
-                AuraStyle::Warning
-            } else {
-                AuraStyle::Success
-            };
-            Some((
-                format!(
-                    "ctx {} {pct}% {}/{}",
-                    meter(pct),
-                    compact(used),
-                    compact(limit)
-                ),
-                style,
-            ))
-        }
-    }
+fn context_piece(ContextUsage { used, limit }: ContextUsage) -> (String, AuraStyle) {
+    let limit = limit.get();
+    let pct = (used.saturating_mul(100) + limit / 2) / limit;
+    let style = if pct >= CONTEXT_ERROR_PCT {
+        AuraStyle::Error
+    } else if pct >= CONTEXT_WARN_PCT {
+        AuraStyle::Warning
+    } else {
+        AuraStyle::Success
+    };
+    (
+        format!(
+            "ctx {} {pct}% {}/{}",
+            meter(pct),
+            compact(used),
+            compact(limit)
+        ),
+        style,
+    )
 }
 
 fn meter(pct: u64) -> String {
@@ -416,10 +400,10 @@ mod tests {
             model: Some("claude-sonnet-4-5".to_owned()),
             cwd: Some("~/src/aura".to_owned()),
             git_branch: Some("main".to_owned()),
-            context: ContextUsage::Bounded {
+            context: Some(ContextUsage {
                 used: 76_000,
                 limit: NonZeroU64::new(200_000).unwrap(),
-            },
+            }),
             prompt_tokens: 182_000,
             completion_tokens: 41_000,
             scratchpad_intercepted: 0,
@@ -496,13 +480,19 @@ mod tests {
     }
 
     #[test]
-    fn unbounded_context_shows_raw_count() {
+    fn context_hidden_without_a_known_window() {
         let snapshot = Snapshot {
-            context: ContextUsage::Unbounded { used: 76_412 },
+            model: Some("m".to_owned()),
+            context: None,
             ..Snapshot::default()
         };
-        let line = strip_ansi(&render(&snapshot, &[Segment::Context], 80, ""));
-        assert_eq!(line, "ctx 76k");
+        let line = strip_ansi(&render(
+            &snapshot,
+            &[Segment::Model, Segment::Context],
+            80,
+            "",
+        ));
+        assert_eq!(line, "m");
     }
 
     #[test]
@@ -595,23 +585,14 @@ mod tests {
 
     #[test]
     fn context_thresholds_pick_style() {
-        let bounded = |used| ContextUsage::Bounded {
+        let usage = |used| ContextUsage {
             used,
             limit: NonZeroU64::new(100).unwrap(),
         };
-        assert!(matches!(
-            context_piece(bounded(69)),
-            Some((_, AuraStyle::Success))
-        ));
-        assert!(matches!(
-            context_piece(bounded(70)),
-            Some((_, AuraStyle::Warning))
-        ));
-        assert!(matches!(
-            context_piece(bounded(90)),
-            Some((_, AuraStyle::Error))
-        ));
-        let (text, _) = context_piece(bounded(120)).unwrap();
+        assert!(matches!(context_piece(usage(69)), (_, AuraStyle::Success)));
+        assert!(matches!(context_piece(usage(70)), (_, AuraStyle::Warning)));
+        assert!(matches!(context_piece(usage(90)), (_, AuraStyle::Error)));
+        let (text, _) = context_piece(usage(120));
         assert_eq!(text, "ctx ████████ 120% 120/100");
     }
 
