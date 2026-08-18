@@ -226,10 +226,10 @@ segments = ["model", "cwd", "git", "context", "tokens", "scratchpad", "mcp"]
 The status line is rendered locally from state the CLI already holds — no
 extra requests or tokens. Segments: `model` (selected model, or the one the
 server reports), `cwd` (`~`-abbreviated working directory), `git` (branch
-from `.git/HEAD`, no `git` subprocess), `context` (context-window meter and
-percentage — shown only when the agent's `[agent.llm]` config sets
-`context_window`, e.g. `context_window = 200000`; orchestration agents span
-many contexts and report no single window, so the segment is absent there), `tokens` (cumulative prompt/completion as `in`/`out`), `scratchpad`
+from `.git/HEAD`, no `git` subprocess), `context` (tokens currently in the
+model's context; becomes a meter with a percentage when the agent's
+`[agent.llm]` config sets `context_window`, e.g. `context_window = 200000`;
+hidden in orchestrated conversations, which span many agent contexts), `tokens` (cumulative prompt/completion as `in`/`out`), `scratchpad`
 (`in` = tokens diverted into the scratchpad, `out` = tokens read back into
 context; shown once any were intercepted), and `mcp` (connected/configured MCP servers). Segments with
 nothing to show are omitted; on narrow terminals the cwd is shortened
