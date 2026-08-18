@@ -154,10 +154,49 @@ pub fn notices_from_event(val: &serde_json::Value) -> Vec<McpNotice> {
         .collect()
 }
 
+/// Servers that connected out of all servers listed by an `aura.mcp_status`
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpCounts {
+    pub connected: usize,
+    pub total: usize,
+}
+
+/// Tally an `aura.mcp_status` payload. `None` when the payload has no
+/// `servers` array.
+pub fn counts_from_event(val: &serde_json::Value) -> Option<McpCounts> {
+    let servers = val.get("servers")?.as_array()?;
+    let connected = servers
+        .iter()
+        .filter(|s| s.get("status").and_then(|v| v.as_str()) == Some("connected"))
+        .count();
+    Some(McpCounts {
+        connected,
+        total: servers.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn counts_connected_out_of_total() {
+        let counts = counts_from_event(&event(json!([
+            { "server_name": "a", "transport": "stdio", "status": "connected", "tools_count": 2 },
+            { "server_name": "b", "transport": "sse", "status": "failed", "tools_count": 0, "reason": "x" },
+            { "server_name": "c", "transport": "http_streamable", "status": "not_attempted", "tools_count": 0 }
+        ])));
+        assert_eq!(
+            counts,
+            Some(McpCounts {
+                connected: 1,
+                total: 3
+            })
+        );
+        assert_eq!(counts_from_event(&json!({ "session_id": "s1" })), None);
+    }
 
     fn event(servers: serde_json::Value) -> serde_json::Value {
         json!({ "servers": servers, "session_id": "s1" })

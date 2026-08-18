@@ -2,6 +2,7 @@ pub mod agent_overview;
 pub mod markdown;
 pub mod pre_launch;
 pub mod prompt;
+pub mod status_line;
 pub mod welcome;
 
 // Sub-modules extracted from the original prompt.rs
