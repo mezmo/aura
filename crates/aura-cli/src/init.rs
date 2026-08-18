@@ -87,6 +87,12 @@ pub struct InitArgs {
     #[arg(long, default_value = "assistant")]
     pub name: String,
 
+    /// Enable the aura-bootstrap configuration agent in the generated config
+    /// (edit the config by chatting with it; token-gated, printed at server
+    /// startup)
+    #[arg(long)]
+    pub bootstrap: bool,
+
     /// Skip live model-list verification entirely (air-gapped / CI)
     #[arg(long)]
     pub offline: bool,
@@ -178,6 +184,6 @@ pub fn run_init(args: &InitArgs) -> Result<()> {
         .with_context(|| format!("failed to write {}", args.output.display()))?;
     println!("Wrote {}", args.output.display());
 
-    println!("{}", next_steps(&args.output, wrote_env));
+    println!("{}", next_steps(&args.output, wrote_env, spec.bootstrap));
     Ok(())
 }

@@ -34,6 +34,7 @@ pub(crate) struct ConfigSpec {
     pub(crate) region: Option<String>,
     pub(crate) base_url: Option<String>,
     pub(crate) name: String,
+    pub(crate) bootstrap: bool,
 }
 
 impl ConfigSpec {
@@ -265,6 +266,17 @@ pub(crate) fn resolve_spec<R: BufRead>(
         );
     }
 
+    // ---- bootstrap agent ----
+    // The flag wins outright; otherwise offer it interactively (default no —
+    // it is a standing admin surface, so enabling stays a deliberate choice).
+    let bootstrap = args.bootstrap
+        || prompter.ask_yes_no(
+            "\nEnable the aura-bootstrap agent? It lets you edit this config \
+             by chatting with it (token-gated; the token is printed at server \
+             startup).",
+            false,
+        )?;
+
     Ok(ConfigSpec {
         provider,
         model,
@@ -272,6 +284,7 @@ pub(crate) fn resolve_spec<R: BufRead>(
         region,
         base_url,
         name: args.name.clone(),
+        bootstrap,
     })
 }
 

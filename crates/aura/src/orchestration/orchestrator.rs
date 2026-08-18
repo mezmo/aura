@@ -4648,6 +4648,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
         workers.insert(
@@ -4661,6 +4662,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
 
@@ -4726,6 +4728,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
 
@@ -4741,6 +4744,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
 
@@ -4756,6 +4760,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
 
@@ -4890,6 +4895,7 @@ mod tests {
                 llm: None,
                 scratchpad: None,
                 skills: None,
+                read_only: false,
             },
         );
 
