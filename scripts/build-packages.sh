@@ -78,6 +78,10 @@ contents:
     dst: "/usr/bin/${binary}"
     file_info:
       mode: 0755
+deb:
+  compression: xz
+rpm:
+  compression: xz
 EOF
 }
 
