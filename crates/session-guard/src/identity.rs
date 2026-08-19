@@ -13,11 +13,10 @@ const RESERVED_SESSION_IDS: [&str; 3] = [".", "..", "latest"];
 
 /// A session identity that is always a safe single path component.
 ///
-/// Business rule: rejects path separators, traversal (`..`), the reserved
-/// name `latest` (collides with the persistence symlink), non-ASCII and
-/// control bytes, and overlength values. Case-sensitive verbatim — a typo
-/// is a new session, by design (matches today's `X-Chat-Session-Id`
-/// matching).
+/// Business rule: exactly 1..=128 bytes of ASCII `[A-Za-z0-9._-]`, and
+/// not `.` / `..` / `latest` (empty included — `root.join("")` resolves
+/// to the claim root itself). Case-sensitive verbatim — a typo is a new
+/// session, by design (matches today's `X-Chat-Session-Id` matching).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(String);
 

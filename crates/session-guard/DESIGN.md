@@ -1,73 +1,121 @@
-# session-guard — design record (Layer 1 skeleton)
+# session-guard - design record (Layer 1 skeleton, rev 2)
 
 Claim-based turn admission for multi-instance AURA: at most one service
 instance runs a turn for a session at a time, with session memory on a
 shared Archil disk. Skeleton commit = type surface only; every `todo!()`
-is a tracked hole (inventory at the bottom).
+is a tracked hole (inventory at the bottom). Rev 2 folds the two-seat
+panel findings (panel ledger below).
 
-## Type → business-rule map
+## Admission protocol in one paragraph
+
+One well-known claim file per session (`{root}/{session}/CLAIM`) is the
+election: fresh admission is a single atomic `O_EXCL` create, so two
+instances can never both win admission. The claim body carries the
+holder, turn, generation, and a heartbeat sequence. A release renames the
+claim to a unique tombstone (`{gen}.TOMBSTONE`) and unlinks the
+tombstone. A steal replaces the body (tmp + rename) only after
+`StalenessEvidence` built from two validated observations of the same
+claim, at least the staleness window apart, revalidated against a fresh
+read at steal time.
+
+## Type-to-business-rule map (every public type)
 
 | Type | One business rule | Invalid state it forbids |
 |---|---|---|
-| `SessionId` | A session id is always a safe single path component (charset `[A-Za-z0-9._-]`, ASCII, ≤128 bytes, not `.`/`..`/`latest`) | Path traversal, symlink collision (`latest`), control-byte injection |
-| `TurnId` | A turn is identified by a time-ordered UUIDv7 fixed at ingress | Two claims for one retry; non-unique claim file names |
-| `InstanceId` | The claim holder is a named service instance (deployment-neutral: hostname, pod, VM, or `AURA_INSTANCE_ID`) | Anonymous/unattributable claims; a k8s-only assumption baked into types |
-| `Generation` | Every admission or steal is the next generation; claim files are named with it | In-place claim rewrites; one client deleting another generation's claim |
-| `HeartbeatSeq` / `HeartbeatSample` | Liveness is a monotonic counter observed with observer-local time, never wall-clock comparison | Clock-skew faking or masking liveness |
-| `StalenessEvidence` | A steal requires adapter-assembled proof that one exact claim (session+fingerprint+holder+gen) had a non-advancing heartbeat across two samples ≥ `stale_after()` apart | Steal from session-id alone; evidence for a different claim incarnation |
-| `SessionArbiter` / `ArbiterGuard` | Same-instance same-session requests serialize in-process before any disk access | Two tasks on one instance both reaching the claim store |
-| `HeldLock` | A held claim carries its lease, its arbiter slot, and its release action; nothing can hold a claim without all three | Claim without liveness; claim that cannot be released |
-| `HeartbeatLease` | The heartbeat actor lives exactly as long as the turn states carry it (by value) | Orphaned heartbeat tasks outliving turns; missing renewal |
-| `WriteCapability` | Persistence writes are authorized per generation and fail closed after lease loss | Writes continuing after a steal (fencing by construction) |
-| `FencedRun` | A run directory exists only as a state proving the seam created it under claim authority | Run dirs created outside admission |
-| `TurnOutcome` | Every terminal path (success/failure/**clarification**) commits | Silent no-manifest exits |
-| `CommittingTurn::barrier` | Ordering is commit → lease stop → release → authorize; commit semantics are injected, never owned by the guard | Manifest written after release; warn-and-continue drain |
-| `CommittedResponse<T>` | Only this value authorizes the terminal frame; it is bound to session+turn+generation and not `Clone` | Emitting a terminal frame without a committed turn; permit reuse/forgery |
-| `AdmissionError` | Only `Busy` is contention (503+Retry-After, LB-retryable); `ContentionLost` distinct; `NotProvisioned` operator-facing | LB retry storms on non-contention failures |
-| `AdmissionEnv` / `AdmissionMode` | Admission is env-configured deployment infrastructure (`AURA_SESSION_ADMISSION=off\|lockfile`), defaulting off, mirroring the session store | Per-agent TOML ambiguity; forced-on clusters |
-| `TurnAdmission` | The port: admit, evidence-steal, locate-holder — object-safe, no orchestration concepts | Orchestration refactor coupling |
+| `SessionId` | Exactly 1..=128 bytes of ASCII `[A-Za-z0-9._-]`, not `.`/`..`/`latest` | Empty id resolving to the claim root; traversal; symlink collision |
+| `TurnId` | A turn is a time-ordered UUIDv7 fixed at ingress | Claim bodies that cannot name the claiming turn |
+| `InstanceId` | The claim holder is a named service instance (1..=64 bytes, same charset); deployment-neutral (`AURA_INSTANCE_ID`, hostname, pod, VM) | Anonymous claims; a k8s-only assumption in the types |
+| `Generation` | Each admission/steal is the next generation | Rewriting history; ambiguous release targets |
+| `HeartbeatSeq` | Liveness is a monotonic counter, never wall clock | Clock-skew faking or masking liveness |
+| `claim_path` / `tombstone_path` | The election is one fixed name; releases target generation-unique tombstones | Two instances both winning admission; deleting another generation's live claim |
+| `ObservedClaim` | Every judgment about a claim comes from one complete validated read (wire is private, parsed through `from_wire`) | Pairing raw samples with remembered metadata; unvalidated wire fields |
+| `StalenessEvidence` (crate-internal) | A steal needs two same-claim observations, non-advancing heartbeat, window-separated; no public constructor exists | Steal on session-id alone; evidence about a different claim incarnation |
+| `EvidenceError` / `WireError` | Diagnostics only; nothing branches on their payloads | Domain logic on raw text |
+| `SessionArbiter` / `ArbiterGuard` | Same-instance same-session requests serialize in-process before any disk access; the guard lives inside `HeldLock` so it spans the turn | Two tasks on one instance both reaching the claim store |
+| `HeldLock` | A held claim is one `OwnedClaim` identity plus its arbiter slot, lease, and bound release; assembled only by the adapter (`HeldLock::new` is crate-internal) | Lease/release/claim generation disagreement; unattributable holds |
+| `HeartbeatLease` | Liveness ends structurally: stop/drop revokes first, the actor is aborted (never detached), a closed channel reads Lost | Orphaned heartbeat tasks; Live-after-death capabilities |
+| `WriteCapability` | Writes are generation-bound and fail closed once the revocation trips | Writes continuing after a steal or stop |
+| `BeatInterval` | The beat is non-zero by construction | `stale_after` degenerating to zero |
+| `AdmissionEnv` | Config is validated once; fields private; zero intervals are errors, not clamps | Unvalidated public config |
+| `AdmissionMode` / `build_admission` | The single factory picks the backend and shares one arbiter; backend constructors are crate-internal | `LocalAdmission` built for a `lockfile` config; per-backend arbiters |
+| `TurnAdmission` | The port: admit + locate_holder; steals are internal (evidence is not externally producible) | Orchestration coupling; callers hand-rolling steals |
+| `LocalAdmission` / `ClaimFileAdmission` | Backends differ only in cross-instance mechanics | (documented behavior, no invariant of their own) |
+| `IdleRequest` | Admission input is pre-validated identities, turn fixed at ingress | Raw strings at the seam |
+| `FencedRun` | A run directory exists as a state only after the seam created it under claim authority | Run dirs outside admission |
+| `TurnOutcome` | Every terminal path (success/failure/clarification) commits | Silent no-manifest exits |
+| `CommitContext` | The commit step learns outcome, run dir, and claim identity from the barrier | Commit work before/outside the barrier's ordering |
+| `CommittingTurn::barrier` | Ordering is commit(ctx) then lease stop then release then authorize; commit semantics are injected | Manifest-after-release; eager commit; warn-and-continue |
+| `BarrierError` | Commit failure quarantines; release failure after durable commit carries the authorized response | Losing the payload on a wedge; conflating the two |
+| `CommittedResponse<T>` | Terminal-frame authorization bound to session+turn+generation; payload reachable only through envelope-preserving `map` or consuming `into_payload` | Detached, reused, or forged authorization |
+| `AdmissionError` | Only `Busy` is LB-retryable contention; `ContentionLost` distinct; `NotProvisioned` operator-facing | Retry storms on non-contention failures |
+| `ReleaseError` | `Superseded` is final (the new owner stands), never force-fixed | Force-unwedging by type accident |
+| `FenceCause` | Write-path failures are lease-loss or I/O, nothing else | Misclassified EROFS |
 
 ## Seam table
 
-| The module reaches into | Visibility | Notes |
+| Reach | Visibility | Notes |
 |---|---|---|
-| `tokio` (sync, task, time) | pub dep | watch channels, heartbeat actor |
-| std fs/path | std | claim file ops in the adapter only |
-| Nothing else | — | zero aura-crate, zero orchestration deps; `aura-web-server` consumes via `TurnAdmission` |
+| `tokio` (sync watch, task, time) | pub dependency | revocation, heartbeat actor |
+| std fs/path | std | claim ops live in `ClaimFileAdmission` only |
+| no aura crates, no orchestration types | - | consumed via `TurnAdmission` |
 
-Constructor visibility: `StalenessEvidence::new`, `HeartbeatSample::new`,
-`LockFingerprint::new`, `HeartbeatLease::new` are `pub(crate)` — only the
-adapter can assemble them.
+Visibility honesty: `pub(crate)` means any module *inside this crate*
+can call it, not "only the adapter". The assembly points are
+`HeldLock::new`, `ObservedClaim::from_wire`, `StalenessEvidence::from_observations`,
+`HeartbeatLease::{static_lease, with_actor}`, and the backend
+constructors - all `pub(crate)`. Outside the crate, none are reachable;
+Layer-2 compile-fail tests pin that.
 
 ## Residual risks (named)
 
-1. **Drop/abandonment**: consuming typestate orders the happy path but
-   cannot compel it (`mem::forget`, aborted tasks). Cancellation is
-   handled by `ActiveTurn::abort`; hard abandonment leaks the claim until
-   staleness. Linearly beyond the module is convention — enforced at the
-   seam, tested by compile-fail + behavioral suites (Layer 2).
-2. **Uncached reads**: the archil adapter's reads must bypass client
-   cache for evidence and `locate_holder`; the exact mechanism
-   (`invalidate-cache`, readdir expiry 0) is a Phase-1 probe, not proven.
-3. **Steal/revive race**: evidence revalidation narrows but cannot
-   eliminate the window where a paused holder resumes post-steal; the
-   `WriteCapability` fail-closed gate is the structural backstop.
-4. **Provisioning** (root/session dirs checked in once) lives at the
-   deployment seam, outside this crate.
+1. **Release/steal race on the claim name**: a release renames CLAIM to
+   its tombstone after a generation re-read; a steal landing between the
+   re-read and the rename would move the stealer's claim into the old
+   holder's tombstone. The stealer's next heartbeat revalidation fails
+   (its claim is gone) and its capability revokes; the window is one
+   rename wide. Phase-1 litmus characterizes it; it is ordering loss,
+   not data loss.
+2. **Check-then-write race on `assert_live`**: the capability check is
+   advisory at the call site; the structural guarantee is that
+   heartbeats fail after revocation, so a stolen claim stops being
+   renewed and the thief's evidence revalidation bounds the overlap.
+3. **Uncached reads**: the archil adapter's reads must bypass client
+   cache (invalidate-cache or readdir expiry 0); Phase-1 probe, not
+   proven.
+4. **Abandonment**: `mem::forget` or task kill leaks the claim until
+   staleness; the Drop path revokes and aborts what it can reach.
+5. **Provisioning** of root/session dirs lives at the deployment seam.
 
-## Hole inventory (baseline at skeleton commit)
+## Panel ledger (Layer 1)
 
-`grep -rEn '^\s+todo!\(' src/` → 12 holes:
+Round 1: frontier seat returned empty (failed delegation, not a pass);
+re-dispatched to a different family per routing rules. Codex seat
+(gpt-5.6-sol): FAIL, 12 BLOCKING + 3 MINOR. All 15 folded in rev 2:
+fixed-name election (C1), OwnedClaim identity + zero-arg release (C2),
+observation-bound evidence + steal moved inside admit (C3), structural
+revocation + abort-not-detach + closed-channel-is-Lost (C4), abort
+transitions on HeldLock/ActiveTurn (C5), lazy context-fed commit +
+release-failure carries the response (C6), envelope-preserving
+CommittedResponse (C7), private wire + ObservedClaim (C8), validated
+config + single factory (C9), min session length (C10), shared arbiter
+(C11), this record (C12), immutability docs (C13), prose fix (C14).
 
-- `identity.rs`: `SessionId::parse`, `InstanceId::parse`, `InstanceId::from_env`
-- `lib.rs`: `AdmissionEnv::from_env`
-- `state.rs`: `ActiveTurn::abort`, `CommittingTurn::barrier`
-- `adapters.rs`: `LocalAdmission::{admit, locate_holder}`,
-  `ClaimFileAdmission::{admit, admit_with_evidence, locate_holder}`
+## Hole inventory (rev 2 baseline)
 
-Fill order: identity/config (pure) → LocalAdmission (no fs) →
-ClaimFileAdmission admit/locate → barrier/abort → steal path. Each fill
-sweeps its `#[expect]` markers and flips its Layer-2 frames red→green.
+`grep -rEn '^\s+todo!\(' src/` returns 16 holes:
 
-`clippy.todo` is `warn` through the fill phase; the completion gate flips
-it to `deny`.
+- `identity.rs` (3): `SessionId::parse`, `InstanceId::parse`,
+  `InstanceId::from_env`
+- `claim.rs` (3): `ObservedClaim::from_wire`, `ObservedClaim::to_wire`,
+  `StalenessEvidence::from_observations`
+- `lib.rs` (2): `AdmissionEnv::from_env`, `build_admission`
+- `state.rs` (3): `HeldLock::abort`, `ActiveTurn::abort`,
+  `CommittingTurn::barrier`
+- `adapters.rs` (5): `LocalAdmission::{admit, locate_holder}`,
+  `ClaimFileAdmission::{observe, admit, locate_holder}`
+
+Fill order: identity/config (pure) then LocalAdmission (no fs) then
+ClaimFileAdmission observe/admit then barrier/aborts then the steal path
+inside admit. Each fill sweeps its `#[expect]` markers and flips its
+Layer-2 frames red to green. `clippy.todo` stays `warn` through the fill
+phase; the completion gate flips it to `deny`.

@@ -1,14 +1,22 @@
-//! Claim-file surface: naming, wire body, liveness evidence, holder views.
+//! Claim surface: the single well-known claim per session, its wire body,
+//! validated observations, and liveness evidence.
+//!
+//! One session has ONE claim file at a fixed path (`{root}/{session}/CLAIM`)
+//! created atomically with `O_EXCL` — that is the cross-instance election.
+//! The body carries the current generation and heartbeat sequence; a steal
+//! replaces the body (tmp + rename) only after validated
+//! [`StalenessEvidence`]; a release renames the claim to a unique tombstone
+//! name and unlinks that, so no client ever deletes a name it does not own
+//! the current generation of without a re-read between (residual window
+//! named in DESIGN.md).
 
-use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::identity::{InstanceId, SessionId, TurnId};
 
 /// A claim's generation. Each successful admission or steal is the next
-/// generation; claim files are named with it, so every claim is unique and
-/// additive — an owner only ever removes its own.
+/// generation. Body and election agree on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Generation(u64);
 
@@ -32,15 +40,15 @@ impl Generation {
     }
 }
 
-impl fmt::Display for Generation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for Generation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
 /// Monotonic heartbeat counter — the liveness measure inside a claim.
 /// Never wall-clock: staleness is "the sequence stopped advancing", so no
-/// clock skew between pods can fake or mask liveness.
+/// clock skew between instances can fake or mask liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HeartbeatSeq(u64);
 
@@ -64,115 +72,157 @@ impl HeartbeatSeq {
     }
 }
 
-/// One observation of a claim's heartbeat, taken by this pod (observer-local
-/// time). Two samples with a non-advancing sequence, taken at least
-/// [`crate::stale_after`] apart, are the raw material of steal evidence.
-#[derive(Debug, Clone, Copy)]
-pub struct HeartbeatSample {
-    /// The heartbeat sequence observed.
-    pub(crate) seq: HeartbeatSeq,
-    /// Observer-local observation time.
-    pub(crate) observed_at: Instant,
+/// The fixed election path for a session: `{root}/{session}/CLAIM`.
+/// One name, atomically created — the admission point.
+#[must_use]
+pub fn claim_path(root: &Path, session: &SessionId) -> PathBuf {
+    root.join(session.as_ref()).join("CLAIM")
 }
 
-impl HeartbeatSample {
-    /// Record a sample (adapter-side).
-    pub(crate) fn new(seq: HeartbeatSeq) -> Self {
+/// The unique tombstone path for one generation of a session's claim:
+/// `{root}/{session}/{generation}.TOMBSTONE`. Renaming the live claim here
+/// is the release; the tombstone unlink can only hit this generation.
+#[must_use]
+pub fn tombstone_path(root: &Path, session: &SessionId, generation: Generation) -> PathBuf {
+    root.join(session.as_ref())
+        .join(format!("{generation}.TOMBSTONE"))
+}
+
+/// Wire body of a claim file. Private: parsing goes through
+/// [`ObservedClaim::from_wire`], which binds it to the file it was read
+/// from and constrains every field.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ClaimWire {
+    instance: String,
+    turn: String,
+    generation: u64,
+    heartbeat_seq: u64,
+}
+
+impl ClaimWire {
+    fn initial(instance: &InstanceId, turn: TurnId, generation: Generation) -> Self {
         Self {
-            seq,
-            observed_at: Instant::now(),
+            instance: instance.as_ref().to_owned(),
+            turn: turn.to_string(),
+            generation: generation.as_u64(),
+            heartbeat_seq: HeartbeatSeq::new(0).as_u64(),
         }
     }
+}
 
-    /// The observed heartbeat sequence.
-    #[must_use]
-    pub const fn seq(self) -> HeartbeatSeq {
-        self.seq
+/// One complete, validated observation of a session's claim, from a single
+/// uncached read. Everything downstream (holder views, staleness
+/// evidence, steal revalidation) starts from one of these; nothing pairs
+/// raw samples with remembered metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedClaim {
+    session: SessionId,
+    holder: InstanceId,
+    turn: TurnId,
+    generation: Generation,
+    heartbeat: HeartbeatSeq,
+    observed_at: Instant,
+}
+
+impl ObservedClaim {
+    /// Parse a wire body as an observation of `session`'s claim. Fallible:
+    /// holder and turn must parse, generation and heartbeat must be
+    /// non-degenerate.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by aura #421 follow-up"
+    )]
+    pub(crate) fn from_wire(
+        session: SessionId,
+        wire: ClaimWire,
+    ) -> Result<Self, crate::claim::WireError> {
+        todo!("fill: validate + bind; aura #421 follow-up")
     }
 
-    /// When this pod took the sample.
+    /// Serialize this observation's wire form (heartbeat renewal writes).
+    pub(crate) fn to_wire(&self) -> ClaimWire {
+        todo!("fill: field mapping; aura #421 follow-up")
+    }
+
+    /// The holder named by the observed claim.
     #[must_use]
-    pub const fn observed_at(self) -> Instant {
+    pub fn holder(&self) -> &InstanceId {
+        &self.holder
+    }
+
+    /// The observed generation.
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// The observed heartbeat.
+    #[must_use]
+    pub const fn heartbeat(&self) -> HeartbeatSeq {
+        self.heartbeat
+    }
+
+    /// Observer-local read time.
+    #[must_use]
+    pub const fn observed_at(&self) -> Instant {
         self.observed_at
     }
 }
 
-/// Identifies one incarnation of a session's lock (the current claim file
-/// name). Binds staleness evidence to a specific claim, not just a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockFingerprint(String);
+/// Why a wire body is not a valid observation. Diagnostic-only.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid claim wire: {0}")]
+pub struct WireError(String);
 
-impl LockFingerprint {
-    /// Wrap a non-empty fingerprint (adapter-side).
-    pub(crate) fn new(raw: String) -> Self {
-        Self(raw)
-    }
+/// Why two observations do not prove staleness. Diagnostic-only.
+#[derive(Debug, thiserror::Error)]
+pub enum EvidenceError {
+    /// The observations are of different claims (holder, turn, or
+    /// generation changed between reads) — the holder was live.
+    #[error("claim changed between observations")]
+    ClaimChanged,
+    /// The heartbeat advanced — the holder is live.
+    #[error("heartbeat advanced between observations")]
+    HeartbeatAdvanced,
+    /// The observations are closer together than `stale_after`; a steal
+    /// on this evidence would race a live-but-slow renewal.
+    #[error("observations not separated by the staleness window")]
+    TooCloseTogether,
 }
 
-impl fmt::Display for LockFingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Proof that a claim is stale, built by the adapter from two uncached
-/// reads of the same claim at least [`crate::stale_after`] apart.
-///
-/// Business rule: a steal may only happen with this evidence, and the
-/// evidence must name the exact claim (session + fingerprint + holder +
-/// generation) whose heartbeat sequence did not advance. The public
-/// constructor does not exist; only the adapter can assemble one.
+/// Proof that one exact claim (same session, holder, turn, generation)
+/// had a non-advancing heartbeat across two observations at least
+/// `stale_after` apart. Assembled only by the adapter's sampler from
+/// [`ObservedClaim`] pairs; there is no public constructor, and the steal
+/// path revalidates against a fresh read before acting.
 #[derive(Debug, Clone)]
-pub struct StalenessEvidence {
-    pub(crate) session: SessionId,
-    pub(crate) fingerprint: LockFingerprint,
-    pub(crate) holder: InstanceId,
-    pub(crate) generation: Generation,
-    pub(crate) first: HeartbeatSample,
-    pub(crate) second: HeartbeatSample,
+pub(crate) struct StalenessEvidence {
+    session: SessionId,
+    stale_generation: Generation,
+    first: ObservedClaim,
+    second: ObservedClaim,
 }
 
 impl StalenessEvidence {
-    /// Assemble evidence (adapter-side only). Same-claim binding is by
-    /// construction; `admit_with_evidence` checks the elapsed time and
-    /// non-advancing sequence before acting.
-    pub(crate) fn new(
-        session: SessionId,
-        fingerprint: LockFingerprint,
-        holder: InstanceId,
-        generation: Generation,
-        first: HeartbeatSample,
-        second: HeartbeatSample,
-    ) -> Self {
-        Self {
-            session,
-            fingerprint,
-            holder,
-            generation,
-            first,
-            second,
-        }
+    /// Build evidence from two observations of the same claim. Verifies
+    /// same-claim binding, non-advancing heartbeat, and window separation.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by aura #421 follow-up"
+    )]
+    pub(crate) fn from_observations(
+        first: ObservedClaim,
+        second: ObservedClaim,
+        stale_after: Duration,
+    ) -> Result<Self, EvidenceError> {
+        todo!("fill: verify binding/window; aura #421 follow-up")
     }
 
-    /// The session the evidence is for.
+    /// The generation the steal would supersede.
     #[must_use]
-    pub fn session(&self) -> &SessionId {
-        &self.session
+    pub const fn stale_generation(&self) -> Generation {
+        self.stale_generation
     }
-}
-
-/// The claim-file wire body. Everything an observer needs to route or
-/// evaluate liveness, nothing wall-clock based.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ClaimBody {
-    /// Holder instance.
-    pub instance: String,
-    /// The turn that claimed.
-    pub turn: String,
-    /// Claim generation (matches the file name).
-    pub generation: u64,
-    /// Latest heartbeat sequence written by the holder.
-    pub heartbeat_seq: u64,
 }
 
 /// Where the current holder of a session runs, for routing and honest
@@ -189,22 +239,10 @@ pub enum Locality {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HolderView {
     /// Holder instance identity.
-    pub instance: InstanceId,
+    pub holder: InstanceId,
     /// Whether that instance is this process.
     pub locality: Locality,
-    /// Last observed heartbeat, if the backing store exposes one.
+    /// Last observed heartbeat (`None` when assembled without a claim
+    /// read, e.g. from this process's own held lock).
     pub last_heartbeat: Option<HeartbeatSeq>,
-}
-
-/// Claim file path: `{root}/{session}/{generation}-{turn}.CLAIM`. Unique per
-/// admission by construction — no claim file is ever rewritten in place.
-#[must_use]
-pub fn claim_path(
-    root: &Path,
-    session: &SessionId,
-    generation: Generation,
-    turn: TurnId,
-) -> PathBuf {
-    root.join(session.as_ref())
-        .join(format!("{generation}-{turn}.CLAIM"))
 }

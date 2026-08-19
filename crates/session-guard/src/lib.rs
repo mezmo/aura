@@ -1,50 +1,51 @@
 //! # session-guard
 //!
-//! Claim-based turn admission for multi-pod AURA: at most one pod runs a
-//! turn for a given session at a time, with cross-pod memory on a shared
-//! Archil disk.
+//! Claim-based turn admission for multi-instance AURA: at most one
+//! service instance runs a turn for a given session at a time, with
+//! cross-instance memory on a shared Archil disk.
 //!
 //! Two layers keep that promise:
 //!
-//! 1. **In-process** — a [`SessionArbiter`] serializes same-session requests
-//!    arriving at one pod, before any filesystem admission.
-//! 2. **Cross-pod** — a *claim file* on the shared disk (`locks/{session}/
-//!    {generation}-{turn}.CLAIM`). Claims are additive and uniquely named, so
-//!    an owner only ever removes its own claim; no client can delete another
-//!    generation's claim. Liveness is a heartbeat *sequence* (never wall
-//!    clocks); a claim whose sequence stops advancing for `STALE_FACTOR`
-//!    beat intervals may be stolen only with [`StalenessEvidence`] built
-//!    from two uncached reads at least `stale_after()` apart.
+//! 1. **In-process** — a [`SessionArbiter`] serializes same-session
+//!    requests arriving at one instance, before any filesystem admission.
+//! 2. **Cross-instance** — one well-known claim file per session
+//!    (`{root}/{session}/CLAIM`), atomically created (`O_EXCL`): that
+//!    create *is* the election. Liveness is a heartbeat *sequence* in the
+//!    claim body (never wall clocks); a claim whose sequence stops
+//!    advancing for the staleness window may be superseded, but only by
+//!    the adapter's evidence-gated steal with revalidation.
 //!
-//! The consuming state machine (one pod's view of one request):
+//! The consuming state machine (one instance's view of one request):
 //!
 //! ```text
 //! Idle ──admit──────────► HeldLock ──open_run──► FencedRun ──activate──► ActiveTurn
-//!  │                        │                      │                       │
-//!  └─busy──► 503            └─error returns lock   └─error returns lock    ├─complete──► CommittingTurn
-//!                                                  (quarantine on loss)   │              │ barrier(commit)
-//!                                                                         └─abort────────► └─► CommittedResponse
+//!  │                        │        (seam does mkdir under capability)   │
+//!  └─busy──► 503            └─seam failure: HeldLock::abort               ├─complete──► CommittingTurn
+//!                                                     ┌──────────────────┘              │ barrier(commit(ctx))
+//!                                     abandonment ────┘                                 └─► CommittedResponse
+//!                                     (drop revokes)
 //! ```
 //!
-//! Only a [`CommittedResponse`] authorizes emitting the terminal frame of a
-//! turn (SSE `[DONE]`, final body, A2A artifact). Mid-turn streaming events
-//! are not gated.
+//! Only a [`CommittedResponse`] authorizes emitting the terminal frame of
+//! a turn (SSE `[DONE]`, final body, A2A artifact). Mid-turn streaming
+//! events are not gated.
 //!
 //! ## Configuration
 //!
-//! Configured **only via environment variables** — deployment infrastructure,
-//! one instance per server, exactly like the session store
-//! (`crates/aura-config/src/session_store.rs`):
+//! Env-configured deployment infrastructure, one instance per server,
+//! exactly like the session store (`crates/aura-config/src/session_store.rs`):
 //!
-//! | Env var                                    | Meaning                                        |
-//! | ------------------------------------------ | ---------------------------------------------- |
-//! | `AURA_SESSION_ADMISSION`                   | `off` (default) or `lockfile`                  |
-//! | `AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS`  | heartbeat interval (default 5000)              |
-//! | `AURA_SESSION_ADMISSION_RETRY_AFTER_MS`    | `Busy` retry hint (default 1000)               |
+//! | Env var                                   | Meaning                            |
+//! | ----------------------------------------- | ---------------------------------- |
+//! | `AURA_SESSION_ADMISSION`                  | `off` (default) or `lockfile`      |
+//! | `AURA_SESSION_ADMISSION_BEAT_INTERVAL_MS` | heartbeat interval (default 5000)  |
+//! | `AURA_SESSION_ADMISSION_RETRY_AFTER_MS`   | `Busy` retry hint (default 1000)   |
 //!
-//! `off` builds a [`LocalAdmission`] (arbiter-only, single-instance behavior);
-//! `lockfile` builds a [`ClaimFileAdmission`] against a claim root the server
-//! derives from its memory dir.
+//! Build the backend with [`build_admission`] — `off` yields a
+//! [`LocalAdmission`] (arbiter-only), `lockfile` a
+//! [`ClaimFileAdmission`] against a claim root derived from the memory
+//! dir. Both share one server-owned [`SessionArbiter`], so every
+//! admission path in the process serializes.
 
 #![allow(dead_code)]
 // session-guard skeleton: remove slices as bodies fill (aura #421 follow-up).
@@ -59,27 +60,30 @@ mod state;
 pub use adapters::{ClaimFileAdmission, LocalAdmission};
 pub use arbiter::{ArbiterGuard, SessionArbiter};
 pub use claim::{
-    ClaimBody, Generation, HeartbeatSample, HeartbeatSeq, HolderView, Locality, LockFingerprint,
-    StalenessEvidence, claim_path,
+    EvidenceError, Generation, HeartbeatSeq, HolderView, Locality, ObservedClaim, WireError,
+    claim_path, tombstone_path,
 };
 pub use identity::{InstanceId, InvalidInstanceId, InvalidSessionId, SessionId, TurnId};
-pub use lease::{LeaseLost, LeaseState, WriteCapability};
+pub use lease::{BeatInterval, LeaseLost, LeaseState, WriteCapability};
 pub use state::{
-    ActiveTurn, AdmissionError, BarrierError, CommittedResponse, CommittingTurn, FenceCause,
-    FencedRun, HeldLock, IdleRequest, OpenRunError, ReleaseError, TurnOutcome,
+    ActiveTurn, AdmissionError, BarrierError, CommitContext, CommittedResponse, CommittingTurn,
+    FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, TurnOutcome,
 };
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// A claim is stealable after this many missed beat intervals.
 pub const STALE_FACTOR: u32 = 3;
 
-/// The duration without an advancing heartbeat after which a claim is stale.
+/// The duration without an advancing heartbeat after which a claim is
+/// stale.
 #[must_use]
-pub fn stale_after(beat_interval: Duration) -> Duration {
-    beat_interval.saturating_mul(STALE_FACTOR)
+pub fn stale_after(beat: BeatInterval) -> Duration {
+    beat.get().saturating_mul(STALE_FACTOR)
 }
 
 /// Which admission backend a deployment runs.
@@ -89,7 +93,7 @@ pub enum AdmissionMode {
     /// Arbiter-only: single-instance behavior (default).
     #[default]
     Off,
-    /// Claim files on the shared memory dir: multi-pod admission.
+    /// Claim files on the shared memory dir: multi-instance admission.
     LockFile,
 }
 
@@ -121,46 +125,76 @@ impl FromStr for AdmissionMode {
 #[error("invalid session admission config: {0}")]
 pub struct AdmissionConfigError(String);
 
-const DEFAULT_BEAT_INTERVAL: Duration = Duration::from_millis(5_000);
-const DEFAULT_RETRY_AFTER: Duration = Duration::from_millis(1_000);
+const DEFAULT_BEAT_INTERVAL_MILLIS: u64 = 5_000;
+const DEFAULT_RETRY_AFTER_MILLIS: u64 = 1_000;
 
-/// Effective admission configuration for one server deployment.
+/// Effective admission configuration. Private fields: the beat interval
+/// is non-zero by construction, so `stale_after` cannot degenerate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionEnv {
-    /// Which backend to build.
-    pub mode: AdmissionMode,
-    /// Heartbeat interval for held claims (drives [`stale_after`]).
-    pub beat_interval: Duration,
-    /// Retry hint carried by [`AdmissionError::Busy`].
-    pub retry_after: Duration,
+    mode: AdmissionMode,
+    beat: BeatInterval,
+    retry_after: Duration,
 }
 
 impl AdmissionEnv {
-    /// Read the `AURA_SESSION_ADMISSION*` environment variables, defaulting
-    /// to `off` when unset.
+    /// Read the `AURA_SESSION_ADMISSION*` environment variables,
+    /// defaulting to `off` when unset. A zero beat interval or retry hint
+    /// is a config error, not a silent clamp.
     pub fn from_env() -> Result<Self, AdmissionConfigError> {
-        todo!("fill: env parsing with defaults; aura #421 follow-up")
+        todo!("fill: env parsing with validation; aura #421 follow-up")
+    }
+
+    /// The configured backend mode.
+    #[must_use]
+    pub const fn mode(&self) -> AdmissionMode {
+        self.mode
+    }
+
+    /// The heartbeat interval.
+    #[must_use]
+    pub const fn beat(&self) -> BeatInterval {
+        self.beat
+    }
+
+    /// The `Busy` retry hint.
+    #[must_use]
+    pub const fn retry_after(&self) -> Duration {
+        self.retry_after
     }
 }
 
-/// The port: everything the web server and HITL routing consume. Built at
-/// startup from [`AdmissionEnv`] exactly like the session store backend.
+/// Build the deployment's admission backend from validated config: one
+/// shared arbiter, one backend, selected by mode. The single factory —
+/// backend constructors are crate-internal so `LocalAdmission` can never
+/// be built for a `lockfile` config.
+///
+/// # Errors
+/// [`AdmissionConfigError`] when `env` selects `lockfile` but `root` is
+/// empty, or the instance id fails validation.
+#[expect(
+    unused_variables,
+    reason = "todo!() body; filled by aura #421 follow-up"
+)]
+pub fn build_admission(
+    env: &AdmissionEnv,
+    root: Option<PathBuf>,
+    instance: InstanceId,
+) -> Result<Arc<dyn TurnAdmission>, AdmissionConfigError> {
+    todo!("fill: mode dispatch + shared arbiter; aura #421 follow-up")
+}
+
+/// The port: everything the web server and HITL routing consume. Steals
+/// are adapter-internal (evidence assembly is not externally producible);
+/// callers see them as ordinary admission outcomes.
 #[async_trait::async_trait]
 pub trait TurnAdmission: Send + Sync {
-    /// Fresh admission (S0→S2): create a new claim, or fail [`AdmissionError::Busy`]
-    /// if a live claim exists.
+    /// Fresh admission (S0→S2): atomically create the session's claim, or
+    /// fail [`AdmissionError::Busy`] if a live claim exists (a stale one
+    /// is evidence-tested and superseded internally).
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError>;
 
-    /// Evidence-gated steal (S1→S2a): replace a claim proven stale by
-    /// `evidence`. The evidence binds session, owner, generation, and two
-    /// non-advancing heartbeat samples; the implementation revalidates it
-    /// against the claim file before replacing.
-    async fn admit_with_evidence(
-        &self,
-        req: IdleRequest,
-        evidence: StalenessEvidence,
-    ) -> Result<HeldLock, AdmissionError>;
-
-    /// Fresh read-only holder lookup for HITL routing, callable from any pod.
+    /// Fresh read-only holder lookup for HITL routing, callable from any
+    /// instance.
     async fn locate_holder(&self, session: &SessionId) -> std::io::Result<Option<HolderView>>;
 }
