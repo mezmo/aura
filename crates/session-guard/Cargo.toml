@@ -1,0 +1,20 @@
+[package]
+name = "session-guard"
+version.workspace = true
+edition.workspace = true
+description = "Claim-based turn admission for multi-pod AURA: one session, one pod at a time"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+
+[lints]
+# Hole inventory: warn through the fill phase; flip to deny at completion.
+rust.unsafe_code = "forbid"
+clippy.todo = "warn"

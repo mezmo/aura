@@ -4284,6 +4284,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "session-guard"
+version = "0.1.21"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

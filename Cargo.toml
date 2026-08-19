@@ -8,6 +8,7 @@ members = [
     "crates/aura-web-server",
     "crates/aura-test-utils",
     "crates/aura-cli",
+    "crates/session-guard",
 ]
 default-members = [
     "crates/aura",
@@ -18,6 +19,7 @@ default-members = [
     "crates/aura-web-server",
     "crates/aura-test-utils",
     "crates/aura-cli",
+    "crates/session-guard",
 ]
 # Keep a local rig checkout's crates out of this workspace (used when
 # temporarily path-pinning rig-core/rig-bedrock at ./rig for fork work).
@@ -97,6 +99,7 @@ uuid = { version = "1.0", features = ["v4", "v5", "v7", "serde"] }
 
 # Enum utilities
 strum = { version = "0.26", features = ["derive"] }
+async-trait = "0.1"
 
 # AWS Bedrock dependencies
 aws-config = "1.8.0"
