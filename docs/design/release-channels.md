@@ -6,20 +6,22 @@ Companion to the ADR
 specifies the release configuration, CI pipeline, branch workflow, validation,
 recovery, and operational requirements.
 
-**Status:** proposed as of 2026-07-29; not yet implemented.
+**Status:** implemented as of 2026-08-17. The repository-side rollout steps in §7
+(creating and protecting `nightly`, retargeting development, the first Cut) are
+administrative and remain outstanding.
 
 ## TL;DR
 
 - Three `semantic-release` branches: permanent `main` (release → `X.Y.Z`) and
   `nightly` (prerelease `nightly`), plus a per-cycle `beta` (prerelease `beta`).
   `nightly` and `beta` derive their base version from the last release on `main`.
-- One `release.config.js` selects **plugins and Docker tags by channel**, derived
-  from `BRANCH_NAME`. `semantic-release` computes the version and publishes; no
-  versioning logic is hand-rolled.
+- One `release.config.js` selects **plugins, exec commands, and Docker tags by
+  channel**, derived from `BRANCH_NAME`. `semantic-release` computes the version and
+  publishes; no versioning logic is hand-rolled.
 - Channel publishing differs: nightly's only external publication plugin is
   **Docker**; beta adds a **GitHub prerelease**; stable adds **changelog, version
-  commit-back, GitHub release, and Homebrew**. `latest` and Homebrew move on stable
-  only.
+  commit-back, GitHub release, Homebrew, and Cloudsmith packages**. `latest`,
+  Homebrew, and the package repository move on stable only.
 - Promotion merges `beta` into `main`; cross-branch changes are merged rather than
   cherry-picked so `main` retains the exact beta history.
 
@@ -49,86 +51,41 @@ artifact, so consumers reference the immutable `X.Y.Z-beta.N`.
 
 ## 2. Release configuration
 
-The current file `extends: '@mezmoinc/release-config-docker'` and pins
-`branches: ['main']`. Under this design it **composes** the shared config
-programmatically — `require` it, then spread and override `branches`, `plugins`, and
-`dockerTags` — rather than relying on semantic-release's `extends`. Every invocation
-(CI and local `release:dry`) runs with `BRANCH_NAME` set to the target branch.
+`release.config.js` keeps `extends: '@mezmoinc/release-config-docker'` and overrides
+`branches`, `plugins`, and the `exec` commands. Every invocation (CI and local
+`release:dry`) runs with `BRANCH_NAME` set to the target branch. The `0.x.x`
+major→minor / minor→patch `releaseRules` downgrade and the
+`@semantic-release/github` asset override carry over unchanged.
 
-```js
-'use strict'
-const base = require('@mezmoinc/release-config-docker')
+Most of the channel machinery already exists and is not reimplemented:
 
-const channelByBranch = { nightly: 'nightly', beta: 'beta', main: 'stable' }
-const branch = process.env.BRANCH_NAME
-const channel = channelByBranch[branch]
-if (!channel) throw new Error(`unsupported release branch: ${branch}`)
-if (process.env.RELEASE_CHANNEL && process.env.RELEASE_CHANNEL !== channel) {
-  throw new Error(`RELEASE_CHANNEL=${process.env.RELEASE_CHANNEL} does not match ${branch}`)
-}
+- **Docker tags** need no per-channel list. The plugin drops a tag that renders
+  empty, and `channel` is empty only on stable, so one static array covers all three
+  rows of the table above. The shared config already uses this idiom to keep the
+  version-family tags off beta; the guards widen from "not beta" to `{{#unless
+  channel}}` so nightly is covered too.
+- **Plugin order** is the shared config's, filtered by a per-channel `DROPPED` set.
+  Its `remap` step already guarantees the docker plugin follows `exec`.
+- **`beta` is a `semantic-release` default branch**; `nightly` is not, so all three
+  are declared. Declaring them also keeps the other defaults (`master`, `next`,
+  `next-major`, `alpha`, the maintenance glob) from going live if such a branch
+  appears.
 
-const branches = [
-  'main',
-  { name: 'beta', prerelease: 'beta', channel: 'beta' },
-  { name: 'nightly', prerelease: 'nightly', channel: 'nightly' },
-]
+What is computed: the plugin drops and the `exec` commands, both keyed off
+`BRANCH_NAME`.
 
-const drop = {
-  stable:  new Set(),
-  beta:    new Set(['@semantic-release/changelog', '@semantic-release/git']),
-  nightly: new Set(['@semantic-release/changelog', '@semantic-release/git',
-                    '@semantic-release/github']),
-}[channel]
-
-const name = (p) => (Array.isArray(p) ? p[0] : p)
-const ORDER = [
-  '@semantic-release/commit-analyzer',
-  '@semantic-release/release-notes-generator',
-  '@semantic-release/changelog',
-  '@semantic-release/exec',
-  '@codedependant/semantic-release-docker',
-  '@semantic-release/github',
-  '@semantic-release/git',
-]
-const byName = new Map()
-for (const p of base.plugins) {
-  const n = name(p)
-  if (byName.has(n)) throw new Error(`duplicate plugin instance: ${n}`)
-  if (!drop.has(n) && !ORDER.includes(n)) throw new Error(`plugin not covered by ORDER: ${n}`)
-  byName.set(n, p)
-}
-
-const preview = process.env.RELEASE_PREVIEW === '1'
-const verifyCmds = ['scripts/verify-release-version.sh "${nextRelease.version}"']
-if (channel === 'stable') {
-  verifyCmds.push('scripts/bump-homebrew-tap.sh --dry-run "${nextRelease.version}"')
-}
-const verifyReleaseCmd = preview
-  ? 'printf "%s\\n" "${nextRelease.version}" > .next-release-version'
-  : verifyCmds.join(' && ')
-const withExecVerify = (p) => {
-  const [plugin, options = {}] = Array.isArray(p) ? p : [p, {}]
-  return plugin === '@semantic-release/exec'
-    ? [plugin, { ...options, verifyReleaseCmd }]
-    : p
-}
-
-const plugins = ORDER
-  .filter((n) => byName.has(n) && !drop.has(n))
-  .map((n) => withExecVerify(byName.get(n)))
-
-const dockerTags = {
-  nightly: ['{{version}}', 'nightly'],
-  beta:    ['{{version}}'],
-  stable:  ['{{version}}', 'latest', '{{major}}-latest',
-            '{{major}}.{{minor}}-latest', 'automated-security-scan'],
-}[channel]
-
-module.exports = { ...base, branches, plugins, dockerTags }
-```
-
-`base.releaseRules` (the `0.x.x` major→minor / minor→patch downgrade) and the
-existing `@semantic-release/github` asset override carry over unchanged.
+- `semantic-release` fixes the plugin list in `getConfig`, before `getBranches`
+  resolves the branch, so a per-channel plugin set cannot read `nextRelease.channel`
+  and must come from the environment. Anything evaluated later — the Docker tags,
+  the `exec` command templates — uses `semantic-release`'s own channel instead.
+- An unrecognised branch keeps every plugin and the full command chain. That is what
+  the change-request dry run wants: it rehearses stable from a feature branch. The
+  `branches` list, not this lookup, is what decides whether a branch may release.
+- The `exec` commands are **top-level** keys, not `exec` plugin options: the dry run
+  names the plugin on the command line (`--plugins … @semantic-release/exec`), and
+  such a plugin is given only the top-level keys.
+- `bump-homebrew-tap.sh` exits on a prerelease version regardless (§3), so the tap is
+  guarded at the point of action as well as by the branch lookup.
 
 ## 3. Per-channel release behavior
 
@@ -136,25 +93,27 @@ existing `@semantic-release/github` asset override carry over unchanged.
 |---|:---:|:---:|:---:|---|
 | `commit-analyzer` | ✅ | ✅ | ✅ | compute version |
 | `release-notes-generator` | ✅ | ✅ | ✅ | notes body |
+| `@semantic-release/npm` | ✅ | ✅ | ✅ | stamp `package.json` (`npmPublish: false`) |
 | `@semantic-release/exec` (`set-version.sh`) | ✅ | ✅ | ✅ | stamp `Cargo.*` for the build |
 | `@codedependant/…/docker` | ✅ | ✅ | ✅ | prepare + publish image |
 | `@semantic-release/github` | — | ✅ | ✅ | release/prerelease + assets |
 | `@semantic-release/changelog` | — | — | ✅ | `CHANGELOG.md` |
 | `@semantic-release/git` | — | — | ✅ | `[skip ci]` version commit-back |
-| Homebrew (`exec` `successCmd`) | — | — | ✅ | tap bump |
+| Homebrew + Cloudsmith (`exec` `successCmd`) | — | — | ✅ | tap bump, `.deb`/`.rpm` publish |
 
 - The `github` plugin auto-marks prereleases from the branch, so beta publishes a
   prerelease with no extra config.
-- **Homebrew** shares the `@semantic-release/exec` instance used for version
-  stamping, so its `successCmd` runs on every channel. `bump-homebrew-tap.sh` must
-  exit for prerelease versions as its **first action — before any credential or
-  network access** — so nightly and beta (which are not provisioned Homebrew
-  credentials) pass. The Homebrew dry-run is gated to stable in the config (§2).
-  Stable tap failures are recovered by rerunning that script directly (§8).
+- **Homebrew and the package repository serve the stable channel**, so their
+  `verifyReleaseCmd` dry runs and their `successCmd` publishes are configured for
+  stable alone. As defense in depth, `bump-homebrew-tap.sh` also exits for a
+  prerelease version as its **first action — before any credential or network
+  access**, so a prerelease version can never reach the tap. Stable tap failures are
+  recovered by rerunning that script directly (§8).
+- `verify-release-version.sh` runs on every channel, first in the chain (§4).
 
 ### Published Docker tags
 
-Selected in JavaScript by channel (array in §2):
+One templated list, resolved per channel (§2):
 
 - nightly → immutable `X.Y.Z-nightly.N` + `nightly`
 - beta → immutable `X.Y.Z-beta.N`
@@ -163,9 +122,9 @@ Selected in JavaScript by channel (array in §2):
 
 ## 4. CI restructuring (Jenkinsfile)
 
-Replace the single `Release` stage (gated on `main`, full release every merge) with a
-per-branch release, each running only the stages its channel needs (`BRANCH_NAME`
-selects the channel; `RELEASE_CHANNEL`, if exported, is validated against it — §2):
+The `Release` stage runs on any of the three release branches instead of `main`
+alone, each running only the stages its channel needs (`BRANCH_NAME` selects the
+channel):
 
 | Trigger | channel | Binaries (linux+darwin) | Docker | `npm run release` |
 |---|---|:---:|:---:|:---:|
@@ -173,32 +132,41 @@ selects the channel; `RELEASE_CHANNEL`, if exported, is validated against it —
 | merge to `beta` | `beta` | ✅ | ✅ | ✅ (+ GitHub prerelease) |
 | merge to `main` | `stable` | ✅ | ✅ | ✅ (full chain) |
 
-- **Binaries:** `make build-binaries-linux` / `-darwin` + `make verify-binaries`
-  (for `checksums.txt`, consumed by Homebrew) run for beta and stable only.
+- **Binaries:** the binary, package, and checksum stages (`make build-binaries-linux`
+  / `-darwin`, `make release-artifacts`) run for beta and stable only. Nightly
+  publishes the image alone.
 - **Build order and version equality:**
-  1. Preview the version into `.next-release-version` (command below).
+  1. `npm run release:version` (`scripts/next-version.mjs`) previews the version into
+     `NEXT_RELEASE_VERSION`; an empty result skips the release.
   2. Stamp and build the beta/stable binaries from that version.
   3. Start the real `semantic-release` run.
   4. `verifyRelease` checks `nextRelease.version` equals the preview, **before any
      `prepare` or publish side effect**.
   5. `prepareCmd` stamps the same version; the Docker plugin builds the image; publish.
 
-  `scripts/verify-release-version.sh` performs the comparison via `verifyReleaseCmd`
-  (on stable, composed ahead of the Homebrew dry-run); a mismatch aborts before side
-  effects.
+  `scripts/verify-release-version.sh` performs the comparison as the first command in
+  `verifyReleaseCmd` (on stable, ahead of the Homebrew and package dry runs); a
+  mismatch aborts before side effects.
+- **Channel branch refs.** `release:version` reads the workspace as a `file://`
+  remote, and semantic-release keeps only the configured branches the repository
+  actually has, so the release stage materializes a local ref for each channel branch
+  first — otherwise a prerelease branch cannot derive its base version from `main`.
 - **`prepare` order (stable):** `changelog` → `exec` (`set-version.sh`) → Docker
-  build → `git` commit-back. Stable images do **not** ship `CHANGELOG.md` (exclude it
+  build → `git` commit-back. Stable images do **not** ship `CHANGELOG.md` (excluded
   from the Docker build context), so the changelog step only needs to precede the
   `git` commit-back.
-- **`[skip ci]` handling:** only `main` commits back, so the existing "don't abort on
-  the release branch" concurrency logic stays on `main`; `nightly` and `beta` no
-  longer produce version commits.
+- **`[skip ci]` handling:** only `main` commits back, so the "don't abort on the
+  release branch" concurrency logic covers all three release branches (an aborted
+  nightly could strand its moving tag) while only `main` produces version commits.
+- **Change-request dry run.** The dry run rehearses the *stable* chain — the widest
+  set of commands — from a feature branch, which the config gives it by default (§2).
+  It passes `--branches=<branch>` to make the branch under test releasable and exports
+  the previewed `NEXT_RELEASE_VERSION` so the version check is exercised too.
 
 Preview a branch's next version with:
 
 ```sh
-rm -f .next-release-version
-BRANCH_NAME=<branch> RELEASE_PREVIEW=1 npm run release:dry -- --no-ci
+BRANCH_NAME=<branch> npm run --silent release:version
 ```
 
 ## 5. Branch workflow
@@ -229,21 +197,22 @@ enforcement mechanism is implementation-specific.
 ## 6. Validation / spike plan
 
 Before wiring CI, dry-run from each actual remote branch using the normal configured
-branch list. Run in preview mode (§4):
+branch list — `release:dry` no longer overrides `--branches`, so the checked-out
+branch is resolved against the configured channels:
 
 ```sh
 git switch main
-BRANCH_NAME=main    RELEASE_PREVIEW=1 npm run release:dry -- --no-ci   # base X.Y.Z
+BRANCH_NAME=main    npm run release:dry
 git switch nightly
-BRANCH_NAME=nightly RELEASE_PREVIEW=1 npm run release:dry -- --no-ci   # X.Y.Z-nightly.N
+BRANCH_NAME=nightly npm run release:dry
 git switch beta
-BRANCH_NAME=beta    RELEASE_PREVIEW=1 npm run release:dry -- --no-ci   # X.Y.Z-beta.N
+BRANCH_NAME=beta    npm run release:dry
 ```
 
 Validating `beta` needs a temporary remote `beta` branch. Accept when: each branch
-yields the right version form, the config validates (no `ERELEASEBRANCHES` /
-`EPRERELEASEBRANCHES`), and nightly and beta versions progress coherently from the same
-stable base.
+yields the right version form (`X.Y.Z`, `X.Y.Z-nightly.N`, `X.Y.Z-beta.N`) on the
+right channel, the config validates (no `ERELEASEBRANCHES` / `EPRERELEASEBRANCHES`),
+and nightly and beta versions progress coherently from the same stable base.
 
 ## 7. Rollout prerequisites and deferred enhancements
 
@@ -265,11 +234,15 @@ stable base.
   (retag by digest) is deferred.
 - **Nightly architecture set.** Restrict nightly to `linux/amd64` to cut CI cost,
   keeping multi-arch for beta/stable.
+- **Prerelease package channel.** Nightly and beta publish no `.deb`/`.rpm`, since a
+  prerelease in the stable Cloudsmith repository would reach `apt upgrade`. A separate
+  prerelease repository would lift that restriction.
 
 ## 8. Failure recovery
 
-Because Homebrew runs after the Git tag and other publications, a Homebrew failure may
-leave an otherwise complete stable release. Recovery rules:
+Because Homebrew and the package publish run after the Git tag and other
+publications, a failure there may leave an otherwise complete stable release.
+Recovery rules:
 
 - Homebrew updates are idempotent; a failed tap bump is retried directly for the
   published version, not by rerunning semantic-release.
@@ -277,7 +250,7 @@ leave an otherwise complete stable release. Recovery rules:
   the full release.
 - Moving tags (`latest`, `nightly`) are never rolled backward during recovery.
 - Operators must be able to determine which outputs succeeded (tag, image, GitHub
-  release, tap).
+  release, tap, packages).
 
 ## 9. Operational requirements
 
@@ -285,27 +258,34 @@ leave an otherwise complete stable release. Recovery rules:
   through persistent repository rules. Only one `beta` may exist; its creation and
   promotion require authorized actors.
 - **Job serialization.** Serialize each channel's release job so an older nightly
-  build cannot move the `nightly` tag after a newer one.
+  build cannot move the `nightly` tag after a newer one. CI serializes rather than
+  aborting on the release branches (§4).
 - **Credential scope.** Every channel receives narrowly scoped repository credentials
   for pushing release tags and notes, plus Docker-registry credentials. Beta and stable
   additionally receive GitHub publication credentials; stable also receives Homebrew
-  credentials.
+  and package-repository credentials.
 - **Registry immutability.** Protect versioned image tags (`X.Y.Z`, `X.Y.Z-beta.N`,
   `X.Y.Z-nightly.N`) from overwrite.
 
 ## 10. Touch points (for implementers)
 
-- `release.config.js` — branches, per-channel plugins, Docker tags (§2, §3).
+- `release.config.js` — channel selection, branches, per-channel plugins, exec
+  commands, and Docker tags (§2, §3).
 - `Jenkinsfile` — per-branch release stages, `BRANCH_NAME`, binary/Docker gating,
-  `prepare` order and version-equality check (§4).
-- `package.json` — `release` / `release:dry` scripts, run with `BRANCH_NAME` set.
-- `scripts/bump-homebrew-tap.sh` — exit for prerelease versions as its first action,
+  channel branch refs, and the version-equality check (§4).
+- `package.json` — `release` / `release:dry` / `release:version` scripts, run with
+  `BRANCH_NAME` set.
+- `scripts/next-version.mjs` — previews the version; analyses a channel branch
+  against the full channel branch list so a prerelease computes a prerelease version.
+- `scripts/verify-release-version.sh` — `exec` `verifyReleaseCmd`; asserts
+  `nextRelease.version` equals `NEXT_RELEASE_VERSION` (§4).
+- `scripts/bump-homebrew-tap.sh` — exits for prerelease versions as its first action,
   before any credential/network use (§3).
-- `scripts/verify-release-version.sh` (new) — `exec` `verifyReleaseCmd`; assert
-  `nextRelease.version` equals `.next-release-version` (§4).
 - `scripts/set-version.sh`, `.makefiles/rust.mk` (`build-binaries-*`,
-  `verify-binaries`) — unchanged, reused per channel.
-- `.dockerignore` — exclude `CHANGELOG.md` from the stable image build context (§4).
+  `release-artifacts`) — unchanged, reused per channel.
+- `.makefiles/commitlint.mk` — lints a branch against its base (`nightly` by default,
+  the change request's target branch in CI).
+- `.dockerignore` — excludes `CHANGELOG.md` from the image build context (§4).
 - Repository ruleset — persistent name-matched protection for `nightly`, `beta`,
   `main` (§9).
 
