@@ -25,7 +25,8 @@ use super::state::{
     PROCESSING, QUEUED_INPUT, QUEUED_WAVE_POS, SESSION_MODEL, STATUS_HINT, STATUS_ROWS,
     STATUS_SEGMENTS, TURN_NOTICES, get_selected_model, lock_term, status_rows, term_size,
 };
-use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot, sanitize};
+use super::status_line::{self, ContextUsage, DEFAULT_SEGMENTS, Segment, Snapshot};
+use super::text::strip_control_chars;
 
 /// Right-aligned on the status line while the REPL is idle.
 const IDLE_RIGHT_TEXT: &str = "AURA, by Mezmo!";
@@ -195,7 +196,9 @@ pub(crate) fn print_status_line(line: &str) {
 /// redrawn (i.e. once the in-flight request finishes), so this is safe to
 /// call mid-stream.
 pub fn add_turn_notice(style: AuraStyle, message: impl AsRef<str>) {
-    let styled = sanitize(message.as_ref()).themed(style).to_string();
+    let styled = strip_control_chars(message.as_ref())
+        .themed(style)
+        .to_string();
     if let Ok(mut g) = TURN_NOTICES.lock() {
         g.push(styled);
     }

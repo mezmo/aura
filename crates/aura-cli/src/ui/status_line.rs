@@ -12,6 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::mcp_status::McpCounts;
 use crate::theme::{AuraStyle, Themed};
+use crate::ui::text::strip_control_chars;
 
 /// One unit of the status line, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,21 +155,20 @@ pub fn render(snapshot: &Snapshot, segments: &[Segment], width: usize, right: &s
     out
 }
 
-/// Replace control characters (C0, DEL, C1) with U+FFFD so text lifted from
-/// the filesystem or a server cannot smuggle escape sequences into the
-/// terminal, and so tampering stays visible rather than silently vanishing.
-pub(crate) fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
-}
-
 fn piece(segment: Segment, snapshot: &Snapshot) -> Option<Piece> {
+    // Model, cwd, and branch come from a server or the filesystem: strip
+    // control characters so they cannot carry escape sequences to the terminal.
     let (text, style) = match segment {
-        Segment::Model => (sanitize(snapshot.model.as_deref()?), AuraStyle::StatusModel),
-        Segment::Cwd => (sanitize(snapshot.cwd.as_deref()?), AuraStyle::StatusPath),
+        Segment::Model => (
+            strip_control_chars(snapshot.model.as_deref()?),
+            AuraStyle::StatusModel,
+        ),
+        Segment::Cwd => (
+            strip_control_chars(snapshot.cwd.as_deref()?),
+            AuraStyle::StatusPath,
+        ),
         Segment::Git => (
-            format!("⎇ {}", sanitize(snapshot.git_branch.as_deref()?)),
+            format!("⎇ {}", strip_control_chars(snapshot.git_branch.as_deref()?)),
             AuraStyle::StatusGit,
         ),
         Segment::Context => context_piece(snapshot.context?),
@@ -499,10 +499,7 @@ mod tests {
         assert!(!line.contains("\x1b[2J"));
         assert!(!line.contains('\t'));
         assert!(!line.contains('\u{9b}'));
-        assert_eq!(
-            strip_ansi(&line),
-            "gpt\u{FFFD}[2J-4o │ ~/a\u{FFFD}b │ ⎇ main\u{FFFD}31m"
-        );
+        assert_eq!(strip_ansi(&line), "gpt[2J-4o │ ~/ab │ ⎇ main31m");
     }
 
     #[test]
