@@ -428,6 +428,13 @@ struct StreamCallParams<'a> {
     event_tx: Option<&'a tokio::sync::mpsc::Sender<Result<StreamItem, StreamError>>>,
 }
 
+/// Failure outcome of [`Orchestrator::planning_stream_with_transient_retry`].
+enum PlanningCallError {
+    TransientExhausted { source: StreamError, retries: usize },
+    ContextOverflow,
+    Fatal(StreamError),
+}
+
 /// One guarded step of a deadline-wrapped stream loop.
 enum LoopStep {
     End,
@@ -1423,6 +1430,103 @@ impl Orchestrator {
         format!("Current time: {timestamp}\n\n{base}")
     }
 
+    /// Stream a planning call with transient-provider retry and backoff.
+    ///
+    /// Clears the routing decision before each call so the decision-ready
+    /// early-exit cannot observe a decision set by a failed stream. Transient
+    /// provider errors are resent the same prompt after an exponential backoff
+    /// governed by `[orchestration.retry]`; the conversation is never touched
+    /// here because the resent prompt is identical to the failed one. Each
+    /// attempt gets a fresh `per_call_timeout_secs` budget; when that timeout
+    /// is nonzero, one coordinator planning call is bounded by
+    /// `(max_retries + 1) × per_call_timeout_secs` plus the cumulative
+    /// backoff.
+    async fn planning_stream_with_transient_retry(
+        &self,
+        agent: &Agent,
+        params: &StreamCallParams<'_>,
+        routing_decision: &super::tools::RoutingDecision,
+    ) -> Result<crate::provider_agent::CompletionResponse, PlanningCallError> {
+        let max_retries = self.config.retry.max_retries;
+        let mut transient_retries = 0usize;
+        let attempt_start = Instant::now();
+
+        loop {
+            // Clear any routing decision left by a prior call so the
+            // decision-ready check starts false for this stream.
+            {
+                let mut guard = routing_decision.lock().await;
+                *guard = None;
+            }
+
+            let call_start = Instant::now();
+            let rd = routing_decision.clone();
+            let result = self
+                .stream_and_collect(
+                    agent,
+                    StreamCallParams {
+                        prompt: params.prompt,
+                        history: params.history.clone(),
+                        phase: params.phase,
+                        event_tx: params.event_tx,
+                    },
+                    || {
+                        let rd = rd.clone();
+                        Box::pin(async move { rd.lock().await.is_some() })
+                    },
+                )
+                .await;
+
+            let response = match result {
+                Ok(r) => r,
+                Err(e) if is_context_overflow_error(e.as_ref()) => {
+                    return Err(PlanningCallError::ContextOverflow);
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if is_transient_planning_error(&err_str) {
+                        // Resend the same prompt after backoff. The provider
+                        // never produced a response, so the routing-tool
+                        // correction (meant for a response that skipped the
+                        // tool) does not apply. The failed prompt is not
+                        // appended to the conversation because it is about
+                        // to be resent verbatim — pushing it would leave an
+                        // unpaired/duplicated user message.
+                        if transient_retries >= max_retries {
+                            tracing::warn!(
+                                "Planning transient retries exhausted ({}/{}) after {:.1}s: {}",
+                                transient_retries,
+                                max_retries,
+                                attempt_start.elapsed().as_secs_f64(),
+                                err_str,
+                            );
+                            return Err(PlanningCallError::TransientExhausted {
+                                source: e,
+                                retries: transient_retries,
+                            });
+                        }
+                        transient_retries += 1;
+                        let delay = self.config.retry.delay_for_retry(transient_retries);
+                        tracing::warn!(
+                            "Planning transient error, retry {}/{} after {:.1}s, \
+                             sleeping {:.1}s before resend: {}",
+                            transient_retries,
+                            max_retries,
+                            call_start.elapsed().as_secs_f64(),
+                            delay.as_secs_f64(),
+                            err_str,
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(PlanningCallError::Fatal(e));
+                }
+            };
+
+            return Ok(response);
+        }
+    }
+
     /// Plan with routing tool support via persistent conversation.
     ///
     /// Uses the coordinator from `CoordinatorState` (created once at
@@ -1470,21 +1574,12 @@ impl Orchestrator {
             &coordinator_state.preamble,
         );
 
-        for attempt in 1..=max_correction_attempts {
-            // Clear any stale routing decision
-            {
-                let mut guard = coordinator_state.routing_decision.lock().await;
-                *guard = None;
-            }
+        // Prompt sent to the coordinator on each attempt.
+        let mut current_prompt = planning_prompt.clone();
 
+        for attempt in 1..=max_correction_attempts {
             let attempt_start = Instant::now();
-            // First attempt sends the planning/continuation prompt; subsequent
-            // attempts send a correction message within the same conversation.
-            let prompt = if attempt == 1 {
-                planning_prompt.clone()
-            } else {
-                super::prompt_constants::corrections::ROUTING_TOOL_REQUIRED.to_string()
-            };
+            let prompt = current_prompt.clone();
 
             tracing::info!(
                 "Planning attempt {}/{} (per_call_timeout={}s, conversation_len={})",
@@ -1507,20 +1602,16 @@ impl Orchestrator {
                 &prompt,
             );
 
-            let rd = coordinator_state.routing_decision.clone();
             let response = match self
-                .stream_and_collect(
+                .planning_stream_with_transient_retry(
                     &coordinator_state.agent,
-                    StreamCallParams {
+                    &StreamCallParams {
                         prompt: &prompt,
                         history: full_history,
                         phase: "Planning",
                         event_tx,
                     },
-                    || {
-                        let rd = rd.clone();
-                        Box::pin(async move { rd.lock().await.is_some() })
-                    },
+                    &coordinator_state.routing_decision,
                 )
                 .await
             {
@@ -1534,26 +1625,24 @@ impl Orchestrator {
                     );
                     r
                 }
-                Err(e) if is_context_overflow_error(e.as_ref()) => {
+                Err(PlanningCallError::ContextOverflow) => {
                     let suggestion = context_overflow_suggestion("planning");
                     return Err(
                         format!("Context limit exceeded during planning. {}", suggestion).into(),
                     );
                 }
-                Err(e) => {
+                Err(PlanningCallError::TransientExhausted { source, retries }) => {
+                    return Err(format!(
+                        "Planning failed after {} transient provider retries: {}",
+                        retries, source
+                    )
+                    .into());
+                }
+                Err(PlanningCallError::Fatal(e)) => {
                     let err_str = e.to_string();
                     coordinator_state
                         .conversation
                         .push(rig::completion::Message::user(&prompt));
-                    if is_transient_planning_error(&err_str) {
-                        tracing::warn!(
-                            "Planning attempt {} transient error after {:.1}s, retrying: {}",
-                            attempt,
-                            attempt_start.elapsed().as_secs_f64(),
-                            err_str,
-                        );
-                        continue;
-                    }
                     tracing::warn!(
                         "Planning attempt {} failed after {:.1}s: {}",
                         attempt,
@@ -1649,6 +1738,11 @@ impl Orchestrator {
 
             final_prompt = Some(prompt);
             final_response = Some(response_text);
+
+            // Next attempt sends the routing-tool correction: the coordinator
+            // responded without calling a routing tool.
+            current_prompt =
+                super::prompt_constants::corrections::ROUTING_TOOL_REQUIRED.to_string();
         }
 
         // All correction attempts exhausted
@@ -3435,18 +3529,31 @@ Assign tasks to the worker whose tools best match the required operations."#,
     /// Classify a task failure error string into a structured category.
     ///
     /// These are deterministic string matches against error messages produced by
-    /// our rig fork (mezmo/rig @ d7e9d92) and our own orchestrator code — never
+    /// our rig fork (mezmo/rig @ ffd9eb7) and our own orchestrator code — never
     /// against non-deterministic model output. Rig's `CompletionError::ProviderError(String)`
     /// flattens HTTP status codes into the error string, so string matching is
     /// the only classification path available without forking rig's error types.
     /// Revisit if/when we replace rig.
+    ///
+    /// Arm ordering is load-bearing. The context arm precedes the provider arms
+    /// because context-overflow bodies embed large token counts (e.g. "14290
+    /// tokens") that collide with bare status-code substrings like "429". The
+    /// "500" match is anchored to rig's "invalid status code" prefixes because
+    /// bare "500" also collides with durations and byte sizes in permanent
+    /// errors (a 404 body mentioning "500" must not read as transient); its
+    /// unanchored textual companion is "internal server error". An
+    /// own-timeout guard precedes the provider arms because "timed out after"
+    /// is this orchestrator's timeout-format signature; its "invalid status
+    /// code" exclusion keeps a rig-flattened provider error whose body mentions
+    /// a timeout (e.g. "request timed out after 30s") on the provider arm,
+    /// since rig's "Invalid status code …" prefix proves provider origin. The
+    /// generic "timed out" arm follows the provider arms as the fallback for
+    /// other timeout phrasings (e.g. reqwest "operation timed out").
     fn categorize_failure_error(error: &str) -> FailureCategory {
         let lower = error.to_lowercase();
         if lower.contains(STALL_MESSAGE) {
             // Inactivity stall carries its own sentinel so it cannot collide
             // with provider errors that merely mention a timeout.
-            FailureCategory::AgentTimeout
-        } else if lower.contains("timed out") {
             FailureCategory::AgentTimeout
         } else if (lower.contains("context")
             && (lower.contains("limit")
@@ -3464,18 +3571,28 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("input is too long")
         {
             FailureCategory::ContextOverflow
-        } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
-            FailureCategory::DepthExhausted
-        } else if lower.contains("duplicate call loop") {
-            FailureCategory::LoopDetected
-        } else if lower.contains("did not call submit_result") {
-            FailureCategory::SoftFailure
+        } else if lower.contains("timed out after") && !lower.contains("invalid status code") {
+            FailureCategory::AgentTimeout
         } else if lower.contains("rate limit")
             || lower.contains("429")
             || lower.contains("too many requests")
             || lower.contains("503")
             || lower.contains("502")
             || lower.contains("service unavailable")
+            || lower.contains("overloaded")
+            || lower.contains("529")
+            || lower.contains("invalid status code 500")
+            || lower.contains("invalid status code: 500")
+            || lower.contains("internal server error")
+            || lower.contains("504")
+            || lower.contains("gateway timeout")
+            || lower.contains("invalid status code 408")
+            || lower.contains("invalid status code: 408")
+            || lower.contains("408 request timeout")
+            || lower.contains("connection refused")
+            || lower.contains("connection reset")
+            || lower.contains("reset by peer")
+            || lower.contains("dns error")
         {
             FailureCategory::ProviderOverloaded
         } else if lower.contains("authentication")
@@ -3490,6 +3607,14 @@ Assign tasks to the worker whose tools best match the required operations."#,
             || lower.contains("is not found for api version")
         {
             FailureCategory::ProviderNotFound
+        } else if lower.contains("timed out") {
+            FailureCategory::AgentTimeout
+        } else if lower.contains("maxdeptherror") || lower.contains("reached limit") {
+            FailureCategory::DepthExhausted
+        } else if lower.contains("duplicate call loop") {
+            FailureCategory::LoopDetected
+        } else if lower.contains("did not call submit_result") {
+            FailureCategory::SoftFailure
         } else {
             FailureCategory::AgentError
         }
@@ -5476,6 +5601,17 @@ mod tests {
     }
 
     #[test]
+    fn test_should_short_circuit_connection_failures() {
+        let failures = vec![
+            make_failure("Http client error: connection refused"),
+            make_failure("Invalid status code: 500 Internal Server Error"),
+        ];
+        assert!(Orchestrator::should_short_circuit_provider_errors(
+            &failures, 0
+        ));
+    }
+
+    #[test]
     fn test_categorize_failure_loop_detected() {
         assert_eq!(
             Orchestrator::categorize_failure_error("Worker blocked by duplicate call loop"),
@@ -5513,6 +5649,84 @@ mod tests {
             Orchestrator::categorize_failure_error("Invalid API key"),
             FailureCategory::ProviderAuthError
         );
+    }
+
+    #[test]
+    fn test_categorize_request_timeout_as_provider_overloaded() {
+        // rig retries 408 at stream-open and only surfaces it once its budget
+        // is spent, so the exhausted error is a provider condition, not a
+        // replannable agent mistake.
+        // Verbatim shape observed in the #454 harness (runs/t408-exhausted).
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Worker failed task 0 after 1 attempts: CompletionError: ProviderError: Invalid status code 408 Request Timeout with message: {\"error\":\"throttled\"}"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        // Bare reason-phrase form, for a provider that omits rig's prefix.
+        assert_eq!(
+            Orchestrator::categorize_failure_error("408 Request Timeout"),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_408_match_does_not_swallow_other_provider_categories() {
+        // Both 408 patterns are anchored so a stray "408" in another status's
+        // body cannot pull it onto the overloaded arm, which runs first.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 404 Not Found with message: model 'foo-408' not found"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 401 Unauthorized with message: key ending 408 is revoked"
+            ),
+            FailureCategory::ProviderAuthError
+        );
+    }
+
+    #[test]
+    fn test_500_match_does_not_swallow_other_provider_categories() {
+        // Both 500 patterns are anchored to rig's "invalid status code"
+        // prefixes so a stray "500" in another status's body (durations,
+        // byte sizes, ids) cannot pull a permanent error onto the overloaded
+        // arm, which runs first.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 404 Not Found with message: model 'foo-500' not found"
+            ),
+            FailureCategory::ProviderNotFound
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "CompletionError: ProviderError: Invalid status code 500 Internal Server Error with message: upstream crashed"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_own_streaming_timeout_is_not_a_provider_error() {
+        // streaming_request_hook.rs emits this noun-form message for aura's
+        // own deadline. It carries no status code, so it must not reach the
+        // provider arm. Pinned to the exact category it lands in today, so a
+        // future arm cannot quietly capture it.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Request timeout (30s) exceeded during planning - cancelling"
+            ),
+            FailureCategory::AgentError
+        );
+    }
+
+    #[test]
+    fn test_request_timeout_is_transient_for_the_planning_loop() {
+        assert!(is_transient_planning_error(
+            "CompletionError: ProviderError: Invalid status code 408 Request Timeout with message: upstream took too long"
+        ));
     }
 
     #[test]
@@ -5617,10 +5831,77 @@ mod tests {
     }
 
     #[test]
-    fn test_categorize_failure_precedence_timeout_before_provider() {
-        // "timed out" should match AgentTimeout even if message also contains "503"
+    fn test_categorize_failure_precedence_provider_before_timeout() {
+        // Rig-flattened 503 whose body mentions a timeout: provider origin wins.
         assert_eq!(
-            Orchestrator::categorize_failure_error("Request timed out after 503 retries"),
+            Orchestrator::categorize_failure_error(
+                "Invalid status code 503 Service Unavailable with message: request timed out after 30s"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_provider_unavailable_patterns() {
+        // Anthropic 529 (overloaded_error), rig-flattened.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Invalid status code 529 with message: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Invalid status code: 500 Internal Server Error"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Invalid status code: 504 Gateway Timeout"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Http client error: error sending request for url (https://api.anthropic.com/v1/messages): error trying to connect: tcp connect error: Connection refused (os error 61)"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("Http client error: connection reset by peer"),
+            FailureCategory::ProviderOverloaded
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "Http client error: error trying to connect: dns error: failed to lookup address information: nodename nor servname provided"
+            ),
+            FailureCategory::ProviderOverloaded
+        );
+    }
+
+    #[test]
+    fn test_categorize_failure_own_timeout_stays_agent_timeout() {
+        // Regression guard: the orchestrator's own timeout strings stay
+        // AgentTimeout even when the budget's digits collide with a status
+        // substring (500s, 503s).
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "worker timed out after 500s — the LLM provider did not respond in time"
+            ),
+            FailureCategory::AgentTimeout
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("planning timed out after 503s"),
+            FailureCategory::AgentTimeout
+        );
+        assert_eq!(
+            Orchestrator::categorize_failure_error("planning timed out after 408s"),
+            FailureCategory::AgentTimeout
+        );
+        // Non-colliding budget stays AgentTimeout too.
+        assert_eq!(
+            Orchestrator::categorize_failure_error(
+                "worker timed out after 300s — the LLM provider did not respond in time"
+            ),
             FailureCategory::AgentTimeout
         );
     }

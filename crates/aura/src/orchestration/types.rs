@@ -495,7 +495,7 @@ pub enum FailureCategory {
     DepthExhausted,
     /// Duplicate call guard fired — worker stuck in a loop.
     LoopDetected,
-    /// LLM temporarily unavailable (429/503).
+    /// LLM provider temporarily unavailable or unreachable.
     ProviderOverloaded,
     /// LLM credentials or auth failed (401/403).
     ProviderAuthError,
