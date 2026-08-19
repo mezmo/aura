@@ -43,16 +43,25 @@ pub(crate) enum LeasePlan {
     },
 }
 
+/// Renewal inputs for a claim-file heartbeat lease.
+pub(crate) struct HeartbeatRenewal {
+    pub(crate) beat: crate::lease::BeatInterval,
+    pub(crate) write: Box<RenewalWrite>,
+}
+
 /// One adapter renewal write (the claim-body rewrite).
 pub(crate) type RenewalWriteFuture =
     std::pin::Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
 pub(crate) type RenewalWrite = dyn FnMut() -> RenewalWriteFuture + Send;
 
 impl AcquiredClaim {
-    /// Assemble a local (static-lease) claim (adapter-side). The release
-    /// action must close over this claim's file; that binding is the
-    /// adapter's contract, tested in Layer 2.
+    /// Assemble a local (static-lease) claim (adapter-side). The
+    /// `proof` token's constructor is private to
+    /// `adapters::local`, so no other backend can build a static-lease
+    /// claim. The release action must close over this claim's file; that
+    /// binding is the adapter's contract, tested in Layer 2.
     pub(crate) fn new_local(
+        _proof: crate::adapters::local::LocalLeaseProof,
         session: SessionId,
         turn: TurnId,
         holder: InstanceId,
@@ -69,19 +78,22 @@ impl AcquiredClaim {
         }
     }
 
-    /// Assemble a claim-file (heartbeat-lease) claim (adapter-side).
-    /// `write` performs one renewal and must return only after the
-    /// claim-body write completes (the same class of crate-internal
-    /// contract as the release closure; residual risk, Layer-2 tested).
+    /// Assemble a claim-file (heartbeat-lease) claim (adapter-side). The
+    /// `proof` token's constructor is private to `adapters::claim_file`,
+    /// so no other backend can build a heartbeat-lease claim. `write`
+    /// performs one renewal and must return only after the claim-body
+    /// write completes (the same class of crate-internal contract as the
+    /// release closure; residual risk, Layer-2 tested).
     pub(crate) fn new_with_heartbeat(
+        _proof: crate::adapters::claim_file::HeartbeatLeaseProof,
         session: SessionId,
         turn: TurnId,
         holder: InstanceId,
         generation: Generation,
         release: ReleaseAction,
-        beat: crate::lease::BeatInterval,
-        write: Box<RenewalWrite>,
+        renewal: HeartbeatRenewal,
     ) -> Self {
+        let HeartbeatRenewal { beat, write } = renewal;
         Self {
             session,
             turn,
@@ -242,30 +254,27 @@ impl HeldLock {
     /// already exist); `AlreadyExists` is a hard error, not retried.
     ///
     /// # Errors
-    /// [`CreateRunError`] carries the [`FenceCause`] and *returns the
-    /// lock* so the caller can [`abort`](Self::abort) cleanly instead of
-    /// dropping into the abandonment window.
+    /// [`CreateRunError`] *returns the lock* in every variant so the
+    /// caller can [`abort`](Self::abort) cleanly instead of dropping
+    /// into the abandonment window. [`CreateRunError::LostAfterCreate`]
+    /// additionally carries the created directory's path so the caller
+    /// can remove or quarantine it before aborting — otherwise a fixed
+    /// turn id could retry into `AlreadyExists` forever.
     pub async fn create_run(self, path: PathBuf) -> Result<FencedRun, CreateRunError> {
         let capability = self.lease.capability();
-        match capability.assert_live() {
-            Ok(()) => {}
-            Err(cause) => {
-                return Err(CreateRunError {
-                    cause: cause.into(),
-                    lock: self,
-                });
-            }
-        }
-        if let Err(cause) = tokio::fs::create_dir(&path).await {
-            return Err(CreateRunError {
-                cause: FenceCause::Io(cause),
+        if let Err(cause) = capability.assert_live() {
+            return Err(CreateRunError::NotLive {
+                cause: cause.into(),
                 lock: self,
             });
         }
-        if let Err(cause) = capability.assert_live() {
-            return Err(CreateRunError {
-                cause: cause.into(),
+        if let Err(cause) = tokio::fs::create_dir(&path).await {
+            return Err(CreateRunError::Create { cause, lock: self });
+        }
+        if capability.assert_live().is_err() {
+            return Err(CreateRunError::LostAfterCreate {
                 lock: self,
+                run_dir: path,
             });
         }
         Ok(FencedRun {
@@ -282,14 +291,33 @@ impl HeldLock {
     }
 }
 
-/// `create_run` failed; the lock is returned for clean abort.
+/// `create_run` failed; every variant returns the lock for clean abort.
 #[derive(Debug)]
-pub struct CreateRunError {
-    /// Why creation failed.
-    pub cause: FenceCause,
-    /// The still-held lock; call [`HeldLock::abort`] (a bare drop
-    /// revokes but abandons the claim to the staleness window).
-    pub lock: HeldLock,
+pub enum CreateRunError {
+    /// The capability was already lost before anything was created.
+    NotLive {
+        /// Why liveness failed.
+        cause: FenceCause,
+        /// The still-held lock.
+        lock: HeldLock,
+    },
+    /// Directory creation failed; nothing was created.
+    Create {
+        /// The filesystem error.
+        cause: std::io::Error,
+        /// The still-held lock.
+        lock: HeldLock,
+    },
+    /// The directory was created, then the lease was found lost. The
+    /// path is carried so the caller can remove or quarantine the
+    /// orphaned directory before aborting — a bare `abort` would leave
+    /// it, and a fixed turn id retrying would hit `AlreadyExists`.
+    LostAfterCreate {
+        /// The still-held lock.
+        lock: HeldLock,
+        /// The directory that was created.
+        run_dir: PathBuf,
+    },
 }
 
 /// The run directory exists and was created under this claim's authority

@@ -1,9 +1,9 @@
-# session-guard - design record (Layer 1 skeleton, rev 7)
+# session-guard - design record (Layer 1 skeleton, rev 11)
 
 Claim-based turn admission for multi-instance AURA: at most one service
 instance runs a turn for a session at a time, with session memory on a
 shared Archil disk. Skeleton = type surface only; every `todo!()` is a
-tracked hole (inventory at the bottom). Rev 7 folds the round-6 panel findings
+tracked hole (inventory at the bottom). Rev 11 folds the round-10 review findings
 (ledger below); the mutation-linearity question is settled by the
 Phase-1 litmus, not by assertion.
 
@@ -54,18 +54,18 @@ runs; the litmus gate treats it as a candidate, not a proof.
 | `StalenessEvidence` (internal) + `ValidatedSteal` | A steal needs two same-claim observations, unchanged heartbeat, window-separated, then revalidation against a strictly later observation (id-ordered, non-wrapping); the token (private fields, accessor-read) carries the session and the superseded incarnation | Steal on session-id alone; stale evidence about a moved claim; a cloned sample masquerading as fresh; a forged token |
 | `EvidenceError` / `WireError` / `HeartbeatExhausted` / `InvalidTurnId` / `InvalidSessionId` / `InvalidInstanceId` / `AdmissionConfigError` | Diagnostics only; nothing branches on their payloads | Domain logic on raw text |
 | `SessionArbiter` / `PendingGuard` / `HeldGuard` (crate-internal) | Same-instance same-session requests serialize before any disk access; a slot is Admitting until the election resolves, Held after confirm (confirm is crate-internal, so no external caller can manufacture a Held slot without an adapter-driven election); `holds()` reports Held only; the held guard lives inside `HeldLock` so it spans the turn | Two local tasks both reaching the claim store; an admission attempt mistaken for a holder; forged local holds |
-| `AcquiredClaim` (internal) | Admission output is one sealed bundle: `new_local` or `new_with_heartbeat` fixes the lease plan at acquisition (never caller-selected), and the single `into_held` builds the lease from the same identity internally | Claim/lease/release identity disagreement; a claim-file claim taking a never-revoking static lease |
+| `AcquiredClaim` (internal) | Admission output is one sealed bundle: `new_local` or `new_with_heartbeat` fixes the lease plan at acquisition (never caller-selected) and requires a backend-private proof token, and the single `into_held` builds the lease from the same identity internally | Claim/lease/release identity disagreement; a claim-file claim taking a never-revoking static lease |
 | `HeldLock` | A held claim carries identity, arbiter slot, lease, and bound release, assembled only via private `from_parts` from `AcquiredClaim::into_held` | Hand-assembled holds; missing liveness |
-| `HeartbeatLease` / `ClaimLeaseSource` / `Liveness` / `Revocation` | Liveness ends structurally (atomic + Notify, `Notified` created before the lost check so a racing revoke cannot be missed; only the lease and the actor exit guard hold revocation authority); the lease OWNS the heartbeat loop (wake-and-join cooperative shutdown, so an in-flight renewal completes before release - abort would not guarantee this, as tokio fs writes ride unabortable `spawn_blocking`); the first failed renewal revokes; capabilities merely observe (clone/drop-safe) | Orphaned heartbeats; Live-after-death capabilities; a dropped capability killing a live lease; a renewal landing after release begins; stop() hanging on a wedged mount (named risk 7) |
+| `HeartbeatLease` / `ClaimLeaseSource` / `Liveness` / `Revocation` | Liveness ends structurally (atomic + Notify, `Notified` created before the lost check so revoke-before-registration and revoke-after-registration are both covered; only the lease and the actor exit guard hold revocation authority); the lease OWNS the heartbeat loop (wake-and-join cooperative shutdown, so an in-flight renewal completes before release - abort would not guarantee this, as tokio fs writes ride unabortable `spawn_blocking`); the first failed renewal revokes; capabilities merely observe (clone/drop-safe) | Orphaned heartbeats; Live-after-death capabilities; a dropped capability killing a live lease; a renewal landing after release begins; stop() hanging on a wedged mount (named risk 7) |
 | `WriteCapability` | Writes are authorized for one session+turn+incarnation triple and fail closed after revocation (identity-complete, checkable against the write target) | Cross-session capability misuse; writes after a steal |
 | `Revocation` (internal) | The lost flag is an atomic; every end path sets it before anything else | Live reads from a dead lease; per-check subscription cost |
 | `BeatInterval` | The beat is non-zero by construction | `stale_after` degenerating to zero |
-| `AdmissionEnv` | Config is validated once; fields private; zero intervals are errors | Unvalidated public config |
-| `AdmissionMode` / `build_admission` | The single factory picks the backend, injects one shared arbiter and one instance identity; backend constructors are crate-internal; the docs state the build-once-per-server requirement (a second call creates an independent arbiter, voiding `off`-mode same-process exclusion) | `LocalAdmission` for a `lockfile` config; per-backend arbiters; caller-supplied identities |
+| `AdmissionEnv` / `LocalAdmissionEnv` / `ClaimFileAdmissionEnv` | Config is validated once; fields live in the sibling `config` module and are private; zero intervals are errors; backend constructors require a mode proof narrowed from the config | Unvalidated public config; constructing a local backend from a lockfile config; forged mode proofs |
+| `AdmissionMode` / `build_admission` | The single factory uses `env` to choose the backend and the matching mode proof, then passes in one shared arbiter and one instance identity; backend constructors are config-proof-gated and not exported; the docs state the build-once-per-server requirement (a second call creates an independent arbiter, voiding `off`-mode same-process exclusion) | `LocalAdmission` for a `lockfile` config; per-backend arbiters; caller-supplied identities |
 | `TurnAdmission` | The port: admit + locate_holder; steals are internal | Orchestration coupling; hand-rolled steals |
-| `LocalAdmission` / `ClaimFileAdmission` | Backends are the factory's two products; they differ only in cross-instance mechanics; both store the backend-owned instance identity | Caller-named holders; identity disagreement between backends |
+| `LocalAdmission` / `ClaimFileAdmission` | Backends are the factory's two products; they differ only in cross-instance mechanics; both require the matching config mode proof at construction and store the backend-owned instance identity plus a backend-private lease proof token (`LocalLeaseProof` or `HeartbeatLeaseProof`) | Caller-named holders; identity disagreement between backends; claim-file admission taking a local static lease |
 | `IdleRequest` | Admission input is a validated session plus the turn fixed at ingress; the acting instance is never caller input | Forged holder identities |
-| `FencedRun` / `CreateRunError` | A run directory enters the state only via `HeldLock::create_run`, which asserts the capability and creates the directory and re-checks liveness; on failure the lock is returned (for `abort`) with the cause - so the directory can never be authorized by a different claim or an already-lost lease, and no failure path is forced into abandonment; downstream states expose `capability()` so persistence and commit cannot silently skip the next check | Run dirs outside admission; cross-claim directory swaps; loss between assert and create |
+| `FencedRun` / `CreateRunError` | A run directory enters the state only via `HeldLock::create_run`, which asserts the capability, creates the directory, and re-checks liveness; on failure the lock is returned (for `abort`), and post-create loss also returns the created path for removal or quarantine; downstream states expose `capability()` so persistence and commit cannot silently skip the next check | Run dirs outside admission; cross-claim directory swaps; loss between assert and create; fixed turn retries wedged by an orphaned run dir |
 | `TurnOutcome` | Every terminal path (success/failure/clarification) commits | Silent no-manifest exits |
 | `CommitContext` | The commit step learns outcome, run dir, and claim identity from the barrier; private fields, not constructible outside the crate | Forgeable commit context; out-of-order commit |
 | `CommittingTurn::barrier` | Ordering is commit(ctx), then lease stop, then release, then authorize; commit is lazy and context-fed | Eager commit; manifest-after-release; warn-and-continue |
@@ -90,9 +90,18 @@ Visibility honesty: `pub(crate)` means any module *inside this crate*
 can call it. The internal assembly points are `AcquiredClaim::{new_local,
 new_with_heartbeat}`, `HeldLock::from_parts` (private), `Generation::mint`, `ObservedClaim::from_wire`,
 `StalenessEvidence::{from_observations, revalidate}`, `HeartbeatLease::
-{static_from, with_heartbeat}`, `Revocation::new`, backend constructors,
-and `release_for`. None are reachable outside the crate; Layer-2
-compile-fail tests pin that.
+{static_from, with_heartbeat}`, `Revocation::new`, and `release_for`
+(private).
+Backend proof-token constructors are stronger than `pub(crate)`:
+`LocalLeaseProof(())` is private to `adapters::local`, while
+`HeartbeatLeaseProof(())` is private to `adapters::claim_file`. Backend
+constructors are crate-internal so the factory can fill, but they require
+config proofs whose fields are private to the sibling `config` module:
+`LocalAdmissionEnv` for `LocalAdmission::new` and
+`ClaimFileAdmissionEnv` for `ClaimFileAdmission::new`. A backend module
+can call the other constructor, but it cannot produce the opposite mode
+proof from its own config. None are reachable outside the crate; Layer-2
+compile-fail tests must pin that when the test layer lands.
 
 ## Residual risks (named)
 
@@ -254,7 +263,7 @@ Rule going forward: every fold patch asserts its replacements, and the
 ledger records repairs only after `grep` verification of the landed
 source.
 
-Round 5 (seat 1 frontier-reviewer pin = kimi k3: PASS with 7 minors;
+Round 5 (seat 1 frontier-reviewer pin = kimi k3: PASS with 8 minors;
 seat 2 codex gpt-5.6-sol: FAIL, 5 BLOCKING + 2 MINOR; different-family
 invariant held):
 
@@ -279,7 +288,7 @@ seat 2 codex gpt-5.6-sol: FAIL, 4 BLOCKING + 3 MINOR):
 
 | # | Seat | Finding | Disposition | Repair |
 |---|---|---|---|---|
-| W1 | codex | create_run consumes the lock on error → no clean release path | Accepted | CreateRunError { cause, lock } returns the lock for abort (r7) |
+| W1 | codex | create_run consumes the lock on error → no clean release path | Accepted | CreateRunError returns the lock for abort (r7) |
 | W2 | codex | create_run TOCTOU material (no structurally-required next assert) | Accepted | post-create liveness recheck + capability() on FencedRun/ActiveTurn (r7) |
 | W3 | codex | revoked() missed-wakeup interval (is_lost before notified()) | Accepted | Notified created before the lost check (r7) |
 | W4 | codex | into_held_local/into_held_with_heartbeat caller-selectable (claim-file could take static lease) | Accepted | LeasePlan fixed at acquisition (new_local/new_with_heartbeat); single into_held (r7) |
@@ -289,7 +298,43 @@ seat 2 codex gpt-5.6-sol: FAIL, 4 BLOCKING + 3 MINOR):
 | W8 | kimi | stop() unbounded join not a named risk | Accepted | residual risk 7 (r7) |
 | W9 | kimi | drop-path renewal remnant not named | Accepted | residual risk 6 clause (r7) |
 
-## Hole inventory (rev 7 baseline)
+Round 7 (seat 1 frontier-reviewer pin = kimi k3: EMPTY, failed
+delegation, not a pass; seat 2 codex gpt-5.6-sol: FAIL, 2 BLOCKING +
+2 MINOR):
+
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| X1 | codex | `AcquiredClaim::new_local` still callable from the claim-file adapter because both constructors are `pub(crate)` | Accepted | adapters split into `local` and `claim_file` modules; each module owns a private-constructor proof token; the matching `AcquiredClaim` constructor requires that token (r8) |
+| X2 | codex | post-create lease loss discarded the just-created run directory path | Accepted | `CreateRunError` is now `NotLive`, `Create`, or `LostAfterCreate { lock, run_dir }`, so cleanup/quarantine can target the orphan before abort (r8) |
+| X3 | codex | round-5 header still said 7 minors after V13 made it 8 | Accepted | header corrected (r8) |
+| X4 | codex | `revoked()` comment misstated `notify_waiters` ordering semantics | Accepted | comment now states both cases: revoke after registration wakes, revoke before registration is caught by the lost check (r8) |
+
+Round 8 (seat 1 rust-reviewer pin = GLM-5.2 after kimi stall: PASS
+with 1 MINOR; seat 2 codex gpt-5.6-sol: FAIL, 1 BLOCKING + 1 MINOR):
+
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| Y1 | GLM | fill-unit list accounted for 18 of 19 holes; `build_admission` was inventoried but not assigned | Accepted | unit 1 now covers config/factory, including mode dispatch and shared arbiter construction (r8/r9) |
+| Y2 | codex | `ClaimFileAdmission::admit` could still construct `LocalAdmission` through `LocalAdmission::new` and delegate to a static lease | Accepted | backend constructors were first made module-private (r9); that made the factory unfillable, then Z1 replaced it with config mode proofs (r10) |
+| Y3 | codex | adapter split used `adapters/mod.rs`, not the repo's sibling-module layout | Accepted | restored the `adapters.rs` facade with `adapters/local.rs` and `adapters/claim_file.rs` as submodules (r9) |
+
+Round 9 (seat 1 rust-reviewer pin = GLM-5.2: PASS with 1 MINOR; seat
+2 codex gpt-5.6-sol: FAIL, 1 BLOCKING):
+
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| Z1 | GLM+codex | module-private backend constructors close the sibling-backend escape but leave `build_admission` unable to construct either backend | Accepted | `AdmissionEnv` moved to sibling `config` module; backend constructors are crate-internal again but require narrowed mode proofs (`LocalAdmissionEnv` / `ClaimFileAdmissionEnv`) whose fields are private to `config` (r10) |
+| Z2 | GLM | visibility paragraph listed `release_for` without noting it is private | Accepted | paragraph now marks `release_for` private (r10) |
+
+Round 10 (seat 1 rust-reviewer pin = GLM-5.2: PASS with 1 MINOR; seat
+2 codex gpt-5.6-sol: PASS with 2 MINOR):
+
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| AA1 | GLM+codex | map row said backends store a config mode proof, but the proof is consumed at construction; only retry/env values and lease proof tokens are stored | Accepted | row now says backends require the config proof at construction and store identity plus backend-private lease proof token (r11) |
+| AA2 | codex | visibility paragraph said Layer-2 compile-fail tests pin the privacy claim, but no Layer-2 harness exists yet | Accepted | wording now says Layer-2 compile-fail tests must pin it when the test layer lands (r11) |
+
+## Hole inventory (rev 11 baseline)
 
 `grep -rEn '^\s+todo!\(' src/` returns 19 holes:
 
@@ -298,16 +343,19 @@ seat 2 codex gpt-5.6-sol: FAIL, 4 BLOCKING + 3 MINOR):
 - `claim.rs` (4): `Generation::parse`, `ObservedClaim::from_wire`,
   `StalenessEvidence::from_observations`,
   `StalenessEvidence::revalidate`
-- `lib.rs` (2): `AdmissionEnv::from_env`, `build_admission`
+- `config.rs` (1): `AdmissionEnv::from_env`
+- `lib.rs` (1): `build_admission`
 - `state.rs` (3): `HeldLock::abort`, `ActiveTurn::abort`,
   `CommittingTurn::barrier`
-- `adapters.rs` (6): `LocalAdmission::{admit, locate_holder}`,
-  `ClaimFileAdmission::{observe, release_for, admit, locate_holder}`
+- `adapters/local.rs` (2): `LocalAdmission::{admit, locate_holder}`
+- `adapters/claim_file.rs` (4): `ClaimFileAdmission::{observe,
+  release_for, admit, locate_holder}`
 
 Fill units, each with its exit criterion (markers swept, inventory
 accounted, its Layer-2 frames green):
 
-1. identities + config (pure; unit tests on parse rules)
+1. identities + config/factory (parse rules, env validation, mode
+   dispatch + shared arbiter construction)
 2. wire + observation (`from_wire`/`to_wire`/`Generation::parse`)
 3. evidence pair + revalidate (window/binding rules)
 4. `LocalAdmission` (arbiter + static lease + no-op release)

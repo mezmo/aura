@@ -58,6 +58,7 @@
 mod adapters;
 mod arbiter;
 mod claim;
+mod config;
 mod identity;
 mod lease;
 mod state;
@@ -66,6 +67,7 @@ pub use adapters::{ClaimFileAdmission, LocalAdmission};
 pub use claim::{
     Generation, HeartbeatSeq, HolderView, Locality, WireError, claim_path, tombstone_path,
 };
+pub use config::{AdmissionConfigError, AdmissionEnv, AdmissionMode};
 pub use identity::{
     InstanceId, InvalidInstanceId, InvalidSessionId, InvalidTurnId, SessionId, TurnId,
 };
@@ -76,9 +78,7 @@ pub use state::{
     TurnOutcome,
 };
 
-use std::fmt;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,88 +92,10 @@ pub fn stale_after(beat: BeatInterval) -> Duration {
     beat.get().saturating_mul(STALE_FACTOR)
 }
 
-/// Which admission backend a deployment runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum AdmissionMode {
-    /// Arbiter-only: single-instance behavior (default).
-    #[default]
-    Off,
-    /// Claim files on the shared memory dir: multi-instance admission.
-    LockFile,
-}
-
-impl fmt::Display for AdmissionMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            AdmissionMode::Off => "off",
-            AdmissionMode::LockFile => "lockfile",
-        })
-    }
-}
-
-impl FromStr for AdmissionMode {
-    type Err = AdmissionConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "off" => Ok(AdmissionMode::Off),
-            "lockfile" | "claim-file" => Ok(AdmissionMode::LockFile),
-            other => Err(AdmissionConfigError(format!(
-                "unknown session admission mode '{other}' (expected 'off' or 'lockfile')"
-            ))),
-        }
-    }
-}
-
-/// Error reading the `AURA_SESSION_ADMISSION*` environment.
-#[derive(Debug, thiserror::Error)]
-#[error("invalid session admission config: {0}")]
-pub struct AdmissionConfigError(String);
-
-const DEFAULT_BEAT_INTERVAL_MILLIS: u64 = 5_000;
-const DEFAULT_RETRY_AFTER_MILLIS: u64 = 1_000;
-
-/// Effective admission configuration. Private fields: the beat interval
-/// is non-zero by construction, so `stale_after` cannot degenerate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmissionEnv {
-    mode: AdmissionMode,
-    beat: BeatInterval,
-    retry_after: Duration,
-}
-
-impl AdmissionEnv {
-    /// Read the `AURA_SESSION_ADMISSION*` environment variables,
-    /// defaulting to `off` when unset. A zero beat interval or retry hint
-    /// is a config error, not a silent clamp.
-    pub fn from_env() -> Result<Self, AdmissionConfigError> {
-        todo!("fill: env parsing with validation; aura #421 follow-up")
-    }
-
-    /// The configured backend mode.
-    #[must_use]
-    pub const fn mode(&self) -> AdmissionMode {
-        self.mode
-    }
-
-    /// The heartbeat interval.
-    #[must_use]
-    pub const fn beat(&self) -> BeatInterval {
-        self.beat
-    }
-
-    /// The `Busy` retry hint.
-    #[must_use]
-    pub const fn retry_after(&self) -> Duration {
-        self.retry_after
-    }
-}
-
 /// Build the deployment's admission backend from validated config: one
 /// shared arbiter, one backend, selected by mode. The single factory —
-/// backend constructors are crate-internal so `LocalAdmission` can never
-/// be built for a `lockfile` config.
+/// backend constructors require a mode-proof narrowed from `env`, so
+/// `LocalAdmission` can never be built from a `lockfile` config.
 ///
 /// # Errors
 /// [`AdmissionConfigError`] when `env` selects `lockfile` but `root` is
