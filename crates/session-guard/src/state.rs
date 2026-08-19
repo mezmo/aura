@@ -3,8 +3,8 @@
 //! predecessor by value, so each stage exists only while the turn owns
 //! it. Admission output is one sealed [`AcquiredClaim`] — the claim
 //! identity and its bound release arrive together, and the lease derives
-//! from the same identity inside [`HeldLock::new`], so identity, lease,
-//! and release cannot disagree.
+//! from the same identity inside the `into_held_*` constructors, so
+//! identity, lease, and release cannot disagree.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use crate::lease::{HeartbeatLease, LeaseLost, WriteCapability};
 /// The complete output of a successful admission (adapter-side,
 /// crate-internal): the claim identity plus the release action bound to
 /// that exact claim at construction. The lease is derived from the same
-/// identity inside [`HeldLock::new`]. (The closure's captured path
+/// identity inside the `into_held_*` constructors. (The closure's captured path
 /// cannot be proven by types — closures are opaque; that binding is the
 /// adapter's contract, tested in Layer 2 and recorded as residual risk.)
 pub(crate) struct AcquiredClaim {
@@ -61,24 +61,30 @@ impl AcquiredClaim {
         HeldLock::from_parts(self, arbiter, lease)
     }
 
-    /// Consume the claim into a held lock with an actor-backed lease —
-    /// claim-file admission. `body` builds the heartbeat actor's future
-    /// from a clone-safe [`crate::lease::Liveness`] observation (for its
-    /// exit checks); the lease spawns and owns the wrapper task, so the
-    /// guard, handle, and body cannot be separated. The lease is built
-    /// from this claim's own identity inside this call.
-    pub(crate) fn into_held_with_actor<F, Fut>(self, arbiter: HeldGuard, body: F) -> HeldLock
+    /// Consume the claim into a held lock with a heartbeat-backed lease
+    /// — claim-file admission. `write` performs one renewal (the
+    /// adapter's claim-body write); the lease owns the loop, wakes and
+    /// joins it on shutdown, and fails closed on the first failed
+    /// renewal. The lease is built from this claim's own identity inside
+    /// this call.
+    pub(crate) fn into_held_with_heartbeat<F, Fut>(
+        self,
+        arbiter: HeldGuard,
+        beat: crate::lease::BeatInterval,
+        write: F,
+    ) -> HeldLock
     where
-        F: FnOnce(crate::lease::Liveness) -> Fut,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
     {
-        let lease = HeartbeatLease::with_actor(
+        let lease = HeartbeatLease::with_heartbeat(
             crate::lease::ClaimLeaseSource {
                 session: self.session.clone(),
                 turn: self.turn,
                 generation: self.generation,
             },
-            body,
+            beat,
+            write,
         );
         HeldLock::from_parts(self, arbiter, lease)
     }
@@ -185,18 +191,30 @@ impl HeldLock {
         self.lease.capability()
     }
 
-    /// Bind the run directory the seam created under claim authority.
-    /// A [`RunDir`] is only obtainable via
-    /// [`RunDir::create_under`](RunDir::create_under), which checks the
-    /// capability at creation — so a fenced run always encodes a
-    /// capability-checked directory. On any seam failure, call
-    /// [`abort`](Self::abort); a bare drop also revokes, but abort
-    /// releases cleanly.
-    pub fn open_run(self, run_dir: RunDir) -> FencedRun {
-        FencedRun {
+    /// Current lease liveness (diagnostics/metrics).
+    #[must_use]
+    pub fn lease_state(&self) -> crate::lease::LeaseState {
+        self.lease.state()
+    }
+
+    /// Create and bind this claim's run directory in one step: the
+    /// capability is asserted and the directory created *by this lock*,
+    /// so the fenced run can never carry a directory authorized by a
+    /// different claim. Non-recursive (the session directory must
+    /// already exist); `AlreadyExists` is a hard error, not retried.
+    /// On any seam failure after this, call [`abort`](Self::abort); a
+    /// bare drop also revokes, but abort releases cleanly.
+    ///
+    /// # Errors
+    /// [`FenceCause::LeaseLost`] when the capability is no longer live;
+    /// [`FenceCause::Io`] for the underlying filesystem error.
+    pub async fn create_run(self, path: PathBuf) -> Result<FencedRun, FenceCause> {
+        self.lease.capability().assert_live()?;
+        tokio::fs::create_dir(&path).await?;
+        Ok(FencedRun {
             lock: self,
-            run_dir,
-        }
+            run_dir: path,
+        })
     }
 
     /// Early cleanup: the seam failed between admission and the turn
@@ -207,48 +225,21 @@ impl HeldLock {
     }
 }
 
-/// A run directory whose creation was authorized by a live
-/// [`WriteCapability`]. The sole constructor performs the `create_dir`
-/// under the capability check, so the value itself is the proof; the
-/// path inside is not forgeable.
-#[derive(Debug)]
-#[must_use]
-pub struct RunDir(PathBuf);
-
-impl RunDir {
-    /// Create the run directory under claim authority: the capability
-    /// must be live at creation time. Non-recursive (`create_dir`
-    /// semantics: the parent — the session directory — must already
-    /// exist; an `AlreadyExists` collision is a hard error, not
-    /// retried).
-    ///
-    /// # Errors
-    /// [`FenceCause::LeaseLost`] when the capability is no longer live;
-    /// [`FenceCause::Io`] for the underlying filesystem error.
-    pub async fn create_under(
-        capability: &WriteCapability,
-        path: PathBuf,
-    ) -> Result<Self, FenceCause> {
-        capability.assert_live()?;
-        tokio::fs::create_dir(&path).await?;
-        Ok(Self(path))
-    }
-}
-
-/// The run directory exists and was created under this claim's authority.
-/// Isolation only — exclusion is the claim, not the directory.
+/// The run directory exists and was created under this claim's authority
+/// by [`HeldLock::create_run`]. Isolation only — exclusion is the claim,
+/// not the directory.
 #[derive(Debug)]
 #[must_use]
 pub struct FencedRun {
     lock: HeldLock,
-    run_dir: RunDir,
+    run_dir: PathBuf,
 }
 
 impl FencedRun {
     /// The fenced run directory.
     #[must_use]
     pub fn run_dir(&self) -> &Path {
-        &self.run_dir.0
+        &self.run_dir
     }
 
     /// Arm the turn: persistence init (with the capability) happens at

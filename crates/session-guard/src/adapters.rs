@@ -137,7 +137,7 @@ impl TurnAdmission for ClaimFileAdmission {
         todo!(
             "fill: arbiter PendingGuard → O_EXCL election or evidence \
              steal (internal, revalidated) → confirm() → AcquiredClaim \
-             into_held_with_actor; aura #421 follow-up"
+             into_held_with_heartbeat; aura #421 follow-up"
         )
     }
 

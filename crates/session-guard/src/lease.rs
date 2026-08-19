@@ -57,10 +57,12 @@ impl Liveness {
 }
 
 /// The authority to end a lease. Held only by [`HeartbeatLease`] and the
-/// actor's [`ActorExitGuard`]; dropping either revokes.
+/// actor's [`ActorExitGuard`]; dropping either revokes. Revoking also
+/// wakes the heartbeat loop (cooperative shutdown).
 #[derive(Debug, Clone)]
 pub(crate) struct Revocation {
     liveness: Liveness,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl Revocation {
@@ -70,17 +72,27 @@ impl Revocation {
             liveness: Liveness {
                 lost: Arc::new(AtomicBool::new(false)),
             },
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Mark lost. Idempotent.
+    /// Mark lost and wake the heartbeat loop. Idempotent.
     pub(crate) fn revoke(&self) {
         self.liveness.lost.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     /// A clone-safe observation of this revocation's flag.
     pub(crate) fn liveness(&self) -> Liveness {
         self.liveness.clone()
+    }
+
+    /// Wait until revoked (heartbeat loop shutdown arm).
+    pub(crate) async fn revoked(&self) {
+        if self.liveness.is_lost() {
+            return;
+        }
+        self.notify.notified().await;
     }
 }
 
@@ -147,23 +159,47 @@ impl HeartbeatLease {
         }
     }
 
-    /// A lease around a heartbeat actor. The lease itself spawns the
-    /// wrapper task that owns the [`ActorExitGuard`], so the guard, the
-    /// returned handle, and the actor body are one task by construction:
-    /// any exit of that task (return, panic, abort) revokes, and the
-    /// lease's stop/drop aborts exactly that task. The body receives a
-    /// clone-safe [`Liveness`] observation for its exit checks.
-    pub(crate) fn with_actor<F, Fut>(source: ClaimLeaseSource, body: F) -> Self
+    /// A lease whose heartbeat loop the lease itself owns and drives.
+    /// `write` performs one renewal (the adapter's claim-body write); the
+    /// loop calls it every `beat` while live. Any write failure revokes
+    /// and ends the loop (renewal failure fails closed).
+    ///
+    /// Shutdown is cooperative so release ordering holds:
+    /// [`stop`](Self::stop) revokes, wakes the loop, and *joins* it — an
+    /// in-flight renewal completes before `stop` returns, so no renewal
+    /// can land after release begins (tokio fs writes ride
+    /// `spawn_blocking` and cannot be aborted, so abort would not give
+    /// that guarantee). The drop path (abandonment) aborts instead and
+    /// the documented residual window applies.
+    pub(crate) fn with_heartbeat<F, Fut>(
+        source: ClaimLeaseSource,
+        beat: BeatInterval,
+        write: F,
+    ) -> Self
     where
-        F: FnOnce(Liveness) -> Fut,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
     {
         let revocation = Revocation::new();
         let guard = ActorExitGuard::new(revocation.clone());
-        let fut = body(revocation.liveness());
+        let shutdown = revocation.clone();
+        let mut write = write;
         let actor = tokio::spawn(async move {
             let _guard = guard;
-            fut.await;
+            loop {
+                tokio::select! {
+                    _ = shutdown.revoked() => break,
+                    _ = tokio::time::sleep(beat.get()) => {
+                        if shutdown.liveness().is_lost() {
+                            break;
+                        }
+                        if write().await.is_err() {
+                            shutdown.revoke();
+                            break;
+                        }
+                    }
+                }
+            }
         });
         Self {
             session: source.session,
@@ -203,11 +239,12 @@ impl HeartbeatLease {
     }
 
     /// Ordered lease shutdown: revoke first (every capability fails
-    /// closed from this instant), then abort-and-join the actor.
+    /// closed from this instant), wake the heartbeat loop, and join it.
+    /// Joining — not aborting — is what guarantees an in-flight renewal
+    /// completes before release begins.
     pub(crate) async fn stop(mut self) {
         self.revocation.revoke();
         if let Some(actor) = self.actor.take() {
-            actor.abort();
             let _ = actor.await;
         }
     }

@@ -6,8 +6,9 @@
 //!
 //! Two layers keep that promise:
 //!
-//! 1. **In-process** — a [`SessionArbiter`] serializes same-session
-//!    requests arriving at one instance, before any filesystem admission.
+//! 1. **In-process** — a session arbiter (internal) serializes
+//!    same-session requests arriving at one instance, before any
+//!    filesystem admission.
 //! 2. **Cross-instance** — one well-known claim file per session
 //!    (`{root}/{session}/CLAIM`), atomically created (`O_EXCL`): that
 //!    create *is* the election. Liveness is a heartbeat *sequence* in the
@@ -44,8 +45,11 @@
 //! Build the backend with [`build_admission`] — `off` yields a
 //! [`LocalAdmission`] (arbiter-only), `lockfile` a
 //! [`ClaimFileAdmission`] against a claim root derived from the memory
-//! dir. Both share one server-owned [`SessionArbiter`], so every
-//! admission path in the process serializes.
+//! dir. The factory shares one internal arbiter and one instance
+//! identity across the process. Build it once per server and share the
+//! product: a second factory call creates a second, independent
+//! arbiter, which would void same-process exclusion in `off` mode (the
+//! `O_EXCL` election still backstops `lockfile` mode).
 
 #![allow(dead_code)]
 // session-guard skeleton: remove slices as bodies fill (aura #421 follow-up).
@@ -59,8 +63,7 @@ mod state;
 
 pub use adapters::{ClaimFileAdmission, LocalAdmission};
 pub use claim::{
-    EvidenceError, Generation, HeartbeatExhausted, HeartbeatSeq, HolderView, Locality,
-    ObservedClaim, WireError, claim_path, tombstone_path,
+    Generation, HeartbeatSeq, HolderView, Locality, WireError, claim_path, tombstone_path,
 };
 pub use identity::{
     InstanceId, InvalidInstanceId, InvalidSessionId, InvalidTurnId, SessionId, TurnId,
@@ -68,8 +71,7 @@ pub use identity::{
 pub use lease::{BeatInterval, LeaseLost, LeaseState, WriteCapability};
 pub use state::{
     ActiveTurn, AdmissionError, BarrierError, CleanupOutcome, CommitContext, CommittedResponse,
-    CommittingTurn, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, RunDir,
-    TurnOutcome,
+    CommittingTurn, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, TurnOutcome,
 };
 
 use std::fmt;

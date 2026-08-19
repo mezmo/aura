@@ -64,9 +64,9 @@ impl std::fmt::Display for Generation {
 pub struct HeartbeatSeq(u64);
 
 impl HeartbeatSeq {
-    /// The initial heartbeat of a fresh claim.
+    /// The initial heartbeat of a fresh claim (crate-internal).
     #[must_use]
-    pub const fn initial() -> Self {
+    pub(crate) const fn initial() -> Self {
         Self(0)
     }
 
@@ -77,9 +77,10 @@ impl HeartbeatSeq {
         Self(n)
     }
 
-    /// The next sequence number, if the counter has room.
+    /// The next sequence number, if the counter has room
+    /// (crate-internal).
     #[must_use]
-    pub const fn try_next(self) -> Option<Self> {
+    pub(crate) const fn try_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(n) => Some(Self(n)),
             None => None,
@@ -148,9 +149,18 @@ pub struct WireError(String);
 pub(crate) struct ObservationId(u64);
 
 impl ObservationId {
-    fn mint() -> Self {
+    /// Mint the next observation id. Fails only at u64 exhaustion (2^64
+    /// reads; typed rather than wrapping).
+    fn mint() -> Result<Self, WireError> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        Self(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        COUNTER
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_add(1),
+            )
+            .map(Self)
+            .map_err(|_| WireError("observation ids exhausted".to_string()))
     }
 }
 
@@ -325,8 +335,21 @@ impl StalenessEvidence {
 /// constructible any other way.
 #[derive(Debug)]
 pub(crate) struct ValidatedSteal {
-    pub(crate) session: SessionId,
-    pub(crate) superseded: Generation,
+    session: SessionId,
+    superseded: Generation,
+}
+
+impl ValidatedSteal {
+    /// The session whose claim was superseded (crate-internal read for
+    /// the store op).
+    pub(crate) fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// The superseded incarnation.
+    pub(crate) const fn superseded(&self) -> Generation {
+        self.superseded
+    }
 }
 
 /// Who holds a session, as an honest observation can report it. Opaque:
@@ -351,13 +374,14 @@ impl HolderView {
         }
     }
 
-    /// A remote hold, per one claim observation; the heartbeat comes
-    /// from the same read as the holder.
-    pub(crate) fn remote(holder: InstanceId, last_heartbeat: HeartbeatSeq) -> Self {
+    /// A remote hold, per one claim observation; both fields derive
+    /// from the same read, so they cannot be paired from different
+    /// observations.
+    pub(crate) fn remote(observed: &ObservedClaim) -> Self {
         Self {
-            holder,
+            holder: observed.holder().clone(),
             locality: Locality::Remote,
-            last_heartbeat: Some(last_heartbeat),
+            last_heartbeat: Some(observed.heartbeat()),
         }
     }
 
