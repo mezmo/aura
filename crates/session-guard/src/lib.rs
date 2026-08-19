@@ -60,14 +60,16 @@ mod state;
 pub use adapters::{ClaimFileAdmission, LocalAdmission};
 pub use arbiter::{ArbiterGuard, SessionArbiter};
 pub use claim::{
-    EvidenceError, Generation, HeartbeatSeq, HolderView, Locality, ObservedClaim, WireError,
-    claim_path, tombstone_path,
+    EvidenceError, Generation, HeartbeatExhausted, HeartbeatSeq, HolderView, ObservedClaim,
+    WireError, claim_path, tombstone_path,
 };
-pub use identity::{InstanceId, InvalidInstanceId, InvalidSessionId, SessionId, TurnId};
+pub use identity::{
+    InstanceId, InvalidInstanceId, InvalidSessionId, InvalidTurnId, SessionId, TurnId,
+};
 pub use lease::{BeatInterval, LeaseLost, LeaseState, WriteCapability};
 pub use state::{
-    ActiveTurn, AdmissionError, BarrierError, CommitContext, CommittedResponse, CommittingTurn,
-    FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, TurnOutcome,
+    ActiveTurn, AdmissionError, BarrierError, CleanupOutcome, CommitContext, CommittedResponse,
+    CommittingTurn, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, TurnOutcome,
 };
 
 use std::fmt;

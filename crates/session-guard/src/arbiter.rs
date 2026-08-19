@@ -25,6 +25,17 @@ impl SessionArbiter {
         Self::default()
     }
 
+    /// Whether this process currently holds `session` (read-only
+    /// membership query for `locate_holder`).
+    #[must_use]
+    pub fn holds(&self, session: &SessionId) -> bool {
+        self.held
+            .0
+            .lock()
+            .expect("session arbiter mutex poisoned")
+            .contains(session)
+    }
+
     /// Try to hold `session` in this process. `None` means this instance
     /// is already running a turn for it — fail fast locally, without
     /// touching the claim store.

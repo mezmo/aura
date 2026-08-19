@@ -60,6 +60,26 @@ impl TurnId {
     pub fn new() -> Self {
         Self(uuid::Uuid::now_v7())
     }
+
+    /// Parse a turn id from its wire (UUID string) form. Accepts any
+    /// valid UUID: claims written by older writers must keep parsing.
+    ///
+    /// # Errors
+    /// [`InvalidTurnId`] when the string is not a UUID.
+    #[expect(
+        unused_variables,
+        reason = "todo!() body; filled by aura #421 follow-up"
+    )]
+    pub fn parse(raw: &str) -> Result<Self, InvalidTurnId> {
+        todo!("fill: uuid parse; aura #421 follow-up")
+    }
+}
+
+/// Why a raw string is not a [`TurnId`]. Diagnostic-only.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid turn id: {reason}")]
+pub struct InvalidTurnId {
+    pub reason: String,
 }
 
 impl Default for TurnId {
@@ -99,10 +119,14 @@ impl InstanceId {
         todo!("fill: charset/length rules; aura #421 follow-up")
     }
 
-    /// Derive this process's instance id: `AURA_INSTANCE_ID` if set,
-    /// else `HOSTNAME` if valid, else a process-unique fallback.
-    #[must_use]
-    pub fn from_env() -> Self {
+    /// Derive this process's instance id. Fails loud when an explicit
+    /// `AURA_INSTANCE_ID` is set but invalid; falls back to `HOSTNAME`
+    /// (if valid) or a process-unique id only when the variable is
+    /// absent.
+    ///
+    /// # Errors
+    /// [`InvalidInstanceId`] when `AURA_INSTANCE_ID` is set but invalid.
+    pub fn from_env() -> Result<Self, InvalidInstanceId> {
         todo!("fill: env/hostname/fallback; aura #421 follow-up")
     }
 }

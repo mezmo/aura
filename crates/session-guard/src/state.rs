@@ -1,30 +1,64 @@
-//! The consuming state chain: admission → held claim → fenced run → active
-//! turn → committing → committed response. Types consume their predecessor
-//! by value, so each stage exists only while the turn owns it. The claim
-//! identity is one private [`OwnedClaim`] — lease, capability, and release
-//! all derive from it, so they cannot disagree.
+//! The consuming state chain: admission → held claim → fenced run →
+//! active turn → committing → committed response. Types consume their
+//! predecessor by value, so each stage exists only while the turn owns
+//! it. Admission output is one sealed [`AcquiredClaim`] — the claim
+//! identity and its bound release arrive together, and the lease derives
+//! from the same identity inside [`HeldLock::new`], so identity, lease,
+//! and release cannot disagree.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use crate::arbiter::ArbiterGuard;
-use crate::claim::{Generation, HolderView, Locality};
+use crate::claim::Generation;
 use crate::identity::{InstanceId, SessionId, TurnId};
 use crate::lease::{HeartbeatLease, LeaseLost, WriteCapability};
 
-/// The one claim identity everything derives from. Never nameable outside
-/// the crate; the release action is bound to exactly this claim at
-/// construction and takes no arguments.
-#[derive(Debug)]
-pub(crate) struct OwnedClaim {
-    pub(crate) session: SessionId,
-    pub(crate) turn: TurnId,
-    pub(crate) holder: InstanceId,
-    pub(crate) generation: Generation,
+/// The complete output of a successful admission (adapter-side,
+/// crate-internal): the claim identity plus the release action bound to
+/// that exact claim at construction. The lease is derived from the same
+/// identity inside [`HeldLock::new`]. (The closure's captured path
+/// cannot be proven by types — closures are opaque; that binding is the
+/// adapter's contract, tested in Layer 2 and recorded as residual risk.)
+pub(crate) struct AcquiredClaim {
+    session: SessionId,
+    turn: TurnId,
+    holder: InstanceId,
+    generation: Generation,
+    release: ReleaseAction,
 }
 
-/// Zero-argument release bound to one [`OwnedClaim`] generation at
-/// construction. It cannot be invoked for any other generation.
+impl AcquiredClaim {
+    /// Assemble (adapter-side). The release action must close over this
+    /// claim's file; that binding is the adapter's contract, tested in
+    /// Layer 2.
+    pub(crate) fn new(
+        session: SessionId,
+        turn: TurnId,
+        holder: InstanceId,
+        generation: Generation,
+        release: ReleaseAction,
+    ) -> Self {
+        Self {
+            session,
+            turn,
+            holder,
+            generation,
+            release,
+        }
+    }
+
+    /// The lease source every derived artifact must be built from.
+    pub(crate) fn lease_source(&self) -> crate::lease::ClaimLeaseSource {
+        crate::lease::ClaimLeaseSource {
+            session: self.session.clone(),
+            turn: self.turn,
+            generation: self.generation,
+        }
+    }
+}
+
+/// Zero-argument release bound to one claim at construction.
 pub(crate) type ReleaseAction = Box<dyn FnOnce() -> ReleaseFuture + Send>;
 
 pub(crate) type ReleaseFuture =
@@ -47,23 +81,24 @@ pub enum AdmissionError {
     #[error("contention lost during steal")]
     ContentionLost,
     /// The claim root is absent or not provisioned (cold-deploy wedge).
-    /// Operator-facing, not retryable by the LB.
+    /// Operator-facing, not retryable by the LB. Diagnostic-only payload.
     #[error("claim root not provisioned: {0}")]
     NotProvisioned(String),
-    /// Claim-store I/O failure.
+    /// Claim-store I/O failure (including invalid claim content, mapped
+    /// deliberately with its source preserved).
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 /// A request awaiting admission, parsed and ready. Built by the ingress
-/// seam after `SessionId` validation, before any visible status.
+/// seam after `SessionId` validation, before any visible status. The
+/// acting instance is the backend's own configured identity, not caller
+/// input.
 #[derive(Debug)]
 #[must_use]
 pub struct IdleRequest {
     /// The session to claim.
     pub session: SessionId,
-    /// Who is asking (this instance).
-    pub instance: InstanceId,
     /// The turn this request will run, fixed here so claim bodies name
     /// the turn even under client retries.
     pub turn: TurnId,
@@ -73,7 +108,10 @@ pub struct IdleRequest {
 /// the arbiter guard inside keeps same-instance requests out.
 #[must_use]
 pub struct HeldLock {
-    claim: OwnedClaim,
+    session: SessionId,
+    turn: TurnId,
+    holder: InstanceId,
+    generation: Generation,
     arbiter: ArbiterGuard,
     lease: HeartbeatLease,
     release: ReleaseAction,
@@ -82,38 +120,40 @@ pub struct HeldLock {
 impl std::fmt::Debug for HeldLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeldLock")
-            .field("session", &self.claim.session)
-            .field("turn", &self.claim.turn)
-            .field("holder", &self.claim.holder)
-            .field("generation", &self.claim.generation)
+            .field("session", &self.session)
+            .field("turn", &self.turn)
+            .field("holder", &self.holder)
+            .field("generation", &self.generation)
             .finish_non_exhaustive()
     }
 }
 
 impl HeldLock {
-    /// Assemble a held lock (adapter-side): claim identity, in-process
-    /// guard, liveness lease, and the release action bound to that claim.
+    /// Assemble a held lock (adapter-side) from one acquired claim, its
+    /// arbiter slot, and a lease built from the claim's own
+    /// [`lease_source`](AcquiredClaim::lease_source). All three then
+    /// share one identity by construction.
     pub(crate) fn new(
-        claim: OwnedClaim,
+        acquired: AcquiredClaim,
         arbiter: ArbiterGuard,
         lease: HeartbeatLease,
-        release: ReleaseAction,
     ) -> Self {
         Self {
-            claim,
+            session: acquired.session,
+            turn: acquired.turn,
+            holder: acquired.holder,
+            generation: acquired.generation,
             arbiter,
             lease,
-            release,
+            release: acquired.release,
         }
     }
 
-    /// Who holds the session right now (this instance).
+    /// Who holds the session right now (this process, no disk read).
     #[must_use]
-    pub fn holder_view(&self) -> HolderView {
-        HolderView {
-            holder: self.claim.holder.clone(),
-            locality: Locality::Here,
-            last_heartbeat: None,
+    pub fn holder_view(&self) -> crate::claim::HolderView {
+        crate::claim::HolderView::Here {
+            holder: self.holder.clone(),
         }
     }
 
@@ -166,8 +206,9 @@ impl FencedRun {
     }
 }
 
-/// A live turn. Terminal outcomes — success, failure, clarification — all
-/// flow through [`complete`](Self::complete); nothing else may follow.
+/// A live turn. Terminal outcomes — success, failure, clarification —
+/// all flow through [`complete`](Self::complete); nothing else may
+/// follow.
 #[derive(Debug)]
 #[must_use]
 pub struct ActiveTurn {
@@ -187,8 +228,8 @@ pub enum TurnOutcome {
 }
 
 impl ActiveTurn {
-    /// End the turn and enter the completion barrier. After this call the
-    /// response is not yet authorized — only the barrier's
+    /// End the turn and enter the completion barrier. After this call
+    /// the response is not yet authorized — only the barrier's
     /// [`CommittedResponse`] is.
     pub fn complete(self, outcome: TurnOutcome) -> CommittingTurn {
         CommittingTurn {
@@ -205,9 +246,8 @@ impl ActiveTurn {
     }
 }
 
-/// Context handed to the injected commit step. Carries everything the
-/// commit needs to name the turn — and everything a manifest writer needs
-/// to record a clarification as a first-class outcome.
+/// Context handed to the injected commit step. Assembled by the barrier
+/// from the turn's own state; not constructible outside the crate.
 #[derive(Debug, Clone)]
 pub struct CommitContext {
     /// The fenced run directory (where manifests go).
@@ -218,8 +258,17 @@ pub struct CommitContext {
     pub session: SessionId,
     /// The turn.
     pub turn: TurnId,
-    /// The claim generation that authorized the turn.
+    /// The claim incarnation that authorized the turn.
     pub generation: Generation,
+}
+
+/// How the barrier's cleanup fared when the commit step failed.
+#[derive(Debug)]
+pub struct CleanupOutcome {
+    /// Whether the run was quarantined.
+    pub quarantined: bool,
+    /// The claim release result.
+    pub release: Result<(), ReleaseError>,
 }
 
 /// The completion barrier: commit → release → authorize. The commit step
@@ -238,11 +287,12 @@ impl CommittingTurn {
     /// heartbeat lease, release the claim, then authorize the response.
     ///
     /// # Errors
-    /// [`BarrierError::CommitFailed`] — the commit step failed; the run
-    /// is quarantined and the claim released. [`BarrierError::Release`]
-    /// — release failed after a durable commit; the authorized response
-    /// travels with the error (data is durable) and the session is
-    /// flagged wedged.
+    /// [`BarrierError::CommitFailed`] — the commit step failed; carries
+    /// the commit error plus the [`CleanupOutcome`] (quarantine and
+    /// release results) so no cleanup failure is silently lost.
+    /// [`BarrierError::Release`] — release failed after a durable
+    /// commit; the authorized response travels with the error (data is
+    /// durable) and the session is flagged wedged.
     #[expect(
         unused_variables,
         reason = "todo!() body; filled by aura #421 follow-up"
@@ -262,14 +312,23 @@ impl CommittingTurn {
 /// Why the barrier failed.
 #[derive(Debug, thiserror::Error)]
 pub enum BarrierError<T, E> {
-    /// The injected commit step failed; the run is quarantined and the
-    /// claim released. `E` is the commit step's own error.
-    CommitFailed(E),
+    /// The injected commit step failed. The run was quarantined (if
+    /// possible) and the claim released (if possible); both outcomes are
+    /// in `cleanup`, so a failed cleanup is never silently dropped.
+    #[error("commit failed; quarantine={}, released={}", cleanup.quarantined, cleanup.release.is_ok())]
+    CommitFailed {
+        /// The commit step's own error.
+        #[source]
+        error: E,
+        /// Quarantine and release results.
+        cleanup: CleanupOutcome,
+    },
     /// The claim release failed after a durable commit. The response is
-    /// authorized (carried here, wedged flag set); the session needs
-    /// operator attention.
+    /// authorized (carried here; delivery is the caller's call); the
+    /// session needs operator attention.
+    #[error("release failed after commit; session wedged")]
     Release {
-        /// The authorized response; delivery is the caller's call.
+        /// The authorized response.
         response: CommittedResponse<T>,
         /// The release failure.
         #[source]
@@ -282,16 +341,27 @@ impl<T, E> BarrierError<T, E> {
     #[must_use]
     pub fn commit_error(&self) -> Option<&E> {
         match self {
-            Self::CommitFailed(e) => Some(e),
+            Self::CommitFailed { error, .. } => Some(error),
             Self::Release { .. } => None,
+        }
+    }
+
+    /// Take the authorized response out of a release failure, if this
+    /// was one. Delivery after a wedge is the caller's decision.
+    #[must_use]
+    pub fn into_release_response(self) -> Option<CommittedResponse<T>> {
+        match self {
+            Self::Release { response, .. } => Some(response),
+            Self::CommitFailed { .. } => None,
         }
     }
 }
 
 /// Sole authorization to emit a terminal frame. Carries the committed
-/// payload bound to session + turn + generation. Not `Clone`; the payload
-/// is only reachable through authorization-preserving transforms, so the
-/// envelope cannot be discarded short of consuming the whole value.
+/// payload bound to session + turn + incarnation. Not `Clone`; the
+/// payload is only reachable through authorization-preserving
+/// transforms, so the envelope cannot be discarded short of consuming
+/// the whole value.
 #[derive(Debug)]
 pub struct CommittedResponse<T> {
     payload: T,
@@ -328,10 +398,10 @@ impl<T> CommittedResponse<T> {
         }
     }
 
-    /// Consume the authorization, yielding the payload to the terminal
-    /// emitter that consumes this value.
+    /// Consume the authorization, yielding the payload and its identity
+    /// to the terminal emitter that consumes this value.
     #[must_use]
-    pub fn into_payload(self) -> (T, SessionId, TurnId, Generation) {
+    pub fn into_parts(self) -> (T, SessionId, TurnId, Generation) {
         (self.payload, self.session, self.turn, self.generation)
     }
 
@@ -351,9 +421,9 @@ impl<T> CommittedResponse<T> {
 /// Why a claim release failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseError {
-    /// The claim's generation no longer matches (stolen during
+    /// The claim's incarnation no longer matches (stolen during
     /// shutdown). Not fixable by force — the new owner's claim stands.
-    #[error("claim superseded (generation {0} stolen)")]
+    #[error("claim superseded (incarnation {0} retired)")]
     Superseded(Generation),
     /// Filesystem failure while releasing.
     #[error(transparent)]

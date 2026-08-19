@@ -1,108 +1,154 @@
 //! Liveness: the heartbeat lease and the write capability it gates.
-//! Revocation is structural: the watch sender is shared with a
-//! [`Revocation`] the stop/drop paths mark Lost *before* anything else,
-//! and a closed channel reads as Lost, never Live.
+//! Revocation is structural and total: the shared flag is revoked on
+//! every end path — explicit stop, lease drop, actor exit (via the exit
+//! guard the actor task owns), and `Revocation`'s own Drop — so a closed
+//! channel always reads Lost, and the capability checks a held receiver,
+//! not a fresh subscription.
 
 use crate::claim::Generation;
-use crate::identity::SessionId;
+use crate::identity::{SessionId, TurnId};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Live state of a held claim, published by the heartbeat actor.
+/// Live state of a held claim, published on the revocation channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LeaseState {
     /// Heartbeats are advancing; the claim is live.
     #[default]
     Live,
-    /// The lease ended (stopped, dropped, or lost); writes gated on it
-    /// must stop.
+    /// The lease ended (stopped, dropped, actor exited, or lost); writes
+    /// gated on it must stop.
     Lost,
 }
 
-/// The claim lease was lost (steal superseded us or renewal failed
-/// fail-closed). The turn must quarantine and stop writing.
+/// The claim lease was lost (steal superseded us, renewal failed, or the
+/// actor died). The turn must quarantine and stop writing.
 #[derive(Debug, thiserror::Error)]
-#[error("session claim lease lost (generation {generation})")]
+#[error("session claim lease lost (incarnation {generation})")]
 pub struct LeaseLost {
-    /// The generation that was lost.
+    /// The incarnation that was lost.
     pub generation: Generation,
+    /// The session it belonged to.
+    pub session: SessionId,
 }
 
-/// Shared revocation flag: one watch sender, marked Lost by every stop or
-/// drop path. A dropped sender reads as Lost through the receiver.
+/// Shared revocation flag. Clones share state; dropping any clone
+/// revokes, so the channel can never read Live after every holder is
+/// gone. Liveness reads hit an atomic, not a fresh watch subscription.
 #[derive(Debug, Clone)]
-pub(crate) struct Revocation(watch::Sender<LeaseState>);
+pub(crate) struct Revocation {
+    sender: std::sync::Arc<watch::Sender<LeaseState>>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl Revocation {
-    /// A live revocation (sender side only, adapter-held).
-    pub(crate) fn new() -> (Self, watch::Receiver<LeaseState>) {
-        let (tx, rx) = watch::channel(LeaseState::Live);
-        (Self(tx), rx)
+    /// A live revocation (sender side).
+    pub(crate) fn new() -> Self {
+        let (tx, _rx) = watch::channel(LeaseState::Live);
+        Self {
+            sender: std::sync::Arc::new(tx),
+            lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
-    /// Mark lost. Idempotent; subsequent sends are no-ops.
+    /// Mark lost. Idempotent.
     pub(crate) fn revoke(&self) {
-        self.0.send_if_modified(|state| {
+        self.lost.store(true, std::sync::atomic::Ordering::Release);
+        self.sender.send_if_modified(|state| {
             let changed = *state == LeaseState::Live;
             *state = LeaseState::Lost;
             changed
         });
     }
 
-    /// Whether the flag is Lost *or the channel is closed*.
+    /// Whether the flag is Lost. Every end path (stop, drop, actor exit,
+    /// sender drop) revokes first, so this is authoritative.
     pub(crate) fn is_lost(&self) -> bool {
-        match *self.0.subscribe().borrow() {
-            LeaseState::Live => false,
-            LeaseState::Lost => true,
-        }
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-/// Handle to the heartbeat lease, carried by value through the turn state
-/// chain. Stopping or dropping it revokes every capability derived from
-/// it; the heartbeat actor (if any) is aborted, never orphaned.
+impl Drop for Revocation {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+/// Owned by the heartbeat actor task: revokes when the task exits for
+/// any reason (return, panic, abort), so actor death can never leave a
+/// lease Live.
+#[derive(Debug)]
+pub(crate) struct ActorExitGuard {
+    revocation: Revocation,
+}
+
+impl ActorExitGuard {
+    /// Arm the exit guard for a starting actor.
+    pub(crate) fn new(revocation: Revocation) -> Self {
+        Self { revocation }
+    }
+}
+
+impl Drop for ActorExitGuard {
+    fn drop(&mut self) {
+        self.revocation.revoke();
+    }
+}
+
+/// The identity a lease (and everything derived from it) is bound to.
+/// Built by [`crate::state::AcquiredClaim::lease_source`], so lease,
+/// capability, and release all share one claim identity.
+#[derive(Debug, Clone)]
+pub(crate) struct ClaimLeaseSource {
+    pub(crate) session: SessionId,
+    pub(crate) turn: TurnId,
+    pub(crate) generation: Generation,
+}
+
+/// The heartbeat lease, carried by value through the turn state chain.
+/// Derived from one [`ClaimLeaseSource`] identity, so its session and
+/// incarnation can never disagree with the claim it defends.
 #[derive(Debug)]
 pub struct HeartbeatLease {
     session: SessionId,
+    turn: TurnId,
     generation: Generation,
     revocation: Revocation,
     actor: Option<JoinHandle<()>>,
 }
 
 impl HeartbeatLease {
-    /// Assemble a lease with no background actor (local admission): the
-    /// revocation flag alone decides liveness.
-    pub(crate) fn static_lease(session: SessionId, generation: Generation) -> Self {
-        let (revocation, _) = Revocation::new();
+    /// A lease with no background actor (local admission): the
+    /// revocation flag alone decides liveness. Bindings come from
+    /// `source`.
+    pub(crate) fn static_from(source: ClaimLeaseSource) -> Self {
         Self {
-            session,
-            generation,
-            revocation,
+            session: source.session,
+            turn: source.turn,
+            generation: source.generation,
+            revocation: Revocation::new(),
             actor: None,
         }
     }
 
-    /// Assemble a lease around a running heartbeat actor (adapter-side).
-    /// The actor must exit when the revocation flag turns Lost.
+    /// A lease around a running heartbeat actor. The actor MUST hold an
+    /// [`ActorExitGuard`] built from a clone of the same revocation, and
+    /// must exit when the flag turns Lost. Binding comes from `source`.
     pub(crate) fn with_actor(
-        session: SessionId,
-        generation: Generation,
+        source: ClaimLeaseSource,
+        revocation: Revocation,
         actor: JoinHandle<()>,
-    ) -> (Self, watch::Receiver<LeaseState>) {
-        let (revocation, rx) = Revocation::new();
-        (
-            Self {
-                session,
-                generation,
-                revocation,
-                actor: Some(actor),
-            },
-            rx,
-        )
+    ) -> Self {
+        Self {
+            session: source.session,
+            turn: source.turn,
+            generation: source.generation,
+            revocation,
+            actor: Some(actor),
+        }
     }
 
-    /// The generation this lease defends.
+    /// The incarnation this lease defends.
     #[must_use]
     pub const fn generation(&self) -> Generation {
         self.generation
@@ -118,12 +164,13 @@ impl HeartbeatLease {
         }
     }
 
-    /// A write capability bound to this lease's generation. Cheap to
-    /// clone; liveness is always read from the shared revocation, never
-    /// cached.
+    /// A write capability bound to this lease's full identity.
+    /// Cheap to clone; liveness is read from the shared flag.
     #[must_use]
     pub fn capability(&self) -> WriteCapability {
         WriteCapability {
+            session: self.session.clone(),
+            turn: self.turn,
             generation: self.generation,
             revocation: self.revocation.clone(),
         }
@@ -142,7 +189,9 @@ impl HeartbeatLease {
 
 impl Drop for HeartbeatLease {
     fn drop(&mut self) {
-        // Abandonment path: revoke synchronously; abort without joining.
+        // Abandonment path: revoke synchronously (also covered by
+        // Revocation's own Drop, but explicit is clearer); abort without
+        // joining.
         self.revocation.revoke();
         if let Some(actor) = self.actor.take() {
             actor.abort();
@@ -150,31 +199,47 @@ impl Drop for HeartbeatLease {
     }
 }
 
-/// Generation-bound permission to write on behalf of a turn. Persistence
-/// writes check [`assert_live`](Self::assert_live) at the write seam; a
-/// lost or closed lease fails the check.
+/// Permission to write on behalf of one turn of one session, under one
+/// claim incarnation. Identity-complete: a capability can be checked
+/// against the exact write target, not just a bare generation. Fails
+/// closed once the backing lease revokes.
 #[derive(Debug, Clone)]
 pub struct WriteCapability {
+    session: SessionId,
+    turn: TurnId,
     generation: Generation,
     revocation: Revocation,
 }
 
 impl WriteCapability {
-    /// The generation this capability authorizes.
+    /// The session this capability authorizes writes for.
+    #[must_use]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// The turn this capability belongs to.
+    #[must_use]
+    pub const fn turn(&self) -> TurnId {
+        self.turn
+    }
+
+    /// The claim incarnation.
     #[must_use]
     pub const fn generation(&self) -> Generation {
         self.generation
     }
 
-    /// Fail if the backing lease is no longer live (stopped, dropped, or
-    /// stolen).
+    /// Fail if the backing lease is no longer live.
     ///
     /// # Errors
-    /// [`LeaseLost`] when the lease is gone.
+    /// [`LeaseLost`] naming this capability's identity when the lease is
+    /// gone.
     pub fn assert_live(&self) -> Result<(), LeaseLost> {
         if self.revocation.is_lost() {
             Err(LeaseLost {
                 generation: self.generation,
+                session: self.session.clone(),
             })
         } else {
             Ok(())
@@ -191,8 +256,8 @@ impl BeatInterval {
     /// Wrap a non-zero interval.
     ///
     /// # Errors
-    /// [`std::num::NonZeroU64`-style rejection] when zero: returns the
-    /// raw value for the caller to report.
+    /// The raw zero duration when `interval` is zero, for the caller to
+    /// report as a config error.
     pub fn new(interval: Duration) -> Result<Self, Duration> {
         if interval.is_zero() {
             Err(interval)
