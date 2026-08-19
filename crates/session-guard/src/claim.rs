@@ -70,9 +70,10 @@ impl HeartbeatSeq {
         Self(0)
     }
 
-    /// Wrap an already-known sequence number.
+    /// Wrap an already-known sequence number (crate-internal: the only
+    /// producer is `ObservedClaim::from_wire`).
     #[must_use]
-    pub const fn new(n: u64) -> Self {
+    pub(crate) const fn new(n: u64) -> Self {
         Self(n)
     }
 
@@ -324,27 +325,66 @@ impl StalenessEvidence {
 /// constructible any other way.
 #[derive(Debug)]
 pub(crate) struct ValidatedSteal {
+    pub(crate) session: SessionId,
     pub(crate) superseded: Generation,
 }
 
-/// Who holds a session, as an honest observation can report it. `Here`
-/// and `Remote` carry exactly the data each can prove: a local hold knows
-/// the holder without a disk read; a remote hold is always an
-/// observation, so it carries the heartbeat. Non-exhaustive: variants
-/// are constructed only inside this crate.
+/// Who holds a session, as an honest observation can report it. Opaque:
+/// constructed only inside this crate (`here` for a local hold — no disk
+/// read needed; `remote` for an observation, which always carries the
+/// heartbeat), so no caller can pair a holder with a heartbeat it never
+/// observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum HolderView {
+pub struct HolderView {
+    holder: InstanceId,
+    locality: Locality,
+    last_heartbeat: Option<HeartbeatSeq>,
+}
+
+impl HolderView {
+    /// A local hold: this process holds the session.
+    pub(crate) fn here(holder: InstanceId) -> Self {
+        Self {
+            holder,
+            locality: Locality::Here,
+            last_heartbeat: None,
+        }
+    }
+
+    /// A remote hold, per one claim observation; the heartbeat comes
+    /// from the same read as the holder.
+    pub(crate) fn remote(holder: InstanceId, last_heartbeat: HeartbeatSeq) -> Self {
+        Self {
+            holder,
+            locality: Locality::Remote,
+            last_heartbeat: Some(last_heartbeat),
+        }
+    }
+
+    /// The holder, local or remote.
+    #[must_use]
+    pub fn holder(&self) -> &InstanceId {
+        &self.holder
+    }
+
+    /// Whether the holder is this process.
+    #[must_use]
+    pub const fn locality(&self) -> Locality {
+        self.locality
+    }
+
+    /// The observed heartbeat (present only for remote observations).
+    #[must_use]
+    pub const fn last_heartbeat(&self) -> Option<HeartbeatSeq> {
+        self.last_heartbeat
+    }
+}
+
+/// Whether a session's holder is this process or another instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locality {
     /// Held by this process.
-    Here {
-        /// This process's identity.
-        holder: InstanceId,
-    },
-    /// Held by another instance, per a fresh claim read.
-    Remote {
-        /// The observed holder.
-        holder: InstanceId,
-        /// The heartbeat seen in the same read.
-        last_heartbeat: HeartbeatSeq,
-    },
+    Here,
+    /// Held by another instance.
+    Remote,
 }

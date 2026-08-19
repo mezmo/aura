@@ -58,10 +58,9 @@ mod lease;
 mod state;
 
 pub use adapters::{ClaimFileAdmission, LocalAdmission};
-pub use arbiter::{HeldGuard, PendingGuard, SessionArbiter};
 pub use claim::{
-    EvidenceError, Generation, HeartbeatExhausted, HeartbeatSeq, HolderView, ObservedClaim,
-    WireError, claim_path, tombstone_path,
+    EvidenceError, Generation, HeartbeatExhausted, HeartbeatSeq, HolderView, Locality,
+    ObservedClaim, WireError, claim_path, tombstone_path,
 };
 pub use identity::{
     InstanceId, InvalidInstanceId, InvalidSessionId, InvalidTurnId, SessionId, TurnId,

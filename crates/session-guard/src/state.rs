@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::arbiter::HeldGuard;
 use crate::claim::Generation;
 use crate::identity::{InstanceId, SessionId, TurnId};
-use crate::lease::ActorExitGuard;
 use crate::lease::{HeartbeatLease, LeaseLost, WriteCapability};
-use tokio::task::JoinHandle;
 
 /// The complete output of a successful admission (adapter-side,
 /// crate-internal): the claim identity plus the release action bound to
@@ -64,23 +62,23 @@ impl AcquiredClaim {
     }
 
     /// Consume the claim into a held lock with an actor-backed lease —
-    /// claim-file admission. `spawn` receives the matching
-    /// [`ActorExitGuard`] and must move it into the task it spawns (a
-    /// guard dropped outside the task revokes immediately: fail-safe).
-    /// The lease is built from this claim's own identity inside this
-    /// call.
-    pub(crate) fn into_held_with_actor(
-        self,
-        arbiter: HeldGuard,
-        spawn: impl FnOnce(ActorExitGuard) -> JoinHandle<()>,
-    ) -> HeldLock {
+    /// claim-file admission. `body` builds the heartbeat actor's future
+    /// from a clone-safe [`crate::lease::Liveness`] observation (for its
+    /// exit checks); the lease spawns and owns the wrapper task, so the
+    /// guard, handle, and body cannot be separated. The lease is built
+    /// from this claim's own identity inside this call.
+    pub(crate) fn into_held_with_actor<F, Fut>(self, arbiter: HeldGuard, body: F) -> HeldLock
+    where
+        F: FnOnce(crate::lease::Liveness) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let lease = HeartbeatLease::with_actor(
             crate::lease::ClaimLeaseSource {
                 session: self.session.clone(),
                 turn: self.turn,
                 generation: self.generation,
             },
-            spawn,
+            body,
         );
         HeldLock::from_parts(self, arbiter, lease)
     }
@@ -178,9 +176,7 @@ impl HeldLock {
     /// Who holds the session right now (this process, no disk read).
     #[must_use]
     pub fn holder_view(&self) -> crate::claim::HolderView {
-        crate::claim::HolderView::Here {
-            holder: self.holder.clone(),
-        }
+        crate::claim::HolderView::here(self.holder.clone())
     }
 
     /// The write capability bound to this claim.
@@ -189,11 +185,14 @@ impl HeldLock {
         self.lease.capability()
     }
 
-    /// Bind the run directory the seam just created under claim
-    /// authority. The seam performs the `create_dir` with the capability
-    /// checked; on failure it must call [`abort`](Self::abort) — a bare
-    /// drop also revokes, but abort releases cleanly.
-    pub fn open_run(self, run_dir: PathBuf) -> FencedRun {
+    /// Bind the run directory the seam created under claim authority.
+    /// A [`RunDir`] is only obtainable via
+    /// [`RunDir::create_under`](RunDir::create_under), which checks the
+    /// capability at creation — so a fenced run always encodes a
+    /// capability-checked directory. On any seam failure, call
+    /// [`abort`](Self::abort); a bare drop also revokes, but abort
+    /// releases cleanly.
+    pub fn open_run(self, run_dir: RunDir) -> FencedRun {
         FencedRun {
             lock: self,
             run_dir,
@@ -226,9 +225,12 @@ impl RunDir {
     /// # Errors
     /// [`FenceCause::LeaseLost`] when the capability is no longer live;
     /// [`FenceCause::Io`] for the underlying filesystem error.
-    pub fn create_under(capability: &WriteCapability, path: PathBuf) -> Result<Self, FenceCause> {
+    pub async fn create_under(
+        capability: &WriteCapability,
+        path: PathBuf,
+    ) -> Result<Self, FenceCause> {
         capability.assert_live()?;
-        std::fs::create_dir(&path)?;
+        tokio::fs::create_dir(&path).await?;
         Ok(Self(path))
     }
 }
@@ -239,14 +241,14 @@ impl RunDir {
 #[must_use]
 pub struct FencedRun {
     lock: HeldLock,
-    run_dir: PathBuf,
+    run_dir: RunDir,
 }
 
 impl FencedRun {
     /// The fenced run directory.
     #[must_use]
     pub fn run_dir(&self) -> &Path {
-        &self.run_dir
+        &self.run_dir.0
     }
 
     /// Arm the turn: persistence init (with the capability) happens at

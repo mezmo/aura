@@ -1,12 +1,11 @@
-# session-guard - design record (Layer 1 skeleton, rev 3)
+# session-guard - design record (Layer 1 skeleton, rev 5)
 
 Claim-based turn admission for multi-instance AURA: at most one service
 instance runs a turn for a session at a time, with session memory on a
 shared Archil disk. Skeleton = type surface only; every `todo!()` is a
-tracked hole (inventory at the bottom). Rev 3 folds the round-2 panel
-findings (ledger below) and records the standing decision that the
-mutation-linearity question is settled by the Phase-1 litmus, not by
-assertion.
+tracked hole (inventory at the bottom). Rev 5 folds the round-4 panel
+findings (ledger below); the mutation-linearity question is settled by
+the Phase-1 litmus, not by assertion.
 
 ## Admission protocol
 
@@ -25,17 +24,21 @@ conditional rename is not. Steal, heartbeat renewal, and release are
 check-then-rename sequences with bounded races (residual risks below).
 The Phase-1 litmus suite decides whether the archil FUSE surface offers
 anything stronger than POSIX; if it does not, the fallback is
-fencing-token semantics, and its chain is: (a) a steal requires
-staleness evidence (3 missed beats) before it can even be attempted, so
-the old holder's heartbeat writes have already been failing; (b) a
-failed renewal revokes the lease within one beat interval, so the
-superseded holder's `WriteCapability` reads Lost at its next write; (c)
-all persistence writes target the turn's own incarnation-scoped run
-directory, so overlap damages at most an in-flight turn's own data.
-Residual window: writes issued between the steal landing and the next
-`assert_live` check. This chain is the *designed* boundary but is
-unverified until the litmus runs; the litmus gate treats it as a
-candidate, not a proof.
+fencing-token semantics, stated here with its holes named: (a) a steal
+requires 3 observed missed beats, but a *paused* holder (never
+scheduled) has experienced no failed renewal, so its local capability
+still reads Live until its actor next runs - the litmus must include a
+paused-holder-resumes-after-steal probe; (b) once the old holder's
+renewal does run and fails, the lease revokes within one beat; (c) turn
+*data* is turn-scoped (each turn writes its own run directory, so
+overlap damages at most the loser's own in-flight run), but two
+session-shared mutations are NOT fenced and must be handled at the aura
+seam: the best-effort `latest` symlink, and `prune_session_runs`
+(which also deletes sibling run dirs and is already slated to move out
+of request init into a GC protocol). Residual window: writes issued
+between a steal landing and the loser's next `assert_live` check. This
+chain is the *designed* boundary and is unverified until the litmus
+runs; the litmus gate treats it as a candidate, not a proof.
 
 ## Type-to-business-rule map (every public item)
 
@@ -50,10 +53,10 @@ candidate, not a proof.
 | `ObservedClaim` | Every claim judgment comes from one complete validated read (private wire, fallible `from_wire`) | Pairing raw samples with remembered metadata; unvalidated wire fields |
 | `StalenessEvidence` (internal) + `ValidatedSteal` | A steal needs two same-claim observations, unchanged heartbeat, window-separated, then revalidation against a strictly later observation (id-ordered); the token carries the full superseded identity | Steal on session-id alone; stale evidence about a moved claim; a cloned sample masquerading as fresh |
 | `EvidenceError` / `WireError` / `HeartbeatExhausted` / `InvalidTurnId` / `InvalidSessionId` / `InvalidInstanceId` / `AdmissionConfigError` | Diagnostics only; nothing branches on their payloads | Domain logic on raw text |
-| `SessionArbiter` / `PendingGuard` / `HeldGuard` | Same-instance same-session requests serialize before any disk access; a slot is Admitting until the election resolves, Held after confirm; `holds()` reports Held only; the held guard lives inside `HeldLock` so it spans the turn | Two local tasks both reaching the claim store; an admission attempt mistaken for a holder |
+| `SessionArbiter` / `PendingGuard` / `HeldGuard` (crate-internal) | Same-instance same-session requests serialize before any disk access; a slot is Admitting until the election resolves, Held after confirm (confirm is crate-internal, so no external caller can manufacture a Held slot without an adapter-driven election); `holds()` reports Held only; the held guard lives inside `HeldLock` so it spans the turn | Two local tasks both reaching the claim store; an admission attempt mistaken for a holder; forged local holds |
 | `AcquiredClaim` (internal) | Admission output is one sealed bundle consumed by `into_held_local`/`into_held_with_actor`, which build the lease from the same identity internally | Claim/lease/release identity disagreement |
-| `HeldLock` | A held claim carries identity, arbiter slot, lease, and bound release, assembled only via `HeldLock::new` from an `AcquiredClaim` | Hand-assembled holds; missing liveness |
-| `HeartbeatLease` / `ClaimLeaseSource` / `Liveness` / `Revocation` | Liveness ends structurally: only the lease and the actor exit guard hold revocation authority; stop, drop, and actor exit all revoke; capabilities merely observe (clone/drop-safe); the actor is spawned through a guard-carrying closure, so misuse fails toward Lost | Orphaned heartbeats; Live-after-death capabilities; a dropped capability killing a live lease |
+| `HeldLock` | A held claim carries identity, arbiter slot, lease, and bound release, assembled only via private `from_parts` from an `AcquiredClaim` (whose `into_held_*` constructors build the lease) | Hand-assembled holds; missing liveness |
+| `HeartbeatLease` / `ClaimLeaseSource` / `Liveness` / `Revocation` | Liveness ends structurally: only the lease and the actor exit guard hold revocation authority (an atomic flag - no channel to disagree with); the lease spawns and owns the wrapper task holding the guard, so guard, handle, and actor body are one task; capabilities merely observe (clone/drop-safe) | Orphaned heartbeats; Live-after-death capabilities; a dropped capability killing a live lease; a dummy actor handle dissociated from its guard |
 | `WriteCapability` | Writes are authorized for one session+turn+incarnation triple and fail closed after revocation (identity-complete, checkable against the write target) | Cross-session capability misuse; writes after a steal |
 | `Revocation` (internal) | The lost flag is an atomic; every end path sets it before anything else | Live reads from a dead lease; per-check subscription cost |
 | `BeatInterval` | The beat is non-zero by construction | `stale_after` degenerating to zero |
@@ -73,7 +76,7 @@ candidate, not a proof.
 | `FenceCause` | Write-path failures are lease-loss or I/O, nothing else | Misclassified EROFS |
 | `LeaseState` / `LeaseLost` | Liveness is Live or Lost, and loss names the session and incarnation | Anonymous loss |
 | `STALE_FACTOR` / `stale_after` | A claim is stealable after 3 missed beats | Sub-revocation steals |
-| `HolderView` | `Here{holder}` (local hold, no disk read) or `Remote{holder, last_heartbeat}` (always an observation); non-exhaustive, variants constructed only in-crate | Forged locality/heartbeat pairings |
+| `HolderView` | Opaque: `here` (local hold, no disk read) or `remote` (always an observation, heartbeat from the same read) are crate-internal constructors; accessors read, never construct | Forged locality/heartbeat pairings |
 
 ## Seam table
 
@@ -85,7 +88,7 @@ candidate, not a proof.
 
 Visibility honesty: `pub(crate)` means any module *inside this crate*
 can call it. The internal assembly points are `AcquiredClaim::new`,
-`HeldLock::new`, `Generation::mint`, `ObservedClaim::from_wire`,
+`HeldLock::from_parts` (private), `Generation::mint`, `ObservedClaim::from_wire`,
 `StalenessEvidence::{from_observations, revalidate}`, `HeartbeatLease::
 {static_from, with_actor}`, `Revocation::new`, backend constructors,
 and `release_for`. None are reachable outside the crate; Layer-2
@@ -207,7 +210,32 @@ note above):
 | T17 | rust | AdmissionConfigError missing from map | Accepted | added to diagnostics row (r4) |
 | T18 | codex | R4 seam contract absent from residual risks | Accepted | risk 2a added (r4) |
 
-## Hole inventory (rev 4 baseline)
+Round 4 (seat 1 frontier-reviewer pin = kimi k3, 7 findings; seat 2
+codex gpt-5.6-sol, 9 findings; different-family invariant restored):
+
+| # | Seat | Finding | Disposition | Repair |
+|---|---|---|---|---|
+| F1 | both | Recorded r4 repairs for open_run/release_for/ValidatedSteal had not landed in code (ledger said they had) | Accepted | landed with asserted patches in r5; process note below |
+| F2 | both | open_run still accepts raw PathBuf (RunDir bypassed) | Accepted | open_run(RunDir); FencedRun stores the token (r5) |
+| F3 | kimi | enum-level #[non_exhaustive] does not block variant construction | Accepted | HolderView is an opaque struct with crate-internal here/remote constructors (r5) |
+| F4 | both | release_for still lacks session | Accepted | release_for(&ObservedClaim) (r5) |
+| F5 | both | ValidatedSteal still lacks session | Accepted | token carries {session, superseded} (r5) |
+| F6 | codex | with_actor guard/handle association unenforced (dummy handle) | Accepted | lease spawns the wrapper task owning the guard; body receives a Liveness observation (r5) |
+| F7 | codex | HeldGuard constructible outside (public confirm) | Accepted | arbiter API crate-internal; exports removed (r5) |
+| F8 | codex | fencing chain: paused holder; session-shared mutations | Accepted | chain restated with holes named (latest symlink, prune); paused-holder litmus added (r5) |
+| F9 | both | watch channel dead surface | Accepted | channel deleted; atomic flag only (r5) |
+| F10 | codex | RunDir::create_under sync I/O on async path | Accepted | async tokio::fs::create_dir (r5) |
+| F11 | both | DESIGN.md stale (rev 3 title, HeldLock::new refs) | Accepted | r5 rewrite |
+| F12 | kimi | HeartbeatSeq::new public (forged heartbeats) | Accepted | pub(crate) (r5) |
+
+Process note (F1): the r4 fold script applied replacements without
+asserting they matched, so three repairs silently missed while the
+ledger recorded them as done - caught only by the panel reading code.
+Rule going forward: every fold patch asserts its replacements, and the
+ledger records repairs only after `grep` verification of the landed
+source.
+
+## Hole inventory (rev 5 baseline)
 
 `grep -rEn '^\s+todo!\(' src/` returns 19 holes:
 

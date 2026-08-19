@@ -34,9 +34,10 @@ pub struct SessionArbiter {
 }
 
 impl SessionArbiter {
-    /// An empty arbiter.
+    /// An empty arbiter (crate-internal: built only by
+    /// [`crate::build_admission`]).
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -44,7 +45,7 @@ impl SessionArbiter {
     /// `None` means this instance is already admitting or holding a turn
     /// for it — fail fast locally, without touching the claim store.
     #[must_use]
-    pub fn try_acquire(&self, session: &SessionId) -> Option<PendingGuard> {
+    pub(crate) fn try_acquire(&self, session: &SessionId) -> Option<PendingGuard> {
         let mut held = self.held.0.lock().expect("session arbiter mutex poisoned");
         if held.contains_key(session) {
             return None;
@@ -60,7 +61,7 @@ impl SessionArbiter {
     /// claim, not a mere admission attempt). The read-only membership
     /// query behind `locate_holder`'s local answer.
     #[must_use]
-    pub fn holds(&self, session: &SessionId) -> bool {
+    pub(crate) fn holds(&self, session: &SessionId) -> bool {
         self.held
             .0
             .lock()
@@ -84,7 +85,7 @@ impl PendingGuard {
     /// instance now holds the claim. Consumes the pending guard, so the
     /// slot can never be both Admitting and Held.
     #[must_use]
-    pub fn confirm(mut self) -> HeldGuard {
+    pub(crate) fn confirm(mut self) -> HeldGuard {
         let held = self.held.take().expect("pending guard parts present");
         let session = self.session.take().expect("pending guard parts present");
         let mut map = held.0.lock().expect("session arbiter mutex poisoned");

@@ -122,8 +122,8 @@ impl ClaimFileAdmission {
         unused_variables,
         reason = "todo!() body; filled by aura #421 follow-up"
     )]
-    fn release_for(&self, claim: crate::claim::Generation) -> crate::state::ReleaseAction {
-        todo!("fill: tombstone rename bound to claim; aura #421 follow-up")
+    fn release_for(&self, claim: &crate::claim::ObservedClaim) -> crate::state::ReleaseAction {
+        todo!("fill: tombstone rename derived from observation; aura #421 follow-up")
     }
 }
 

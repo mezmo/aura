@@ -16,10 +16,9 @@ use crate::identity::{SessionId, TurnId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Live state of a held claim, published on the revocation channel.
+/// Live state of a held claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LeaseState {
     /// Heartbeats are advancing; the claim is live.
@@ -41,29 +40,15 @@ pub struct LeaseLost {
     pub session: SessionId,
 }
 
-/// Clone-safe, drop-safe liveness observation. The atomic is the
-/// authoritative read; the watch channel exists for anyone who needs to
-/// await a change. Holding or dropping a `Liveness` never alters state.
+/// Clone-safe, drop-safe liveness observation: a shared atomic flag.
+/// Holding or dropping a `Liveness` never alters state; only a
+/// [`Revocation`] can.
 #[derive(Debug, Clone)]
 pub(crate) struct Liveness {
     lost: Arc<AtomicBool>,
-    sender: Arc<watch::Sender<LeaseState>>,
 }
 
 impl Liveness {
-    /// A live flag pair: the observation handle and a receiver for
-    /// awaiting changes.
-    pub(crate) fn channel() -> (Self, watch::Receiver<LeaseState>) {
-        let (tx, rx) = watch::channel(LeaseState::Live);
-        (
-            Self {
-                lost: Arc::new(AtomicBool::new(false)),
-                sender: Arc::new(tx),
-            },
-            rx,
-        )
-    }
-
     /// Whether the lease is Lost. Authoritative: every end path sets the
     /// flag before anything else.
     pub(crate) fn is_lost(&self) -> bool {
@@ -79,20 +64,23 @@ pub(crate) struct Revocation {
 }
 
 impl Revocation {
-    /// A live revocation bound to a fresh liveness pair.
+    /// A live revocation bound to a fresh liveness flag.
     pub(crate) fn new() -> Self {
-        let (liveness, _rx) = Liveness::channel();
-        Self { liveness }
+        Self {
+            liveness: Liveness {
+                lost: Arc::new(AtomicBool::new(false)),
+            },
+        }
     }
 
     /// Mark lost. Idempotent.
     pub(crate) fn revoke(&self) {
         self.liveness.lost.store(true, Ordering::Release);
-        self.liveness.sender.send_if_modified(|state| {
-            let changed = *state == LeaseState::Live;
-            *state = LeaseState::Lost;
-            changed
-        });
+    }
+
+    /// A clone-safe observation of this revocation's flag.
+    pub(crate) fn liveness(&self) -> Liveness {
+        self.liveness.clone()
     }
 }
 
@@ -159,16 +147,24 @@ impl HeartbeatLease {
         }
     }
 
-    /// A lease around a heartbeat actor. The `spawn` closure receives
-    /// the matching [`ActorExitGuard`] and must move it into the task it
-    /// spawns; if it drops the guard instead, the guard's Drop revokes
-    /// immediately and the lease reads Lost (fail-safe).
-    pub(crate) fn with_actor(
-        source: ClaimLeaseSource,
-        spawn: impl FnOnce(ActorExitGuard) -> JoinHandle<()>,
-    ) -> Self {
+    /// A lease around a heartbeat actor. The lease itself spawns the
+    /// wrapper task that owns the [`ActorExitGuard`], so the guard, the
+    /// returned handle, and the actor body are one task by construction:
+    /// any exit of that task (return, panic, abort) revokes, and the
+    /// lease's stop/drop aborts exactly that task. The body receives a
+    /// clone-safe [`Liveness`] observation for its exit checks.
+    pub(crate) fn with_actor<F, Fut>(source: ClaimLeaseSource, body: F) -> Self
+    where
+        F: FnOnce(Liveness) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let revocation = Revocation::new();
-        let actor = spawn(ActorExitGuard::new(revocation.clone()));
+        let guard = ActorExitGuard::new(revocation.clone());
+        let fut = body(revocation.liveness());
+        let actor = tokio::spawn(async move {
+            let _guard = guard;
+            fut.await;
+        });
         Self {
             session: source.session,
             turn: source.turn,
