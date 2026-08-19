@@ -3,7 +3,7 @@
 //! predecessor by value, so each stage exists only while the turn owns
 //! it. Admission output is one sealed [`AcquiredClaim`] — the claim
 //! identity and its bound release arrive together, and the lease derives
-//! from the same identity inside the `into_held_*` constructors, so
+//! from the same identity inside `into_held`, so
 //! identity, lease, and release cannot disagree.
 
 use std::future::Future;
@@ -17,7 +17,7 @@ use crate::lease::{HeartbeatLease, LeaseLost, WriteCapability};
 /// The complete output of a successful admission (adapter-side,
 /// crate-internal): the claim identity plus the release action bound to
 /// that exact claim at construction. The lease is derived from the same
-/// identity inside the `into_held_*` constructors. (The closure's captured path
+/// identity inside `into_held`. (The closure's captured path
 /// cannot be proven by types — closures are opaque; that binding is the
 /// adapter's contract, tested in Layer 2 and recorded as residual risk.)
 pub(crate) struct AcquiredClaim {
@@ -26,13 +26,33 @@ pub(crate) struct AcquiredClaim {
     holder: InstanceId,
     generation: Generation,
     release: ReleaseAction,
+    lease_plan: LeasePlan,
 }
 
+/// How the lease for this claim renews. Chosen by the adapter at
+/// acquisition (local = static, claim-file = heartbeat), NOT by the
+/// caller at assembly — so the claim-file backend cannot silently take a
+/// never-revoking static lease.
+pub(crate) enum LeasePlan {
+    /// No renewal (local admission): revocation is the only end.
+    Static,
+    /// Lease-owned heartbeat loop over an adapter renewal write.
+    Heartbeat {
+        beat: crate::lease::BeatInterval,
+        write: Box<RenewalWrite>,
+    },
+}
+
+/// One adapter renewal write (the claim-body rewrite).
+pub(crate) type RenewalWriteFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<(), std::io::Error>> + Send>>;
+pub(crate) type RenewalWrite = dyn FnMut() -> RenewalWriteFuture + Send;
+
 impl AcquiredClaim {
-    /// Assemble (adapter-side). The release action must close over this
-    /// claim's file; that binding is the adapter's contract, tested in
-    /// Layer 2.
-    pub(crate) fn new(
+    /// Assemble a local (static-lease) claim (adapter-side). The release
+    /// action must close over this claim's file; that binding is the
+    /// adapter's contract, tested in Layer 2.
+    pub(crate) fn new_local(
         session: SessionId,
         turn: TurnId,
         holder: InstanceId,
@@ -45,48 +65,58 @@ impl AcquiredClaim {
             holder,
             generation,
             release,
+            lease_plan: LeasePlan::Static,
         }
     }
 
-    /// Consume the claim into a held lock with a static (actor-free)
-    /// lease — local admission. The lease is built from this claim's own
-    /// identity inside this call, so identity, lease, and release cannot
-    /// disagree.
-    pub(crate) fn into_held_local(self, arbiter: HeldGuard) -> HeldLock {
-        let lease = HeartbeatLease::static_from(crate::lease::ClaimLeaseSource {
-            session: self.session.clone(),
-            turn: self.turn,
-            generation: self.generation,
-        });
-        HeldLock::from_parts(self, arbiter, lease)
+    /// Assemble a claim-file (heartbeat-lease) claim (adapter-side).
+    /// `write` performs one renewal and must return only after the
+    /// claim-body write completes (the same class of crate-internal
+    /// contract as the release closure; residual risk, Layer-2 tested).
+    pub(crate) fn new_with_heartbeat(
+        session: SessionId,
+        turn: TurnId,
+        holder: InstanceId,
+        generation: Generation,
+        release: ReleaseAction,
+        beat: crate::lease::BeatInterval,
+        write: Box<RenewalWrite>,
+    ) -> Self {
+        Self {
+            session,
+            turn,
+            holder,
+            generation,
+            release,
+            lease_plan: LeasePlan::Heartbeat { beat, write },
+        }
     }
 
-    /// Consume the claim into a held lock with a heartbeat-backed lease
-    /// — claim-file admission. `write` performs one renewal (the
-    /// adapter's claim-body write); the lease owns the loop, wakes and
-    /// joins it on shutdown, and fails closed on the first failed
-    /// renewal. The lease is built from this claim's own identity inside
-    /// this call.
-    pub(crate) fn into_held_with_heartbeat<F, Fut>(
-        self,
-        arbiter: HeldGuard,
-        beat: crate::lease::BeatInterval,
-        write: F,
-    ) -> HeldLock
-    where
-        F: FnMut() -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
-    {
-        let lease = HeartbeatLease::with_heartbeat(
-            crate::lease::ClaimLeaseSource {
-                session: self.session.clone(),
-                turn: self.turn,
-                generation: self.generation,
-            },
-            beat,
-            write,
-        );
-        HeldLock::from_parts(self, arbiter, lease)
+    /// Consume the claim into a held lock. The lease is built from this
+    /// claim's own identity and its adapter-chosen lease plan inside this
+    /// call, so identity, lease, and release cannot disagree, and the
+    /// lease kind is never caller-selected.
+    pub(crate) fn into_held(self, arbiter: HeldGuard) -> HeldLock {
+        let Self {
+            session,
+            turn,
+            holder,
+            generation,
+            release,
+            lease_plan,
+        } = self;
+        let source = crate::lease::ClaimLeaseSource {
+            session: session.clone(),
+            turn,
+            generation,
+        };
+        let lease = match lease_plan {
+            LeasePlan::Static => HeartbeatLease::static_from(source),
+            LeasePlan::Heartbeat { beat, write } => {
+                HeartbeatLease::with_heartbeat(source, beat, write)
+            }
+        };
+        HeldLock::from_parts(session, turn, holder, generation, release, arbiter, lease)
     }
 }
 
@@ -164,18 +194,25 @@ impl std::fmt::Debug for HeldLock {
 }
 
 impl HeldLock {
-    /// Assemble from parts (private: only the `into_held_*` constructors
-    /// on [`AcquiredClaim`] call this, which is what binds lease to
-    /// claim by construction).
-    fn from_parts(acquired: AcquiredClaim, arbiter: HeldGuard, lease: HeartbeatLease) -> Self {
+    /// Assemble from parts (private: only `into_held` calls this,
+    /// which is what binds lease to claim by construction).
+    fn from_parts(
+        session: SessionId,
+        turn: TurnId,
+        holder: InstanceId,
+        generation: Generation,
+        release: ReleaseAction,
+        arbiter: HeldGuard,
+        lease: HeartbeatLease,
+    ) -> Self {
         Self {
-            session: acquired.session,
-            turn: acquired.turn,
-            holder: acquired.holder,
-            generation: acquired.generation,
+            session,
+            turn,
+            holder,
+            generation,
             lease,
             arbiter,
-            release: acquired.release,
+            release,
         }
     }
 
@@ -198,19 +235,39 @@ impl HeldLock {
     }
 
     /// Create and bind this claim's run directory in one step: the
-    /// capability is asserted and the directory created *by this lock*,
-    /// so the fenced run can never carry a directory authorized by a
-    /// different claim. Non-recursive (the session directory must
+    /// capability is asserted, the directory created *by this lock*, and
+    /// liveness re-checked after creation — so the fenced run can never
+    /// carry a directory authorized by a different claim or an
+    /// already-lost lease. Non-recursive (the session directory must
     /// already exist); `AlreadyExists` is a hard error, not retried.
-    /// On any seam failure after this, call [`abort`](Self::abort); a
-    /// bare drop also revokes, but abort releases cleanly.
     ///
     /// # Errors
-    /// [`FenceCause::LeaseLost`] when the capability is no longer live;
-    /// [`FenceCause::Io`] for the underlying filesystem error.
-    pub async fn create_run(self, path: PathBuf) -> Result<FencedRun, FenceCause> {
-        self.lease.capability().assert_live()?;
-        tokio::fs::create_dir(&path).await?;
+    /// [`CreateRunError`] carries the [`FenceCause`] and *returns the
+    /// lock* so the caller can [`abort`](Self::abort) cleanly instead of
+    /// dropping into the abandonment window.
+    pub async fn create_run(self, path: PathBuf) -> Result<FencedRun, CreateRunError> {
+        let capability = self.lease.capability();
+        match capability.assert_live() {
+            Ok(()) => {}
+            Err(cause) => {
+                return Err(CreateRunError {
+                    cause: cause.into(),
+                    lock: self,
+                });
+            }
+        }
+        if let Err(cause) = tokio::fs::create_dir(&path).await {
+            return Err(CreateRunError {
+                cause: FenceCause::Io(cause),
+                lock: self,
+            });
+        }
+        if let Err(cause) = capability.assert_live() {
+            return Err(CreateRunError {
+                cause: cause.into(),
+                lock: self,
+            });
+        }
         Ok(FencedRun {
             lock: self,
             run_dir: path,
@@ -223,6 +280,16 @@ impl HeldLock {
     pub async fn abort(self) -> Result<(), ReleaseError> {
         todo!("fill: lease stop + release; aura #421 follow-up")
     }
+}
+
+/// `create_run` failed; the lock is returned for clean abort.
+#[derive(Debug)]
+pub struct CreateRunError {
+    /// Why creation failed.
+    pub cause: FenceCause,
+    /// The still-held lock; call [`HeldLock::abort`] (a bare drop
+    /// revokes but abandons the claim to the staleness window).
+    pub lock: HeldLock,
 }
 
 /// The run directory exists and was created under this claim's authority
@@ -242,6 +309,13 @@ impl FencedRun {
         &self.run_dir
     }
 
+    /// The write capability bound to this claim (persistence checks it
+    /// before every write).
+    #[must_use]
+    pub fn capability(&self) -> WriteCapability {
+        self.lock.capability()
+    }
+
     /// Arm the turn: persistence init (with the capability) happens at
     /// the seam between this call and the first write; a failure there
     /// calls [`abort`](ActiveTurn::abort) on the result.
@@ -257,6 +331,15 @@ impl FencedRun {
 #[must_use]
 pub struct ActiveTurn {
     run: FencedRun,
+}
+
+impl ActiveTurn {
+    /// The write capability bound to this claim (persistence checks it
+    /// before every write).
+    #[must_use]
+    pub fn capability(&self) -> WriteCapability {
+        self.run.capability()
+    }
 }
 
 /// The terminal outcome of a turn. Every path commits, including

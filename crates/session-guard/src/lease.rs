@@ -87,12 +87,16 @@ impl Revocation {
         self.liveness.clone()
     }
 
-    /// Wait until revoked (heartbeat loop shutdown arm).
+    /// Wait until revoked (heartbeat loop shutdown arm). The `Notified`
+    /// future is created BEFORE the lost check so a `revoke()` racing
+    /// between the check and the registration is still observed
+    /// (`notify_waiters` wakes any `Notified` created after it).
     pub(crate) async fn revoked(&self) {
+        let notified = self.notify.notified();
         if self.liveness.is_lost() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 

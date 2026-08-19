@@ -19,11 +19,12 @@
 //! The consuming state machine (one instance's view of one request):
 //!
 //! ```text
-//! Idle ──admit──────────► HeldLock ──open_run──► FencedRun ──activate──► ActiveTurn
-//!  │                        │        (seam does mkdir under capability)   │
-//!  └─busy──► 503            └─seam failure: HeldLock::abort               ├─complete──► CommittingTurn
-//!                                                     ┌──────────────────┘              │ barrier(commit(ctx))
-//!                                     abandonment ────┘                                 └─► CommittedResponse
+//! Idle ──admit──────────► HeldLock ──create_run──► FencedRun ──activate──► ActiveTurn
+//!  │                        │         (asserts capability, creates, rechecks;     │
+//!  └─busy──► 503            │          error returns the lock for abort)          │
+//!                           └─create_run Err: abort returned lock                 ├─complete──► CommittingTurn
+//!                                                     ┌───────────────────────────┘              │ barrier(commit(ctx))
+//!                                     abandonment ────┘                                      └─► CommittedResponse
 //!                                     (drop revokes)
 //! ```
 //!
@@ -71,7 +72,8 @@ pub use identity::{
 pub use lease::{BeatInterval, LeaseLost, LeaseState, WriteCapability};
 pub use state::{
     ActiveTurn, AdmissionError, BarrierError, CleanupOutcome, CommitContext, CommittedResponse,
-    CommittingTurn, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError, TurnOutcome,
+    CommittingTurn, CreateRunError, FenceCause, FencedRun, HeldLock, IdleRequest, ReleaseError,
+    TurnOutcome,
 };
 
 use std::fmt;

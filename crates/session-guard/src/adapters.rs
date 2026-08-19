@@ -56,7 +56,7 @@ impl TurnAdmission for LocalAdmission {
     async fn admit(&self, req: IdleRequest) -> Result<HeldLock, AdmissionError> {
         todo!(
             "fill: arbiter PendingGuard → confirm() → AcquiredClaim \
-             into_held_local; aura #421 follow-up"
+             AcquiredClaim::new_local → into_held; aura #421 follow-up"
         )
     }
 
@@ -137,7 +137,7 @@ impl TurnAdmission for ClaimFileAdmission {
         todo!(
             "fill: arbiter PendingGuard → O_EXCL election or evidence \
              steal (internal, revalidated) → confirm() → AcquiredClaim \
-             into_held_with_heartbeat; aura #421 follow-up"
+             AcquiredClaim::new_with_heartbeat → into_held; aura #421 follow-up"
         )
     }
 
