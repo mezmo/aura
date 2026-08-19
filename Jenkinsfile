@@ -459,10 +459,12 @@ pipeline {
             sh "git checkout -B ${CURRENT_BRANCH}"
 
             script {
-              env.NEXT_RELEASE_VERSION = sh(
-                script: "npm run --silent release:version 'file://${env.WORKSPACE}'",
-                returnStdout: true
-              ).trim()
+              withCredentials(RELEASE_CREDENTIALS) {
+                env.NEXT_RELEASE_VERSION = sh(
+                  script: 'npm run --silent release:version',
+                  returnStdout: true
+                ).trim()
+              }
               echo env.NEXT_RELEASE_VERSION ? "Release version: ${env.NEXT_RELEASE_VERSION}" : 'No release version determined; skipping build'
             }
           }
